@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{Ack, InboxRecord, SyncCheckpoint};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncEngineModule;
@@ -11,7 +12,7 @@ impl SyncEngineModule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSyncState {
     pub checkpoint: SyncCheckpoint,
     pub seen_message_ids: BTreeSet<String>,
@@ -21,7 +22,7 @@ pub struct DeviceSyncState {
     pub last_head_seq: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncDecision {
     pub from_seq: u64,
     pub to_seq: u64,
@@ -69,9 +70,10 @@ impl SyncEngine {
     }
 
     pub fn next_fetch(state: &DeviceSyncState) -> Option<SyncDecision> {
-        if state.pending_retry || state.checkpoint.last_fetched_seq < state.last_head_seq {
+        let from_seq = state.checkpoint.last_acked_seq.saturating_add(1);
+        if state.pending_retry || from_seq <= state.last_head_seq {
             Some(SyncDecision {
-                from_seq: state.checkpoint.last_acked_seq.saturating_add(1),
+                from_seq,
                 to_seq: state.last_head_seq,
             })
         } else {
@@ -110,7 +112,10 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::{SyncEngine, SyncEngineModule};
-    use crate::model::{Envelope, InboxRecord, MessageType, SenderProof, CURRENT_MODEL_VERSION};
+    use crate::model::{
+        DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType, SenderProof,
+        WakeHint, CURRENT_MODEL_VERSION,
+    };
 
     #[test]
     fn module_name_is_stable() {
@@ -144,6 +149,31 @@ mod tests {
         assert_eq!(decision.to_seq, 5);
     }
 
+    #[test]
+    fn pending_retry_keeps_fetching_from_last_acked_seq() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        state.checkpoint.last_fetched_seq = 5;
+        state.checkpoint.last_acked_seq = 3;
+        SyncEngine::note_pending_retry(&mut state, 4);
+
+        let decision = SyncEngine::next_fetch(&state).expect("should retry");
+        assert_eq!(decision.from_seq, 4);
+        assert_eq!(decision.to_seq, 0);
+    }
+
+    #[test]
+    fn clear_pending_retry_resets_retry_flag() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        let record = sample_record("msg:1", 1);
+        SyncEngine::store_pending_record(&mut state, &record);
+        assert!(state.pending_retry);
+
+        SyncEngine::clear_pending_retry(&mut state, 1);
+
+        assert!(!state.pending_retry);
+        assert!(state.pending_records.is_empty());
+    }
+
     fn sample_record(message_id: &str, seq: u64) -> InboxRecord {
         InboxRecord {
             seq,
@@ -151,6 +181,7 @@ mod tests {
             message_id: message_id.into(),
             received_at: seq,
             expires_at: None,
+            state: InboxRecordState::Available,
             envelope: Envelope {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 message_id: message_id.into(),
@@ -162,6 +193,10 @@ mod tests {
                 message_type: MessageType::MlsApplication,
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: vec![],
+                delivery_class: DeliveryClass::Normal,
+                wake_hint: Some(WakeHint {
+                    latest_seq_hint: Some(seq),
+                }),
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),

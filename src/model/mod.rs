@@ -70,7 +70,23 @@ impl Validate for DeviceIdentity {
         validate_required("user_id", &self.user_id)?;
         validate_required("device_id", &self.device_id)?;
         validate_required("device_public_key", &self.device_public_key)?;
-        self.binding.validate()
+        self.binding.validate()?;
+        if self.binding.user_id != self.user_id {
+            return Err(CoreError::invalid_input(
+                "device binding user_id must match device identity user_id",
+            ));
+        }
+        if self.binding.device_id != self.device_id {
+            return Err(CoreError::invalid_input(
+                "device binding device_id must match device identity device_id",
+            ));
+        }
+        if self.binding.device_public_key != self.device_public_key {
+            return Err(CoreError::invalid_input(
+                "device binding device_public_key must match device identity device_public_key",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -199,6 +215,24 @@ impl Validate for StorageRef {
         validate_required("kind", &self.kind)?;
         validate_required("ref", &self.object_ref)?;
         validate_required("mime_type", &self.mime_type)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryClass {
+    Normal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WakeHint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_seq_hint: Option<u64>,
+}
+
+impl Validate for WakeHint {
+    fn validate(&self) -> CoreResult<()> {
+        Ok(())
     }
 }
 
@@ -338,6 +372,9 @@ pub struct Envelope {
     pub inline_ciphertext: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_refs: Vec<StorageRef>,
+    pub delivery_class: DeliveryClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_hint: Option<WakeHint>,
     pub sender_proof: SenderProof,
 }
 
@@ -349,10 +386,25 @@ impl Validate for Envelope {
         validate_required("sender_user_id", &self.sender_user_id)?;
         validate_required("sender_device_id", &self.sender_device_id)?;
         validate_required("recipient_device_id", &self.recipient_device_id)?;
+        match self.delivery_class {
+            DeliveryClass::Normal => {}
+        }
+        if let Some(wake_hint) = &self.wake_hint {
+            wake_hint.validate()?;
+        }
         self.sender_proof.validate()?;
         if self.inline_ciphertext.is_none() && self.storage_refs.is_empty() {
             return Err(CoreError::invalid_input(
                 "envelope must include inline_ciphertext or at least one storage_ref",
+            ));
+        }
+        if self
+            .inline_ciphertext
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(CoreError::invalid_input(
+                "inline_ciphertext must not be empty when provided",
             ));
         }
         for reference in &self.storage_refs {
@@ -360,6 +412,12 @@ impl Validate for Envelope {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxRecordState {
+    Available,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +428,7 @@ pub struct InboxRecord {
     pub received_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+    pub state: InboxRecordState,
     pub envelope: Envelope,
 }
 
@@ -377,7 +436,21 @@ impl Validate for InboxRecord {
     fn validate(&self) -> CoreResult<()> {
         validate_required("recipient_device_id", &self.recipient_device_id)?;
         validate_required("message_id", &self.message_id)?;
-        self.envelope.validate()
+        self.envelope.validate()?;
+        if self.message_id != self.envelope.message_id {
+            return Err(CoreError::invalid_input(
+                "inbox record message_id must match envelope message_id",
+            ));
+        }
+        if self.recipient_device_id != self.envelope.recipient_device_id {
+            return Err(CoreError::invalid_input(
+                "inbox record recipient_device_id must match envelope recipient_device_id",
+            ));
+        }
+        match self.state {
+            InboxRecordState::Available => {}
+        }
+        Ok(())
     }
 }
 
@@ -464,7 +537,13 @@ pub struct SyncCheckpoint {
 
 impl Validate for SyncCheckpoint {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("device_id", &self.device_id)
+        validate_required("device_id", &self.device_id)?;
+        if self.last_acked_seq > self.last_fetched_seq {
+            return Err(CoreError::invalid_input(
+                "last_acked_seq must not exceed last_fetched_seq",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -533,7 +612,14 @@ impl Validate for DeploymentBundle {
         validate_required(
             "inbox_websocket_endpoint",
             &self.inbox_websocket_endpoint,
-        )
+        )?;
+        if let Some(user_id) = &self.expected_user_id {
+            validate_required("expected_user_id", user_id)?;
+        }
+        if let Some(device_id) = &self.expected_device_id {
+            validate_required("expected_device_id", device_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -601,10 +687,30 @@ mod tests {
     }
 
     #[test]
+    fn delivery_class_serializes_as_snake_case() {
+        let json = serde_json::to_string(&DeliveryClass::Normal).expect("serialize enum");
+        assert_eq!(json, "\"normal\"");
+    }
+
+    #[test]
     fn conversation_kind_parses_from_snake_case() {
         let kind: ConversationKind =
             serde_json::from_str("\"direct\"").expect("deserialize enum");
         assert_eq!(kind, ConversationKind::Direct);
+    }
+
+    #[test]
+    fn delivery_class_rejects_unknown_value() {
+        let error = serde_json::from_str::<DeliveryClass>("\"priority\"")
+            .expect_err("unknown delivery class should fail");
+        assert!(error.is_data());
+    }
+
+    #[test]
+    fn inbox_record_state_rejects_unknown_value() {
+        let error = serde_json::from_str::<InboxRecordState>("\"deleted\"")
+            .expect_err("unknown record state should fail");
+        assert!(error.is_data());
     }
 
     #[test]
@@ -614,6 +720,110 @@ mod tests {
             ..sample_identity_bundle()
         };
         let error = bundle.validate().expect_err("bundle should reject version");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn device_identity_validation_rejects_binding_mismatch() {
+        let mut device = DeviceIdentity {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            user_id: "user:alice".into(),
+            device_id: "device:alice:phone".into(),
+            device_public_key: "device-pub".into(),
+            created_at: 0,
+            binding: DeviceBinding {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                user_id: "user:alice".into(),
+                device_id: "device:alice:laptop".into(),
+                device_public_key: "device-pub".into(),
+                created_at: 0,
+                signature: "sig".into(),
+            },
+        };
+        let error = device.validate().expect_err("binding mismatch should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        device.binding.device_id = device.device_id.clone();
+        device.binding.device_public_key = "other-device-pub".into();
+        let error = device
+            .validate()
+            .expect_err("device public key mismatch should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn envelope_validation_rejects_empty_inline_ciphertext() {
+        let mut envelope = sample_envelope();
+        envelope.inline_ciphertext = Some(String::new());
+        let error = envelope
+            .validate()
+            .expect_err("empty inline ciphertext should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn inbox_record_validation_rejects_envelope_mismatch() {
+        let mut record = InboxRecord {
+            seq: 1,
+            recipient_device_id: "device:bob:phone".into(),
+            message_id: "msg:1".into(),
+            received_at: 1,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: sample_envelope(),
+        };
+        record.envelope.recipient_device_id = "device:bob:laptop".into();
+        let error = record
+            .validate()
+            .expect_err("recipient mismatch should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn inbox_record_round_trips_json_with_state() {
+        let record = InboxRecord {
+            seq: 1,
+            recipient_device_id: "device:bob:phone".into(),
+            message_id: "msg:1".into(),
+            received_at: 1,
+            expires_at: Some(10),
+            state: InboxRecordState::Available,
+            envelope: sample_envelope(),
+        };
+        let json = serde_json::to_string(&record).expect("serialize record");
+        let decoded: InboxRecord = serde_json::from_str(&json).expect("deserialize record");
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn sync_checkpoint_validation_rejects_acked_past_fetched() {
+        let checkpoint = SyncCheckpoint {
+            device_id: "device:bob:phone".into(),
+            last_fetched_seq: 2,
+            last_acked_seq: 3,
+            updated_at: 3,
+        };
+        let error = checkpoint
+            .validate()
+            .expect_err("acked past fetched should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn deployment_bundle_validation_rejects_empty_expected_ids() {
+        let bundle = DeploymentBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            region: "local".into(),
+            inbox_http_endpoint: "https://example.com".into(),
+            inbox_websocket_endpoint: "wss://example.com/ws".into(),
+            storage_base_info: StorageBaseInfo::default(),
+            runtime_config: RuntimeConfig::default(),
+            expected_user_id: Some(String::new()),
+            expected_device_id: None,
+        };
+        let error = bundle
+            .validate()
+            .expect_err("empty expected_user_id should fail");
         assert_eq!(error.code(), "invalid_input");
     }
 
@@ -680,6 +890,10 @@ mod tests {
             message_type: MessageType::MlsApplication,
             inline_ciphertext: Some("ciphertext".into()),
             storage_refs: vec![],
+            delivery_class: DeliveryClass::Normal,
+            wake_hint: Some(WakeHint {
+                latest_seq_hint: Some(3),
+            }),
             sender_proof: SenderProof {
                 proof_type: "signature".into(),
                 value: "proof".into(),

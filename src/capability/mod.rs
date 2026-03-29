@@ -158,6 +158,9 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::model::DeploymentBundle;
 
+    const ALICE_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
     #[test]
     fn module_name_is_stable() {
         assert_eq!(CapabilityModule.name(), "capability");
@@ -165,7 +168,7 @@ mod tests {
 
     #[test]
     fn generated_capability_can_be_verified() {
-        let identity = IdentityManager::create_or_recover(Some("alpha beta gamma"), Some("phone"))
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
         let deployment = sample_deployment();
         let profile = CapabilityManager::build_device_contact_profile(

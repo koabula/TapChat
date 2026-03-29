@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use serde::{Deserialize as SerdeDeserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
 use crate::identity::LocalIdentityState;
@@ -21,7 +22,7 @@ impl MlsAdapterModule {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize)]
 pub struct PublishedKeyPackage {
     pub key_package_ref: String,
     pub key_package_b64: String,
@@ -604,6 +605,11 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::model::MessageType;
 
+    const ALICE_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const BOB_MNEMONIC: &str =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
     #[test]
     fn module_name_is_stable() {
         assert_eq!(MlsAdapterModule.name(), "mls_adapter");
@@ -611,7 +617,7 @@ mod tests {
 
     #[test]
     fn key_package_can_be_generated() {
-        let identity = IdentityManager::create_or_recover(Some("alpha beta gamma"), Some("phone"))
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
         let package = MlsAdapter::generate_key_package(&identity, 0).expect("package");
         assert!(!package.key_package_b64.is_empty());
@@ -620,9 +626,9 @@ mod tests {
     #[test]
     fn welcome_import_and_application_message_round_trip() {
         let alice_identity =
-            IdentityManager::create_or_recover(Some("alpha beta gamma"), Some("phone"))
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
                 .expect("alice");
-        let bob_identity = IdentityManager::create_or_recover(Some("delta epsilon zeta"), Some("phone"))
+        let bob_identity = IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone"))
             .expect("bob");
 
         let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
