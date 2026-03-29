@@ -28,7 +28,7 @@ pub struct UserIdentity {
 
 impl Validate for UserIdentity {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("user_public_key", &self.user_public_key)
     }
@@ -46,7 +46,7 @@ pub struct DeviceBinding {
 
 impl Validate for DeviceBinding {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("device_id", &self.device_id)?;
         validate_required("device_public_key", &self.device_public_key)?;
@@ -66,7 +66,7 @@ pub struct DeviceIdentity {
 
 impl Validate for DeviceIdentity {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("device_id", &self.device_id)?;
         validate_required("device_public_key", &self.device_public_key)?;
@@ -92,7 +92,7 @@ pub struct DeviceStatus {
 
 impl Validate for DeviceStatus {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("device_id", &self.device_id)
     }
@@ -136,14 +136,28 @@ pub struct InboxAppendCapability {
 
 impl Validate for InboxAppendCapability {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("target_device_id", &self.target_device_id)?;
         validate_required("endpoint", &self.endpoint)?;
         validate_required("signature", &self.signature)?;
+        if self.service != CapabilityService::Inbox {
+            return Err(CoreError::invalid_input(
+                "service must be inbox for inbox append capability",
+            ));
+        }
         if self.operations.is_empty() {
             return Err(CoreError::invalid_input(
                 "operations must contain at least one capability operation",
+            ));
+        }
+        if self
+            .operations
+            .iter()
+            .any(|operation| *operation != CapabilityOperation::Append)
+        {
+            return Err(CoreError::invalid_input(
+                "operations must only contain append",
             ));
         }
         Ok(())
@@ -162,7 +176,7 @@ pub struct KeyPackageRef {
 
 impl Validate for KeyPackageRef {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("device_id", &self.device_id)?;
         validate_required("ref", &self.object_ref)
@@ -201,11 +215,26 @@ pub struct DeviceContactProfile {
 
 impl Validate for DeviceContactProfile {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("device_id", &self.device_id)?;
         validate_required("device_public_key", &self.device_public_key)?;
         self.binding.validate()?;
+        if self.binding.device_id != self.device_id {
+            return Err(CoreError::invalid_input(
+                "device binding device_id must match device profile device_id",
+            ));
+        }
+        if self.binding.device_public_key != self.device_public_key {
+            return Err(CoreError::invalid_input(
+                "device binding device_public_key must match device profile device_public_key",
+            ));
+        }
         self.inbox_append_capability.validate()?;
+        if self.inbox_append_capability.target_device_id != self.device_id {
+            return Err(CoreError::invalid_input(
+                "capability target_device_id must match device profile device_id",
+            ));
+        }
         self.keypackage_ref.validate()
     }
 }
@@ -234,7 +263,7 @@ pub struct IdentityBundle {
 
 impl Validate for IdentityBundle {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("user_public_key", &self.user_public_key)?;
         validate_required("signature", &self.signature)?;
@@ -245,6 +274,26 @@ impl Validate for IdentityBundle {
         }
         for device in &self.devices {
             device.validate()?;
+            if device.binding.user_id != self.user_id {
+                return Err(CoreError::invalid_input(
+                    "device binding user_id must match bundle user_id",
+                ));
+            }
+            if device.inbox_append_capability.user_id != self.user_id {
+                return Err(CoreError::invalid_input(
+                    "capability user_id must match bundle user_id",
+                ));
+            }
+            if device.keypackage_ref.user_id != self.user_id {
+                return Err(CoreError::invalid_input(
+                    "key package ref user_id must match bundle user_id",
+                ));
+            }
+            if device.keypackage_ref.device_id != device.device_id {
+                return Err(CoreError::invalid_input(
+                    "key package ref device_id must match device profile device_id",
+                ));
+            }
         }
         Ok(())
     }
@@ -294,7 +343,7 @@ pub struct Envelope {
 
 impl Validate for Envelope {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("message_id", &self.message_id)?;
         validate_required("conversation_id", &self.conversation_id)?;
         validate_required("sender_user_id", &self.sender_user_id)?;
@@ -478,7 +527,7 @@ pub struct DeploymentBundle {
 
 impl Validate for DeploymentBundle {
     fn validate(&self) -> CoreResult<()> {
-        validate_required("version", &self.version)?;
+        validate_version(&self.version)?;
         validate_required("region", &self.region)?;
         validate_required("inbox_http_endpoint", &self.inbox_http_endpoint)?;
         validate_required(
@@ -492,6 +541,16 @@ fn validate_required(field: &str, value: &str) -> CoreResult<()> {
     if value.trim().is_empty() {
         return Err(CoreError::invalid_input(format!(
             "{field} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_version(value: &str) -> CoreResult<()> {
+    validate_required("version", value)?;
+    if value != CURRENT_MODEL_VERSION {
+        return Err(CoreError::invalid_input(format!(
+            "unsupported version {value}, expected {CURRENT_MODEL_VERSION}"
         )));
     }
     Ok(())
@@ -546,6 +605,16 @@ mod tests {
         let kind: ConversationKind =
             serde_json::from_str("\"direct\"").expect("deserialize enum");
         assert_eq!(kind, ConversationKind::Direct);
+    }
+
+    #[test]
+    fn validation_rejects_unsupported_version() {
+        let bundle = IdentityBundle {
+            version: "9.9".into(),
+            ..sample_identity_bundle()
+        };
+        let error = bundle.validate().expect_err("bundle should reject version");
+        assert_eq!(error.code(), "invalid_input");
     }
 
     fn sample_identity_bundle() -> IdentityBundle {

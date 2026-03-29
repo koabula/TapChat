@@ -2,10 +2,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+use crate::capability::CapabilityManager;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
-    DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind, IdentityBundle,
-    UserIdentity, Validate, CURRENT_MODEL_VERSION,
+    DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind,
+    IdentityBundle, StorageProfile, UserIdentity, Validate, CURRENT_MODEL_VERSION,
 };
 
 const DEFAULT_DEVICE_NAME: &str = "device";
@@ -139,8 +140,14 @@ impl IdentityManager {
 
     pub fn verify_identity_bundle(bundle: &IdentityBundle) -> CoreResult<()> {
         bundle.validate()?;
+        let verifying_key = parse_verifying_key(&bundle.user_public_key)?;
+        let signature = parse_signature(&bundle.signature)?;
+        verifying_key
+            .verify(identity_bundle_payload(bundle).as_bytes(), &signature)
+            .map_err(|_| CoreError::invalid_input("identity bundle signature mismatch"))?;
         for device in &bundle.devices {
             Self::verify_device_binding(&bundle.user_public_key, &device.binding)?;
+            CapabilityManager::verify_device_contact_profile(device)?;
             if device.binding.user_id != bundle.user_id {
                 return Err(CoreError::invalid_input(
                     "device binding user_id does not match identity bundle user_id",
@@ -158,6 +165,48 @@ impl IdentityManager {
             }
         }
         Ok(())
+    }
+
+    pub fn export_identity_bundle(
+        local_identity: &LocalIdentityState,
+        deployment: &DeploymentBundle,
+        key_package_ref: String,
+        key_package_expires_at: u64,
+    ) -> CoreResult<IdentityBundle> {
+        let device_profile = CapabilityManager::build_device_contact_profile(
+            local_identity,
+            deployment,
+            key_package_ref,
+            key_package_expires_at,
+        )?;
+        let unsigned = IdentityBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            user_id: local_identity.user_identity.user_id.clone(),
+            user_public_key: local_identity.user_identity.user_public_key.clone(),
+            devices: vec![device_profile],
+            device_status_ref: Some(format!(
+                "{}/state/{}/device_status.json",
+                deployment.storage_base_info.base_url.clone().unwrap_or_default(),
+                local_identity.user_identity.user_id
+            )),
+            storage_profile: Some(StorageProfile {
+                base_url: deployment.storage_base_info.base_url.clone(),
+                profile_ref: Some(format!(
+                    "{}/state/{}/storage_profile.json",
+                    deployment.storage_base_info.base_url.clone().unwrap_or_default(),
+                    local_identity.user_identity.user_id
+                )),
+            }),
+            updated_at: local_identity.device_status.updated_at,
+            signature: String::new(),
+        };
+        let signature = local_identity
+            .user_root_signing_key()
+            .sign(identity_bundle_payload(&unsigned).as_bytes());
+        Ok(IdentityBundle {
+            signature: encode_hex(&signature.to_bytes()),
+            ..unsigned
+        })
     }
 }
 
@@ -214,6 +263,35 @@ fn derive_seed(label: &str, input: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
+    let mut parts = vec![
+        bundle.version.clone(),
+        bundle.user_id.clone(),
+        bundle.user_public_key.clone(),
+        bundle.updated_at.to_string(),
+        bundle.device_status_ref.clone().unwrap_or_default(),
+        bundle
+            .storage_profile
+            .as_ref()
+            .and_then(|profile| profile.base_url.clone())
+            .unwrap_or_default(),
+        bundle
+            .storage_profile
+            .as_ref()
+            .and_then(|profile| profile.profile_ref.clone())
+            .unwrap_or_default(),
+    ];
+    for device in &bundle.devices {
+        parts.push(device.device_id.clone());
+        parts.push(device.device_public_key.clone());
+        parts.push(device.binding.signature.clone());
+        parts.push(device.inbox_append_capability.signature.clone());
+        parts.push(device.keypackage_ref.object_ref.clone());
+        parts.push(device.keypackage_ref.expires_at.to_string());
+    }
+    parts.join("|")
+}
+
 fn short_fingerprint(bytes: &[u8], len: usize) -> String {
     encode_hex(bytes)[..len].to_string()
 }
@@ -237,7 +315,7 @@ fn parse_hex(input: &str) -> CoreResult<Vec<u8>> {
     Ok(output)
 }
 
-fn parse_verifying_key(input: &str) -> CoreResult<VerifyingKey> {
+pub fn parse_verifying_key(input: &str) -> CoreResult<VerifyingKey> {
     let bytes = parse_hex(input)?;
     let array: [u8; 32] = bytes
         .try_into()
@@ -246,7 +324,7 @@ fn parse_verifying_key(input: &str) -> CoreResult<VerifyingKey> {
         .map_err(|_| CoreError::invalid_input("invalid verifying key bytes"))
 }
 
-fn parse_signature(input: &str) -> CoreResult<Signature> {
+pub fn parse_signature(input: &str) -> CoreResult<Signature> {
     let bytes = parse_hex(input)?;
     let array: [u8; 64] = bytes
         .try_into()
@@ -258,9 +336,9 @@ fn parse_signature(input: &str) -> CoreResult<Signature> {
 mod tests {
     use super::{IdentityManager, IdentityModule};
     use crate::model::{
-        CapabilityConstraints, CapabilityOperation, CapabilityService, DeviceContactProfile,
-        DeviceStatusKind, IdentityBundle, InboxAppendCapability, KeyPackageRef,
-        CURRENT_MODEL_VERSION,
+        CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
+        DeviceContactProfile, DeviceStatusKind, IdentityBundle, InboxAppendCapability,
+        KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
     };
 
     #[test]
@@ -352,5 +430,35 @@ mod tests {
         let error = IdentityManager::verify_identity_bundle(&bundle)
             .expect_err("tampered bundle should fail");
         assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn exported_identity_bundle_can_be_verified() {
+        let identity = IdentityManager::create_or_recover(Some("alpha beta gamma"), Some("phone"))
+            .expect("identity");
+        let bundle = IdentityManager::export_identity_bundle(
+            &identity,
+            &sample_deployment(),
+            "kp-ref".into(),
+            999,
+        )
+        .expect("bundle");
+        IdentityManager::verify_identity_bundle(&bundle).expect("bundle should verify");
+    }
+
+    fn sample_deployment() -> DeploymentBundle {
+        DeploymentBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            region: "local".into(),
+            inbox_http_endpoint: "https://example.com".into(),
+            inbox_websocket_endpoint: "wss://example.com/ws".into(),
+            storage_base_info: StorageBaseInfo {
+                base_url: Some("https://storage.example.com".into()),
+                bucket_hint: None,
+            },
+            runtime_config: crate::model::RuntimeConfig::default(),
+            expected_user_id: None,
+            expected_device_id: None,
+        }
     }
 }

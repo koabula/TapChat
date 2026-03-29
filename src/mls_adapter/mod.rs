@@ -52,6 +52,14 @@ pub struct CreateConversationArtifacts {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveMembersArtifacts {
+    pub commit_b64: String,
+    pub removed_device_ids: Vec<String>,
+    pub member_device_ids: Vec<String>,
+    pub epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundMlsMessage {
     pub payload_b64: String,
     pub epoch: u64,
@@ -76,6 +84,7 @@ pub enum IngestResult {
 struct LocalMlsState {
     group: MlsGroup,
     member_device_ids: BTreeSet<String>,
+    status: MlsStateStatus,
 }
 
 pub struct MlsAdapter {
@@ -198,6 +207,7 @@ impl MlsAdapter {
             LocalMlsState {
                 group,
                 member_device_ids: member_device_ids.clone(),
+                status: MlsStateStatus::Active,
             },
         );
 
@@ -212,6 +222,101 @@ impl MlsAdapter {
                 .collect(),
             member_device_ids: member_device_ids.into_iter().collect(),
             epoch: self.export_group_summary(conversation_id)?.epoch,
+        })
+    }
+
+    pub fn add_members(
+        &mut self,
+        conversation_id: &str,
+        peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
+    ) -> CoreResult<CreateConversationArtifacts> {
+        if peer_devices_with_keypackages.is_empty() {
+            return Err(CoreError::invalid_input(
+                "peer_devices_with_keypackages must not be empty",
+            ));
+        }
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+
+        let mut key_packages = Vec::with_capacity(peer_devices_with_keypackages.len());
+        for peer in peer_devices_with_keypackages {
+            if peer.device_id.trim().is_empty() {
+                return Err(CoreError::invalid_input("peer device_id must not be empty"));
+            }
+            key_packages.push(decode_key_package(&peer.key_package_b64)?);
+        }
+
+        let (commit, welcome, _group_info) = state
+            .group
+            .add_members(&self.provider, &self.signer, &key_packages)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to add MLS members: {error}"))
+            })?;
+        state
+            .group
+            .merge_pending_commit(&self.provider)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to merge pending commit: {error}"))
+            })?;
+        for peer in peer_devices_with_keypackages {
+            state.member_device_ids.insert(peer.device_id.clone());
+        }
+        state.status = MlsStateStatus::Active;
+
+        let commit_b64 = encode_mls_message(commit)?;
+        let welcome_b64 = encode_mls_message(welcome)?;
+        Ok(CreateConversationArtifacts {
+            commit_b64,
+            welcomes: peer_devices_with_keypackages
+                .iter()
+                .map(|peer| WelcomeEnvelope {
+                    recipient_device_id: peer.device_id.clone(),
+                    payload_b64: welcome_b64.clone(),
+                })
+                .collect(),
+            member_device_ids: state.member_device_ids.iter().cloned().collect(),
+            epoch: state.group.epoch().as_u64(),
+        })
+    }
+
+    pub fn remove_members(
+        &mut self,
+        conversation_id: &str,
+        device_ids: &[String],
+    ) -> CoreResult<RemoveMembersArtifacts> {
+        if device_ids.is_empty() {
+            return Err(CoreError::invalid_input("device_ids must not be empty"));
+        }
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+
+        let leaf_indices = member_leaf_indices_for_devices(&state.group, device_ids)?;
+        let (commit, _welcome, _group_info) = state
+            .group
+            .remove_members(&self.provider, &self.signer, &leaf_indices)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to remove MLS members: {error}"))
+            })?;
+        state
+            .group
+            .merge_pending_commit(&self.provider)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to merge pending commit: {error}"))
+            })?;
+        for device_id in device_ids {
+            state.member_device_ids.remove(device_id);
+        }
+        state.status = MlsStateStatus::Active;
+
+        Ok(RemoveMembersArtifacts {
+            commit_b64: encode_mls_message(commit)?,
+            removed_device_ids: device_ids.to_vec(),
+            member_device_ids: state.member_device_ids.iter().cloned().collect(),
+            epoch: state.group.epoch().as_u64(),
         })
     }
 
@@ -266,9 +371,39 @@ impl MlsAdapter {
             conversation_id: conversation_id.to_string(),
             epoch: state.group.epoch().as_u64(),
             member_device_ids: state.member_device_ids.iter().cloned().collect(),
-            status: MlsStateStatus::Active,
+            status: state.status,
             updated_at: state.group.epoch().as_u64(),
         })
+    }
+
+    pub fn mark_recovery_needed(&mut self, conversation_id: &str) {
+        if let Some(state) = self.groups.get_mut(conversation_id) {
+            state.status = MlsStateStatus::NeedsRecovery;
+        }
+    }
+
+    pub fn mark_needs_rebuild(&mut self, conversation_id: &str) {
+        if let Some(state) = self.groups.get_mut(conversation_id) {
+            state.status = MlsStateStatus::NeedsRebuild;
+        }
+    }
+
+    pub fn attempt_recovery(&mut self, conversation_id: &str) -> CoreResult<MlsStateSummary> {
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        if state.status == MlsStateStatus::NeedsRebuild {
+            return Err(CoreError::invalid_state(
+                "conversation MLS state requires rebuild",
+            ));
+        }
+        state.status = MlsStateStatus::Active;
+        self.export_group_summary(conversation_id)
+    }
+
+    pub fn clear_conversation(&mut self, conversation_id: &str) {
+        self.groups.remove(conversation_id);
     }
 
     fn ingest_welcome(&mut self, conversation_id: &str, payload_b64: &str) -> CoreResult<IngestResult> {
@@ -306,6 +441,7 @@ impl MlsAdapter {
             LocalMlsState {
                 group,
                 member_device_ids,
+                status: MlsStateStatus::Active,
             },
         );
         Ok(IngestResult::AppliedWelcome {
@@ -332,23 +468,22 @@ impl MlsAdapter {
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
             Err(_) => {
-                return Ok(if message_type == MessageType::MlsCommit {
-                    IngestResult::PendingRetry
-                } else {
-                    IngestResult::NeedsRebuild
-                })
+                state.status = MlsStateStatus::NeedsRecovery;
+                return Ok(IngestResult::PendingRetry);
             }
         };
         let sender_identity = extract_sender_identity(processed.credential())?;
         match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(application) => Ok(IngestResult::AppliedApplication(
-                DecryptedApplicationMessage {
+            ProcessedMessageContent::ApplicationMessage(application) => {
+                state.status = MlsStateStatus::Active;
+                Ok(IngestResult::AppliedApplication(DecryptedApplicationMessage {
                     plaintext: application.into_bytes(),
                     sender_identity,
-                },
-            )),
+                }))
+            }
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 if message_type != MessageType::MlsCommit {
+                    state.status = MlsStateStatus::NeedsRebuild;
                     return Ok(IngestResult::NeedsRebuild);
                 }
                 state
@@ -356,11 +491,15 @@ impl MlsAdapter {
                     .merge_staged_commit(provider, *staged_commit)
                     .map_err(|_| CoreError::invalid_state("failed to merge staged commit"))?;
                 state.member_device_ids = extract_member_device_ids(&state.group)?;
+                state.status = MlsStateStatus::Active;
                 Ok(IngestResult::AppliedCommit {
                     epoch: state.group.epoch().as_u64(),
                 })
             }
-            _ => Ok(IngestResult::PendingRetry),
+            _ => {
+                state.status = MlsStateStatus::NeedsRecovery;
+                Ok(IngestResult::PendingRetry)
+            }
         }
     }
 }
@@ -393,6 +532,31 @@ fn extract_member_device_ids(group: &MlsGroup) -> CoreResult<BTreeSet<String>> {
         members.insert(device_id.to_string());
     }
     Ok(members)
+}
+
+fn member_leaf_indices_for_devices(
+    group: &MlsGroup,
+    device_ids: &[String],
+) -> CoreResult<Vec<LeafNodeIndex>> {
+    let mut indices = Vec::with_capacity(device_ids.len());
+    for device_id in device_ids {
+        let member = group
+            .members()
+            .find(|member| {
+                extract_sender_identity(&member.credential)
+                    .ok()
+                    .and_then(|identity| identity.split('|').nth(1).map(str::to_string))
+                    .as_deref()
+                    == Some(device_id.as_str())
+            })
+            .ok_or_else(|| {
+                CoreError::invalid_input(format!(
+                    "MLS member for device {device_id} does not exist"
+                ))
+            })?;
+        indices.push(member.index);
+    }
+    Ok(indices)
 }
 
 fn encode_mls_message(message: MlsMessageOut) -> CoreResult<String> {

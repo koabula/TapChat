@@ -29,6 +29,10 @@ impl CoreError {
         Self::new("unsupported", message)
     }
 
+    pub fn temporary_failure(message: impl Into<String>) -> Self {
+        Self::new("temporary_failure", message)
+    }
+
     pub fn code(&self) -> &'static str {
         self.code
     }

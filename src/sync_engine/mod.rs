@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::{Ack, InboxRecord, SyncCheckpoint};
 
@@ -15,6 +15,16 @@ impl SyncEngineModule {
 pub struct DeviceSyncState {
     pub checkpoint: SyncCheckpoint,
     pub seen_message_ids: BTreeSet<String>,
+    pub pending_records: BTreeMap<u64, InboxRecord>,
+    pub pending_record_seqs: BTreeSet<u64>,
+    pub pending_retry: bool,
+    pub last_head_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncDecision {
+    pub from_seq: u64,
+    pub to_seq: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -30,6 +40,10 @@ impl SyncEngine {
                 updated_at: 0,
             },
             seen_message_ids: BTreeSet::new(),
+            pending_records: BTreeMap::new(),
+            pending_record_seqs: BTreeSet::new(),
+            pending_retry: false,
+            last_head_seq: 0,
         }
     }
 
@@ -47,6 +61,38 @@ impl SyncEngine {
         state.checkpoint.last_fetched_seq = to_seq.max(state.checkpoint.last_fetched_seq);
         state.checkpoint.updated_at = state.checkpoint.last_fetched_seq;
         fresh
+    }
+
+    pub fn register_head(state: &mut DeviceSyncState, head_seq: u64) {
+        state.last_head_seq = head_seq.max(state.last_head_seq);
+        state.checkpoint.updated_at = state.last_head_seq;
+    }
+
+    pub fn next_fetch(state: &DeviceSyncState) -> Option<SyncDecision> {
+        if state.pending_retry || state.checkpoint.last_fetched_seq < state.last_head_seq {
+            Some(SyncDecision {
+                from_seq: state.checkpoint.last_acked_seq.saturating_add(1),
+                to_seq: state.last_head_seq,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn note_pending_retry(state: &mut DeviceSyncState, seq: u64) {
+        state.pending_retry = true;
+        state.pending_record_seqs.insert(seq);
+    }
+
+    pub fn store_pending_record(state: &mut DeviceSyncState, record: &InboxRecord) {
+        state.pending_records.insert(record.seq, record.clone());
+        Self::note_pending_retry(state, record.seq);
+    }
+
+    pub fn clear_pending_retry(state: &mut DeviceSyncState, seq: u64) {
+        state.pending_record_seqs.remove(&seq);
+        state.pending_records.remove(&seq);
+        state.pending_retry = !state.pending_record_seqs.is_empty();
     }
 
     pub fn ack_up_to(state: &mut DeviceSyncState, ack_seq: u64) -> Ack {
@@ -87,6 +133,15 @@ mod tests {
         let ack = SyncEngine::ack_up_to(&mut state, 10);
         assert_eq!(ack.ack_seq, 10);
         assert_eq!(state.checkpoint.last_acked_seq, 10);
+    }
+
+    #[test]
+    fn next_fetch_uses_head_and_retry_state() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        SyncEngine::register_head(&mut state, 5);
+        let decision = SyncEngine::next_fetch(&state).expect("should fetch");
+        assert_eq!(decision.from_seq, 1);
+        assert_eq!(decision.to_seq, 5);
     }
 
     fn sample_record(message_id: &str, seq: u64) -> InboxRecord {
