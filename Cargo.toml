@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/tapchat_phase10_adapter"]
+resolver = "2"
+
 [package]
 name = "TapChat"
 version = "0.1.0"

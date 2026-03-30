@@ -166,7 +166,7 @@ impl MlsAdapter {
             PublishedKeyPackage {
                 key_package_ref: key_package_b64.clone(),
                 key_package_b64,
-                expires_at: 86_400,
+                expires_at: 4_102_444_800_000,
                 credential_identity,
             },
         ))
@@ -974,3 +974,4 @@ fn copy_signer(signer: &SignatureKeyPair) -> CoreResult<SignatureKeyPair> {
     serde_json::from_slice(&serialized)
         .map_err(|error| CoreError::invalid_state(format!("failed to decode MLS signer: {error}")))
 }
+

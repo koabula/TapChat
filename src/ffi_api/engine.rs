@@ -38,6 +38,25 @@ impl CoreEngine {
         Self::default()
     }
 
+    pub fn local_bundle(&self) -> Option<&IdentityBundle> {
+        self.state.local_bundle.as_ref()
+    }
+
+    pub fn conversation_state(&self, conversation_id: &str) -> Option<&LocalConversationState> {
+        self.state.conversations.get(conversation_id)
+    }
+
+    pub fn sync_state(&self, device_id: &str) -> Option<&crate::sync_engine::DeviceSyncState> {
+        self.state.sync_states.get(device_id)
+    }
+
+    pub fn local_device_id(&self) -> Option<&str> {
+        self.state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.device_identity.device_id.as_str())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn from_restored_state(snapshot: CorePersistenceSnapshot) -> Self {
         let restored_mls = MlsAdapter::restore_from_persisted_states(
@@ -230,6 +249,8 @@ impl CoreEngine {
                     .deployment
                     .and_then(|deployment| deployment.published_key_package),
                 pending_requests: BTreeMap::new(),
+                request_nonce: 0,
+                message_nonce: 0,
                 recovery_contexts,
             },
         };
@@ -337,8 +358,8 @@ impl CoreEngine {
             CoreEvent::BlobUploaded { task_id } => {
                 self.handle_blob_uploaded(task_id)
             }
-            CoreEvent::BlobDownloaded { task_id, destination, blob_ciphertext: _ } => {
-                self.handle_blob_downloaded(task_id, destination)
+            CoreEvent::BlobDownloaded { task_id, destination, blob_ciphertext } => {
+                self.handle_blob_downloaded(task_id, destination, blob_ciphertext)
             }
             CoreEvent::BlobTransferFailed { task_id, retryable, detail } => {
                 self.handle_blob_transfer_failed(task_id, retryable, detail)
@@ -647,7 +668,8 @@ impl CoreEngine {
         attachment_descriptor: AttachmentDescriptor,
     ) -> CoreResult<CoreOutput> {
         self.ensure_conversation_ready_for_send(&conversation_id)?;
-        let message_id = self.next_message_id(&conversation_id, "attachment");
+        let message_nonce = self.next_message_nonce();
+        let message_id = self.next_message_id(&conversation_id, "attachment", message_nonce);
         let metadata_json = serde_json::to_string(&attachment_descriptor).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode attachment descriptor: {error}"))
         })?;
@@ -869,13 +891,17 @@ impl CoreEngine {
             .deployment_bundle
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        let inbox_websocket_endpoint = deployment.inbox_websocket_endpoint.clone();
+        let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
+        let headers = self.device_runtime_headers()?;
         let sync_state = self
             .state
             .sync_states
             .entry(device_id.clone())
             .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+        let last_acked_seq = sync_state.checkpoint.last_acked_seq;
         self.state.realtime_sessions.entry(device_id.clone()).or_default();
-        let request_id = format!("get_head:{device_id}:{}", self.state.pending_requests.len() + 1);
+        let request_id = self.next_request_id(&format!("get_head:{device_id}"));
         self.state.pending_requests.insert(
             request_id.clone(),
             PendingRequest::GetHead {
@@ -893,9 +919,9 @@ impl CoreEngine {
                     connection: RealtimeConnectionEffect {
                         subscription: RealtimeSubscriptionRequest {
                             device_id: device_id.clone(),
-                            endpoint: deployment.inbox_websocket_endpoint.clone(),
-                            last_acked_seq: sync_state.checkpoint.last_acked_seq,
-                            headers: self.device_runtime_headers()?,
+                            endpoint: inbox_websocket_endpoint,
+                            last_acked_seq,
+                            headers: headers.clone(),
                         },
                     },
                 },
@@ -905,10 +931,10 @@ impl CoreEngine {
                         method: HttpMethod::Get,
                         url: format!(
                             "{}/v1/inbox/{}/head",
-                            deployment.inbox_http_endpoint.trim_end_matches('/'),
+                            inbox_http_endpoint.trim_end_matches('/'),
                             device_id
                         ),
-                        headers: self.device_runtime_headers()?,
+                        headers: headers.clone(),
                         body: None,
                     },
                 },
@@ -925,6 +951,14 @@ impl CoreEngine {
         })
     }
 
+    fn next_request_id(&mut self, prefix: &str) -> String {
+        self.state.request_nonce = self.state.request_nonce.saturating_add(1);
+        format!("{prefix}:{}", self.state.request_nonce)
+    }
+    fn next_message_nonce(&mut self) -> u64 {
+        self.state.message_nonce = self.state.message_nonce.saturating_add(1);
+        self.state.message_nonce
+    }
     fn device_runtime_headers(&self) -> CoreResult<BTreeMap<String, String>> {
         let deployment = self
             .state
@@ -1355,7 +1389,7 @@ impl CoreEngine {
     }
 
     fn build_envelope(
-        &self,
+        &mut self,
         conversation_id: &str,
         recipient_device_id: &str,
         message_type: MessageType,
@@ -1366,14 +1400,18 @@ impl CoreEngine {
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let sender_user_id = identity.user_identity.user_id.clone();
+        let sender_device_id = identity.device_identity.device_id.clone();
+        let sender_proof = identity.sign_sender_proof(payload_b64.as_bytes());
+        let message_nonce = self.next_message_nonce();
         Ok(Envelope {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-            message_id: self.next_message_id(conversation_id, recipient_device_id),
+            message_id: self.next_message_id(conversation_id, recipient_device_id, message_nonce),
             conversation_id: conversation_id.to_string(),
-            sender_user_id: identity.user_identity.user_id.clone(),
-            sender_device_id: identity.device_identity.device_id.clone(),
+            sender_user_id,
+            sender_device_id,
             recipient_device_id: recipient_device_id.to_string(),
-            created_at: (self.state.outbox.len() + self.state.pending_outbox.len() + 1) as u64,
+            created_at: message_nonce,
             message_type,
             inline_ciphertext: Some(payload_b64.clone()),
             storage_refs: vec![],
@@ -1381,7 +1419,7 @@ impl CoreEngine {
             wake_hint: None,
             sender_proof: SenderProof {
                 proof_type: "device_signature".into(),
-                value: identity.sign_sender_proof(payload_b64.as_bytes()),
+                value: sender_proof,
             },
         })
     }
@@ -1404,7 +1442,7 @@ impl CoreEngine {
     }
 
     fn build_control_membership_changed_messages(
-        &self,
+        &mut self,
         conversation_id: &str,
         peer_user_id: &str,
         peer_active_device_ids: &[String],
@@ -1429,7 +1467,7 @@ impl CoreEngine {
     }
 
     fn commit_envelopes_for_artifacts(
-        &self,
+        &mut self,
         conversation_id: &str,
         peer_active_device_ids: &[String],
         artifacts: &CreateConversationArtifacts,
@@ -1448,7 +1486,7 @@ impl CoreEngine {
     }
 
     fn welcome_envelopes_for_artifacts(
-        &self,
+        &mut self,
         conversation_id: &str,
         artifacts: &CreateConversationArtifacts,
     ) -> CoreResult<Vec<Envelope>> {
@@ -1467,7 +1505,7 @@ impl CoreEngine {
     }
 
     fn commit_envelopes_for_remove(
-        &self,
+        &mut self,
         conversation_id: &str,
         peer_active_device_ids: &[String],
         artifacts: &RemoveMembersArtifacts,
@@ -1485,13 +1523,8 @@ impl CoreEngine {
             .collect()
     }
 
-    fn next_message_id(&self, conversation_id: &str, suffix: &str) -> String {
-        format!(
-            "msg:{}:{}:{}",
-            conversation_id,
-            self.state.outbox.len() + self.state.pending_outbox.len() + 1,
-            suffix
-        )
+    fn next_message_id(&self, conversation_id: &str, suffix: &str, message_nonce: u64) -> String {
+        format!("msg:{conversation_id}:{message_nonce}:{suffix}")
     }
 
     fn merge_with_transport_flush(&mut self, output: CoreOutput) -> CoreResult<CoreOutput> {
@@ -1557,6 +1590,7 @@ impl CoreEngine {
     }
 
     fn flush_blob_uploads(&mut self) -> CoreResult<CoreOutput> {
+        let headers = self.device_runtime_headers()?;
         let keys: Vec<String> = self.state.pending_blob_uploads.keys().cloned().collect();
         let mut effects = Vec::new();
         for task_id in keys {
@@ -1585,7 +1619,7 @@ impl CoreEngine {
                         mime_type: task.descriptor.mime_type.clone(),
                         size_bytes: task.descriptor.size_bytes,
                         file_name: task.descriptor.file_name.clone(),
-                        headers: self.device_runtime_headers()?,
+                        headers: headers.clone(),
                     },
                 });
             }
@@ -1637,17 +1671,17 @@ impl CoreEngine {
     }
 
     fn build_append_request(&mut self, item: &PendingOutboxItem) -> CoreResult<HttpRequestEffect> {
-        let bundle = self
+        let device_profile = self
             .state
             .contacts
             .get(&item.peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer identity bundle has not been imported"))?;
-        let device_profile = bundle
+            .ok_or_else(|| CoreError::invalid_input("peer identity bundle has not been imported"))?
             .devices
             .iter()
             .find(|device| device.device_id == item.envelope.recipient_device_id)
-            .ok_or_else(|| CoreError::invalid_input("recipient device profile is missing"))?;
-        let request_id = format!("append:{}:{}", item.envelope.message_id, self.state.pending_requests.len() + 1);
+            .ok_or_else(|| CoreError::invalid_input("recipient device profile is missing"))?
+            .clone();
+        let request_id = self.next_request_id(&format!("append:{}", item.envelope.message_id));
         self.state.pending_requests.insert(
             request_id.clone(),
             PendingRequest::AppendEnvelope {
@@ -1689,7 +1723,8 @@ impl CoreEngine {
             .deployment_bundle
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
-        let request_id = format!("ack:{}:{}", ack.device_id, self.state.pending_requests.len() + 1);
+        let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
+        let request_id = self.next_request_id(&format!("ack:{}", ack.device_id));
         self.state.pending_requests.insert(
             request_id.clone(),
             PendingRequest::Ack {
@@ -1705,7 +1740,7 @@ impl CoreEngine {
             method: HttpMethod::Post,
             url: format!(
                 "{}/v1/inbox/{}/ack",
-                deployment.inbox_http_endpoint.trim_end_matches('/'),
+                inbox_http_endpoint.trim_end_matches('/'),
                 ack.device_id
             ),
             headers,
@@ -1721,8 +1756,10 @@ impl CoreEngine {
             .deployment_bundle
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
+        let headers = self.device_runtime_headers()?;
         let limit = decision.to_seq.saturating_sub(decision.from_seq).saturating_add(1).max(1);
-        let request_id = format!("fetch:{device_id}:{}", self.state.pending_requests.len() + 1);
+        let request_id = self.next_request_id(&format!("fetch:{device_id}"));
         self.state.pending_requests.insert(
             request_id.clone(),
             PendingRequest::FetchMessages {
@@ -1748,12 +1785,12 @@ impl CoreEngine {
                     method: HttpMethod::Get,
                     url: format!(
                         "{}/v1/inbox/{}/messages?fromSeq={}&limit={}",
-                        deployment.inbox_http_endpoint.trim_end_matches('/'),
+                        inbox_http_endpoint.trim_end_matches('/'),
                         fetch.device_id,
                         fetch.from_seq,
                         fetch.limit
                     ),
-                    headers: self.device_runtime_headers()?,
+                    headers: headers.clone(),
                     body: None,
                 },
             }],
@@ -2006,8 +2043,21 @@ impl CoreEngine {
         &mut self,
         task_id: String,
         _destination: String,
+        blob_ciphertext: Option<String>,
     ) -> CoreResult<CoreOutput> {
-        self.state.pending_blob_downloads.remove(&task_id);
+        if let Some(task) = self.state.pending_blob_downloads.remove(&task_id) {
+            if let Some(blob_ciphertext) = blob_ciphertext {
+                if let Some(state) = self.state.conversations.get_mut(&task.conversation_id) {
+                    if let Some(message) = state
+                        .messages
+                        .iter_mut()
+                        .find(|message| message.message_id == task.message_id)
+                    {
+                        message.downloaded_blob_b64 = Some(blob_ciphertext);
+                    }
+                }
+            }
+        }
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -2167,8 +2217,38 @@ impl CoreEngine {
                                 record.envelope.message_type,
                                 record.envelope.inline_ciphertext.as_deref().unwrap_or_default(),
                             )? {
-                            IngestResult::AppliedApplication(_) | IngestResult::AppliedCommit { .. }
-                            | IngestResult::AppliedWelcome { .. } => {
+                            IngestResult::AppliedApplication(application) => {
+                                if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+                                    if let Some(message) = state
+                                        .messages
+                                        .iter_mut()
+                                        .find(|message| message.message_id == record.message_id)
+                                    {
+                                        message.plaintext = String::from_utf8(application.plaintext).ok();
+                                    }
+                                }
+                                if let Ok(summary) = self
+                                    .state
+                                    .mls_adapter
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        CoreError::invalid_state("mls adapter is not initialized")
+                                    })?
+                                    .export_group_summary(&conversation_id)
+                                {
+                                    self.state
+                                        .mls_summaries
+                                        .insert(conversation_id.clone(), summary);
+                                }
+                                self.state.recovery_contexts.remove(&conversation_id);
+                                if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+                                    if state.conversation.state != ConversationState::NeedsRebuild {
+                                        state.recovery_status = RecoveryStatus::Healthy;
+                                    }
+                                }
+                                ackable = true;
+                            }
+                            IngestResult::AppliedCommit { .. } | IngestResult::AppliedWelcome { .. } => {
                                 if let Ok(summary) = self
                                     .state
                                     .mls_adapter
@@ -2746,3 +2826,10 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
     }
     base
 }
+
+
+
+
+
+
+

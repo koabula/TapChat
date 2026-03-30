@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
     Conversation, ConversationKind, ConversationMember, ConversationState, DeviceStatusKind,
-    Envelope, MessageType,
+    Envelope, MessageType, StorageRef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,9 @@ pub struct StoredMessage {
     pub recipient_device_id: String,
     pub message_type: MessageType,
     pub created_at: u64,
+    pub plaintext: Option<String>,
+    pub storage_refs: Vec<StorageRef>,
+    pub downloaded_blob_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +227,9 @@ impl ConversationManager {
             recipient_device_id: envelope.recipient_device_id.clone(),
             message_type: envelope.message_type,
             created_at: envelope.created_at,
+            plaintext: None,
+            storage_refs: envelope.storage_refs.clone(),
+            downloaded_blob_b64: None,
         });
         state.last_message_type = Some(envelope.message_type);
         state.conversation.updated_at = envelope.created_at;

@@ -279,6 +279,8 @@ pub(crate) struct CoreState {
     pub(crate) mls_summaries: BTreeMap<String, MlsStateSummary>,
     pub(crate) published_key_package: Option<PublishedKeyPackage>,
     pub(crate) pending_requests: BTreeMap<String, PendingRequest>,
+    pub(crate) request_nonce: u64,
+    pub(crate) message_nonce: u64,
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
 }
 
@@ -326,7 +328,12 @@ impl Default for CoreState {
             mls_summaries: BTreeMap::new(),
             published_key_package: None,
             pending_requests: BTreeMap::new(),
+            request_nonce: 0,
+            message_nonce: 0,
             recovery_contexts: BTreeMap::new(),
         }
     }
 }
+
+
+

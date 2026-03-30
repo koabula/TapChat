@@ -6,7 +6,8 @@
   "scripts": {
     "check": "tsc --noEmit",
     "test": "tsx --test test/cloudflare.test.ts",
-    "test:integration": "tsx --test test/*.integration.test.ts"
+    "test:integration": "tsx --test test/*.integration.test.ts",
+    "phase10:runtime": "node scripts/phase10-runtime.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
