@@ -7,7 +7,8 @@ use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
 use crate::identity::IdentityManager;
 use crate::mls_adapter::{
-    CreateConversationArtifacts, IngestResult, PeerDeviceKeyPackage, RemoveMembersArtifacts,
+    CreateConversationArtifacts, IngestResult, MlsAdapter, PeerDeviceKeyPackage,
+    RemoveMembersArtifacts,
 };
 use crate::model::{
     Ack, ConversationKind, ConversationState, DeliveryClass, Envelope, IdentityBundle,
@@ -33,6 +34,20 @@ impl CoreEngine {
 
     #[allow(dead_code)]
     pub(crate) fn from_restored_state(snapshot: CorePersistenceSnapshot) -> Self {
+        let restored_mls = MlsAdapter::restore_from_persisted_states(
+            &snapshot
+                .mls_states
+                .iter()
+                .map(|state| {
+                    (
+                        state.conversation_id.clone(),
+                        state.summary.clone(),
+                        state.serialized_group_state.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
         let mut contacts = BTreeMap::new();
         for contact in snapshot.contacts {
             contacts.insert(contact.user_id, contact.bundle);
@@ -48,10 +63,7 @@ impl CoreEngine {
             sync_states.insert(sync_state.device_id, sync_state.state);
         }
 
-        let mut mls_summaries = BTreeMap::new();
-        for mls_state in snapshot.mls_states {
-            mls_summaries.insert(mls_state.conversation_id, mls_state.summary);
-        }
+        let mls_summaries = restored_mls.summaries;
 
         let pending_outbox: Vec<PendingOutboxItem> = snapshot
             .pending_outbox
@@ -183,9 +195,10 @@ impl CoreEngine {
             })
             .collect();
 
-        Self {
+        let local_identity = snapshot.local_identity.map(|identity| identity.state);
+        let mut engine = Self {
             state: CoreState {
-                local_identity: snapshot.local_identity.map(|identity| identity.state),
+                local_identity,
                 local_bundle: snapshot
                     .deployment
                     .as_ref()
@@ -203,7 +216,7 @@ impl CoreEngine {
                 pending_blob_uploads,
                 pending_blob_downloads,
                 realtime_sessions,
-                mls_adapter: None,
+                mls_adapter: restored_mls.adapter,
                 mls_summaries,
                 published_key_package: snapshot
                     .deployment
@@ -211,7 +224,32 @@ impl CoreEngine {
                 pending_requests: BTreeMap::new(),
                 recovery_contexts,
             },
+        };
+
+        if engine.state.mls_adapter.is_none() {
+            if let Some(identity) = engine.state.local_identity.as_ref() {
+                if let Ok((adapter, published_key_package)) = MlsAdapter::bootstrap(identity) {
+                    engine.state.mls_adapter = Some(adapter);
+                    if engine.state.published_key_package.is_none() {
+                        engine.state.published_key_package = Some(published_key_package);
+                    }
+                }
+            }
         }
+
+        for conversation_id in restored_mls.failed_conversation_ids {
+            if let Some(conversation) = engine.state.conversations.get_mut(&conversation_id) {
+                conversation.conversation.state = ConversationState::NeedsRebuild;
+                conversation.recovery_status = RecoveryStatus::NeedsRebuild;
+            }
+            if let Some(summary) = engine.state.mls_summaries.get_mut(&conversation_id) {
+                summary.status = MlsStateStatus::NeedsRebuild;
+                summary.updated_at = 0;
+            }
+            engine.state.recovery_contexts.remove(&conversation_id);
+        }
+
+        engine
     }
 
     pub fn handle_command(&mut self, command: CoreCommand) -> CoreResult<CoreOutput> {
@@ -2492,6 +2530,23 @@ fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
 }
 
 fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
+    let persisted_mls_states: Vec<PersistedMlsState> = state
+        .mls_summaries
+        .iter()
+        .map(|(conversation_id, summary)| PersistedMlsState {
+            conversation_id: conversation_id.clone(),
+            summary: summary.clone(),
+            serialized_group_state: state
+                .mls_adapter
+                .as_ref()
+                .and_then(|adapter| adapter.export_persisted_group_state(conversation_id).ok()),
+        })
+        .collect();
+    let mls_state_persistence_blocked = !persisted_mls_states.is_empty()
+        && persisted_mls_states
+            .iter()
+            .any(|state| state.serialized_group_state.is_none());
+
     CorePersistenceSnapshot {
         local_identity: state
             .local_identity
@@ -2526,15 +2581,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 state: sync_state.clone(),
             })
             .collect(),
-        mls_states: state
-            .mls_summaries
-            .iter()
-            .map(|(conversation_id, summary)| PersistedMlsState {
-                conversation_id: conversation_id.clone(),
-                summary: summary.clone(),
-                serialized_group_state: None,
-            })
-            .collect(),
+        mls_states: persisted_mls_states,
         pending_outbox: state
             .pending_outbox
             .iter()
@@ -2609,7 +2656,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 needs_reconnect: session.needs_reconnect,
             })
             .collect(),
-        mls_state_persistence_blocked: !state.mls_summaries.is_empty(),
+        mls_state_persistence_blocked,
     }
 }
 

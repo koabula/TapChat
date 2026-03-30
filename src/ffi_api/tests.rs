@@ -122,6 +122,20 @@ mod tests {
             })
             .expect("blob uploaded");
 
+        assert_eq!(
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .find(|item| !item.envelope.storage_refs.is_empty())
+                .expect("attachment outbox")
+                .envelope
+                .storage_refs
+                .first()
+                .expect("storage ref")
+                .object_ref,
+            "https://storage.example.com/blob"
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
@@ -331,6 +345,114 @@ mod tests {
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
         )));
+    }
+
+    #[test]
+    fn persisted_snapshot_contains_restorable_mls_state() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let snapshot = extract_snapshot(&output);
+
+        assert!(!snapshot.mls_state_persistence_blocked);
+        assert!(snapshot
+            .mls_states
+            .iter()
+            .all(|state| state.serialized_group_state.is_some()));
+    }
+
+    #[test]
+    fn restored_engine_replays_pending_ack_and_blob_uploads_on_app_started() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut engine, bob_bundle.user_id.clone());
+        let upload_output = engine
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id,
+                attachment_descriptor: AttachmentDescriptor {
+                    source: "file.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 4,
+                    file_name: Some("file.bin".into()),
+                },
+            })
+            .expect("attachment");
+        let mut snapshot = extract_snapshot(&upload_output);
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+        snapshot.pending_acks.push(crate::persistence::PersistedPendingAck {
+            device_id: device_id.clone(),
+            ack: crate::model::Ack {
+                device_id: device_id.clone(),
+                ack_seq: 7,
+                acked_message_ids: vec!["msg:ack".into()],
+                acked_at: 7,
+            },
+            retries: 0,
+        });
+
+        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let resumed = restored
+            .handle_event(CoreEvent::AppStarted)
+            .expect("app started");
+
+        assert!(resumed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::UploadBlob { .. }
+        )));
+        assert!(resumed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
+        )));
+    }
+
+    #[test]
+    fn corrupted_mls_snapshot_marks_only_affected_conversation_for_rebuild() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let mut snapshot = extract_snapshot(&output);
+        snapshot.mls_states[0].serialized_group_state = Some("{broken".into());
+
+        let restored = CoreEngine::from_restored_state(snapshot);
+
+        assert_eq!(
+            restored
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            crate::model::ConversationState::NeedsRebuild
+        );
+        assert_eq!(
+            restored
+                .state
+                .mls_summaries
+                .get(&conversation_id)
+                .expect("summary")
+                .status,
+            crate::model::MlsStateStatus::NeedsRebuild
+        );
     }
 
     #[test]

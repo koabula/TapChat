@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +136,14 @@ pub struct CorePersistenceSnapshot {
     pub realtime_sessions: Vec<PersistedRealtimeSession>,
     #[serde(default)]
     pub mls_state_persistence_blocked: bool,
+}
+
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SnapshotFileEnvelope {
+    format_version: u32,
+    snapshot: CorePersistenceSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -458,6 +468,69 @@ impl SystemStateRepository for InMemoryPersistence {
     }
 }
 
+pub fn save_snapshot(path: &Path, snapshot: &CorePersistenceSnapshot) -> crate::CoreResult<()> {
+    let payload = SnapshotFileEnvelope {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        snapshot: snapshot.clone(),
+    };
+    let serialized = serde_json::to_vec_pretty(&payload).map_err(|error| {
+        crate::CoreError::invalid_state(format!("failed to serialize persistence snapshot: {error}"))
+    })?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tapchat.snapshot.json");
+    let temp_path = path.with_file_name(format!("{file_name}.tmp"));
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            crate::CoreError::invalid_state(format!(
+                "failed to create persistence snapshot directory: {error}"
+            ))
+        })?;
+    }
+
+    fs::write(&temp_path, serialized).map_err(|error| {
+        crate::CoreError::invalid_state(format!("failed to write persistence snapshot: {error}"))
+    })?;
+
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| {
+            crate::CoreError::invalid_state(format!(
+                "failed to replace existing persistence snapshot: {error}"
+            ))
+        })?;
+    }
+
+    fs::rename(&temp_path, path).map_err(|error| {
+        crate::CoreError::invalid_state(format!("failed to finalize persistence snapshot: {error}"))
+    })?;
+    Ok(())
+}
+
+pub fn load_snapshot(path: &Path) -> crate::CoreResult<Option<CorePersistenceSnapshot>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path).map_err(|error| {
+        crate::CoreError::invalid_state(format!("failed to read persistence snapshot: {error}"))
+    })?;
+    let envelope: SnapshotFileEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::CoreError::invalid_input(format!("failed to decode persistence snapshot: {error}"))
+    })?;
+
+    if envelope.format_version != SNAPSHOT_FORMAT_VERSION {
+        return Err(crate::CoreError::unsupported(format!(
+            "unsupported persistence snapshot format version {}",
+            envelope.format_version
+        )));
+    }
+
+    Ok(Some(envelope.snapshot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,5 +703,68 @@ mod tests {
 
         assert_eq!(persisted.state.recovery_status, RecoveryStatus::NeedsRecovery);
         assert_eq!(persisted.state.messages.len(), 0);
+    }
+
+    #[test]
+    fn snapshot_file_round_trips() {
+        let path = unique_snapshot_path("roundtrip");
+        let snapshot = CorePersistenceSnapshot {
+            local_identity: None,
+            deployment: None,
+            contacts: vec![],
+            conversations: vec![],
+            sync_states: vec![],
+            mls_states: vec![],
+            pending_outbox: vec![],
+            pending_acks: vec![],
+            pending_blob_transfers: vec![],
+            recovery_contexts: vec![],
+            realtime_sessions: vec![],
+            mls_state_persistence_blocked: false,
+        };
+
+        save_snapshot(&path, &snapshot).expect("save snapshot");
+        let loaded = load_snapshot(&path).expect("load snapshot").expect("snapshot");
+        assert_eq!(loaded, snapshot);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_file_rejects_invalid_json() {
+        let path = unique_snapshot_path("invalid-json");
+        fs::write(&path, b"{not json").expect("write invalid json");
+
+        let error = load_snapshot(&path).expect_err("invalid json should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_file_rejects_unsupported_version() {
+        let path = unique_snapshot_path("bad-version");
+        fs::write(
+            &path,
+            serde_json::json!({
+                "format_version": SNAPSHOT_FORMAT_VERSION + 1,
+                "snapshot": CorePersistenceSnapshot::default(),
+            })
+            .to_string(),
+        )
+        .expect("write invalid version");
+
+        let error = load_snapshot(&path).expect_err("unsupported version should fail");
+        assert_eq!(error.code(), "unsupported");
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn unique_snapshot_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tapchat-{name}-{nanos}.json"))
     }
 }
