@@ -602,6 +602,39 @@ pub struct StorageBaseInfo {
     pub bucket_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRuntimeAuth {
+    pub scheme: String,
+    pub token: String,
+    pub expires_at: u64,
+    pub user_id: String,
+    pub device_id: String,
+    pub scopes: Vec<String>,
+}
+
+impl Validate for DeviceRuntimeAuth {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("scheme", &self.scheme)?;
+        validate_required("token", &self.token)?;
+        validate_required("user_id", &self.user_id)?;
+        validate_required("device_id", &self.device_id)?;
+        if self.scheme != "bearer" {
+            return Err(CoreError::invalid_input(
+                "device_runtime_auth scheme must be bearer",
+            ));
+        }
+        if self.scopes.is_empty() {
+            return Err(CoreError::invalid_input(
+                "device_runtime_auth scopes must not be empty",
+            ));
+        }
+        for scope in &self.scopes {
+            validate_required("device_runtime_auth.scopes", scope)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
@@ -630,6 +663,8 @@ pub struct DeploymentBundle {
     pub storage_base_info: StorageBaseInfo,
     pub runtime_config: RuntimeConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_runtime_auth: Option<DeviceRuntimeAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_device_id: Option<String>,
@@ -645,6 +680,9 @@ impl Validate for DeploymentBundle {
             &self.inbox_websocket_endpoint,
         )?;
         validate_runtime_config(&self.runtime_config)?;
+        if let Some(auth) = &self.device_runtime_auth {
+            auth.validate()?;
+        }
         if let Some(user_id) = &self.expected_user_id {
             validate_required("expected_user_id", user_id)?;
         }
@@ -880,6 +918,7 @@ mod tests {
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
             storage_base_info: StorageBaseInfo::default(),
             runtime_config: RuntimeConfig::default(),
+            device_runtime_auth: None,
             expected_user_id: Some(String::new()),
             expected_device_id: None,
         };
@@ -901,6 +940,7 @@ mod tests {
                 features: vec!["cloudflare_worker".into()],
                 ..RuntimeConfig::default()
             },
+            device_runtime_auth: None,
             expected_user_id: None,
             expected_device_id: None,
         };
@@ -935,6 +975,68 @@ mod tests {
         assert_eq!(decoded, config);
         assert!(!json.contains("cloudflare"));
         assert!(!json.contains("worker_route"));
+    }
+
+    #[test]
+    fn deployment_bundle_round_trips_with_device_runtime_auth() {
+        let bundle = DeploymentBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            region: "local".into(),
+            inbox_http_endpoint: "https://example.com".into(),
+            inbox_websocket_endpoint: "wss://example.com/ws".into(),
+            storage_base_info: StorageBaseInfo::default(),
+            runtime_config: RuntimeConfig::default(),
+            device_runtime_auth: Some(DeviceRuntimeAuth {
+                scheme: "bearer".into(),
+                token: "token-1".into(),
+                expires_at: 99,
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                scopes: vec![
+                    "inbox_read".into(),
+                    "inbox_ack".into(),
+                    "inbox_subscribe".into(),
+                    "storage_prepare_upload".into(),
+                    "shared_state_write".into(),
+                    "keypackage_write".into(),
+                ],
+            }),
+            expected_user_id: Some("user:alice".into()),
+            expected_device_id: Some("device:alice:phone".into()),
+        };
+
+        let json = serde_json::to_string(&bundle).expect("serialize deployment bundle");
+        let decoded: DeploymentBundle =
+            serde_json::from_str(&json).expect("deserialize deployment bundle");
+
+        assert_eq!(decoded, bundle);
+    }
+
+    #[test]
+    fn deployment_bundle_rejects_invalid_device_runtime_auth_scheme() {
+        let bundle = DeploymentBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            region: "local".into(),
+            inbox_http_endpoint: "https://example.com".into(),
+            inbox_websocket_endpoint: "wss://example.com/ws".into(),
+            storage_base_info: StorageBaseInfo::default(),
+            runtime_config: RuntimeConfig::default(),
+            device_runtime_auth: Some(DeviceRuntimeAuth {
+                scheme: "mac".into(),
+                token: "token-1".into(),
+                expires_at: 99,
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                scopes: vec!["inbox_read".into()],
+            }),
+            expected_user_id: None,
+            expected_device_id: None,
+        };
+
+        let error = bundle
+            .validate()
+            .expect_err("invalid auth scheme should fail");
+        assert_eq!(error.code(), "invalid_input");
     }
 
     fn sample_identity_bundle() -> IdentityBundle {

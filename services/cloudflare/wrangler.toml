@@ -1,0 +1,24 @@
+name = "tapchat-cloudflare"
+main = "src/index.ts"
+compatibility_date = "2026-03-30"
+
+[vars]
+PUBLIC_BASE_URL = "https://example.com"
+DEPLOYMENT_REGION = "local"
+MAX_INLINE_BYTES = "4096"
+RETENTION_DAYS = "30"
+SHARING_TOKEN_SECRET = "replace-me"
+BOOTSTRAP_TOKEN_SECRET = "replace-me-bootstrap"
+
+[[durable_objects.bindings]]
+name = "INBOX"
+class_name = "InboxDurableObject"
+
+[[r2_buckets]]
+binding = "TAPCHAT_STORAGE"
+bucket_name = "tapchat-storage"
+preview_bucket_name = "tapchat-storage-preview"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["InboxDurableObject"]

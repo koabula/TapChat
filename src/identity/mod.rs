@@ -430,8 +430,8 @@ mod tests {
     use bip39::Language;
     use crate::model::{
         CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
-        DeviceContactProfile, DeviceStatusKind, IdentityBundle, InboxAppendCapability,
-        KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
+        DeviceContactProfile, DeviceRuntimeAuth, DeviceStatusKind, IdentityBundle,
+        InboxAppendCapability, KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
     };
 
     const ALICE_MNEMONIC: &str =
@@ -667,6 +667,14 @@ mod tests {
                 max_inline_bytes: Some(4096),
                 features: vec!["generic_sync".into()],
             },
+            device_runtime_auth: Some(DeviceRuntimeAuth {
+                scheme: "bearer".into(),
+                token: "device-runtime-token".into(),
+                expires_at: 999,
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                scopes: vec!["inbox_read".into(), "shared_state_write".into()],
+            }),
             expected_user_id: None,
             expected_device_id: None,
         }

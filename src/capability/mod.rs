@@ -156,7 +156,7 @@ fn capability_payload(capability: &InboxAppendCapability) -> String {
 mod tests {
     use super::{CapabilityManager, CapabilityModule};
     use crate::identity::IdentityManager;
-    use crate::model::DeploymentBundle;
+    use crate::model::{DeploymentBundle, DeviceRuntimeAuth};
 
     const ALICE_MNEMONIC: &str =
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -197,8 +197,18 @@ mod tests {
                 max_inline_bytes: Some(4096),
                 features: vec!["generic_sync".into()],
             },
+            device_runtime_auth: Some(DeviceRuntimeAuth {
+                scheme: "bearer".into(),
+                token: "device-runtime-token".into(),
+                expires_at: 999,
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                scopes: vec!["inbox_read".into()],
+            }),
             expected_user_id: None,
             expected_device_id: None,
         }
     }
 }
+
+

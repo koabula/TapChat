@@ -8,8 +8,9 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        ConversationKind, DeliveryClass, DeploymentBundle, Envelope, IdentityBundle, InboxRecord,
-        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
+        ConversationKind, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth, Envelope,
+        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
+        WakeHint,
         CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{CorePersistenceSnapshot, PersistOp};
@@ -37,7 +38,9 @@ mod tests {
             .expect("send");
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
+            CoreEffect::ExecuteHttpRequest { request }
+                if request.url.contains("/messages")
+                    && request.headers.contains_key("X-Tapchat-Capability")
         )));
     }
 
@@ -86,7 +89,8 @@ mod tests {
             .expect("attachment");
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { .. }
+            CoreEffect::PrepareBlobUpload { upload }
+            if upload.headers.get("Authorization") == Some(&"Bearer device-runtime-token".into())
         )));
     }
 
@@ -233,6 +237,7 @@ mod tests {
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
+                && request.headers.get("Authorization") == Some(&"Bearer device-runtime-token".into())
         )));
     }
 
@@ -344,6 +349,76 @@ mod tests {
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ScheduleTimer { timer } if timer.timer_id == format!("sync:{device_id}")
+        )));
+    }
+
+    #[test]
+    fn sync_requests_include_device_runtime_auth_header() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+            })
+            .expect("identity");
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+
+        let output = engine
+            .handle_command(CoreCommand::SyncInbox {
+                device_id,
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::OpenRealtimeConnection { connection }
+                if connection.subscription.headers.get("Authorization")
+                    == Some(&"Bearer device-runtime-token".into())
+        )));
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request }
+                if request.url.contains("/head")
+                    && request.headers.get("Authorization")
+                        == Some(&"Bearer device-runtime-token".into())
+        )));
+    }
+
+    #[test]
+    fn prepare_blob_upload_effect_includes_device_runtime_auth_header() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id,
+                attachment_descriptor: AttachmentDescriptor {
+                    source: "file.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 4,
+                    file_name: Some("file.bin".into()),
+                },
+            })
+            .expect("attachment");
+
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::PrepareBlobUpload { upload }
+                if upload.headers.get("Authorization")
+                    == Some(&"Bearer device-runtime-token".into())
         )));
     }
 
@@ -983,6 +1058,19 @@ mod tests {
                 max_inline_bytes: Some(4096),
                 features: vec!["generic_sync".into()],
             },
+            device_runtime_auth: Some(DeviceRuntimeAuth {
+                scheme: "bearer".into(),
+                token: "device-runtime-token".into(),
+                expires_at: 999,
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                scopes: vec![
+                    "inbox_read".into(),
+                    "inbox_ack".into(),
+                    "inbox_subscribe".into(),
+                    "storage_prepare_upload".into(),
+                ],
+            }),
             expected_user_id: None,
             expected_device_id: None,
         }

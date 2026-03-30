@@ -1,0 +1,19 @@
+{
+  "name": "tapchat-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/cloudflare.test.ts",
+    "test:integration": "tsx --test test/*.integration.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "esbuild": "^0.27.4",
+    "miniflare": "^4.20260317.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.78.0"
+  }
+}

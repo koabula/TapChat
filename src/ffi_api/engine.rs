@@ -895,7 +895,7 @@ impl CoreEngine {
                             device_id: device_id.clone(),
                             endpoint: deployment.inbox_websocket_endpoint.clone(),
                             last_acked_seq: sync_state.checkpoint.last_acked_seq,
-                            headers: BTreeMap::new(),
+                            headers: self.device_runtime_headers()?,
                         },
                     },
                 },
@@ -908,7 +908,7 @@ impl CoreEngine {
                             deployment.inbox_http_endpoint.trim_end_matches('/'),
                             device_id
                         ),
-                        headers: BTreeMap::new(),
+                        headers: self.device_runtime_headers()?,
                         body: None,
                     },
                 },
@@ -923,6 +923,25 @@ impl CoreEngine {
             ],
             view_model: None,
         })
+    }
+
+    fn device_runtime_headers(&self) -> CoreResult<BTreeMap<String, String>> {
+        let deployment = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        let auth = deployment.device_runtime_auth.as_ref().ok_or_else(|| {
+            CoreError::invalid_state("device runtime auth is not initialized")
+        })?;
+        if auth.scheme != "bearer" {
+            return Err(CoreError::invalid_state(
+                "unsupported device runtime auth scheme",
+            ));
+        }
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), format!("Bearer {}", auth.token));
+        Ok(headers)
     }
 
     fn refresh_identity_state(&mut self, user_id: String) -> CoreResult<CoreOutput> {
@@ -1566,6 +1585,7 @@ impl CoreEngine {
                         mime_type: task.descriptor.mime_type.clone(),
                         size_bytes: task.descriptor.size_bytes,
                         file_name: task.descriptor.file_name.clone(),
+                        headers: self.device_runtime_headers()?,
                     },
                 });
             }
@@ -1645,6 +1665,12 @@ impl CoreEngine {
             "Authorization".into(),
             format!("Bearer {}", device_profile.inbox_append_capability.signature),
         );
+        headers.insert(
+            "X-Tapchat-Capability".into(),
+            serde_json::to_string(&device_profile.inbox_append_capability).map_err(|error| {
+                CoreError::invalid_input(format!("failed to encode append capability: {error}"))
+            })?,
+        );
         headers.insert("Content-Type".into(), "application/json".into());
         Ok(HttpRequestEffect {
             request_id,
@@ -1671,7 +1697,7 @@ impl CoreEngine {
                 ack_seq: ack.ack_seq,
             },
         );
-        let mut headers = BTreeMap::new();
+        let mut headers = self.device_runtime_headers()?;
         headers.insert("Content-Type".into(), "application/json".into());
         let request = AckRequest { ack: ack.clone() };
         Ok(HttpRequestEffect {
@@ -1727,7 +1753,7 @@ impl CoreEngine {
                         fetch.from_seq,
                         fetch.limit
                     ),
-                    headers: BTreeMap::new(),
+                    headers: self.device_runtime_headers()?,
                     body: None,
                 },
             }],
