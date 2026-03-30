@@ -86,12 +86,12 @@ mod tests {
             .expect("attachment");
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::UploadBlob { .. }
+            CoreEffect::PrepareBlobUpload { .. }
         )));
     }
 
     #[test]
-    fn blob_uploaded_emits_append_request() {
+    fn prepared_blob_upload_and_completion_emit_append_request() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -107,19 +107,31 @@ mod tests {
             })
             .expect("attachment");
         let task_id = match upload.effects.iter().find_map(|effect| match effect {
-            CoreEffect::UploadBlob { transfer } => Some(transfer.task_id.clone()),
+            CoreEffect::PrepareBlobUpload { upload } => Some(upload.task_id.clone()),
             _ => None,
         }) {
             Some(task_id) => task_id,
             None => panic!("expected upload task"),
         };
+        let upload_ready = alice
+            .handle_event(CoreEvent::BlobUploadPrepared {
+                task_id: task_id.clone(),
+                result: crate::transport_contract::PrepareBlobUploadResult {
+                    blob_ref: "blob:attachment-1".into(),
+                    upload_target: "upload:attachment-1".into(),
+                    upload_headers: std::collections::BTreeMap::new(),
+                    download_target: Some("blob-download:attachment-1".into()),
+                    expires_at: Some(99),
+                },
+            })
+            .expect("blob prepared");
+        assert!(upload_ready.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::UploadBlob { upload } if upload.upload_target == "upload:attachment-1"
+        )));
 
         let output = alice
-            .handle_event(CoreEvent::BlobUploaded {
-                task_id,
-                reference: "cid:blob".into(),
-                sharing_url: Some("https://storage.example.com/blob".into()),
-            })
+            .handle_event(CoreEvent::BlobUploaded { task_id })
             .expect("blob uploaded");
 
         assert_eq!(
@@ -134,7 +146,7 @@ mod tests {
                 .first()
                 .expect("storage ref")
                 .object_ref,
-            "https://storage.example.com/blob"
+            "blob-download:attachment-1"
         );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
@@ -235,14 +247,20 @@ mod tests {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("refresh");
-        let request_id = find_http_request_id(&output, "/identity_bundle.json");
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchIdentityBundle { fetch } if fetch.user_id == bob_bundle.user_id
+        )));
 
         let updated_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
         let response = alice
-            .handle_event(CoreEvent::HttpResponseReceived {
-                request_id,
-                status: 200,
-                body: Some(updated_bundle_json_for_user(&bob_bundle.user_id, updated_bundle)),
+            .handle_event(CoreEvent::IdentityBundleFetched {
+                user_id: bob_bundle.user_id.clone(),
+                bundle: serde_json::from_str(&updated_bundle_json_for_user(
+                    &bob_bundle.user_id,
+                    updated_bundle,
+                ))
+                .expect("bundle"),
             })
             .expect("identity bundle response");
 
@@ -259,6 +277,37 @@ mod tests {
                 .expect("conversation")
                 .recovery_status,
             crate::conversation::RecoveryStatus::NeedsRecovery
+        );
+    }
+
+    #[test]
+    fn identity_refresh_requires_explicit_identity_bundle_reference() {
+        let bundle = sample_identity_bundle_without_identity_ref(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bundle.clone());
+
+        let error = alice
+            .handle_command(CoreCommand::RefreshIdentityState {
+                user_id: bundle.user_id.clone(),
+            })
+            .expect_err("missing identity reference should fail");
+        assert_eq!(error.code(), "invalid_state");
+    }
+
+    #[test]
+    fn contact_refresh_does_not_fallback_to_deployment_runtime_reference() {
+        let bundle = sample_identity_bundle_without_identity_ref(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bundle.clone());
+
+        let error = engine
+            .handle_command(CoreCommand::RefreshIdentityState {
+                user_id: bundle.user_id.clone(),
+            })
+            .expect_err("contact refresh should require contact-owned reference");
+
+        assert_eq!(error.code(), "invalid_state");
+        assert_eq!(
+            error.message(),
+            "contact identity bundle reference is missing"
         );
     }
 
@@ -368,6 +417,106 @@ mod tests {
     }
 
     #[test]
+    fn append_requires_explicit_accepted_result() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+
+        let error = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":false,"seq":0}"#.into()),
+            })
+            .expect_err("append accepted=false should fail");
+        assert_eq!(error.code(), "temporary_failure");
+    }
+
+    #[test]
+    fn ack_requires_explicit_accepted_result() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+        let local_user_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let peer_user_id = engine.state.contacts.keys().next().expect("contact").clone();
+        let peer_device_id = engine
+            .state
+            .contacts
+            .values()
+            .next()
+            .expect("contact")
+            .devices[0]
+            .device_id
+            .clone();
+
+        let sync = engine
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let head_request_id = find_http_request_id(&sync, "/head");
+        let fetch = engine
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: head_request_id,
+                status: 200,
+                body: Some("{\"head_seq\":1}".into()),
+            })
+            .expect("head response");
+        let fetch_request_id = find_http_request_id(&fetch, "/messages?fromSeq=1");
+        let fetched = engine
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: fetch_request_id,
+                status: 200,
+                body: Some(
+                    serde_json::json!({
+                        "to_seq": 1,
+                        "records": [sample_control_record(
+                            &device_id,
+                            1,
+                            &local_user_id,
+                            &peer_user_id,
+                            &peer_device_id,
+                        )],
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("fetch response");
+        let ack_request_id = find_http_request_id(&fetched, "/ack");
+
+        let error = engine
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: ack_request_id,
+                status: 200,
+                body: Some(r#"{"accepted":false,"ack_seq":0}"#.into()),
+            })
+            .expect_err("ack accepted=false should fail");
+        assert_eq!(error.code(), "temporary_failure");
+    }
+
+    #[test]
     fn restored_engine_replays_pending_ack_and_blob_uploads_on_app_started() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -410,11 +559,54 @@ mod tests {
 
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::UploadBlob { .. }
+            CoreEffect::PrepareBlobUpload { .. }
         )));
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
+        )));
+    }
+
+    #[test]
+    fn prepared_blob_upload_survives_snapshot_restore() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut engine, bob_bundle.user_id.clone());
+        let upload_output = engine
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id,
+                attachment_descriptor: AttachmentDescriptor {
+                    source: "file.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 4,
+                    file_name: Some("file.bin".into()),
+                },
+            })
+            .expect("attachment");
+        let mut snapshot = extract_snapshot(&upload_output);
+        if let Some(crate::persistence::PersistedPendingBlobTransfer::Upload {
+            prepared_upload, ..
+        }) = snapshot.pending_blob_transfers.first_mut()
+        {
+            *prepared_upload = Some(crate::transport_contract::PrepareBlobUploadResult {
+                blob_ref: "blob:prepared".into(),
+                upload_target: "upload:prepared".into(),
+                upload_headers: std::collections::BTreeMap::new(),
+                download_target: Some("download:prepared".into()),
+                expires_at: Some(42),
+            });
+        } else {
+            panic!("missing persisted upload task");
+        }
+
+        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let resumed = restored
+            .handle_event(CoreEvent::AppStarted)
+            .expect("app started");
+
+        assert!(resumed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::UploadBlob { upload } if upload.upload_target == "upload:prepared"
         )));
     }
 
@@ -545,10 +737,13 @@ mod tests {
                     user_id: bob_bundle.user_id.clone(),
                 })
                 .expect("refresh");
-            let request_id = find_http_request_id(&refresh, "/identity_bundle.json");
+            assert!(refresh.effects.iter().any(|effect| matches!(
+                effect,
+                CoreEffect::FetchIdentityBundle { fetch } if fetch.user_id == bob_bundle.user_id
+            )));
             let output = alice
-                .handle_event(CoreEvent::HttpRequestFailed {
-                    request_id,
+                .handle_event(CoreEvent::IdentityBundleFetchFailed {
+                    user_id: bob_bundle.user_id.clone(),
                     retryable: true,
                     detail: Some("network".into()),
                 })
@@ -679,6 +874,25 @@ mod tests {
         .expect("bundle")
     }
 
+    fn sample_identity_bundle_without_identity_ref(
+        mnemonic: &str,
+        device_name: &str,
+    ) -> IdentityBundle {
+        let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
+            .expect("identity");
+        let package = MlsAdapter::generate_key_package(&identity, 0).expect("package");
+        let mut deployment = sample_deployment();
+        deployment.runtime_config.identity_bundle_ref = None;
+
+        IdentityManager::export_identity_bundle(
+            &identity,
+            &deployment,
+            package.key_package_b64,
+            package.expires_at,
+        )
+        .expect("bundle")
+    }
+
     fn updated_bundle_json_for_user(user_id: &str, mut bundle: IdentityBundle) -> String {
         bundle.user_id = user_id.to_string();
         serde_json::to_string(&bundle).expect("bundle json")
@@ -757,7 +971,18 @@ mod tests {
                 base_url: Some("https://storage.example.com".into()),
                 bucket_hint: None,
             },
-            runtime_config: crate::model::RuntimeConfig::default(),
+            runtime_config: crate::model::RuntimeConfig {
+                supported_realtime_kinds: vec![crate::model::RealtimeKind::Websocket],
+                identity_bundle_ref: Some(
+                    "https://storage.example.com/state/user:alice/identity_bundle.json".into(),
+                ),
+                device_status_ref: Some(
+                    "https://storage.example.com/state/user:alice/device_status.json".into(),
+                ),
+                keypackage_ref_base: Some("https://storage.example.com/keypackages".into()),
+                max_inline_bytes: Some(4096),
+                features: vec!["generic_sync".into()],
+            },
             expected_user_id: None,
             expected_device_id: None,
         }

@@ -8,6 +8,7 @@ pub mod mls_adapter;
 pub mod model;
 pub mod persistence;
 pub mod sync_engine;
+pub mod transport_contract;
 
 pub use error::{CoreError, CoreResult};
 pub use ffi_api::{

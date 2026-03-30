@@ -10,6 +10,10 @@ use crate::model::{
 };
 use crate::persistence::{CorePersistenceSnapshot, PersistOp};
 use crate::sync_engine::DeviceSyncState;
+use crate::transport_contract::{
+    BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest, PrepareBlobUploadRequest,
+    PrepareBlobUploadResult, RealtimeSubscriptionRequest,
+};
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
 
@@ -55,7 +59,10 @@ pub enum CoreEvent {
     InboxRecordsFetched { device_id: String, records: Vec<InboxRecord>, to_seq: u64 },
     HttpResponseReceived { request_id: String, status: u16, body: Option<String> },
     HttpRequestFailed { request_id: String, retryable: bool, detail: Option<String> },
-    BlobUploaded { task_id: String, reference: String, sharing_url: Option<String> },
+    IdentityBundleFetched { user_id: String, bundle: IdentityBundle },
+    IdentityBundleFetchFailed { user_id: String, retryable: bool, detail: Option<String> },
+    BlobUploadPrepared { task_id: String, result: PrepareBlobUploadResult },
+    BlobUploaded { task_id: String },
     BlobDownloaded { task_id: String, destination: String, blob_ciphertext: Option<String> },
     BlobTransferFailed { task_id: String, retryable: bool, detail: Option<String> },
     TimerTriggered { timer_id: String },
@@ -99,19 +106,7 @@ pub struct HttpRequestEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealtimeConnectionEffect {
-    pub device_id: String,
-    pub url: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlobTransferEffect {
-    pub task_id: String,
-    pub source: String,
-    pub target: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub metadata: BTreeMap<String, String>,
+    pub subscription: RealtimeSubscriptionRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,8 +135,10 @@ pub enum CoreEffect {
     ExecuteHttpRequest { request: HttpRequestEffect },
     OpenRealtimeConnection { connection: RealtimeConnectionEffect },
     CloseRealtimeConnection { device_id: String },
-    UploadBlob { transfer: BlobTransferEffect },
-    DownloadBlob { transfer: BlobTransferEffect },
+    FetchIdentityBundle { fetch: FetchIdentityBundleRequest },
+    PrepareBlobUpload { upload: PrepareBlobUploadRequest },
+    UploadBlob { upload: BlobUploadRequest },
+    DownloadBlob { download: BlobDownloadRequest },
     PersistState { persist: PersistStateEffect },
     ScheduleTimer { timer: TimerEffect },
     EmitUserNotification { notification: UserNotificationEffect },
@@ -241,6 +238,7 @@ pub(crate) struct PendingBlobUpload {
     pub(crate) descriptor: AttachmentDescriptor,
     pub(crate) message_id: String,
     pub(crate) metadata_ciphertext: String,
+    pub(crate) prepared_upload: Option<PrepareBlobUploadResult>,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
 }
@@ -288,7 +286,6 @@ pub(crate) struct CoreState {
 pub(crate) enum PendingRequest {
     GetHead { device_id: String },
     FetchMessages { device_id: String, from_seq: u64, limit: u64 },
-    GetIdentityBundle { user_id: String },
     AppendEnvelope { message_id: String, peer_user_id: String },
     Ack { device_id: String, ack_seq: u64 },
 }

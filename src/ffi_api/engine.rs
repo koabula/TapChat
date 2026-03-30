@@ -21,6 +21,12 @@ use crate::persistence::{
     PersistedRecoveryContext, PersistedRecoveryReason, PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
+use crate::transport_contract::{
+    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, BlobDownloadRequest,
+    BlobUploadRequest,
+    FetchIdentityBundleRequest, FetchMessagesRequest, FetchMessagesResult, GetHeadResult,
+    PrepareBlobUploadRequest, PrepareBlobUploadResult, RealtimeSubscriptionRequest,
+};
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
@@ -108,6 +114,7 @@ impl CoreEngine {
                     size_bytes,
                     file_name,
                     metadata_ciphertext,
+                    prepared_upload,
                     retries,
                 } => {
                     pending_blob_uploads.insert(
@@ -123,6 +130,7 @@ impl CoreEngine {
                             },
                             message_id,
                             metadata_ciphertext,
+                            prepared_upload,
                             retries,
                             in_flight: false,
                         },
@@ -306,8 +314,28 @@ impl CoreEngine {
             CoreEvent::HttpRequestFailed { request_id, retryable, detail } => {
                 self.handle_http_failure(request_id, retryable, detail)
             }
-            CoreEvent::BlobUploaded { task_id, reference, sharing_url } => {
-                self.handle_blob_uploaded(task_id, reference, sharing_url)
+            CoreEvent::IdentityBundleFetched { user_id: _, bundle } => {
+                self.apply_identity_bundle_update(bundle)
+            }
+            CoreEvent::IdentityBundleFetchFailed {
+                user_id,
+                retryable,
+                detail,
+            } => self.handle_identity_refresh_failure(
+                &user_id,
+                detail.unwrap_or_else(|| {
+                    if retryable {
+                        format!("identity refresh request failed for {user_id}")
+                    } else {
+                        format!("identity refresh failed for {user_id}")
+                    }
+                }),
+            ),
+            CoreEvent::BlobUploadPrepared { task_id, result } => {
+                self.handle_blob_upload_prepared(task_id, result)
+            }
+            CoreEvent::BlobUploaded { task_id } => {
+                self.handle_blob_uploaded(task_id)
             }
             CoreEvent::BlobDownloaded { task_id, destination, blob_ciphertext: _ } => {
                 self.handle_blob_downloaded(task_id, destination)
@@ -639,6 +667,7 @@ impl CoreEngine {
                 descriptor: attachment_descriptor.clone(),
                 message_id: message_id.clone(),
                 metadata_ciphertext,
+                prepared_upload: None,
                 retries: 0,
                 in_flight: false,
             },
@@ -840,7 +869,7 @@ impl CoreEngine {
             .deployment_bundle
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
-        let _sync_state = self
+        let sync_state = self
             .state
             .sync_states
             .entry(device_id.clone())
@@ -862,9 +891,12 @@ impl CoreEngine {
             effects: vec![
                 CoreEffect::OpenRealtimeConnection {
                     connection: RealtimeConnectionEffect {
-                        device_id: device_id.clone(),
-                        url: deployment.inbox_websocket_endpoint.clone(),
-                        headers: BTreeMap::new(),
+                        subscription: RealtimeSubscriptionRequest {
+                            device_id: device_id.clone(),
+                            endpoint: deployment.inbox_websocket_endpoint.clone(),
+                            last_acked_seq: sync_state.checkpoint.last_acked_seq,
+                            headers: BTreeMap::new(),
+                        },
                     },
                 },
                 CoreEffect::ExecuteHttpRequest {
@@ -899,35 +931,22 @@ impl CoreEngine {
             .contacts
             .get(&user_id)
             .ok_or_else(|| CoreError::invalid_input("contact does not exist"))?;
-        let base_url = bundle
-            .storage_profile
-            .as_ref()
-            .and_then(|profile| profile.base_url.clone())
-            .or_else(|| {
-                self.state
-                    .deployment_bundle
-                    .as_ref()
-                    .and_then(|deployment| deployment.storage_base_info.base_url.clone())
-            })
-            .ok_or_else(|| CoreError::invalid_state("storage profile base_url is missing"))?;
-        let request_id = format!("identity_bundle:{user_id}:{}", self.state.pending_requests.len() + 1);
-        self.state.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::GetIdentityBundle { user_id: user_id.clone() },
-        );
+        let reference = bundle
+            .identity_bundle_ref
+            .clone()
+            .ok_or_else(|| {
+                CoreError::invalid_state("contact identity bundle reference is missing")
+            })?;
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
                 system_statuses_changed: vec![SystemStatus::IdentityRefreshNeeded],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id,
-                    method: HttpMethod::Get,
-                    url: format!("{}/identity_bundle.json", base_url.trim_end_matches('/')),
-                    headers: BTreeMap::new(),
-                    body: None,
+            effects: vec![CoreEffect::FetchIdentityBundle {
+                fetch: FetchIdentityBundleRequest {
+                    user_id,
+                    reference: Some(reference),
                 },
             }],
             view_model: None,
@@ -1528,19 +1547,28 @@ impl CoreEngine {
             if task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
                 continue;
             }
-            let mut metadata = BTreeMap::new();
-            metadata.insert("conversation_id".into(), task.conversation_id.clone());
-            metadata.insert("message_id".into(), task.message_id.clone());
-            metadata.insert("mime_type".into(), task.descriptor.mime_type.clone());
-            metadata.insert("size_bytes".into(), task.descriptor.size_bytes.to_string());
-            effects.push(CoreEffect::UploadBlob {
-                transfer: BlobTransferEffect {
-                    task_id: task.task_id.clone(),
-                    source: task.descriptor.source.clone(),
-                    target: task.conversation_id.clone(),
-                    metadata,
-                },
-            });
+            if let Some(prepared) = &task.prepared_upload {
+                effects.push(CoreEffect::UploadBlob {
+                    upload: BlobUploadRequest {
+                        task_id: task.task_id.clone(),
+                        source_path: task.descriptor.source.clone(),
+                        upload_target: prepared.upload_target.clone(),
+                        upload_headers: prepared.upload_headers.clone(),
+                        blob_ref: prepared.blob_ref.clone(),
+                    },
+                });
+            } else {
+                effects.push(CoreEffect::PrepareBlobUpload {
+                    upload: PrepareBlobUploadRequest {
+                        task_id: task.task_id.clone(),
+                        conversation_id: task.conversation_id.clone(),
+                        message_id: task.message_id.clone(),
+                        mime_type: task.descriptor.mime_type.clone(),
+                        size_bytes: task.descriptor.size_bytes,
+                        file_name: task.descriptor.file_name.clone(),
+                    },
+                });
+            }
             if let Some(entry) = self.state.pending_blob_uploads.get_mut(&task_id) {
                 entry.in_flight = true;
             }
@@ -1566,11 +1594,12 @@ impl CoreEngine {
                 continue;
             }
             effects.push(CoreEffect::DownloadBlob {
-                transfer: BlobTransferEffect {
+                download: BlobDownloadRequest {
                     task_id: task.task_id.clone(),
-                    source: task.reference.clone(),
-                    target: task.destination.clone(),
-                    metadata: BTreeMap::new(),
+                    blob_ref: task.reference.clone(),
+                    download_target: task.reference.clone(),
+                    destination_path: task.destination.clone(),
+                    download_headers: BTreeMap::new(),
                 },
             });
             if let Some(entry) = self.state.pending_blob_downloads.get_mut(&task_id) {
@@ -1606,11 +1635,11 @@ impl CoreEngine {
                 peer_user_id: item.peer_user_id.clone(),
             },
         );
-        let body = serde_json::json!({
-            "version": crate::model::CURRENT_MODEL_VERSION,
-            "recipient_device_id": item.envelope.recipient_device_id,
-            "envelope": item.envelope,
-        });
+        let body = AppendEnvelopeRequest {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            recipient_device_id: item.envelope.recipient_device_id.clone(),
+            envelope: item.envelope.clone(),
+        };
         let mut headers = BTreeMap::new();
         headers.insert(
             "Authorization".into(),
@@ -1622,7 +1651,9 @@ impl CoreEngine {
             method: HttpMethod::Post,
             url: device_profile.inbox_append_capability.endpoint.clone(),
             headers,
-            body: Some(body.to_string()),
+            body: Some(serde_json::to_string(&body).map_err(|error| {
+                CoreError::invalid_input(format!("failed to encode append request: {error}"))
+            })?),
         })
     }
 
@@ -1642,6 +1673,7 @@ impl CoreEngine {
         );
         let mut headers = BTreeMap::new();
         headers.insert("Content-Type".into(), "application/json".into());
+        let request = AckRequest { ack: ack.clone() };
         Ok(HttpRequestEffect {
             request_id,
             method: HttpMethod::Post,
@@ -1651,7 +1683,7 @@ impl CoreEngine {
                 ack.device_id
             ),
             headers,
-            body: Some(serde_json::to_string(ack).map_err(|error| {
+            body: Some(serde_json::to_string(&request).map_err(|error| {
                 CoreError::invalid_input(format!("failed to encode ack request: {error}"))
             })?),
         })
@@ -1673,6 +1705,11 @@ impl CoreEngine {
                 limit,
             },
         );
+        let fetch = FetchMessagesRequest {
+            device_id: device_id.clone(),
+            from_seq: decision.from_seq,
+            limit,
+        };
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
@@ -1686,9 +1723,9 @@ impl CoreEngine {
                     url: format!(
                         "{}/v1/inbox/{}/messages?fromSeq={}&limit={}",
                         deployment.inbox_http_endpoint.trim_end_matches('/'),
-                        device_id,
-                        decision.from_seq,
-                        limit
+                        fetch.device_id,
+                        fetch.from_seq,
+                        fetch.limit
                     ),
                     headers: BTreeMap::new(),
                     body: None,
@@ -1714,7 +1751,7 @@ impl CoreEngine {
         }
         match request {
             PendingRequest::GetHead { device_id } => {
-                let head: HeadResponse = serde_json::from_str(body.as_deref().unwrap_or("{\"head_seq\":0}"))
+                let head: GetHeadResult = serde_json::from_str(body.as_deref().unwrap_or("{\"head_seq\":0}"))
                     .map_err(|error| CoreError::invalid_input(format!("failed to decode head response: {error}")))?;
                 let sync_state = self
                     .state
@@ -1729,22 +1766,41 @@ impl CoreEngine {
                 }
             }
             PendingRequest::FetchMessages { device_id, .. } => {
-                let response: FetchResponse = serde_json::from_str(body.as_deref().unwrap_or("{\"to_seq\":0,\"records\":[]}"))
+                let response: FetchMessagesResult = serde_json::from_str(body.as_deref().unwrap_or("{\"to_seq\":0,\"records\":[]}"))
                     .map_err(|error| CoreError::invalid_input(format!("failed to decode fetch response: {error}")))?;
                 self.handle_inbox_records(device_id, response.records, response.to_seq)
             }
-            PendingRequest::GetIdentityBundle { .. } => {
-                let bundle: IdentityBundle = serde_json::from_str(body.as_deref().unwrap_or("{}"))
-                    .map_err(|error| CoreError::invalid_input(format!("failed to decode identity bundle response: {error}")))?;
-                self.apply_identity_bundle_update(bundle)
-            }
             PendingRequest::AppendEnvelope { message_id, .. } => {
+                let result: AppendEnvelopeResult =
+                    serde_json::from_str(body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"))
+                        .map_err(|error| {
+                            CoreError::invalid_input(format!(
+                                "failed to decode append response: {error}"
+                            ))
+                        })?;
+                if !result.accepted {
+                    return Err(CoreError::temporary_failure(
+                        "append response was not accepted",
+                    ));
+                }
                 self.state
                     .pending_outbox
                     .retain(|item| item.envelope.message_id != message_id);
                 self.flush_pending_transport()
             }
             PendingRequest::Ack { device_id, .. } => {
+                let result: AckResult =
+                    serde_json::from_str(body.as_deref().unwrap_or("{\"accepted\":false,\"ack_seq\":0}"))
+                        .map_err(|error| {
+                            CoreError::invalid_input(format!(
+                                "failed to decode ack response: {error}"
+                            ))
+                        })?;
+                if !result.accepted {
+                    return Err(CoreError::temporary_failure(
+                        "ack response was not accepted",
+                    ));
+                }
                 self.state.pending_acks.remove(&device_id);
                 self.flush_pending_transport()
             }
@@ -1866,32 +1922,25 @@ impl CoreEngine {
                     view_model: None,
                 })
             }
-            PendingRequest::GetIdentityBundle { user_id } => {
-                if retryable {
-                    self.handle_identity_refresh_failure(
-                        &user_id,
-                        detail.unwrap_or_else(|| {
-                            format!("identity refresh request failed for {user_id}")
-                        }),
-                    )
-                } else {
-                    self.rebuild_affected_conversations_for_peer(
-                        &user_id,
-                        detail.unwrap_or_else(|| {
-                            format!("identity refresh failed for {user_id}")
-                        }),
-                    )
-                }
-            }
         }
     }
 
-    fn handle_blob_uploaded(
+    fn handle_blob_upload_prepared(
         &mut self,
         task_id: String,
-        reference: String,
-        sharing_url: Option<String>,
+        result: PrepareBlobUploadResult,
     ) -> CoreResult<CoreOutput> {
+        let task = self
+            .state
+            .pending_blob_uploads
+            .get_mut(&task_id)
+            .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
+        task.prepared_upload = Some(result);
+        task.in_flight = false;
+        self.flush_pending_transport()
+    }
+
+    fn handle_blob_uploaded(&mut self, task_id: String) -> CoreResult<CoreOutput> {
         let task = self
             .state
             .pending_blob_uploads
@@ -1899,7 +1948,13 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
         let peer_user_id = self.peer_user_for_conversation(&task.conversation_id)?;
         let recipients = self.recipient_device_ids(&task.conversation_id)?;
-        let final_ref = sharing_url.unwrap_or(reference);
+        let prepared = task.prepared_upload.ok_or_else(|| {
+            CoreError::invalid_state("blob upload completed before upload target was prepared")
+        })?;
+        let final_ref = prepared
+            .download_target
+            .clone()
+            .unwrap_or(prepared.blob_ref.clone());
         let mut envelopes = Vec::new();
         for recipient in recipients {
             let mut envelope = self.build_envelope(
@@ -1913,7 +1968,7 @@ impl CoreEngine {
                 object_ref: final_ref.clone(),
                 size_bytes: task.descriptor.size_bytes,
                 mime_type: task.descriptor.mime_type.clone(),
-                expires_at: None,
+                expires_at: prepared.expires_at,
             });
             envelopes.push(envelope);
         }
@@ -2413,12 +2468,6 @@ impl CoreEngine {
                 }],
                 view_model: None,
             }),
-            PendingRequest::GetIdentityBundle { user_id } => {
-                self.handle_identity_refresh_failure(
-                    &user_id,
-                    body.unwrap_or_else(|| format!("identity refresh returned status {status}")),
-                )
-            }
         }
     }
 
@@ -2501,17 +2550,6 @@ impl CoreEngine {
         let to_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
         self.handle_inbox_records(device_id, records, to_seq)
     }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct HeadResponse {
-    head_seq: u64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct FetchResponse {
-    to_seq: u64,
-    records: Vec<InboxRecord>,
 }
 
 fn current_timestamp_hint(outbox_len: usize) -> u64 {
@@ -2613,6 +2651,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 size_bytes: task.descriptor.size_bytes,
                 file_name: task.descriptor.file_name.clone(),
                 metadata_ciphertext: task.metadata_ciphertext.clone(),
+                prepared_upload: task.prepared_upload.clone(),
                 retries: task.retries,
             })
             .chain(

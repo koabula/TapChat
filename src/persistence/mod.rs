@@ -9,6 +9,7 @@ use crate::identity::LocalIdentityState;
 use crate::mls_adapter::PublishedKeyPackage;
 use crate::model::{Ack, DeploymentBundle, Envelope, IdentityBundle, MlsStateSummary};
 use crate::sync_engine::DeviceSyncState;
+use crate::transport_contract::PrepareBlobUploadResult;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedLocalIdentity {
@@ -73,6 +74,7 @@ pub enum PersistedPendingBlobTransfer {
         size_bytes: u64,
         file_name: Option<String>,
         metadata_ciphertext: String,
+        prepared_upload: Option<PrepareBlobUploadResult>,
         retries: u8,
     },
     Download {
@@ -567,6 +569,7 @@ mod tests {
                     user_id: "user:bob".into(),
                     user_public_key: "pub".into(),
                     devices: vec![],
+                    identity_bundle_ref: Some("ref:identity-bob".into()),
                     device_status_ref: None,
                     storage_profile: None,
                     updated_at: 0,
@@ -710,8 +713,60 @@ mod tests {
         let path = unique_snapshot_path("roundtrip");
         let snapshot = CorePersistenceSnapshot {
             local_identity: None,
-            deployment: None,
-            contacts: vec![],
+            deployment: Some(PersistedDeployment {
+                deployment_bundle: DeploymentBundle {
+                    version: CURRENT_MODEL_VERSION.to_string(),
+                    region: "local".into(),
+                    inbox_http_endpoint: "https://example.com".into(),
+                    inbox_websocket_endpoint: "wss://example.com/ws".into(),
+                    storage_base_info: crate::model::StorageBaseInfo {
+                        base_url: Some("https://storage.example.com".into()),
+                        bucket_hint: None,
+                    },
+                    runtime_config: crate::model::RuntimeConfig {
+                        supported_realtime_kinds: vec![crate::model::RealtimeKind::Websocket],
+                        identity_bundle_ref: Some("ref:identity-local".into()),
+                        device_status_ref: Some("ref:device-status-local".into()),
+                        keypackage_ref_base: Some("ref:keypackages-local".into()),
+                        max_inline_bytes: Some(4096),
+                        features: vec!["generic_sync".into()],
+                    },
+                    expected_user_id: Some("user:alice".into()),
+                    expected_device_id: Some("device:alice:phone".into()),
+                },
+                local_bundle: Some(IdentityBundle {
+                    version: CURRENT_MODEL_VERSION.to_string(),
+                    user_id: "user:alice".into(),
+                    user_public_key: "pub".into(),
+                    devices: vec![sample_contact_device("user:alice", "device:alice:phone")],
+                    identity_bundle_ref: Some("ref:identity-local".into()),
+                    device_status_ref: Some("ref:device-status-local".into()),
+                    storage_profile: Some(crate::model::StorageProfile {
+                        base_url: Some("https://storage.example.com".into()),
+                        profile_ref: None,
+                    }),
+                    updated_at: 0,
+                    signature: "sig".into(),
+                }),
+                published_key_package: None,
+            }),
+            contacts: vec![PersistedContact {
+                user_id: "user:bob".into(),
+                bundle: IdentityBundle {
+                    version: CURRENT_MODEL_VERSION.to_string(),
+                    user_id: "user:bob".into(),
+                    user_public_key: "pub-bob".into(),
+                    devices: vec![sample_contact_device("user:bob", "device:bob:phone")],
+                    identity_bundle_ref: Some("ref:identity-bob".into()),
+                    device_status_ref: Some("ref:device-status-bob".into()),
+                    storage_profile: Some(crate::model::StorageProfile {
+                        base_url: Some("https://storage.example.com".into()),
+                        profile_ref: None,
+                    }),
+                    updated_at: 1,
+                    signature: "sig-bob".into(),
+                },
+            }],
             conversations: vec![],
             sync_states: vec![],
             mls_states: vec![],
@@ -726,6 +781,23 @@ mod tests {
         save_snapshot(&path, &snapshot).expect("save snapshot");
         let loaded = load_snapshot(&path).expect("load snapshot").expect("snapshot");
         assert_eq!(loaded, snapshot);
+        assert_eq!(
+            loaded
+                .deployment
+                .as_ref()
+                .and_then(|deployment| {
+                    deployment
+                        .deployment_bundle
+                        .runtime_config
+                        .identity_bundle_ref
+                        .as_deref()
+                }),
+            Some("ref:identity-local")
+        );
+        assert_eq!(
+            loaded.contacts[0].bundle.identity_bundle_ref.as_deref(),
+            Some("ref:identity-bob")
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -766,5 +838,41 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("tapchat-{name}-{nanos}.json"))
+    }
+
+    fn sample_contact_device(user_id: &str, device_id: &str) -> crate::model::DeviceContactProfile {
+        crate::model::DeviceContactProfile {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            device_id: device_id.into(),
+            device_public_key: format!("pub:{device_id}"),
+            binding: crate::model::DeviceBinding {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                user_id: user_id.into(),
+                device_id: device_id.into(),
+                device_public_key: format!("pub:{device_id}"),
+                created_at: 0,
+                signature: "binding-sig".into(),
+            },
+            status: DeviceStatusKind::Active,
+            inbox_append_capability: crate::model::InboxAppendCapability {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                service: crate::model::CapabilityService::Inbox,
+                user_id: user_id.into(),
+                target_device_id: device_id.into(),
+                endpoint: "https://example.com/inbox".into(),
+                operations: vec![crate::model::CapabilityOperation::Append],
+                conversation_scope: vec![],
+                expires_at: 999,
+                constraints: None,
+                signature: "cap-sig".into(),
+            },
+            keypackage_ref: crate::model::KeyPackageRef {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                user_id: user_id.into(),
+                device_id: device_id.into(),
+                object_ref: format!("ref:keypackage:{device_id}"),
+                expires_at: 999,
+            },
+        }
     }
 }

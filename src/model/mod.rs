@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 use crate::error::{CoreError, CoreResult};
 
@@ -275,10 +274,22 @@ impl Validate for DeviceContactProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StorageProfile {
+    // Optional shared storage access hint for platform adapters. It is metadata only and
+    // must not be treated as an implicit locator for identity or device-state refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    // Optional profile object reference for storage metadata. This is not an identity bundle
+    // reference and must not be used as a fallback for shared-state discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealtimeKind {
+    Websocket,
+    ServerSentEvents,
+    Polling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +298,10 @@ pub struct IdentityBundle {
     pub user_id: String,
     pub user_public_key: String,
     pub devices: Vec<DeviceContactProfile>,
+    // Canonical shared-state reference for this identity bundle. Contact refresh must only
+    // use this explicit reference and must not infer object locations from storage hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_bundle_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_status_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +316,9 @@ impl Validate for IdentityBundle {
         validate_required("user_id", &self.user_id)?;
         validate_required("user_public_key", &self.user_public_key)?;
         validate_required("signature", &self.signature)?;
+        if let Some(identity_bundle_ref) = &self.identity_bundle_ref {
+            validate_required("identity_bundle_ref", identity_bundle_ref)?;
+        }
         if self.devices.is_empty() {
             return Err(CoreError::invalid_input(
                 "identity bundle must contain at least one device profile",
@@ -585,9 +603,22 @@ pub struct StorageBaseInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub values: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_realtime_kinds: Vec<RealtimeKind>,
+    // Optional bootstrap hint for exporting the local user's shared identity bundle.
+    // It must not be used as a fallback source when refreshing a contact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_bundle_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_status_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keypackage_ref_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inline_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +644,7 @@ impl Validate for DeploymentBundle {
             "inbox_websocket_endpoint",
             &self.inbox_websocket_endpoint,
         )?;
+        validate_runtime_config(&self.runtime_config)?;
         if let Some(user_id) = &self.expected_user_id {
             validate_required("expected_user_id", user_id)?;
         }
@@ -638,6 +670,36 @@ fn validate_version(value: &str) -> CoreResult<()> {
         return Err(CoreError::invalid_input(format!(
             "unsupported version {value}, expected {CURRENT_MODEL_VERSION}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_runtime_config(config: &RuntimeConfig) -> CoreResult<()> {
+    if let Some(identity_bundle_ref) = &config.identity_bundle_ref {
+        validate_required("runtime_config.identity_bundle_ref", identity_bundle_ref)?;
+    }
+    if let Some(device_status_ref) = &config.device_status_ref {
+        validate_required("runtime_config.device_status_ref", device_status_ref)?;
+    }
+    if let Some(keypackage_ref_base) = &config.keypackage_ref_base {
+        validate_required("runtime_config.keypackage_ref_base", keypackage_ref_base)?;
+    }
+    for feature in &config.features {
+        validate_required("runtime_config.features", feature)?;
+        let normalized = feature.to_ascii_lowercase();
+        if normalized.contains("cloudflare")
+            || normalized.contains("worker")
+            || normalized.contains("durable_object")
+            || normalized.contains("r2")
+            || normalized.contains("bucket")
+            || normalized.contains("path_template")
+            || normalized.contains("route")
+            || normalized.contains("storage_provider")
+        {
+            return Err(CoreError::invalid_input(format!(
+                "runtime_config feature {feature} must remain platform-neutral"
+            )));
+        }
     }
     Ok(())
 }
@@ -827,6 +889,54 @@ mod tests {
         assert_eq!(error.code(), "invalid_input");
     }
 
+    #[test]
+    fn runtime_config_rejects_platform_specific_features() {
+        let bundle = DeploymentBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            region: "local".into(),
+            inbox_http_endpoint: "https://example.com".into(),
+            inbox_websocket_endpoint: "wss://example.com/ws".into(),
+            storage_base_info: StorageBaseInfo::default(),
+            runtime_config: RuntimeConfig {
+                features: vec!["cloudflare_worker".into()],
+                ..RuntimeConfig::default()
+            },
+            expected_user_id: None,
+            expected_device_id: None,
+        };
+        let error = bundle.validate().expect_err("platform feature should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn runtime_config_rejects_unknown_fields_during_decode() {
+        let error = serde_json::from_str::<RuntimeConfig>(
+            r#"{"worker_route":"/v1/inbox","features":["generic_sync"]}"#,
+        )
+        .expect_err("unknown field should fail");
+        assert!(error.is_data());
+    }
+
+    #[test]
+    fn runtime_config_round_trips_with_generic_fields_only() {
+        let config = RuntimeConfig {
+            supported_realtime_kinds: vec![RealtimeKind::Websocket, RealtimeKind::Polling],
+            identity_bundle_ref: Some("ref:identity:alice".into()),
+            device_status_ref: Some("ref:device-status:alice".into()),
+            keypackage_ref_base: Some("ref:keypackages:alice".into()),
+            max_inline_bytes: Some(4096),
+            features: vec!["generic_sync".into(), "attachment_v1".into()],
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize runtime config");
+        let decoded: RuntimeConfig =
+            serde_json::from_str(&json).expect("deserialize runtime config");
+
+        assert_eq!(decoded, config);
+        assert!(!json.contains("cloudflare"));
+        assert!(!json.contains("worker_route"));
+    }
+
     fn sample_identity_bundle() -> IdentityBundle {
         IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
@@ -868,6 +978,7 @@ mod tests {
                     expires_at: 999,
                 },
             }],
+            identity_bundle_ref: Some("https://storage.example.com/state/user:alice/identity_bundle.json".into()),
             device_status_ref: Some("s3://state/device_status.json".into()),
             storage_profile: Some(StorageProfile {
                 base_url: Some("https://storage.example.com".into()),

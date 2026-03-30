@@ -255,18 +255,13 @@ impl IdentityManager {
             user_id: local_identity.user_identity.user_id.clone(),
             user_public_key: local_identity.user_identity.user_public_key.clone(),
             devices: vec![device_profile],
-            device_status_ref: Some(format!(
-                "{}/state/{}/device_status.json",
-                deployment.storage_base_info.base_url.clone().unwrap_or_default(),
-                local_identity.user_identity.user_id
-            )),
+            // Deployment runtime config may provide bootstrap references for publishing the
+            // local user's shared state. Contact refresh must not infer these values.
+            identity_bundle_ref: deployment.runtime_config.identity_bundle_ref.clone(),
+            device_status_ref: deployment.runtime_config.device_status_ref.clone(),
             storage_profile: Some(StorageProfile {
                 base_url: deployment.storage_base_info.base_url.clone(),
-                profile_ref: Some(format!(
-                    "{}/state/{}/storage_profile.json",
-                    deployment.storage_base_info.base_url.clone().unwrap_or_default(),
-                    local_identity.user_identity.user_id
-                )),
+                profile_ref: None,
             }),
             updated_at: local_identity.device_status.updated_at,
             signature: String::new(),
@@ -365,6 +360,7 @@ fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
         bundle.user_id.clone(),
         bundle.user_public_key.clone(),
         bundle.updated_at.to_string(),
+        bundle.identity_bundle_ref.clone().unwrap_or_default(),
         bundle.device_status_ref.clone().unwrap_or_default(),
         bundle
             .storage_profile
@@ -556,6 +552,7 @@ mod tests {
                     expires_at: 999,
                 },
             }],
+            identity_bundle_ref: None,
             device_status_ref: None,
             storage_profile: None,
             updated_at: 0,
@@ -582,6 +579,72 @@ mod tests {
         IdentityManager::verify_identity_bundle(&bundle).expect("bundle should verify");
     }
 
+    #[test]
+    fn exported_identity_bundle_uses_runtime_config_bootstrap_refs_only() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let bundle = IdentityManager::export_identity_bundle(
+            &identity,
+            &sample_deployment(),
+            "kp-ref".into(),
+            999,
+        )
+        .expect("bundle");
+
+        assert_eq!(
+            bundle.identity_bundle_ref.as_deref(),
+            Some("https://storage.example.com/state/user:alice/identity_bundle.json")
+        );
+        assert_eq!(
+            bundle.device_status_ref.as_deref(),
+            Some("https://storage.example.com/state/user:alice/device_status.json")
+        );
+        assert_eq!(
+            bundle
+                .storage_profile
+                .as_ref()
+                .and_then(|profile| profile.base_url.as_deref()),
+            Some("https://storage.example.com")
+        );
+        assert_eq!(
+            bundle
+                .storage_profile
+                .as_ref()
+                .and_then(|profile| profile.profile_ref.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn exported_identity_bundle_does_not_infer_state_paths_from_base_url() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let mut deployment = sample_deployment();
+        deployment.runtime_config.identity_bundle_ref = None;
+        deployment.runtime_config.device_status_ref = None;
+
+        let bundle =
+            IdentityManager::export_identity_bundle(&identity, &deployment, "kp-ref".into(), 999)
+                .expect("bundle");
+
+        assert_eq!(bundle.identity_bundle_ref, None);
+        assert_eq!(bundle.device_status_ref, None);
+        assert_eq!(
+            bundle
+                .storage_profile
+                .as_ref()
+                .and_then(|profile| profile.base_url.as_deref()),
+            Some("https://storage.example.com")
+        );
+        assert_eq!(
+            bundle
+                .storage_profile
+                .as_ref()
+                .and_then(|profile| profile.profile_ref.as_deref()),
+            None
+        );
+    }
+
     fn sample_deployment() -> DeploymentBundle {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
@@ -592,7 +655,18 @@ mod tests {
                 base_url: Some("https://storage.example.com".into()),
                 bucket_hint: None,
             },
-            runtime_config: crate::model::RuntimeConfig::default(),
+            runtime_config: crate::model::RuntimeConfig {
+                supported_realtime_kinds: vec![crate::model::RealtimeKind::Websocket],
+                identity_bundle_ref: Some(
+                    "https://storage.example.com/state/user:alice/identity_bundle.json".into(),
+                ),
+                device_status_ref: Some(
+                    "https://storage.example.com/state/user:alice/device_status.json".into(),
+                ),
+                keypackage_ref_base: Some("https://storage.example.com/keypackages".into()),
+                max_inline_bytes: Some(4096),
+                features: vec!["generic_sync".into()],
+            },
             expected_user_id: None,
             expected_device_id: None,
         }

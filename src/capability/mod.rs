@@ -189,7 +189,14 @@ mod tests {
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
             storage_base_info: crate::model::StorageBaseInfo::default(),
-            runtime_config: crate::model::RuntimeConfig::default(),
+            runtime_config: crate::model::RuntimeConfig {
+                supported_realtime_kinds: vec![crate::model::RealtimeKind::Websocket],
+                identity_bundle_ref: None,
+                device_status_ref: None,
+                keypackage_ref_base: Some("https://example.com/keypackages".into()),
+                max_inline_bytes: Some(4096),
+                features: vec!["generic_sync".into()],
+            },
             expected_user_id: None,
             expected_device_id: None,
         }
