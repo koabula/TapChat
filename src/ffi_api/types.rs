@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::attachment_crypto::AttachmentPayloadMetadata;
 use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
@@ -44,6 +45,9 @@ pub enum CoreCommand {
     },
     SyncInbox { device_id: String, reason: Option<String> },
     RefreshIdentityState { user_id: String },
+    CreateAdditionalDeviceIdentity { mnemonic: Option<String>, device_name: Option<String> },
+    RotateLocalKeyPackage,
+    ApplyLocalDeviceStatusUpdate { status: crate::model::DeviceStatusKind },
     RebuildConversation { conversation_id: String },
 }
 
@@ -236,6 +240,8 @@ pub(crate) struct PendingBlobUpload {
     pub(crate) task_id: String,
     pub(crate) conversation_id: String,
     pub(crate) descriptor: AttachmentDescriptor,
+    pub(crate) encrypted_source_path: String,
+    pub(crate) payload_metadata: AttachmentPayloadMetadata,
     pub(crate) message_id: String,
     pub(crate) metadata_ciphertext: String,
     pub(crate) prepared_upload: Option<PrepareBlobUploadResult>,
@@ -250,6 +256,7 @@ pub(crate) struct PendingBlobDownload {
     pub(crate) message_id: String,
     pub(crate) reference: String,
     pub(crate) destination: String,
+    pub(crate) payload_metadata: AttachmentPayloadMetadata,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
 }
@@ -334,6 +341,7 @@ impl Default for CoreState {
         }
     }
 }
+
 
 
 

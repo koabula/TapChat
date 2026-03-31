@@ -250,11 +250,23 @@ impl IdentityManager {
             key_package_ref,
             key_package_expires_at,
         )?;
+        Self::export_identity_bundle_with_devices(
+            local_identity,
+            deployment,
+            vec![device_profile],
+        )
+    }
+
+    pub fn export_identity_bundle_with_devices(
+        local_identity: &LocalIdentityState,
+        deployment: &DeploymentBundle,
+        devices: Vec<crate::model::DeviceContactProfile>,
+    ) -> CoreResult<IdentityBundle> {
         let unsigned = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             user_id: local_identity.user_identity.user_id.clone(),
             user_public_key: local_identity.user_identity.user_public_key.clone(),
-            devices: vec![device_profile],
+            devices,
             // Deployment runtime config may provide bootstrap references for publishing the
             // local user's shared state. Contact refresh must not infer these values.
             identity_bundle_ref: deployment.runtime_config.identity_bundle_ref.clone(),

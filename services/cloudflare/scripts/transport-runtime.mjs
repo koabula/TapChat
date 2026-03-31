@@ -1,9 +1,9 @@
 import { unstable_dev } from "wrangler";
 
-const port = Number(process.env.TAPCHAT_PHASE10_PORT ?? "0");
-const persistTo = process.env.TAPCHAT_PHASE10_PERSIST_TO;
-const sharingSecret = process.env.TAPCHAT_PHASE10_SHARING_SECRET ?? "phase10-sharing-secret";
-const bootstrapSecret = process.env.TAPCHAT_PHASE10_BOOTSTRAP_SECRET ?? "phase10-bootstrap-secret";
+const port = Number(process.env.TAPCHAT_TRANSPORT_PORT ?? "0");
+const persistTo = process.env.TAPCHAT_TRANSPORT_PERSIST_TO;
+const sharingSecret = process.env.TAPCHAT_TRANSPORT_SHARING_SECRET ?? "transport-sharing-secret";
+const bootstrapSecret = process.env.TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET ?? "transport-bootstrap-secret";
 const baseUrl = `http://127.0.0.1:${port}`;
 
 const worker = await unstable_dev("src/index.ts", {
@@ -16,7 +16,7 @@ const worker = await unstable_dev("src/index.ts", {
   logLevel: "error",
   vars: {
     PUBLIC_BASE_URL: baseUrl,
-    DEPLOYMENT_REGION: "local-phase10",
+    DEPLOYMENT_REGION: "local-transport",
     SHARING_TOKEN_SECRET: sharingSecret,
     BOOTSTRAP_TOKEN_SECRET: bootstrapSecret
   },
@@ -56,3 +56,4 @@ process.stdin.resume();
 process.stdin.on("end", shutdown);
 
 await new Promise(() => {});
+

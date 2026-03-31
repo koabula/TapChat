@@ -1,3 +1,4 @@
+pub mod attachment_crypto;
 pub mod capability;
 pub mod conversation;
 pub mod error;
@@ -33,3 +34,4 @@ mod tests {
         logger.log(LogLevel::Info, "phase0", "core initialized");
     }
 }
+

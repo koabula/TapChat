@@ -27,26 +27,26 @@ impl CloudflareRuntimeHandle {
     pub async fn start(workspace_root: impl AsRef<Path>) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
         let service_root = workspace_root.join("services").join("cloudflare");
-        let temp_dir = tempfile::tempdir_in(workspace_root).context("create phase10 temp dir")?;
+        let temp_dir = tempfile::tempdir_in(workspace_root).context("create transport temp dir")?;
         let port = reserve_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let websocket_base_url = format!("ws://127.0.0.1:{port}");
-        let bootstrap_secret = format!("phase10-bootstrap-{port}");
-        let sharing_secret = format!("phase10-sharing-{port}");
+        let bootstrap_secret = format!("transport-bootstrap-{port}");
+        let sharing_secret = format!("transport-sharing-{port}");
 
         let mut child = Command::new("node");
         child
-            .arg("scripts/phase10-runtime.mjs")
+            .arg("scripts/transport-runtime.mjs")
             .current_dir(&service_root)
-            .env("TAPCHAT_PHASE10_PORT", port.to_string())
-            .env("TAPCHAT_PHASE10_PERSIST_TO", temp_dir.path())
-            .env("TAPCHAT_PHASE10_BOOTSTRAP_SECRET", &bootstrap_secret)
-            .env("TAPCHAT_PHASE10_SHARING_SECRET", &sharing_secret)
+            .env("TAPCHAT_TRANSPORT_PORT", port.to_string())
+            .env("TAPCHAT_TRANSPORT_PERSIST_TO", temp_dir.path())
+            .env("TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET", &bootstrap_secret)
+            .env("TAPCHAT_TRANSPORT_SHARING_SECRET", &sharing_secret)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .stdin(Stdio::piped());
 
-        let mut child = child.spawn().context("spawn cloudflare phase10 runtime")?;
+        let mut child = child.spawn().context("spawn cloudflare transport runtime")?;
         let stdout = child.stdout.take().context("runtime stdout unavailable")?;
         let mut lines = BufReader::new(stdout).lines();
         let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
@@ -186,3 +186,4 @@ fn reserve_port() -> Result<u16> {
     drop(listener);
     Ok(port)
 }
+

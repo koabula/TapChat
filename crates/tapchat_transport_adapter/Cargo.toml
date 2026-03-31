@@ -1,5 +1,5 @@
 [package]
-name = "tapchat_phase10_adapter"
+name = "tapchat_transport_adapter"
 version = "0.1.0"
 edition = "2024"
 

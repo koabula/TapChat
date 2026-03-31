@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::attachment_crypto::AttachmentPayloadMetadata;
 use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::PublishedKeyPackage;
@@ -70,6 +71,8 @@ pub enum PersistedPendingBlobTransfer {
         conversation_id: String,
         message_id: String,
         source: String,
+        encrypted_source_path: String,
+        payload_metadata: AttachmentPayloadMetadata,
         mime_type: String,
         size_bytes: u64,
         file_name: Option<String>,
@@ -83,6 +86,7 @@ pub enum PersistedPendingBlobTransfer {
         message_id: String,
         reference: String,
         destination: String,
+        payload_metadata: AttachmentPayloadMetadata,
         retries: u8,
     },
 }
@@ -536,6 +540,7 @@ pub fn load_snapshot(path: &Path) -> crate::CoreResult<Option<CorePersistenceSna
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
@@ -637,6 +642,18 @@ mod tests {
                 message_id: "msg:1".into(),
                 reference: "cid:1".into(),
                 destination: "download.bin".into(),
+                payload_metadata: AttachmentPayloadMetadata {
+                    mime_type: "application/octet-stream".into(),
+                    size_bytes: 8,
+                    file_name: Some("download.bin".into()),
+                    encryption: crate::attachment_crypto::AttachmentCipherMetadata {
+                        algorithm: crate::attachment_crypto::ATTACHMENT_CIPHER_ALGORITHM.into(),
+                        key_b64: base64::engine::general_purpose::STANDARD
+                            .encode([7_u8; 32]),
+                        nonce_b64: base64::engine::general_purpose::STANDARD
+                            .encode([9_u8; 12]),
+                    },
+                },
                 retries: 1,
             }],
             recovery_contexts: vec![PersistedRecoveryContext {
@@ -884,3 +901,4 @@ mod tests {
         }
     }
 }
+

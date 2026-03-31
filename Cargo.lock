@@ -6,6 +6,7 @@ version = 4
 name = "TapChat"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "base64",
  "bip39",
  "ed25519-dalek",
@@ -2104,7 +2105,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tapchat_phase10_adapter"
+name = "tapchat_transport_adapter"
 version = "0.1.0"
 dependencies = [
  "TapChat",

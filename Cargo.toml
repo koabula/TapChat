@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/tapchat_phase10_adapter"]
+members = [".", "crates/tapchat_transport_adapter"]
 resolver = "2"
 
 [package]
@@ -8,6 +8,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.10"
 base64 = "0.22"
 bip39 = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

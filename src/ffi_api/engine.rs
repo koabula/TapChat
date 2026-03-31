@@ -1,5 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use crate::attachment_crypto::{
+    AttachmentPayloadMetadata, decrypt_blob, encrypt_blob, write_ciphertext_temp,
+};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
@@ -40,6 +45,14 @@ impl CoreEngine {
 
     pub fn local_bundle(&self) -> Option<&IdentityBundle> {
         self.state.local_bundle.as_ref()
+    }
+
+    pub fn local_identity(&self) -> Option<&crate::identity::LocalIdentityState> {
+        self.state.local_identity.as_ref()
+    }
+
+    pub fn contact_bundle(&self, user_id: &str) -> Option<&IdentityBundle> {
+        self.state.contacts.get(user_id)
     }
 
     pub fn conversation_state(&self, conversation_id: &str) -> Option<&LocalConversationState> {
@@ -129,6 +142,8 @@ impl CoreEngine {
                     conversation_id,
                     message_id,
                     source,
+                    encrypted_source_path,
+                    payload_metadata,
                     mime_type,
                     size_bytes,
                     file_name,
@@ -147,6 +162,8 @@ impl CoreEngine {
                                 size_bytes,
                                 file_name,
                             },
+                            encrypted_source_path,
+                            payload_metadata,
                             message_id,
                             metadata_ciphertext,
                             prepared_upload,
@@ -161,6 +178,7 @@ impl CoreEngine {
                     message_id,
                     reference,
                     destination,
+                    payload_metadata,
                     retries,
                 } => {
                     pending_blob_downloads.insert(
@@ -171,6 +189,7 @@ impl CoreEngine {
                             message_id,
                             reference,
                             destination,
+                            payload_metadata,
                             retries,
                             in_flight: false,
                         },
@@ -309,6 +328,13 @@ impl CoreEngine {
             } => self.download_attachment(conversation_id, message_id, reference, destination),
             CoreCommand::SyncInbox { device_id, .. } => self.sync_inbox(device_id),
             CoreCommand::RefreshIdentityState { user_id } => self.refresh_identity_state(user_id),
+            CoreCommand::CreateAdditionalDeviceIdentity { mnemonic, device_name } => {
+                self.create_additional_device_identity(mnemonic, device_name)
+            }
+            CoreCommand::RotateLocalKeyPackage => self.rotate_local_key_package(),
+            CoreCommand::ApplyLocalDeviceStatusUpdate { status } => {
+                self.apply_local_device_status_update(status)
+            }
             CoreCommand::RebuildConversation { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
             }
@@ -493,6 +519,107 @@ impl CoreEngine {
         })
     }
 
+    fn create_additional_device_identity(
+        &mut self,
+        mnemonic: Option<String>,
+        device_name: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let mnemonic = mnemonic.ok_or_else(|| {
+            CoreError::invalid_input("mnemonic is required to create an additional device")
+        })?;
+        let recovered = IdentityManager::recover_user_root(&mnemonic)?;
+        if let Some(existing) = self.state.local_identity.as_ref() {
+            if existing.user_identity.user_id != recovered.user_identity.user_id {
+                return Err(CoreError::invalid_input(
+                    "provided mnemonic does not match persisted local identity",
+                ));
+            }
+        }
+        let _ = device_name;
+        let identity = IdentityManager::create_new_device_for_user(&recovered, None)?;
+        let (adapter, package) = crate::mls_adapter::MlsAdapter::bootstrap(&identity)?;
+        let user_id = identity.user_identity.user_id.clone();
+        let device_id = identity.device_identity.device_id.clone();
+        self.state.local_identity = Some(identity);
+        self.state.mls_adapter = Some(adapter);
+        self.state.published_key_package = Some(package);
+        self.state
+            .sync_states
+            .insert(device_id.clone(), SyncEngine::new_device_state(&device_id));
+        self.refresh_local_bundle()?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
+            )],
+            view_model: Some(CoreViewModel {
+                contacts: vec![ContactSummary {
+                    user_id,
+                    device_count: 1,
+                }],
+                banners: vec![SystemBanner {
+                    status: SystemStatus::IdentityRefreshNeeded,
+                    message: format!("additional local device ready for {device_id}"),
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn rotate_local_key_package(&mut self) -> CoreResult<CoreOutput> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let _ = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+        let package = MlsAdapter::generate_key_package(identity, 0)?;
+        self.state.published_key_package = Some(package);
+        self.refresh_local_bundle()?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
+            view_model: None,
+        })
+    }
+
+    fn apply_local_device_status_update(
+        &mut self,
+        status: crate::model::DeviceStatusKind,
+    ) -> CoreResult<CoreOutput> {
+        let identity = self
+            .state
+            .local_identity
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        identity.device_status.status = status;
+        identity.device_status.updated_at = identity.device_status.updated_at.saturating_add(1);
+        self.refresh_local_bundle()?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
+            )],
+            view_model: None,
+        })
+    }
+
     fn create_conversation(
         &mut self,
         peer_user_id: String,
@@ -670,8 +797,24 @@ impl CoreEngine {
         self.ensure_conversation_ready_for_send(&conversation_id)?;
         let message_nonce = self.next_message_nonce();
         let message_id = self.next_message_id(&conversation_id, "attachment", message_nonce);
-        let metadata_json = serde_json::to_string(&attachment_descriptor).map_err(|error| {
-            CoreError::invalid_input(format!("failed to encode attachment descriptor: {error}"))
+        let plaintext = fs::read(&attachment_descriptor.source).map_err(|error| {
+            CoreError::invalid_input(format!(
+                "failed to read attachment source {}: {error}",
+                attachment_descriptor.source
+            ))
+        })?;
+        let encrypted = encrypt_blob(&plaintext)?;
+        let encrypted_source_path = write_ciphertext_temp(&message_id, &encrypted.ciphertext)?;
+        let payload_metadata = AttachmentPayloadMetadata {
+            mime_type: attachment_descriptor.mime_type.clone(),
+            size_bytes: attachment_descriptor.size_bytes,
+            file_name: attachment_descriptor.file_name.clone(),
+            encryption: encrypted.metadata,
+        };
+        let metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
+            CoreError::invalid_input(format!(
+                "failed to encode attachment payload metadata: {error}"
+            ))
         })?;
         let metadata_ciphertext = self
             .state
@@ -687,6 +830,8 @@ impl CoreEngine {
                 task_id: task_id.clone(),
                 conversation_id: conversation_id.clone(),
                 descriptor: attachment_descriptor.clone(),
+                encrypted_source_path,
+                payload_metadata,
                 message_id: message_id.clone(),
                 metadata_ciphertext,
                 prepared_upload: None,
@@ -723,6 +868,25 @@ impl CoreEngine {
         reference: String,
         destination: String,
     ) -> CoreResult<CoreOutput> {
+        let payload_metadata = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|state| {
+                state
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == message_id)
+            })
+            .and_then(|message| message.plaintext.as_deref())
+            .ok_or_else(|| CoreError::invalid_input("attachment metadata is missing"))?
+            .to_string();
+        let payload_metadata: AttachmentPayloadMetadata =
+            serde_json::from_str(&payload_metadata).map_err(|error| {
+                CoreError::invalid_input(format!(
+                    "failed to decode attachment payload metadata: {error}"
+                ))
+            })?;
         self.state.pending_blob_downloads.insert(
             format!("blob-download:{message_id}"),
             PendingBlobDownload {
@@ -731,6 +895,7 @@ impl CoreEngine {
                 message_id,
                 reference,
                 destination,
+                payload_metadata,
                 retries: 0,
                 in_flight: false,
             },
@@ -1604,7 +1769,7 @@ impl CoreEngine {
                 effects.push(CoreEffect::UploadBlob {
                     upload: BlobUploadRequest {
                         task_id: task.task_id.clone(),
-                        source_path: task.descriptor.source.clone(),
+                        source_path: task.encrypted_source_path.clone(),
                         upload_target: prepared.upload_target.clone(),
                         upload_headers: prepared.upload_headers.clone(),
                         blob_ref: prepared.blob_ref.clone(),
@@ -2029,8 +2194,10 @@ impl CoreEngine {
             envelope.storage_refs.push(StorageRef {
                 kind: "attachment".into(),
                 object_ref: final_ref.clone(),
-                size_bytes: task.descriptor.size_bytes,
-                mime_type: task.descriptor.mime_type.clone(),
+                size_bytes: fs::metadata(&task.encrypted_source_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(task.payload_metadata.size_bytes),
+                mime_type: "application/octet-stream".into(),
                 expires_at: prepared.expires_at,
             });
             envelopes.push(envelope);
@@ -2042,11 +2209,23 @@ impl CoreEngine {
     fn handle_blob_downloaded(
         &mut self,
         task_id: String,
-        _destination: String,
+        destination: String,
         blob_ciphertext: Option<String>,
     ) -> CoreResult<CoreOutput> {
         if let Some(task) = self.state.pending_blob_downloads.remove(&task_id) {
             if let Some(blob_ciphertext) = blob_ciphertext {
+                let ciphertext = STANDARD.decode(&blob_ciphertext).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "downloaded blob ciphertext was not valid base64: {error}"
+                    ))
+                })?;
+                let plaintext = decrypt_blob(&ciphertext, &task.payload_metadata.encryption)?;
+                fs::write(&destination, &plaintext).map_err(|error| {
+                    CoreError::invalid_state(format!(
+                        "failed to write decrypted attachment {}: {error}",
+                        destination
+                    ))
+                })?;
                 if let Some(state) = self.state.conversations.get_mut(&task.conversation_id) {
                     if let Some(message) = state
                         .messages
@@ -2753,6 +2932,8 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 conversation_id: task.conversation_id.clone(),
                 message_id: task.message_id.clone(),
                 source: task.descriptor.source.clone(),
+                encrypted_source_path: task.encrypted_source_path.clone(),
+                payload_metadata: task.payload_metadata.clone(),
                 mime_type: task.descriptor.mime_type.clone(),
                 size_bytes: task.descriptor.size_bytes,
                 file_name: task.descriptor.file_name.clone(),
@@ -2770,6 +2951,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                         message_id: task.message_id.clone(),
                         reference: task.reference.clone(),
                         destination: task.destination.clone(),
+                        payload_metadata: task.payload_metadata.clone(),
                         retries: task.retries,
                     }),
             )

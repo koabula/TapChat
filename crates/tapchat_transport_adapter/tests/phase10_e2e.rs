@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::ffi_api::{AttachmentDescriptor, CoreCommand};
 use tapchat_core::identity::IdentityManager;
-use tapchat_phase10_adapter::{CloudflareRuntimeHandle, CoreDriver};
+use tapchat_transport_adapter::{CloudflareRuntimeHandle, CoreDriver};
 
 const ALICE_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -79,7 +79,7 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
     let mut ctx = setup_pair().await?;
     let temp_dir = tempfile::tempdir()?;
     let source_path = temp_dir.path().join("payload.bin");
-    let original = b"phase10 attachment bytes".to_vec();
+    let original = b"transport attachment bytes".to_vec();
     tokio::fs::write(&source_path, &original).await?;
 
     ctx.alice
@@ -113,6 +113,8 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
 
     let attachment_message_id = attachment_message.message_id.clone();
     let attachment_reference = attachment_message.storage_refs[0].object_ref.clone();
+    let raw_blob = reqwest::get(&attachment_reference).await?.bytes().await?;
+    assert_ne!(raw_blob.as_ref(), original.as_slice());
     let destination = temp_dir.path().join("downloaded.bin");
     ctx.bob
         .run_command_until_idle(CoreCommand::DownloadAttachment {
@@ -140,10 +142,11 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
         .downloaded_blob_b64
         .as_ref()
         .context("downloaded blob bytes missing")?;
-    assert_eq!(STANDARD.decode(blob_ciphertext)?, original);
+    assert_eq!(STANDARD.decode(blob_ciphertext)?, raw_blob);
 
     Ok(())
 }
+
 
 async fn sync_bob(ctx: &mut PairContext, reason: &str) -> Result<()> {
     sync_driver_until_stable(&mut ctx.bob, &ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, reason).await
@@ -286,5 +289,6 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root")
         .to_path_buf()
 }
+
 
 

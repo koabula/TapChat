@@ -1,10 +1,14 @@
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, FfiApiModule,
         RealtimeEvent,
     };
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
+    use crate::attachment_crypto::{
+        ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata, AttachmentPayloadMetadata,
+    };
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
@@ -79,12 +83,7 @@ mod tests {
         let output = alice
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id,
-                attachment_descriptor: AttachmentDescriptor {
-                    source: "file.bin".into(),
-                    mime_type: "application/octet-stream".into(),
-                    size_bytes: 4,
-                    file_name: Some("file.bin".into()),
-                },
+                attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
         assert!(output.effects.iter().any(|effect| matches!(
@@ -102,12 +101,7 @@ mod tests {
         let upload = alice
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id,
-                attachment_descriptor: AttachmentDescriptor {
-                    source: "file.bin".into(),
-                    mime_type: "application/octet-stream".into(),
-                    size_bytes: 4,
-                    file_name: Some("file.bin".into()),
-                },
+                attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
         let task_id = match upload.effects.iter().find_map(|effect| match effect {
@@ -405,12 +399,7 @@ mod tests {
         let output = alice
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id,
-                attachment_descriptor: AttachmentDescriptor {
-                    source: "file.bin".into(),
-                    mime_type: "application/octet-stream".into(),
-                    size_bytes: 4,
-                    file_name: Some("file.bin".into()),
-                },
+                attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
 
@@ -599,12 +588,7 @@ mod tests {
         let upload_output = engine
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id,
-                attachment_descriptor: AttachmentDescriptor {
-                    source: "file.bin".into(),
-                    mime_type: "application/octet-stream".into(),
-                    size_bytes: 4,
-                    file_name: Some("file.bin".into()),
-                },
+                attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
         let mut snapshot = extract_snapshot(&upload_output);
@@ -650,12 +634,7 @@ mod tests {
         let upload_output = engine
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id,
-                attachment_descriptor: AttachmentDescriptor {
-                    source: "file.bin".into(),
-                    mime_type: "application/octet-stream".into(),
-                    size_bytes: 4,
-                    file_name: Some("file.bin".into()),
-                },
+                attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
         let mut snapshot = extract_snapshot(&upload_output);
@@ -863,6 +842,39 @@ mod tests {
             })
             .expect("identity");
         engine
+            .state
+            .conversations
+            .insert(
+                "conv:test".into(),
+                crate::conversation::LocalConversationState {
+                    conversation: crate::model::Conversation {
+                        conversation_id: "conv:test".into(),
+                        kind: ConversationKind::Direct,
+                        member_users: vec!["user:alice".into(), "user:bob".into()],
+                        member_devices: vec![],
+                        state: crate::model::ConversationState::Active,
+                        updated_at: 0,
+                    },
+                    messages: vec![crate::conversation::StoredMessage {
+                        message_id: "msg:download".into(),
+                        sender_device_id: "device:sender".into(),
+                        recipient_device_id: "device:recipient".into(),
+                        message_type: MessageType::MlsApplication,
+                        created_at: 0,
+                        plaintext: Some(
+                            serde_json::to_string(&sample_attachment_payload_metadata())
+                                .expect("attachment metadata"),
+                        ),
+                        storage_refs: vec![],
+                        downloaded_blob_b64: None,
+                    }],
+                    last_message_type: Some(MessageType::MlsApplication),
+                    peer_user_id: "user:bob".into(),
+                    last_known_peer_active_devices: Default::default(),
+                    recovery_status: crate::conversation::RecoveryStatus::Healthy,
+                },
+            );
+        engine
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id: "conv:test".into(),
                 message_id: "msg:download".into(),
@@ -902,6 +914,126 @@ mod tests {
             .state
             .pending_blob_downloads
             .contains_key("blob-download:msg:download"));
+    }
+
+    #[test]
+    fn create_additional_device_identity_keeps_user_and_changes_device() {
+        let first = seeded_engine(ALICE_MNEMONIC, "phone", sample_identity_bundle(BOB_MNEMONIC, "phone"));
+        let original_user_id = first
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let original_device_id = first
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateAdditionalDeviceIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("laptop".into()),
+            })
+            .expect("additional device");
+
+        let identity = engine.state.local_identity.as_ref().expect("local identity");
+        assert_eq!(identity.user_identity.user_id, original_user_id);
+        assert_ne!(identity.device_identity.device_id, original_device_id);
+    }
+
+    #[test]
+    fn rotate_local_key_package_updates_local_bundle_reference() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let before = engine
+            .state
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .keypackage_ref
+            .object_ref
+            .clone();
+
+        engine
+            .handle_command(CoreCommand::RotateLocalKeyPackage)
+            .expect("rotate key package");
+
+        let after = engine
+            .state
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .keypackage_ref
+            .object_ref
+            .clone();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn apply_local_device_status_update_updates_local_bundle_status() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+
+        engine
+            .handle_command(CoreCommand::ApplyLocalDeviceStatusUpdate {
+                status: crate::model::DeviceStatusKind::Revoked,
+            })
+            .expect("status update");
+
+        assert!(matches!(
+            engine.state.local_bundle.as_ref().expect("local bundle").devices[0].status,
+            crate::model::DeviceStatusKind::Revoked
+        ));
+    }
+
+    #[test]
+    fn identity_bundle_update_with_new_device_refreshes_contact_devices() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_laptop,
+            &sample_deployment(),
+            bob_laptop_package.key_package_b64,
+            bob_laptop_package.expires_at,
+        )
+        .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile.clone()],
+        )
+        .expect("merged bundle");
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged.clone() })
+            .expect("apply bundle update");
+
+        let updated = alice.state.contacts.get(&merged.user_id).expect("updated contact");
+        assert_eq!(updated.devices.len(), 2);
+        assert!(updated
+            .devices
+            .iter()
+            .any(|device| device.device_id == bob_laptop_profile.device_id));
     }
 
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
@@ -971,6 +1103,30 @@ mod tests {
     fn updated_bundle_json_for_user(user_id: &str, mut bundle: IdentityBundle) -> String {
         bundle.user_id = user_id.to_string();
         serde_json::to_string(&bundle).expect("bundle json")
+    }
+
+    fn sample_attachment_descriptor() -> AttachmentDescriptor {
+        let path = unique_temp_path("attachment");
+        std::fs::write(&path, [1_u8, 2, 3, 4]).expect("write attachment temp file");
+        AttachmentDescriptor {
+            source: path.to_string_lossy().to_string(),
+            mime_type: "application/octet-stream".into(),
+            size_bytes: 4,
+            file_name: Some("file.bin".into()),
+        }
+    }
+
+    fn sample_attachment_payload_metadata() -> AttachmentPayloadMetadata {
+        AttachmentPayloadMetadata {
+            mime_type: "application/octet-stream".into(),
+            size_bytes: 4,
+            file_name: Some("file.bin".into()),
+            encryption: AttachmentCipherMetadata {
+                algorithm: ATTACHMENT_CIPHER_ALGORITHM.into(),
+                key_b64: STANDARD.encode([1_u8; 32]),
+                nonce_b64: STANDARD.encode([2_u8; 12]),
+            },
+        }
     }
 
     fn sample_control_record(
@@ -1074,5 +1230,13 @@ mod tests {
             expected_user_id: None,
             expected_device_id: None,
         }
+    }
+
+    fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("tapchat-{prefix}-{nanos}.bin"))
     }
 }
