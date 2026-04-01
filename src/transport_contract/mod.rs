@@ -87,7 +87,7 @@ pub struct PrepareBlobUploadResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobUploadRequest {
     pub task_id: String,
-    pub source_path: String,
+    pub blob_ciphertext_b64: String,
     pub upload_target: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub upload_headers: BTreeMap<String, String>,
@@ -99,7 +99,6 @@ pub struct BlobDownloadRequest {
     pub task_id: String,
     pub blob_ref: String,
     pub download_target: String,
-    pub destination_path: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub download_headers: BTreeMap<String, String>,
 }

@@ -1,7 +1,3 @@
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-
 use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit}};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand::RngCore;
@@ -80,21 +76,6 @@ pub fn decrypt_blob(ciphertext: &[u8], metadata: &AttachmentCipherMetadata) -> C
     cipher
         .decrypt(Nonce::from_slice(&nonce), ciphertext)
         .map_err(|_| CoreError::invalid_input("failed to decrypt attachment blob"))
-}
-
-pub fn write_ciphertext_temp(task_id: &str, ciphertext: &[u8]) -> CoreResult<String> {
-    let mut path: PathBuf = env::temp_dir();
-    let sanitized_task_id: String = task_id
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
-            _ => '_',
-        })
-        .collect();
-    path.push(format!("tapchat-{sanitized_task_id}.blob"));
-    fs::write(&path, ciphertext)
-        .map_err(|error| CoreError::invalid_state(format!("failed to persist encrypted attachment blob: {error}")))?;
-    Ok(path.to_string_lossy().to_string())
 }
 
 #[cfg(test)]

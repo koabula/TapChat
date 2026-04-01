@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::ffi_api::{AttachmentDescriptor, CoreCommand, CoreEvent};
+use tapchat_core::ffi_api::{
+    AttachmentDescriptor, CoreCommand, CoreEvent, RecoveryReason, MAX_TRANSPORT_RETRIES,
+};
 use tapchat_core::identity::IdentityManager;
 use tapchat_core::model::{
     ConversationKind, DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceStatusKind,
-    IdentityBundle,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus,
 };
 use tapchat_transport_adapter::{CloudflareRuntimeHandle, CoreDriver};
 
@@ -110,7 +112,7 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
         .run_command_until_idle(CoreCommand::SendAttachmentMessage {
             conversation_id: ctx.conversation_id.clone(),
             attachment_descriptor: AttachmentDescriptor {
-                source: source_path.to_string_lossy().to_string(),
+                attachment_id: source_path.to_string_lossy().to_string(),
                 mime_type: "application/octet-stream".into(),
                 size_bytes: original.len() as u64,
                 file_name: Some("payload.bin".into()),
@@ -441,6 +443,806 @@ async fn restart_from_snapshot_during_recovery_resumes_and_converges() -> Result
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_refresh_identity_and_reconcile_are_idempotent_during_recovery() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    let initial_pending = ctx.alice.pending_mls_artifacts(&ctx.conversation_id);
+    let initial_context = ctx
+        .alice
+        .recovery_context_snapshot(&ctx.conversation_id)
+        .context("initial recovery context missing")?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+
+    refresh_alice_contact(&mut ctx).await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+
+    let repeated_pending = ctx.alice.pending_mls_artifacts(&ctx.conversation_id);
+    assert!(repeated_pending.pending_welcome_count <= initial_pending.pending_welcome_count);
+    assert!(repeated_pending.pending_commit_count <= initial_pending.pending_commit_count);
+    if let Some(repeated_context) = ctx.alice.recovery_context_snapshot(&ctx.conversation_id) {
+        assert!(repeated_context.attempt_count >= initial_context.attempt_count);
+        assert!(
+            repeated_context.identity_refresh_retry_count
+                >= initial_context.identity_refresh_retry_count
+        );
+    } else {
+        assert_eq!(
+            ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+            Some(RecoveryStatus::Healthy)
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_success() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    ctx.alice.fail_next_identity_fetch(&ctx.bob_user_id, true, 2);
+    let _ = ctx.alice.take_scheduled_timers();
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::RefreshIdentityState {
+            user_id: ctx.bob_user_id.clone(),
+        })
+        .await?;
+    let first_timers = ctx.alice.take_scheduled_timers();
+    assert_eq!(count_named_timers(&first_timers, "refresh_identity:"), 1);
+    assert_eq!(
+        ctx.alice
+            .recovery_context_snapshot(&ctx.conversation_id)
+            .context("context after first failure")?
+            .identity_refresh_retry_count,
+        1
+    );
+
+    let timer_id = first_timers[0].0.clone();
+    ctx.alice.trigger_timer(timer_id.clone()).await?;
+    let second_timers = ctx.alice.take_scheduled_timers();
+    assert_eq!(count_named_timers(&second_timers, "refresh_identity:"), 1);
+    assert_eq!(
+        ctx.alice
+            .recovery_context_snapshot(&ctx.conversation_id)
+            .context("context after second failure")?
+            .identity_refresh_retry_count,
+        2
+    );
+
+    ctx.alice.trigger_timer(timer_id).await?;
+    let final_timers = ctx.alice.take_scheduled_timers();
+    assert_eq!(count_named_timers(&final_timers, "refresh_identity:"), 0);
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "refresh-retry-success-laptop",
+    )
+    .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_sync_timer_and_manual_sync_do_not_regress_checkpoint() -> Result<()> {
+    let mut ctx = setup_pair().await?;
+
+    let _ = ctx.bob.take_scheduled_timers();
+    ctx.bob.close_realtime(&ctx.bob_device_id).await?;
+    let disconnect_timers = ctx.bob.take_scheduled_timers();
+    let sync_timer = disconnect_timers
+        .iter()
+        .find_map(|(timer_id, _)| timer_id.starts_with("sync:").then_some(timer_id.clone()))
+        .context("sync timer missing after realtime disconnect")?;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "duplicate sync".into(),
+        })
+        .await?;
+
+    ctx.bob.trigger_timer(sync_timer.clone()).await?;
+    let checkpoint_after_timer = ctx
+        .bob
+        .sync_checkpoint_snapshot(&ctx.bob_device_id)
+        .context("checkpoint after timer")?;
+    ctx.bob
+        .run_command_until_idle(CoreCommand::SyncInbox {
+            device_id: ctx.bob_device_id.clone(),
+            reason: Some("manual-after-timer".into()),
+        })
+        .await?;
+    let checkpoint_after_manual = ctx
+        .bob
+        .sync_checkpoint_snapshot(&ctx.bob_device_id)
+        .context("checkpoint after manual sync")?;
+    ctx.bob.trigger_timer(sync_timer).await?;
+    let checkpoint_after_duplicate = ctx
+        .bob
+        .sync_checkpoint_snapshot(&ctx.bob_device_id)
+        .context("checkpoint after duplicate timer")?;
+
+    assert!(checkpoint_after_manual.last_fetched_seq >= checkpoint_after_timer.last_fetched_seq);
+    assert!(checkpoint_after_manual.last_acked_seq >= checkpoint_after_timer.last_acked_seq);
+    assert!(
+        checkpoint_after_duplicate.last_fetched_seq >= checkpoint_after_manual.last_fetched_seq
+    );
+    assert!(checkpoint_after_duplicate.last_acked_seq >= checkpoint_after_manual.last_acked_seq);
+
+    let conversation = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after duplicate sync")?;
+    assert_eq!(count_plaintext_messages(conversation, "duplicate sync"), 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn needs_recovery_persists_without_premature_rebuild_under_partial_delivery() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+    let phone_baseline = last_acked_seq(&ctx.bob_phone, &ctx.bob_phone_device_id)?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "partial-delivery-laptop-join",
+    )
+    .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "partial delivery".into(),
+        })
+        .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "partial-delivery-laptop-message",
+    )
+    .await?;
+
+    let phone_records = fetch_inbox_records_since(
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        phone_baseline + 1,
+    )
+    .await?;
+    let application_records = records_of_type(&phone_records, MessageType::MlsApplication);
+    let commit_records = records_of_type(&phone_records, MessageType::MlsCommit);
+    inject_records_without_effects(
+        &mut ctx.bob_phone,
+        &ctx.bob_phone_device_id,
+        application_records.clone(),
+    )?;
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::RefreshIdentityState {
+            user_id: ctx.alice_user_id.clone(),
+        })
+        .await?;
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+
+    assert_ne!(
+        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRebuild)
+    );
+    assert_ne!(
+        ctx.bob_phone.conversation_mls_status(&ctx.conversation_id),
+        Some(MlsStateStatus::NeedsRebuild)
+    );
+
+    let commit_to_seq = highest_seq(&commit_records).context("commit seq for partial delivery")?;
+    let _ = ctx
+        .bob_phone
+        .inject_event_until_idle(CoreEvent::InboxRecordsFetched {
+            device_id: ctx.bob_phone_device_id.clone(),
+            records: commit_records,
+            to_seq: commit_to_seq,
+        })
+        .await?;
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    assert_eq!(
+        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_identity_refresh_retry_caps_once_and_stops_scheduling() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    let recovery_reason = ctx
+        .alice
+        .recovery_context_snapshot(&ctx.conversation_id)
+        .context("recovery context after initial refresh")?
+        .reason;
+    assert!(matches!(
+        recovery_reason,
+        RecoveryReason::IdentityChanged | RecoveryReason::MembershipChanged
+    ));
+    ctx.alice.fail_next_identity_fetch(
+        &ctx.bob_user_id,
+        true,
+        (MAX_TRANSPORT_RETRIES as usize) * 2,
+    );
+    let _ = ctx.alice.take_scheduled_timers();
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::RefreshIdentityState {
+            user_id: ctx.bob_user_id.clone(),
+        })
+        .await?;
+    let mut refresh_timers =
+        count_named_timers(&ctx.alice.take_scheduled_timers(), "refresh_identity:");
+    assert_eq!(refresh_timers, 1);
+
+    for _ in 0..(MAX_TRANSPORT_RETRIES * 2) {
+        ctx.alice
+            .trigger_timer(format!("refresh_identity:{}", ctx.bob_user_id))
+            .await?;
+        refresh_timers = count_named_timers(
+            &ctx.alice.take_scheduled_timers(),
+            "refresh_identity:",
+        );
+        if ctx.alice.conversation_recovery_status(&ctx.conversation_id)
+            == Some(RecoveryStatus::NeedsRebuild)
+        {
+            break;
+        }
+    }
+
+    assert_eq!(refresh_timers, 0);
+    if let Some(context) = ctx.alice.recovery_context_snapshot(&ctx.conversation_id) {
+        assert!(context.identity_refresh_retry_count >= MAX_TRANSPORT_RETRIES);
+    }
+
+    ctx.alice
+        .trigger_timer(format!("refresh_identity:{}", ctx.bob_user_id))
+        .await?;
+    assert_eq!(
+        count_named_timers(&ctx.alice.take_scheduled_timers(), "refresh_identity:"),
+        0
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_mid_recovery_preserves_context_checkpoint_and_realtime_state() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+    let alice_device_id = ctx
+        .alice
+        .engine()
+        .local_device_id()
+        .context("alice device id")?
+        .to_string();
+
+    ctx.alice.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    ctx.alice.close_realtime(&alice_device_id).await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SyncInbox {
+            device_id: alice_device_id.clone(),
+            reason: Some("restart-mid-recovery-baseline".into()),
+        })
+        .await?;
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    let before_restart_context = ctx
+        .alice
+        .recovery_context_snapshot(&ctx.conversation_id)
+        .context("alice recovery context before restart")?;
+    let before_restart_checkpoint = ctx
+        .alice
+        .sync_checkpoint_snapshot(&alice_device_id)
+        .context("alice checkpoint before restart")?;
+    let before_restart_realtime = ctx
+        .alice
+        .realtime_session_snapshot(&alice_device_id)
+        .context("alice realtime session before restart")?;
+    let before_restart_realtime_seq = before_restart_realtime.last_known_seq;
+
+    let snapshot = ctx
+        .alice
+        .latest_snapshot()
+        .cloned()
+        .context("alice snapshot before restart")?;
+    let mut restored =
+        CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    restored.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    ctx.alice = restored;
+
+    let after_restart_context = ctx
+        .alice
+        .recovery_context_snapshot(&ctx.conversation_id)
+        .context("alice recovery context after restart")?;
+    let after_restart_checkpoint = ctx
+        .alice
+        .sync_checkpoint_snapshot(&alice_device_id)
+        .context("alice checkpoint after restart")?;
+    let after_restart_realtime = ctx
+        .alice
+        .realtime_session_snapshot(&alice_device_id)
+        .context("alice realtime session after restart")?;
+    assert_eq!(after_restart_context.reason, before_restart_context.reason);
+    assert_eq!(
+        after_restart_checkpoint.pending_record_seqs,
+        before_restart_checkpoint.pending_record_seqs
+    );
+    assert_eq!(after_restart_realtime.last_known_seq, before_restart_realtime_seq);
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "restart-mid-recovery-laptop-join",
+    )
+    .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+    let phone_baseline = last_acked_seq(&ctx.bob_phone, &ctx.bob_phone_device_id)?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "missing-commit-laptop-join",
+    )
+    .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "after missing commit".into(),
+        })
+        .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "missing-commit-laptop-message",
+    )
+    .await?;
+
+    let phone_records = fetch_inbox_records_since(
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        phone_baseline + 1,
+    )
+    .await?;
+    let application_records = records_of_type(&phone_records, MessageType::MlsApplication);
+    let commit_records = records_of_type(&phone_records, MessageType::MlsCommit);
+    assert!(!application_records.is_empty());
+    assert!(!commit_records.is_empty());
+
+    inject_records_without_effects(
+        &mut ctx.bob_phone,
+        &ctx.bob_phone_device_id,
+        application_records.clone(),
+    )?;
+    assert_eq!(
+        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+    assert!(
+        ctx.bob_phone
+            .sync_checkpoint_snapshot(&ctx.bob_phone_device_id)
+            .context("phone checkpoint after partial application")?
+            .last_fetched_seq
+            >= highest_seq(&application_records).context("application seq")?
+    );
+
+    let commit_to_seq = highest_seq(&commit_records).context("commit seq")?;
+    let _ = ctx
+        .bob_phone
+        .inject_event_until_idle(CoreEvent::InboxRecordsFetched {
+            device_id: ctx.bob_phone_device_id.clone(),
+            records: commit_records,
+            to_seq: commit_to_seq,
+        })
+        .await?;
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+
+    let phone_conversation = ctx
+        .bob_phone
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob phone conversation missing after missing commit recovery")?;
+    assert!(phone_conversation
+        .messages
+        .iter()
+        .any(|message| message.message_type == MessageType::MlsApplication));
+    assert_eq!(
+        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+    assert_eq!(
+        ctx.bob_phone.conversation_mls_status(&ctx.conversation_id),
+        Some(MlsStateStatus::Active)
+    );
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "after missing commit recovered".into(),
+        })
+        .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_phone,
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        "missing-commit-phone-recovered-message",
+    )
+    .await?;
+    let recovered_phone_conversation = ctx
+        .bob_phone
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob phone conversation missing after recovered message")?;
+    assert!(recovered_phone_conversation
+        .messages
+        .iter()
+        .any(|message| message.plaintext.as_deref() == Some("after missing commit recovered")));
+    let phone_head = ctx
+        .runtime
+        .get_head(&ctx.bob_phone_auth, &ctx.bob_phone_device_id)
+        .await?
+        .head_seq;
+    assert!(last_acked_seq(&ctx.bob_phone, &ctx.bob_phone_device_id)? >= phone_head);
+
+    let laptop_conversation = ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob laptop conversation missing after missing commit recovery")?;
+    assert!(laptop_conversation
+        .messages
+        .iter()
+        .any(|message| message.plaintext.as_deref() == Some("after missing commit")));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+    assert!(ctx.alice.snapshot_has_recovery_context(&ctx.conversation_id));
+
+    let mut snapshot = ctx
+        .alice
+        .latest_snapshot()
+        .cloned()
+        .context("alice snapshot missing for unrecoverable gap test")?;
+    let broken_reference = format!(
+        "{}/v1/shared-state/{}/identity-bundle-missing",
+        ctx.runtime.base_url(),
+        urlencoding::encode(&ctx.bob_user_id)
+    );
+    let bob_contact = snapshot
+        .contacts
+        .iter_mut()
+        .find(|contact| contact.user_id == ctx.bob_user_id)
+        .context("bob contact missing in alice snapshot")?;
+    bob_contact.bundle.identity_bundle_ref = Some(broken_reference);
+    ctx.alice = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    ctx.alice.inject_event_until_idle(CoreEvent::AppStarted).await?;
+
+    for _ in 0..3 {
+        let _ = ctx
+            .alice
+            .run_command_until_idle(CoreCommand::RefreshIdentityState {
+                user_id: ctx.bob_user_id.clone(),
+            })
+            .await?;
+    }
+
+    let alice_conversation = ctx
+        .alice
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("alice conversation missing after unrecoverable gap escalation")?;
+    assert_eq!(alice_conversation.recovery_status, RecoveryStatus::NeedsRebuild);
+    assert_eq!(
+        alice_conversation.conversation.state,
+        tapchat_core::model::ConversationState::NeedsRebuild
+    );
+    assert_eq!(
+        ctx.alice.conversation_mls_status(&ctx.conversation_id),
+        Some(MlsStateStatus::NeedsRebuild)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_during_recovery_keeps_revoked_device_isolated() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::ApplyLocalDeviceStatusUpdate {
+            status: DeviceStatusKind::Revoked,
+        })
+        .await?;
+    publish_bob_bundle(&ctx, DeviceStatusKind::Revoked, DeviceStatusKind::Active).await?;
+    ctx.alice.clear_recent_transport_activity();
+    refresh_alice_contact(&mut ctx).await?;
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "revoke-during-recovery-laptop",
+    )
+    .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_phone,
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        "revoke-during-recovery-phone-removal",
+    )
+    .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    let phone_head_before = ctx
+        .runtime
+        .get_head(&ctx.bob_phone_auth, &ctx.bob_phone_device_id)
+        .await?
+        .head_seq;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "post revoke during recovery".into(),
+        })
+        .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "revoke-during-recovery-laptop-message",
+    )
+    .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_phone,
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        "revoke-during-recovery-phone-message",
+    )
+    .await?;
+
+    let phone_head_after = ctx
+        .runtime
+        .get_head(&ctx.bob_phone_auth, &ctx.bob_phone_device_id)
+        .await?
+        .head_seq;
+    assert_eq!(phone_head_after, phone_head_before);
+
+    let laptop_conversation = ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob laptop conversation missing after revoke during recovery")?;
+    assert!(laptop_conversation
+        .messages
+        .iter()
+        .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery")));
+
+    let phone_conversation = ctx
+        .bob_phone
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob phone conversation missing after revoke during recovery")?;
+    assert!(!phone_conversation
+        .messages
+        .iter()
+        .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery")));
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    let members = ctx.alice.conversation_members(&ctx.conversation_id);
+    assert!(
+        members.iter().any(|member| {
+            member.device_id == ctx.bob_phone_device_id && member.status == DeviceStatusKind::Revoked
+        }) || members.iter().all(|member| member.device_id != ctx.bob_phone_device_id)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_during_recovery_preserves_context_and_converges() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "restart-mid-recovery-laptop",
+    )
+    .await?;
+    assert!(ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .is_some());
+
+    let snapshot = ctx
+        .alice
+        .latest_snapshot()
+        .cloned()
+        .context("alice recovery snapshot missing for mid-stage restart")?;
+    assert!(snapshot
+        .recovery_contexts
+        .iter()
+        .any(|context| context.conversation_id == ctx.conversation_id));
+
+    let mut restored = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    restored.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    assert!(restored.snapshot_has_recovery_context(&ctx.conversation_id));
+    ctx.alice = restored;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "after mid recovery restart".into(),
+        })
+        .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "restart-mid-recovery-message",
+    )
+    .await?;
+
+    let laptop_conversation = ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob laptop conversation missing after mid-stage restart recovery")?;
+    assert!(laptop_conversation
+        .messages
+        .iter()
+        .any(|message| message.plaintext.as_deref() == Some("after mid recovery restart")));
 
     Ok(())
 }
@@ -932,6 +1734,71 @@ async fn sync_driver_until_stable(
         sync_state.checkpoint.last_acked_seq,
         sync_state.pending_records.len()
     )
+}
+
+async fn fetch_inbox_records_since(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    device_id: &str,
+    from_seq: u64,
+) -> Result<Vec<InboxRecord>> {
+    Ok(runtime
+        .fetch_messages(auth, device_id, from_seq, 100)
+        .await?
+        .records)
+}
+
+fn inject_records_without_effects(
+    driver: &mut CoreDriver,
+    device_id: &str,
+    records: Vec<InboxRecord>,
+) -> Result<()> {
+    let to_seq = highest_seq(&records).unwrap_or(0);
+    let _ = driver.inject_event_without_effects(CoreEvent::InboxRecordsFetched {
+        device_id: device_id.to_string(),
+        records,
+        to_seq,
+    })?;
+    Ok(())
+}
+
+fn records_of_type(records: &[InboxRecord], message_type: MessageType) -> Vec<InboxRecord> {
+    records
+        .iter()
+        .filter(|record| record.envelope.message_type == message_type)
+        .cloned()
+        .collect()
+}
+
+fn highest_seq(records: &[InboxRecord]) -> Option<u64> {
+    records.iter().map(|record| record.seq).max()
+}
+
+fn count_named_timers(timers: &[(String, u64)], prefix: &str) -> usize {
+    timers
+        .iter()
+        .filter(|(timer_id, _)| timer_id.starts_with(prefix))
+        .count()
+}
+
+fn count_plaintext_messages(
+    conversation: &tapchat_core::conversation::LocalConversationState,
+    plaintext: &str,
+) -> usize {
+    conversation
+        .messages
+        .iter()
+        .filter(|message| message.plaintext.as_deref() == Some(plaintext))
+        .count()
+}
+
+fn last_acked_seq(driver: &CoreDriver, device_id: &str) -> Result<u64> {
+    Ok(driver
+        .engine()
+        .sync_state(device_id)
+        .context("sync state missing")?
+        .checkpoint
+        .last_acked_seq)
 }
 
 fn workspace_root() -> PathBuf {

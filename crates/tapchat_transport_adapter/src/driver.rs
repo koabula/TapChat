@@ -8,9 +8,9 @@ use reqwest::Client;
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
-    RealtimeEvent,
+    RealtimeEvent, RecoveryContextSnapshot, RealtimeSessionSnapshot, SyncCheckpointSnapshot,
 };
-use tapchat_core::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType};
+use tapchat_core::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
@@ -35,6 +35,8 @@ pub struct DriverRuntime {
     storage_prepare_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
+    injected_identity_fetch_failures: BTreeMap<String, Vec<bool>>,
+    injected_sync_fetch_failures: BTreeMap<String, Vec<bool>>,
 }
 
 pub struct CoreDriver {
@@ -86,6 +88,8 @@ impl CoreDriver {
                     .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
+                injected_identity_fetch_failures: BTreeMap::new(),
+                injected_sync_fetch_failures: BTreeMap::new(),
             },
         })
     }
@@ -106,6 +110,8 @@ impl CoreDriver {
                     .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
+                injected_identity_fetch_failures: BTreeMap::new(),
+                injected_sync_fetch_failures: BTreeMap::new(),
             },
         })
     }
@@ -164,6 +170,40 @@ impl CoreDriver {
         self.engine
             .conversation_state(conversation_id)
             .map(|state| state.recovery_status)
+    }
+
+    pub fn conversation_mls_status(&self, conversation_id: &str) -> Option<MlsStateStatus> {
+        self.engine
+            .mls_summary(conversation_id)
+            .map(|summary| summary.status)
+    }
+
+    pub fn snapshot_has_recovery_context(&self, conversation_id: &str) -> bool {
+        self.runtime
+            .latest_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .recovery_contexts
+                    .iter()
+                    .any(|context| context.conversation_id == conversation_id)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn recovery_context_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Option<RecoveryContextSnapshot> {
+        self.engine.recovery_context_snapshot(conversation_id)
+    }
+
+    pub fn sync_checkpoint_snapshot(&self, device_id: &str) -> Option<SyncCheckpointSnapshot> {
+        self.engine.sync_checkpoint_snapshot(device_id)
+    }
+
+    pub fn realtime_session_snapshot(&self, device_id: &str) -> Option<RealtimeSessionSnapshot> {
+        self.engine.realtime_session_snapshot(device_id)
     }
 
     pub fn pending_mls_artifacts(&self, conversation_id: &str) -> PendingMlsArtifacts {
@@ -249,6 +289,26 @@ impl CoreDriver {
         self.runtime.recent_messages.clear();
     }
 
+    pub fn take_scheduled_timers(&mut self) -> Vec<(String, u64)> {
+        std::mem::take(&mut self.runtime.scheduled_timers)
+    }
+
+    pub fn fail_next_identity_fetch(&mut self, user_id: &str, retryable: bool, times: usize) {
+        self.runtime
+            .injected_identity_fetch_failures
+            .entry(user_id.to_string())
+            .or_default()
+            .extend(std::iter::repeat(retryable).take(times));
+    }
+
+    pub fn fail_next_sync_fetch(&mut self, device_id: &str, retryable: bool, times: usize) {
+        self.runtime
+            .injected_sync_fetch_failures
+            .entry(device_id.to_string())
+            .or_default()
+            .extend(std::iter::repeat(retryable).take(times));
+    }
+
     pub async fn run_command_until_idle(&mut self, command: CoreCommand) -> Result<CoreOutput> {
         let output = self.engine.handle_command(command)?;
         let output = self.execute_until_idle(output).await?;
@@ -259,6 +319,12 @@ impl CoreDriver {
     pub async fn inject_event_until_idle(&mut self, event: CoreEvent) -> Result<CoreOutput> {
         let output = self.engine.handle_event(event)?;
         let output = self.execute_until_idle(output).await?;
+        self.record_observed_output(&output);
+        Ok(output)
+    }
+
+    pub fn inject_event_without_effects(&mut self, event: CoreEvent) -> Result<CoreOutput> {
+        let output = self.engine.handle_event(event)?;
         self.record_observed_output(&output);
         Ok(output)
     }
@@ -293,6 +359,13 @@ impl CoreDriver {
         Ok(())
     }
 
+    pub async fn trigger_timer(&mut self, timer_id: impl Into<String>) -> Result<CoreOutput> {
+        self.inject_event_until_idle(CoreEvent::TimerTriggered {
+            timer_id: timer_id.into(),
+        })
+        .await
+    }
+
     async fn execute_until_idle(&mut self, mut output: CoreOutput) -> Result<CoreOutput> {
         loop {
             let effects = std::mem::take(&mut output.effects);
@@ -325,9 +398,13 @@ impl CoreDriver {
                 Ok(Vec::new())
             }
             CoreEffect::FetchIdentityBundle { fetch } => self.fetch_identity_bundle(fetch).await,
+            CoreEffect::ReadAttachmentBytes { read } => self.read_attachment_bytes(read).await,
             CoreEffect::PrepareBlobUpload { upload } => self.prepare_blob_upload(upload).await,
             CoreEffect::UploadBlob { upload } => self.upload_blob(upload).await,
             CoreEffect::DownloadBlob { download } => self.download_blob(download).await,
+            CoreEffect::WriteDownloadedAttachment { write } => {
+                self.write_downloaded_attachment(write).await
+            }
             CoreEffect::PersistState { persist } => {
                 self.persist_state(persist);
                 Ok(Vec::new())
@@ -347,6 +424,18 @@ impl CoreDriver {
         &mut self,
         request: tapchat_core::ffi_api::HttpRequestEffect,
     ) -> Result<Vec<CoreEvent>> {
+        if let Some(device_id) = parse_fetch_device_id(&request.url) {
+            if let Some(failures) = self.runtime.injected_sync_fetch_failures.get_mut(&device_id) {
+                if !failures.is_empty() {
+                    let retryable = failures.remove(0);
+                    return Ok(vec![CoreEvent::HttpRequestFailed {
+                        request_id: request.request_id,
+                        retryable,
+                        detail: Some(format!("injected sync fetch failure for {device_id}")),
+                    }]);
+                }
+            }
+        }
         let method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
@@ -453,7 +542,21 @@ impl CoreDriver {
         Ok(vec![CoreEvent::WebSocketConnected { device_id }])
     }
 
-    async fn fetch_identity_bundle(&self, fetch: FetchIdentityBundleRequest) -> Result<Vec<CoreEvent>> {
+    async fn fetch_identity_bundle(&mut self, fetch: FetchIdentityBundleRequest) -> Result<Vec<CoreEvent>> {
+        if let Some(failures) = self
+            .runtime
+            .injected_identity_fetch_failures
+            .get_mut(&fetch.user_id)
+        {
+            if !failures.is_empty() {
+                let retryable = failures.remove(0);
+                return Ok(vec![CoreEvent::IdentityBundleFetchFailed {
+                    user_id: fetch.user_id,
+                    retryable,
+                    detail: Some("injected identity fetch failure".into()),
+                }]);
+            }
+        }
         let reference = fetch.reference.ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
         match self.runtime.client.get(reference).send().await {
             Ok(response) if response.status().is_success() => {
@@ -504,8 +607,21 @@ impl CoreDriver {
         }
     }
 
+    async fn read_attachment_bytes(
+        &self,
+        read: tapchat_core::ffi_api::ReadAttachmentBytesEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let bytes = tokio::fs::read(&read.attachment_id).await.context("read attachment bytes")?;
+        Ok(vec![CoreEvent::AttachmentBytesLoaded {
+            task_id: read.task_id,
+            plaintext_b64: STANDARD.encode(bytes),
+        }])
+    }
+
     async fn upload_blob(&self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
-        let bytes = tokio::fs::read(&upload.source_path).await.context("read upload source")?;
+        let bytes = STANDARD
+            .decode(&upload.blob_ciphertext_b64)
+            .context("decode upload blob ciphertext")?;
         let mut request = self.runtime.client.put(upload.upload_target.clone());
         for (key, value) in &upload.upload_headers {
             request = request.header(key, value);
@@ -533,13 +649,8 @@ impl CoreDriver {
         match request.send().await {
             Ok(response) if response.status().is_success() => {
                 let bytes = response.bytes().await?;
-                if let Some(parent) = PathBuf::from(&download.destination_path).parent() {
-                    tokio::fs::create_dir_all(parent).await.ok();
-                }
-                tokio::fs::write(&download.destination_path, &bytes).await?;
                 Ok(vec![CoreEvent::BlobDownloaded {
                     task_id: download.task_id,
-                    destination: download.destination_path,
                     blob_ciphertext: Some(STANDARD.encode(&bytes)),
                 }])
             }
@@ -554,6 +665,20 @@ impl CoreDriver {
                 detail: Some(error.to_string()),
             }]),
         }
+    }
+
+    async fn write_downloaded_attachment(
+        &self,
+        write: tapchat_core::ffi_api::WriteDownloadedAttachmentEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let bytes = STANDARD
+            .decode(&write.plaintext_b64)
+            .context("decode downloaded attachment plaintext")?;
+        if let Some(parent) = PathBuf::from(&write.destination_id).parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        tokio::fs::write(&write.destination_id, &bytes).await?;
+        Ok(Vec::new())
     }
 
     fn persist_state(&mut self, persist: PersistStateEffect) {
@@ -601,6 +726,15 @@ fn parse_realtime_event(device_id: &str, text: &str) -> Result<CoreEvent> {
         device_id: device_id.to_string(),
         event,
     })
+}
+
+fn parse_fetch_device_id(url: &str) -> Option<String> {
+    let path = url.split('?').next()?;
+    let marker = "/v1/inbox/";
+    let start = path.find(marker)? + marker.len();
+    let rest = &path[start..];
+    let end = rest.find("/messages")?;
+    Some(urlencoding::decode(&rest[..end]).ok()?.into_owned())
 }
 
 fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {

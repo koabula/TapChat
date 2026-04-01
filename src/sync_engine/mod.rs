@@ -174,6 +174,27 @@ mod tests {
         assert!(state.pending_records.is_empty());
     }
 
+    #[test]
+    fn duplicate_fetch_and_replay_keep_checkpoint_monotonic() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        let record = sample_record("msg:1", 4);
+
+        let fresh = SyncEngine::register_fetch(&mut state, std::slice::from_ref(&record), 4);
+        assert_eq!(fresh.len(), 1);
+        SyncEngine::store_pending_record(&mut state, &record);
+        let ack = SyncEngine::ack_up_to(&mut state, 4);
+        assert_eq!(ack.ack_seq, 4);
+
+        let duplicate = SyncEngine::register_fetch(&mut state, std::slice::from_ref(&record), 4);
+        assert!(duplicate.is_empty());
+        assert_eq!(state.checkpoint.last_fetched_seq, 4);
+        assert_eq!(state.checkpoint.last_acked_seq, 4);
+
+        SyncEngine::clear_pending_retry(&mut state, 4);
+        assert_eq!(state.checkpoint.last_acked_seq, 4);
+        assert_eq!(state.checkpoint.last_fetched_seq, 4);
+    }
+
     fn sample_record(message_id: &str, seq: u64) -> InboxRecord {
         InboxRecord {
             seq,

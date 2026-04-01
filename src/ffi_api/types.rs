@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::attachment_crypto::AttachmentPayloadMetadata;
+use crate::conversation::RecoveryStatus;
 use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
     Ack, ConversationKind, DeploymentBundle, Envelope, IdentityBundle, InboxRecord, MessageType,
-    MlsStateSummary,
+    MlsStateStatus, MlsStateSummary,
 };
 use crate::persistence::{CorePersistenceSnapshot, PersistOp};
 use crate::sync_engine::DeviceSyncState;
@@ -65,9 +66,10 @@ pub enum CoreEvent {
     HttpRequestFailed { request_id: String, retryable: bool, detail: Option<String> },
     IdentityBundleFetched { user_id: String, bundle: IdentityBundle },
     IdentityBundleFetchFailed { user_id: String, retryable: bool, detail: Option<String> },
+    AttachmentBytesLoaded { task_id: String, plaintext_b64: String },
     BlobUploadPrepared { task_id: String, result: PrepareBlobUploadResult },
     BlobUploaded { task_id: String },
-    BlobDownloaded { task_id: String, destination: String, blob_ciphertext: Option<String> },
+    BlobDownloaded { task_id: String, blob_ciphertext: Option<String> },
     BlobTransferFailed { task_id: String, retryable: bool, detail: Option<String> },
     TimerTriggered { timer_id: String },
     UserConfirmedRebuild { conversation_id: String },
@@ -82,10 +84,23 @@ pub enum RealtimeEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentDescriptor {
-    pub source: String,
+    pub attachment_id: String,
     pub mime_type: String,
     pub size_bytes: u64,
     pub file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadAttachmentBytesEffect {
+    pub task_id: String,
+    pub attachment_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteDownloadedAttachmentEffect {
+    pub task_id: String,
+    pub destination_id: String,
+    pub plaintext_b64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,9 +155,11 @@ pub enum CoreEffect {
     OpenRealtimeConnection { connection: RealtimeConnectionEffect },
     CloseRealtimeConnection { device_id: String },
     FetchIdentityBundle { fetch: FetchIdentityBundleRequest },
+    ReadAttachmentBytes { read: ReadAttachmentBytesEffect },
     PrepareBlobUpload { upload: PrepareBlobUploadRequest },
     UploadBlob { upload: BlobUploadRequest },
     DownloadBlob { download: BlobDownloadRequest },
+    WriteDownloadedAttachment { write: WriteDownloadedAttachmentEffect },
     PersistState { persist: PersistStateEffect },
     ScheduleTimer { timer: TimerEffect },
     EmitUserNotification { notification: UserNotificationEffect },
@@ -177,6 +194,8 @@ pub struct ConversationSummary {
     pub conversation_id: String,
     pub state: String,
     pub last_message_type: Option<MessageType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,10 +259,10 @@ pub(crate) struct PendingBlobUpload {
     pub(crate) task_id: String,
     pub(crate) conversation_id: String,
     pub(crate) descriptor: AttachmentDescriptor,
-    pub(crate) encrypted_source_path: String,
-    pub(crate) payload_metadata: AttachmentPayloadMetadata,
+    pub(crate) blob_ciphertext_b64: Option<String>,
+    pub(crate) payload_metadata: Option<AttachmentPayloadMetadata>,
     pub(crate) message_id: String,
-    pub(crate) metadata_ciphertext: String,
+    pub(crate) metadata_ciphertext: Option<String>,
     pub(crate) prepared_upload: Option<PrepareBlobUploadResult>,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
@@ -255,7 +274,7 @@ pub(crate) struct PendingBlobDownload {
     pub(crate) conversation_id: String,
     pub(crate) message_id: String,
     pub(crate) reference: String,
-    pub(crate) destination: String,
+    pub(crate) destination_id: String,
     pub(crate) payload_metadata: AttachmentPayloadMetadata,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
@@ -300,20 +319,61 @@ pub(crate) enum PendingRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum RecoveryReason {
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryReason {
     MissingCommit,
     MissingWelcome,
     MembershipChanged,
     IdentityChanged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhase {
+    WaitingForSync,
+    WaitingForPendingReplay,
+    WaitingForIdentityRefresh,
+    WaitingForExplicitReconcile,
+    EscalatedToRebuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryEscalationReason {
+    MlsMarkedUnrecoverable,
+    IdentityRefreshRetryExhausted,
+    ExplicitNeedsRebuildControl,
+    RecoveryPolicyExhausted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecoveryContext {
     pub(crate) conversation_id: String,
     pub(crate) reason: RecoveryReason,
-    pub(crate) sync_attempted: bool,
-    pub(crate) identity_refresh_attempted: bool,
+    pub(crate) phase: RecoveryPhase,
+    pub(crate) attempt_count: u8,
     pub(crate) identity_refresh_retry_count: u8,
+    pub(crate) last_error: Option<String>,
+    pub(crate) escalation_reason: Option<RecoveryEscalationReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryDiagnostics {
+    pub conversation_id: String,
+    pub recovery_status: RecoveryStatus,
+    pub reason: RecoveryReason,
+    pub phase: RecoveryPhase,
+    pub attempt_count: u8,
+    pub identity_refresh_retry_count: u8,
+    pub pending_record_count: usize,
+    pub pending_record_seqs: Vec<u64>,
+    pub last_fetched_seq: u64,
+    pub last_acked_seq: u64,
+    pub mls_status: Option<MlsStateStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_reason: Option<RecoveryEscalationReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 impl Default for CoreState {

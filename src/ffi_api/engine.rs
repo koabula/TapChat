@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use crate::attachment_crypto::{
-    AttachmentPayloadMetadata, decrypt_blob, encrypt_blob, write_ciphertext_temp,
-};
+use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
@@ -22,6 +19,7 @@ use crate::model::{
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
     PersistedDeployment, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    PersistedRecoveryEscalationReason, PersistedRecoveryPhase,
     PersistedPendingAck, PersistedPendingBlobTransfer, PersistedRealtimeSession,
     PersistedRecoveryContext, PersistedRecoveryReason, PersistedSyncState,
 };
@@ -36,6 +34,30 @@ use crate::transport_contract::{
 #[derive(Debug, Default)]
 pub struct CoreEngine {
     pub(crate) state: CoreState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryContextSnapshot {
+    pub reason: RecoveryReason,
+    pub phase: RecoveryPhase,
+    pub attempt_count: u8,
+    pub identity_refresh_retry_count: u8,
+    pub last_error: Option<String>,
+    pub escalation_reason: Option<RecoveryEscalationReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCheckpointSnapshot {
+    pub last_fetched_seq: u64,
+    pub last_acked_seq: u64,
+    pub pending_retry: bool,
+    pub pending_record_seqs: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealtimeSessionSnapshot {
+    pub last_known_seq: u64,
+    pub needs_reconnect: bool,
 }
 
 impl CoreEngine {
@@ -59,8 +81,48 @@ impl CoreEngine {
         self.state.conversations.get(conversation_id)
     }
 
+    pub fn mls_summary(&self, conversation_id: &str) -> Option<&MlsStateSummary> {
+        self.state.mls_summaries.get(conversation_id)
+    }
+
     pub fn sync_state(&self, device_id: &str) -> Option<&crate::sync_engine::DeviceSyncState> {
         self.state.sync_states.get(device_id)
+    }
+
+    pub fn recovery_context_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Option<RecoveryContextSnapshot> {
+        self.state
+            .recovery_contexts
+            .get(conversation_id)
+            .map(|context| RecoveryContextSnapshot {
+                reason: context.reason,
+                phase: context.phase,
+                attempt_count: context.attempt_count,
+                identity_refresh_retry_count: context.identity_refresh_retry_count,
+                last_error: context.last_error.clone(),
+                escalation_reason: context.escalation_reason,
+            })
+    }
+
+    pub fn sync_checkpoint_snapshot(&self, device_id: &str) -> Option<SyncCheckpointSnapshot> {
+        self.state.sync_states.get(device_id).map(|state| SyncCheckpointSnapshot {
+            last_fetched_seq: state.checkpoint.last_fetched_seq,
+            last_acked_seq: state.checkpoint.last_acked_seq,
+            pending_retry: state.pending_retry,
+            pending_record_seqs: state.pending_record_seqs.iter().copied().collect(),
+        })
+    }
+
+    pub fn realtime_session_snapshot(&self, device_id: &str) -> Option<RealtimeSessionSnapshot> {
+        self.state
+            .realtime_sessions
+            .get(device_id)
+            .map(|session| RealtimeSessionSnapshot {
+                last_known_seq: session.last_known_seq,
+                needs_reconnect: session.needs_reconnect,
+            })
     }
 
     pub fn local_device_id(&self) -> Option<&str> {
@@ -140,8 +202,8 @@ impl CoreEngine {
                     task_id,
                     conversation_id,
                     message_id,
-                    source,
-                    encrypted_source_path,
+                    attachment_id,
+                    blob_ciphertext_b64,
                     payload_metadata,
                     mime_type,
                     size_bytes,
@@ -156,12 +218,12 @@ impl CoreEngine {
                             task_id,
                             conversation_id,
                             descriptor: AttachmentDescriptor {
-                                source,
+                                attachment_id,
                                 mime_type,
                                 size_bytes,
                                 file_name,
                             },
-                            encrypted_source_path,
+                            blob_ciphertext_b64,
                             payload_metadata,
                             message_id,
                             metadata_ciphertext,
@@ -176,7 +238,7 @@ impl CoreEngine {
                     conversation_id,
                     message_id,
                     reference,
-                    destination,
+                    destination_id,
                     payload_metadata,
                     retries,
                 } => {
@@ -187,7 +249,7 @@ impl CoreEngine {
                             conversation_id,
                             message_id,
                             reference,
-                            destination,
+                            destination_id,
                             payload_metadata,
                             retries,
                             in_flight: false,
@@ -232,9 +294,38 @@ impl CoreEngine {
                                 RecoveryReason::IdentityChanged
                             }
                         },
-                        sync_attempted: context.sync_attempted,
-                        identity_refresh_attempted: context.identity_refresh_attempted,
+                        phase: match context.phase {
+                            PersistedRecoveryPhase::WaitingForSync => RecoveryPhase::WaitingForSync,
+                            PersistedRecoveryPhase::WaitingForPendingReplay => {
+                                RecoveryPhase::WaitingForPendingReplay
+                            }
+                            PersistedRecoveryPhase::WaitingForIdentityRefresh => {
+                                RecoveryPhase::WaitingForIdentityRefresh
+                            }
+                            PersistedRecoveryPhase::WaitingForExplicitReconcile => {
+                                RecoveryPhase::WaitingForExplicitReconcile
+                            }
+                            PersistedRecoveryPhase::EscalatedToRebuild => {
+                                RecoveryPhase::EscalatedToRebuild
+                            }
+                        },
+                        attempt_count: context.attempt_count,
                         identity_refresh_retry_count: context.identity_refresh_retry_count,
+                        last_error: context.last_error,
+                        escalation_reason: context.escalation_reason.map(|reason| match reason {
+                            PersistedRecoveryEscalationReason::MlsMarkedUnrecoverable => {
+                                RecoveryEscalationReason::MlsMarkedUnrecoverable
+                            }
+                            PersistedRecoveryEscalationReason::IdentityRefreshRetryExhausted => {
+                                RecoveryEscalationReason::IdentityRefreshRetryExhausted
+                            }
+                            PersistedRecoveryEscalationReason::ExplicitNeedsRebuildControl => {
+                                RecoveryEscalationReason::ExplicitNeedsRebuildControl
+                            }
+                            PersistedRecoveryEscalationReason::RecoveryPolicyExhausted => {
+                                RecoveryEscalationReason::RecoveryPolicyExhausted
+                            }
+                        }),
                     },
                 )
             })
@@ -293,7 +384,18 @@ impl CoreEngine {
                 summary.status = MlsStateStatus::NeedsRebuild;
                 summary.updated_at = 0;
             }
-            engine.state.recovery_contexts.remove(&conversation_id);
+            engine.state.recovery_contexts.insert(
+                conversation_id.clone(),
+                RecoveryContext {
+                    conversation_id,
+                    reason: RecoveryReason::MissingCommit,
+                    phase: RecoveryPhase::EscalatedToRebuild,
+                    attempt_count: 0,
+                    identity_refresh_retry_count: MAX_TRANSPORT_RETRIES,
+                    last_error: Some("failed to restore MLS group state".into()),
+                    escalation_reason: Some(RecoveryEscalationReason::MlsMarkedUnrecoverable),
+                },
+            );
         }
 
         engine
@@ -377,14 +479,17 @@ impl CoreEngine {
                     }
                 }),
             ),
+            CoreEvent::AttachmentBytesLoaded { task_id, plaintext_b64 } => {
+                self.handle_attachment_bytes_loaded(task_id, plaintext_b64)
+            }
             CoreEvent::BlobUploadPrepared { task_id, result } => {
                 self.handle_blob_upload_prepared(task_id, result)
             }
             CoreEvent::BlobUploaded { task_id } => {
                 self.handle_blob_uploaded(task_id)
             }
-            CoreEvent::BlobDownloaded { task_id, destination, blob_ciphertext } => {
-                self.handle_blob_downloaded(task_id, destination, blob_ciphertext)
+            CoreEvent::BlobDownloaded { task_id, blob_ciphertext } => {
+                self.handle_blob_downloaded(task_id, blob_ciphertext)
             }
             CoreEvent::BlobTransferFailed { task_id, retryable, detail } => {
                 self.handle_blob_transfer_failed(task_id, retryable, detail)
@@ -453,6 +558,10 @@ impl CoreEngine {
         };
         for conversation_id in affected_conversations {
             self.mark_recovery_needed(&conversation_id, RecoveryReason::IdentityChanged);
+            self.transition_recovery_phase(
+                &conversation_id,
+                RecoveryPhase::WaitingForExplicitReconcile,
+            );
             output = merge_outputs(output, self.reconcile_conversation_membership(conversation_id)?);
         }
         if let Some(device_id) = self
@@ -711,6 +820,7 @@ impl CoreEngine {
                     conversation_id,
                     state: "active".into(),
                     last_message_type: Some(MessageType::MlsCommit),
+                    recovery: None,
                 }],
                 messages: generated
                     .iter()
@@ -791,32 +901,6 @@ impl CoreEngine {
         self.ensure_conversation_ready_for_send(&conversation_id)?;
         let message_nonce = self.next_message_nonce();
         let message_id = self.next_message_id(&conversation_id, "attachment", message_nonce);
-        let plaintext = fs::read(&attachment_descriptor.source).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to read attachment source {}: {error}",
-                attachment_descriptor.source
-            ))
-        })?;
-        let encrypted = encrypt_blob(&plaintext)?;
-        let encrypted_source_path = write_ciphertext_temp(&message_id, &encrypted.ciphertext)?;
-        let payload_metadata = AttachmentPayloadMetadata {
-            mime_type: attachment_descriptor.mime_type.clone(),
-            size_bytes: attachment_descriptor.size_bytes,
-            file_name: attachment_descriptor.file_name.clone(),
-            encryption: encrypted.metadata,
-        };
-        let metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to encode attachment payload metadata: {error}"
-            ))
-        })?;
-        let metadata_ciphertext = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&conversation_id, metadata_json.as_bytes())?
-            .payload_b64;
         let task_id = format!("blob-upload:{message_id}");
         self.state.pending_blob_uploads.insert(
             task_id.clone(),
@@ -824,10 +908,10 @@ impl CoreEngine {
                 task_id: task_id.clone(),
                 conversation_id: conversation_id.clone(),
                 descriptor: attachment_descriptor.clone(),
-                encrypted_source_path,
-                payload_metadata,
+                blob_ciphertext_b64: None,
+                payload_metadata: None,
                 message_id: message_id.clone(),
-                metadata_ciphertext,
+                metadata_ciphertext: None,
                 prepared_upload: None,
                 retries: 0,
                 in_flight: false,
@@ -881,20 +965,34 @@ impl CoreEngine {
                     "failed to decode attachment payload metadata: {error}"
                 ))
             })?;
+        let task_id = format!("blob-download:{message_id}");
         self.state.pending_blob_downloads.insert(
-            format!("blob-download:{message_id}"),
+            task_id.clone(),
             PendingBlobDownload {
-                task_id: format!("blob-download:{message_id}"),
+                task_id: task_id.clone(),
                 conversation_id,
                 message_id,
                 reference,
-                destination,
+                destination_id: destination,
                 payload_metadata,
                 retries: 0,
                 in_flight: false,
             },
         );
-        self.flush_pending_transport()
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    messages_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SavePendingBlobTransfer { task_id }],
+                )],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        ))
     }
 
     fn reconcile_conversation_membership(&mut self, conversation_id: String) -> CoreResult<CoreOutput> {
@@ -1142,6 +1240,12 @@ impl CoreEngine {
             .entry(device_id.clone())
             .or_insert_with(|| SyncEngine::new_device_state(&device_id));
         let last_acked_seq = sync_state.checkpoint.last_acked_seq;
+        for context in self.state.recovery_contexts.values_mut() {
+            if context.phase == RecoveryPhase::WaitingForSync {
+                context.phase = RecoveryPhase::WaitingForPendingReplay;
+                context.attempt_count = context.attempt_count.saturating_add(1);
+            }
+        }
         self.state.realtime_sessions.entry(device_id.clone()).or_default();
         let request_id = self.next_request_id(&format!("get_head:{device_id}"));
         self.state.pending_requests.insert(
@@ -1221,6 +1325,14 @@ impl CoreEngine {
     }
 
     fn refresh_identity_state(&mut self, user_id: String) -> CoreResult<CoreOutput> {
+        for conversation_id in self.affected_conversations_for_peer(&user_id) {
+            if let Some(context) = self.state.recovery_contexts.get_mut(&conversation_id) {
+                if context.phase == RecoveryPhase::WaitingForIdentityRefresh {
+                    context.attempt_count = context.attempt_count.saturating_add(1);
+                    context.last_error = None;
+                }
+            }
+        }
         let bundle = self
             .state
             .contacts
@@ -1271,7 +1383,12 @@ impl CoreEngine {
             adapter.mark_needs_rebuild(&conversation_id);
             adapter.clear_conversation(&conversation_id);
         }
-        self.state.recovery_contexts.remove(&conversation_id);
+        self.ensure_recovery_context(&conversation_id, RecoveryReason::IdentityChanged);
+        self.transition_recovery_phase(&conversation_id, RecoveryPhase::EscalatedToRebuild);
+        if let Some(context) = self.state.recovery_contexts.get_mut(&conversation_id) {
+            context.escalation_reason
+                .get_or_insert(RecoveryEscalationReason::RecoveryPolicyExhausted);
+        }
         self.state.mls_summaries.insert(
             conversation_id.clone(),
             MlsStateSummary {
@@ -1301,9 +1418,10 @@ impl CoreEngine {
             )],
             view_model: Some(CoreViewModel {
                 conversations: vec![ConversationSummary {
-                    conversation_id,
+                    conversation_id: conversation_id.clone(),
                     state: "needs_rebuild".into(),
                     last_message_type,
+                    recovery: self.recovery_snapshot_for_conversation(&conversation_id),
                 }],
                 ..CoreViewModel::default()
             }),
@@ -1432,6 +1550,21 @@ impl CoreEngine {
             return self.sync_inbox(device_id.to_string());
         }
         if let Some(user_id) = timer_id.strip_prefix("refresh_identity:") {
+            let has_pending_recovery = self
+                .affected_conversations_for_peer(user_id)
+                .into_iter()
+                .any(|conversation_id| {
+                    self.state
+                        .recovery_contexts
+                        .get(&conversation_id)
+                        .map(|context| {
+                            context.phase == RecoveryPhase::WaitingForIdentityRefresh
+                        })
+                        .unwrap_or(false)
+                });
+            if !has_pending_recovery {
+                return Ok(CoreOutput::default());
+            }
             return self.refresh_identity_state(user_id.to_string());
         }
         if let Some(message_id) = timer_id.strip_prefix("retry_append:") {
@@ -1610,24 +1743,98 @@ impl CoreEngine {
         Ok(())
     }
 
-    fn mark_recovery_needed(&mut self, conversation_id: &str, reason: RecoveryReason) {
+    fn ensure_recovery_context(
+        &mut self,
+        conversation_id: &str,
+        reason: RecoveryReason,
+    ) -> &mut RecoveryContext {
         self.state
             .recovery_contexts
             .entry(conversation_id.to_string())
-            .and_modify(|context| context.reason = reason)
+            .and_modify(|context| {
+                context.reason = reason;
+                if matches!(
+                    context.phase,
+                    RecoveryPhase::EscalatedToRebuild | RecoveryPhase::WaitingForExplicitReconcile
+                ) {
+                    return;
+                }
+                if matches!(reason, RecoveryReason::MissingCommit)
+                    && matches!(context.phase, RecoveryPhase::WaitingForSync)
+                {
+                    context.phase = RecoveryPhase::WaitingForPendingReplay;
+                }
+            })
             .or_insert(RecoveryContext {
                 conversation_id: conversation_id.to_string(),
                 reason,
-                sync_attempted: false,
-                identity_refresh_attempted: false,
+                phase: RecoveryPhase::WaitingForSync,
+                attempt_count: 0,
                 identity_refresh_retry_count: 0,
-            });
+                last_error: None,
+                escalation_reason: None,
+            })
+    }
+
+    fn mark_recovery_needed(&mut self, conversation_id: &str, reason: RecoveryReason) {
+        let context = self.ensure_recovery_context(conversation_id, reason);
+        if matches!(reason, RecoveryReason::MissingCommit)
+            && matches!(context.phase, RecoveryPhase::WaitingForSync)
+        {
+            context.phase = RecoveryPhase::WaitingForPendingReplay;
+        }
         if let Some(state) = self.state.conversations.get_mut(conversation_id) {
             state.recovery_status = RecoveryStatus::NeedsRecovery;
         }
         if let Some(adapter) = self.state.mls_adapter.as_mut() {
             adapter.mark_recovery_needed(conversation_id);
         }
+    }
+
+    fn transition_recovery_phase(&mut self, conversation_id: &str, next_phase: RecoveryPhase) {
+        if let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) {
+            if context.phase != next_phase {
+                context.phase = next_phase;
+                context.attempt_count = context.attempt_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn clear_recovery_context_as_healthy(&mut self, conversation_id: &str) {
+        self.state.recovery_contexts.remove(conversation_id);
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            if state.conversation.state != ConversationState::NeedsRebuild {
+                state.recovery_status = RecoveryStatus::Healthy;
+            }
+        }
+    }
+
+    fn escalate_conversation_to_rebuild(
+        &mut self,
+        conversation_id: &str,
+        escalation_reason: RecoveryEscalationReason,
+        message: impl Into<String>,
+    ) -> CoreResult<CoreOutput> {
+        let message = message.into();
+        if let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) {
+            context.phase = RecoveryPhase::EscalatedToRebuild;
+            context.escalation_reason = Some(escalation_reason);
+            context.last_error = Some(message.clone());
+        } else {
+            self.state.recovery_contexts.insert(
+                conversation_id.to_string(),
+                RecoveryContext {
+                    conversation_id: conversation_id.to_string(),
+                    reason: RecoveryReason::IdentityChanged,
+                    phase: RecoveryPhase::EscalatedToRebuild,
+                    attempt_count: 0,
+                    identity_refresh_retry_count: MAX_TRANSPORT_RETRIES,
+                    last_error: Some(message.clone()),
+                    escalation_reason: Some(escalation_reason),
+                },
+            );
+        }
+        self.rebuild_conversation(conversation_id.to_string())
     }
 
     fn build_envelope(
@@ -1680,6 +1887,47 @@ impl CoreEngine {
                 RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
             },
             last_message_type: conversation.last_message_type,
+            recovery: self.recovery_snapshot_for_conversation(conversation_id),
+        })
+    }
+
+    fn recovery_snapshot_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Option<RecoveryDiagnostics> {
+        let conversation = self.state.conversations.get(conversation_id)?;
+        if conversation.recovery_status == RecoveryStatus::Healthy {
+            return None;
+        }
+        let context = self.state.recovery_contexts.get(conversation_id);
+        let local_device_id = self.local_device_id()?;
+        let sync_state = self.state.sync_states.get(local_device_id);
+        Some(RecoveryDiagnostics {
+            conversation_id: conversation_id.to_string(),
+            recovery_status: conversation.recovery_status,
+            reason: context
+                .map(|value| value.reason)
+                .unwrap_or(RecoveryReason::MembershipChanged),
+            phase: context
+                .map(|value| value.phase)
+                .unwrap_or(RecoveryPhase::EscalatedToRebuild),
+            attempt_count: context.map(|value| value.attempt_count).unwrap_or(0),
+            identity_refresh_retry_count: context
+                .map(|value| value.identity_refresh_retry_count)
+                .unwrap_or(0),
+            pending_record_count: sync_state.map(|value| value.pending_records.len()).unwrap_or(0),
+            pending_record_seqs: sync_state
+                .map(|value| value.pending_record_seqs.iter().copied().collect())
+                .unwrap_or_default(),
+            last_fetched_seq: sync_state
+                .map(|value| value.checkpoint.last_fetched_seq)
+                .unwrap_or(0),
+            last_acked_seq: sync_state
+                .map(|value| value.checkpoint.last_acked_seq)
+                .unwrap_or(0),
+            mls_status: self.state.mls_summaries.get(conversation_id).map(|value| value.status),
+            escalation_reason: context.and_then(|value| value.escalation_reason),
+            last_error: context.and_then(|value| value.last_error.clone()),
         })
     }
 
@@ -1842,24 +2090,40 @@ impl CoreEngine {
             if task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
                 continue;
             }
-            if let Some(prepared) = &task.prepared_upload {
+            if task.blob_ciphertext_b64.is_none() {
+                effects.push(CoreEffect::ReadAttachmentBytes {
+                    read: ReadAttachmentBytesEffect {
+                        task_id: task.task_id.clone(),
+                        attachment_id: task.descriptor.attachment_id.clone(),
+                    },
+                });
+            } else if let Some(prepared) = &task.prepared_upload {
                 effects.push(CoreEffect::UploadBlob {
                     upload: BlobUploadRequest {
                         task_id: task.task_id.clone(),
-                        source_path: task.encrypted_source_path.clone(),
+                        blob_ciphertext_b64: task
+                            .blob_ciphertext_b64
+                            .clone()
+                            .unwrap_or_default(),
                         upload_target: prepared.upload_target.clone(),
                         upload_headers: prepared.upload_headers.clone(),
                         blob_ref: prepared.blob_ref.clone(),
                     },
                 });
             } else {
+                let size_bytes = task
+                    .blob_ciphertext_b64
+                    .as_ref()
+                    .and_then(|value| STANDARD.decode(value).ok())
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or(task.descriptor.size_bytes);
                 effects.push(CoreEffect::PrepareBlobUpload {
                     upload: PrepareBlobUploadRequest {
                         task_id: task.task_id.clone(),
                         conversation_id: task.conversation_id.clone(),
                         message_id: task.message_id.clone(),
                         mime_type: task.descriptor.mime_type.clone(),
-                        size_bytes: task.descriptor.size_bytes,
+                        size_bytes,
                         file_name: task.descriptor.file_name.clone(),
                         headers: headers.clone(),
                     },
@@ -1894,7 +2158,6 @@ impl CoreEngine {
                     task_id: task.task_id.clone(),
                     blob_ref: task.reference.clone(),
                     download_target: task.reference.clone(),
-                    destination_path: task.destination.clone(),
                     download_headers: BTreeMap::new(),
                 },
             });
@@ -2242,7 +2505,19 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
         task.prepared_upload = Some(result);
         task.in_flight = false;
-        self.flush_pending_transport()
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SavePendingBlobTransfer {
+                        task_id: task_id.clone(),
+                    }],
+                )],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        ))
     }
 
     fn handle_blob_uploaded(&mut self, task_id: String) -> CoreResult<CoreOutput> {
@@ -2266,29 +2541,111 @@ impl CoreEngine {
                 &task.conversation_id,
                 &recipient,
                 MessageType::MlsApplication,
-                task.metadata_ciphertext.clone(),
+                task.metadata_ciphertext.clone().ok_or_else(|| {
+                    CoreError::invalid_state("blob upload completed before metadata ciphertext was prepared")
+                })?,
             )?;
             envelope.storage_refs.push(StorageRef {
                 kind: "attachment".into(),
                 object_ref: final_ref.clone(),
-                size_bytes: fs::metadata(&task.encrypted_source_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(task.payload_metadata.size_bytes),
+                size_bytes: task
+                    .blob_ciphertext_b64
+                    .as_ref()
+                    .and_then(|value| STANDARD.decode(value).ok())
+                    .map(|bytes| bytes.len() as u64)
+                    .or_else(|| task.payload_metadata.as_ref().map(|metadata| metadata.size_bytes))
+                    .unwrap_or(task.descriptor.size_bytes),
                 mime_type: "application/octet-stream".into(),
                 expires_at: prepared.expires_at,
             });
             envelopes.push(envelope);
         }
         self.enqueue_envelopes(peer_user_id, envelopes);
-        self.flush_pending_transport()
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::DeletePendingBlobTransfer { task_id }],
+                )],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        ))
+    }
+
+    fn handle_attachment_bytes_loaded(
+        &mut self,
+        task_id: String,
+        plaintext_b64: String,
+    ) -> CoreResult<CoreOutput> {
+        let plaintext = STANDARD.decode(&plaintext_b64).map_err(|error| {
+            CoreError::invalid_input(format!(
+                "attachment plaintext bytes were not valid base64: {error}"
+            ))
+        })?;
+        let (conversation_id, mime_type, size_bytes, file_name) = {
+            let task = self
+                .state
+                .pending_blob_uploads
+                .get(&task_id)
+                .ok_or_else(|| CoreError::invalid_input("pending blob upload task not found"))?;
+            (
+                task.conversation_id.clone(),
+                task.descriptor.mime_type.clone(),
+                task.descriptor.size_bytes,
+                task.descriptor.file_name.clone(),
+            )
+        };
+        let encrypted = encrypt_blob(&plaintext)?;
+        let payload_metadata = AttachmentPayloadMetadata {
+            mime_type,
+            size_bytes,
+            file_name,
+            encryption: encrypted.metadata,
+        };
+        let metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
+            CoreError::invalid_input(format!(
+                "failed to encode attachment payload metadata: {error}"
+            ))
+        })?;
+        let metadata_ciphertext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&conversation_id, metadata_json.as_bytes())?
+            .payload_b64;
+        let task = self
+            .state
+            .pending_blob_uploads
+            .get_mut(&task_id)
+            .ok_or_else(|| CoreError::invalid_input("pending blob upload task not found"))?;
+        task.blob_ciphertext_b64 = Some(STANDARD.encode(encrypted.ciphertext));
+        task.payload_metadata = Some(payload_metadata);
+        task.metadata_ciphertext = Some(metadata_ciphertext);
+        task.in_flight = false;
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SavePendingBlobTransfer {
+                        task_id: task_id.clone(),
+                    }],
+                )],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        ))
     }
 
     fn handle_blob_downloaded(
         &mut self,
         task_id: String,
-        destination: String,
         blob_ciphertext: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        let mut effects = Vec::new();
         if let Some(task) = self.state.pending_blob_downloads.remove(&task_id) {
             if let Some(blob_ciphertext) = blob_ciphertext {
                 let ciphertext = STANDARD.decode(&blob_ciphertext).map_err(|error| {
@@ -2297,12 +2654,13 @@ impl CoreEngine {
                     ))
                 })?;
                 let plaintext = decrypt_blob(&ciphertext, &task.payload_metadata.encryption)?;
-                fs::write(&destination, &plaintext).map_err(|error| {
-                    CoreError::invalid_state(format!(
-                        "failed to write decrypted attachment {}: {error}",
-                        destination
-                    ))
-                })?;
+                effects.push(CoreEffect::WriteDownloadedAttachment {
+                    write: WriteDownloadedAttachmentEffect {
+                        task_id: task.task_id.clone(),
+                        destination_id: task.destination_id.clone(),
+                        plaintext_b64: STANDARD.encode(&plaintext),
+                    },
+                });
                 if let Some(state) = self.state.conversations.get_mut(&task.conversation_id) {
                     if let Some(message) = state
                         .messages
@@ -2319,7 +2677,14 @@ impl CoreEngine {
                 messages_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects: vec![],
+            effects: {
+                let mut effects = effects;
+                effects.push(persist_effect(
+                    &self.state,
+                    vec![PersistOp::DeletePendingBlobTransfer { task_id }],
+                ));
+                effects
+            },
             view_model: None,
         })
     }
@@ -2496,12 +2861,7 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
-                                self.state.recovery_contexts.remove(&conversation_id);
-                                if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
-                                    if state.conversation.state != ConversationState::NeedsRebuild {
-                                        state.recovery_status = RecoveryStatus::Healthy;
-                                    }
-                                }
+                                self.clear_recovery_context_as_healthy(&conversation_id);
                                 ackable = true;
                             }
                             IngestResult::AppliedCommit { .. } => {
@@ -2518,14 +2878,7 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
-                                self.state.recovery_contexts.remove(&conversation_id);
-                                if let Some(state) =
-                                    self.state.conversations.get_mut(&conversation_id)
-                                {
-                                    if state.conversation.state != ConversationState::NeedsRebuild {
-                                        state.recovery_status = RecoveryStatus::Healthy;
-                                    }
-                                }
+                                self.clear_recovery_context_as_healthy(&conversation_id);
                                 ackable = true;
                             }
                             IngestResult::AppliedWelcome { .. } => {
@@ -2546,14 +2899,7 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
-                                self.state.recovery_contexts.remove(&conversation_id);
-                                if let Some(state) =
-                                    self.state.conversations.get_mut(&conversation_id)
-                                {
-                                    if state.conversation.state != ConversationState::NeedsRebuild {
-                                        state.recovery_status = RecoveryStatus::Healthy;
-                                    }
-                                }
+                                self.clear_recovery_context_as_healthy(&conversation_id);
                                 ackable = true;
                             }
                             IngestResult::PendingRetry => {
@@ -2567,6 +2913,10 @@ impl CoreEngine {
                                     SyncEngine::store_pending_record(sync_state, &record);
                                 }
                                 self.mark_recovery_needed(&conversation_id, reason);
+                                self.transition_recovery_phase(
+                                    &conversation_id,
+                                    RecoveryPhase::WaitingForPendingReplay,
+                                );
                                 output = merge_outputs(
                                     output,
                                     self.advance_recovery(&conversation_id)?,
@@ -2575,7 +2925,11 @@ impl CoreEngine {
                             IngestResult::NeedsRebuild => {
                                 output = merge_outputs(
                                     output,
-                                    self.rebuild_conversation(conversation_id.clone())?,
+                                    self.escalate_conversation_to_rebuild(
+                                        &conversation_id,
+                                        RecoveryEscalationReason::MlsMarkedUnrecoverable,
+                                        "MLS marked conversation unrecoverable",
+                                    )?,
                                 );
                             }
                         }
@@ -2596,7 +2950,11 @@ impl CoreEngine {
                         if apply_effect.needs_rebuild {
                             output = merge_outputs(
                                 output,
-                                self.rebuild_conversation(conversation_id.clone())?,
+                                self.escalate_conversation_to_rebuild(
+                                    &conversation_id,
+                                    RecoveryEscalationReason::ExplicitNeedsRebuildControl,
+                                    "conversation received explicit rebuild control message",
+                                )?,
                             );
                         }
                     }
@@ -2703,28 +3061,21 @@ impl CoreEngine {
     fn advance_recovery(&mut self, conversation_id: &str) -> CoreResult<CoreOutput> {
         enum RecoveryAction {
             Sync,
+            ReplayPending,
             RefreshIdentity,
-            Rebuild,
+            Reconcile,
         }
 
         let Some(action) = ({
-            let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) else {
+            let Some(context) = self.state.recovery_contexts.get(conversation_id) else {
                 return Ok(CoreOutput::default());
             };
-            if !context.sync_attempted {
-                context.sync_attempted = true;
-                Some(RecoveryAction::Sync)
-            } else if matches!(
-                context.reason,
-                RecoveryReason::MissingWelcome
-                    | RecoveryReason::MembershipChanged
-                    | RecoveryReason::IdentityChanged
-            ) && !context.identity_refresh_attempted
-            {
-                context.identity_refresh_attempted = true;
-                Some(RecoveryAction::RefreshIdentity)
-            } else {
-                Some(RecoveryAction::Rebuild)
+            match context.phase {
+                RecoveryPhase::WaitingForSync => Some(RecoveryAction::Sync),
+                RecoveryPhase::WaitingForPendingReplay => Some(RecoveryAction::ReplayPending),
+                RecoveryPhase::WaitingForIdentityRefresh => Some(RecoveryAction::RefreshIdentity),
+                RecoveryPhase::WaitingForExplicitReconcile => Some(RecoveryAction::Reconcile),
+                RecoveryPhase::EscalatedToRebuild => None,
             }
         }) else {
             return Ok(CoreOutput::default());
@@ -2732,21 +3083,42 @@ impl CoreEngine {
 
         match action {
             RecoveryAction::Sync => {
+                self.transition_recovery_phase(
+                    conversation_id,
+                    RecoveryPhase::WaitingForPendingReplay,
+                );
                 let device_id = self
-                .state
-                .local_identity
-                .as_ref()
-                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-                .device_identity
-                .device_id
-                .clone();
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+                    .device_identity
+                    .device_id
+                    .clone();
                 self.sync_inbox(device_id)
             }
+            RecoveryAction::ReplayPending => {
+                let device_id = self
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+                    .device_identity
+                    .device_id
+                    .clone();
+                self.replay_pending_records_for_device(device_id)
+            }
             RecoveryAction::RefreshIdentity => {
+                self.transition_recovery_phase(
+                    conversation_id,
+                    RecoveryPhase::WaitingForIdentityRefresh,
+                );
                 let user_id = self.peer_user_for_conversation(conversation_id)?;
                 self.refresh_identity_state(user_id)
             }
-            RecoveryAction::Rebuild => self.rebuild_conversation(conversation_id.to_string()),
+            RecoveryAction::Reconcile => self.reconcile_conversation_membership(
+                conversation_id.to_string(),
+            ),
         }
     }
 
@@ -2877,31 +3249,6 @@ impl CoreEngine {
         }
     }
 
-    fn rebuild_affected_conversations_for_peer(
-        &mut self,
-        peer_user_id: &str,
-        message: String,
-    ) -> CoreResult<CoreOutput> {
-        let mut output = CoreOutput {
-            state_update: CoreStateUpdate {
-                conversations_changed: true,
-                system_statuses_changed: vec![SystemStatus::ConversationNeedsRebuild],
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![CoreEffect::EmitUserNotification {
-                notification: UserNotificationEffect {
-                    status: SystemStatus::ConversationNeedsRebuild,
-                    message,
-                },
-            }],
-            view_model: None,
-        };
-        for conversation_id in self.affected_conversations_for_peer(peer_user_id) {
-            output = merge_outputs(output, self.rebuild_conversation(conversation_id)?);
-        }
-        Ok(output)
-    }
-
     fn handle_identity_refresh_failure(
         &mut self,
         user_id: &str,
@@ -2911,9 +3258,12 @@ impl CoreEngine {
         let mut should_retry = false;
         for conversation_id in &affected_conversations {
             if let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) {
-                context.identity_refresh_attempted = true;
-                context.identity_refresh_retry_count =
-                    context.identity_refresh_retry_count.saturating_add(1);
+                if context.identity_refresh_retry_count < MAX_TRANSPORT_RETRIES {
+                    context.identity_refresh_retry_count =
+                        context.identity_refresh_retry_count.saturating_add(1);
+                }
+                context.phase = RecoveryPhase::WaitingForIdentityRefresh;
+                context.last_error = Some(message.clone());
                 if context.identity_refresh_retry_count < MAX_TRANSPORT_RETRIES {
                     should_retry = true;
                 }
@@ -2935,7 +3285,18 @@ impl CoreEngine {
                 view_model: None,
             })
         } else {
-            self.rebuild_affected_conversations_for_peer(user_id, message)
+            let mut output = CoreOutput::default();
+            for conversation_id in affected_conversations {
+                output = merge_outputs(
+                    output,
+                    self.escalate_conversation_to_rebuild(
+                        &conversation_id,
+                        RecoveryEscalationReason::IdentityRefreshRetryExhausted,
+                        message.clone(),
+                    )?,
+                );
+            }
+            Ok(output)
         }
     }
 
@@ -2954,7 +3315,25 @@ impl CoreEngine {
             records
         };
         let to_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
-        self.handle_inbox_records(device_id, records, to_seq)
+        let output = self.handle_inbox_records(device_id.clone(), records, to_seq)?;
+        let pending_retry = self
+            .state
+            .sync_states
+            .get(&device_id)
+            .map(|state| state.pending_retry)
+            .unwrap_or(false);
+        let next_phase = if pending_retry {
+            RecoveryPhase::WaitingForPendingReplay
+        } else {
+            RecoveryPhase::WaitingForIdentityRefresh
+        };
+        let recovery_ids: Vec<String> = self.state.recovery_contexts.keys().cloned().collect();
+        for conversation_id in recovery_ids {
+            if self.state.conversations.contains_key(&conversation_id) {
+                self.transition_recovery_phase(&conversation_id, next_phase);
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -3053,8 +3432,8 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 task_id: task.task_id.clone(),
                 conversation_id: task.conversation_id.clone(),
                 message_id: task.message_id.clone(),
-                source: task.descriptor.source.clone(),
-                encrypted_source_path: task.encrypted_source_path.clone(),
+                attachment_id: task.descriptor.attachment_id.clone(),
+                blob_ciphertext_b64: task.blob_ciphertext_b64.clone(),
                 payload_metadata: task.payload_metadata.clone(),
                 mime_type: task.descriptor.mime_type.clone(),
                 size_bytes: task.descriptor.size_bytes,
@@ -3072,7 +3451,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                         conversation_id: task.conversation_id.clone(),
                         message_id: task.message_id.clone(),
                         reference: task.reference.clone(),
-                        destination: task.destination.clone(),
+                        destination_id: task.destination_id.clone(),
                         payload_metadata: task.payload_metadata.clone(),
                         retries: task.retries,
                     }),
@@ -3091,9 +3470,38 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                     }
                     RecoveryReason::IdentityChanged => PersistedRecoveryReason::IdentityChanged,
                 },
-                sync_attempted: context.sync_attempted,
-                identity_refresh_attempted: context.identity_refresh_attempted,
+                phase: match context.phase {
+                    RecoveryPhase::WaitingForSync => PersistedRecoveryPhase::WaitingForSync,
+                    RecoveryPhase::WaitingForPendingReplay => {
+                        PersistedRecoveryPhase::WaitingForPendingReplay
+                    }
+                    RecoveryPhase::WaitingForIdentityRefresh => {
+                        PersistedRecoveryPhase::WaitingForIdentityRefresh
+                    }
+                    RecoveryPhase::WaitingForExplicitReconcile => {
+                        PersistedRecoveryPhase::WaitingForExplicitReconcile
+                    }
+                    RecoveryPhase::EscalatedToRebuild => {
+                        PersistedRecoveryPhase::EscalatedToRebuild
+                    }
+                },
+                attempt_count: context.attempt_count,
                 identity_refresh_retry_count: context.identity_refresh_retry_count,
+                last_error: context.last_error.clone(),
+                escalation_reason: context.escalation_reason.map(|reason| match reason {
+                    RecoveryEscalationReason::MlsMarkedUnrecoverable => {
+                        PersistedRecoveryEscalationReason::MlsMarkedUnrecoverable
+                    }
+                    RecoveryEscalationReason::IdentityRefreshRetryExhausted => {
+                        PersistedRecoveryEscalationReason::IdentityRefreshRetryExhausted
+                    }
+                    RecoveryEscalationReason::ExplicitNeedsRebuildControl => {
+                        PersistedRecoveryEscalationReason::ExplicitNeedsRebuildControl
+                    }
+                    RecoveryEscalationReason::RecoveryPolicyExhausted => {
+                        PersistedRecoveryEscalationReason::RecoveryPolicyExhausted
+                    }
+                }),
             })
             .collect(),
         realtime_sessions: state

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
 use serde_json::json;
 use tapchat_core::model::{CURRENT_MODEL_VERSION, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
-use tapchat_core::transport_contract::GetHeadResult;
+use tapchat_core::transport_contract::{FetchMessagesResult, GetHeadResult};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -156,6 +156,31 @@ impl CloudflareRuntimeHandle {
             .context("get head request")?;
         if !response.status().is_success() {
             bail!("get head failed with status {}", response.status());
+        }
+        let body = response.text().await?;
+        Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
+    }
+
+    pub async fn fetch_messages(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        device_id: &str,
+        from_seq: u64,
+        limit: u64,
+    ) -> Result<FetchMessagesResult> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/inbox/{}/messages?fromSeq={from_seq}&limit={limit}",
+                self.base_url,
+                urlencoding::encode(device_id)
+            ))
+            .header("Authorization", format!("Bearer {}", auth.token))
+            .send()
+            .await
+            .context("fetch messages request")?;
+        if !response.status().is_success() {
+            bail!("fetch messages failed with status {}", response.status());
         }
         let body = response.text().await?;
         Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)

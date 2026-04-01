@@ -88,8 +88,7 @@ mod tests {
             .expect("attachment");
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { upload }
-            if upload.headers.get("Authorization") == Some(&"Bearer device-runtime-token".into())
+            CoreEffect::ReadAttachmentBytes { read } if read.attachment_id.ends_with(".bin")
         )));
     }
 
@@ -105,12 +104,24 @@ mod tests {
             })
             .expect("attachment");
         let task_id = match upload.effects.iter().find_map(|effect| match effect {
-            CoreEffect::PrepareBlobUpload { upload } => Some(upload.task_id.clone()),
+            CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
             _ => None,
         }) {
             Some(task_id) => task_id,
             None => panic!("expected upload task"),
         };
+        let prepared = alice
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id: task_id.clone(),
+                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+            })
+            .expect("attachment bytes loaded");
+        assert!(prepared.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::PrepareBlobUpload { upload }
+                if upload.headers.get("Authorization")
+                    == Some(&"Bearer device-runtime-token".into())
+        )));
         let upload_ready = alice
             .handle_event(CoreEvent::BlobUploadPrepared {
                 task_id: task_id.clone(),
@@ -403,6 +414,16 @@ mod tests {
             })
             .expect("attachment");
 
+        let task_id = output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+            _ => None,
+        }).expect("read attachment effect");
+        let output = alice
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id,
+                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+            })
+            .expect("attachment bytes loaded");
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::PrepareBlobUpload { upload }
@@ -618,7 +639,7 @@ mod tests {
 
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { .. }
+            CoreEffect::ReadAttachmentBytes { .. }
         )));
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
@@ -637,11 +658,27 @@ mod tests {
                 attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
-        let mut snapshot = extract_snapshot(&upload_output);
+        let task_id = upload_output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+            _ => None,
+        }).expect("read attachment effect");
+        let prepared_output = engine
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id,
+                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+            })
+            .expect("attachment bytes loaded");
+        let mut snapshot = extract_snapshot(&prepared_output);
         if let Some(crate::persistence::PersistedPendingBlobTransfer::Upload {
+            blob_ciphertext_b64,
+            payload_metadata,
+            metadata_ciphertext,
             prepared_upload, ..
         }) = snapshot.pending_blob_transfers.first_mut()
         {
+            assert!(blob_ciphertext_b64.is_some());
+            assert!(payload_metadata.is_some());
+            assert!(metadata_ciphertext.is_some());
             *prepared_upload = Some(crate::transport_contract::PrepareBlobUploadResult {
                 blob_ref: "blob:prepared".into(),
                 upload_target: "upload:prepared".into(),
@@ -779,9 +816,11 @@ mod tests {
             RecoveryContext {
                 conversation_id: conversation_id.clone(),
                 reason: RecoveryReason::IdentityChanged,
-                sync_attempted: true,
-                identity_refresh_attempted: true,
+                phase: crate::ffi_api::RecoveryPhase::WaitingForIdentityRefresh,
+                attempt_count: 1,
                 identity_refresh_retry_count: 0,
+                last_error: None,
+                escalation_reason: None,
             },
         );
 
@@ -825,6 +864,89 @@ mod tests {
                 .state,
             crate::model::ConversationState::NeedsRebuild
         );
+    }
+
+    #[test]
+    fn identity_refresh_failure_below_limit_keeps_needs_recovery() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice.state.recovery_contexts.insert(
+            conversation_id.clone(),
+            RecoveryContext {
+                conversation_id: conversation_id.clone(),
+                reason: RecoveryReason::IdentityChanged,
+                phase: crate::ffi_api::RecoveryPhase::WaitingForIdentityRefresh,
+                attempt_count: 1,
+                identity_refresh_retry_count: 0,
+                last_error: None,
+                escalation_reason: None,
+            },
+        );
+        alice
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .recovery_status = crate::conversation::RecoveryStatus::NeedsRecovery;
+
+        let output = alice
+            .handle_event(CoreEvent::IdentityBundleFetchFailed {
+                user_id: bob_bundle.user_id.clone(),
+                retryable: true,
+                detail: Some("network".into()),
+            })
+            .expect("refresh failure");
+
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ScheduleTimer { timer }
+            if timer.timer_id == format!("refresh_identity:{}", bob_bundle.user_id)
+        )));
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            crate::model::ConversationState::Active
+        );
+        assert_eq!(
+            alice
+                .recovery_context_snapshot(&conversation_id)
+                .expect("context")
+                .identity_refresh_retry_count,
+            1
+        );
+    }
+
+    #[test]
+    fn late_refresh_identity_timer_is_noop_after_recovery_clears() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice.state.recovery_contexts.insert(
+            conversation_id.clone(),
+            RecoveryContext {
+                conversation_id: conversation_id.clone(),
+                reason: RecoveryReason::IdentityChanged,
+                phase: crate::ffi_api::RecoveryPhase::WaitingForIdentityRefresh,
+                attempt_count: 1,
+                identity_refresh_retry_count: 1,
+                last_error: None,
+                escalation_reason: None,
+            },
+        );
+        alice.state.recovery_contexts.remove(&conversation_id);
+
+        let output = alice
+            .handle_event(CoreEvent::TimerTriggered {
+                timer_id: format!("refresh_identity:{}", bob_bundle.user_id),
+            })
+            .expect("late timer");
+        assert!(output.effects.is_empty());
     }
 
     #[test]
@@ -1326,7 +1448,7 @@ mod tests {
         let path = unique_temp_path("attachment");
         std::fs::write(&path, [1_u8, 2, 3, 4]).expect("write attachment temp file");
         AttachmentDescriptor {
-            source: path.to_string_lossy().to_string(),
+            attachment_id: path.to_string_lossy().to_string(),
             mime_type: "application/octet-stream".into(),
             size_bytes: 4,
             file_name: Some("file.bin".into()),
