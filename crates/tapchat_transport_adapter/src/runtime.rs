@@ -128,6 +128,24 @@ impl CloudflareRuntimeHandle {
         Ok(())
     }
 
+    pub async fn get_identity_bundle(&self, user_id: &str) -> Result<IdentityBundle> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/shared-state/{}/identity-bundle",
+                self.base_url,
+                urlencoding::encode(user_id)
+            ))
+            .send()
+            .await
+            .context("get identity bundle request")?;
+        if !response.status().is_success() {
+            bail!("get identity bundle failed with status {}", response.status());
+        }
+        let body = response.text().await?;
+        Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
+    }
+
     pub async fn get_head(&self, auth: &DeviceRuntimeAuth, device_id: &str) -> Result<GetHeadResult> {
         let response = self
             .client
@@ -186,4 +204,3 @@ fn reserve_port() -> Result<u16> {
     drop(listener);
     Ok(port)
 }
-

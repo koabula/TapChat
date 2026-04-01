@@ -5,15 +5,16 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use reqwest::Client;
+use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
     RealtimeEvent,
 };
-use tapchat_core::model::IdentityBundle;
+use tapchat_core::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::transport_contract::{
-    BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest, PrepareBlobUploadRequest,
-    RealtimeSubscriptionRequest,
+    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
+    PrepareBlobUploadRequest, RealtimeSubscriptionRequest,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -32,6 +33,8 @@ pub struct DriverRuntime {
     notifications: Vec<String>,
     scheduled_timers: Vec<(String, u64)>,
     storage_prepare_url: Option<String>,
+    recent_appends: Vec<Envelope>,
+    recent_messages: Vec<(String, MessageType)>,
 }
 
 pub struct CoreDriver {
@@ -39,9 +42,52 @@ pub struct CoreDriver {
     runtime: DriverRuntime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactDeviceSnapshot {
+    pub device_id: String,
+    pub status: DeviceStatusKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationMemberSnapshot {
+    pub user_id: String,
+    pub device_id: String,
+    pub status: DeviceStatusKind,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PendingMlsArtifacts {
+    pub pending_welcome_count: usize,
+    pub pending_commit_count: usize,
+}
+
 impl CoreDriver {
     pub fn new() -> Result<Self> {
         Self::new_with_storage_base(None)
+    }
+
+    pub fn from_snapshot(
+        snapshot: CorePersistenceSnapshot,
+        base_url: Option<String>,
+    ) -> Result<Self> {
+        let latest_snapshot = snapshot.clone();
+        let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            engine: CoreEngine::from_restored_state(snapshot),
+            runtime: DriverRuntime {
+                client: Client::builder().build().context("build driver reqwest client")?,
+                websocket_tx,
+                websocket_rx,
+                websocket_tasks: BTreeMap::new(),
+                latest_snapshot: Some(latest_snapshot),
+                notifications: Vec::new(),
+                scheduled_timers: Vec::new(),
+                storage_prepare_url: base_url
+                    .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
+                recent_appends: Vec::new(),
+                recent_messages: Vec::new(),
+            },
+        })
     }
 
     pub fn new_with_storage_base(base_url: Option<String>) -> Result<Self> {
@@ -58,6 +104,8 @@ impl CoreDriver {
                 scheduled_timers: Vec::new(),
                 storage_prepare_url: base_url
                     .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
+                recent_appends: Vec::new(),
+                recent_messages: Vec::new(),
             },
         })
     }
@@ -78,14 +126,141 @@ impl CoreDriver {
         &self.runtime.scheduled_timers
     }
 
+    pub fn contact_devices(&self, user_id: &str) -> Vec<ContactDeviceSnapshot> {
+        self.engine
+            .contact_bundle(user_id)
+            .map(|bundle| {
+                bundle
+                    .devices
+                    .iter()
+                    .map(|device| ContactDeviceSnapshot {
+                        device_id: device.device_id.clone(),
+                        status: device.status,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn conversation_members(&self, conversation_id: &str) -> Vec<ConversationMemberSnapshot> {
+        self.engine
+            .conversation_state(conversation_id)
+            .map(|state| {
+                state
+                    .conversation
+                    .member_devices
+                    .iter()
+                    .map(|member| ConversationMemberSnapshot {
+                        user_id: member.user_id.clone(),
+                        device_id: member.device_id.clone(),
+                        status: member.status,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn conversation_recovery_status(&self, conversation_id: &str) -> Option<RecoveryStatus> {
+        self.engine
+            .conversation_state(conversation_id)
+            .map(|state| state.recovery_status)
+    }
+
+    pub fn pending_mls_artifacts(&self, conversation_id: &str) -> PendingMlsArtifacts {
+        let mut artifacts = PendingMlsArtifacts::default();
+        let Some(snapshot) = self.runtime.latest_snapshot.as_ref() else {
+            for envelope in &self.runtime.recent_appends {
+                if envelope.conversation_id != conversation_id {
+                    continue;
+                }
+                match envelope.message_type {
+                    MessageType::MlsWelcome => {
+                        artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                    }
+                    MessageType::MlsCommit => {
+                        artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            for (recent_conversation_id, message_type) in &self.runtime.recent_messages {
+                if recent_conversation_id != conversation_id {
+                    continue;
+                }
+                match message_type {
+                    MessageType::MlsWelcome => {
+                        artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                    }
+                    MessageType::MlsCommit => {
+                        artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            return artifacts;
+        };
+        for item in &snapshot.pending_outbox {
+            if item.envelope.conversation_id != conversation_id {
+                continue;
+            }
+            match item.envelope.message_type {
+                MessageType::MlsWelcome => {
+                    artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                }
+                MessageType::MlsCommit => {
+                    artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        for envelope in &self.runtime.recent_appends {
+            if envelope.conversation_id != conversation_id {
+                continue;
+            }
+            match envelope.message_type {
+                MessageType::MlsWelcome => {
+                    artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                }
+                MessageType::MlsCommit => {
+                    artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        for (recent_conversation_id, message_type) in &self.runtime.recent_messages {
+            if recent_conversation_id != conversation_id {
+                continue;
+            }
+            match message_type {
+                MessageType::MlsWelcome => {
+                    artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                }
+                MessageType::MlsCommit => {
+                    artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        artifacts
+    }
+
+    pub fn clear_recent_transport_activity(&mut self) {
+        self.runtime.recent_appends.clear();
+        self.runtime.recent_messages.clear();
+    }
+
     pub async fn run_command_until_idle(&mut self, command: CoreCommand) -> Result<CoreOutput> {
         let output = self.engine.handle_command(command)?;
-        self.execute_until_idle(output).await
+        let output = self.execute_until_idle(output).await?;
+        self.record_observed_output(&output);
+        Ok(output)
     }
 
     pub async fn inject_event_until_idle(&mut self, event: CoreEvent) -> Result<CoreOutput> {
         let output = self.engine.handle_event(event)?;
-        self.execute_until_idle(output).await
+        let output = self.execute_until_idle(output).await?;
+        self.record_observed_output(&output);
+        Ok(output)
     }
 
     pub async fn pump_until_idle(&mut self, max_wait: Duration) -> Result<Vec<CoreOutput>> {
@@ -169,7 +344,7 @@ impl CoreDriver {
     }
 
     async fn execute_http_request(
-        &self,
+        &mut self,
         request: tapchat_core::ffi_api::HttpRequestEffect,
     ) -> Result<Vec<CoreEvent>> {
         let method = match request.method {
@@ -188,6 +363,10 @@ impl CoreDriver {
             builder = builder.header(key, header_value);
         }
         if let Some(body) = request.body.as_deref() {
+            if request.url.contains("/messages") {
+                let append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
+                self.runtime.recent_appends.push(append_request.envelope);
+            }
             let converted = if looks_like_json(body) {
                 to_camel_case_json_string(body)?
             } else {
@@ -382,6 +561,18 @@ impl CoreDriver {
             self.runtime.latest_snapshot = Some(snapshot);
         }
     }
+
+    fn record_observed_output(&mut self, output: &CoreOutput) {
+        let Some(view_model) = output.view_model.as_ref() else {
+            return;
+        };
+        self.runtime.recent_messages.extend(
+            view_model
+                .messages
+                .iter()
+                .map(|message| (message.conversation_id.clone(), message.message_type)),
+        );
+    }
 }
 
 fn looks_like_json(value: &str) -> bool {
@@ -441,5 +632,8 @@ mod tests {
         }
     }
 }
+
+
+
 
 

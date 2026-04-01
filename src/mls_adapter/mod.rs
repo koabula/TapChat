@@ -143,14 +143,13 @@ impl MlsAdapter {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
-        let key_package_bundle = KeyPackage::builder()
-            .build(DEFAULT_CIPHERSUITE, &provider, &signer, credential_with_key.clone())
-            .map_err(|error| CoreError::invalid_state(format!("failed to build key package: {error}")))?;
-        let key_package = key_package_bundle.key_package().clone();
-        let key_package_bytes = MlsMessageOut::from(key_package)
-            .to_bytes()
-            .map_err(|error| CoreError::invalid_state(format!("failed to encode key package: {error}")))?;
-        let key_package_b64 = BASE64.encode(key_package_bytes);
+        let credential_identity = build_credential_identity(local_identity);
+        let package = Self::build_published_key_package(
+            &provider,
+            &signer,
+            credential_with_key.clone(),
+            credential_identity.clone(),
+        )?;
 
         let adapter = Self {
             provider,
@@ -161,20 +160,21 @@ impl MlsAdapter {
             groups: BTreeMap::new(),
         };
 
-        Ok((
-            adapter,
-            PublishedKeyPackage {
-                key_package_ref: key_package_b64.clone(),
-                key_package_b64,
-                expires_at: 4_102_444_800_000,
-                credential_identity,
-            },
-        ))
+        Ok((adapter, package))
     }
 
     pub fn generate_key_package(local_identity: &LocalIdentityState, _now: u64) -> CoreResult<PublishedKeyPackage> {
         let (_, package) = Self::bootstrap(local_identity)?;
         Ok(package)
+    }
+
+    pub fn rotate_key_package(&mut self, _now: u64) -> CoreResult<PublishedKeyPackage> {
+        Self::build_published_key_package(
+            &self.provider,
+            &self.signer,
+            self.credential_with_key.clone(),
+            self.credential_identity.clone(),
+        )
     }
 
     pub fn create_conversation(
@@ -425,7 +425,13 @@ impl MlsAdapter {
     }
 
     pub fn clear_conversation(&mut self, conversation_id: &str) {
-        self.groups.remove(conversation_id);
+        if let Some(mut state) = self.groups.remove(conversation_id) {
+            let _ = state.group.delete(self.provider.storage());
+        }
+    }
+
+    pub fn has_conversation(&self, conversation_id: &str) -> bool {
+        self.groups.contains_key(conversation_id)
     }
 
     pub fn export_persisted_group_state(&self, conversation_id: &str) -> CoreResult<String> {
@@ -585,6 +591,12 @@ impl MlsAdapter {
     }
 
     fn ingest_welcome(&mut self, conversation_id: &str, payload_b64: &str) -> CoreResult<IngestResult> {
+        // Rebuild/rejoin semantics treat a fresh welcome as authoritative for this
+        // conversation. If stale local state still exists, replace it before
+        // attempting to join the new group.
+        if self.groups.contains_key(conversation_id) {
+            self.clear_conversation(conversation_id);
+        }
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .build();
@@ -679,6 +691,33 @@ impl MlsAdapter {
                 Ok(IngestResult::PendingRetry)
             }
         }
+    }
+
+    fn build_published_key_package(
+        provider: &OpenMlsRustCrypto,
+        signer: &SignatureKeyPair,
+        credential_with_key: CredentialWithKey,
+        credential_identity: String,
+    ) -> CoreResult<PublishedKeyPackage> {
+        let key_package_bundle = KeyPackage::builder()
+            .build(
+                DEFAULT_CIPHERSUITE,
+                provider,
+                signer,
+                credential_with_key,
+            )
+            .map_err(|error| CoreError::invalid_state(format!("failed to build key package: {error}")))?;
+        let key_package = key_package_bundle.key_package().clone();
+        let key_package_bytes = MlsMessageOut::from(key_package)
+            .to_bytes()
+            .map_err(|error| CoreError::invalid_state(format!("failed to encode key package: {error}")))?;
+        let key_package_b64 = BASE64.encode(key_package_bytes);
+        Ok(PublishedKeyPackage {
+            key_package_ref: key_package_b64.clone(),
+            key_package_b64,
+            expires_at: 4_102_444_800_000,
+            credential_identity,
+        })
     }
 }
 

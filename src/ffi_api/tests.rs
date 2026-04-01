@@ -1036,6 +1036,223 @@ mod tests {
             .any(|device| device.device_id == bob_laptop_profile.device_id));
     }
 
+    #[test]
+    fn identity_bundle_update_with_new_device_queues_welcome_and_commit() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_laptop,
+            &sample_deployment(),
+            bob_laptop_package.key_package_b64,
+            bob_laptop_package.expires_at,
+        )
+        .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile.clone()],
+        )
+        .expect("merged bundle");
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: merged.clone(),
+            })
+            .expect("apply bundle update");
+
+        assert!(alice.state.pending_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_type == MessageType::MlsWelcome
+                && item.envelope.recipient_device_id == bob_laptop_profile.device_id
+        }));
+        assert!(alice.state.pending_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_type == MessageType::MlsCommit
+        }));
+    }
+
+    #[test]
+    fn revoked_device_update_queues_remove_commit_without_welcome() {
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_phone = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob phone identity");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_package = MlsAdapter::generate_key_package(&bob_phone, 0).expect("phone package");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let deployment = sample_deployment();
+        let mut bob_phone_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_phone,
+            &deployment,
+            bob_phone_package.key_package_b64,
+            bob_phone_package.expires_at,
+        )
+        .expect("phone profile");
+        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_laptop,
+            &deployment,
+            bob_laptop_package.key_package_b64,
+            bob_laptop_package.expires_at,
+        )
+        .expect("laptop profile");
+        let active_bundle = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &deployment,
+            vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
+        )
+        .expect("active bundle");
+
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", active_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, active_bundle.user_id.clone());
+
+        bob_phone_profile.status = crate::model::DeviceStatusKind::Revoked;
+        let revoked_bundle = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &deployment,
+            vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
+        )
+        .expect("revoked bundle");
+        let pending_before = alice.state.pending_outbox.len();
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: revoked_bundle,
+            })
+            .expect("apply revoked bundle update");
+
+        let new_pending = &alice.state.pending_outbox[pending_before..];
+        assert!(!new_pending.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_type == MessageType::MlsWelcome
+        }));
+        let remove_commits: Vec<_> = new_pending
+            .iter()
+            .filter(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            })
+            .collect();
+        assert!(!remove_commits.is_empty());
+        assert!(remove_commits
+            .iter()
+            .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
+        assert!(remove_commits
+            .iter()
+            .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id));
+    }
+
+    #[test]
+    fn repeated_explicit_reconcile_is_idempotent() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_laptop,
+            &sample_deployment(),
+            bob_laptop_package.key_package_b64,
+            bob_laptop_package.expires_at,
+        )
+        .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile],
+        )
+        .expect("merged bundle");
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
+            .expect("apply bundle update");
+        let pending_after_refresh = alice.state.pending_outbox.len();
+
+        alice
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("explicit reconcile should be idempotent");
+
+        assert_eq!(alice.state.pending_outbox.len(), pending_after_refresh);
+    }
+
+    #[test]
+    fn restored_needs_rebuild_then_reconcile_recreates_mls_artifacts() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let create_output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "before rebuild".into(),
+            })
+            .expect("send");
+        let mut snapshot = extract_snapshot(&create_output);
+        snapshot
+            .mls_states
+            .first_mut()
+            .expect("mls state")
+            .serialized_group_state = Some("{broken".into());
+        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let pending_before = restored.state.pending_outbox.len();
+
+        let output = restored
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("reconcile after rebuild");
+
+        assert!(output.view_model.as_ref().is_some_and(|view| {
+            view.messages
+                .iter()
+                .any(|message| message.message_type == MessageType::MlsCommit)
+                && view
+                    .messages
+                    .iter()
+                    .any(|message| message.message_type == MessageType::MlsWelcome)
+        }));
+        assert!(restored.state.pending_outbox[pending_before..].iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_type == MessageType::MlsCommit
+        }));
+        assert!(restored.state.pending_outbox[pending_before..].iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_type == MessageType::MlsWelcome
+        }));
+        assert_eq!(
+            restored
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .recovery_status,
+            crate::conversation::RecoveryStatus::NeedsRecovery
+        );
+        assert_eq!(
+            restored
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            crate::model::ConversationState::Active
+        );
+    }
+
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
         let mut engine = CoreEngine::new();
         engine

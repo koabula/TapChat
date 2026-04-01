@@ -118,6 +118,8 @@ pub struct PersistedRealtimeSession {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CorePersistenceSnapshot {
+    #[serde(default)]
+    pub message_nonce: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_identity: Option<PersistedLocalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +230,7 @@ pub trait SystemStateRepository {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InMemoryPersistence {
+    message_nonce: u64,
     local_identity: Option<PersistedLocalIdentity>,
     deployment: Option<PersistedDeployment>,
     contacts: BTreeMap<String, PersistedContact>,
@@ -243,6 +246,7 @@ pub struct InMemoryPersistence {
 
 impl InMemoryPersistence {
     pub fn save_snapshot(&mut self, snapshot: &CorePersistenceSnapshot) {
+        self.message_nonce = snapshot.message_nonce;
         self.local_identity = snapshot.local_identity.clone();
         self.deployment = snapshot.deployment.clone();
         self.contacts = snapshot
@@ -309,6 +313,7 @@ impl InMemoryPersistence {
 
     pub fn load_snapshot(&self) -> CorePersistenceSnapshot {
         CorePersistenceSnapshot {
+            message_nonce: self.message_nonce,
             local_identity: self.local_identity.clone(),
             deployment: self.deployment.clone(),
             contacts: self.contacts.values().cloned().collect(),
@@ -564,6 +569,7 @@ mod tests {
         )
         .expect("conversation");
         let snapshot = CorePersistenceSnapshot {
+            message_nonce: 7,
             local_identity: Some(PersistedLocalIdentity {
                 state: identity.clone(),
             }),
@@ -729,6 +735,7 @@ mod tests {
     fn snapshot_file_round_trips() {
         let path = unique_snapshot_path("roundtrip");
         let snapshot = CorePersistenceSnapshot {
+            message_nonce: 11,
             local_identity: None,
             deployment: Some(PersistedDeployment {
                 deployment_bundle: DeploymentBundle {

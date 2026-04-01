@@ -150,7 +150,6 @@ type RuntimeWebSocket = {
 };
 
 function waitForWebSocketMessage(socket: RuntimeWebSocket, timeoutMs = 3_000): Promise<unknown> {
-  socket.accept();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("timed out waiting for websocket message")), timeoutMs);
     socket.addEventListener("message", (event) => {
@@ -158,6 +157,11 @@ function waitForWebSocketMessage(socket: RuntimeWebSocket, timeoutMs = 3_000): P
       resolve(JSON.parse(String(event.data)));
     });
   });
+}
+
+async function waitForSubscribeReady(socket: RuntimeWebSocket): Promise<void> {
+  socket.accept();
+  await new Promise((resolve) => setTimeout(resolve, 25));
 }
 
 async function waitForCleanup(mf: Miniflare, token: string, deviceId: string, fromSeq: number, spillKey: string, timeoutMs = 5_000): Promise<void> {
@@ -207,6 +211,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   assert.equal(subscribeResponse.status, 101);
   assert.ok(subscribeResponse.webSocket);
   const socket = subscribeResponse.webSocket as unknown as RuntimeWebSocket;
+  await waitForSubscribeReady(socket);
   const firstMessage = waitForWebSocketMessage(socket);
 
   const append1 = await appendEnvelope(mf, deviceId, "msg:1", "cipher-1");
@@ -320,3 +325,4 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
 process.on("exit", () => {
   void fs.rm(TMP_DIR, { recursive: true, force: true });
 });
+

@@ -171,7 +171,7 @@ export async function handleInboxDurableRequest(
 }
 
 export class InboxDurableObject extends DurableObjectBase {
-  private readonly sessions = new Map<string, WebSocket>();
+  private readonly sessions = new Map<string, ManagedSession>();
   private readonly stateRef: DurableObjectState;
   private readonly envRef: Env;
 
@@ -191,10 +191,10 @@ export class InboxDurableObject extends DurableObjectBase {
       state: new DurableObjectStorageAdapter(this.stateRef.storage),
       spillStore: new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
       sessions: Array.from(this.sessions.values()).map(
-        (socket) =>
+        (session) =>
           ({
             send(payload: string): void {
-              socket.send(payload);
+              session.send(payload);
             }
           }) satisfies SessionSink
       ),
@@ -206,7 +206,11 @@ export class InboxDurableObject extends DurableObjectBase {
         const server = pair[1];
         server.accept();
         const sessionId = crypto.randomUUID();
-        this.sessions.set(sessionId, server);
+        const session = new ManagedSession(server);
+        this.sessions.set(sessionId, session);
+        queueMicrotask(() => {
+          session.markReady();
+        });
         server.addEventListener("close", () => {
           this.sessions.delete(sessionId);
         });
@@ -232,5 +236,37 @@ export class InboxDurableObject extends DurableObjectBase {
       }
     );
     await service.cleanExpiredRecords(Date.now());
+  }
+}
+
+class ManagedSession {
+  private readonly socket: WebSocket;
+  private ready = false;
+  private readonly queuedPayloads: string[] = [];
+
+  constructor(socket: WebSocket) {
+    this.socket = socket;
+  }
+
+  send(payload: string): void {
+    if (!this.ready) {
+      this.queuedPayloads.push(payload);
+      return;
+    }
+    this.socket.send(payload);
+  }
+
+  markReady(): void {
+    if (this.ready) {
+      return;
+    }
+    this.ready = true;
+    while (this.queuedPayloads.length > 0) {
+      const payload = this.queuedPayloads.shift();
+      if (payload === undefined) {
+        break;
+      }
+      this.socket.send(payload);
+    }
   }
 }

@@ -70,8 +70,7 @@ impl CoreEngine {
             .map(|identity| identity.device_identity.device_id.as_str())
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn from_restored_state(snapshot: CorePersistenceSnapshot) -> Self {
+    pub fn from_restored_state(snapshot: CorePersistenceSnapshot) -> Self {
         let restored_mls = MlsAdapter::restore_from_persisted_states(
             &snapshot
                 .mls_states
@@ -269,7 +268,7 @@ impl CoreEngine {
                     .and_then(|deployment| deployment.published_key_package),
                 pending_requests: BTreeMap::new(),
                 request_nonce: 0,
-                message_nonce: 0,
+                message_nonce: snapshot.message_nonce,
                 recovery_contexts,
             },
         };
@@ -572,17 +571,12 @@ impl CoreEngine {
     }
 
     fn rotate_local_key_package(&mut self) -> CoreResult<CoreOutput> {
-        let identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let _ = self
+        let package = self
             .state
             .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
-        let package = MlsAdapter::generate_key_package(identity, 0)?;
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .rotate_key_package(0)?;
         self.state.published_key_package = Some(package);
         self.refresh_local_bundle()?;
         Ok(CoreOutput {
@@ -940,8 +934,23 @@ impl CoreEngine {
                 current_timestamp_hint(self.state.outbox.len()),
             );
         }
+        let needs_rebootstrap = {
+            let conversation_state = self
+                .state
+                .conversations
+                .get(&conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+            conversation_state.conversation.state == ConversationState::NeedsRebuild
+                || conversation_state.recovery_status == RecoveryStatus::NeedsRebuild
+                || self
+                    .state
+                    .mls_summaries
+                    .get(&conversation_id)
+                    .map(|summary| summary.status == MlsStateStatus::NeedsRebuild)
+                    .unwrap_or(false)
+        };
 
-        if !reconcile.changed {
+        if !reconcile.changed && !needs_rebootstrap {
             if let Some(adapter) = self.state.mls_adapter.as_mut() {
                 if let Ok(summary) = adapter.attempt_recovery(&conversation_id) {
                     self.state.mls_summaries.insert(conversation_id.clone(), summary);
@@ -973,6 +982,74 @@ impl CoreEngine {
                 output = merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
             }
             return self.merge_with_transport_flush(output);
+        }
+
+        if needs_rebootstrap {
+            let key_packages = self.peer_key_packages(&peer_user_id, &peer_active_device_ids)?;
+            let artifacts = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                .create_conversation(&conversation_id, &key_packages)?;
+            let summary = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter missing after rebuild"))?
+                .export_group_summary(&conversation_id)?;
+            self.state.mls_summaries.insert(conversation_id.clone(), summary);
+            if let Some(conversation_state) = self.state.conversations.get_mut(&conversation_id) {
+                conversation_state.conversation.state = ConversationState::Active;
+                conversation_state.recovery_status = RecoveryStatus::NeedsRecovery;
+                conversation_state.conversation.member_devices = reconcile.member_devices.clone();
+                conversation_state.last_known_peer_active_devices =
+                    peer_active_device_ids.iter().cloned().collect();
+            }
+
+            let mut generated = self.commit_envelopes_for_artifacts(
+                &conversation_id,
+                &peer_active_device_ids,
+                &artifacts,
+            )?;
+            generated.extend(self.welcome_envelopes_for_artifacts(
+                &conversation_id,
+                &artifacts,
+            )?);
+            self.enqueue_envelopes(peer_user_id, generated.clone());
+            self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
+            return self.merge_with_transport_flush(CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    messages_changed: true,
+                    contacts_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveConversation {
+                            conversation_id: conversation_id.clone(),
+                        },
+                        PersistOp::SaveMlsState {
+                            conversation_id: conversation_id.clone(),
+                        },
+                    ],
+                )],
+                view_model: Some(CoreViewModel {
+                    conversations: vec![self.conversation_summary(&conversation_id)?],
+                    messages: generated
+                        .iter()
+                        .map(|envelope| MessageSummary {
+                            conversation_id: envelope.conversation_id.clone(),
+                            message_id: envelope.message_id.clone(),
+                            message_type: envelope.message_type,
+                        })
+                        .collect(),
+                    ..CoreViewModel::default()
+                }),
+            });
         }
 
         let mut generated = self.build_control_membership_changed_messages(
@@ -2427,7 +2504,35 @@ impl CoreEngine {
                                 }
                                 ackable = true;
                             }
-                            IngestResult::AppliedCommit { .. } | IngestResult::AppliedWelcome { .. } => {
+                            IngestResult::AppliedCommit { .. } => {
+                                if let Ok(summary) = self
+                                    .state
+                                    .mls_adapter
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        CoreError::invalid_state("mls adapter is not initialized")
+                                    })?
+                                    .export_group_summary(&conversation_id)
+                                {
+                                    self.state
+                                        .mls_summaries
+                                        .insert(conversation_id.clone(), summary);
+                                }
+                                self.state.recovery_contexts.remove(&conversation_id);
+                                if let Some(state) =
+                                    self.state.conversations.get_mut(&conversation_id)
+                                {
+                                    if state.conversation.state != ConversationState::NeedsRebuild {
+                                        state.recovery_status = RecoveryStatus::Healthy;
+                                    }
+                                }
+                                ackable = true;
+                            }
+                            IngestResult::AppliedWelcome { .. } => {
+                                self.clear_pending_records_for_conversation(
+                                    &device_id,
+                                    &conversation_id,
+                                );
                                 if let Ok(summary) = self
                                     .state
                                     .mls_adapter
@@ -2569,6 +2674,22 @@ impl CoreEngine {
                 last_known_peer_active_devices: BTreeSet::from([record.envelope.sender_device_id.clone()]),
                 recovery_status: RecoveryStatus::Healthy,
             });
+    }
+
+    fn clear_pending_records_for_conversation(&mut self, device_id: &str, conversation_id: &str) {
+        let Some(sync_state) = self.state.sync_states.get_mut(device_id) else {
+            return;
+        };
+        let pending_seqs: Vec<u64> = sync_state
+            .pending_records
+            .iter()
+            .filter_map(|(seq, record)| {
+                (record.envelope.conversation_id == conversation_id).then_some(*seq)
+            })
+            .collect();
+        for seq in pending_seqs {
+            SyncEngine::clear_pending_retry(sync_state, seq);
+        }
     }
 
     fn recovery_reason_for_record(&self, conversation_id: &str) -> RecoveryReason {
@@ -2871,6 +2992,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .any(|state| state.serialized_group_state.is_none());
 
     CorePersistenceSnapshot {
+        message_nonce: state.message_nonce,
         local_identity: state
             .local_identity
             .clone()
