@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod attachment_crypto;
 pub mod capability;
 pub mod conversation;

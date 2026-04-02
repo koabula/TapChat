@@ -20,6 +20,8 @@ pub struct PersistedDeployment {
     pub deployment_bundle: DeploymentBundle,
     pub local_bundle: Option<IdentityBundle>,
     pub published_key_package: Option<PublishedKeyPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialized_mls_bootstrap_state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +765,7 @@ mod tests {
                     signature: "sig".into(),
                 }),
                 published_key_package: None,
+                serialized_mls_bootstrap_state: None,
             }),
             contacts: vec![PersistedContact {
                 user_id: "user:bob".into(),

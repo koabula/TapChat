@@ -1,0 +1,745 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures_util::StreamExt;
+use reqwest::Client;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, Instant, timeout};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+
+use crate::ffi_api::{
+    CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
+    RealtimeEvent, RecoveryContextSnapshot, RealtimeSessionSnapshot, SyncCheckpointSnapshot,
+};
+use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
+use crate::persistence::CorePersistenceSnapshot;
+use crate::transport_contract::{
+    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
+    PrepareBlobUploadRequest, RealtimeSubscriptionRequest,
+};
+
+use super::util::{to_camel_case_json_string, to_snake_case_json_string};
+
+pub struct DriverRuntime {
+    client: Client,
+    websocket_tx: UnboundedSender<CoreEvent>,
+    websocket_rx: UnboundedReceiver<CoreEvent>,
+    websocket_tasks: BTreeMap<String, JoinHandle<()>>,
+    latest_snapshot: Option<CorePersistenceSnapshot>,
+    notifications: Vec<String>,
+    scheduled_timers: Vec<ScheduledTimer>,
+    storage_prepare_url: Option<String>,
+    recent_appends: Vec<Envelope>,
+    recent_messages: Vec<(String, MessageType)>,
+}
+
+pub struct CoreDriver {
+    engine: CoreEngine,
+    runtime: DriverRuntime,
+    suppress_realtime: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ScheduledTimer {
+    timer_id: String,
+    delay_ms: u64,
+    scheduled_at: Instant,
+}
+
+const MAX_TIMER_EVENTS_PER_RUN: usize = 256;
+const MAX_TIMER_EVENTS_PER_ID: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ContactDeviceSnapshot {
+    pub device_id: String,
+    pub status: DeviceStatusKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ConversationMemberSnapshot {
+    pub user_id: String,
+    pub device_id: String,
+    pub status: DeviceStatusKind,
+}
+
+impl CoreDriver {
+    pub fn from_snapshot(
+        snapshot: CorePersistenceSnapshot,
+        base_url: Option<String>,
+    ) -> Result<Self> {
+        let latest_snapshot = snapshot.clone();
+        let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            engine: CoreEngine::from_restored_state(snapshot),
+            runtime: DriverRuntime {
+                client: Client::builder().build().context("build driver reqwest client")?,
+                websocket_tx,
+                websocket_rx,
+                websocket_tasks: BTreeMap::new(),
+                latest_snapshot: Some(latest_snapshot),
+                notifications: Vec::new(),
+                scheduled_timers: Vec::new(),
+                storage_prepare_url: base_url
+                    .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
+                recent_appends: Vec::new(),
+                recent_messages: Vec::new(),
+            },
+            suppress_realtime: false,
+        })
+    }
+
+    pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
+        self.runtime.latest_snapshot.as_ref()
+    }
+
+    pub fn notifications(&self) -> &[String] {
+        &self.runtime.notifications
+    }
+
+    pub fn latest_notification(&self) -> Option<&str> {
+        self.runtime.notifications.last().map(String::as_str)
+    }
+
+    pub fn pending_outbox_count(&self) -> usize {
+        self.runtime
+            .latest_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.pending_outbox.len())
+            .unwrap_or_default()
+    }
+
+    pub fn pending_blob_upload_count(&self) -> usize {
+        self.runtime
+            .latest_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.pending_blob_transfers.len())
+            .unwrap_or_default()
+    }
+
+    pub fn local_identity(&self) -> Option<&crate::identity::LocalIdentityState> {
+        self.engine.local_identity()
+    }
+
+    pub fn local_bundle(&self) -> Option<&IdentityBundle> {
+        self.engine.local_bundle()
+    }
+
+    pub fn contact_bundle(&self, user_id: &str) -> Option<&IdentityBundle> {
+        self.engine.contact_bundle(user_id)
+    }
+
+    pub fn conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> Option<&crate::conversation::LocalConversationState> {
+        self.engine.conversation_state(conversation_id)
+    }
+
+    pub fn mls_status(&self, conversation_id: &str) -> Option<MlsStateStatus> {
+        self.engine.mls_summary(conversation_id).map(|summary| summary.status)
+    }
+
+    pub fn contact_devices(&self, user_id: &str) -> Vec<ContactDeviceSnapshot> {
+        self.engine
+            .contact_bundle(user_id)
+            .map(|bundle| {
+                bundle
+                    .devices
+                    .iter()
+                    .map(|device| ContactDeviceSnapshot {
+                        device_id: device.device_id.clone(),
+                        status: device.status,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn conversation_members(&self, conversation_id: &str) -> Vec<ConversationMemberSnapshot> {
+        self.engine
+            .conversation_state(conversation_id)
+            .map(|state| {
+                state
+                    .conversation
+                    .member_devices
+                    .iter()
+                    .map(|member| ConversationMemberSnapshot {
+                        user_id: member.user_id.clone(),
+                        device_id: member.device_id.clone(),
+                        status: member.status,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn recovery_context_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Option<RecoveryContextSnapshot> {
+        self.engine.recovery_context_snapshot(conversation_id)
+    }
+
+    pub fn sync_checkpoint_snapshot(&self, device_id: &str) -> Option<SyncCheckpointSnapshot> {
+        self.engine.sync_checkpoint_snapshot(device_id)
+    }
+
+    pub fn realtime_session_snapshot(&self, device_id: &str) -> Option<RealtimeSessionSnapshot> {
+        self.engine.realtime_session_snapshot(device_id)
+    }
+
+    pub async fn run_command_until_idle(&mut self, command: CoreCommand) -> Result<CoreOutput> {
+        self.suppress_realtime = false;
+        let output = self.engine.handle_command(command)?;
+        let output = self.execute_until_idle(output).await?;
+        self.sync_latest_snapshot();
+        self.record_observed_output(&output);
+        Ok(output)
+    }
+
+    pub async fn run_command_until_idle_without_realtime(
+        &mut self,
+        command: CoreCommand,
+    ) -> Result<CoreOutput> {
+        self.suppress_realtime = true;
+        let output = self.engine.handle_command(command)?;
+        let output = self.execute_until_idle(output).await?;
+        self.suppress_realtime = false;
+        self.sync_latest_snapshot();
+        self.record_observed_output(&output);
+        Ok(output)
+    }
+
+    pub async fn inject_event_until_idle(&mut self, event: CoreEvent) -> Result<CoreOutput> {
+        let output = self.engine.handle_event(event)?;
+        let output = self.execute_until_idle(output).await?;
+        self.sync_latest_snapshot();
+        self.record_observed_output(&output);
+        Ok(output)
+    }
+
+    pub async fn pump_until_idle(&mut self, max_wait: Duration) -> Result<Vec<CoreOutput>> {
+        let deadline = Instant::now() + max_wait;
+        let mut outputs = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let event = match timeout(remaining.min(Duration::from_millis(250)), self.runtime.websocket_rx.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+            outputs.push(self.inject_event_until_idle(event).await?);
+        }
+        Ok(outputs)
+    }
+
+    pub async fn close_realtime(&mut self, device_id: &str) -> Result<()> {
+        if let Some(task) = self.runtime.websocket_tasks.remove(device_id) {
+            task.abort();
+        }
+        self.engine.clear_realtime_reconnect(device_id);
+        self.sync_latest_snapshot();
+        Ok(())
+    }
+
+    async fn execute_until_idle(&mut self, mut output: CoreOutput) -> Result<CoreOutput> {
+        let mut processed_timers = 0usize;
+        let mut timer_counts = BTreeMap::<String, usize>::new();
+        loop {
+            let effects = std::mem::take(&mut output.effects);
+            if effects.is_empty() {
+                if let Some(timer_event) =
+                    self.take_due_timer_event(&mut processed_timers, &mut timer_counts)?
+                {
+                    output = merge_outputs(
+                        output,
+                        self.engine
+                            .handle_event(timer_event.clone())
+                            .map_err(|error| anyhow!("event {:?} failed: {}", timer_event, error))?,
+                    );
+                    continue;
+                }
+                break;
+            }
+            let mut processed_any_event = false;
+            for effect in effects {
+                let emitted_events = self.execute_effect(effect).await?;
+                for event in emitted_events {
+                    processed_any_event = true;
+                    output = merge_outputs(
+                        output,
+                        self.engine
+                            .handle_event(event.clone())
+                            .map_err(|error| anyhow!("event {:?} failed: {}", event, error))?,
+                    );
+                }
+            }
+            while let Some(timer_event) =
+                self.take_due_timer_event(&mut processed_timers, &mut timer_counts)?
+            {
+                processed_any_event = true;
+                output = merge_outputs(
+                    output,
+                    self.engine
+                        .handle_event(timer_event.clone())
+                        .map_err(|error| anyhow!("event {:?} failed: {}", timer_event, error))?,
+                );
+            }
+            if !processed_any_event {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
+    async fn execute_effect(&mut self, effect: CoreEffect) -> Result<Vec<CoreEvent>> {
+        match effect {
+            CoreEffect::ExecuteHttpRequest { request } => self.execute_http_request(request).await,
+            CoreEffect::OpenRealtimeConnection { connection } => {
+                if self.suppress_realtime {
+                    return Ok(Vec::new());
+                }
+                self.open_realtime(connection.subscription).await
+            }
+            CoreEffect::CloseRealtimeConnection { device_id } => {
+                if let Some(task) = self.runtime.websocket_tasks.remove(&device_id) {
+                    task.abort();
+                }
+                Ok(Vec::new())
+            }
+            CoreEffect::FetchIdentityBundle { fetch } => self.fetch_identity_bundle(fetch).await,
+            CoreEffect::ReadAttachmentBytes { read } => self.read_attachment_bytes(read).await,
+            CoreEffect::PrepareBlobUpload { upload } => self.prepare_blob_upload(upload).await,
+            CoreEffect::UploadBlob { upload } => self.upload_blob(upload).await,
+            CoreEffect::DownloadBlob { download } => self.download_blob(download).await,
+            CoreEffect::WriteDownloadedAttachment { write } => {
+                self.write_downloaded_attachment(write).await
+            }
+            CoreEffect::PersistState { persist } => {
+                self.persist_state(persist);
+                Ok(Vec::new())
+            }
+            CoreEffect::ScheduleTimer { timer } => {
+                self.runtime.scheduled_timers.push(ScheduledTimer {
+                    timer_id: timer.timer_id,
+                    delay_ms: timer.delay_ms,
+                    scheduled_at: Instant::now(),
+                });
+                Ok(Vec::new())
+            }
+            CoreEffect::EmitUserNotification { notification } => {
+                self.runtime.notifications.push(notification.message);
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    async fn execute_http_request(
+        &mut self,
+        request: crate::ffi_api::HttpRequestEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let method = match request.method {
+            HttpMethod::Get => reqwest::Method::GET,
+            HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
+            HttpMethod::Delete => reqwest::Method::DELETE,
+        };
+        let mut builder = self.runtime.client.request(method, &request.url);
+        for (key, value) in &request.headers {
+            let header_value = if key.eq_ignore_ascii_case("X-Tapchat-Capability") {
+                to_camel_case_json_string(value)?
+            } else {
+                value.clone()
+            };
+            builder = builder.header(key, header_value);
+        }
+        if let Some(body) = request.body.as_deref() {
+            if request.url.contains("/messages") {
+                let append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
+                self.runtime.recent_appends.push(append_request.envelope);
+            }
+            let converted = if looks_like_json(body) {
+                to_camel_case_json_string(body)?
+            } else {
+                body.to_string()
+            };
+            builder = builder.body(converted);
+        }
+        match builder.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let body = response.text().await.ok().filter(|value| !value.is_empty()).map(|value| {
+                    if content_type.contains("application/json") {
+                        to_snake_case_json_string(&value).unwrap_or(value)
+                    } else {
+                        value
+                    }
+                });
+                Ok(vec![CoreEvent::HttpResponseReceived {
+                    request_id: request.request_id,
+                    status,
+                    body,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::HttpRequestFailed {
+                request_id: request.request_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn open_realtime(
+        &mut self,
+        subscription: RealtimeSubscriptionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let endpoint = subscription
+            .endpoint
+            .replace("{deviceId}", &urlencoding::encode(&subscription.device_id));
+        let mut request = endpoint.into_client_request()?;
+        for (key, value) in &subscription.headers {
+            request.headers_mut().insert(
+                reqwest::header::HeaderName::from_bytes(key.as_bytes())?,
+                reqwest::header::HeaderValue::from_str(value)?,
+            );
+        }
+        let (stream, _) = connect_async(request).await.context("open realtime websocket")?;
+        let device_id = subscription.device_id.clone();
+        let sender = self.runtime.websocket_tx.clone();
+        let task_device_id = device_id.clone();
+        let handle = tokio::spawn(async move {
+            let (_, mut read) = stream.split();
+            while let Some(message) = read.next().await {
+                match message {
+                    Ok(Message::Text(text)) => {
+                        if let Ok(event) = parse_realtime_event(&task_device_id, &text) {
+                            let _ = sender.send(event);
+                        }
+                    }
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = sender.send(CoreEvent::WebSocketDisconnected {
+                            device_id: task_device_id.clone(),
+                            reason: Some(error.to_string()),
+                        });
+                        return;
+                    }
+                }
+            }
+            let _ = sender.send(CoreEvent::WebSocketDisconnected {
+                device_id: task_device_id,
+                reason: Some("remote closed".into()),
+            });
+        });
+        self.runtime.websocket_tasks.insert(device_id.clone(), handle);
+        Ok(vec![CoreEvent::WebSocketConnected { device_id }])
+    }
+
+    async fn fetch_identity_bundle(
+        &mut self,
+        fetch: FetchIdentityBundleRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let reference = fetch
+            .reference
+            .ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
+        match self.runtime.client.get(reference).send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let bundle: IdentityBundle =
+                    serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+                Ok(vec![CoreEvent::IdentityBundleFetched {
+                    user_id: fetch.user_id,
+                    bundle,
+                }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
+                user_id: fetch.user_id,
+                retryable: false,
+                detail: Some(format!("status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
+                user_id: fetch.user_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn prepare_blob_upload(
+        &self,
+        upload: PrepareBlobUploadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let url = self
+            .runtime
+            .storage_prepare_url
+            .clone()
+            .ok_or_else(|| anyhow!("storage prepare url is not configured"))?;
+        let mut request = self.runtime.client.post(url);
+        for (key, value) in &upload.headers {
+            request = request.header(key, value);
+        }
+        let body = serde_json::to_string(&upload)?;
+        match request.body(to_camel_case_json_string(&body)?).send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let result = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+                Ok(vec![CoreEvent::BlobUploadPrepared {
+                    task_id: upload.task_id,
+                    result,
+                }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: upload.task_id,
+                retryable: false,
+                detail: Some(format!("prepare upload failed with status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: upload.task_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn read_attachment_bytes(
+        &self,
+        read: crate::ffi_api::ReadAttachmentBytesEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let bytes = tokio::fs::read(&read.attachment_id)
+            .await
+            .context("read attachment bytes")?;
+        Ok(vec![CoreEvent::AttachmentBytesLoaded {
+            task_id: read.task_id,
+            plaintext_b64: STANDARD.encode(bytes),
+        }])
+    }
+
+    async fn upload_blob(&self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
+        let bytes = STANDARD
+            .decode(&upload.blob_ciphertext_b64)
+            .context("decode upload blob ciphertext")?;
+        let mut request = self.runtime.client.put(upload.upload_target.clone());
+        for (key, value) in &upload.upload_headers {
+            request = request.header(key, value);
+        }
+        match request.body(bytes).send().await {
+            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::BlobUploaded {
+                task_id: upload.task_id,
+            }]),
+            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: upload.task_id,
+                retryable: false,
+                detail: Some(format!("upload failed with status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: upload.task_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn download_blob(&self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
+        let mut request = self.runtime.client.get(download.download_target.clone());
+        for (key, value) in &download.download_headers {
+            request = request.header(key, value);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let bytes = response.bytes().await?;
+                Ok(vec![CoreEvent::BlobDownloaded {
+                    task_id: download.task_id,
+                    blob_ciphertext: Some(STANDARD.encode(&bytes)),
+                }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: download.task_id,
+                retryable: false,
+                detail: Some(format!("download failed with status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: download.task_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn write_downloaded_attachment(
+        &self,
+        write: crate::ffi_api::WriteDownloadedAttachmentEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let bytes = STANDARD
+            .decode(&write.plaintext_b64)
+            .context("decode downloaded attachment plaintext")?;
+        if let Some(parent) = PathBuf::from(&write.destination_id).parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        tokio::fs::write(&write.destination_id, &bytes).await?;
+        Ok(Vec::new())
+    }
+
+    fn persist_state(&mut self, persist: PersistStateEffect) {
+        if let Some(snapshot) = persist.snapshot {
+            self.runtime.latest_snapshot = Some(snapshot);
+        }
+    }
+
+    fn take_due_timer_event(
+        &mut self,
+        processed_timers: &mut usize,
+        timer_counts: &mut BTreeMap<String, usize>,
+    ) -> Result<Option<CoreEvent>> {
+        let now = Instant::now();
+        let Some(index) = self
+            .runtime
+            .scheduled_timers
+            .iter()
+            .position(|timer| now >= timer.scheduled_at + Duration::from_millis(timer.delay_ms))
+        else {
+            return Ok(None);
+        };
+
+        let timer = self.runtime.scheduled_timers.remove(index);
+        *processed_timers += 1;
+        if *processed_timers > MAX_TIMER_EVENTS_PER_RUN {
+            return Err(anyhow!("timer guard exceeded while driving core effects"));
+        }
+        let count = timer_counts.entry(timer.timer_id.clone()).or_default();
+        *count += 1;
+        if *count > MAX_TIMER_EVENTS_PER_ID {
+            return Err(anyhow!(
+                "timer guard exceeded for {} while driving core effects",
+                timer.timer_id
+            ));
+        }
+        Ok(Some(CoreEvent::TimerTriggered {
+            timer_id: timer.timer_id,
+        }))
+    }
+
+    fn record_observed_output(&mut self, output: &CoreOutput) {
+        let Some(view_model) = output.view_model.as_ref() else {
+            return;
+        };
+        self.runtime.recent_messages.extend(
+            view_model
+                .messages
+                .iter()
+                .map(|message| (message.conversation_id.clone(), message.message_type)),
+        );
+    }
+
+    fn sync_latest_snapshot(&mut self) {
+        self.runtime.latest_snapshot = Some(self.engine.refresh_snapshot());
+    }
+}
+
+fn looks_like_json(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
+fn parse_realtime_event(device_id: &str, text: &str) -> Result<CoreEvent> {
+    let normalized = to_snake_case_json_string(text)?;
+    let value: serde_json::Value = serde_json::from_str(&normalized)?;
+    let event_type = value
+        .get("event")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("missing realtime event kind"))?;
+    let event = match event_type {
+        "head_updated" => RealtimeEvent::HeadUpdated {
+            seq: value
+                .get("seq")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow!("missing seq"))?,
+        },
+        "inbox_record_available" => RealtimeEvent::InboxRecordAvailable {
+            seq: value
+                .get("seq")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow!("missing seq"))?,
+            record: value
+                .get("record")
+                .map(|record| serde_json::from_value(record.clone()))
+                .transpose()?,
+        },
+        other => return Err(anyhow!("unsupported realtime event {other}")),
+    };
+    Ok(CoreEvent::RealtimeEventReceived {
+        device_id: device_id.to_string(),
+        event,
+    })
+}
+
+fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
+    left.state_update.conversations_changed |= right.state_update.conversations_changed;
+    left.state_update.messages_changed |= right.state_update.messages_changed;
+    left.state_update.contacts_changed |= right.state_update.contacts_changed;
+    left.state_update.checkpoints_changed |= right.state_update.checkpoints_changed;
+    left.state_update
+        .system_statuses_changed
+        .extend(right.state_update.system_statuses_changed);
+    left.effects.extend(right.effects);
+    if right.view_model.is_some() {
+        left.view_model = right.view_model;
+    }
+    left
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_realtime_event, ScheduledTimer};
+    use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn websocket_payload_maps_to_core_event() {
+        let event =
+            parse_realtime_event("device:bob:phone", r#"{"event":"head_updated","seq":7}"#)
+                .expect("parse");
+        match event {
+            crate::CoreEvent::RealtimeEventReceived { device_id, event } => {
+                assert_eq!(device_id, "device:bob:phone");
+                assert!(matches!(
+                    event,
+                    crate::ffi_api::RealtimeEvent::HeadUpdated { seq: 7 }
+                ));
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn zero_delay_timer_is_due_immediately() {
+        let timer = ScheduledTimer {
+            timer_id: "sync:device:bob".into(),
+            delay_ms: 0,
+            scheduled_at: Instant::now(),
+        };
+        assert!(Instant::now() >= timer.scheduled_at + Duration::from_millis(timer.delay_ms));
+    }
+
+    #[test]
+    fn nonzero_delay_timer_is_not_due_immediately() {
+        let timer = ScheduledTimer {
+            timer_id: "retry_append:msg:1".into(),
+            delay_ms: 50,
+            scheduled_at: Instant::now(),
+        };
+        assert!(Instant::now() < timer.scheduled_at + Duration::from_millis(timer.delay_ms));
+    }
+}

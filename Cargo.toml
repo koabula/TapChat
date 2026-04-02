@@ -7,16 +7,35 @@ name = "TapChat"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "tapchat_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tapchat"
+path = "src/main.rs"
+
 [dependencies]
 aes-gcm = "0.10"
+anyhow = "1"
 base64 = "0.22"
 bip39 = "2"
+clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+futures-util = "0.3"
 hmac = "0.12"
 openmls = { version = "0.8.1", features = ["openmls_rust_crypto"] }
 openmls_basic_credential = "0.5.0"
 openmls_rust_crypto = "0.5.1"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+urlencoding = "2"
+
+[dev-dependencies]
+tapchat_transport_adapter = { path = "crates/tapchat_transport_adapter" }

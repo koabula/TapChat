@@ -36,7 +36,7 @@ pub struct CoreEngine {
     pub(crate) state: CoreState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecoveryContextSnapshot {
     pub reason: RecoveryReason,
     pub phase: RecoveryPhase,
@@ -46,7 +46,7 @@ pub struct RecoveryContextSnapshot {
     pub escalation_reason: Option<RecoveryEscalationReason>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SyncCheckpointSnapshot {
     pub last_fetched_seq: u64,
     pub last_acked_seq: u64,
@@ -54,7 +54,7 @@ pub struct SyncCheckpointSnapshot {
     pub pending_record_seqs: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct RealtimeSessionSnapshot {
     pub last_known_seq: u64,
     pub needs_reconnect: bool,
@@ -123,6 +123,17 @@ impl CoreEngine {
                 last_known_seq: session.last_known_seq,
                 needs_reconnect: session.needs_reconnect,
             })
+    }
+
+    pub fn clear_realtime_reconnect(&mut self, device_id: &str) {
+        if let Some(session) = self.state.realtime_sessions.get_mut(device_id) {
+            session.connected = false;
+            session.needs_reconnect = false;
+        }
+    }
+
+    pub fn refresh_snapshot(&self) -> CorePersistenceSnapshot {
+        build_persistence_snapshot(&self.state)
     }
 
     pub fn local_device_id(&self) -> Option<&str> {
@@ -332,15 +343,14 @@ impl CoreEngine {
             .collect();
 
         let local_identity = snapshot.local_identity.map(|identity| identity.state);
+        let persisted_deployment = snapshot.deployment.clone();
         let mut engine = Self {
             state: CoreState {
                 local_identity,
-                local_bundle: snapshot
-                    .deployment
+                local_bundle: persisted_deployment
                     .as_ref()
                     .and_then(|deployment| deployment.local_bundle.clone()),
-                deployment_bundle: snapshot
-                    .deployment
+                deployment_bundle: persisted_deployment
                     .as_ref()
                     .map(|deployment| deployment.deployment_bundle.clone()),
                 contacts,
@@ -354,8 +364,7 @@ impl CoreEngine {
                 realtime_sessions,
                 mls_adapter: restored_mls.adapter,
                 mls_summaries,
-                published_key_package: snapshot
-                    .deployment
+                published_key_package: persisted_deployment
                     .and_then(|deployment| deployment.published_key_package),
                 pending_requests: BTreeMap::new(),
                 request_nonce: 0,
@@ -363,6 +372,18 @@ impl CoreEngine {
                 recovery_contexts,
             },
         };
+
+        if engine.state.mls_adapter.is_none() {
+            if let Some(serialized_state) = snapshot
+                .deployment
+                .as_ref()
+                .and_then(|deployment| deployment.serialized_mls_bootstrap_state.clone())
+            {
+                if let Ok(adapter) = MlsAdapter::restore_from_bootstrap_state(&serialized_state) {
+                    engine.state.mls_adapter = Some(adapter);
+                }
+            }
+        }
 
         if engine.state.mls_adapter.is_none() {
             if let Some(identity) = engine.state.local_identity.as_ref() {
@@ -2764,6 +2785,17 @@ impl CoreEngine {
         records: Vec<InboxRecord>,
         to_seq: u64,
     ) -> CoreResult<CoreOutput> {
+        self.handle_inbox_records_internal(device_id, records, to_seq, true)
+    }
+
+    fn handle_inbox_records_internal(
+        &mut self,
+        device_id: String,
+        records: Vec<InboxRecord>,
+        to_seq: u64,
+        allow_pending_replay: bool,
+    ) -> CoreResult<CoreOutput> {
+        let mut pending_recovery_conversations = BTreeSet::new();
         let mut fresh_records = {
             let sync_state = self
                 .state
@@ -2917,10 +2949,7 @@ impl CoreEngine {
                                     &conversation_id,
                                     RecoveryPhase::WaitingForPendingReplay,
                                 );
-                                output = merge_outputs(
-                                    output,
-                                    self.advance_recovery(&conversation_id)?,
-                                );
+                                pending_recovery_conversations.insert(conversation_id.clone());
                             }
                             IngestResult::NeedsRebuild => {
                                 output = merge_outputs(
@@ -2991,7 +3020,49 @@ impl CoreEngine {
                 },
             );
         }
+        output = merge_outputs(
+            output,
+            self.process_pending_recovery_batch(
+                &device_id,
+                pending_recovery_conversations,
+                allow_pending_replay,
+            )?,
+        );
         self.merge_with_transport_flush(output)
+    }
+
+    fn process_pending_recovery_batch(
+        &mut self,
+        device_id: &str,
+        conversations: BTreeSet<String>,
+        allow_pending_replay: bool,
+    ) -> CoreResult<CoreOutput> {
+        if conversations.is_empty() {
+            return Ok(CoreOutput::default());
+        }
+
+        let pending_retry = self
+            .state
+            .sync_states
+            .get(device_id)
+            .map(|state| state.pending_retry)
+            .unwrap_or(false);
+
+        if pending_retry && allow_pending_replay {
+            return self.replay_pending_records_for_device(device_id.to_string());
+        }
+
+        let next_phase = if pending_retry {
+            RecoveryPhase::WaitingForPendingReplay
+        } else {
+            RecoveryPhase::WaitingForIdentityRefresh
+        };
+        for conversation_id in conversations {
+            if self.state.conversations.contains_key(&conversation_id) {
+                self.transition_recovery_phase(&conversation_id, next_phase);
+            }
+        }
+        Ok(CoreOutput::default())
     }
 
     fn ensure_local_conversation_for_record(
@@ -3055,70 +3126,6 @@ impl CoreEngine {
             RecoveryReason::MissingCommit
         } else {
             RecoveryReason::MissingWelcome
-        }
-    }
-
-    fn advance_recovery(&mut self, conversation_id: &str) -> CoreResult<CoreOutput> {
-        enum RecoveryAction {
-            Sync,
-            ReplayPending,
-            RefreshIdentity,
-            Reconcile,
-        }
-
-        let Some(action) = ({
-            let Some(context) = self.state.recovery_contexts.get(conversation_id) else {
-                return Ok(CoreOutput::default());
-            };
-            match context.phase {
-                RecoveryPhase::WaitingForSync => Some(RecoveryAction::Sync),
-                RecoveryPhase::WaitingForPendingReplay => Some(RecoveryAction::ReplayPending),
-                RecoveryPhase::WaitingForIdentityRefresh => Some(RecoveryAction::RefreshIdentity),
-                RecoveryPhase::WaitingForExplicitReconcile => Some(RecoveryAction::Reconcile),
-                RecoveryPhase::EscalatedToRebuild => None,
-            }
-        }) else {
-            return Ok(CoreOutput::default());
-        };
-
-        match action {
-            RecoveryAction::Sync => {
-                self.transition_recovery_phase(
-                    conversation_id,
-                    RecoveryPhase::WaitingForPendingReplay,
-                );
-                let device_id = self
-                    .state
-                    .local_identity
-                    .as_ref()
-                    .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-                    .device_identity
-                    .device_id
-                    .clone();
-                self.sync_inbox(device_id)
-            }
-            RecoveryAction::ReplayPending => {
-                let device_id = self
-                    .state
-                    .local_identity
-                    .as_ref()
-                    .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-                    .device_identity
-                    .device_id
-                    .clone();
-                self.replay_pending_records_for_device(device_id)
-            }
-            RecoveryAction::RefreshIdentity => {
-                self.transition_recovery_phase(
-                    conversation_id,
-                    RecoveryPhase::WaitingForIdentityRefresh,
-                );
-                let user_id = self.peer_user_for_conversation(conversation_id)?;
-                self.refresh_identity_state(user_id)
-            }
-            RecoveryAction::Reconcile => self.reconcile_conversation_membership(
-                conversation_id.to_string(),
-            ),
         }
     }
 
@@ -3315,7 +3322,7 @@ impl CoreEngine {
             records
         };
         let to_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
-        let output = self.handle_inbox_records(device_id.clone(), records, to_seq)?;
+        let output = self.handle_inbox_records_internal(device_id.clone(), records, to_seq, false)?;
         let pending_retry = self
             .state
             .sync_states
@@ -3380,6 +3387,14 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             deployment_bundle,
             local_bundle: state.local_bundle.clone(),
             published_key_package: state.published_key_package.clone(),
+            serialized_mls_bootstrap_state: if state.mls_summaries.is_empty() {
+                state
+                    .mls_adapter
+                    .as_ref()
+                    .and_then(|adapter| adapter.export_bootstrap_state().ok())
+            } else {
+                None
+            },
         }),
         contacts: state
             .contacts

@@ -438,6 +438,53 @@ impl MlsAdapter {
         if !self.groups.contains_key(conversation_id) {
             return Err(CoreError::invalid_input("conversation MLS state does not exist"));
         }
+        self.export_serializable_state()
+    }
+
+    pub fn export_bootstrap_state(&self) -> CoreResult<String> {
+        self.export_serializable_state()
+    }
+
+    pub fn restore_from_bootstrap_state(serialized_state: &str) -> CoreResult<Self> {
+        let provider = OpenMlsRustCrypto::default();
+        let parsed: PersistedGroupState = serde_json::from_str(serialized_state)
+            .map_err(|error| {
+                CoreError::invalid_state(format!(
+                    "failed to decode persisted MLS bootstrap state: {error}"
+                ))
+            })?;
+        let PersistedGroupState {
+            credential_identity,
+            local_device_id,
+            signer,
+            credential_with_key,
+            storage,
+        } = parsed;
+        {
+            let mut values = provider.storage().values.write().map_err(|_| {
+                CoreError::invalid_state("failed to write restored MLS provider storage")
+            })?;
+            for (key, value) in &storage.values {
+                let decoded_key = BASE64
+                    .decode(key)
+                    .map_err(|_| CoreError::invalid_input("invalid persisted MLS storage key"))?;
+                let decoded_value = BASE64.decode(value).map_err(|_| {
+                    CoreError::invalid_input("invalid persisted MLS storage value")
+                })?;
+                values.insert(decoded_key, decoded_value);
+            }
+        }
+        Ok(Self {
+            provider,
+            signer,
+            credential_with_key,
+            credential_identity,
+            local_device_id,
+            groups: BTreeMap::new(),
+        })
+    }
+
+    fn export_serializable_state(&self) -> CoreResult<String> {
         let values = self.provider.storage().values.read().map_err(|_| {
             CoreError::invalid_state("failed to read MLS provider storage for persistence")
         })?;
@@ -977,6 +1024,46 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn persisted_bootstrap_state_restores_welcome_staging() {
+        let alice_identity =
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+                .expect("alice");
+        let bob_identity = IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone"))
+            .expect("bob");
+
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
+        let (bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+        let bootstrap_state = bob_adapter
+            .export_bootstrap_state()
+            .expect("bootstrap state");
+
+        let artifacts = alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: bob_package.key_package_b64,
+                }],
+            )
+            .expect("create conversation");
+
+        let mut restored_bob =
+            MlsAdapter::restore_from_bootstrap_state(&bootstrap_state).expect("restore");
+        let welcome_result = restored_bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &artifacts.welcomes[0].payload_b64,
+            )
+            .expect("welcome");
+
+        assert!(matches!(welcome_result, IngestResult::AppliedWelcome { .. }));
     }
 
     #[test]
