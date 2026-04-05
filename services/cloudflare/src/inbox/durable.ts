@@ -253,7 +253,7 @@ class ManagedSession {
       this.queuedPayloads.push(payload);
       return;
     }
-    this.socket.send(payload);
+    this.dispatch(payload);
   }
 
   markReady(): void {
@@ -266,7 +266,15 @@ class ManagedSession {
       if (payload === undefined) {
         break;
       }
-      this.socket.send(payload);
+      this.dispatch(payload);
     }
+  }
+
+  private dispatch(payload: string): void {
+    // Deliver on the next task turn so back-to-back publish events are not lost
+    // by the Miniflare test client while it swaps message listeners.
+    setTimeout(() => {
+      this.socket.send(payload);
+    }, 0);
   }
 }

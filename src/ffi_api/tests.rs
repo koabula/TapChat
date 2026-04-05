@@ -1077,6 +1077,115 @@ mod tests {
     }
 
     #[test]
+    fn additional_device_snapshot_round_trip_restores_bootstrap_for_welcome_staging() {
+        let bob_phone_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_phone_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_phone_bundle.user_id.clone());
+
+        let mut laptop = CoreEngine::new();
+        laptop
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        let create_output = laptop
+            .handle_command(CoreCommand::CreateAdditionalDeviceIdentity {
+                mnemonic: Some(BOB_MNEMONIC.into()),
+                device_name: Some("laptop".into()),
+            })
+            .expect("additional device");
+        let snapshot = extract_snapshot(&create_output);
+        let deployment = snapshot
+            .deployment
+            .as_ref()
+            .expect("persisted deployment for additional device");
+        assert_eq!(
+            deployment
+                .local_bundle
+                .as_ref()
+                .expect("local bundle")
+                .devices[0]
+                .device_id,
+            snapshot
+                .local_identity
+                .as_ref()
+                .expect("local identity")
+                .state
+                .device_identity
+                .device_id
+        );
+        assert_eq!(
+            deployment
+                .published_key_package
+                .as_ref()
+                .expect("published key package")
+                .key_package_ref,
+            deployment
+                .local_bundle
+                .as_ref()
+                .expect("local bundle")
+                .devices[0]
+                .keypackage_ref
+                .object_ref
+        );
+        assert!(
+            deployment.serialized_mls_bootstrap_state.is_some(),
+            "additional device snapshot should persist MLS bootstrap state before welcome"
+        );
+
+        let laptop_profile = deployment
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .clone();
+        let laptop_identity = snapshot
+            .local_identity
+            .as_ref()
+            .expect("local identity")
+            .state
+            .clone();
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &laptop_identity,
+            &sample_deployment(),
+            vec![bob_phone_bundle.devices[0].clone(), laptop_profile.clone()],
+        )
+        .expect("merged bundle");
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
+            .expect("apply merged bundle");
+        let welcome = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsWelcome
+                    && item.envelope.recipient_device_id == laptop_profile.device_id
+            })
+            .map(|item| item.envelope.clone())
+            .expect("welcome for laptop");
+
+        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let result = restored
+            .state
+            .mls_adapter
+            .as_mut()
+            .expect("restored laptop adapter")
+            .ingest_message(
+                &conversation_id,
+                &welcome.sender_device_id,
+                MessageType::MlsWelcome,
+                welcome
+                    .inline_ciphertext
+                    .as_deref()
+                    .expect("welcome payload"),
+            )
+            .expect("stage welcome after snapshot restore");
+        assert!(matches!(result, crate::mls_adapter::IngestResult::AppliedWelcome { .. }));
+    }
+
+    #[test]
     fn rotate_local_key_package_updates_local_bundle_reference() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
@@ -1308,6 +1417,47 @@ mod tests {
             .expect("explicit reconcile should be idempotent");
 
         assert_eq!(alice.state.pending_outbox.len(), pending_after_refresh);
+    }
+
+    #[test]
+    fn restored_identity_update_state_keeps_reconcile_idempotent() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_laptop,
+            &sample_deployment(),
+            bob_laptop_package.key_package_b64,
+            bob_laptop_package.expires_at,
+        )
+        .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile],
+        )
+        .expect("merged bundle");
+
+        let refresh_output = alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
+            .expect("apply bundle update");
+        let pending_after_refresh = alice.state.pending_outbox.len();
+
+        let snapshot = extract_snapshot(&refresh_output);
+        let mut restored = CoreEngine::from_restored_state(snapshot);
+        restored
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("explicit reconcile after restore should remain idempotent");
+
+        assert_eq!(restored.state.pending_outbox.len(), pending_after_refresh);
     }
 
     #[test]

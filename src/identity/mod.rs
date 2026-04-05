@@ -262,6 +262,7 @@ impl IdentityManager {
         deployment: &DeploymentBundle,
         devices: Vec<crate::model::DeviceContactProfile>,
     ) -> CoreResult<IdentityBundle> {
+        let encoded_user_id = urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
         let unsigned = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             user_id: local_identity.user_identity.user_id.clone(),
@@ -269,8 +270,16 @@ impl IdentityManager {
             devices,
             // Deployment runtime config may provide bootstrap references for publishing the
             // local user's shared state. Contact refresh must not infer these values.
-            identity_bundle_ref: deployment.runtime_config.identity_bundle_ref.clone(),
-            device_status_ref: deployment.runtime_config.device_status_ref.clone(),
+            identity_bundle_ref: deployment
+                .runtime_config
+                .identity_bundle_ref
+                .clone()
+                .map(|reference| reference.replace("{userId}", &encoded_user_id)),
+            device_status_ref: deployment
+                .runtime_config
+                .device_status_ref
+                .clone()
+                .map(|reference| reference.replace("{userId}", &encoded_user_id)),
             storage_profile: Some(StorageProfile {
                 base_url: deployment.storage_base_info.base_url.clone(),
                 profile_ref: None,
@@ -654,6 +663,37 @@ mod tests {
                 .as_ref()
                 .and_then(|profile| profile.profile_ref.as_deref()),
             None
+        );
+    }
+
+    #[test]
+    fn exported_identity_bundle_materializes_runtime_refs_for_local_user() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let mut deployment = sample_deployment();
+        deployment.runtime_config.identity_bundle_ref = Some(
+            "https://storage.example.com/state/{userId}/identity_bundle.json".into(),
+        );
+        deployment.runtime_config.device_status_ref = Some(
+            "https://storage.example.com/state/{userId}/device_status.json".into(),
+        );
+
+        let bundle =
+            IdentityManager::export_identity_bundle(&identity, &deployment, "kp-ref".into(), 999)
+                .expect("bundle");
+        let encoded_user_id = urlencoding::encode(&identity.user_identity.user_id).into_owned();
+        let expected_identity_ref =
+            format!("https://storage.example.com/state/{encoded_user_id}/identity_bundle.json");
+        let expected_status_ref =
+            format!("https://storage.example.com/state/{encoded_user_id}/device_status.json");
+
+        assert_eq!(
+            bundle.identity_bundle_ref.as_deref(),
+            Some(expected_identity_ref.as_str())
+        );
+        assert_eq!(
+            bundle.device_status_ref.as_deref(),
+            Some(expected_status_ref.as_str())
         );
     }
 
