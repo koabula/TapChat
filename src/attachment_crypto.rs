@@ -1,4 +1,7 @@
-use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit}};
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -36,8 +39,9 @@ pub fn encrypt_blob(plaintext: &[u8]) -> CoreResult<EncryptedAttachment> {
     rand::thread_rng().fill_bytes(&mut key);
     rand::thread_rng().fill_bytes(&mut nonce);
 
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|error| CoreError::invalid_state(format!("failed to initialize attachment cipher: {error}")))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|error| {
+        CoreError::invalid_state(format!("failed to initialize attachment cipher: {error}"))
+    })?;
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|_| CoreError::invalid_state("failed to encrypt attachment blob"))?;
@@ -66,13 +70,18 @@ pub fn decrypt_blob(ciphertext: &[u8], metadata: &AttachmentCipherMetadata) -> C
         .decode(&metadata.nonce_b64)
         .map_err(|_| CoreError::invalid_input("attachment nonce must be valid base64"))?;
     if key.len() != ATTACHMENT_KEY_LEN {
-        return Err(CoreError::invalid_input("attachment key has invalid length"));
+        return Err(CoreError::invalid_input(
+            "attachment key has invalid length",
+        ));
     }
     if nonce.len() != ATTACHMENT_NONCE_LEN {
-        return Err(CoreError::invalid_input("attachment nonce has invalid length"));
+        return Err(CoreError::invalid_input(
+            "attachment nonce has invalid length",
+        ));
     }
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|error| CoreError::invalid_state(format!("failed to initialize attachment cipher: {error}")))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|error| {
+        CoreError::invalid_state(format!("failed to initialize attachment cipher: {error}"))
+    })?;
     cipher
         .decrypt(Nonce::from_slice(&nonce), ciphertext)
         .map_err(|_| CoreError::invalid_input("failed to decrypt attachment blob"))

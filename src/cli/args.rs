@@ -42,9 +42,21 @@ pub enum ProfileSubcommand {
         #[arg(long)]
         root: PathBuf,
     },
-    Show { #[arg(long)] profile: PathBuf },
-    ImportDeployment { #[arg(long)] profile: PathBuf, bundle_file: PathBuf },
-    ExportIdentity { #[arg(long)] profile: PathBuf, #[arg(long)] out: Option<PathBuf> },
+    Show {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    ImportDeployment {
+        #[arg(long)]
+        profile: PathBuf,
+        bundle_file: PathBuf,
+    },
+    ExportIdentity {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -79,9 +91,20 @@ pub enum DeviceSubcommand {
         #[arg(long)]
         mnemonic_file: PathBuf,
     },
-    RotateKeyPackage { #[arg(long)] profile: PathBuf },
-    Status { #[arg(long)] profile: PathBuf },
-    Revoke { #[arg(long)] profile: PathBuf, #[arg(long)] target_device_id: String },
+    RotateKeyPackage {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Revoke {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        target_device_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -92,10 +115,81 @@ pub struct ContactCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ContactSubcommand {
-    ImportIdentity { #[arg(long)] profile: PathBuf, bundle_file: PathBuf },
-    Refresh { #[arg(long)] profile: PathBuf, #[arg(long)] user_id: String },
-    Show { #[arg(long)] profile: PathBuf, #[arg(long)] user_id: String },
-    List { #[arg(long)] profile: PathBuf },
+    ImportIdentity {
+        #[arg(long)]
+        profile: PathBuf,
+        bundle_file: PathBuf,
+    },
+    Refresh {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        user_id: String,
+    },
+    Show {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        user_id: String,
+    },
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Requests(ContactRequestsCommand),
+    Allowlist(ContactAllowlistCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ContactRequestsCommand {
+    #[command(subcommand)]
+    pub command: ContactRequestsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContactRequestsSubcommand {
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Accept {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        request_id: String,
+    },
+    Reject {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        request_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ContactAllowlistCommand {
+    #[command(subcommand)]
+    pub command: ContactAllowlistSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContactAllowlistSubcommand {
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Add {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        user_id: String,
+    },
+    Remove {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        user_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -106,12 +200,40 @@ pub struct ConversationCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ConversationSubcommand {
-    CreateDirect { #[arg(long)] profile: PathBuf, #[arg(long)] peer_user_id: String },
-    List { #[arg(long)] profile: PathBuf },
-    Show { #[arg(long)] profile: PathBuf, #[arg(long)] conversation_id: String },
-    Members { #[arg(long)] profile: PathBuf, #[arg(long)] conversation_id: String },
-    Rebuild { #[arg(long)] profile: PathBuf, #[arg(long)] conversation_id: String },
-    Reconcile { #[arg(long)] profile: PathBuf, #[arg(long)] conversation_id: String },
+    CreateDirect {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        peer_user_id: String,
+    },
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        conversation_id: String,
+    },
+    Members {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        conversation_id: String,
+    },
+    Rebuild {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        conversation_id: String,
+    },
+    Reconcile {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        conversation_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -150,7 +272,12 @@ pub enum MessageSubcommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
-    List { #[arg(long)] profile: PathBuf, #[arg(long)] conversation_id: String },
+    List {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        conversation_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -161,12 +288,32 @@ pub struct SyncCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SyncSubcommand {
-    Once { #[arg(long)] profile: PathBuf },
-    Foreground { #[arg(long)] profile: PathBuf },
-    RealtimeConnect { #[arg(long)] profile: PathBuf },
-    RealtimeClose { #[arg(long)] profile: PathBuf },
-    Status { #[arg(long)] profile: PathBuf },
-    Head { #[arg(long)] profile: PathBuf, #[arg(long)] device_id: Option<String> },
+    Once {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Foreground {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    RealtimeConnect {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    RealtimeClose {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Head {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        device_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -177,9 +324,20 @@ pub struct RuntimeCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum RuntimeSubcommand {
-    LocalStart { #[arg(long)] profile: PathBuf },
-    LocalStop { #[arg(long)] profile: PathBuf },
-    LocalStatus { #[arg(long)] profile: PathBuf },
+    LocalStart {
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+    },
+    LocalStop {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    LocalStatus {
+        #[arg(long)]
+        profile: PathBuf,
+    },
 }
 
 #[cfg(test)]

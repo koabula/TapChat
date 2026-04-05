@@ -170,13 +170,22 @@ class FakeInboxStub implements DurableObjectStub {
   }
 }
 
-function createEnv(options?: { rateLimitPerMinute?: string; rateLimitPerHour?: string; retentionDays?: string; maxInlineBytes?: string }) {
+function createEnv(options?: {
+  rateLimitPerMinute?: string;
+  rateLimitPerHour?: string;
+  retentionDays?: string;
+  maxInlineBytes?: string;
+  sharingSecret?: string;
+  bootstrapSecret?: string;
+}) {
   const bucket = new MemoryR2Store();
   const inboxes = new Map<string, FakeInboxStub>();
   const maxInlineBytes = Number(options?.maxInlineBytes ?? "128");
   const retentionDays = Number(options?.retentionDays ?? "30");
   const rateLimitPerMinute = Number(options?.rateLimitPerMinute ?? "60");
   const rateLimitPerHour = Number(options?.rateLimitPerHour ?? "600");
+  const sharingSecret = options?.sharingSecret ?? "secret";
+  const bootstrapSecret = options?.bootstrapSecret ?? "bootstrap-secret";
 
   const env: Env = {
     PUBLIC_BASE_URL: "https://example.com",
@@ -185,8 +194,8 @@ function createEnv(options?: { rateLimitPerMinute?: string; rateLimitPerHour?: s
     RETENTION_DAYS: String(retentionDays),
     RATE_LIMIT_PER_MINUTE: String(rateLimitPerMinute),
     RATE_LIMIT_PER_HOUR: String(rateLimitPerHour),
-    SHARING_TOKEN_SECRET: "secret",
-    BOOTSTRAP_TOKEN_SECRET: "bootstrap-secret",
+    SHARING_TOKEN_SECRET: sharingSecret,
+    BOOTSTRAP_TOKEN_SECRET: bootstrapSecret,
     TAPCHAT_STORAGE: bucket.asBucket(),
     INBOX: {
       idFromName(name: string) {
@@ -343,6 +352,51 @@ test("issues device deployment bundle with runtime auth and security features", 
   assert.ok(bundle.runtimeConfig.features.includes("message_requests"));
   assert.ok(bundle.runtimeConfig.features.includes("allowlist"));
   assert.ok(bundle.runtimeConfig.features.includes("rate_limit"));
+});
+
+test("bootstrap rejects expired token", async () => {
+  const { env } = createEnv();
+  const token = await signSharingPayload("bootstrap-secret", {
+    version: CURRENT_MODEL_VERSION,
+    service: "bootstrap",
+    userId: "user:bob",
+    deviceId: "device:bob:phone",
+    operations: ["issue_device_bundle"],
+    expiresAt: 1
+  });
+
+  const response = await handleRequest(
+    new Request("https://example.com/v1/bootstrap/device", {
+      method: "POST",
+      headers: {
+        ...authHeaders(token),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        userId: "user:bob",
+        deviceId: "device:bob:phone"
+      } satisfies BootstrapDeviceRequest)
+    }),
+    env
+  );
+
+  assert.equal(response.status, 403);
+});
+
+test("rotating sharing secret invalidates previously issued device runtime tokens", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const rotated = createEnv({ sharingSecret: "rotated-secret" });
+
+  const response = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/head", {
+      headers: authHeaders(bundle.deviceRuntimeAuth!.token)
+    }),
+    rotated.env
+  );
+
+  assert.equal(response.status, 403);
 });
 
 test("accepts append requests only with explicit capability header", async () => {
@@ -710,7 +764,3 @@ test("ack semantics reject backwards ack and cleanup only removes expired acked 
   assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), false);
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
 });
-
-
-
-

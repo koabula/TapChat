@@ -39,8 +39,11 @@ pub struct RuntimeMetadata {
     pub sharing_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_root: Option<PathBuf>,
 }
-
 pub struct Profile {
     root: PathBuf,
     meta: ProfileMetadata,
@@ -86,7 +89,11 @@ impl Profile {
         &self.meta
     }
 
-    pub fn update_identity(&mut self, user_id: Option<String>, device_id: Option<String>) -> Result<()> {
+    pub fn update_identity(
+        &mut self,
+        user_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<()> {
         self.meta.user_id = user_id;
         self.meta.device_id = device_id;
         self.save_metadata()
@@ -110,8 +117,7 @@ impl Profile {
         if !path.exists() {
             return Ok(CorePersistenceSnapshot::default());
         }
-        decode_snapshot(&fs::read(&path).context("read snapshot")?)
-            .map_err(anyhow::Error::from)
+        decode_snapshot(&fs::read(&path).context("read snapshot")?).map_err(anyhow::Error::from)
     }
 
     pub fn save_snapshot(&self, snapshot: &CorePersistenceSnapshot) -> Result<()> {
@@ -127,7 +133,11 @@ impl Profile {
         Ok(path)
     }
 
-    pub fn save_identity_bundle(&self, bundle: &IdentityBundle, file_name: &str) -> Result<PathBuf> {
+    pub fn save_identity_bundle(
+        &self,
+        bundle: &IdentityBundle,
+        file_name: &str,
+    ) -> Result<PathBuf> {
         let path = self.meta.bundles_dir.join(file_name);
         let bytes = serde_json::to_vec_pretty(bundle)?;
         write_atomic(&path, &bytes)?;
@@ -151,11 +161,16 @@ impl Profile {
         if !path.exists() {
             return Ok(RuntimeMetadata::default());
         }
-        Ok(serde_json::from_slice(&fs::read(path).context("read runtime metadata")?)?)
+        Ok(serde_json::from_slice(
+            &fs::read(path).context("read runtime metadata")?,
+        )?)
     }
 
     pub fn save_runtime_metadata(&self, runtime: &RuntimeMetadata) -> Result<()> {
-        write_atomic(&self.runtime_meta_path(), &serde_json::to_vec_pretty(runtime)?)
+        write_atomic(
+            &self.runtime_meta_path(),
+            &serde_json::to_vec_pretty(runtime)?,
+        )
     }
 
     pub fn clear_runtime_metadata(&self) -> Result<()> {

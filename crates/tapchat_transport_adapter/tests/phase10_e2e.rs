@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{
-    AttachmentDescriptor, CoreCommand, CoreEvent, RecoveryReason, MAX_TRANSPORT_RETRIES,
+    AttachmentDescriptor, CoreCommand, CoreEvent, MAX_TRANSPORT_RETRIES, RecoveryReason,
 };
 use tapchat_core::identity::IdentityManager;
 use tapchat_core::model::{
@@ -63,10 +63,12 @@ async fn text_happy_path_and_reconnect_recovery_work() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after first text")?;
-    assert!(conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("hello bob")));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("hello bob"))
+    );
 
     let sync_state = ctx
         .bob
@@ -75,7 +77,10 @@ async fn text_happy_path_and_reconnect_recovery_work() -> Result<()> {
         .context("bob sync state missing")?;
     assert!(sync_state.checkpoint.last_acked_seq > 0);
 
-    let head = ctx.runtime.get_head(&ctx.bob_auth, &ctx.bob_device_id).await?;
+    let head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?;
     assert!(head.head_seq > 0);
 
     ctx.bob.close_realtime(&ctx.bob_device_id).await?;
@@ -92,10 +97,12 @@ async fn text_happy_path_and_reconnect_recovery_work() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after reconnect")?;
-    assert!(recovered
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after reconnect")));
+    assert!(
+        recovered
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after reconnect"))
+    );
 
     Ok(())
 }
@@ -131,11 +138,13 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
         .iter()
         .find(|message| !message.storage_refs.is_empty())
         .context("attachment message not found")?;
-    assert!(attachment_message
-        .plaintext
-        .as_deref()
-        .unwrap_or_default()
-        .contains("payload.bin"));
+    assert!(
+        attachment_message
+            .plaintext
+            .as_deref()
+            .unwrap_or_default()
+            .contains("payload.bin")
+    );
 
     let attachment_message_id = attachment_message.message_id.clone();
     let attachment_reference = attachment_message.storage_refs[0].object_ref.clone();
@@ -177,7 +186,8 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
 async fn identity_refresh_sees_new_device_in_runtime() -> Result<()> {
     let mut ctx = setup_trio().await?;
 
-    let merged = publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    let merged =
+        publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
     assert_eq!(merged.devices.len(), 2);
     let runtime_bundle = ctx.runtime.get_identity_bundle(&ctx.bob_user_id).await?;
     assert_eq!(runtime_bundle.devices.len(), 2);
@@ -185,7 +195,11 @@ async fn identity_refresh_sees_new_device_in_runtime() -> Result<()> {
 
     let devices = ctx.alice.contact_devices(&ctx.bob_user_id);
     assert_eq!(devices.len(), 2);
-    assert!(devices.iter().any(|device| device.device_id == ctx.bob_laptop_device_id));
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.device_id == ctx.bob_laptop_device_id)
+    );
     assert!(devices.iter().any(|device| {
         device.device_id == ctx.bob_phone_device_id && device.status == DeviceStatusKind::Active
     }));
@@ -202,12 +216,8 @@ async fn reconcile_emits_welcome_and_commit_for_new_device() -> Result<()> {
     refresh_alice_contact(&mut ctx).await?;
 
     let pending = ctx.alice.pending_mls_artifacts(&ctx.conversation_id);
-    assert!(
-        pending.pending_welcome_count > 0
-    );
-    assert!(
-        pending.pending_commit_count > 0
-    );
+    assert!(pending.pending_welcome_count > 0);
+    assert!(pending.pending_commit_count > 0);
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRecovery)
@@ -241,13 +251,19 @@ async fn new_device_ingests_welcome_and_joins_existing_conversation() -> Result<
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after welcome ingest")?;
-    assert!(conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("hello laptop")));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("hello laptop"))
+    );
 
     let members = ctx.alice.conversation_members(&ctx.conversation_id);
-    assert!(members.iter().any(|member| member.device_id == ctx.bob_laptop_device_id));
+    assert!(
+        members
+            .iter()
+            .any(|member| member.device_id == ctx.bob_laptop_device_id)
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -328,26 +344,33 @@ async fn revoke_shrinks_membership_and_stops_delivery_to_old_device() -> Result<
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after revoke send")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke"))
+    );
 
     let phone_conversation = ctx
         .bob_phone
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after revoke")?;
-    assert!(!phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke")));
+    assert!(
+        !phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke"))
+    );
 
     let members = ctx.alice.conversation_members(&ctx.conversation_id);
     assert!(
         members.iter().any(|member| {
-            member.device_id == ctx.bob_phone_device_id && member.status == DeviceStatusKind::Revoked
-        }) || members.iter().all(|member| member.device_id != ctx.bob_phone_device_id)
+            member.device_id == ctx.bob_phone_device_id
+                && member.status == DeviceStatusKind::Revoked
+        }) || members
+            .iter()
+            .all(|member| member.device_id != ctx.bob_phone_device_id)
     );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
@@ -367,11 +390,12 @@ async fn delayed_welcome_delivery_recovers_after_sync_and_reconcile() -> Result<
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRecovery)
     );
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_none());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_none()
+    );
 
     sync_driver_until_stable(
         &mut ctx.bob_laptop,
@@ -387,11 +411,12 @@ async fn delayed_welcome_delivery_recovers_after_sync_and_reconcile() -> Result<
         })
         .await?;
 
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_some());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_some()
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -416,8 +441,11 @@ async fn restart_from_snapshot_during_recovery_resumes_and_converges() -> Result
         .latest_snapshot()
         .cloned()
         .context("alice recovery snapshot missing")?;
-    let mut restored = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
-    restored.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    let mut restored =
+        CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    restored
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
     ctx.alice = restored;
 
     sync_driver_until_stable(
@@ -434,11 +462,12 @@ async fn restart_from_snapshot_during_recovery_resumes_and_converges() -> Result
         })
         .await?;
 
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_some());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_some()
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -495,12 +524,14 @@ async fn repeated_refresh_identity_and_reconcile_are_idempotent_during_recovery(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_success() -> Result<()> {
+async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_success()
+-> Result<()> {
     let mut ctx = setup_trio().await?;
 
     publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
     refresh_alice_contact(&mut ctx).await?;
-    ctx.alice.fail_next_identity_fetch(&ctx.bob_user_id, true, 2);
+    ctx.alice
+        .fail_next_identity_fetch(&ctx.bob_user_id, true, 2);
     let _ = ctx.alice.take_scheduled_timers();
 
     ctx.alice
@@ -613,6 +644,83 @@ async fn duplicate_sync_timer_and_manual_sync_do_not_regress_checkpoint() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_realtime_head_and_record_events_do_not_duplicate_delivery() -> Result<()> {
+    let mut ctx = setup_pair().await?;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "duplicate realtime".into(),
+        })
+        .await?;
+    let head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    let fetched =
+        fetch_inbox_records_since(&ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, 1).await?;
+    let record = fetched
+        .last()
+        .cloned()
+        .context("missing fetched record for duplicate realtime test")?;
+
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::HeadUpdated { seq: head },
+        })
+        .await?;
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::HeadUpdated { seq: head },
+        })
+        .await?;
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::InboxRecordAvailable {
+                seq: record.seq,
+                record: Some(record.clone()),
+            },
+        })
+        .await?;
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::InboxRecordAvailable {
+                seq: record.seq,
+                record: Some(record),
+            },
+        })
+        .await?;
+
+    sync_bob(&mut ctx, "duplicate-realtime-recovery").await?;
+
+    let checkpoint = ctx
+        .bob
+        .sync_checkpoint_snapshot(&ctx.bob_device_id)
+        .context("checkpoint after duplicate realtime")?;
+    assert!(checkpoint.last_acked_seq >= head);
+    let conversation = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after duplicate realtime")?;
+    assert_eq!(
+        count_plaintext_messages(conversation, "duplicate realtime"),
+        1
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn needs_recovery_persists_without_premature_rebuild_under_partial_delivery() -> Result<()> {
     let mut ctx = setup_trio().await?;
     let phone_baseline = last_acked_seq(&ctx.bob_phone, &ctx.bob_phone_device_id)?;
@@ -674,7 +782,8 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
         .await?;
 
     assert_ne!(
-        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        ctx.bob_phone
+            .conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRebuild)
     );
     assert_ne!(
@@ -697,7 +806,8 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
         })
         .await?;
     assert_eq!(
-        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        ctx.bob_phone
+            .conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
     );
 
@@ -739,10 +849,8 @@ async fn exhausted_identity_refresh_retry_caps_once_and_stops_scheduling() -> Re
         ctx.alice
             .trigger_timer(format!("refresh_identity:{}", ctx.bob_user_id))
             .await?;
-        refresh_timers = count_named_timers(
-            &ctx.alice.take_scheduled_timers(),
-            "refresh_identity:",
-        );
+        refresh_timers =
+            count_named_timers(&ctx.alice.take_scheduled_timers(), "refresh_identity:");
         if ctx.alice.conversation_recovery_status(&ctx.conversation_id)
             == Some(RecoveryStatus::NeedsRebuild)
         {
@@ -776,7 +884,9 @@ async fn restart_mid_recovery_preserves_context_checkpoint_and_realtime_state() 
         .context("alice device id")?
         .to_string();
 
-    ctx.alice.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    ctx.alice
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
     ctx.alice.close_realtime(&alice_device_id).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::SyncInbox {
@@ -807,7 +917,9 @@ async fn restart_mid_recovery_preserves_context_checkpoint_and_realtime_state() 
         .context("alice snapshot before restart")?;
     let mut restored =
         CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
-    restored.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    restored
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
     ctx.alice = restored;
 
     let after_restart_context = ctx
@@ -827,7 +939,10 @@ async fn restart_mid_recovery_preserves_context_checkpoint_and_realtime_state() 
         after_restart_checkpoint.pending_record_seqs,
         before_restart_checkpoint.pending_record_seqs
     );
-    assert_eq!(after_restart_realtime.last_known_seq, before_restart_realtime_seq);
+    assert_eq!(
+        after_restart_realtime.last_known_seq,
+        before_restart_realtime_seq
+    );
 
     sync_driver_until_stable(
         &mut ctx.bob_laptop,
@@ -913,7 +1028,8 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         application_records.clone(),
     )?;
     assert_eq!(
-        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        ctx.bob_phone
+            .conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRecovery)
     );
     assert!(
@@ -944,12 +1060,15 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after missing commit recovery")?;
-    assert!(phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.message_type == MessageType::MlsApplication));
+    assert!(
+        phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.message_type == MessageType::MlsApplication)
+    );
     assert_eq!(
-        ctx.bob_phone.conversation_recovery_status(&ctx.conversation_id),
+        ctx.bob_phone
+            .conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
     );
     assert_eq!(
@@ -976,10 +1095,12 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after recovered message")?;
-    assert!(recovered_phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after missing commit recovered")));
+    assert!(
+        recovered_phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after missing commit recovered"))
+    );
     let phone_head = ctx
         .runtime
         .get_head(&ctx.bob_phone_auth, &ctx.bob_phone_device_id)
@@ -992,10 +1113,12 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after missing commit recovery")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after missing commit")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after missing commit"))
+    );
 
     Ok(())
 }
@@ -1010,7 +1133,10 @@ async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRecovery)
     );
-    assert!(ctx.alice.snapshot_has_recovery_context(&ctx.conversation_id));
+    assert!(
+        ctx.alice
+            .snapshot_has_recovery_context(&ctx.conversation_id)
+    );
 
     let mut snapshot = ctx
         .alice
@@ -1029,7 +1155,9 @@ async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
         .context("bob contact missing in alice snapshot")?;
     bob_contact.bundle.identity_bundle_ref = Some(broken_reference);
     ctx.alice = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
-    ctx.alice.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    ctx.alice
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
 
     for _ in 0..3 {
         let _ = ctx
@@ -1045,7 +1173,10 @@ async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("alice conversation missing after unrecoverable gap escalation")?;
-    assert_eq!(alice_conversation.recovery_status, RecoveryStatus::NeedsRebuild);
+    assert_eq!(
+        alice_conversation.recovery_status,
+        RecoveryStatus::NeedsRebuild
+    );
     assert_eq!(
         alice_conversation.conversation.state,
         tapchat_core::model::ConversationState::NeedsRebuild
@@ -1140,20 +1271,24 @@ async fn revoke_during_recovery_keeps_revoked_device_isolated() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after revoke during recovery")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery"))
+    );
 
     let phone_conversation = ctx
         .bob_phone
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after revoke during recovery")?;
-    assert!(!phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery")));
+    assert!(
+        !phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery"))
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -1162,8 +1297,11 @@ async fn revoke_during_recovery_keeps_revoked_device_isolated() -> Result<()> {
     let members = ctx.alice.conversation_members(&ctx.conversation_id);
     assert!(
         members.iter().any(|member| {
-            member.device_id == ctx.bob_phone_device_id && member.status == DeviceStatusKind::Revoked
-        }) || members.iter().all(|member| member.device_id != ctx.bob_phone_device_id)
+            member.device_id == ctx.bob_phone_device_id
+                && member.status == DeviceStatusKind::Revoked
+        }) || members
+            .iter()
+            .all(|member| member.device_id != ctx.bob_phone_device_id)
     );
 
     Ok(())
@@ -1188,24 +1326,30 @@ async fn restart_during_recovery_preserves_context_and_converges() -> Result<()>
         "restart-mid-recovery-laptop",
     )
     .await?;
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_some());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_some()
+    );
 
     let snapshot = ctx
         .alice
         .latest_snapshot()
         .cloned()
         .context("alice recovery snapshot missing for mid-stage restart")?;
-    assert!(snapshot
-        .recovery_contexts
-        .iter()
-        .any(|context| context.conversation_id == ctx.conversation_id));
+    assert!(
+        snapshot
+            .recovery_contexts
+            .iter()
+            .any(|context| context.conversation_id == ctx.conversation_id)
+    );
 
-    let mut restored = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
-    restored.inject_event_until_idle(CoreEvent::AppStarted).await?;
+    let mut restored =
+        CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    restored
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
     assert!(restored.snapshot_has_recovery_context(&ctx.conversation_id));
     ctx.alice = restored;
 
@@ -1239,10 +1383,12 @@ async fn restart_during_recovery_preserves_context_and_converges() -> Result<()>
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after mid-stage restart recovery")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after mid recovery restart")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after mid recovery restart"))
+    );
 
     Ok(())
 }
@@ -1367,16 +1513,25 @@ async fn rebuild_command_recreates_direct_conversation_and_recovers() -> Result<
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after rebuild recovery")?;
-    assert!(conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after rebuild")));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after rebuild"))
+    );
 
     Ok(())
 }
 
 async fn sync_bob(ctx: &mut PairContext, reason: &str) -> Result<()> {
-    sync_driver_until_stable(&mut ctx.bob, &ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, reason).await
+    sync_driver_until_stable(
+        &mut ctx.bob,
+        &ctx.runtime,
+        &ctx.bob_auth,
+        &ctx.bob_device_id,
+        reason,
+    )
+    .await
 }
 
 async fn setup_pair() -> Result<PairContext> {
@@ -1391,31 +1546,45 @@ async fn setup_pair() -> Result<PairContext> {
             device_name: Some("phone".into()),
         })
         .await?;
-    bob
-        .run_command_until_idle(CoreCommand::CreateOrLoadIdentity {
-            mnemonic: Some(BOB_MNEMONIC.into()),
-            device_name: Some("phone".into()),
-        })
+    bob.run_command_until_idle(CoreCommand::CreateOrLoadIdentity {
+        mnemonic: Some(BOB_MNEMONIC.into()),
+        device_name: Some("phone".into()),
+    })
+    .await?;
+
+    let alice_user_id = IdentityManager::recover_user_root(ALICE_MNEMONIC)?
+        .user_identity
+        .user_id;
+    let bob_user_id = IdentityManager::recover_user_root(BOB_MNEMONIC)?
+        .user_identity
+        .user_id;
+    let alice_device_id = alice
+        .engine()
+        .local_device_id()
+        .context("alice device id")?
+        .to_string();
+    let bob_device_id = bob
+        .engine()
+        .local_device_id()
+        .context("bob device id")?
+        .to_string();
+
+    let alice_bundle = runtime
+        .bootstrap_device_bundle(&alice_user_id, &alice_device_id)
         .await?;
-
-    let alice_user_id = IdentityManager::recover_user_root(ALICE_MNEMONIC)?.user_identity.user_id;
-    let bob_user_id = IdentityManager::recover_user_root(BOB_MNEMONIC)?.user_identity.user_id;
-    let alice_device_id = alice.engine().local_device_id().context("alice device id")?.to_string();
-    let bob_device_id = bob.engine().local_device_id().context("bob device id")?.to_string();
-
-    let alice_bundle = runtime.bootstrap_device_bundle(&alice_user_id, &alice_device_id).await?;
-    let bob_bundle = runtime.bootstrap_device_bundle(&bob_user_id, &bob_device_id).await?;
+    let bob_bundle = runtime
+        .bootstrap_device_bundle(&bob_user_id, &bob_device_id)
+        .await?;
 
     alice
         .run_command_until_idle(CoreCommand::ImportDeploymentBundle {
             bundle: alice_bundle.clone(),
         })
         .await?;
-    bob
-        .run_command_until_idle(CoreCommand::ImportDeploymentBundle {
-            bundle: bob_bundle.clone(),
-        })
-        .await?;
+    bob.run_command_until_idle(CoreCommand::ImportDeploymentBundle {
+        bundle: bob_bundle.clone(),
+    })
+    .await?;
 
     let alice_local_bundle = publish_local_identity_bundle(
         &alice,
@@ -1425,22 +1594,33 @@ async fn setup_pair() -> Result<PairContext> {
         &bob,
         &concrete_deployment_bundle(&bob_bundle, &bob_user_id),
     )?;
-    let alice_auth = alice_bundle.device_runtime_auth.clone().context("alice device auth")?;
-    let bob_auth = bob_bundle.device_runtime_auth.clone().context("bob device auth")?;
+    let alice_auth = alice_bundle
+        .device_runtime_auth
+        .clone()
+        .context("alice device auth")?;
+    let bob_auth = bob_bundle
+        .device_runtime_auth
+        .clone()
+        .context("bob device auth")?;
 
-    runtime.put_identity_bundle(&alice_auth, &alice_local_bundle).await?;
-    runtime.put_identity_bundle(&bob_auth, &bob_local_bundle).await?;
+    runtime
+        .put_identity_bundle(&alice_auth, &alice_local_bundle)
+        .await?;
+    runtime
+        .put_identity_bundle(&bob_auth, &bob_local_bundle)
+        .await?;
+    configure_allowlist(&runtime, &alice_auth, std::slice::from_ref(&bob_user_id)).await?;
+    configure_allowlist(&runtime, &bob_auth, std::slice::from_ref(&alice_user_id)).await?;
 
     alice
         .run_command_until_idle(CoreCommand::ImportIdentityBundle {
             bundle: bob_local_bundle.clone(),
         })
         .await?;
-    bob
-        .run_command_until_idle(CoreCommand::ImportIdentityBundle {
-            bundle: alice_local_bundle.clone(),
-        })
-        .await?;
+    bob.run_command_until_idle(CoreCommand::ImportIdentityBundle {
+        bundle: alice_local_bundle.clone(),
+    })
+    .await?;
 
     let created = alice
         .run_command_until_idle(CoreCommand::CreateConversation {
@@ -1483,7 +1663,10 @@ async fn setup_trio() -> Result<TrioContext> {
 
     let mut bob_laptop = CoreDriver::new_with_storage_base(Some(runtime.base_url().to_string()))?;
     let public_bundle = public_deployment_bundle(
-        alice.engine().local_bundle().context("alice local bundle for trio")?,
+        alice
+            .engine()
+            .local_bundle()
+            .context("alice local bundle for trio")?,
         &runtime,
     )?;
     bob_laptop
@@ -1498,8 +1681,12 @@ async fn setup_trio() -> Result<TrioContext> {
         })
         .await?;
 
-    let alice_user_id = IdentityManager::recover_user_root(ALICE_MNEMONIC)?.user_identity.user_id;
-    let bob_user_id = IdentityManager::recover_user_root(BOB_MNEMONIC)?.user_identity.user_id;
+    let alice_user_id = IdentityManager::recover_user_root(ALICE_MNEMONIC)?
+        .user_identity
+        .user_id;
+    let bob_user_id = IdentityManager::recover_user_root(BOB_MNEMONIC)?
+        .user_identity
+        .user_id;
     let bob_laptop_device_id = bob_laptop
         .engine()
         .local_device_id()
@@ -1509,7 +1696,10 @@ async fn setup_trio() -> Result<TrioContext> {
         .bootstrap_device_bundle(&bob_user_id, &bob_laptop_device_id)
         .await?;
     let alice_bundle = runtime
-        .bootstrap_device_bundle(&alice_user_id, alice.engine().local_device_id().context("alice device")?)
+        .bootstrap_device_bundle(
+            &alice_user_id,
+            alice.engine().local_device_id().context("alice device")?,
+        )
         .await?;
     let bob_phone_bundle = runtime
         .bootstrap_device_bundle(&bob_user_id, &bob_device_id)
@@ -1531,6 +1721,12 @@ async fn setup_trio() -> Result<TrioContext> {
         .device_runtime_auth
         .clone()
         .context("bob laptop auth")?;
+    configure_allowlist(
+        &runtime,
+        &bob_laptop_auth,
+        std::slice::from_ref(&alice_user_id),
+    )
+    .await?;
 
     Ok(TrioContext {
         runtime,
@@ -1620,6 +1816,14 @@ async fn publish_bob_bundle(
     Ok(merged)
 }
 
+async fn configure_allowlist(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    allowed_sender_user_ids: &[String],
+) -> Result<()> {
+    runtime.put_allowlist(auth, allowed_sender_user_ids).await
+}
+
 fn publish_local_identity_bundle(
     driver: &CoreDriver,
     deployment: &DeploymentBundle,
@@ -1678,7 +1882,10 @@ fn public_deployment_bundle(
         version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
         region: "local-transport".into(),
         inbox_http_endpoint: runtime.base_url().to_string(),
-        inbox_websocket_endpoint: format!("{}/v1/inbox/{{deviceId}}/subscribe", runtime.websocket_base_url()),
+        inbox_websocket_endpoint: format!(
+            "{}/v1/inbox/{{deviceId}}/subscribe",
+            runtime.websocket_base_url()
+        ),
         storage_base_info: tapchat_core::model::StorageBaseInfo {
             base_url: Some(runtime.base_url().to_string()),
             bucket_hint: Some("tapchat-storage".into()),
@@ -1687,7 +1894,10 @@ fn public_deployment_bundle(
             supported_realtime_kinds: vec![tapchat_core::model::RealtimeKind::Websocket],
             identity_bundle_ref: Some(identity_ref),
             device_status_ref: Some(device_status_ref),
-            keypackage_ref_base: Some(format!("{}/v1/shared-state/keypackages", runtime.base_url())),
+            keypackage_ref_base: Some(format!(
+                "{}/v1/shared-state/keypackages",
+                runtime.base_url()
+            )),
             max_inline_bytes: Some(4096),
             features: vec!["generic_sync".into(), "attachment_v1".into()],
         },
@@ -1722,17 +1932,33 @@ async fn sync_driver_until_stable(
             })
             .await?;
         let head = runtime.get_head(auth, device_id).await?.head_seq;
-        let sync_state = driver.engine().sync_state(device_id).context("sync state missing after sync")?;
+        let sync_state = driver
+            .engine()
+            .sync_state(device_id)
+            .context("sync state missing after sync")?;
         if sync_state.checkpoint.last_acked_seq >= head {
             return Ok(());
         }
     }
     let head = runtime.get_head(auth, device_id).await?.head_seq;
-    let sync_state = driver.engine().sync_state(device_id).context("sync state missing after retries")?;
+    let sync_state = driver
+        .engine()
+        .sync_state(device_id)
+        .context("sync state missing after retries")?;
+    let realtime = driver.realtime_session_snapshot(device_id);
     bail!(
-        "sync did not stabilize for {device_id}; head_seq={head}, acked_seq={}, pending_records={}",
+        "sync did not stabilize for {device_id}; head_seq={head}, acked_seq={}, fetched_seq={}, pending_records={}, last_known_realtime_seq={}, needs_reconnect={}",
         sync_state.checkpoint.last_acked_seq,
-        sync_state.pending_records.len()
+        sync_state.checkpoint.last_fetched_seq,
+        sync_state.pending_records.len(),
+        realtime
+            .as_ref()
+            .map(|snapshot| snapshot.last_known_seq)
+            .unwrap_or_default(),
+        realtime
+            .as_ref()
+            .map(|snapshot| snapshot.needs_reconnect)
+            .unwrap_or(false)
     )
 }
 
@@ -1809,4 +2035,3 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root")
         .to_path_buf()
 }
-

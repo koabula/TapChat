@@ -8,8 +8,8 @@ use sha2::Sha512;
 use crate::capability::CapabilityManager;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
-    DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind,
-    IdentityBundle, StorageProfile, UserIdentity, Validate, CURRENT_MODEL_VERSION,
+    CURRENT_MODEL_VERSION, DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus,
+    DeviceStatusKind, IdentityBundle, StorageProfile, UserIdentity, Validate,
 };
 
 type HmacSha512 = Hmac<Sha512>;
@@ -85,13 +85,14 @@ impl IdentityManager {
             _ => {
                 return Err(CoreError::invalid_state(
                     "unsupported default BIP-39 mnemonic word count",
-                ))
+                ));
             }
         };
         let mut entropy = vec![0_u8; entropy_len];
         rand::thread_rng().fill_bytes(&mut entropy);
-        let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
-            .map_err(|error| CoreError::invalid_state(format!("failed to generate mnemonic: {error}")))?;
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy).map_err(|error| {
+            CoreError::invalid_state(format!("failed to generate mnemonic: {error}"))
+        })?;
         Ok(mnemonic.to_string())
     }
 
@@ -184,14 +185,13 @@ impl IdentityManager {
         Self::create_new_device_for_user(&user_root, None)
     }
 
-    pub fn verify_device_binding(
-        user_public_key: &str,
-        binding: &DeviceBinding,
-    ) -> CoreResult<()> {
+    pub fn verify_device_binding(user_public_key: &str, binding: &DeviceBinding) -> CoreResult<()> {
         binding.validate()?;
         let verifying_key = parse_verifying_key(user_public_key)?;
         if binding.device_public_key.trim().is_empty() {
-            return Err(CoreError::invalid_input("device binding device_public_key is empty"));
+            return Err(CoreError::invalid_input(
+                "device binding device_public_key is empty",
+            ));
         }
         let signature = parse_signature(&binding.signature)?;
         verifying_key
@@ -250,11 +250,7 @@ impl IdentityManager {
             key_package_ref,
             key_package_expires_at,
         )?;
-        Self::export_identity_bundle_with_devices(
-            local_identity,
-            deployment,
-            vec![device_profile],
-        )
+        Self::export_identity_bundle_with_devices(local_identity, deployment, vec![device_profile])
     }
 
     pub fn export_identity_bundle_with_devices(
@@ -262,7 +258,8 @@ impl IdentityManager {
         deployment: &DeploymentBundle,
         devices: Vec<crate::model::DeviceContactProfile>,
     ) -> CoreResult<IdentityBundle> {
-        let encoded_user_id = urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
+        let encoded_user_id =
+            urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
         let unsigned = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             user_id: local_identity.user_identity.user_id.clone(),
@@ -312,7 +309,10 @@ fn build_device_binding(
         created_at,
         signature: encode_hex(
             &user_root_key
-                .sign(build_binding_payload(user_id, device_id, device_public_key, created_at).as_bytes())
+                .sign(
+                    build_binding_payload(user_id, device_id, device_public_key, created_at)
+                        .as_bytes(),
+                )
                 .to_bytes(),
         ),
     }
@@ -447,16 +447,15 @@ pub fn parse_signature(input: &str) -> CoreResult<Signature> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IdentityManager, IdentityModule, DEFAULT_MNEMONIC_WORDS};
-    use bip39::Language;
+    use super::{DEFAULT_MNEMONIC_WORDS, IdentityManager, IdentityModule};
     use crate::model::{
-        CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
-        DeviceContactProfile, DeviceRuntimeAuth, DeviceStatusKind, IdentityBundle,
-        InboxAppendCapability, KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, CapabilityConstraints, CapabilityOperation, CapabilityService,
+        DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceStatusKind,
+        IdentityBundle, InboxAppendCapability, KeyPackageRef, StorageBaseInfo,
     };
+    use bip39::Language;
 
-    const ALICE_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
@@ -499,7 +498,10 @@ mod tests {
         let second = IdentityManager::create_new_device_for_user(&user_root, None).expect("second");
 
         assert_eq!(first.user_identity.user_id, second.user_identity.user_id);
-        assert_ne!(first.device_identity.device_id, second.device_identity.device_id);
+        assert_ne!(
+            first.device_identity.device_id,
+            second.device_identity.device_id
+        );
     }
 
     #[test]
@@ -514,7 +516,10 @@ mod tests {
         .expect("restored identity");
 
         assert_eq!(first.user_identity.user_id, restored.user_identity.user_id);
-        assert_eq!(first.device_identity.device_id, restored.device_identity.device_id);
+        assert_eq!(
+            first.device_identity.device_id,
+            restored.device_identity.device_id
+        );
     }
 
     #[test]
@@ -671,12 +676,10 @@ mod tests {
         let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
         let mut deployment = sample_deployment();
-        deployment.runtime_config.identity_bundle_ref = Some(
-            "https://storage.example.com/state/{userId}/identity_bundle.json".into(),
-        );
-        deployment.runtime_config.device_status_ref = Some(
-            "https://storage.example.com/state/{userId}/device_status.json".into(),
-        );
+        deployment.runtime_config.identity_bundle_ref =
+            Some("https://storage.example.com/state/{userId}/identity_bundle.json".into());
+        deployment.runtime_config.device_status_ref =
+            Some("https://storage.example.com/state/{userId}/device_status.json".into());
 
         let bundle =
             IdentityManager::export_identity_bundle(&identity, &deployment, "kp-ref".into(), 999)

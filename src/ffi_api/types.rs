@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::attachment_crypto::AttachmentPayloadMetadata;
-use crate::conversation::RecoveryStatus;
 use crate::conversation::LocalConversationState;
+use crate::conversation::RecoveryStatus;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
@@ -30,26 +30,62 @@ impl FfiApiModule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreCommand {
-    CreateOrLoadIdentity { mnemonic: Option<String>, device_name: Option<String> },
-    ImportDeploymentBundle { bundle: DeploymentBundle },
-    ImportIdentityBundle { bundle: IdentityBundle },
-    ApplyIdentityBundleUpdate { bundle: IdentityBundle },
-    CreateConversation { peer_user_id: String, conversation_kind: ConversationKind },
-    ReconcileConversationMembership { conversation_id: String },
-    SendTextMessage { conversation_id: String, plaintext: String },
-    SendAttachmentMessage { conversation_id: String, attachment_descriptor: AttachmentDescriptor },
+    CreateOrLoadIdentity {
+        mnemonic: Option<String>,
+        device_name: Option<String>,
+    },
+    ImportDeploymentBundle {
+        bundle: DeploymentBundle,
+    },
+    ImportIdentityBundle {
+        bundle: IdentityBundle,
+    },
+    ApplyIdentityBundleUpdate {
+        bundle: IdentityBundle,
+    },
+    CreateConversation {
+        peer_user_id: String,
+        conversation_kind: ConversationKind,
+    },
+    ReconcileConversationMembership {
+        conversation_id: String,
+    },
+    SendTextMessage {
+        conversation_id: String,
+        plaintext: String,
+    },
+    SendAttachmentMessage {
+        conversation_id: String,
+        attachment_descriptor: AttachmentDescriptor,
+    },
     DownloadAttachment {
         conversation_id: String,
         message_id: String,
         reference: String,
         destination: String,
     },
-    SyncInbox { device_id: String, reason: Option<String> },
-    RefreshIdentityState { user_id: String },
-    CreateAdditionalDeviceIdentity { mnemonic: Option<String>, device_name: Option<String> },
+    SyncInbox {
+        device_id: String,
+        reason: Option<String>,
+    },
+    RefreshIdentityState {
+        user_id: String,
+    },
+    CreateAdditionalDeviceIdentity {
+        mnemonic: Option<String>,
+        device_name: Option<String>,
+    },
     RotateLocalKeyPackage,
-    ApplyLocalDeviceStatusUpdate { status: crate::model::DeviceStatusKind },
-    RebuildConversation { conversation_id: String },
+    ApplyLocalDeviceStatusUpdate {
+        status: crate::model::DeviceStatusKind,
+    },
+    UpdateLocalDeviceStatus {
+        target_device_id: String,
+        status: crate::model::DeviceStatusKind,
+    },
+    RebuildConversation {
+        conversation_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,29 +93,83 @@ pub enum CoreCommand {
 pub enum CoreEvent {
     AppStarted,
     AppForegrounded,
-    WebSocketConnected { device_id: String },
-    WebSocketDisconnected { device_id: String, reason: Option<String> },
-    RealtimeEventReceived { device_id: String, event: RealtimeEvent },
-    WakeupReceived { device_id: String, latest_seq_hint: Option<u64> },
-    InboxRecordsFetched { device_id: String, records: Vec<InboxRecord>, to_seq: u64 },
-    HttpResponseReceived { request_id: String, status: u16, body: Option<String> },
-    HttpRequestFailed { request_id: String, retryable: bool, detail: Option<String> },
-    IdentityBundleFetched { user_id: String, bundle: IdentityBundle },
-    IdentityBundleFetchFailed { user_id: String, retryable: bool, detail: Option<String> },
-    AttachmentBytesLoaded { task_id: String, plaintext_b64: String },
-    BlobUploadPrepared { task_id: String, result: PrepareBlobUploadResult },
-    BlobUploaded { task_id: String },
-    BlobDownloaded { task_id: String, blob_ciphertext: Option<String> },
-    BlobTransferFailed { task_id: String, retryable: bool, detail: Option<String> },
-    TimerTriggered { timer_id: String },
-    UserConfirmedRebuild { conversation_id: String },
+    WebSocketConnected {
+        device_id: String,
+    },
+    WebSocketDisconnected {
+        device_id: String,
+        reason: Option<String>,
+    },
+    RealtimeEventReceived {
+        device_id: String,
+        event: RealtimeEvent,
+    },
+    WakeupReceived {
+        device_id: String,
+        latest_seq_hint: Option<u64>,
+    },
+    InboxRecordsFetched {
+        device_id: String,
+        records: Vec<InboxRecord>,
+        to_seq: u64,
+    },
+    HttpResponseReceived {
+        request_id: String,
+        status: u16,
+        body: Option<String>,
+    },
+    HttpRequestFailed {
+        request_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    IdentityBundleFetched {
+        user_id: String,
+        bundle: IdentityBundle,
+    },
+    IdentityBundleFetchFailed {
+        user_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    AttachmentBytesLoaded {
+        task_id: String,
+        plaintext_b64: String,
+    },
+    BlobUploadPrepared {
+        task_id: String,
+        result: PrepareBlobUploadResult,
+    },
+    BlobUploaded {
+        task_id: String,
+    },
+    BlobDownloaded {
+        task_id: String,
+        blob_ciphertext: Option<String>,
+    },
+    BlobTransferFailed {
+        task_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    TimerTriggered {
+        timer_id: String,
+    },
+    UserConfirmedRebuild {
+        conversation_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RealtimeEvent {
-    HeadUpdated { seq: u64 },
-    InboxRecordAvailable { seq: u64, record: Option<InboxRecord> },
+    HeadUpdated {
+        seq: u64,
+    },
+    InboxRecordAvailable {
+        seq: u64,
+        record: Option<InboxRecord>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,18 +241,42 @@ pub struct UserNotificationEffect {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreEffect {
-    ExecuteHttpRequest { request: HttpRequestEffect },
-    OpenRealtimeConnection { connection: RealtimeConnectionEffect },
-    CloseRealtimeConnection { device_id: String },
-    FetchIdentityBundle { fetch: FetchIdentityBundleRequest },
-    ReadAttachmentBytes { read: ReadAttachmentBytesEffect },
-    PrepareBlobUpload { upload: PrepareBlobUploadRequest },
-    UploadBlob { upload: BlobUploadRequest },
-    DownloadBlob { download: BlobDownloadRequest },
-    WriteDownloadedAttachment { write: WriteDownloadedAttachmentEffect },
-    PersistState { persist: PersistStateEffect },
-    ScheduleTimer { timer: TimerEffect },
-    EmitUserNotification { notification: UserNotificationEffect },
+    ExecuteHttpRequest {
+        request: HttpRequestEffect,
+    },
+    OpenRealtimeConnection {
+        connection: RealtimeConnectionEffect,
+    },
+    CloseRealtimeConnection {
+        device_id: String,
+    },
+    FetchIdentityBundle {
+        fetch: FetchIdentityBundleRequest,
+    },
+    ReadAttachmentBytes {
+        read: ReadAttachmentBytesEffect,
+    },
+    PrepareBlobUpload {
+        upload: PrepareBlobUploadRequest,
+    },
+    UploadBlob {
+        upload: BlobUploadRequest,
+    },
+    DownloadBlob {
+        download: BlobDownloadRequest,
+    },
+    WriteDownloadedAttachment {
+        write: WriteDownloadedAttachmentEffect,
+    },
+    PersistState {
+        persist: PersistStateEffect,
+    },
+    ScheduleTimer {
+        timer: TimerEffect,
+    },
+    EmitUserNotification {
+        notification: UserNotificationEffect,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,10 +426,22 @@ pub(crate) struct CoreState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingRequest {
-    GetHead { device_id: String },
-    FetchMessages { device_id: String, from_seq: u64, limit: u64 },
-    AppendEnvelope { message_id: String, peer_user_id: String },
-    Ack { device_id: String, ack_seq: u64 },
+    GetHead {
+        device_id: String,
+    },
+    FetchMessages {
+        device_id: String,
+        from_seq: u64,
+        limit: u64,
+    },
+    AppendEnvelope {
+        message_id: String,
+        peer_user_id: String,
+    },
+    Ack {
+        device_id: String,
+        ack_seq: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,7 +527,3 @@ impl Default for CoreState {
         }
     }
 }
-
-
-
-

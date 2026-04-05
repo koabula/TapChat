@@ -506,7 +506,9 @@ pub fn encode_snapshot(snapshot: &CorePersistenceSnapshot) -> crate::CoreResult<
         snapshot: snapshot.clone(),
     };
     serde_json::to_vec_pretty(&payload).map_err(|error| {
-        crate::CoreError::invalid_state(format!("failed to serialize persistence snapshot: {error}"))
+        crate::CoreError::invalid_state(format!(
+            "failed to serialize persistence snapshot: {error}"
+        ))
     })
 }
 
@@ -528,22 +530,20 @@ pub fn decode_snapshot(bytes: &[u8]) -> crate::CoreResult<CorePersistenceSnapsho
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
-        WakeHint, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
+        MessageType, SenderProof, WakeHint,
     };
+    use base64::Engine as _;
 
-    const ALICE_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
     fn in_memory_repository_round_trips_snapshot() {
-        let identity =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-                .expect("identity");
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
         let conversation = ConversationManager::create_direct_conversation(
             &identity.user_identity.user_id,
             &identity.device_identity.device_id,
@@ -637,10 +637,8 @@ mod tests {
                     file_name: Some("download.bin".into()),
                     encryption: crate::attachment_crypto::AttachmentCipherMetadata {
                         algorithm: crate::attachment_crypto::ATTACHMENT_CIPHER_ALGORITHM.into(),
-                        key_b64: base64::engine::general_purpose::STANDARD
-                            .encode([7_u8; 32]),
-                        nonce_b64: base64::engine::general_purpose::STANDARD
-                            .encode([9_u8; 12]),
+                        key_b64: base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
+                        nonce_b64: base64::engine::general_purpose::STANDARD.encode([9_u8; 12]),
                     },
                 },
                 retries: 1,
@@ -689,9 +687,8 @@ mod tests {
 
     #[test]
     fn persisted_types_capture_recovery_and_conversation_state() {
-        let identity =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-                .expect("identity");
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
         let mut conversation = ConversationManager::create_direct_conversation(
             &identity.user_identity.user_id,
             &identity.device_identity.device_id,
@@ -701,18 +698,24 @@ mod tests {
         .expect("conversation");
         conversation.recovery_status = RecoveryStatus::NeedsRecovery;
         conversation.conversation.state = ConversationState::Active;
-        conversation.conversation.member_devices.push(crate::model::ConversationMember {
-            user_id: "user:bob".into(),
-            device_id: "device:bob:laptop".into(),
-            status: DeviceStatusKind::Revoked,
-        });
+        conversation
+            .conversation
+            .member_devices
+            .push(crate::model::ConversationMember {
+                user_id: "user:bob".into(),
+                device_id: "device:bob:laptop".into(),
+                status: DeviceStatusKind::Revoked,
+            });
 
         let persisted = PersistedConversation {
             conversation_id: conversation.conversation.conversation_id.clone(),
             state: conversation.clone(),
         };
 
-        assert_eq!(persisted.state.recovery_status, RecoveryStatus::NeedsRecovery);
+        assert_eq!(
+            persisted.state.recovery_status,
+            RecoveryStatus::NeedsRecovery
+        );
         assert_eq!(persisted.state.messages.len(), 0);
     }
 
@@ -799,23 +802,19 @@ mod tests {
         let loaded = decode_snapshot(&encoded).expect("decode snapshot");
         assert_eq!(loaded, snapshot);
         assert_eq!(
-            loaded
-                .deployment
-                .as_ref()
-                .and_then(|deployment| {
-                    deployment
-                        .deployment_bundle
-                        .runtime_config
-                        .identity_bundle_ref
-                        .as_deref()
-                }),
+            loaded.deployment.as_ref().and_then(|deployment| {
+                deployment
+                    .deployment_bundle
+                    .runtime_config
+                    .identity_bundle_ref
+                    .as_deref()
+            }),
             Some("ref:identity-local")
         );
         assert_eq!(
             loaded.contacts[0].bundle.identity_bundle_ref.as_deref(),
             Some("ref:identity-bob")
         );
-
     }
 
     #[test]
@@ -872,4 +871,3 @@ mod tests {
         }
     }
 }
-

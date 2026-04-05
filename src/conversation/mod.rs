@@ -301,7 +301,10 @@ mod tests {
         )
         .expect("conversation should be created");
 
-        assert_eq!(state.conversation.kind, crate::model::ConversationKind::Direct);
+        assert_eq!(
+            state.conversation.kind,
+            crate::model::ConversationKind::Direct
+        );
         assert_eq!(state.conversation.member_devices.len(), 3);
     }
 

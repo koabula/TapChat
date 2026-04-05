@@ -675,10 +675,7 @@ impl Validate for DeploymentBundle {
         validate_version(&self.version)?;
         validate_required("region", &self.region)?;
         validate_required("inbox_http_endpoint", &self.inbox_http_endpoint)?;
-        validate_required(
-            "inbox_websocket_endpoint",
-            &self.inbox_websocket_endpoint,
-        )?;
+        validate_required("inbox_websocket_endpoint", &self.inbox_websocket_endpoint)?;
         validate_runtime_config(&self.runtime_config)?;
         if let Some(auth) = &self.device_runtime_auth {
             auth.validate()?;
@@ -755,8 +752,7 @@ mod tests {
     fn identity_bundle_round_trips_json() {
         let bundle = sample_identity_bundle();
         let json = serde_json::to_string(&bundle).expect("serialize bundle");
-        let decoded: IdentityBundle =
-            serde_json::from_str(&json).expect("deserialize bundle");
+        let decoded: IdentityBundle = serde_json::from_str(&json).expect("deserialize bundle");
         assert_eq!(decoded, bundle);
     }
 
@@ -764,8 +760,7 @@ mod tests {
     fn envelope_round_trips_json() {
         let envelope = sample_envelope();
         let json = serde_json::to_string(&envelope).expect("serialize envelope");
-        let decoded: Envelope =
-            serde_json::from_str(&json).expect("deserialize envelope");
+        let decoded: Envelope = serde_json::from_str(&json).expect("deserialize envelope");
         assert_eq!(decoded, envelope);
     }
 
@@ -794,8 +789,7 @@ mod tests {
 
     #[test]
     fn conversation_kind_parses_from_snake_case() {
-        let kind: ConversationKind =
-            serde_json::from_str("\"direct\"").expect("deserialize enum");
+        let kind: ConversationKind = serde_json::from_str("\"direct\"").expect("deserialize enum");
         assert_eq!(kind, ConversationKind::Direct);
     }
 
@@ -1080,7 +1074,9 @@ mod tests {
                     expires_at: 999,
                 },
             }],
-            identity_bundle_ref: Some("https://storage.example.com/state/user:alice/identity_bundle.json".into()),
+            identity_bundle_ref: Some(
+                "https://storage.example.com/state/user:alice/identity_bundle.json".into(),
+            ),
             device_status_ref: Some("s3://state/device_status.json".into()),
             storage_profile: Some(StorageProfile {
                 base_url: Some("https://storage.example.com".into()),

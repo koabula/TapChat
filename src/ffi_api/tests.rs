@@ -1,26 +1,24 @@
 #[cfg(test)]
 mod tests {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use crate::attachment_crypto::{
+        ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata, AttachmentPayloadMetadata,
+    };
+    use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, FfiApiModule,
         RealtimeEvent,
     };
-    use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
-    use crate::attachment_crypto::{
-        ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata, AttachmentPayloadMetadata,
-    };
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        ConversationKind, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth, Envelope,
-        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
-        WakeHint,
-        CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, ConversationKind, DeliveryClass, DeploymentBundle,
+        DeviceRuntimeAuth, Envelope, IdentityBundle, InboxRecord, InboxRecordState, MessageType,
+        SenderProof, StorageBaseInfo, WakeHint,
     };
     use crate::persistence::{CorePersistenceSnapshot, PersistOp};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-    const ALICE_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
@@ -62,7 +60,14 @@ mod tests {
                 device_name: Some("phone".into()),
             })
             .expect("identity");
-        let device_id = engine.state.local_identity.as_ref().unwrap().device_identity.device_id.clone();
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .unwrap()
+            .device_identity
+            .device_id
+            .clone();
         let output = engine
             .handle_event(CoreEvent::RealtimeEventReceived {
                 device_id,
@@ -183,7 +188,13 @@ mod tests {
             .user_identity
             .user_id
             .clone();
-        let peer_user_id = engine.state.contacts.keys().next().expect("contact").clone();
+        let peer_user_id = engine
+            .state
+            .contacts
+            .keys()
+            .next()
+            .expect("contact")
+            .clone();
         let peer_device_id = engine
             .state
             .contacts
@@ -235,10 +246,12 @@ mod tests {
             .expect("fetch response");
 
         assert!(output.state_update.conversations_changed);
-        assert!(engine
-            .state
-            .conversations
-            .contains_key(&expected_conversation_id));
+        assert!(
+            engine
+                .state
+                .conversations
+                .contains_key(&expected_conversation_id)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -414,10 +427,14 @@ mod tests {
             })
             .expect("attachment");
 
-        let task_id = output.effects.iter().find_map(|effect| match effect {
-            CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
-            _ => None,
-        }).expect("read attachment effect");
+        let task_id = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+                _ => None,
+            })
+            .expect("read attachment effect");
         let output = alice
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id,
@@ -450,10 +467,12 @@ mod tests {
         });
 
         let persist = persist.expect("persist effect");
-        assert!(persist
-            .ops
-            .iter()
-            .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. })));
+        assert!(
+            persist
+                .ops
+                .iter()
+                .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. }))
+        );
         assert!(persist.snapshot.is_some());
     }
 
@@ -495,10 +514,12 @@ mod tests {
         let snapshot = extract_snapshot(&output);
 
         assert!(!snapshot.mls_state_persistence_blocked);
-        assert!(snapshot
-            .mls_states
-            .iter()
-            .all(|state| state.serialized_group_state.is_some()));
+        assert!(
+            snapshot
+                .mls_states
+                .iter()
+                .all(|state| state.serialized_group_state.is_some())
+        );
     }
 
     #[test]
@@ -544,7 +565,13 @@ mod tests {
             .user_identity
             .user_id
             .clone();
-        let peer_user_id = engine.state.contacts.keys().next().expect("contact").clone();
+        let peer_user_id = engine
+            .state
+            .contacts
+            .keys()
+            .next()
+            .expect("contact")
+            .clone();
         let peer_device_id = engine
             .state
             .contacts
@@ -621,26 +648,30 @@ mod tests {
             .device_identity
             .device_id
             .clone();
-        snapshot.pending_acks.push(crate::persistence::PersistedPendingAck {
-            device_id: device_id.clone(),
-            ack: crate::model::Ack {
+        snapshot
+            .pending_acks
+            .push(crate::persistence::PersistedPendingAck {
                 device_id: device_id.clone(),
-                ack_seq: 7,
-                acked_message_ids: vec!["msg:ack".into()],
-                acked_at: 7,
-            },
-            retries: 0,
-        });
+                ack: crate::model::Ack {
+                    device_id: device_id.clone(),
+                    ack_seq: 7,
+                    acked_message_ids: vec!["msg:ack".into()],
+                    acked_at: 7,
+                },
+                retries: 0,
+            });
 
         let mut restored = CoreEngine::from_restored_state(snapshot);
         let resumed = restored
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
 
-        assert!(resumed.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ReadAttachmentBytes { .. }
-        )));
+        assert!(
+            resumed
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. }))
+        );
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -658,10 +689,14 @@ mod tests {
                 attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
-        let task_id = upload_output.effects.iter().find_map(|effect| match effect {
-            CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
-            _ => None,
-        }).expect("read attachment effect");
+        let task_id = upload_output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+                _ => None,
+            })
+            .expect("read attachment effect");
         let prepared_output = engine
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id,
@@ -673,7 +708,8 @@ mod tests {
             blob_ciphertext_b64,
             payload_metadata,
             metadata_ciphertext,
-            prepared_upload, ..
+            prepared_upload,
+            ..
         }) = snapshot.pending_blob_transfers.first_mut()
         {
             assert!(blob_ciphertext_b64.is_some());
@@ -758,7 +794,13 @@ mod tests {
             .user_identity
             .user_id
             .clone();
-        let peer_user_id = engine.state.contacts.keys().next().expect("contact").clone();
+        let peer_user_id = engine
+            .state
+            .contacts
+            .keys()
+            .next()
+            .expect("contact")
+            .clone();
         let peer_device_id = engine
             .state
             .contacts
@@ -807,6 +849,87 @@ mod tests {
     }
 
     #[test]
+    fn stale_realtime_head_after_fetch_is_noop() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+        let local_user_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let peer_user_id = engine
+            .state
+            .contacts
+            .keys()
+            .next()
+            .expect("contact")
+            .clone();
+        let peer_device_id = engine
+            .state
+            .contacts
+            .values()
+            .next()
+            .expect("contact")
+            .devices[0]
+            .device_id
+            .clone();
+
+        let record = sample_control_record(
+            &device_id,
+            1,
+            &local_user_id,
+            &peer_user_id,
+            &peer_device_id,
+        );
+        let conversation_id = record.envelope.conversation_id.clone();
+
+        engine
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: device_id.clone(),
+                records: vec![record],
+                to_seq: 1,
+            })
+            .expect("fetch records");
+
+        let stale = engine
+            .handle_event(CoreEvent::RealtimeEventReceived {
+                device_id: device_id.clone(),
+                event: RealtimeEvent::HeadUpdated { seq: 1 },
+            })
+            .expect("stale realtime");
+
+        assert!(stale.effects.is_empty());
+        assert_eq!(
+            engine
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine
+                .sync_checkpoint_snapshot(&device_id)
+                .expect("checkpoint")
+                .last_acked_seq,
+            1
+        );
+    }
+
+    #[test]
     fn identity_refresh_retries_then_marks_conversation_for_rebuild() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -848,9 +971,12 @@ mod tests {
                     if timer.timer_id == format!("refresh_identity:{}", bob_bundle.user_id)
                 )));
             } else {
-                assert!(output.state_update.system_statuses_changed.contains(
-                    &crate::ffi_api::SystemStatus::ConversationNeedsRebuild
-                ));
+                assert!(
+                    output
+                        .state_update
+                        .system_statuses_changed
+                        .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild)
+                );
             }
         }
 
@@ -963,39 +1089,36 @@ mod tests {
                 device_name: Some("phone".into()),
             })
             .expect("identity");
-        engine
-            .state
-            .conversations
-            .insert(
-                "conv:test".into(),
-                crate::conversation::LocalConversationState {
-                    conversation: crate::model::Conversation {
-                        conversation_id: "conv:test".into(),
-                        kind: ConversationKind::Direct,
-                        member_users: vec!["user:alice".into(), "user:bob".into()],
-                        member_devices: vec![],
-                        state: crate::model::ConversationState::Active,
-                        updated_at: 0,
-                    },
-                    messages: vec![crate::conversation::StoredMessage {
-                        message_id: "msg:download".into(),
-                        sender_device_id: "device:sender".into(),
-                        recipient_device_id: "device:recipient".into(),
-                        message_type: MessageType::MlsApplication,
-                        created_at: 0,
-                        plaintext: Some(
-                            serde_json::to_string(&sample_attachment_payload_metadata())
-                                .expect("attachment metadata"),
-                        ),
-                        storage_refs: vec![],
-                        downloaded_blob_b64: None,
-                    }],
-                    last_message_type: Some(MessageType::MlsApplication),
-                    peer_user_id: "user:bob".into(),
-                    last_known_peer_active_devices: Default::default(),
-                    recovery_status: crate::conversation::RecoveryStatus::Healthy,
+        engine.state.conversations.insert(
+            "conv:test".into(),
+            crate::conversation::LocalConversationState {
+                conversation: crate::model::Conversation {
+                    conversation_id: "conv:test".into(),
+                    kind: ConversationKind::Direct,
+                    member_users: vec!["user:alice".into(), "user:bob".into()],
+                    member_devices: vec![],
+                    state: crate::model::ConversationState::Active,
+                    updated_at: 0,
                 },
-            );
+                messages: vec![crate::conversation::StoredMessage {
+                    message_id: "msg:download".into(),
+                    sender_device_id: "device:sender".into(),
+                    recipient_device_id: "device:recipient".into(),
+                    message_type: MessageType::MlsApplication,
+                    created_at: 0,
+                    plaintext: Some(
+                        serde_json::to_string(&sample_attachment_payload_metadata())
+                            .expect("attachment metadata"),
+                    ),
+                    storage_refs: vec![],
+                    downloaded_blob_b64: None,
+                }],
+                last_message_type: Some(MessageType::MlsApplication),
+                peer_user_id: "user:bob".into(),
+                last_known_peer_active_devices: Default::default(),
+                recovery_status: crate::conversation::RecoveryStatus::Healthy,
+            },
+        );
         engine
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id: "conv:test".into(),
@@ -1025,22 +1148,30 @@ mod tests {
                     })
                     .expect("retry timer");
             } else {
-                assert!(!output.effects.iter().any(|effect| matches!(
-                    effect,
-                    CoreEffect::ScheduleTimer { .. }
-                )));
+                assert!(
+                    !output
+                        .effects
+                        .iter()
+                        .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. }))
+                );
             }
         }
 
-        assert!(!engine
-            .state
-            .pending_blob_downloads
-            .contains_key("blob-download:msg:download"));
+        assert!(
+            !engine
+                .state
+                .pending_blob_downloads
+                .contains_key("blob-download:msg:download")
+        );
     }
 
     #[test]
     fn create_additional_device_identity_keeps_user_and_changes_device() {
-        let first = seeded_engine(ALICE_MNEMONIC, "phone", sample_identity_bundle(BOB_MNEMONIC, "phone"));
+        let first = seeded_engine(
+            ALICE_MNEMONIC,
+            "phone",
+            sample_identity_bundle(BOB_MNEMONIC, "phone"),
+        );
         let original_user_id = first
             .state
             .local_identity
@@ -1071,7 +1202,11 @@ mod tests {
             })
             .expect("additional device");
 
-        let identity = engine.state.local_identity.as_ref().expect("local identity");
+        let identity = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("local identity");
         assert_eq!(identity.user_identity.user_id, original_user_id);
         assert_ne!(identity.device_identity.device_id, original_device_id);
     }
@@ -1080,7 +1215,8 @@ mod tests {
     fn additional_device_snapshot_round_trip_restores_bootstrap_for_welcome_staging() {
         let bob_phone_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_phone_bundle.clone());
-        let conversation_id = create_direct_conversation(&mut alice, bob_phone_bundle.user_id.clone());
+        let conversation_id =
+            create_direct_conversation(&mut alice, bob_phone_bundle.user_id.clone());
 
         let mut laptop = CoreEngine::new();
         laptop
@@ -1182,7 +1318,10 @@ mod tests {
                     .expect("welcome payload"),
             )
             .expect("stage welcome after snapshot restore");
-        assert!(matches!(result, crate::mls_adapter::IngestResult::AppliedWelcome { .. }));
+        assert!(matches!(
+            result,
+            crate::mls_adapter::IngestResult::AppliedWelcome { .. }
+        ));
     }
 
     #[test]
@@ -1227,7 +1366,13 @@ mod tests {
             .expect("status update");
 
         assert!(matches!(
-            engine.state.local_bundle.as_ref().expect("local bundle").devices[0].status,
+            engine
+                .state
+                .local_bundle
+                .as_ref()
+                .expect("local bundle")
+                .devices[0]
+                .status,
             crate::model::DeviceStatusKind::Revoked
         ));
     }
@@ -1240,14 +1385,16 @@ mod tests {
         let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
-        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
-        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
-            &bob_laptop,
-            &sample_deployment(),
-            bob_laptop_package.key_package_b64,
-            bob_laptop_package.expires_at,
-        )
-        .expect("laptop profile");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
         let merged = IdentityManager::export_identity_bundle_with_devices(
             &bob_laptop,
             &sample_deployment(),
@@ -1256,15 +1403,23 @@ mod tests {
         .expect("merged bundle");
 
         alice
-            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged.clone() })
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: merged.clone(),
+            })
             .expect("apply bundle update");
 
-        let updated = alice.state.contacts.get(&merged.user_id).expect("updated contact");
+        let updated = alice
+            .state
+            .contacts
+            .get(&merged.user_id)
+            .expect("updated contact");
         assert_eq!(updated.devices.len(), 2);
-        assert!(updated
-            .devices
-            .iter()
-            .any(|device| device.device_id == bob_laptop_profile.device_id));
+        assert!(
+            updated
+                .devices
+                .iter()
+                .any(|device| device.device_id == bob_laptop_profile.device_id)
+        );
     }
 
     #[test]
@@ -1277,14 +1432,16 @@ mod tests {
         let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
-        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
-        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
-            &bob_laptop,
-            &sample_deployment(),
-            bob_laptop_package.key_package_b64,
-            bob_laptop_package.expires_at,
-        )
-        .expect("laptop profile");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
         let merged = IdentityManager::export_identity_bundle_with_devices(
             &bob_laptop,
             &sample_deployment(),
@@ -1316,24 +1473,27 @@ mod tests {
             .expect("bob phone identity");
         let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
-        let bob_phone_package = MlsAdapter::generate_key_package(&bob_phone, 0).expect("phone package");
+        let bob_phone_package =
+            MlsAdapter::generate_key_package(&bob_phone, 0).expect("phone package");
         let bob_laptop_package =
             MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
         let deployment = sample_deployment();
-        let mut bob_phone_profile = crate::capability::CapabilityManager::build_device_contact_profile(
-            &bob_phone,
-            &deployment,
-            bob_phone_package.key_package_b64,
-            bob_phone_package.expires_at,
-        )
-        .expect("phone profile");
-        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
-            &bob_laptop,
-            &deployment,
-            bob_laptop_package.key_package_b64,
-            bob_laptop_package.expires_at,
-        )
-        .expect("laptop profile");
+        let mut bob_phone_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_phone,
+                &deployment,
+                bob_phone_package.key_package_b64,
+                bob_phone_package.expires_at,
+            )
+            .expect("phone profile");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &deployment,
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
         let active_bundle = IdentityManager::export_identity_bundle_with_devices(
             &bob_laptop,
             &deployment,
@@ -1372,12 +1532,16 @@ mod tests {
             })
             .collect();
         assert!(!remove_commits.is_empty());
-        assert!(remove_commits
-            .iter()
-            .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
-        assert!(remove_commits
-            .iter()
-            .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id));
+        assert!(
+            remove_commits
+                .iter()
+                .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id)
+        );
+        assert!(
+            remove_commits
+                .iter()
+                .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id)
+        );
     }
 
     #[test]
@@ -1390,14 +1554,16 @@ mod tests {
         let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
-        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
-        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
-            &bob_laptop,
-            &sample_deployment(),
-            bob_laptop_package.key_package_b64,
-            bob_laptop_package.expires_at,
-        )
-        .expect("laptop profile");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
         let merged = IdentityManager::export_identity_bundle_with_devices(
             &bob_laptop,
             &sample_deployment(),
@@ -1429,14 +1595,16 @@ mod tests {
         let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
-        let bob_laptop_package = MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
-        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
-            &bob_laptop,
-            &sample_deployment(),
-            bob_laptop_package.key_package_b64,
-            bob_laptop_package.expires_at,
-        )
-        .expect("laptop profile");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
         let merged = IdentityManager::export_identity_bundle_with_devices(
             &bob_laptop,
             &sample_deployment(),
@@ -1496,14 +1664,22 @@ mod tests {
                     .iter()
                     .any(|message| message.message_type == MessageType::MlsWelcome)
         }));
-        assert!(restored.state.pending_outbox[pending_before..].iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsCommit
-        }));
-        assert!(restored.state.pending_outbox[pending_before..].iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsWelcome
-        }));
+        assert!(
+            restored.state.pending_outbox[pending_before..]
+                .iter()
+                .any(|item| {
+                    item.envelope.conversation_id == conversation_id
+                        && item.envelope.message_type == MessageType::MlsCommit
+                })
+        );
+        assert!(
+            restored.state.pending_outbox[pending_before..]
+                .iter()
+                .any(|item| {
+                    item.envelope.conversation_id == conversation_id
+                        && item.envelope.message_type == MessageType::MlsWelcome
+                })
+        );
         assert_eq!(
             restored
                 .state
@@ -1559,7 +1735,8 @@ mod tests {
     }
 
     fn sample_identity_bundle(mnemonic: &str, device_name: &str) -> IdentityBundle {
-        let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name)).expect("identity");
+        let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
+            .expect("identity");
         let package = MlsAdapter::generate_key_package(&identity, 0).expect("package");
         IdentityManager::export_identity_bundle(
             &identity,

@@ -1,5 +1,5 @@
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::model::{CURRENT_MODEL_VERSION, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
@@ -23,11 +23,20 @@ pub struct LocalRuntimeInstance {
     pub websocket_base_url: String,
     pub bootstrap_secret: String,
     pub sharing_secret: String,
+    pub service_root: PathBuf,
 }
 
-pub fn start_local_runtime(workspace_root: impl AsRef<Path>, persist_to: impl AsRef<Path>) -> Result<LocalRuntimeInstance> {
-    let workspace_root = workspace_root.as_ref();
-    let service_root = workspace_root.join("services").join("cloudflare");
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CliAllowlistDocument {
+    pub allowed_sender_user_ids: Vec<String>,
+    pub rejected_sender_user_ids: Vec<String>,
+}
+
+pub fn start_local_runtime(
+    service_root: impl AsRef<Path>,
+    persist_to: impl AsRef<Path>,
+) -> Result<LocalRuntimeInstance> {
+    let service_root = service_root.as_ref().to_path_buf();
     let port = reserve_port()?;
     let base_url = format!("http://127.0.0.1:{port}");
     let bootstrap_secret = format!("transport-bootstrap-{port}");
@@ -60,7 +69,9 @@ pub fn start_local_runtime(workspace_root: impl AsRef<Path>, persist_to: impl As
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        let mut child = child.spawn().context("spawn cloudflare transport runtime")?;
+        let mut child = child
+            .spawn()
+            .context("spawn cloudflare transport runtime")?;
         let pid = child.id();
         let stdout = child.stdout.take().context("runtime stdout unavailable")?;
         let mut reader = BufReader::new(stdout);
@@ -85,6 +96,7 @@ pub fn start_local_runtime(workspace_root: impl AsRef<Path>, persist_to: impl As
                 .to_string(),
             bootstrap_secret,
             sharing_secret,
+            service_root,
         })
     }
 }
@@ -131,7 +143,9 @@ node scripts/transport-runtime.mjs *> \"{}\"\n",
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = starter.output().context("spawn detached cloudflare transport runtime")?;
+    let output = starter
+        .output()
+        .context("spawn detached cloudflare transport runtime")?;
     if !output.status.success() {
         bail!(
             "failed to launch detached cloudflare runtime: {}",
@@ -158,14 +172,12 @@ node scripts/transport-runtime.mjs *> \"{}\"\n",
             .to_string(),
         bootstrap_secret: bootstrap_secret.to_string(),
         sharing_secret: sharing_secret.to_string(),
+        service_root: service_root.to_path_buf(),
     })
 }
 
 #[cfg(windows)]
-fn wait_for_runtime_metadata(
-    stdout_path: &Path,
-    stderr_path: &Path,
-) -> Result<serde_json::Value> {
+fn wait_for_runtime_metadata(stdout_path: &Path, stderr_path: &Path) -> Result<serde_json::Value> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(contents) = std::fs::read_to_string(stdout_path) {
@@ -202,7 +214,10 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
     let client = Client::builder().build().context("build reqwest client")?;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
     loop {
-        let response = client.get(format!("{base_url}/v1/deployment-bundle")).send().await;
+        let response = client
+            .get(format!("{base_url}/v1/deployment-bundle"))
+            .send()
+            .await;
         if let Ok(response) = response {
             if response.status().is_success() {
                 return Ok(());
@@ -268,45 +283,50 @@ pub async fn put_identity_bundle(auth: &DeviceRuntimeAuth, bundle: &IdentityBund
         .await
         .context("put identity bundle")?;
     if !response.status().is_success() {
-        bail!("put identity bundle failed with status {}", response.status());
+        bail!(
+            "put identity bundle failed with status {}",
+            response.status()
+        );
     }
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-struct CliAllowlistDocument {
-    allowed_sender_user_ids: Vec<String>,
-    rejected_sender_user_ids: Vec<String>,
-}
-
-pub async fn allow_sender_user(auth: &DeviceRuntimeAuth, base_url: &str, sender_user_id: &str) -> Result<()> {
+pub async fn list_allowlist(
+    auth: &DeviceRuntimeAuth,
+    base_url: &str,
+) -> Result<CliAllowlistDocument> {
     let client = Client::builder().build().context("build reqwest client")?;
     let allowlist_url = format!(
         "{}/v1/inbox/{}/allowlist",
         base_url.trim_end_matches('/'),
         urlencoding::encode(&auth.device_id)
     );
-    let existing = client
+    let response = client
         .get(&allowlist_url)
         .header("Authorization", format!("Bearer {}", auth.token))
         .send()
         .await
         .context("get allowlist")?;
-    let mut allowed_sender_user_ids = Vec::new();
-    let mut rejected_sender_user_ids = Vec::new();
-    if existing.status().is_success() {
-        let body = existing.text().await.context("read allowlist response")?;
-        let normalized = to_snake_case_json_string(&body)?;
-        let document: CliAllowlistDocument = serde_json::from_str(&normalized)?;
-        allowed_sender_user_ids = document.allowed_sender_user_ids;
-        rejected_sender_user_ids = document.rejected_sender_user_ids;
+    if !response.status().is_success() {
+        bail!("get allowlist failed with status {}", response.status());
     }
-    if !allowed_sender_user_ids.iter().any(|user_id| user_id == sender_user_id) {
-        allowed_sender_user_ids.push(sender_user_id.to_string());
-        allowed_sender_user_ids.sort();
-        allowed_sender_user_ids.dedup();
-    }
-    rejected_sender_user_ids.retain(|user_id| user_id != sender_user_id);
+    let body = response.text().await.context("read allowlist response")?;
+    let normalized = to_snake_case_json_string(&body)?;
+    Ok(serde_json::from_str(&normalized)?)
+}
+
+pub async fn put_allowlist(
+    auth: &DeviceRuntimeAuth,
+    base_url: &str,
+    allowed_sender_user_ids: &[String],
+    rejected_sender_user_ids: &[String],
+) -> Result<()> {
+    let client = Client::builder().build().context("build reqwest client")?;
+    let allowlist_url = format!(
+        "{}/v1/inbox/{}/allowlist",
+        base_url.trim_end_matches('/'),
+        urlencoding::encode(&auth.device_id)
+    );
     let response = client
         .put(&allowlist_url)
         .header("Authorization", format!("Bearer {}", auth.token))
@@ -323,6 +343,122 @@ pub async fn allow_sender_user(auth: &DeviceRuntimeAuth, base_url: &str, sender_
     }
     Ok(())
 }
+
+pub async fn add_allowlist_user(
+    auth: &DeviceRuntimeAuth,
+    base_url: &str,
+    sender_user_id: &str,
+) -> Result<CliAllowlistDocument> {
+    let mut document = list_allowlist(auth, base_url).await?;
+    if !document
+        .allowed_sender_user_ids
+        .iter()
+        .any(|user_id| user_id == sender_user_id)
+    {
+        document
+            .allowed_sender_user_ids
+            .push(sender_user_id.to_string());
+        document.allowed_sender_user_ids.sort();
+        document.allowed_sender_user_ids.dedup();
+    }
+    document
+        .rejected_sender_user_ids
+        .retain(|user_id| user_id != sender_user_id);
+    put_allowlist(
+        auth,
+        base_url,
+        &document.allowed_sender_user_ids,
+        &document.rejected_sender_user_ids,
+    )
+    .await?;
+    Ok(document)
+}
+
+pub async fn remove_allowlist_user(
+    auth: &DeviceRuntimeAuth,
+    base_url: &str,
+    sender_user_id: &str,
+) -> Result<CliAllowlistDocument> {
+    let mut document = list_allowlist(auth, base_url).await?;
+    document
+        .allowed_sender_user_ids
+        .retain(|user_id| user_id != sender_user_id);
+    put_allowlist(
+        auth,
+        base_url,
+        &document.allowed_sender_user_ids,
+        &document.rejected_sender_user_ids,
+    )
+    .await?;
+    Ok(document)
+}
+
+pub async fn allow_sender_user(
+    auth: &DeviceRuntimeAuth,
+    base_url: &str,
+    sender_user_id: &str,
+) -> Result<()> {
+    let _ = add_allowlist_user(auth, base_url, sender_user_id).await?;
+    Ok(())
+}
+
+pub fn resolve_workspace_root(
+    explicit: Option<&Path>,
+    profile_root: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return resolve_workspace_candidate(path)
+            .with_context(|| format!("resolve workspace root from {}", path.display()));
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+    if let Some(profile_root) = profile_root {
+        candidates.push(profile_root.to_path_buf());
+    }
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir);
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    for candidate in candidates {
+        if let Ok(root) = resolve_workspace_candidate(&candidate) {
+            return Ok(root);
+        }
+    }
+
+    bail!(
+        "unable to locate workspace root containing services/cloudflare/scripts/transport-runtime.mjs; pass --workspace-root explicitly"
+    )
+}
+
+pub fn resolve_service_root(
+    explicit: Option<&Path>,
+    profile_root: Option<&Path>,
+) -> Result<PathBuf> {
+    Ok(resolve_workspace_root(explicit, profile_root)?
+        .join("services")
+        .join("cloudflare"))
+}
+
+fn resolve_workspace_candidate(start: &Path) -> Result<PathBuf> {
+    for candidate in start.ancestors() {
+        let script = candidate
+            .join("services")
+            .join("cloudflare")
+            .join("scripts")
+            .join("transport-runtime.mjs");
+        if script.exists() {
+            return Ok(candidate.to_path_buf());
+        }
+    }
+    bail!("workspace root not found")
+}
+
 pub fn stop_local_runtime(pid: u32) -> Result<()> {
     #[cfg(windows)]
     {
@@ -365,5 +501,3 @@ fn reserve_port() -> Result<u16> {
     drop(listener);
     Ok(port)
 }
-
-

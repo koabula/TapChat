@@ -8,9 +8,11 @@ use reqwest::Client;
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
-    RealtimeEvent, RecoveryContextSnapshot, RealtimeSessionSnapshot, SyncCheckpointSnapshot,
+    RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
 };
-use tapchat_core::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
+use tapchat_core::model::{
+    DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus,
+};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
@@ -77,15 +79,18 @@ impl CoreDriver {
         Ok(Self {
             engine: CoreEngine::from_restored_state(snapshot),
             runtime: DriverRuntime {
-                client: Client::builder().build().context("build driver reqwest client")?,
+                client: Client::builder()
+                    .build()
+                    .context("build driver reqwest client")?,
                 websocket_tx,
                 websocket_rx,
                 websocket_tasks: BTreeMap::new(),
                 latest_snapshot: Some(latest_snapshot),
                 notifications: Vec::new(),
                 scheduled_timers: Vec::new(),
-                storage_prepare_url: base_url
-                    .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
+                storage_prepare_url: base_url.map(|value| {
+                    format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
+                }),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
@@ -99,15 +104,18 @@ impl CoreDriver {
         Ok(Self {
             engine: CoreEngine::new(),
             runtime: DriverRuntime {
-                client: Client::builder().build().context("build driver reqwest client")?,
+                client: Client::builder()
+                    .build()
+                    .context("build driver reqwest client")?,
                 websocket_tx,
                 websocket_rx,
                 websocket_tasks: BTreeMap::new(),
                 latest_snapshot: None,
                 notifications: Vec::new(),
                 scheduled_timers: Vec::new(),
-                storage_prepare_url: base_url
-                    .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
+                storage_prepare_url: base_url.map(|value| {
+                    format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
+                }),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
@@ -215,10 +223,12 @@ impl CoreDriver {
                 }
                 match envelope.message_type {
                     MessageType::MlsWelcome => {
-                        artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                        artifacts.pending_welcome_count =
+                            artifacts.pending_welcome_count.saturating_add(1);
                     }
                     MessageType::MlsCommit => {
-                        artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                        artifacts.pending_commit_count =
+                            artifacts.pending_commit_count.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -229,10 +239,12 @@ impl CoreDriver {
                 }
                 match message_type {
                     MessageType::MlsWelcome => {
-                        artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                        artifacts.pending_welcome_count =
+                            artifacts.pending_welcome_count.saturating_add(1);
                     }
                     MessageType::MlsCommit => {
-                        artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                        artifacts.pending_commit_count =
+                            artifacts.pending_commit_count.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -245,10 +257,12 @@ impl CoreDriver {
             }
             match item.envelope.message_type {
                 MessageType::MlsWelcome => {
-                    artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                    artifacts.pending_welcome_count =
+                        artifacts.pending_welcome_count.saturating_add(1);
                 }
                 MessageType::MlsCommit => {
-                    artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                    artifacts.pending_commit_count =
+                        artifacts.pending_commit_count.saturating_add(1);
                 }
                 _ => {}
             }
@@ -259,10 +273,12 @@ impl CoreDriver {
             }
             match envelope.message_type {
                 MessageType::MlsWelcome => {
-                    artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                    artifacts.pending_welcome_count =
+                        artifacts.pending_welcome_count.saturating_add(1);
                 }
                 MessageType::MlsCommit => {
-                    artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                    artifacts.pending_commit_count =
+                        artifacts.pending_commit_count.saturating_add(1);
                 }
                 _ => {}
             }
@@ -273,10 +289,12 @@ impl CoreDriver {
             }
             match message_type {
                 MessageType::MlsWelcome => {
-                    artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+                    artifacts.pending_welcome_count =
+                        artifacts.pending_welcome_count.saturating_add(1);
                 }
                 MessageType::MlsCommit => {
-                    artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+                    artifacts.pending_commit_count =
+                        artifacts.pending_commit_count.saturating_add(1);
                 }
                 _ => {}
             }
@@ -337,7 +355,12 @@ impl CoreDriver {
             if remaining.is_zero() {
                 break;
             }
-            let event = match timeout(remaining.min(Duration::from_millis(250)), self.runtime.websocket_rx.recv()).await {
+            let event = match timeout(
+                remaining.min(Duration::from_millis(250)),
+                self.runtime.websocket_rx.recv(),
+            )
+            .await
+            {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(_) => break,
@@ -377,7 +400,12 @@ impl CoreDriver {
                 let emitted_events = self.execute_effect(effect).await?;
                 for event in emitted_events {
                     processed_any_event = true;
-                    output = merge_outputs(output, self.engine.handle_event(event.clone()).map_err(|error| anyhow!("event {:?} failed: {}", event, error))?);
+                    output = merge_outputs(
+                        output,
+                        self.engine
+                            .handle_event(event.clone())
+                            .map_err(|error| anyhow!("event {:?} failed: {}", event, error))?,
+                    );
                 }
             }
             if !processed_any_event {
@@ -390,7 +418,9 @@ impl CoreDriver {
     async fn execute_effect(&mut self, effect: CoreEffect) -> Result<Vec<CoreEvent>> {
         match effect {
             CoreEffect::ExecuteHttpRequest { request } => self.execute_http_request(request).await,
-            CoreEffect::OpenRealtimeConnection { connection } => self.open_realtime(connection.subscription).await,
+            CoreEffect::OpenRealtimeConnection { connection } => {
+                self.open_realtime(connection.subscription).await
+            }
             CoreEffect::CloseRealtimeConnection { device_id } => {
                 if let Some(task) = self.runtime.websocket_tasks.remove(&device_id) {
                     task.abort();
@@ -410,7 +440,9 @@ impl CoreDriver {
                 Ok(Vec::new())
             }
             CoreEffect::ScheduleTimer { timer } => {
-                self.runtime.scheduled_timers.push((timer.timer_id, timer.delay_ms));
+                self.runtime
+                    .scheduled_timers
+                    .push((timer.timer_id, timer.delay_ms));
                 Ok(Vec::new())
             }
             CoreEffect::EmitUserNotification { notification } => {
@@ -425,7 +457,11 @@ impl CoreDriver {
         request: tapchat_core::ffi_api::HttpRequestEffect,
     ) -> Result<Vec<CoreEvent>> {
         if let Some(device_id) = parse_fetch_device_id(&request.url) {
-            if let Some(failures) = self.runtime.injected_sync_fetch_failures.get_mut(&device_id) {
+            if let Some(failures) = self
+                .runtime
+                .injected_sync_fetch_failures
+                .get_mut(&device_id)
+            {
                 if !failures.is_empty() {
                     let retryable = failures.remove(0);
                     return Ok(vec![CoreEvent::HttpRequestFailed {
@@ -498,7 +534,10 @@ impl CoreDriver {
         }
     }
 
-    async fn open_realtime(&mut self, subscription: RealtimeSubscriptionRequest) -> Result<Vec<CoreEvent>> {
+    async fn open_realtime(
+        &mut self,
+        subscription: RealtimeSubscriptionRequest,
+    ) -> Result<Vec<CoreEvent>> {
         let endpoint = subscription
             .endpoint
             .replace("{deviceId}", &urlencoding::encode(&subscription.device_id));
@@ -509,7 +548,9 @@ impl CoreDriver {
                 reqwest::header::HeaderValue::from_str(value)?,
             );
         }
-        let (stream, _) = connect_async(request).await.context("open realtime websocket")?;
+        let (stream, _) = connect_async(request)
+            .await
+            .context("open realtime websocket")?;
         let device_id = subscription.device_id.clone();
         let sender = self.runtime.websocket_tx.clone();
         let task_device_id = device_id.clone();
@@ -538,11 +579,16 @@ impl CoreDriver {
                 reason: Some("remote closed".into()),
             });
         });
-        self.runtime.websocket_tasks.insert(device_id.clone(), handle);
+        self.runtime
+            .websocket_tasks
+            .insert(device_id.clone(), handle);
         Ok(vec![CoreEvent::WebSocketConnected { device_id }])
     }
 
-    async fn fetch_identity_bundle(&mut self, fetch: FetchIdentityBundleRequest) -> Result<Vec<CoreEvent>> {
+    async fn fetch_identity_bundle(
+        &mut self,
+        fetch: FetchIdentityBundleRequest,
+    ) -> Result<Vec<CoreEvent>> {
         if let Some(failures) = self
             .runtime
             .injected_identity_fetch_failures
@@ -557,12 +603,18 @@ impl CoreDriver {
                 }]);
             }
         }
-        let reference = fetch.reference.ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
+        let reference = fetch
+            .reference
+            .ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
         match self.runtime.client.get(reference).send().await {
             Ok(response) if response.status().is_success() => {
                 let body = response.text().await?;
-                let bundle: IdentityBundle = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::IdentityBundleFetched { user_id: fetch.user_id, bundle }])
+                let bundle: IdentityBundle =
+                    serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+                Ok(vec![CoreEvent::IdentityBundleFetched {
+                    user_id: fetch.user_id,
+                    bundle,
+                }])
             }
             Ok(response) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
@@ -577,7 +629,10 @@ impl CoreDriver {
         }
     }
 
-    async fn prepare_blob_upload(&self, upload: PrepareBlobUploadRequest) -> Result<Vec<CoreEvent>> {
+    async fn prepare_blob_upload(
+        &self,
+        upload: PrepareBlobUploadRequest,
+    ) -> Result<Vec<CoreEvent>> {
         let url = self
             .runtime
             .storage_prepare_url
@@ -592,12 +647,18 @@ impl CoreDriver {
             Ok(response) if response.status().is_success() => {
                 let body = response.text().await?;
                 let result = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::BlobUploadPrepared { task_id: upload.task_id, result }])
+                Ok(vec![CoreEvent::BlobUploadPrepared {
+                    task_id: upload.task_id,
+                    result,
+                }])
             }
             Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
                 retryable: false,
-                detail: Some(format!("prepare upload failed with status {}", response.status())),
+                detail: Some(format!(
+                    "prepare upload failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
@@ -611,7 +672,9 @@ impl CoreDriver {
         &self,
         read: tapchat_core::ffi_api::ReadAttachmentBytesEffect,
     ) -> Result<Vec<CoreEvent>> {
-        let bytes = tokio::fs::read(&read.attachment_id).await.context("read attachment bytes")?;
+        let bytes = tokio::fs::read(&read.attachment_id)
+            .await
+            .context("read attachment bytes")?;
         Ok(vec![CoreEvent::AttachmentBytesLoaded {
             task_id: read.task_id,
             plaintext_b64: STANDARD.encode(bytes),
@@ -627,7 +690,9 @@ impl CoreDriver {
             request = request.header(key, value);
         }
         match request.body(bytes).send().await {
-            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::BlobUploaded { task_id: upload.task_id }]),
+            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::BlobUploaded {
+                task_id: upload.task_id,
+            }]),
             Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
                 retryable: false,
@@ -714,11 +779,20 @@ fn parse_realtime_event(device_id: &str, text: &str) -> Result<CoreEvent> {
         .ok_or_else(|| anyhow!("missing realtime event kind"))?;
     let event = match event_type {
         "head_updated" => RealtimeEvent::HeadUpdated {
-            seq: value.get("seq").and_then(|value| value.as_u64()).ok_or_else(|| anyhow!("missing seq"))?,
+            seq: value
+                .get("seq")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow!("missing seq"))?,
         },
         "inbox_record_available" => RealtimeEvent::InboxRecordAvailable {
-            seq: value.get("seq").and_then(|value| value.as_u64()).ok_or_else(|| anyhow!("missing seq"))?,
-            record: value.get("record").map(|record| serde_json::from_value(record.clone())).transpose()?,
+            seq: value
+                .get("seq")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| anyhow!("missing seq"))?,
+            record: value
+                .get("record")
+                .map(|record| serde_json::from_value(record.clone()))
+                .transpose()?,
         },
         other => return Err(anyhow!("unsupported realtime event {other}")),
     };
@@ -742,7 +816,9 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
     left.state_update.messages_changed |= right.state_update.messages_changed;
     left.state_update.contacts_changed |= right.state_update.contacts_changed;
     left.state_update.checkpoints_changed |= right.state_update.checkpoints_changed;
-    left.state_update.system_statuses_changed.extend(right.state_update.system_statuses_changed);
+    left.state_update
+        .system_statuses_changed
+        .extend(right.state_update.system_statuses_changed);
     left.effects.extend(right.effects);
     if right.view_model.is_some() {
         left.view_model = right.view_model;
@@ -756,18 +832,17 @@ mod tests {
 
     #[test]
     fn websocket_payload_maps_to_core_event() {
-        let event = parse_realtime_event("device:bob:phone", r#"{"event":"head_updated","seq":7}"#).expect("parse");
+        let event = parse_realtime_event("device:bob:phone", r#"{"event":"head_updated","seq":7}"#)
+            .expect("parse");
         match event {
             tapchat_core::CoreEvent::RealtimeEventReceived { device_id, event } => {
                 assert_eq!(device_id, "device:bob:phone");
-                assert!(matches!(event, tapchat_core::ffi_api::RealtimeEvent::HeadUpdated { seq: 7 }));
+                assert!(matches!(
+                    event,
+                    tapchat_core::ffi_api::RealtimeEvent::HeadUpdated { seq: 7 }
+                ));
             }
             _ => panic!("unexpected event"),
         }
     }
 }
-
-
-
-
-

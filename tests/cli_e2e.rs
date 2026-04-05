@@ -68,10 +68,17 @@ fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
         "--profile",
         &profile_root.to_string_lossy(),
     ])?;
-    let pid = started["pid"].as_u64().context("runtime start missing pid")? as u32;
+    let pid = started["pid"]
+        .as_u64()
+        .context("runtime start missing pid")? as u32;
     let mut pid_guard = RuntimePidGuard::new(pid);
     assert_eq!(started["started"], Value::Bool(true));
-    assert!(started["base_url"].as_str().unwrap_or_default().starts_with("http://127.0.0.1:"));
+    assert!(
+        started["base_url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("http://127.0.0.1:")
+    );
     assert!(
         started["websocket_base_url"]
             .as_str()
@@ -87,7 +94,12 @@ fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
     ])?;
     assert_eq!(status["pid"].as_u64(), Some(pid as u64));
     assert_eq!(status["mode"].as_str(), Some("local"));
-    assert!(status["base_url"].as_str().unwrap_or_default().starts_with("http://127.0.0.1:"));
+    assert!(
+        status["base_url"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("http://127.0.0.1:")
+    );
     assert!(
         status["websocket_base_url"]
             .as_str()
@@ -126,11 +138,26 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
     let temp_root = repo_temp_dir("message-requests")?;
     let alice_profile = temp_root.path().join("alice");
     let bob_profile = temp_root.path().join("bob");
-    let alice_mnemonic = write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
+    let alice_mnemonic =
+        write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
     let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
 
-    run_cli_json(["profile", "init", "--name", "alice", "--root", &alice_profile.to_string_lossy()])?;
-    run_cli_json(["profile", "init", "--name", "bob", "--root", &bob_profile.to_string_lossy()])?;
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "alice",
+        "--root",
+        &alice_profile.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "bob",
+        "--root",
+        &bob_profile.to_string_lossy(),
+    ])?;
 
     let alice_identity = run_cli_json([
         "device",
@@ -160,7 +187,8 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
 
     let alice_bundle = runtime_bootstrap_device_bundle(&runtime, &alice_user_id, &alice_device_id)?;
     let bob_bundle = runtime_bootstrap_device_bundle(&runtime, &bob_user_id, &bob_device_id)?;
-    let alice_bundle_path = write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
+    let alice_bundle_path =
+        write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
     let bob_bundle_path = write_json_file(temp_root.path(), "bob-deployment.json", &bob_bundle)?;
 
     run_cli_json([
@@ -178,11 +206,17 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
         &bob_bundle_path.to_string_lossy(),
     ])?;
 
-    let alice_identity_path = export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
-    let bob_identity_path = export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
+    let alice_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
+    let bob_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
     let alice_identity_bundle: IdentityBundle = read_json_file(&alice_identity_path)?;
     let bob_identity_bundle: IdentityBundle = read_json_file(&bob_identity_path)?;
-    runtime_put_identity_bundle(&runtime, bundle_auth(&alice_bundle)?, &alice_identity_bundle)?;
+    runtime_put_identity_bundle(
+        &runtime,
+        bundle_auth(&alice_bundle)?,
+        &alice_identity_bundle,
+    )?;
     runtime_put_identity_bundle(&runtime, bundle_auth(&bob_bundle)?, &bob_identity_bundle)?;
 
     run_cli_json([
@@ -220,7 +254,10 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
     assert!(requests[0].message_count >= 1);
 
     let pre_accept_sync = sync_once(&bob_profile)?;
-    assert_eq!(required_u64(&pre_accept_sync["checkpoint"], "last_acked_seq")?, 0);
+    assert_eq!(
+        required_u64(&pre_accept_sync["checkpoint"], "last_acked_seq")?,
+        0
+    );
 
     runtime_accept_message_request(&runtime, bundle_auth(&bob_bundle)?, &requests[0].request_id)?;
 
@@ -236,10 +273,483 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
         "--conversation-id",
         &conversation_id,
     ])?;
-    assert_eq!(count_plaintext_messages(&messages, "pending request message"), 1);
+    assert_eq!(
+        count_plaintext_messages(&messages, "pending request message"),
+        1
+    );
 
     Ok(())
 }
+#[test]
+fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
+    let _guard = test_lock();
+    let workspace_root = workspace_root();
+    let runtime = runtime_handle(&workspace_root)?;
+    let temp_root = repo_temp_dir("contact-policy")?;
+    let alice_profile = temp_root.path().join("alice");
+    let bob_profile = temp_root.path().join("bob");
+    let alice_mnemonic =
+        write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
+    let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
+
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "alice",
+        "--root",
+        &alice_profile.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "bob",
+        "--root",
+        &bob_profile.to_string_lossy(),
+    ])?;
+
+    let alice_identity = run_cli_json([
+        "device",
+        "recover",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--device-name",
+        "phone",
+        "--mnemonic-file",
+        &alice_mnemonic.to_string_lossy(),
+    ])?;
+    let bob_identity = run_cli_json([
+        "device",
+        "recover",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--device-name",
+        "phone",
+        "--mnemonic-file",
+        &bob_mnemonic.to_string_lossy(),
+    ])?;
+
+    let alice_user_id = required_str(&alice_identity, "user_id")?;
+    let alice_device_id = required_str(&alice_identity, "device_id")?;
+    let bob_user_id = required_str(&bob_identity, "user_id")?;
+    let bob_device_id = required_str(&bob_identity, "device_id")?;
+
+    let alice_bundle = runtime_bootstrap_device_bundle(&runtime, &alice_user_id, &alice_device_id)?;
+    let bob_bundle = runtime_bootstrap_device_bundle(&runtime, &bob_user_id, &bob_device_id)?;
+    let alice_bundle_path =
+        write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
+    let bob_bundle_path = write_json_file(temp_root.path(), "bob-deployment.json", &bob_bundle)?;
+
+    run_cli_json([
+        "profile",
+        "import-deployment",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        &alice_bundle_path.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "profile",
+        "import-deployment",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        &bob_bundle_path.to_string_lossy(),
+    ])?;
+
+    let alice_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
+    let bob_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
+    let alice_identity_bundle: IdentityBundle = read_json_file(&alice_identity_path)?;
+    let bob_identity_bundle: IdentityBundle = read_json_file(&bob_identity_path)?;
+    runtime_put_identity_bundle(
+        &runtime,
+        bundle_auth(&alice_bundle)?,
+        &alice_identity_bundle,
+    )?;
+    runtime_put_identity_bundle(&runtime, bundle_auth(&bob_bundle)?, &bob_identity_bundle)?;
+
+    run_cli_json([
+        "contact",
+        "import-identity",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        &bob_identity_path.to_string_lossy(),
+    ])?;
+
+    let created = run_cli_json([
+        "conversation",
+        "create-direct",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--peer-user-id",
+        &bob_user_id,
+    ])?;
+    let conversation_id = required_str(&created, "conversation_id")?;
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--text",
+        "policy request 1",
+    ])?;
+
+    let requests = run_cli_json([
+        "contact",
+        "requests",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+    ])?;
+    let requests = requests.as_array().context("requests list not array")?;
+    assert_eq!(requests.len(), 1);
+    let request_id = required_str(&requests[0], "request_id")?;
+    assert_eq!(
+        requests[0]["sender_user_id"].as_str(),
+        Some(alice_user_id.as_str())
+    );
+
+    let rejected = run_cli_json([
+        "contact",
+        "requests",
+        "reject",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--request-id",
+        &request_id,
+    ])?;
+    assert_eq!(rejected["rejected"], Value::Bool(true));
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--text",
+        "policy request 2",
+    ])?;
+    let blocked_sync = sync_once(&bob_profile)?;
+    assert_eq!(
+        required_u64(&blocked_sync["checkpoint"], "last_acked_seq")?,
+        0
+    );
+
+    let updated = run_cli_json([
+        "contact",
+        "allowlist",
+        "add",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--user-id",
+        &alice_user_id,
+    ])?;
+    assert_eq!(updated["updated"], Value::Bool(true));
+    let allowlist = run_cli_json([
+        "contact",
+        "allowlist",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+    ])?;
+    assert!(
+        allowlist["allowed_sender_user_ids"]
+            .as_array()
+            .context("allowlist missing allowed_sender_user_ids")?
+            .iter()
+            .any(|value| value.as_str() == Some(alice_user_id.as_str()))
+    );
+
+    run_cli_json([
+        "contact",
+        "import-identity",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        &alice_identity_path.to_string_lossy(),
+    ])?;
+    let allowlist_requests = run_cli_json([
+        "contact",
+        "requests",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+    ])?;
+    assert!(
+        allowlist_requests
+            .as_array()
+            .context("allowlist requests not array")?
+            .is_empty()
+    );
+
+    let removed = run_cli_json([
+        "contact",
+        "allowlist",
+        "remove",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--user-id",
+        &alice_user_id,
+    ])?;
+    assert_eq!(removed["updated"], Value::Bool(true));
+    let allowlist_after_remove = run_cli_json([
+        "contact",
+        "allowlist",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+    ])?;
+    assert!(
+        !allowlist_after_remove["allowed_sender_user_ids"]
+            .as_array()
+            .context("allowlist after remove missing allowed_sender_user_ids")?
+            .iter()
+            .any(|value| value.as_str() == Some(alice_user_id.as_str()))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_device_revoke_remote_target_updates_published_bundle() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("revoke-remote")?;
+    let laptop = start_bob_laptop_recovery(&ctx)?;
+    let merged_identity = runtime_get_identity_bundle(&ctx.runtime, &ctx.bob_user_id)?;
+    assert!(
+        merged_identity
+            .devices
+            .iter()
+            .any(|device| device.device_id == laptop.laptop_device_id)
+    );
+
+    let mut snapshot: Value = read_json_file(&ctx.bob_profile.join("snapshot.json"))?;
+    snapshot["snapshot"]["deployment"]["local_bundle"] = serde_json::to_value(&merged_identity)?;
+    assert!(
+        snapshot["snapshot"]["deployment"]["local_bundle"]["devices"]
+            .as_array()
+            .context("patched local bundle devices missing")?
+            .iter()
+            .any(|device| device["device_id"].as_str() == Some(laptop.laptop_device_id.as_str()))
+    );
+    fs::write(
+        ctx.bob_profile.join("snapshot.json"),
+        serde_json::to_vec_pretty(&snapshot)?,
+    )?;
+
+    let revoked = run_cli_json([
+        "device",
+        "revoke",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--target-device-id",
+        &laptop.laptop_device_id,
+    ])?;
+    assert_eq!(revoked["revoked"], Value::Bool(true));
+
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+    let alice_contact = run_cli_json([
+        "contact",
+        "show",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+    assert!(
+        alice_contact["devices"]
+            .as_array()
+            .context("alice contact devices missing after revoke")?
+            .iter()
+            .any(|device| {
+                device["device_id"].as_str() == Some(laptop.laptop_device_id.as_str())
+                    && device["status"].as_str() == Some("revoked")
+            })
+    );
+
+    let exported_identity_path = export_identity_bundle_to_path(
+        ctx.temp_root.path(),
+        &ctx.bob_profile,
+        "bob-post-revoke-identity.json",
+    )?;
+    let exported_identity: IdentityBundle = read_json_file(&exported_identity_path)?;
+    assert!(exported_identity.devices.iter().any(|device| {
+        device.device_id == laptop.laptop_device_id
+            && matches!(
+                device.status,
+                tapchat_core::model::DeviceStatusKind::Revoked
+            )
+    }));
+
+    Ok(())
+}
+
+#[test]
+fn cli_runtime_local_start_accepts_explicit_workspace_root() -> Result<()> {
+    let _guard = test_lock();
+    let temp_root = repo_temp_dir("runtime-workspace")?;
+    let profile_root = temp_root.path().join("runtime-profile");
+
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "runtime",
+        "--root",
+        &profile_root.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "device",
+        "create",
+        "--profile",
+        &profile_root.to_string_lossy(),
+        "--device-name",
+        "phone",
+    ])?;
+
+    let started = run_cli_json([
+        "runtime",
+        "local-start",
+        "--profile",
+        &profile_root.to_string_lossy(),
+        "--workspace-root",
+        &workspace_root().to_string_lossy(),
+    ])?;
+    let pid = started["pid"]
+        .as_u64()
+        .context("runtime start missing pid")? as u32;
+    let mut pid_guard = RuntimePidGuard::new(pid);
+    assert_eq!(
+        started["workspace_root"].as_str(),
+        Some(workspace_root().to_string_lossy().as_ref())
+    );
+    assert!(
+        started["service_root"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("services\\cloudflare")
+            || started["service_root"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("services/cloudflare")
+    );
+
+    let status = run_cli_json([
+        "runtime",
+        "local-status",
+        "--profile",
+        &profile_root.to_string_lossy(),
+    ])?;
+    assert_eq!(
+        status["workspace_root"].as_str(),
+        Some(workspace_root().to_string_lossy().as_ref())
+    );
+
+    let failure = run_cli_output([
+        "runtime",
+        "local-start",
+        "--profile",
+        &profile_root.to_string_lossy(),
+        "--workspace-root",
+        &temp_root.path().join("missing-root").to_string_lossy(),
+    ])?;
+    assert!(!failure.status.success());
+
+    let stopped = run_cli_json([
+        "runtime",
+        "local-stop",
+        "--profile",
+        &profile_root.to_string_lossy(),
+    ])?;
+    assert_eq!(stopped["stopped"], Value::Bool(true));
+    pid_guard.clear();
+
+    Ok(())
+}
+#[test]
+fn cli_runtime_local_start_discovers_workspace_from_binary_outside_repo_cwd() -> Result<()> {
+    let _guard = test_lock();
+    let temp_root = repo_temp_dir("runtime-cwd")?;
+    let profile_root = temp_root.path().join("runtime-profile");
+
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "runtime",
+        "--root",
+        &profile_root.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "device",
+        "create",
+        "--profile",
+        &profile_root.to_string_lossy(),
+        "--device-name",
+        "phone",
+    ])?;
+
+    let started = run_cli_json_in_cwd(
+        temp_root.path(),
+        [
+            "runtime",
+            "local-start",
+            "--profile",
+            &profile_root.to_string_lossy(),
+        ],
+    )?;
+    let pid = started["pid"]
+        .as_u64()
+        .context("runtime start missing pid")? as u32;
+    let mut pid_guard = RuntimePidGuard::new(pid);
+    assert_eq!(started["started"], Value::Bool(true));
+    assert_eq!(
+        started["workspace_root"].as_str(),
+        Some(workspace_root().to_string_lossy().as_ref())
+    );
+
+    let stopped = run_cli_json([
+        "runtime",
+        "local-stop",
+        "--profile",
+        &profile_root.to_string_lossy(),
+    ])?;
+    assert_eq!(stopped["stopped"], Value::Bool(true));
+    pid_guard.clear();
+    Ok(())
+}
+
+#[test]
+fn cli_device_revoke_missing_target_returns_stable_error() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("revoke-missing-target")?;
+
+    let failure = run_cli_output([
+        "device",
+        "revoke",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--target-device-id",
+        "device:bob:missing",
+    ])?;
+    assert!(!failure.status.success());
+    let stderr = String::from_utf8_lossy(&failure.stderr);
+    assert!(stderr.contains("target device is not present in local identity bundle"));
+
+    Ok(())
+}
+
 #[test]
 fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
     let _guard = test_lock();
@@ -273,11 +783,13 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--profile",
         &ctx.bob_profile.to_string_lossy(),
     ])?;
-    assert!(bob_conversations
-        .as_array()
-        .context("conversation list not array")?
-        .iter()
-        .any(|row| row["conversation_id"].as_str() == Some(ctx.conversation_id.as_str())));
+    assert!(
+        bob_conversations
+            .as_array()
+            .context("conversation list not array")?
+            .iter()
+            .any(|row| row["conversation_id"].as_str() == Some(ctx.conversation_id.as_str()))
+    );
 
     let bob_show = run_cli_json([
         "conversation",
@@ -302,7 +814,10 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--conversation-id",
         &ctx.conversation_id,
     ])?;
-    assert_eq!(count_plaintext_messages(&first_messages, "hello from cli e2e"), 1);
+    assert_eq!(
+        count_plaintext_messages(&first_messages, "hello from cli e2e"),
+        1
+    );
 
     let attachment_path = ctx.temp_root.path().join("attachment.txt");
     fs::write(&attachment_path, "hello from cli attachment e2e")?;
@@ -390,7 +905,10 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         &downloaded_path.to_string_lossy(),
     ])?;
     assert_eq!(downloaded["downloaded"], Value::Bool(true));
-    assert_eq!(fs::read_to_string(&downloaded_path)?, "hello from cli attachment e2e");
+    assert_eq!(
+        fs::read_to_string(&downloaded_path)?,
+        "hello from cli attachment e2e"
+    );
 
     for text in ["offline batch 1", "offline batch 2", "offline batch 3"] {
         run_cli_json([
@@ -419,7 +937,8 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--profile",
         &ctx.bob_profile.to_string_lossy(),
     ])?;
-    let receiver_before_acked = required_u64(&receiver_status_before["checkpoint"], "last_acked_seq")?;
+    let receiver_before_acked =
+        required_u64(&receiver_status_before["checkpoint"], "last_acked_seq")?;
     assert!(receiver_before_acked < head_seq);
     assert!(receiver_status_before["notifications"].is_array());
 
@@ -430,7 +949,8 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         &ctx.bob_profile.to_string_lossy(),
     ])?;
     assert_eq!(offline_recovery_sync["synced"], Value::Bool(true));
-    let offline_recovery_acked = required_u64(&offline_recovery_sync["checkpoint"], "last_acked_seq")?;
+    let offline_recovery_acked =
+        required_u64(&offline_recovery_sync["checkpoint"], "last_acked_seq")?;
     assert_eq!(offline_recovery_acked, head_seq);
     assert_realtime_not_connected(&offline_recovery_sync["realtime"]);
 
@@ -454,7 +974,10 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--conversation-id",
         &ctx.conversation_id,
     ])?;
-    assert_eq!(bob_show_after_offline["recovery_status"].as_str(), Some("Healthy"));
+    assert_eq!(
+        bob_show_after_offline["recovery_status"].as_str(),
+        Some("Healthy")
+    );
     assert_eq!(
         required_u64(&bob_show_after_offline["checkpoint"], "last_acked_seq")?,
         head_seq
@@ -478,23 +1001,49 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--conversation-id",
         &ctx.conversation_id,
     ])?;
-    for text in ["hello from cli e2e", "offline batch 1", "offline batch 2", "offline batch 3"] {
+    for text in [
+        "hello from cli e2e",
+        "offline batch 1",
+        "offline batch 2",
+        "offline batch 3",
+    ] {
         assert_eq!(count_plaintext_messages(&repeated_messages, text), 1);
     }
+    let repeated_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+    ])?;
+    assert_eq!(
+        required_u64(&repeated_status["checkpoint"], "last_acked_seq")?,
+        head_seq
+    );
+    assert!(repeated_status["realtime"].is_object());
+    assert!(repeated_status["notifications"].is_array());
+    assert_eq!(
+        conversation_show(&ctx.bob_profile, &ctx.conversation_id)?["recovery_status"].as_str(),
+        Some("Healthy")
+    );
 
     let snapshot: Value = read_json_file(&ctx.bob_profile.join("snapshot.json"))?;
     let conversations = snapshot["snapshot"]["conversations"]
         .as_array()
         .context("snapshot conversations missing")?;
-    assert!(conversations
-        .iter()
-        .any(|row| row["conversation_id"].as_str() == Some(ctx.conversation_id.as_str())));
+    assert!(
+        conversations
+            .iter()
+            .any(|row| row["conversation_id"].as_str() == Some(ctx.conversation_id.as_str()))
+    );
     let sync_states = snapshot["snapshot"]["sync_states"]
         .as_array()
         .context("snapshot sync states missing")?;
     assert!(sync_states.iter().any(|row| {
         row["device_id"].as_str() == Some(ctx.bob_device_id.as_str())
-            && row["state"]["checkpoint"]["last_acked_seq"].as_u64().unwrap_or_default() == head_seq
+            && row["state"]["checkpoint"]["last_acked_seq"]
+                .as_u64()
+                .unwrap_or_default()
+                == head_seq
     }));
 
     Ok(())
@@ -523,13 +1072,19 @@ fn cli_multi_device_join_and_switch_e2e_work() -> Result<()> {
         Some("NeedsRecovery") | Some("NeedsRebuild")
     ));
     assert!(alice_show["checkpoint"].is_object());
-    assert!(snapshot_has_recovery_context(&ctx.alice_profile, &ctx.conversation_id)?);
+    assert!(snapshot_has_recovery_context(
+        &ctx.alice_profile,
+        &ctx.conversation_id
+    )?);
     assert!(laptop.merged_identity_path.exists());
 
     let laptop_sync = sync_once(&laptop.laptop_profile)?;
     assert_eq!(laptop_sync["synced"], Value::Bool(true));
     assert_realtime_not_connected(&laptop_sync["realtime"]);
-    assert!(conversation_exists(&laptop.laptop_profile, &ctx.conversation_id)?);
+    assert!(conversation_exists(
+        &laptop.laptop_profile,
+        &ctx.conversation_id
+    )?);
 
     for _ in 0..4 {
         run_cli_json([
@@ -542,8 +1097,7 @@ fn cli_multi_device_join_and_switch_e2e_work() -> Result<()> {
         ])?;
         let _ = sync_once(&laptop.laptop_profile)?;
         if conversation_exists(&laptop.laptop_profile, &ctx.conversation_id)?
-            && conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?
-                .as_deref()
+            && conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
                 == Some("Healthy")
         {
             break;
@@ -551,12 +1105,24 @@ fn cli_multi_device_join_and_switch_e2e_work() -> Result<()> {
     }
 
     let alice_show_after = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
-    assert_eq!(alice_show_after["recovery_status"].as_str(), Some("Healthy"));
-    assert!(conversation_exists(&laptop.laptop_profile, &ctx.conversation_id)?);
+    assert_eq!(
+        alice_show_after["recovery_status"].as_str(),
+        Some("Healthy")
+    );
+    assert!(conversation_exists(
+        &laptop.laptop_profile,
+        &ctx.conversation_id
+    )?);
     let laptop_show_after_reconcile =
         conversation_show(&laptop.laptop_profile, &ctx.conversation_id)?;
-    assert_eq!(laptop_show_after_reconcile["conversation_state"].as_str(), Some("active"));
-    assert_eq!(laptop_show_after_reconcile["recovery_status"].as_str(), Some("Healthy"));
+    assert_eq!(
+        laptop_show_after_reconcile["conversation_state"].as_str(),
+        Some("active")
+    );
+    assert_eq!(
+        laptop_show_after_reconcile["recovery_status"].as_str(),
+        Some("Healthy")
+    );
 
     run_cli_json([
         "message",
@@ -578,7 +1144,10 @@ fn cli_multi_device_join_and_switch_e2e_work() -> Result<()> {
         "--conversation-id",
         &ctx.conversation_id,
     ])?;
-    assert_eq!(count_plaintext_messages(&laptop_messages, "hello laptop"), 1);
+    assert_eq!(
+        count_plaintext_messages(&laptop_messages, "hello laptop"),
+        1
+    );
 
     Ok(())
 }
@@ -605,7 +1174,10 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
         alice_show_before["recovery_status"].as_str(),
         Some("NeedsRecovery") | Some("NeedsRebuild")
     ));
-    assert!(snapshot_has_recovery_context(&ctx.alice_profile, &ctx.conversation_id)?);
+    assert!(snapshot_has_recovery_context(
+        &ctx.alice_profile,
+        &ctx.conversation_id
+    )?);
 
     let alice_snapshot_before = read_json_file::<Value>(&ctx.alice_profile.join("snapshot.json"))?;
     let alice_sync_before = snapshot_sync_state(&alice_snapshot_before, &ctx.alice_device_id)?;
@@ -632,8 +1204,14 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
     let alice_sync_after = snapshot_sync_state(&alice_snapshot_after, &ctx.alice_device_id)?;
     let after_restart_acked = required_u64(alice_sync_after, "last_acked_seq")?;
     assert!(after_restart_acked >= before_restart_acked);
-    assert!(snapshot_has_conversation(&ctx.alice_profile, &ctx.conversation_id)?);
-    assert!(snapshot_has_recovery_context(&ctx.alice_profile, &ctx.conversation_id)?);
+    assert!(snapshot_has_conversation(
+        &ctx.alice_profile,
+        &ctx.conversation_id
+    )?);
+    assert!(snapshot_has_recovery_context(
+        &ctx.alice_profile,
+        &ctx.conversation_id
+    )?);
     assert!(laptop.merged_identity_path.exists());
 
     let laptop_sync = sync_once(&laptop.laptop_profile)?;
@@ -649,8 +1227,7 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
             &ctx.conversation_id,
         ])?;
         let _ = sync_once(&laptop.laptop_profile)?;
-        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?
-            .as_deref()
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
             == Some("Healthy")
         {
             break;
@@ -658,15 +1235,37 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
     }
 
     let alice_show_healthy = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
-    assert_eq!(alice_show_healthy["conversation_state"].as_str(), Some("active"));
-    assert_eq!(alice_show_healthy["recovery_status"].as_str(), Some("Healthy"));
-    assert!(conversation_exists(&laptop.laptop_profile, &ctx.conversation_id)?);
+    assert_eq!(
+        alice_show_healthy["conversation_state"].as_str(),
+        Some("active")
+    );
+    assert_eq!(
+        alice_show_healthy["recovery_status"].as_str(),
+        Some("Healthy")
+    );
+    assert!(alice_show_healthy["checkpoint"].is_object());
+    assert!(conversation_exists(
+        &laptop.laptop_profile,
+        &ctx.conversation_id
+    )?);
 
     let alice_snapshot_final = read_json_file::<Value>(&ctx.alice_profile.join("snapshot.json"))?;
     let alice_sync_final = snapshot_sync_state(&alice_snapshot_final, &ctx.alice_device_id)?;
     let final_acked = required_u64(alice_sync_final, "last_acked_seq")?;
     assert!(final_acked >= after_restart_acked);
-    assert!(snapshot_has_conversation(&ctx.alice_profile, &ctx.conversation_id)?);
+    assert!(snapshot_has_conversation(
+        &ctx.alice_profile,
+        &ctx.conversation_id
+    )?);
+    let alice_status_final = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert!(alice_status_final["notifications"].is_array());
+    assert!(alice_status_final["checkpoint"].is_object());
+    assert!(alice_status_final.get("realtime").is_some());
 
     Ok(())
 }
@@ -743,7 +1342,9 @@ impl Drop for RuntimePidGuard {
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
         #[cfg(not(windows))]
-        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
     }
 }
 
@@ -779,6 +1380,49 @@ fn run_cleanup_script(workspace_root: &Path, what_if: bool) -> Result<String> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     ))
+}
+
+fn run_cli_output<I, S>(args: I) -> Result<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut command = Command::new(binary_path());
+    command
+        .current_dir(workspace_root())
+        .arg("--output")
+        .arg("json");
+    for arg in args {
+        command.arg(arg.as_ref());
+    }
+    command.output().context("run tapchat cli")
+}
+fn run_cli_json_in_cwd<I, S>(cwd: &Path, args: I) -> Result<Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut command = Command::new(binary_path());
+    command.current_dir(cwd).arg("--output").arg("json");
+    for arg in args {
+        command.arg(arg.as_ref());
+    }
+    let output = command.output().context("run tapchat cli")?;
+    if !output.status.success() {
+        bail!(
+            "tapchat command failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("decode cli stdout as utf-8")?;
+    serde_json::from_str(&stdout).map_err(|error| {
+        anyhow!(
+            "failed to parse cli json output: {error}\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 fn run_cli_json<I, S>(args: I) -> Result<Value>
@@ -828,7 +1472,12 @@ fn conversation_show(profile: &Path, conversation_id: &str) -> Result<Value> {
 }
 
 fn conversation_exists(profile: &Path, conversation_id: &str) -> Result<bool> {
-    let rows = run_cli_json(["conversation", "list", "--profile", &profile.to_string_lossy()])?;
+    let rows = run_cli_json([
+        "conversation",
+        "list",
+        "--profile",
+        &profile.to_string_lossy(),
+    ])?;
     Ok(rows
         .as_array()
         .context("conversation list not array")?
@@ -837,10 +1486,11 @@ fn conversation_exists(profile: &Path, conversation_id: &str) -> Result<bool> {
 }
 
 fn conversation_recovery_status(profile: &Path, conversation_id: &str) -> Result<Option<String>> {
-    Ok(conversation_show(profile, conversation_id)?
-        ["recovery_status"]
-        .as_str()
-        .map(|value| value.to_string()))
+    Ok(
+        conversation_show(profile, conversation_id)?["recovery_status"]
+            .as_str()
+            .map(|value| value.to_string()),
+    )
 }
 
 fn binary_path() -> PathBuf {
@@ -912,11 +1562,26 @@ fn setup_cli_pair(suffix: &str) -> Result<CliPairContext> {
     let temp_root = repo_temp_dir(suffix)?;
     let alice_profile = temp_root.path().join("alice");
     let bob_profile = temp_root.path().join("bob");
-    let alice_mnemonic = write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
+    let alice_mnemonic =
+        write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
     let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
 
-    run_cli_json(["profile", "init", "--name", "alice", "--root", &alice_profile.to_string_lossy()])?;
-    run_cli_json(["profile", "init", "--name", "bob", "--root", &bob_profile.to_string_lossy()])?;
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "alice",
+        "--root",
+        &alice_profile.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "bob",
+        "--root",
+        &bob_profile.to_string_lossy(),
+    ])?;
 
     let alice_identity = run_cli_json([
         "device",
@@ -946,7 +1611,8 @@ fn setup_cli_pair(suffix: &str) -> Result<CliPairContext> {
 
     let alice_bundle = runtime_bootstrap_device_bundle(&runtime, &alice_user_id, &alice_device_id)?;
     let bob_bundle = runtime_bootstrap_device_bundle(&runtime, &bob_user_id, &bob_device_id)?;
-    let alice_bundle_path = write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
+    let alice_bundle_path =
+        write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
     let bob_bundle_path = write_json_file(temp_root.path(), "bob-deployment.json", &bob_bundle)?;
 
     run_cli_json([
@@ -964,12 +1630,28 @@ fn setup_cli_pair(suffix: &str) -> Result<CliPairContext> {
         &bob_bundle_path.to_string_lossy(),
     ])?;
 
-    let alice_identity_path = export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
-    let bob_identity_path = export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
+    let alice_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
+    let bob_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
     let alice_identity_bundle: IdentityBundle = read_json_file(&alice_identity_path)?;
     let bob_identity_bundle: IdentityBundle = read_json_file(&bob_identity_path)?;
-    runtime_put_identity_bundle(&runtime, bundle_auth(&alice_bundle)?, &alice_identity_bundle)?;
+    runtime_put_identity_bundle(
+        &runtime,
+        bundle_auth(&alice_bundle)?,
+        &alice_identity_bundle,
+    )?;
     runtime_put_identity_bundle(&runtime, bundle_auth(&bob_bundle)?, &bob_identity_bundle)?;
+    runtime_put_allowlist(
+        &runtime,
+        bundle_auth(&alice_bundle)?,
+        std::slice::from_ref(&bob_user_id),
+    )?;
+    runtime_put_allowlist(
+        &runtime,
+        bundle_auth(&bob_bundle)?,
+        std::slice::from_ref(&alice_user_id),
+    )?;
 
     run_cli_json([
         "contact",
@@ -1013,13 +1695,24 @@ fn setup_cli_pair(suffix: &str) -> Result<CliPairContext> {
 
 fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
     let laptop_profile = ctx.temp_root.path().join("bob-laptop");
-    let bob_mnemonic = write_mnemonic_file(ctx.temp_root.path(), "bob-laptop-mnemonic.txt", BOB_MNEMONIC)?;
+    let bob_mnemonic = write_mnemonic_file(
+        ctx.temp_root.path(),
+        "bob-laptop-mnemonic.txt",
+        BOB_MNEMONIC,
+    )?;
     let public_bundle_path = write_json_file(
         ctx.temp_root.path(),
         "bob-laptop-public-deployment.json",
         &ctx.bob_bundle,
     )?;
-    run_cli_json(["profile", "init", "--name", "bob-laptop", "--root", &laptop_profile.to_string_lossy()])?;
+    run_cli_json([
+        "profile",
+        "init",
+        "--name",
+        "bob-laptop",
+        "--root",
+        &laptop_profile.to_string_lossy(),
+    ])?;
     run_cli_json([
         "profile",
         "import-deployment",
@@ -1039,8 +1732,13 @@ fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
     ])?;
     let laptop_device_id = required_str(&laptop_identity, "device_id")?;
 
-    let laptop_bundle = runtime_bootstrap_device_bundle(&ctx.runtime, &ctx.bob_user_id, &laptop_device_id)?;
-    let laptop_bundle_path = write_json_file(ctx.temp_root.path(), "bob-laptop-deployment.json", &laptop_bundle)?;
+    let laptop_bundle =
+        runtime_bootstrap_device_bundle(&ctx.runtime, &ctx.bob_user_id, &laptop_device_id)?;
+    let laptop_bundle_path = write_json_file(
+        ctx.temp_root.path(),
+        "bob-laptop-deployment.json",
+        &laptop_bundle,
+    )?;
     run_cli_json([
         "profile",
         "import-deployment",
@@ -1054,8 +1752,11 @@ fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
         &ctx.bob_profile,
         "bob-phone-refresh-identity.json",
     )?;
-    let laptop_identity_path =
-        export_identity_bundle_to_path(ctx.temp_root.path(), &laptop_profile, "bob-laptop-identity.json")?;
+    let laptop_identity_path = export_identity_bundle_to_path(
+        ctx.temp_root.path(),
+        &laptop_profile,
+        "bob-laptop-identity.json",
+    )?;
     let phone_bundle: IdentityBundle = read_json_file(&phone_identity_path)?;
     let laptop_identity_bundle: IdentityBundle = read_json_file(&laptop_identity_path)?;
     let merged_identity = merge_identity_bundles(
@@ -1063,14 +1764,24 @@ fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
         &laptop_profile,
         &[phone_bundle.clone(), laptop_identity_bundle],
     )?;
-    let merged_identity_path = write_json_file(ctx.temp_root.path(), "bob-identity-merged.json", &merged_identity)?;
+    let merged_identity_path = write_json_file(
+        ctx.temp_root.path(),
+        "bob-identity-merged.json",
+        &merged_identity,
+    )?;
     runtime_put_identity_bundle(&ctx.runtime, bundle_auth(&laptop_bundle)?, &merged_identity)?;
-    runtime_put_allowlist(&ctx.runtime, bundle_auth(&laptop_bundle)?, std::slice::from_ref(&ctx.alice_user_id))?;
+    runtime_put_allowlist(
+        &ctx.runtime,
+        bundle_auth(&laptop_bundle)?,
+        std::slice::from_ref(&ctx.alice_user_id),
+    )?;
     let runtime_identity = runtime_get_identity_bundle(&ctx.runtime, &ctx.bob_user_id)?;
-    assert!(runtime_identity
-        .devices
-        .iter()
-        .any(|device| device.device_id == laptop_device_id));
+    assert!(
+        runtime_identity
+            .devices
+            .iter()
+            .any(|device| device.device_id == laptop_device_id)
+    );
 
     run_cli_json([
         "contact",
@@ -1088,11 +1799,13 @@ fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
         "--user-id",
         &ctx.bob_user_id,
     ])?;
-    assert!(alice_contact["devices"]
-        .as_array()
-        .context("alice contact devices missing")?
-        .iter()
-        .any(|device| device["device_id"].as_str() == Some(laptop_device_id.as_str())));
+    assert!(
+        alice_contact["devices"]
+            .as_array()
+            .context("alice contact devices missing")?
+            .iter()
+            .any(|device| device["device_id"].as_str() == Some(laptop_device_id.as_str()))
+    );
     run_cli_json([
         "sync",
         "once",
@@ -1104,7 +1817,10 @@ fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
         "import-identity",
         "--profile",
         &laptop_profile.to_string_lossy(),
-        &ctx.temp_root.path().join("alice-identity.json").to_string_lossy(),
+        &ctx.temp_root
+            .path()
+            .join("alice-identity.json")
+            .to_string_lossy(),
     ])?;
 
     Ok(CliLaptopContext {
@@ -1124,7 +1840,10 @@ fn export_identity_bundle_to_path(root: &Path, profile: &Path, name: &str) -> Re
         "--out",
         &output.to_string_lossy(),
     ])?;
-    assert_eq!(required_str(&exported, "written")?, output.to_string_lossy());
+    assert_eq!(
+        required_str(&exported, "written")?,
+        output.to_string_lossy()
+    );
     Ok(output)
 }
 
@@ -1133,7 +1852,9 @@ fn merge_identity_bundles(
     signer_profile: &Path,
     bundles: &[IdentityBundle],
 ) -> Result<IdentityBundle> {
-    let local_identity: LocalIdentityState = snapshot_local_identity(&read_json_file::<Value>(&signer_profile.join("snapshot.json"))?)?;
+    let local_identity: LocalIdentityState = snapshot_local_identity(&read_json_file::<Value>(
+        &signer_profile.join("snapshot.json"),
+    )?)?;
     let deployment = concrete_deployment_bundle(deployment, &local_identity.user_identity.user_id);
     let mut devices = Vec::new();
     for bundle in bundles {
@@ -1177,7 +1898,10 @@ fn snapshot_has_recovery_context(profile: &Path, conversation_id: &str) -> Resul
     let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
     Ok(snapshot["snapshot"]["recovery_contexts"]
         .as_array()
-        .map(|rows| rows.iter().any(|row| row["conversation_id"].as_str() == Some(conversation_id)))
+        .map(|rows| {
+            rows.iter()
+                .any(|row| row["conversation_id"].as_str() == Some(conversation_id))
+        })
         .unwrap_or(false))
 }
 
@@ -1185,7 +1909,10 @@ fn snapshot_has_conversation(profile: &Path, conversation_id: &str) -> Result<bo
     let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
     Ok(snapshot["snapshot"]["conversations"]
         .as_array()
-        .map(|rows| rows.iter().any(|row| row["conversation_id"].as_str() == Some(conversation_id)))
+        .map(|rows| {
+            rows.iter()
+                .any(|row| row["conversation_id"].as_str() == Some(conversation_id))
+        })
         .unwrap_or(false))
 }
 
@@ -1258,9 +1985,3 @@ where
         .context("build tokio runtime for cli e2e helper")?
         .block_on(build())
 }
-
-
-
-
-
-

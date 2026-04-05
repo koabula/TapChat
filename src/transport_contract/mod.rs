@@ -119,7 +119,7 @@ pub struct FetchIdentityBundleResult {
 mod tests {
     use super::*;
     use crate::model::{
-        DeliveryClass, MessageType, SenderProof, StorageRef, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, DeliveryClass, MessageType, SenderProof, StorageRef,
     };
 
     #[test]

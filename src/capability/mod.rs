@@ -1,11 +1,10 @@
 use ed25519_dalek::{Signer, Verifier};
 
 use crate::error::{CoreError, CoreResult};
-use crate::identity::{encode_hex, parse_verifying_key, LocalIdentityState};
+use crate::identity::{LocalIdentityState, encode_hex, parse_verifying_key};
 use crate::model::{
-    CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
-    DeviceContactProfile, InboxAppendCapability, KeyPackageRef, Validate,
-    CURRENT_MODEL_VERSION,
+    CURRENT_MODEL_VERSION, CapabilityConstraints, CapabilityOperation, CapabilityService,
+    DeploymentBundle, DeviceContactProfile, InboxAppendCapability, KeyPackageRef, Validate,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -75,8 +74,11 @@ impl CapabilityManager {
         key_package_ref: String,
         key_package_expires_at: u64,
     ) -> CoreResult<DeviceContactProfile> {
-        let capability =
-            Self::build_inbox_append_capability(local_identity, deployment, key_package_expires_at)?;
+        let capability = Self::build_inbox_append_capability(
+            local_identity,
+            deployment,
+            key_package_expires_at,
+        )?;
         Ok(DeviceContactProfile {
             version: CURRENT_MODEL_VERSION.to_string(),
             device_id: local_identity.device_identity.device_id.clone(),
@@ -158,8 +160,7 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::model::{DeploymentBundle, DeviceRuntimeAuth};
 
-    const ALICE_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
     #[test]
     fn module_name_is_stable() {
@@ -178,8 +179,7 @@ mod tests {
             42,
         )
         .expect("profile");
-        CapabilityManager::verify_device_contact_profile(&profile)
-            .expect("profile should verify");
+        CapabilityManager::verify_device_contact_profile(&profile).expect("profile should verify");
     }
 
     fn sample_deployment() -> DeploymentBundle {
@@ -210,5 +210,3 @@ mod tests {
         }
     }
 }
-
-

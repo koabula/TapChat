@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
@@ -13,23 +12,23 @@ use crate::mls_adapter::{
     RemoveMembersArtifacts,
 };
 use crate::model::{
-    Ack, ConversationKind, ConversationState, DeliveryClass, Envelope, IdentityBundle,
-    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
+    Ack, ConversationKind, ConversationState, DeliveryClass, Envelope, IdentityBundle, InboxRecord,
+    MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
     PersistedDeployment, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
-    PersistedRecoveryEscalationReason, PersistedRecoveryPhase,
     PersistedPendingAck, PersistedPendingBlobTransfer, PersistedRealtimeSession,
-    PersistedRecoveryContext, PersistedRecoveryReason, PersistedSyncState,
+    PersistedRecoveryContext, PersistedRecoveryEscalationReason, PersistedRecoveryPhase,
+    PersistedRecoveryReason, PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
     AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, BlobDownloadRequest,
-    BlobUploadRequest,
-    FetchIdentityBundleRequest, FetchMessagesRequest, FetchMessagesResult, GetHeadResult,
-    PrepareBlobUploadRequest, PrepareBlobUploadResult, RealtimeSubscriptionRequest,
+    BlobUploadRequest, FetchIdentityBundleRequest, FetchMessagesRequest, FetchMessagesResult,
+    GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult, RealtimeSubscriptionRequest,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
@@ -107,12 +106,15 @@ impl CoreEngine {
     }
 
     pub fn sync_checkpoint_snapshot(&self, device_id: &str) -> Option<SyncCheckpointSnapshot> {
-        self.state.sync_states.get(device_id).map(|state| SyncCheckpointSnapshot {
-            last_fetched_seq: state.checkpoint.last_fetched_seq,
-            last_acked_seq: state.checkpoint.last_acked_seq,
-            pending_retry: state.pending_retry,
-            pending_record_seqs: state.pending_record_seqs.iter().copied().collect(),
-        })
+        self.state
+            .sync_states
+            .get(device_id)
+            .map(|state| SyncCheckpointSnapshot {
+                last_fetched_seq: state.checkpoint.last_fetched_seq,
+                last_acked_seq: state.checkpoint.last_acked_seq,
+                pending_retry: state.pending_retry,
+                pending_record_seqs: state.pending_record_seqs.iter().copied().collect(),
+            })
     }
 
     pub fn realtime_session_snapshot(&self, device_id: &str) -> Option<RealtimeSessionSnapshot> {
@@ -424,24 +426,30 @@ impl CoreEngine {
 
     pub fn handle_command(&mut self, command: CoreCommand) -> CoreResult<CoreOutput> {
         match command {
-            CoreCommand::CreateOrLoadIdentity { mnemonic, device_name } => {
-                self.create_or_load_identity(mnemonic, device_name)
-            }
+            CoreCommand::CreateOrLoadIdentity {
+                mnemonic,
+                device_name,
+            } => self.create_or_load_identity(mnemonic, device_name),
             CoreCommand::ImportDeploymentBundle { bundle } => self.import_deployment_bundle(bundle),
             CoreCommand::ImportIdentityBundle { bundle } => self.import_identity_bundle(bundle),
-            CoreCommand::ApplyIdentityBundleUpdate { bundle } => self.apply_identity_bundle_update(bundle),
-            CoreCommand::CreateConversation { peer_user_id, conversation_kind } => {
-                self.create_conversation(peer_user_id, conversation_kind)
+            CoreCommand::ApplyIdentityBundleUpdate { bundle } => {
+                self.apply_identity_bundle_update(bundle)
             }
+            CoreCommand::CreateConversation {
+                peer_user_id,
+                conversation_kind,
+            } => self.create_conversation(peer_user_id, conversation_kind),
             CoreCommand::ReconcileConversationMembership { conversation_id } => {
                 self.reconcile_conversation_membership(conversation_id)
             }
-            CoreCommand::SendTextMessage { conversation_id, plaintext } => {
-                self.send_text_message(conversation_id, plaintext)
-            }
-            CoreCommand::SendAttachmentMessage { conversation_id, attachment_descriptor } => {
-                self.send_attachment_message(conversation_id, attachment_descriptor)
-            }
+            CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext,
+            } => self.send_text_message(conversation_id, plaintext),
+            CoreCommand::SendAttachmentMessage {
+                conversation_id,
+                attachment_descriptor,
+            } => self.send_attachment_message(conversation_id, attachment_descriptor),
             CoreCommand::DownloadAttachment {
                 conversation_id,
                 message_id,
@@ -450,13 +458,18 @@ impl CoreEngine {
             } => self.download_attachment(conversation_id, message_id, reference, destination),
             CoreCommand::SyncInbox { device_id, .. } => self.sync_inbox(device_id),
             CoreCommand::RefreshIdentityState { user_id } => self.refresh_identity_state(user_id),
-            CoreCommand::CreateAdditionalDeviceIdentity { mnemonic, device_name } => {
-                self.create_additional_device_identity(mnemonic, device_name)
-            }
+            CoreCommand::CreateAdditionalDeviceIdentity {
+                mnemonic,
+                device_name,
+            } => self.create_additional_device_identity(mnemonic, device_name),
             CoreCommand::RotateLocalKeyPackage => self.rotate_local_key_package(),
             CoreCommand::ApplyLocalDeviceStatusUpdate { status } => {
                 self.apply_local_device_status_update(status)
             }
+            CoreCommand::UpdateLocalDeviceStatus {
+                target_device_id,
+                status,
+            } => self.update_local_device_status(target_device_id, status),
             CoreCommand::RebuildConversation { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
             }
@@ -466,7 +479,9 @@ impl CoreEngine {
     pub fn handle_event(&mut self, event: CoreEvent) -> CoreResult<CoreOutput> {
         match event {
             CoreEvent::AppStarted | CoreEvent::AppForegrounded => self.start_foreground_sync(),
-            CoreEvent::WebSocketConnected { device_id } => self.handle_websocket_connected(device_id),
+            CoreEvent::WebSocketConnected { device_id } => {
+                self.handle_websocket_connected(device_id)
+            }
             CoreEvent::WebSocketDisconnected { device_id, .. } => {
                 self.handle_websocket_disconnected(device_id)
             }
@@ -474,15 +489,21 @@ impl CoreEngine {
                 self.handle_realtime_event(device_id, event)
             }
             CoreEvent::WakeupReceived { device_id, .. } => self.sync_inbox(device_id),
-            CoreEvent::InboxRecordsFetched { device_id, records, to_seq } => {
-                self.handle_inbox_records(device_id, records, to_seq)
-            }
-            CoreEvent::HttpResponseReceived { request_id, status, body } => {
-                self.handle_http_response(request_id, status, body)
-            }
-            CoreEvent::HttpRequestFailed { request_id, retryable, detail } => {
-                self.handle_http_failure(request_id, retryable, detail)
-            }
+            CoreEvent::InboxRecordsFetched {
+                device_id,
+                records,
+                to_seq,
+            } => self.handle_inbox_records(device_id, records, to_seq),
+            CoreEvent::HttpResponseReceived {
+                request_id,
+                status,
+                body,
+            } => self.handle_http_response(request_id, status, body),
+            CoreEvent::HttpRequestFailed {
+                request_id,
+                retryable,
+                detail,
+            } => self.handle_http_failure(request_id, retryable, detail),
             CoreEvent::IdentityBundleFetched { user_id: _, bundle } => {
                 self.apply_identity_bundle_update(bundle)
             }
@@ -500,21 +521,23 @@ impl CoreEngine {
                     }
                 }),
             ),
-            CoreEvent::AttachmentBytesLoaded { task_id, plaintext_b64 } => {
-                self.handle_attachment_bytes_loaded(task_id, plaintext_b64)
-            }
+            CoreEvent::AttachmentBytesLoaded {
+                task_id,
+                plaintext_b64,
+            } => self.handle_attachment_bytes_loaded(task_id, plaintext_b64),
             CoreEvent::BlobUploadPrepared { task_id, result } => {
                 self.handle_blob_upload_prepared(task_id, result)
             }
-            CoreEvent::BlobUploaded { task_id } => {
-                self.handle_blob_uploaded(task_id)
-            }
-            CoreEvent::BlobDownloaded { task_id, blob_ciphertext } => {
-                self.handle_blob_downloaded(task_id, blob_ciphertext)
-            }
-            CoreEvent::BlobTransferFailed { task_id, retryable, detail } => {
-                self.handle_blob_transfer_failed(task_id, retryable, detail)
-            }
+            CoreEvent::BlobUploaded { task_id } => self.handle_blob_uploaded(task_id),
+            CoreEvent::BlobDownloaded {
+                task_id,
+                blob_ciphertext,
+            } => self.handle_blob_downloaded(task_id, blob_ciphertext),
+            CoreEvent::BlobTransferFailed {
+                task_id,
+                retryable,
+                detail,
+            } => self.handle_blob_transfer_failed(task_id, retryable, detail),
             CoreEvent::TimerTriggered { timer_id } => self.handle_timer(timer_id),
             CoreEvent::UserConfirmedRebuild { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
@@ -573,7 +596,9 @@ impl CoreEngine {
             },
             effects: vec![persist_effect(
                 &self.state,
-                vec![PersistOp::SaveContact { user_id: user_id.clone() }],
+                vec![PersistOp::SaveContact {
+                    user_id: user_id.clone(),
+                }],
             )],
             view_model: None,
         };
@@ -583,7 +608,10 @@ impl CoreEngine {
                 &conversation_id,
                 RecoveryPhase::WaitingForExplicitReconcile,
             );
-            output = merge_outputs(output, self.reconcile_conversation_membership(conversation_id)?);
+            output = merge_outputs(
+                output,
+                self.reconcile_conversation_membership(conversation_id)?,
+            );
         }
         if let Some(device_id) = self
             .state
@@ -723,14 +751,58 @@ impl CoreEngine {
         &mut self,
         status: crate::model::DeviceStatusKind,
     ) -> CoreResult<CoreOutput> {
-        let identity = self
+        let device_id = self
             .state
             .local_identity
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        identity.device_status.status = status;
-        identity.device_status.updated_at = identity.device_status.updated_at.saturating_add(1);
-        self.refresh_local_bundle()?;
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .device_identity
+            .device_id
+            .clone();
+        self.update_local_device_status(device_id, status)
+    }
+
+    fn update_local_device_status(
+        &mut self,
+        target_device_id: String,
+        status: crate::model::DeviceStatusKind,
+    ) -> CoreResult<CoreOutput> {
+        let local_device_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .device_identity
+            .device_id
+            .clone();
+        let updated_at = if target_device_id == local_device_id {
+            let identity = self
+                .state
+                .local_identity
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            identity.device_status.status = status;
+            identity.device_status.updated_at = identity.device_status.updated_at.saturating_add(1);
+            identity.device_status.updated_at
+        } else {
+            let local_bundle =
+                self.state.local_bundle.as_mut().ok_or_else(|| {
+                    CoreError::invalid_state("local identity bundle is unavailable")
+                })?;
+            let device = local_bundle
+                .devices
+                .iter_mut()
+                .find(|device| device.device_id == target_device_id)
+                .ok_or_else(|| {
+                    CoreError::invalid_input(
+                        "target device is not present in local identity bundle",
+                    )
+                })?;
+            device.status = status;
+            local_bundle.updated_at = local_bundle.updated_at.saturating_add(1);
+            local_bundle.updated_at
+        };
+        self.refresh_local_bundle_with_updated_at(updated_at)?;
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
@@ -750,18 +822,18 @@ impl CoreEngine {
         conversation_kind: ConversationKind,
     ) -> CoreResult<CoreOutput> {
         if conversation_kind != ConversationKind::Direct {
-            return Err(CoreError::unsupported("phase 5 only supports direct conversations"));
+            return Err(CoreError::unsupported(
+                "phase 5 only supports direct conversations",
+            ));
         }
         let local_identity = self
             .state
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let contact_bundle = self
-            .state
-            .contacts
-            .get(&peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer identity bundle has not been imported"))?;
+        let contact_bundle = self.state.contacts.get(&peer_user_id).ok_or_else(|| {
+            CoreError::invalid_input("peer identity bundle has not been imported")
+        })?;
         let peer_device_ids: Vec<String> = contact_bundle
             .devices
             .iter()
@@ -798,8 +870,12 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter missing after create"))?
             .export_group_summary(&conversation_id)?;
-        self.state.mls_summaries.insert(conversation_id.clone(), summary);
-        self.state.conversations.insert(conversation_id.clone(), local_conversation);
+        self.state
+            .mls_summaries
+            .insert(conversation_id.clone(), summary);
+        self.state
+            .conversations
+            .insert(conversation_id.clone(), local_conversation);
 
         let mut generated = Vec::new();
         for device_id in &peer_device_ids {
@@ -856,7 +932,11 @@ impl CoreEngine {
         })
     }
 
-    fn send_text_message(&mut self, conversation_id: String, plaintext: String) -> CoreResult<CoreOutput> {
+    fn send_text_message(
+        &mut self,
+        conversation_id: String,
+        plaintext: String,
+    ) -> CoreResult<CoreOutput> {
         self.ensure_conversation_ready_for_send(&conversation_id)?;
         if plaintext.trim().is_empty() {
             return Err(CoreError::invalid_input("plaintext must not be empty"));
@@ -980,12 +1060,12 @@ impl CoreEngine {
             .and_then(|message| message.plaintext.as_deref())
             .ok_or_else(|| CoreError::invalid_input("attachment metadata is missing"))?
             .to_string();
-        let payload_metadata: AttachmentPayloadMetadata =
-            serde_json::from_str(&payload_metadata).map_err(|error| {
-                CoreError::invalid_input(format!(
-                    "failed to decode attachment payload metadata: {error}"
-                ))
-            })?;
+        let payload_metadata: AttachmentPayloadMetadata = serde_json::from_str(&payload_metadata)
+            .map_err(|error| {
+            CoreError::invalid_input(format!(
+                "failed to decode attachment payload metadata: {error}"
+            ))
+        })?;
         let task_id = format!("blob-download:{message_id}");
         self.state.pending_blob_downloads.insert(
             task_id.clone(),
@@ -1016,7 +1096,10 @@ impl CoreEngine {
         ))
     }
 
-    fn reconcile_conversation_membership(&mut self, conversation_id: String) -> CoreResult<CoreOutput> {
+    fn reconcile_conversation_membership(
+        &mut self,
+        conversation_id: String,
+    ) -> CoreResult<CoreOutput> {
         let local_identity = self
             .state
             .local_identity
@@ -1072,7 +1155,9 @@ impl CoreEngine {
         if !reconcile.changed && !needs_rebootstrap {
             if let Some(adapter) = self.state.mls_adapter.as_mut() {
                 if let Ok(summary) = adapter.attempt_recovery(&conversation_id) {
-                    self.state.mls_summaries.insert(conversation_id.clone(), summary);
+                    self.state
+                        .mls_summaries
+                        .insert(conversation_id.clone(), summary);
                 }
             }
             self.state.recovery_contexts.remove(&conversation_id);
@@ -1117,7 +1202,9 @@ impl CoreEngine {
                 .as_ref()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter missing after rebuild"))?
                 .export_group_summary(&conversation_id)?;
-            self.state.mls_summaries.insert(conversation_id.clone(), summary);
+            self.state
+                .mls_summaries
+                .insert(conversation_id.clone(), summary);
             if let Some(conversation_state) = self.state.conversations.get_mut(&conversation_id) {
                 conversation_state.conversation.state = ConversationState::Active;
                 conversation_state.recovery_status = RecoveryStatus::NeedsRecovery;
@@ -1131,10 +1218,7 @@ impl CoreEngine {
                 &peer_active_device_ids,
                 &artifacts,
             )?;
-            generated.extend(self.welcome_envelopes_for_artifacts(
-                &conversation_id,
-                &artifacts,
-            )?);
+            generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
             self.enqueue_envelopes(peer_user_id, generated.clone());
             self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
             return self.merge_with_transport_flush(CoreOutput {
@@ -1189,10 +1273,7 @@ impl CoreEngine {
                 &peer_active_device_ids,
                 &artifacts,
             )?);
-            generated.extend(self.welcome_envelopes_for_artifacts(
-                &conversation_id,
-                &artifacts,
-            )?);
+            generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
         }
         if !reconcile.revoked_devices.is_empty() {
             let artifacts = self
@@ -1267,7 +1348,10 @@ impl CoreEngine {
                 context.attempt_count = context.attempt_count.saturating_add(1);
             }
         }
-        self.state.realtime_sessions.entry(device_id.clone()).or_default();
+        self.state
+            .realtime_sessions
+            .entry(device_id.clone())
+            .or_default();
         let request_id = self.next_request_id(&format!("get_head:{device_id}"));
         self.state.pending_requests.insert(
             request_id.clone(),
@@ -1332,9 +1416,10 @@ impl CoreEngine {
             .deployment_bundle
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
-        let auth = deployment.device_runtime_auth.as_ref().ok_or_else(|| {
-            CoreError::invalid_state("device runtime auth is not initialized")
-        })?;
+        let auth = deployment
+            .device_runtime_auth
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("device runtime auth is not initialized"))?;
         if auth.scheme != "bearer" {
             return Err(CoreError::invalid_state(
                 "unsupported device runtime auth scheme",
@@ -1359,12 +1444,9 @@ impl CoreEngine {
             .contacts
             .get(&user_id)
             .ok_or_else(|| CoreError::invalid_input("contact does not exist"))?;
-        let reference = bundle
-            .identity_bundle_ref
-            .clone()
-            .ok_or_else(|| {
-                CoreError::invalid_state("contact identity bundle reference is missing")
-            })?;
+        let reference = bundle.identity_bundle_ref.clone().ok_or_else(|| {
+            CoreError::invalid_state("contact identity bundle reference is missing")
+        })?;
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
@@ -1407,7 +1489,8 @@ impl CoreEngine {
         self.ensure_recovery_context(&conversation_id, RecoveryReason::IdentityChanged);
         self.transition_recovery_phase(&conversation_id, RecoveryPhase::EscalatedToRebuild);
         if let Some(context) = self.state.recovery_contexts.get_mut(&conversation_id) {
-            context.escalation_reason
+            context
+                .escalation_reason
                 .get_or_insert(RecoveryEscalationReason::RecoveryPolicyExhausted);
         }
         self.state.mls_summaries.insert(
@@ -1464,7 +1547,11 @@ impl CoreEngine {
 
     fn handle_websocket_connected(&mut self, device_id: String) -> CoreResult<CoreOutput> {
         let last_known_seq = {
-            let session = self.state.realtime_sessions.entry(device_id.clone()).or_default();
+            let session = self
+                .state
+                .realtime_sessions
+                .entry(device_id.clone())
+                .or_default();
             session.connected = true;
             session.needs_reconnect = false;
             session.last_known_seq
@@ -1494,7 +1581,11 @@ impl CoreEngine {
     }
 
     fn handle_websocket_disconnected(&mut self, device_id: String) -> CoreResult<CoreOutput> {
-        let session = self.state.realtime_sessions.entry(device_id.clone()).or_default();
+        let session = self
+            .state
+            .realtime_sessions
+            .entry(device_id.clone())
+            .or_default();
         session.connected = false;
         session.needs_reconnect = true;
         Ok(CoreOutput {
@@ -1513,7 +1604,11 @@ impl CoreEngine {
         })
     }
 
-    fn handle_realtime_event(&mut self, device_id: String, event: RealtimeEvent) -> CoreResult<CoreOutput> {
+    fn handle_realtime_event(
+        &mut self,
+        device_id: String,
+        event: RealtimeEvent,
+    ) -> CoreResult<CoreOutput> {
         match event {
             RealtimeEvent::HeadUpdated { seq } => {
                 let sync_state = self
@@ -1522,7 +1617,11 @@ impl CoreEngine {
                     .entry(device_id.clone())
                     .or_insert_with(|| SyncEngine::new_device_state(&device_id));
                 SyncEngine::register_head(sync_state, seq);
-                self.state.realtime_sessions.entry(device_id.clone()).or_default().last_known_seq = seq;
+                self.state
+                    .realtime_sessions
+                    .entry(device_id.clone())
+                    .or_default()
+                    .last_known_seq = seq;
                 if let Some(decision) = SyncEngine::next_fetch(sync_state) {
                     self.issue_fetch(device_id, decision)
                 } else {
@@ -1578,9 +1677,7 @@ impl CoreEngine {
                     self.state
                         .recovery_contexts
                         .get(&conversation_id)
-                        .map(|context| {
-                            context.phase == RecoveryPhase::WaitingForIdentityRefresh
-                        })
+                        .map(|context| context.phase == RecoveryPhase::WaitingForIdentityRefresh)
                         .unwrap_or(false)
                 });
             if !has_pending_recovery {
@@ -1621,6 +1718,22 @@ impl CoreEngine {
     }
 
     fn refresh_local_bundle(&mut self) -> CoreResult<()> {
+        let updated_at = self
+            .state
+            .local_bundle
+            .as_ref()
+            .map(|bundle| bundle.updated_at)
+            .unwrap_or_else(|| {
+                self.state
+                    .local_identity
+                    .as_ref()
+                    .map(|identity| identity.device_status.updated_at)
+                    .unwrap_or_default()
+            });
+        self.refresh_local_bundle_with_updated_at(updated_at)
+    }
+
+    fn refresh_local_bundle_with_updated_at(&mut self, updated_at: u64) -> CoreResult<()> {
         let Some(local_identity) = self.state.local_identity.as_ref() else {
             return Ok(());
         };
@@ -1633,15 +1746,38 @@ impl CoreEngine {
             .published_key_package
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("published key package missing"))?;
-        self.state.local_bundle = Some(IdentityManager::export_identity_bundle(
-            local_identity,
+        let mut signing_identity = local_identity.clone();
+        signing_identity.device_status.updated_at = updated_at;
+        let mut devices = self
+            .state
+            .local_bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .devices
+                    .iter()
+                    .filter(|device| device.device_id != local_identity.device_identity.device_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        devices.push(
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &signing_identity,
+                deployment,
+                package.key_package_ref.clone(),
+                package.expires_at,
+            )?,
+        );
+        devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        let bundle = IdentityManager::export_identity_bundle_with_devices(
+            &signing_identity,
             deployment,
-            package.key_package_ref.clone(),
-            package.expires_at,
-        )?);
+            devices,
+        )?;
+        self.state.local_bundle = Some(bundle);
         Ok(())
     }
-
     fn affected_conversations_for_peer(&self, peer_user_id: &str) -> Vec<String> {
         self.state
             .conversations
@@ -1657,11 +1793,9 @@ impl CoreEngine {
     }
 
     fn peer_active_device_ids(&self, peer_user_id: &str) -> CoreResult<Vec<String>> {
-        let bundle = self
-            .state
-            .contacts
-            .get(peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer identity bundle has not been imported"))?;
+        let bundle = self.state.contacts.get(peer_user_id).ok_or_else(|| {
+            CoreError::invalid_input("peer identity bundle has not been imported")
+        })?;
         let devices: Vec<String> = bundle
             .devices
             .iter()
@@ -1682,11 +1816,9 @@ impl CoreEngine {
         device_ids: &[String],
     ) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
         let wanted: BTreeSet<String> = device_ids.iter().cloned().collect();
-        let bundle = self
-            .state
-            .contacts
-            .get(peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer identity bundle has not been imported"))?;
+        let bundle = self.state.contacts.get(peer_user_id).ok_or_else(|| {
+            CoreError::invalid_input("peer identity bundle has not been imported")
+        })?;
         Ok(bundle
             .devices
             .iter()
@@ -1744,7 +1876,9 @@ impl CoreEngine {
 
     fn ensure_conversation_ready_for_send(&self, conversation_id: &str) -> CoreResult<()> {
         if conversation_id.trim().is_empty() {
-            return Err(CoreError::invalid_input("conversation_id must not be empty"));
+            return Err(CoreError::invalid_input(
+                "conversation_id must not be empty",
+            ));
         }
         let conversation = self
             .state
@@ -1936,7 +2070,9 @@ impl CoreEngine {
             identity_refresh_retry_count: context
                 .map(|value| value.identity_refresh_retry_count)
                 .unwrap_or(0),
-            pending_record_count: sync_state.map(|value| value.pending_records.len()).unwrap_or(0),
+            pending_record_count: sync_state
+                .map(|value| value.pending_records.len())
+                .unwrap_or(0),
             pending_record_seqs: sync_state
                 .map(|value| value.pending_record_seqs.iter().copied().collect())
                 .unwrap_or_default(),
@@ -1946,7 +2082,11 @@ impl CoreEngine {
             last_acked_seq: sync_state
                 .map(|value| value.checkpoint.last_acked_seq)
                 .unwrap_or(0),
-            mls_status: self.state.mls_summaries.get(conversation_id).map(|value| value.status),
+            mls_status: self
+                .state
+                .mls_summaries
+                .get(conversation_id)
+                .map(|value| value.status),
             escalation_reason: context.and_then(|value| value.escalation_reason),
             last_error: context.and_then(|value| value.last_error.clone()),
         })
@@ -2122,10 +2262,7 @@ impl CoreEngine {
                 effects.push(CoreEffect::UploadBlob {
                     upload: BlobUploadRequest {
                         task_id: task.task_id.clone(),
-                        blob_ciphertext_b64: task
-                            .blob_ciphertext_b64
-                            .clone()
-                            .unwrap_or_default(),
+                        blob_ciphertext_b64: task.blob_ciphertext_b64.clone().unwrap_or_default(),
                         upload_target: prepared.upload_target.clone(),
                         upload_headers: prepared.upload_headers.clone(),
                         blob_ref: prepared.blob_ref.clone(),
@@ -2223,7 +2360,10 @@ impl CoreEngine {
         let mut headers = BTreeMap::new();
         headers.insert(
             "Authorization".into(),
-            format!("Bearer {}", device_profile.inbox_append_capability.signature),
+            format!(
+                "Bearer {}",
+                device_profile.inbox_append_capability.signature
+            ),
         );
         headers.insert(
             "X-Tapchat-Capability".into(),
@@ -2284,7 +2424,11 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
         let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
         let headers = self.device_runtime_headers()?;
-        let limit = decision.to_seq.saturating_sub(decision.from_seq).saturating_add(1).max(1);
+        let limit = decision
+            .to_seq
+            .saturating_sub(decision.from_seq)
+            .saturating_add(1)
+            .max(1);
         let request_id = self.next_request_id(&format!("fetch:{device_id}"));
         self.state.pending_requests.insert(
             request_id.clone(),
@@ -2340,8 +2484,12 @@ impl CoreEngine {
         }
         match request {
             PendingRequest::GetHead { device_id } => {
-                let head: GetHeadResult = serde_json::from_str(body.as_deref().unwrap_or("{\"head_seq\":0}"))
-                    .map_err(|error| CoreError::invalid_input(format!("failed to decode head response: {error}")))?;
+                let head: GetHeadResult = serde_json::from_str(
+                    body.as_deref().unwrap_or("{\"head_seq\":0}"),
+                )
+                .map_err(|error| {
+                    CoreError::invalid_input(format!("failed to decode head response: {error}"))
+                })?;
                 let sync_state = self
                     .state
                     .sync_states
@@ -2355,18 +2503,21 @@ impl CoreEngine {
                 }
             }
             PendingRequest::FetchMessages { device_id, .. } => {
-                let response: FetchMessagesResult = serde_json::from_str(body.as_deref().unwrap_or("{\"to_seq\":0,\"records\":[]}"))
-                    .map_err(|error| CoreError::invalid_input(format!("failed to decode fetch response: {error}")))?;
+                let response: FetchMessagesResult = serde_json::from_str(
+                    body.as_deref().unwrap_or("{\"to_seq\":0,\"records\":[]}"),
+                )
+                .map_err(|error| {
+                    CoreError::invalid_input(format!("failed to decode fetch response: {error}"))
+                })?;
                 self.handle_inbox_records(device_id, response.records, response.to_seq)
             }
             PendingRequest::AppendEnvelope { message_id, .. } => {
-                let result: AppendEnvelopeResult =
-                    serde_json::from_str(body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"))
-                        .map_err(|error| {
-                            CoreError::invalid_input(format!(
-                                "failed to decode append response: {error}"
-                            ))
-                        })?;
+                let result: AppendEnvelopeResult = serde_json::from_str(
+                    body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"),
+                )
+                .map_err(|error| {
+                    CoreError::invalid_input(format!("failed to decode append response: {error}"))
+                })?;
                 if !result.accepted {
                     return Err(CoreError::temporary_failure(
                         "append response was not accepted",
@@ -2378,13 +2529,13 @@ impl CoreEngine {
                 self.flush_pending_transport()
             }
             PendingRequest::Ack { device_id, .. } => {
-                let result: AckResult =
-                    serde_json::from_str(body.as_deref().unwrap_or("{\"accepted\":false,\"ack_seq\":0}"))
-                        .map_err(|error| {
-                            CoreError::invalid_input(format!(
-                                "failed to decode ack response: {error}"
-                            ))
-                        })?;
+                let result: AckResult = serde_json::from_str(
+                    body.as_deref()
+                        .unwrap_or("{\"accepted\":false,\"ack_seq\":0}"),
+                )
+                .map_err(|error| {
+                    CoreError::invalid_input(format!("failed to decode ack response: {error}"))
+                })?;
                 if !result.accepted {
                     return Err(CoreError::temporary_failure(
                         "ack response was not accepted",
@@ -2420,7 +2571,9 @@ impl CoreEngine {
                     if retryable && item.retries < MAX_TRANSPORT_RETRIES {
                         return Ok(CoreOutput {
                             state_update: CoreStateUpdate {
-                                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                                system_statuses_changed: vec![
+                                    SystemStatus::TemporaryNetworkFailure,
+                                ],
                                 ..CoreStateUpdate::default()
                             },
                             effects: vec![CoreEffect::ScheduleTimer {
@@ -2456,7 +2609,9 @@ impl CoreEngine {
                     if retryable && ack.retries < MAX_TRANSPORT_RETRIES {
                         return Ok(CoreOutput {
                             state_update: CoreStateUpdate {
-                                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                                system_statuses_changed: vec![
+                                    SystemStatus::TemporaryNetworkFailure,
+                                ],
                                 ..CoreStateUpdate::default()
                             },
                             effects: vec![CoreEffect::ScheduleTimer {
@@ -2477,40 +2632,37 @@ impl CoreEngine {
                     effects: vec![CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
                             status: SystemStatus::TemporaryNetworkFailure,
-                            message: detail.unwrap_or_else(|| {
-                                format!("ack request failed for {device_id}")
-                            }),
+                            message: detail
+                                .unwrap_or_else(|| format!("ack request failed for {device_id}")),
                         },
                     }],
                     view_model: None,
                 })
             }
-            PendingRequest::GetHead { device_id } | PendingRequest::FetchMessages { device_id, .. } => {
-                Ok(CoreOutput {
-                    state_update: CoreStateUpdate {
-                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: if retryable {
-                        vec![CoreEffect::ScheduleTimer {
-                            timer: TimerEffect {
-                                timer_id: format!("sync:{device_id}"),
-                                delay_ms: 0,
-                            },
-                        }]
-                    } else {
-                        vec![CoreEffect::EmitUserNotification {
-                            notification: UserNotificationEffect {
-                                status: SystemStatus::TemporaryNetworkFailure,
-                                message: detail.unwrap_or_else(|| {
-                                    format!("sync request failed for {device_id}")
-                                }),
-                            },
-                        }]
-                    },
-                    view_model: None,
-                })
-            }
+            PendingRequest::GetHead { device_id }
+            | PendingRequest::FetchMessages { device_id, .. } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: if retryable {
+                    vec![CoreEffect::ScheduleTimer {
+                        timer: TimerEffect {
+                            timer_id: format!("sync:{device_id}"),
+                            delay_ms: 0,
+                        },
+                    }]
+                } else {
+                    vec![CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message: detail
+                                .unwrap_or_else(|| format!("sync request failed for {device_id}")),
+                        },
+                    }]
+                },
+                view_model: None,
+            }),
         }
     }
 
@@ -2563,7 +2715,9 @@ impl CoreEngine {
                 &recipient,
                 MessageType::MlsApplication,
                 task.metadata_ciphertext.clone().ok_or_else(|| {
-                    CoreError::invalid_state("blob upload completed before metadata ciphertext was prepared")
+                    CoreError::invalid_state(
+                        "blob upload completed before metadata ciphertext was prepared",
+                    )
                 })?,
             )?;
             envelope.storage_refs.push(StorageRef {
@@ -2574,7 +2728,11 @@ impl CoreEngine {
                     .as_ref()
                     .and_then(|value| STANDARD.decode(value).ok())
                     .map(|bytes| bytes.len() as u64)
-                    .or_else(|| task.payload_metadata.as_ref().map(|metadata| metadata.size_bytes))
+                    .or_else(|| {
+                        task.payload_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.size_bytes)
+                    })
                     .unwrap_or(task.descriptor.size_bytes),
                 mime_type: "application/octet-stream".into(),
                 expires_at: prepared.expires_at,
@@ -2858,26 +3016,37 @@ impl CoreEngine {
             let mut ackable = apply_effect.duplicate_message;
             if !apply_effect.duplicate_message {
                 match record.envelope.message_type {
-                    MessageType::MlsApplication | MessageType::MlsCommit | MessageType::MlsWelcome => {
+                    MessageType::MlsApplication
+                    | MessageType::MlsCommit
+                    | MessageType::MlsWelcome => {
                         match self
                             .state
                             .mls_adapter
                             .as_mut()
-                            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                            .ok_or_else(|| {
+                                CoreError::invalid_state("mls adapter is not initialized")
+                            })?
                             .ingest_message(
                                 &conversation_id,
                                 &record.envelope.sender_device_id,
                                 record.envelope.message_type,
-                                record.envelope.inline_ciphertext.as_deref().unwrap_or_default(),
+                                record
+                                    .envelope
+                                    .inline_ciphertext
+                                    .as_deref()
+                                    .unwrap_or_default(),
                             )? {
                             IngestResult::AppliedApplication(application) => {
-                                if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+                                if let Some(state) =
+                                    self.state.conversations.get_mut(&conversation_id)
+                                {
                                     if let Some(message) = state
                                         .messages
                                         .iter_mut()
                                         .find(|message| message.message_id == record.message_id)
                                     {
-                                        message.plaintext = String::from_utf8(application.plaintext).ok();
+                                        message.plaintext =
+                                            String::from_utf8(application.plaintext).ok();
                                     }
                                 }
                                 if let Ok(summary) = self
@@ -2941,7 +3110,9 @@ impl CoreEngine {
                                         .state
                                         .sync_states
                                         .entry(device_id.clone())
-                                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                                        .or_insert_with(|| {
+                                            SyncEngine::new_device_state(&device_id)
+                                        });
                                     SyncEngine::store_pending_record(sync_state, &record);
                                 }
                                 self.mark_recovery_needed(&conversation_id, reason);
@@ -3100,7 +3271,10 @@ impl CoreEngine {
                 messages: Vec::new(),
                 last_message_type: None,
                 peer_user_id: record.envelope.sender_user_id.clone(),
-                last_known_peer_active_devices: BTreeSet::from([record.envelope.sender_device_id.clone()]),
+                last_known_peer_active_devices: BTreeSet::from([record
+                    .envelope
+                    .sender_device_id
+                    .clone()]),
                 recovery_status: RecoveryStatus::Healthy,
             });
     }
@@ -3219,9 +3393,8 @@ impl CoreEngine {
                     effects: vec![CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
                             status: SystemStatus::TemporaryNetworkFailure,
-                            message: body.unwrap_or_else(|| {
-                                format!("ack request returned status {status}")
-                            }),
+                            message: body
+                                .unwrap_or_else(|| format!("ack request returned status {status}")),
                         },
                     }],
                     view_model: None,
@@ -3322,7 +3495,8 @@ impl CoreEngine {
             records
         };
         let to_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
-        let output = self.handle_inbox_records_internal(device_id.clone(), records, to_seq, false)?;
+        let output =
+            self.handle_inbox_records_internal(device_id.clone(), records, to_seq, false)?;
         let pending_retry = self
             .state
             .sync_states
@@ -3383,19 +3557,22 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .local_identity
             .clone()
             .map(|identity| PersistedLocalIdentity { state: identity }),
-        deployment: state.deployment_bundle.clone().map(|deployment_bundle| PersistedDeployment {
-            deployment_bundle,
-            local_bundle: state.local_bundle.clone(),
-            published_key_package: state.published_key_package.clone(),
-            serialized_mls_bootstrap_state: if state.mls_summaries.is_empty() {
-                state
-                    .mls_adapter
-                    .as_ref()
-                    .and_then(|adapter| adapter.export_bootstrap_state().ok())
-            } else {
-                None
-            },
-        }),
+        deployment: state
+            .deployment_bundle
+            .clone()
+            .map(|deployment_bundle| PersistedDeployment {
+                deployment_bundle,
+                local_bundle: state.local_bundle.clone(),
+                published_key_package: state.published_key_package.clone(),
+                serialized_mls_bootstrap_state: if state.mls_summaries.is_empty() {
+                    state
+                        .mls_adapter
+                        .as_ref()
+                        .and_then(|adapter| adapter.export_bootstrap_state().ok())
+                } else {
+                    None
+                },
+            }),
         contacts: state
             .contacts
             .iter()
@@ -3457,20 +3634,17 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 prepared_upload: task.prepared_upload.clone(),
                 retries: task.retries,
             })
-            .chain(
-                state
-                    .pending_blob_downloads
-                    .values()
-                    .map(|task| PersistedPendingBlobTransfer::Download {
-                        task_id: task.task_id.clone(),
-                        conversation_id: task.conversation_id.clone(),
-                        message_id: task.message_id.clone(),
-                        reference: task.reference.clone(),
-                        destination_id: task.destination_id.clone(),
-                        payload_metadata: task.payload_metadata.clone(),
-                        retries: task.retries,
-                    }),
-            )
+            .chain(state.pending_blob_downloads.values().map(|task| {
+                PersistedPendingBlobTransfer::Download {
+                    task_id: task.task_id.clone(),
+                    conversation_id: task.conversation_id.clone(),
+                    message_id: task.message_id.clone(),
+                    reference: task.reference.clone(),
+                    destination_id: task.destination_id.clone(),
+                    payload_metadata: task.payload_metadata.clone(),
+                    retries: task.retries,
+                }
+            }))
             .collect(),
         recovery_contexts: state
             .recovery_contexts
@@ -3480,9 +3654,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 reason: match context.reason {
                     RecoveryReason::MissingCommit => PersistedRecoveryReason::MissingCommit,
                     RecoveryReason::MissingWelcome => PersistedRecoveryReason::MissingWelcome,
-                    RecoveryReason::MembershipChanged => {
-                        PersistedRecoveryReason::MembershipChanged
-                    }
+                    RecoveryReason::MembershipChanged => PersistedRecoveryReason::MembershipChanged,
                     RecoveryReason::IdentityChanged => PersistedRecoveryReason::IdentityChanged,
                 },
                 phase: match context.phase {
@@ -3496,9 +3668,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                     RecoveryPhase::WaitingForExplicitReconcile => {
                         PersistedRecoveryPhase::WaitingForExplicitReconcile
                     }
-                    RecoveryPhase::EscalatedToRebuild => {
-                        PersistedRecoveryPhase::EscalatedToRebuild
-                    }
+                    RecoveryPhase::EscalatedToRebuild => PersistedRecoveryPhase::EscalatedToRebuild,
                 },
                 attempt_count: context.attempt_count,
                 identity_refresh_retry_count: context.identity_refresh_retry_count,
@@ -3553,10 +3723,3 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
     }
     base
 }
-
-
-
-
-
-
-

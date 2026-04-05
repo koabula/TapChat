@@ -13,7 +13,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 use crate::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
-    RealtimeEvent, RecoveryContextSnapshot, RealtimeSessionSnapshot, SyncCheckpointSnapshot,
+    RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
 };
 use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
 use crate::persistence::CorePersistenceSnapshot;
@@ -66,6 +66,13 @@ pub struct ConversationMemberSnapshot {
     pub status: DeviceStatusKind,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PendingMlsArtifacts {
+    pub pending_welcome_count: usize,
+    pub pending_commit_count: usize,
+}
+
 impl CoreDriver {
     pub fn from_snapshot(
         snapshot: CorePersistenceSnapshot,
@@ -76,15 +83,18 @@ impl CoreDriver {
         Ok(Self {
             engine: CoreEngine::from_restored_state(snapshot),
             runtime: DriverRuntime {
-                client: Client::builder().build().context("build driver reqwest client")?,
+                client: Client::builder()
+                    .build()
+                    .context("build driver reqwest client")?,
                 websocket_tx,
                 websocket_rx,
                 websocket_tasks: BTreeMap::new(),
                 latest_snapshot: Some(latest_snapshot),
                 notifications: Vec::new(),
                 scheduled_timers: Vec::new(),
-                storage_prepare_url: base_url
-                    .map(|value| format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))),
+                storage_prepare_url: base_url.map(|value| {
+                    format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
+                }),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
             },
@@ -140,7 +150,9 @@ impl CoreDriver {
     }
 
     pub fn mls_status(&self, conversation_id: &str) -> Option<MlsStateStatus> {
-        self.engine.mls_summary(conversation_id).map(|summary| summary.status)
+        self.engine
+            .mls_summary(conversation_id)
+            .map(|summary| summary.status)
     }
 
     pub fn contact_devices(&self, user_id: &str) -> Vec<ContactDeviceSnapshot> {
@@ -175,6 +187,119 @@ impl CoreDriver {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub fn conversation_recovery_status(
+        &self,
+        conversation_id: &str,
+    ) -> Option<crate::conversation::RecoveryStatus> {
+        self.engine
+            .conversation_state(conversation_id)
+            .map(|state| state.recovery_status)
+    }
+
+    #[allow(dead_code)]
+    pub fn snapshot_has_recovery_context(&self, conversation_id: &str) -> bool {
+        self.runtime
+            .latest_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .recovery_contexts
+                    .iter()
+                    .any(|context| context.conversation_id == conversation_id)
+            })
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn pending_mls_artifacts(&self, conversation_id: &str) -> PendingMlsArtifacts {
+        let mut artifacts = PendingMlsArtifacts::default();
+        let Some(snapshot) = self.runtime.latest_snapshot.as_ref() else {
+            for envelope in &self.runtime.recent_appends {
+                if envelope.conversation_id != conversation_id {
+                    continue;
+                }
+                match envelope.message_type {
+                    MessageType::MlsWelcome => {
+                        artifacts.pending_welcome_count =
+                            artifacts.pending_welcome_count.saturating_add(1);
+                    }
+                    MessageType::MlsCommit => {
+                        artifacts.pending_commit_count =
+                            artifacts.pending_commit_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            for (recent_conversation_id, message_type) in &self.runtime.recent_messages {
+                if recent_conversation_id != conversation_id {
+                    continue;
+                }
+                match message_type {
+                    MessageType::MlsWelcome => {
+                        artifacts.pending_welcome_count =
+                            artifacts.pending_welcome_count.saturating_add(1);
+                    }
+                    MessageType::MlsCommit => {
+                        artifacts.pending_commit_count =
+                            artifacts.pending_commit_count.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            return artifacts;
+        };
+        for item in &snapshot.pending_outbox {
+            if item.envelope.conversation_id != conversation_id {
+                continue;
+            }
+            match item.envelope.message_type {
+                MessageType::MlsWelcome => {
+                    artifacts.pending_welcome_count =
+                        artifacts.pending_welcome_count.saturating_add(1);
+                }
+                MessageType::MlsCommit => {
+                    artifacts.pending_commit_count =
+                        artifacts.pending_commit_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        for envelope in &self.runtime.recent_appends {
+            if envelope.conversation_id != conversation_id {
+                continue;
+            }
+            match envelope.message_type {
+                MessageType::MlsWelcome => {
+                    artifacts.pending_welcome_count =
+                        artifacts.pending_welcome_count.saturating_add(1);
+                }
+                MessageType::MlsCommit => {
+                    artifacts.pending_commit_count =
+                        artifacts.pending_commit_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        for (recent_conversation_id, message_type) in &self.runtime.recent_messages {
+            if recent_conversation_id != conversation_id {
+                continue;
+            }
+            match message_type {
+                MessageType::MlsWelcome => {
+                    artifacts.pending_welcome_count =
+                        artifacts.pending_welcome_count.saturating_add(1);
+                }
+                MessageType::MlsCommit => {
+                    artifacts.pending_commit_count =
+                        artifacts.pending_commit_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        artifacts
     }
 
     pub fn recovery_context_snapshot(
@@ -230,7 +355,12 @@ impl CoreDriver {
             if remaining.is_zero() {
                 break;
             }
-            let event = match timeout(remaining.min(Duration::from_millis(250)), self.runtime.websocket_rx.recv()).await {
+            let event = match timeout(
+                remaining.min(Duration::from_millis(250)),
+                self.runtime.websocket_rx.recv(),
+            )
+            .await
+            {
                 Ok(Some(event)) => event,
                 Ok(None) => break,
                 Err(_) => break,
@@ -262,7 +392,9 @@ impl CoreDriver {
                         output,
                         self.engine
                             .handle_event(timer_event.clone())
-                            .map_err(|error| anyhow!("event {:?} failed: {}", timer_event, error))?,
+                            .map_err(|error| {
+                                anyhow!("event {:?} failed: {}", timer_event, error)
+                            })?,
                     );
                     continue;
                 }
@@ -381,13 +513,18 @@ impl CoreDriver {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
-                let body = response.text().await.ok().filter(|value| !value.is_empty()).map(|value| {
-                    if content_type.contains("application/json") {
-                        to_snake_case_json_string(&value).unwrap_or(value)
-                    } else {
-                        value
-                    }
-                });
+                let body = response
+                    .text()
+                    .await
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| {
+                        if content_type.contains("application/json") {
+                            to_snake_case_json_string(&value).unwrap_or(value)
+                        } else {
+                            value
+                        }
+                    });
                 Ok(vec![CoreEvent::HttpResponseReceived {
                     request_id: request.request_id,
                     status,
@@ -416,7 +553,9 @@ impl CoreDriver {
                 reqwest::header::HeaderValue::from_str(value)?,
             );
         }
-        let (stream, _) = connect_async(request).await.context("open realtime websocket")?;
+        let (stream, _) = connect_async(request)
+            .await
+            .context("open realtime websocket")?;
         let device_id = subscription.device_id.clone();
         let sender = self.runtime.websocket_tx.clone();
         let task_device_id = device_id.clone();
@@ -445,7 +584,9 @@ impl CoreDriver {
                 reason: Some("remote closed".into()),
             });
         });
-        self.runtime.websocket_tasks.insert(device_id.clone(), handle);
+        self.runtime
+            .websocket_tasks
+            .insert(device_id.clone(), handle);
         Ok(vec![CoreEvent::WebSocketConnected { device_id }])
     }
 
@@ -505,7 +646,10 @@ impl CoreDriver {
             Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
                 retryable: false,
-                detail: Some(format!("prepare upload failed with status {}", response.status())),
+                detail: Some(format!(
+                    "prepare upload failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
@@ -605,11 +749,10 @@ impl CoreDriver {
         timer_counts: &mut BTreeMap<String, usize>,
     ) -> Result<Option<CoreEvent>> {
         let now = Instant::now();
-        let Some(index) = self
-            .runtime
-            .scheduled_timers
-            .iter()
-            .position(|timer| now >= timer.scheduled_at + Duration::from_millis(timer.delay_ms))
+        let Some(index) =
+            self.runtime.scheduled_timers.iter().position(|timer| {
+                now >= timer.scheduled_at + Duration::from_millis(timer.delay_ms)
+            })
         else {
             return Ok(None);
         };
@@ -703,14 +846,13 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_realtime_event, ScheduledTimer};
+    use super::{ScheduledTimer, parse_realtime_event};
     use tokio::time::{Duration, Instant};
 
     #[test]
     fn websocket_payload_maps_to_core_event() {
-        let event =
-            parse_realtime_event("device:bob:phone", r#"{"event":"head_updated","seq":7}"#)
-                .expect("parse");
+        let event = parse_realtime_event("device:bob:phone", r#"{"event":"head_updated","seq":7}"#)
+            .expect("parse");
         match event {
             crate::CoreEvent::RealtimeEventReceived { device_id, event } => {
                 assert_eq!(device_id, "device:bob:phone");

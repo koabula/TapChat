@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -129,13 +129,17 @@ impl std::fmt::Debug for MlsAdapter {
 }
 
 impl MlsAdapter {
-    pub fn bootstrap(local_identity: &LocalIdentityState) -> CoreResult<(Self, PublishedKeyPackage)> {
+    pub fn bootstrap(
+        local_identity: &LocalIdentityState,
+    ) -> CoreResult<(Self, PublishedKeyPackage)> {
         let provider = OpenMlsRustCrypto::default();
-        let signer = SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm())
-            .map_err(|error| CoreError::invalid_state(format!("failed to create MLS signer: {error}")))?;
-        signer
-            .store(provider.storage())
-            .map_err(|error| CoreError::invalid_state(format!("failed to store MLS signer: {error}")))?;
+        let signer =
+            SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).map_err(|error| {
+                CoreError::invalid_state(format!("failed to create MLS signer: {error}"))
+            })?;
+        signer.store(provider.storage()).map_err(|error| {
+            CoreError::invalid_state(format!("failed to store MLS signer: {error}"))
+        })?;
 
         let credential_identity = build_credential_identity(local_identity);
         let credential = BasicCredential::new(credential_identity.clone().into_bytes());
@@ -163,7 +167,10 @@ impl MlsAdapter {
         Ok((adapter, package))
     }
 
-    pub fn generate_key_package(local_identity: &LocalIdentityState, _now: u64) -> CoreResult<PublishedKeyPackage> {
+    pub fn generate_key_package(
+        local_identity: &LocalIdentityState,
+        _now: u64,
+    ) -> CoreResult<PublishedKeyPackage> {
         let (_, package) = Self::bootstrap(local_identity)?;
         Ok(package)
     }
@@ -183,7 +190,9 @@ impl MlsAdapter {
         peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
     ) -> CoreResult<CreateConversationArtifacts> {
         if conversation_id.trim().is_empty() {
-            return Err(CoreError::invalid_input("conversation_id must not be empty"));
+            return Err(CoreError::invalid_input(
+                "conversation_id must not be empty",
+            ));
         }
         if peer_devices_with_keypackages.is_empty() {
             return Err(CoreError::invalid_input(
@@ -202,7 +211,9 @@ impl MlsAdapter {
             group_id,
             self.credential_with_key.clone(),
         )
-        .map_err(|error| CoreError::invalid_state(format!("failed to create MLS group: {error}")))?;
+        .map_err(|error| {
+            CoreError::invalid_state(format!("failed to create MLS group: {error}"))
+        })?;
 
         let mut member_device_ids = BTreeSet::from([self.local_device_id.clone()]);
         let mut key_packages = Vec::with_capacity(peer_devices_with_keypackages.len());
@@ -216,10 +227,14 @@ impl MlsAdapter {
 
         let (commit, welcome, _group_info) = group
             .add_members(&self.provider, &self.signer, &key_packages)
-            .map_err(|error| CoreError::invalid_state(format!("failed to add MLS members: {error}")))?;
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to add MLS members: {error}"))
+            })?;
         group
             .merge_pending_commit(&self.provider)
-            .map_err(|error| CoreError::invalid_state(format!("failed to merge pending commit: {error}")))?;
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to merge pending commit: {error}"))
+            })?;
 
         let commit_b64 = encode_mls_message(commit)?;
         let welcome_b64 = encode_mls_message(welcome)?;
@@ -356,7 +371,9 @@ impl MlsAdapter {
         let message = state
             .group
             .create_message(provider, signer, plaintext_bytes)
-            .map_err(|error| CoreError::invalid_state(format!("failed to create MLS application: {error}")))?;
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to create MLS application: {error}"))
+            })?;
         Ok(OutboundMlsMessage {
             payload_b64: encode_mls_message(message)?,
             epoch: state.group.epoch().as_u64(),
@@ -376,7 +393,12 @@ impl MlsAdapter {
                 if !self.groups.contains_key(conversation_id) {
                     return Ok(IngestResult::PendingRetry);
                 }
-                self.ingest_protocol_message(conversation_id, sender_device_id, message_type, payload_b64)
+                self.ingest_protocol_message(
+                    conversation_id,
+                    sender_device_id,
+                    message_type,
+                    payload_b64,
+                )
             }
             _ => Err(CoreError::unsupported(
                 "mls adapter only supports MLS message types",
@@ -436,7 +458,9 @@ impl MlsAdapter {
 
     pub fn export_persisted_group_state(&self, conversation_id: &str) -> CoreResult<String> {
         if !self.groups.contains_key(conversation_id) {
-            return Err(CoreError::invalid_input("conversation MLS state does not exist"));
+            return Err(CoreError::invalid_input(
+                "conversation MLS state does not exist",
+            ));
         }
         self.export_serializable_state()
     }
@@ -447,8 +471,8 @@ impl MlsAdapter {
 
     pub fn restore_from_bootstrap_state(serialized_state: &str) -> CoreResult<Self> {
         let provider = OpenMlsRustCrypto::default();
-        let parsed: PersistedGroupState = serde_json::from_str(serialized_state)
-            .map_err(|error| {
+        let parsed: PersistedGroupState =
+            serde_json::from_str(serialized_state).map_err(|error| {
                 CoreError::invalid_state(format!(
                     "failed to decode persisted MLS bootstrap state: {error}"
                 ))
@@ -468,9 +492,9 @@ impl MlsAdapter {
                 let decoded_key = BASE64
                     .decode(key)
                     .map_err(|_| CoreError::invalid_input("invalid persisted MLS storage key"))?;
-                let decoded_value = BASE64.decode(value).map_err(|_| {
-                    CoreError::invalid_input("invalid persisted MLS storage value")
-                })?;
+                let decoded_value = BASE64
+                    .decode(value)
+                    .map_err(|_| CoreError::invalid_input("invalid persisted MLS storage value"))?;
                 values.insert(decoded_key, decoded_value);
             }
         }
@@ -598,12 +622,13 @@ impl MlsAdapter {
 
         for (conversation_id, mut summary) in parsed_states {
             let group_id = GroupId::from_slice(conversation_id.as_bytes());
-            let Some(group) = MlsGroup::load(adapter.provider.storage(), &group_id)
-                .map_err(|error| {
+            let Some(group) =
+                MlsGroup::load(adapter.provider.storage(), &group_id).map_err(|error| {
                     CoreError::invalid_state(format!(
                         "failed to load persisted MLS group state: {error}"
                     ))
-                })? else {
+                })?
+            else {
                 failed_conversation_ids.push(conversation_id.clone());
                 summary.status = MlsStateStatus::NeedsRebuild;
                 summaries.insert(conversation_id, summary);
@@ -621,13 +646,7 @@ impl MlsAdapter {
                 },
             );
             let exported = adapter.export_group_summary(&conversation_id)?;
-            summaries.insert(
-                conversation_id,
-                MlsStateSummary {
-                    status,
-                    ..exported
-                },
-            );
+            summaries.insert(conversation_id, MlsStateSummary { status, ..exported });
         }
 
         Ok(RestoreMlsStateResult {
@@ -637,7 +656,11 @@ impl MlsAdapter {
         })
     }
 
-    fn ingest_welcome(&mut self, conversation_id: &str, payload_b64: &str) -> CoreResult<IngestResult> {
+    fn ingest_welcome(
+        &mut self,
+        conversation_id: &str,
+        payload_b64: &str,
+    ) -> CoreResult<IngestResult> {
         // Rebuild/rejoin semantics treat a fresh welcome as authoritative for this
         // conversation. If stale local state still exists, replace it before
         // attempting to join the new group.
@@ -659,19 +682,16 @@ impl MlsAdapter {
             _ => {
                 return Err(CoreError::invalid_input(
                     "decoded MLS message was not a welcome",
-                ))
+                ));
             }
         };
-        let staged = StagedWelcome::new_from_welcome(
-            &self.provider,
-            &config,
-            welcome,
-            None,
-        )
-        .map_err(|error| CoreError::invalid_state(format!("failed to stage welcome: {error}")))?;
-        let group = staged
-            .into_group(&self.provider)
-            .map_err(|error| CoreError::invalid_state(format!("failed to join group from welcome: {error}")))?;
+        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to stage welcome: {error}"))
+            })?;
+        let group = staged.into_group(&self.provider).map_err(|error| {
+            CoreError::invalid_state(format!("failed to join group from welcome: {error}"))
+        })?;
         let member_device_ids = extract_member_device_ids(&group)?;
         self.groups.insert(
             conversation_id.to_string(),
@@ -713,10 +733,12 @@ impl MlsAdapter {
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(application) => {
                 state.status = MlsStateStatus::Active;
-                Ok(IngestResult::AppliedApplication(DecryptedApplicationMessage {
-                    plaintext: application.into_bytes(),
-                    sender_identity,
-                }))
+                Ok(IngestResult::AppliedApplication(
+                    DecryptedApplicationMessage {
+                        plaintext: application.into_bytes(),
+                        sender_identity,
+                    },
+                ))
             }
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 if message_type != MessageType::MlsCommit {
@@ -747,17 +769,16 @@ impl MlsAdapter {
         credential_identity: String,
     ) -> CoreResult<PublishedKeyPackage> {
         let key_package_bundle = KeyPackage::builder()
-            .build(
-                DEFAULT_CIPHERSUITE,
-                provider,
-                signer,
-                credential_with_key,
-            )
-            .map_err(|error| CoreError::invalid_state(format!("failed to build key package: {error}")))?;
+            .build(DEFAULT_CIPHERSUITE, provider, signer, credential_with_key)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to build key package: {error}"))
+            })?;
         let key_package = key_package_bundle.key_package().clone();
         let key_package_bytes = MlsMessageOut::from(key_package)
             .to_bytes()
-            .map_err(|error| CoreError::invalid_state(format!("failed to encode key package: {error}")))?;
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to encode key package: {error}"))
+            })?;
         let key_package_b64 = BASE64.encode(key_package_bytes);
         Ok(PublishedKeyPackage {
             key_package_ref: key_package_b64.clone(),
@@ -824,11 +845,9 @@ fn member_leaf_indices_for_devices(
 }
 
 fn encode_mls_message(message: MlsMessageOut) -> CoreResult<String> {
-    Ok(BASE64.encode(
-        message
-            .to_bytes()
-            .map_err(|error| CoreError::invalid_state(format!("failed to encode MLS message: {error}")))?,
-    ))
+    Ok(BASE64.encode(message.to_bytes().map_err(|error| {
+        CoreError::invalid_state(format!("failed to encode MLS message: {error}"))
+    })?))
 }
 
 fn decode_mls_message(payload_b64: &str) -> CoreResult<MlsMessageIn> {
@@ -843,8 +862,9 @@ fn decode_key_package(payload_b64: &str) -> CoreResult<KeyPackage> {
     let bytes = BASE64
         .decode(payload_b64)
         .map_err(|_| CoreError::invalid_input("invalid base64 key package payload"))?;
-    let message = MlsMessageIn::tls_deserialize_exact(bytes)
-        .map_err(|error| CoreError::invalid_input(format!("failed to decode key package message: {error}")))?;
+    let message = MlsMessageIn::tls_deserialize_exact(bytes).map_err(|error| {
+        CoreError::invalid_input(format!("failed to decode key package message: {error}"))
+    })?;
     match message.extract() {
         MlsMessageBodyIn::KeyPackage(key_package) => {
             let provider = OpenMlsRustCrypto::default();
@@ -862,14 +882,11 @@ fn decode_key_package(payload_b64: &str) -> CoreResult<KeyPackage> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage,
-    };
+    use super::{IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage};
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
 
-    const ALICE_MNEMONIC: &str =
-        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
@@ -889,13 +906,13 @@ mod tests {
     #[test]
     fn welcome_import_and_application_message_round_trip() {
         let alice_identity =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-                .expect("alice");
-        let bob_identity = IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone"))
-            .expect("bob");
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
 
         let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
-        let (mut bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+        let (mut bob_adapter, bob_package) =
+            MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
 
         let artifacts = alice_adapter
             .create_conversation(
@@ -917,7 +934,10 @@ mod tests {
                 &artifacts.welcomes[0].payload_b64,
             )
             .expect("welcome");
-        assert!(matches!(welcome_result, IngestResult::AppliedWelcome { .. }));
+        assert!(matches!(
+            welcome_result,
+            IngestResult::AppliedWelcome { .. }
+        ));
 
         let commit_result = bob_adapter
             .ingest_message(
@@ -954,13 +974,13 @@ mod tests {
     #[test]
     fn persisted_group_state_restores_application_flow() {
         let alice_identity =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-                .expect("alice");
-        let bob_identity = IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone"))
-            .expect("bob");
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
 
         let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
-        let (mut bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+        let (mut bob_adapter, bob_package) =
+            MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
 
         let artifacts = alice_adapter
             .create_conversation(
@@ -1029,10 +1049,9 @@ mod tests {
     #[test]
     fn persisted_bootstrap_state_restores_welcome_staging() {
         let alice_identity =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-                .expect("alice");
-        let bob_identity = IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone"))
-            .expect("bob");
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
 
         let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
         let (bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
@@ -1063,7 +1082,10 @@ mod tests {
             )
             .expect("welcome");
 
-        assert!(matches!(welcome_result, IngestResult::AppliedWelcome { .. }));
+        assert!(matches!(
+            welcome_result,
+            IngestResult::AppliedWelcome { .. }
+        ));
     }
 
     #[test]
@@ -1082,7 +1104,10 @@ mod tests {
         .expect("restore");
 
         assert!(restored.adapter.is_none());
-        assert_eq!(restored.failed_conversation_ids, vec!["conv:broken".to_string()]);
+        assert_eq!(
+            restored.failed_conversation_ids,
+            vec!["conv:broken".to_string()]
+        );
         assert_eq!(
             restored
                 .summaries
@@ -1095,9 +1120,9 @@ mod tests {
 }
 
 fn copy_signer(signer: &SignatureKeyPair) -> CoreResult<SignatureKeyPair> {
-    let serialized = serde_json::to_vec(signer)
-        .map_err(|error| CoreError::invalid_state(format!("failed to encode MLS signer: {error}")))?;
+    let serialized = serde_json::to_vec(signer).map_err(|error| {
+        CoreError::invalid_state(format!("failed to encode MLS signer: {error}"))
+    })?;
     serde_json::from_slice(&serialized)
         .map_err(|error| CoreError::invalid_state(format!("failed to decode MLS signer: {error}")))
 }
-

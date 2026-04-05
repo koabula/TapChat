@@ -1,6 +1,6 @@
-pub mod cli;
 pub mod attachment_crypto;
 pub mod capability;
+pub mod cli;
 pub mod conversation;
 pub mod error;
 pub mod ffi_api;
@@ -13,9 +13,7 @@ pub mod sync_engine;
 pub mod transport_contract;
 
 pub use error::{CoreError, CoreResult};
-pub use ffi_api::{
-    CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, CoreStateUpdate,
-};
+pub use ffi_api::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, CoreStateUpdate};
 pub use logging::{LogLevel, Logger, NoopLogger};
 
 #[cfg(test)]
@@ -35,4 +33,3 @@ mod tests {
         logger.log(LogLevel::Info, "phase0", "core initialized");
     }
 }
-

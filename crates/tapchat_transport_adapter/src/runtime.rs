@@ -6,7 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use tapchat_core::model::{CURRENT_MODEL_VERSION, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
+use tapchat_core::model::{
+    CURRENT_MODEL_VERSION, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle,
+};
 use tapchat_core::transport_contract::{FetchMessagesResult, GetHeadResult};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -32,6 +34,11 @@ struct RuntimeMessageRequestList {
     pub requests: Vec<RuntimeMessageRequest>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeAllowlistDocument {
+    pub allowed_sender_user_ids: Vec<String>,
+    pub rejected_sender_user_ids: Vec<String>,
+}
 pub struct CloudflareRuntimeHandle {
     child: Child,
     _temp_dir: TempDir,
@@ -64,14 +71,17 @@ impl CloudflareRuntimeHandle {
             .stderr(Stdio::inherit())
             .stdin(Stdio::piped());
 
-        let mut child = child.spawn().context("spawn cloudflare transport runtime")?;
+        let mut child = child
+            .spawn()
+            .context("spawn cloudflare transport runtime")?;
         let stdout = child.stdout.take().context("runtime stdout unavailable")?;
         let mut lines = BufReader::new(stdout).lines();
         let line = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
             .await
             .context("timed out waiting for runtime metadata")??
             .context("runtime exited before emitting metadata")?;
-        let metadata: serde_json::Value = serde_json::from_str(&line).context("parse runtime metadata")?;
+        let metadata: serde_json::Value =
+            serde_json::from_str(&line).context("parse runtime metadata")?;
         let announced_base_url = metadata
             .get("baseUrl")
             .and_then(|value| value.as_str())
@@ -103,7 +113,11 @@ impl CloudflareRuntimeHandle {
         &self.websocket_base_url
     }
 
-    pub async fn bootstrap_device_bundle(&self, user_id: &str, device_id: &str) -> Result<DeploymentBundle> {
+    pub async fn bootstrap_device_bundle(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<DeploymentBundle> {
         let token = self.bootstrap_token(user_id, device_id)?;
         let response = self
             .client
@@ -124,7 +138,11 @@ impl CloudflareRuntimeHandle {
         Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
     }
 
-    pub async fn put_identity_bundle(&self, auth: &DeviceRuntimeAuth, bundle: &IdentityBundle) -> Result<()> {
+    pub async fn put_identity_bundle(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        bundle: &IdentityBundle,
+    ) -> Result<()> {
         let reference = bundle
             .identity_bundle_ref
             .clone()
@@ -141,12 +159,19 @@ impl CloudflareRuntimeHandle {
             .await
             .context("put identity bundle")?;
         if !response.status().is_success() {
-            bail!("put identity bundle failed with status {}", response.status());
+            bail!(
+                "put identity bundle failed with status {}",
+                response.status()
+            );
         }
         Ok(())
     }
 
-    pub async fn put_allowlist(&self, auth: &DeviceRuntimeAuth, allowed_sender_user_ids: &[String]) -> Result<()> {
+    pub async fn put_allowlist(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        allowed_sender_user_ids: &[String],
+    ) -> Result<()> {
         let response = self
             .client
             .put(format!(
@@ -169,7 +194,35 @@ impl CloudflareRuntimeHandle {
         Ok(())
     }
 
-    pub async fn list_message_requests(&self, auth: &DeviceRuntimeAuth) -> Result<Vec<RuntimeMessageRequest>> {
+    pub async fn get_allowlist(
+        &self,
+        auth: &DeviceRuntimeAuth,
+    ) -> Result<RuntimeAllowlistDocument> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/inbox/{}/allowlist",
+                self.base_url,
+                urlencoding::encode(&auth.device_id)
+            ))
+            .header("Authorization", format!("Bearer {}", auth.token))
+            .send()
+            .await
+            .context("get allowlist")?;
+        if !response.status().is_success() {
+            bail!("get allowlist failed with status {}", response.status());
+        }
+        let body = response.text().await?;
+        let normalized = to_snake_case_json_string(&body)?;
+        Ok(serde_json::from_str::<RuntimeAllowlistDocument>(
+            &normalized,
+        )?)
+    }
+
+    pub async fn list_message_requests(
+        &self,
+        auth: &DeviceRuntimeAuth,
+    ) -> Result<Vec<RuntimeMessageRequest>> {
         let response = self
             .client
             .get(format!(
@@ -182,14 +235,21 @@ impl CloudflareRuntimeHandle {
             .await
             .context("list message requests")?;
         if !response.status().is_success() {
-            bail!("list message requests failed with status {}", response.status());
+            bail!(
+                "list message requests failed with status {}",
+                response.status()
+            );
         }
         let body = response.text().await?;
         let normalized = to_snake_case_json_string(&body)?;
         Ok(serde_json::from_str::<RuntimeMessageRequestList>(&normalized)?.requests)
     }
 
-    pub async fn accept_message_request(&self, auth: &DeviceRuntimeAuth, request_id: &str) -> Result<()> {
+    pub async fn accept_message_request(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        request_id: &str,
+    ) -> Result<()> {
         let response = self
             .client
             .post(format!(
@@ -203,12 +263,19 @@ impl CloudflareRuntimeHandle {
             .await
             .context("accept message request")?;
         if !response.status().is_success() {
-            bail!("accept message request failed with status {}", response.status());
+            bail!(
+                "accept message request failed with status {}",
+                response.status()
+            );
         }
         Ok(())
     }
 
-    pub async fn reject_message_request(&self, auth: &DeviceRuntimeAuth, request_id: &str) -> Result<()> {
+    pub async fn reject_message_request(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        request_id: &str,
+    ) -> Result<()> {
         let response = self
             .client
             .post(format!(
@@ -222,7 +289,10 @@ impl CloudflareRuntimeHandle {
             .await
             .context("reject message request")?;
         if !response.status().is_success() {
-            bail!("reject message request failed with status {}", response.status());
+            bail!(
+                "reject message request failed with status {}",
+                response.status()
+            );
         }
         Ok(())
     }
@@ -239,16 +309,27 @@ impl CloudflareRuntimeHandle {
             .await
             .context("get identity bundle request")?;
         if !response.status().is_success() {
-            bail!("get identity bundle failed with status {}", response.status());
+            bail!(
+                "get identity bundle failed with status {}",
+                response.status()
+            );
         }
         let body = response.text().await?;
         Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
     }
 
-    pub async fn get_head(&self, auth: &DeviceRuntimeAuth, device_id: &str) -> Result<GetHeadResult> {
+    pub async fn get_head(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        device_id: &str,
+    ) -> Result<GetHeadResult> {
         let response = self
             .client
-            .get(format!("{}/v1/inbox/{}/head", self.base_url, urlencoding::encode(device_id)))
+            .get(format!(
+                "{}/v1/inbox/{}/head",
+                self.base_url,
+                urlencoding::encode(device_id)
+            ))
             .header("Authorization", format!("Bearer {}", auth.token))
             .send()
             .await
@@ -288,16 +369,20 @@ impl CloudflareRuntimeHandle {
     async fn wait_until_ready(&self) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-          let response = self.client.get(format!("{}/v1/deployment-bundle", self.base_url)).send().await;
-          if let Ok(response) = response {
-              if response.status().is_success() {
-                  return Ok(());
-              }
-          }
-          if Instant::now() >= deadline {
-              bail!("cloudflare runtime did not become ready in time");
-          }
-          sleep(Duration::from_millis(200)).await;
+            let response = self
+                .client
+                .get(format!("{}/v1/deployment-bundle", self.base_url))
+                .send()
+                .await;
+            if let Ok(response) = response {
+                if response.status().is_success() {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("cloudflare runtime did not become ready in time");
+            }
+            sleep(Duration::from_millis(200)).await;
         }
     }
 

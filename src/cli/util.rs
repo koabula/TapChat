@@ -6,8 +6,8 @@ use sha2::Sha256;
 
 pub fn sign_hmac_token(secret: &str, payload: &Value) -> Result<String> {
     let payload_bytes = serde_json::to_vec(payload)?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .context("failed to initialize hmac")?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).context("failed to initialize hmac")?;
     mac.update(&payload_bytes);
     let signature = mac.finalize().into_bytes();
     Ok(format!(
