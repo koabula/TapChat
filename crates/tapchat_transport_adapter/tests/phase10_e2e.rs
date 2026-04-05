@@ -11,7 +11,7 @@ use tapchat_core::model::{
     ConversationKind, DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceStatusKind,
     IdentityBundle, InboxRecord, MessageType, MlsStateStatus,
 };
-use tapchat_transport_adapter::{CloudflareRuntimeHandle, CoreDriver};
+use tapchat_transport_adapter::{CloudflareRuntimeHandle, CloudflareRuntimeOptions, CoreDriver};
 
 const ALICE_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -29,6 +29,7 @@ struct PairContext {
     bob_auth: DeviceRuntimeAuth,
 }
 
+#[allow(dead_code)]
 struct TrioContext {
     runtime: CloudflareRuntimeHandle,
     alice: CoreDriver,
@@ -721,6 +722,228 @@ async fn duplicate_realtime_head_and_record_events_do_not_duplicate_delivery() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_then_stale_realtime_events_are_noop() -> Result<()> {
+    let mut ctx = setup_pair().await?;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "fetch first".into(),
+        })
+        .await?;
+    sync_bob(&mut ctx, "fetch-first").await?;
+
+    let head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    let fetched =
+        fetch_inbox_records_since(&ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, 1).await?;
+    let record = fetched
+        .last()
+        .cloned()
+        .context("missing record for stale realtime test")?;
+
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::HeadUpdated { seq: head },
+        })
+        .await?;
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::InboxRecordAvailable {
+                seq: record.seq,
+                record: Some(record),
+            },
+        })
+        .await?;
+
+    let checkpoint = ctx
+        .bob
+        .sync_checkpoint_snapshot(&ctx.bob_device_id)
+        .context("checkpoint after stale realtime")?;
+    assert!(checkpoint.last_acked_seq >= head);
+    let conversation = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after stale realtime")?;
+    assert_eq!(count_plaintext_messages(conversation, "fetch first"), 1);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_during_recovery_survives_restart_and_downloads_once() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let source_path = temp_dir.path().join("recovery-payload.bin");
+    let original = b"attachment during recovery bytes".to_vec();
+    tokio::fs::write(&source_path, &original).await?;
+
+    add_bob_laptop_to_conversation(&mut ctx).await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendAttachmentMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            attachment_descriptor: AttachmentDescriptor {
+                attachment_id: source_path.to_string_lossy().to_string(),
+                mime_type: "application/octet-stream".into(),
+                size_bytes: original.len() as u64,
+                file_name: Some("recovery-payload.bin".into()),
+            },
+        })
+        .await?;
+
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::ApplyLocalDeviceStatusUpdate {
+            status: DeviceStatusKind::Revoked,
+        })
+        .await?;
+    publish_bob_bundle(&ctx, DeviceStatusKind::Revoked, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "attachment-during-recovery",
+    )
+    .await?;
+
+    let snapshot = ctx
+        .alice
+        .latest_snapshot()
+        .cloned()
+        .context("alice snapshot missing for attachment restart test")?;
+    let mut restored =
+        CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    restored
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
+    ctx.alice = restored;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    let conversation = ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob laptop conversation missing after recovery attachment")?;
+    let attachment_message = conversation
+        .messages
+        .iter()
+        .find(|message| !message.storage_refs.is_empty())
+        .context("recovery attachment message missing")?;
+    let attachment_message_id = attachment_message.message_id.clone();
+    let attachment_reference = attachment_message.storage_refs[0].object_ref.clone();
+    let raw_blob = reqwest::get(&attachment_reference).await?.bytes().await?;
+
+    let destination = temp_dir.path().join("downloaded-recovery-payload.bin");
+    ctx.bob_laptop
+        .run_command_until_idle(CoreCommand::DownloadAttachment {
+            conversation_id: ctx.conversation_id.clone(),
+            message_id: attachment_message_id.clone(),
+            reference: attachment_reference,
+            destination: destination.to_string_lossy().to_string(),
+        })
+        .await?;
+    assert_eq!(tokio::fs::read(&destination).await?, original);
+
+    let updated = ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob laptop conversation missing after recovery attachment download")?;
+    assert_eq!(
+        updated
+            .messages
+            .iter()
+            .filter(|message| message.message_id == attachment_message_id)
+            .count(),
+        1
+    );
+    let downloaded_message = updated
+        .messages
+        .iter()
+        .find(|message| message.message_id == attachment_message_id)
+        .context("downloaded recovery attachment message missing")?;
+    assert_eq!(
+        STANDARD.decode(
+            downloaded_message
+                .downloaded_blob_b64
+                .as_ref()
+                .context("downloaded recovery blob bytes missing")?
+        )?,
+        raw_blob
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cleanup_after_ack_keeps_checkpoint_monotonic_and_local_messages_intact() -> Result<()> {
+    let mut ctx = setup_pair_with_runtime_options(CloudflareRuntimeOptions {
+        retention_days: Some(0),
+        ..Default::default()
+    })
+    .await?;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "cleanup protected".into(),
+        })
+        .await?;
+    sync_bob(&mut ctx, "cleanup-initial").await?;
+
+    let head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    wait_for_runtime_cleanup(&ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, 1).await?;
+    sync_bob(&mut ctx, "cleanup-repeat").await?;
+
+    let checkpoint = ctx
+        .bob
+        .sync_checkpoint_snapshot(&ctx.bob_device_id)
+        .context("checkpoint after cleanup repeat")?;
+    assert!(checkpoint.last_acked_seq >= head);
+    let conversation = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after cleanup")?;
+    assert_eq!(
+        count_plaintext_messages(conversation, "cleanup protected"),
+        1
+    );
+    assert_eq!(
+        ctx.bob.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn needs_recovery_persists_without_premature_rebuild_under_partial_delivery() -> Result<()> {
     let mut ctx = setup_trio().await?;
     let phone_baseline = last_acked_seq(&ctx.bob_phone, &ctx.bob_phone_device_id)?;
@@ -1308,6 +1531,113 @@ async fn revoke_during_recovery_keeps_revoked_device_isolated() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_during_recovery_then_restart_keeps_revoked_device_isolated() -> Result<()> {
+    let mut ctx = setup_trio().await?;
+
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::NeedsRecovery)
+    );
+
+    ctx.bob_phone
+        .run_command_until_idle(CoreCommand::ApplyLocalDeviceStatusUpdate {
+            status: DeviceStatusKind::Revoked,
+        })
+        .await?;
+    publish_bob_bundle(&ctx, DeviceStatusKind::Revoked, DeviceStatusKind::Active).await?;
+    refresh_alice_contact(&mut ctx).await?;
+
+    let snapshot = ctx
+        .alice
+        .latest_snapshot()
+        .cloned()
+        .context("alice snapshot missing for revoke restart test")?;
+    let mut restored =
+        CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
+    restored
+        .inject_event_until_idle(CoreEvent::AppStarted)
+        .await?;
+    ctx.alice = restored;
+
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "revoke-restart-laptop",
+    )
+    .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_phone,
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        "revoke-restart-phone",
+    )
+    .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: ctx.conversation_id.clone(),
+        })
+        .await?;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "post revoke restart".into(),
+        })
+        .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_laptop,
+        &ctx.runtime,
+        &ctx.bob_laptop_auth,
+        &ctx.bob_laptop_device_id,
+        "revoke-restart-laptop-message",
+    )
+    .await?;
+    sync_driver_until_stable(
+        &mut ctx.bob_phone,
+        &ctx.runtime,
+        &ctx.bob_phone_auth,
+        &ctx.bob_phone_device_id,
+        "revoke-restart-phone-message",
+    )
+    .await?;
+
+    let laptop_conversation = ctx
+        .bob_laptop
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob laptop conversation missing after revoke restart")?;
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke restart"))
+    );
+
+    let phone_conversation = ctx
+        .bob_phone
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob phone conversation missing after revoke restart")?;
+    assert!(
+        !phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke restart"))
+    );
+    assert_eq!(
+        ctx.alice.conversation_recovery_status(&ctx.conversation_id),
+        Some(RecoveryStatus::Healthy)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_during_recovery_preserves_context_and_converges() -> Result<()> {
     let mut ctx = setup_trio().await?;
 
@@ -1535,8 +1865,12 @@ async fn sync_bob(ctx: &mut PairContext, reason: &str) -> Result<()> {
 }
 
 async fn setup_pair() -> Result<PairContext> {
+    setup_pair_with_runtime_options(CloudflareRuntimeOptions::default()).await
+}
+
+async fn setup_pair_with_runtime_options(options: CloudflareRuntimeOptions) -> Result<PairContext> {
     let workspace_root = workspace_root();
-    let runtime = CloudflareRuntimeHandle::start(&workspace_root).await?;
+    let runtime = CloudflareRuntimeHandle::start_with_options(&workspace_root, options).await?;
     let mut alice = CoreDriver::new_with_storage_base(Some(runtime.base_url().to_string()))?;
     let mut bob = CoreDriver::new_with_storage_base(Some(runtime.base_url().to_string()))?;
 
@@ -1972,6 +2306,26 @@ async fn fetch_inbox_records_since(
         .fetch_messages(auth, device_id, from_seq, 100)
         .await?
         .records)
+}
+
+async fn wait_for_runtime_cleanup(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    device_id: &str,
+    from_seq: u64,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let records = runtime
+            .fetch_messages(auth, device_id, from_seq, 100)
+            .await?
+            .records;
+        if records.is_empty() {
+            return Ok(());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    bail!("runtime cleanup did not remove acked records in time")
 }
 
 fn inject_records_without_effects(

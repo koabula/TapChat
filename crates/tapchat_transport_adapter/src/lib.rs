@@ -3,4 +3,7 @@ pub mod runtime;
 pub mod util;
 
 pub use driver::{CoreDriver, DriverRuntime};
-pub use runtime::{CloudflareRuntimeHandle, RuntimeAllowlistDocument, RuntimeMessageRequest};
+pub use runtime::{
+    CloudflareRuntimeHandle, CloudflareRuntimeOptions, RuntimeAllowlistDocument,
+    RuntimeMessageRequest,
+};

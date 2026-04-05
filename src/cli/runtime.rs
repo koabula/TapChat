@@ -475,6 +475,7 @@ pub fn stop_local_runtime(pid: u32) -> Result<()> {
             }
             bail!("taskkill failed for pid {pid}: {detail}");
         }
+        wait_for_process_exit(pid, Duration::from_secs(15))?;
     }
     #[cfg(not(windows))]
     {
@@ -491,8 +492,46 @@ pub fn stop_local_runtime(pid: u32) -> Result<()> {
             }
             bail!("kill failed for pid {pid}: {detail}");
         }
+        wait_for_process_exit(pid, Duration::from_secs(15))?;
     }
     Ok(())
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_is_running(pid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("process {pid} did not exit in time")
+}
+
+fn process_is_running(pid: u32) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .context("run tasklist")?;
+        if !output.status.success() {
+            bail!(
+                "tasklist failed for pid {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.lines().any(|line| line.contains(&pid.to_string())))
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .context("run kill -0")?;
+        Ok(output.status.success())
+    }
 }
 
 fn reserve_port() -> Result<u16> {

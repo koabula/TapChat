@@ -4,6 +4,10 @@ const port = Number(process.env.TAPCHAT_TRANSPORT_PORT ?? "0");
 const persistTo = process.env.TAPCHAT_TRANSPORT_PERSIST_TO;
 const sharingSecret = process.env.TAPCHAT_TRANSPORT_SHARING_SECRET ?? "transport-sharing-secret";
 const bootstrapSecret = process.env.TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET ?? "transport-bootstrap-secret";
+const maxInlineBytes = process.env.MAX_INLINE_BYTES;
+const retentionDays = process.env.RETENTION_DAYS;
+const rateLimitPerMinute = process.env.RATE_LIMIT_PER_MINUTE;
+const rateLimitPerHour = process.env.RATE_LIMIT_PER_HOUR;
 const baseUrl = `http://127.0.0.1:${port}`;
 
 const worker = await unstable_dev("src/index.ts", {
@@ -18,7 +22,11 @@ const worker = await unstable_dev("src/index.ts", {
     PUBLIC_BASE_URL: baseUrl,
     DEPLOYMENT_REGION: "local-transport",
     SHARING_TOKEN_SECRET: sharingSecret,
-    BOOTSTRAP_TOKEN_SECRET: bootstrapSecret
+    BOOTSTRAP_TOKEN_SECRET: bootstrapSecret,
+    ...(maxInlineBytes ? { MAX_INLINE_BYTES: maxInlineBytes } : {}),
+    ...(retentionDays ? { RETENTION_DAYS: retentionDays } : {}),
+    ...(rateLimitPerMinute ? { RATE_LIMIT_PER_MINUTE: rateLimitPerMinute } : {}),
+    ...(rateLimitPerHour ? { RATE_LIMIT_PER_HOUR: rateLimitPerHour } : {})
   },
   experimental: {
     disableExperimentalWarning: true,
@@ -56,4 +64,3 @@ process.stdin.resume();
 process.stdin.on("end", shutdown);
 
 await new Promise(() => {});
-

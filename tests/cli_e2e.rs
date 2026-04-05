@@ -2,12 +2,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tapchat_core::identity::{IdentityManager, LocalIdentityState};
 use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
-use tapchat_transport_adapter::{CloudflareRuntimeHandle, RuntimeMessageRequest};
+use tapchat_transport_adapter::{
+    CloudflareRuntimeHandle, CloudflareRuntimeOptions, RuntimeMessageRequest,
+};
 use tempfile::{Builder, TempDir};
 
 const ALICE_MNEMONIC: &str =
@@ -1270,6 +1274,314 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn cli_attachment_restart_and_delayed_recovery_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("attachment-restart")?;
+    let laptop = start_bob_laptop_recovery(&ctx)?;
+
+    let attachment_path = ctx.temp_root.path().join("recovery-attachment.txt");
+    fs::write(&attachment_path, "attachment during delayed recovery")?;
+
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let _ = sync_once(&laptop.laptop_profile)?;
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    run_cli_json([
+        "message",
+        "send-attachment",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--file",
+        &attachment_path.to_string_lossy(),
+    ])?;
+    let _ = sync_once(&laptop.laptop_profile)?;
+
+    let merged_identity = runtime_get_identity_bundle(&ctx.runtime, &ctx.bob_user_id)?;
+    patch_profile_local_bundle(&laptop.laptop_profile, &merged_identity)?;
+    let revoked = run_cli_json([
+        "device",
+        "revoke",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+        "--target-device-id",
+        &ctx.bob_device_id,
+    ])?;
+    assert_eq!(revoked["revoked"], Value::Bool(true));
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+
+    let recovering_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert!(matches!(
+        recovering_show["recovery_status"].as_str(),
+        Some("NeedsRecovery") | Some("NeedsRebuild")
+    ));
+    let recovering_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert!(recovering_status["checkpoint"].is_object());
+    assert!(recovering_status["notifications"].is_array());
+    assert!(recovering_status.get("realtime").is_some());
+
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let _ = sync_once(&laptop.laptop_profile)?;
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    let alice_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_eq!(alice_show["recovery_status"].as_str(), Some("Healthy"));
+    let laptop_show = conversation_show(&laptop.laptop_profile, &ctx.conversation_id)?;
+    assert_eq!(laptop_show["conversation_state"].as_str(), Some("active"));
+    assert_eq!(laptop_show["recovery_status"].as_str(), Some("Healthy"));
+
+    let laptop_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    let attachment_message = laptop_messages
+        .as_array()
+        .context("laptop message list not array")?
+        .iter()
+        .find(|message| {
+            message["storage_refs"]
+                .as_array()
+                .map(|refs| !refs.is_empty())
+                .unwrap_or(false)
+        })
+        .cloned()
+        .context("laptop attachment message missing after delayed recovery")?;
+    let attachment_message_id = required_str(&attachment_message, "message_id")?;
+    let attachment_reference = attachment_message["storage_refs"][0]["ref"]
+        .as_str()
+        .context("laptop attachment reference missing")?
+        .to_string();
+
+    let downloaded_path = laptop
+        .laptop_profile
+        .join("attachments")
+        .join("inbox")
+        .join("recovered-attachment.txt");
+    let downloaded = run_cli_json([
+        "message",
+        "download-attachment",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--message-id",
+        &attachment_message_id,
+        "--reference",
+        &attachment_reference,
+        "--out",
+        &downloaded_path.to_string_lossy(),
+    ])?;
+    assert_eq!(downloaded["downloaded"], Value::Bool(true));
+    assert_eq!(
+        fs::read_to_string(&downloaded_path)?,
+        "attachment during delayed recovery"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_cleanup_after_ack_keeps_checkpoint_monotonic() -> Result<()> {
+    let _guard = test_lock();
+    let workspace_root = workspace_root();
+    let runtime = runtime_handle_with_options(
+        &workspace_root,
+        CloudflareRuntimeOptions {
+            retention_days: Some(0),
+            ..Default::default()
+        },
+    )?;
+    let ctx = setup_cli_pair_with_runtime("cleanup-after-ack", runtime)?;
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "cleanup baseline",
+    ])?;
+    let first_sync = sync_once(&ctx.bob_profile)?;
+    assert_eq!(first_sync["synced"], Value::Bool(true));
+    let head = runtime_get_head(
+        &ctx.runtime,
+        bundle_auth(&ctx.bob_bundle)?,
+        &ctx.bob_device_id,
+    )?;
+    let acked_seq = required_u64(&first_sync["checkpoint"], "last_acked_seq")?;
+    assert_eq!(acked_seq, head);
+
+    wait_for_runtime_cleanup(
+        &ctx.runtime,
+        bundle_auth(&ctx.bob_bundle)?,
+        &ctx.bob_device_id,
+        1,
+    )?;
+
+    let second_sync = sync_once(&ctx.bob_profile)?;
+    assert_eq!(second_sync["synced"], Value::Bool(true));
+    assert_eq!(
+        required_u64(&second_sync["checkpoint"], "last_acked_seq")?,
+        acked_seq
+    );
+    let messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(count_plaintext_messages(&messages, "cleanup baseline"), 1);
+    assert_eq!(
+        conversation_show(&ctx.bob_profile, &ctx.conversation_id)?["recovery_status"].as_str(),
+        Some("Healthy")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn cli_revoke_with_delayed_sync_keeps_revoked_device_isolated() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("revoke-delayed-sync")?;
+    let laptop = start_bob_laptop_recovery(&ctx)?;
+
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let _ = sync_once(&laptop.laptop_profile)?;
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    let merged_identity = runtime_get_identity_bundle(&ctx.runtime, &ctx.bob_user_id)?;
+    patch_profile_local_bundle(&laptop.laptop_profile, &merged_identity)?;
+    let revoked = run_cli_json([
+        "device",
+        "revoke",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+        "--target-device-id",
+        &ctx.bob_device_id,
+    ])?;
+    assert_eq!(revoked["revoked"], Value::Bool(true));
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+    run_cli_json([
+        "conversation",
+        "reconcile",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "post revoke delayed sync",
+    ])?;
+    let delayed_laptop_sync = sync_once(&laptop.laptop_profile)?;
+    assert_eq!(delayed_laptop_sync["synced"], Value::Bool(true));
+
+    let laptop_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&laptop_messages, "post revoke delayed sync"),
+        1
+    );
+
+    let delayed_phone_sync = sync_once(&ctx.bob_profile)?;
+    assert_eq!(delayed_phone_sync["synced"], Value::Bool(true));
+    let phone_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&phone_messages, "post revoke delayed sync"),
+        0
+    );
+
+    Ok(())
+}
+
 #[cfg(windows)]
 #[test]
 fn cleanup_test_temp_script_removes_cli_temp_artifacts() -> Result<()> {
@@ -1337,20 +1649,22 @@ impl Drop for RuntimePidGuard {
         let Some(pid) = self.pid.take() else {
             return;
         };
-        #[cfg(windows)]
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-        #[cfg(not(windows))]
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
+        let _ = stop_pid_and_wait(pid);
     }
 }
 
 fn runtime_handle(workspace_root: &Path) -> Result<CloudflareRuntimeHandle> {
-    with_tokio(|| async { CloudflareRuntimeHandle::start(workspace_root).await })
-        .context("start cloudflare runtime")
+    runtime_handle_with_options(workspace_root, CloudflareRuntimeOptions::default())
+}
+
+fn runtime_handle_with_options(
+    workspace_root: &Path,
+    options: CloudflareRuntimeOptions,
+) -> Result<CloudflareRuntimeHandle> {
+    with_tokio(|| async {
+        CloudflareRuntimeHandle::start_with_options(workspace_root, options).await
+    })
+    .context("start cloudflare runtime")
 }
 
 fn run_cleanup_script(workspace_root: &Path, what_if: bool) -> Result<String> {
@@ -1559,6 +1873,13 @@ fn assert_realtime_not_connected(snapshot: &Value) {
 fn setup_cli_pair(suffix: &str) -> Result<CliPairContext> {
     let workspace_root = workspace_root();
     let runtime = runtime_handle(&workspace_root)?;
+    setup_cli_pair_with_runtime(suffix, runtime)
+}
+
+fn setup_cli_pair_with_runtime(
+    suffix: &str,
+    runtime: CloudflareRuntimeHandle,
+) -> Result<CliPairContext> {
     let temp_root = repo_temp_dir(suffix)?;
     let alice_profile = temp_root.path().join("alice");
     let bob_profile = temp_root.path().join("bob");
@@ -1916,6 +2237,16 @@ fn snapshot_has_conversation(profile: &Path, conversation_id: &str) -> Result<bo
         .unwrap_or(false))
 }
 
+fn patch_profile_local_bundle(profile: &Path, bundle: &IdentityBundle) -> Result<()> {
+    let mut snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
+    snapshot["snapshot"]["deployment"]["local_bundle"] = serde_json::to_value(bundle)?;
+    fs::write(
+        profile.join("snapshot.json"),
+        serde_json::to_vec_pretty(&snapshot)?,
+    )?;
+    Ok(())
+}
+
 fn bundle_auth(bundle: &DeploymentBundle) -> Result<&DeviceRuntimeAuth> {
     bundle
         .device_runtime_auth
@@ -1974,6 +2305,36 @@ fn runtime_get_identity_bundle(
     with_tokio(|| async { runtime.get_identity_bundle(user_id).await })
 }
 
+fn runtime_get_head(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    device_id: &str,
+) -> Result<u64> {
+    with_tokio(|| async { Ok(runtime.get_head(auth, device_id).await?.head_seq) })
+}
+
+fn wait_for_runtime_cleanup(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    device_id: &str,
+    from_seq: u64,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let records = with_tokio(|| async {
+            Ok(runtime
+                .fetch_messages(auth, device_id, from_seq, 100)
+                .await?
+                .records)
+        })?;
+        if records.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("runtime cleanup did not remove acked records in time")
+}
+
 fn with_tokio<F, Fut, T>(build: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
@@ -1984,4 +2345,90 @@ where
         .build()
         .context("build tokio runtime for cli e2e helper")?
         .block_on(build())
+}
+
+fn stop_pid_and_wait(pid: u32) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .context("run taskkill for cli e2e runtime")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = stderr.trim();
+            let combined = if detail.is_empty() {
+                stdout.trim().to_string()
+            } else {
+                detail.to_string()
+            };
+            let lower = combined.to_ascii_lowercase();
+            if !(lower.contains("not found")
+                || lower.contains("no running instance")
+                || combined.contains("找不到")
+                || combined.contains("没有运行的任务"))
+            {
+                bail!("taskkill failed for pid {pid}: {combined}");
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .context("run kill for cli e2e runtime")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let detail = stderr.trim();
+            if !(detail.contains("No such process") || stdout.contains("No such process")) {
+                let combined = if detail.is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    detail.to_string()
+                };
+                bail!("kill failed for pid {pid}: {combined}");
+            }
+        }
+    }
+    wait_for_pid_exit(pid, Duration::from_secs(15))
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_running(pid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("process {pid} did not exit in time")
+}
+
+fn pid_is_running(pid: u32) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .context("run tasklist for cli e2e runtime")?;
+        if !output.status.success() {
+            bail!(
+                "tasklist failed for pid {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.lines().any(|line| line.contains(&pid.to_string())))
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .context("run kill -0 for cli e2e runtime")?;
+        Ok(output.status.success())
+    }
 }

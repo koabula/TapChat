@@ -39,6 +39,15 @@ pub struct RuntimeAllowlistDocument {
     pub allowed_sender_user_ids: Vec<String>,
     pub rejected_sender_user_ids: Vec<String>,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct CloudflareRuntimeOptions {
+    pub max_inline_bytes: Option<u64>,
+    pub retention_days: Option<u64>,
+    pub rate_limit_per_minute: Option<u64>,
+    pub rate_limit_per_hour: Option<u64>,
+}
+
 pub struct CloudflareRuntimeHandle {
     child: Child,
     _temp_dir: TempDir,
@@ -50,6 +59,13 @@ pub struct CloudflareRuntimeHandle {
 
 impl CloudflareRuntimeHandle {
     pub async fn start(workspace_root: impl AsRef<Path>) -> Result<Self> {
+        Self::start_with_options(workspace_root, CloudflareRuntimeOptions::default()).await
+    }
+
+    pub async fn start_with_options(
+        workspace_root: impl AsRef<Path>,
+        options: CloudflareRuntimeOptions,
+    ) -> Result<Self> {
         let workspace_root = workspace_root.as_ref();
         let service_root = workspace_root.join("services").join("cloudflare");
         let temp_dir = tempfile::tempdir_in(workspace_root).context("create transport temp dir")?;
@@ -67,9 +83,25 @@ impl CloudflareRuntimeHandle {
             .env("TAPCHAT_TRANSPORT_PERSIST_TO", temp_dir.path())
             .env("TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET", &bootstrap_secret)
             .env("TAPCHAT_TRANSPORT_SHARING_SECRET", &sharing_secret)
+            .env_remove("MAX_INLINE_BYTES")
+            .env_remove("RETENTION_DAYS")
+            .env_remove("RATE_LIMIT_PER_MINUTE")
+            .env_remove("RATE_LIMIT_PER_HOUR")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .stdin(Stdio::piped());
+        if let Some(value) = options.max_inline_bytes {
+            child.env("MAX_INLINE_BYTES", value.to_string());
+        }
+        if let Some(value) = options.retention_days {
+            child.env("RETENTION_DAYS", value.to_string());
+        }
+        if let Some(value) = options.rate_limit_per_minute {
+            child.env("RATE_LIMIT_PER_MINUTE", value.to_string());
+        }
+        if let Some(value) = options.rate_limit_per_hour {
+            child.env("RATE_LIMIT_PER_HOUR", value.to_string());
+        }
 
         let mut child = child
             .spawn()
@@ -364,6 +396,30 @@ impl CloudflareRuntimeHandle {
         }
         let body = response.text().await?;
         Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
+    }
+
+    pub async fn ack_messages(
+        &self,
+        auth: &DeviceRuntimeAuth,
+        device_id: &str,
+        ack_seq: u64,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/inbox/{}/ack",
+                self.base_url,
+                urlencoding::encode(device_id)
+            ))
+            .header("Authorization", format!("Bearer {}", auth.token))
+            .json(&json!({ "ackSeq": ack_seq }))
+            .send()
+            .await
+            .context("ack messages request")?;
+        if !response.status().is_success() {
+            bail!("ack messages failed with status {}", response.status());
+        }
+        Ok(())
     }
 
     async fn wait_until_ready(&self) -> Result<()> {
