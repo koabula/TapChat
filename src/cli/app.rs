@@ -11,17 +11,19 @@ use crate::persistence::CorePersistenceSnapshot;
 use crate::transport_contract::{AllowlistDocument, GetHeadResult, MessageRequestItem};
 
 use super::args::{
-    Cli, Command, ContactAllowlistCommand, ContactAllowlistSubcommand, ContactCommand,
-    ContactRequestsCommand, ContactRequestsSubcommand, ContactSubcommand, ConversationCommand,
-    ConversationSubcommand, DeviceCommand, DeviceSubcommand, MessageCommand, MessageSubcommand,
-    OutputFormat, ProfileCommand, ProfileSubcommand, RuntimeCommand, RuntimeSubcommand,
-    SyncCommand, SyncSubcommand,
+    Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
+    CloudflareRuntimeSubcommand, Command, ContactAllowlistCommand, ContactAllowlistSubcommand,
+    ContactCommand, ContactRequestsCommand, ContactRequestsSubcommand, ContactSubcommand,
+    ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand,
+    MessageCommand, MessageSubcommand, OutputFormat, ProfileCommand, ProfileSubcommand,
+    RuntimeCommand, RuntimeSubcommand, SyncCommand, SyncSubcommand,
 };
 use super::driver::CoreDriver;
-use super::profile::{Profile, RuntimeMetadata};
+use super::profile::{Profile, ProfileRegistry, RuntimeMetadata};
 use super::runtime::{
-    bootstrap_device_bundle, resolve_service_root, resolve_workspace_root, start_local_runtime,
-    stop_local_runtime, wait_until_ready,
+    bootstrap_device_bundle, deploy_cloudflare_runtime, derive_cloudflare_defaults,
+    prompt_cloudflare_overrides, resolve_cloudflare_config, resolve_service_root,
+    resolve_workspace_root, start_local_runtime, stop_local_runtime, wait_until_ready,
 };
 use super::util::to_snake_case_json_string;
 pub async fn run() -> Result<()> {
@@ -101,6 +103,43 @@ impl CliApp {
                 } else {
                     self.print_value(&bundle)
                 }
+            }
+            ProfileSubcommand::List => {
+                let registry = ProfileRegistry::load()?;
+                self.print_value(&serde_json::json!({
+                    "active_profile": registry.active_profile,
+                    "profiles": registry.profiles,
+                }))
+            }
+            ProfileSubcommand::Activate { profile, name } => {
+                let mut registry = ProfileRegistry::load()?;
+                let active_profile = match (profile, name) {
+                    (Some(profile), None) => {
+                        registry.set_active(&profile)?;
+                        profile
+                    }
+                    (None, Some(name)) => registry.set_active_by_name(&name)?,
+                    _ => bail!("specify either --profile or --name"),
+                };
+                registry.save()?;
+                self.print_value(&serde_json::json!({
+                    "activated": true,
+                    "profile": active_profile,
+                }))
+            }
+            ProfileSubcommand::Current => {
+                let registry = ProfileRegistry::load()?;
+                self.print_value(registry.current()?)
+            }
+            ProfileSubcommand::Remove { profile } => {
+                let mut registry = ProfileRegistry::load()?;
+                registry.remove(&profile);
+                registry.save()?;
+                self.print_value(&serde_json::json!({
+                    "removed": true,
+                    "profile": profile,
+                    "active_profile": registry.active_profile,
+                }))
             }
         }
     }
@@ -455,7 +494,7 @@ impl CliApp {
                 let mut profile = Profile::open(profile)?;
                 let mut driver = load_driver(&profile)?;
                 let notification_offset = driver.notifications().len();
-                driver
+                let output = driver
                     .run_command_until_idle(CoreCommand::SendTextMessage {
                         conversation_id: conversation_id.clone(),
                         plaintext: text,
@@ -466,6 +505,7 @@ impl CliApp {
                     "sent": true,
                     "conversation_id": conversation_id,
                     "pending_outbox": driver.pending_outbox_count(),
+                    "append_result": append_result_from_output(&output),
                     "latest_notification": latest_notification_since(&driver, notification_offset),
                 }))
             }
@@ -478,7 +518,7 @@ impl CliApp {
                 let mut driver = load_driver(&profile)?;
                 let descriptor = attachment_descriptor(&file)?;
                 let notification_offset = driver.notifications().len();
-                driver
+                let output = driver
                     .run_command_until_idle(CoreCommand::SendAttachmentMessage {
                         conversation_id: conversation_id.clone(),
                         attachment_descriptor: descriptor,
@@ -491,6 +531,7 @@ impl CliApp {
                     "file": file,
                     "pending_outbox": driver.pending_outbox_count(),
                     "pending_blob_uploads": driver.pending_blob_upload_count(),
+                    "append_result": append_result_from_output(&output),
                     "latest_notification": latest_notification_since(&driver, notification_offset),
                 }))
             }
@@ -680,6 +721,13 @@ impl CliApp {
                     mode: Some("local".into()),
                     workspace_root: Some(resolved_workspace_root),
                     service_root: Some(instance.service_root.clone()),
+                    worker_name: None,
+                    public_base_url: None,
+                    deploy_url: None,
+                    deployment_region: None,
+                    bucket_name: None,
+                    preview_bucket_name: None,
+                    last_deployed_at: None,
                 })?;
                 persist_driver(&mut profile, &driver)?;
                 self.print_value(&serde_json::json!({
@@ -717,6 +765,174 @@ impl CliApp {
                     "service_root": runtime.service_root,
                 }))
             }
+            RuntimeSubcommand::Cloudflare(command) => self.run_cloudflare_runtime(command).await,
+        }
+    }
+
+    async fn run_cloudflare_runtime(&self, command: CloudflareRuntimeCommand) -> Result<()> {
+        match command.command {
+            CloudflareRuntimeSubcommand::Provision(command) => {
+                self.run_cloudflare_provision(command).await
+            }
+            CloudflareRuntimeSubcommand::Status { profile } => {
+                let profile = Profile::open(profile)?;
+                let runtime = profile.load_runtime_metadata()?;
+                self.print_value(&serde_json::json!({
+                    "mode": runtime.mode,
+                    "worker_name": runtime.worker_name,
+                    "public_base_url": runtime.public_base_url,
+                    "deploy_url": runtime.deploy_url,
+                    "deployment_region": runtime.deployment_region,
+                    "bucket_name": runtime.bucket_name,
+                    "preview_bucket_name": runtime.preview_bucket_name,
+                    "service_root": runtime.service_root,
+                    "deployment_bound": profile.metadata().deployment_bundle_path.is_some(),
+                    "user_id": profile.metadata().user_id,
+                    "device_id": profile.metadata().device_id,
+                }))
+            }
+            CloudflareRuntimeSubcommand::Redeploy { profile } => {
+                let mut profile = Profile::open(profile)?;
+                let runtime = profile.load_runtime_metadata()?;
+                ensure_cloudflare_runtime_metadata(&runtime)?;
+                let mut driver = load_driver(&profile)?;
+                let identity = driver
+                    .local_identity()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+                let service_root = runtime
+                    .service_root
+                    .clone()
+                    .ok_or_else(|| anyhow!("cloudflare service_root is not recorded"))?;
+                let config = rebuild_cloudflare_config(&runtime)?;
+                self.provision_cloudflare_profile(
+                    &mut profile,
+                    &mut driver,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                    &service_root,
+                    config,
+                )
+                .await
+            }
+            CloudflareRuntimeSubcommand::RotateSecrets { profile } => {
+                let mut profile = Profile::open(profile)?;
+                let runtime = profile.load_runtime_metadata()?;
+                ensure_cloudflare_runtime_metadata(&runtime)?;
+                let mut driver = load_driver(&profile)?;
+                let identity = driver
+                    .local_identity()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+                let service_root = runtime
+                    .service_root
+                    .clone()
+                    .ok_or_else(|| anyhow!("cloudflare service_root is not recorded"))?;
+                let mut defaults = derive_cloudflare_defaults(
+                    &profile.metadata().name,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                );
+                defaults.worker_name = runtime.worker_name.clone().unwrap_or(defaults.worker_name);
+                defaults.public_base_url = runtime.public_base_url.clone().unwrap_or_default();
+                defaults.deployment_region = runtime
+                    .deployment_region
+                    .clone()
+                    .unwrap_or(defaults.deployment_region);
+                defaults.bucket_name = runtime.bucket_name.clone().unwrap_or(defaults.bucket_name);
+                defaults.preview_bucket_name = runtime
+                    .preview_bucket_name
+                    .clone()
+                    .unwrap_or(defaults.preview_bucket_name);
+                let config = resolve_cloudflare_config(
+                    &defaults,
+                    &super::runtime::CloudflareDeployOverrides::default(),
+                );
+                self.provision_cloudflare_profile(
+                    &mut profile,
+                    &mut driver,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                    &service_root,
+                    config,
+                )
+                .await
+            }
+            CloudflareRuntimeSubcommand::Detach { profile } => {
+                let mut profile = Profile::open(profile)?;
+                let mut snapshot = profile.load_snapshot()?;
+                snapshot.deployment = None;
+                profile.save_snapshot(&snapshot)?;
+                profile.clear_runtime_metadata()?;
+                profile.clear_deployment_bundle_path()?;
+                self.print_value(&serde_json::json!({
+                    "detached": true,
+                    "profile": profile.root(),
+                }))
+            }
+        }
+    }
+
+    async fn run_cloudflare_provision(&self, command: CloudflareProvisionCommand) -> Result<()> {
+        match command.command {
+            CloudflareProvisionSubcommand::Auto { profile } => {
+                let mut profile = Profile::open(profile)?;
+                let mut driver = load_driver(&profile)?;
+                let identity = driver
+                    .local_identity()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+                let service_root = resolve_service_root(
+                    None,
+                    Some(profile.metadata().root_dir.as_path()),
+                )?;
+                let defaults = derive_cloudflare_defaults(
+                    &profile.metadata().name,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                );
+                let config = resolve_cloudflare_config(
+                    &defaults,
+                    &super::runtime::CloudflareDeployOverrides::default(),
+                );
+                self.provision_cloudflare_profile(
+                    &mut profile,
+                    &mut driver,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                    &service_root,
+                    config,
+                )
+                .await
+            }
+            CloudflareProvisionSubcommand::Custom { profile } => {
+                let mut profile = Profile::open(profile)?;
+                let mut driver = load_driver(&profile)?;
+                let identity = driver
+                    .local_identity()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+                let service_root = resolve_service_root(
+                    None,
+                    Some(profile.metadata().root_dir.as_path()),
+                )?;
+                let defaults = derive_cloudflare_defaults(
+                    &profile.metadata().name,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                );
+                let overrides = prompt_cloudflare_overrides(&defaults)?;
+                let config = resolve_cloudflare_config(&defaults, &overrides);
+                self.provision_cloudflare_profile(
+                    &mut profile,
+                    &mut driver,
+                    &identity.user_identity.user_id,
+                    &identity.device_identity.device_id,
+                    &service_root,
+                    config,
+                )
+                .await
+            }
         }
     }
     async fn run_identity_command(
@@ -752,6 +968,62 @@ impl CliApp {
             "user_id": identity.user_identity.user_id,
             "device_id": identity.device_identity.device_id,
             "mnemonic": identity.mnemonic,
+        }))
+    }
+
+    async fn provision_cloudflare_profile(
+        &self,
+        profile: &mut Profile,
+        driver: &mut CoreDriver,
+        user_id: &str,
+        device_id: &str,
+        service_root: &Path,
+        config: super::runtime::ResolvedCloudflareDeployConfig,
+    ) -> Result<()> {
+        let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
+        let bundle = bootstrap_device_bundle(
+            &deployment.effective_public_base_url,
+            &config.bootstrap_token_secret,
+            user_id,
+            device_id,
+        )
+        .await?;
+        driver
+            .run_command_until_idle(CoreCommand::ImportDeploymentBundle {
+                bundle: bundle.clone(),
+            })
+            .await?;
+        profile.save_deployment_bundle(&bundle)?;
+        profile.save_runtime_metadata(&RuntimeMetadata {
+            pid: None,
+            base_url: Some(deployment.effective_public_base_url.clone()),
+            websocket_base_url: None,
+            bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
+            sharing_secret: Some(config.sharing_token_secret.clone()),
+            mode: Some("cloudflare".into()),
+            workspace_root: service_root.parent().and_then(|value| value.parent()).map(PathBuf::from),
+            service_root: Some(service_root.to_path_buf()),
+            worker_name: Some(deployment.worker_name.clone()),
+            public_base_url: Some(deployment.effective_public_base_url.clone()),
+            deploy_url: Some(deployment.deploy_url.clone()),
+            deployment_region: Some(deployment.deployment_region.clone()),
+            bucket_name: Some(deployment.bucket_name.clone()),
+            preview_bucket_name: Some(deployment.preview_bucket_name.clone()),
+            last_deployed_at: Some(format!("{:?}", std::time::SystemTime::now())),
+        })?;
+        persist_driver(profile, driver)?;
+        self.print_value(&serde_json::json!({
+            "provisioned": true,
+            "mode": "cloudflare",
+            "worker_name": deployment.worker_name,
+            "public_base_url": deployment.effective_public_base_url,
+            "deploy_url": deployment.deploy_url,
+            "bucket_name": deployment.bucket_name,
+            "preview_bucket_name": deployment.preview_bucket_name,
+            "deployment_region": deployment.deployment_region,
+            "generated_secrets": deployment.generated_secrets,
+            "user_id": user_id,
+            "device_id": device_id,
         }))
     }
 
@@ -858,6 +1130,58 @@ fn latest_notification_since(driver: &crate::cli::driver::CoreDriver, offset: us
         .notifications()
         .get(offset..)
         .and_then(|notifications| notifications.last().cloned())
+}
+
+fn append_result_from_output(
+    output: &crate::ffi_api::CoreOutput,
+) -> Option<&crate::ffi_api::AppendResultSummary> {
+    output
+        .view_model
+        .as_ref()
+        .and_then(|view| view.append_result.as_ref())
+}
+
+fn ensure_cloudflare_runtime_metadata(runtime: &RuntimeMetadata) -> Result<()> {
+    if runtime.mode.as_deref() != Some("cloudflare") {
+        bail!("runtime metadata is not bound to a cloudflare deployment");
+    }
+    Ok(())
+}
+
+fn rebuild_cloudflare_config(
+    runtime: &RuntimeMetadata,
+) -> Result<super::runtime::ResolvedCloudflareDeployConfig> {
+    Ok(super::runtime::ResolvedCloudflareDeployConfig {
+        worker_name: runtime
+            .worker_name
+            .clone()
+            .ok_or_else(|| anyhow!("cloudflare worker_name is not recorded"))?,
+        public_base_url: runtime.public_base_url.clone().unwrap_or_default(),
+        deployment_region: runtime
+            .deployment_region
+            .clone()
+            .unwrap_or_else(|| "global".into()),
+        max_inline_bytes: "4096".into(),
+        retention_days: "30".into(),
+        rate_limit_per_minute: "60".into(),
+        rate_limit_per_hour: "600".into(),
+        bucket_name: runtime
+            .bucket_name
+            .clone()
+            .ok_or_else(|| anyhow!("cloudflare bucket_name is not recorded"))?,
+        preview_bucket_name: runtime
+            .preview_bucket_name
+            .clone()
+            .ok_or_else(|| anyhow!("cloudflare preview_bucket_name is not recorded"))?,
+        sharing_token_secret: runtime
+            .sharing_secret
+            .clone()
+            .ok_or_else(|| anyhow!("cloudflare sharing_secret is not recorded"))?,
+        bootstrap_token_secret: runtime
+            .bootstrap_secret
+            .clone()
+            .ok_or_else(|| anyhow!("cloudflare bootstrap_secret is not recorded"))?,
+    })
 }
 
 async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadResult> {

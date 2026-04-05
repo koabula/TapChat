@@ -1031,8 +1031,27 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
         .system_statuses_changed
         .extend(right.state_update.system_statuses_changed);
     left.effects.extend(right.effects);
-    if right.view_model.is_some() {
-        left.view_model = right.view_model;
+    match (&mut left.view_model, right.view_model) {
+        (Some(left_view), Some(mut right_view)) => {
+            left_view.conversations.append(&mut right_view.conversations);
+            left_view.messages.append(&mut right_view.messages);
+            left_view.contacts.append(&mut right_view.contacts);
+            left_view.banners.append(&mut right_view.banners);
+            left_view.message_requests.append(&mut right_view.message_requests);
+            if right_view.allowlist.is_some() {
+                left_view.allowlist = right_view.allowlist.take();
+            }
+            if right_view.message_request_action.is_some() {
+                left_view.message_request_action = right_view.message_request_action.take();
+            }
+            if right_view.append_result.is_some() {
+                left_view.append_result = right_view.append_result.take();
+            }
+        }
+        (None, Some(right_view)) => {
+            left.view_model = Some(right_view);
+        }
+        _ => {}
     }
     left
 }

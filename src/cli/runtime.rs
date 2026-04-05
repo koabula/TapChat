@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,7 +9,9 @@ use std::time::{Duration, Instant};
 use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result, bail};
+use rand::RngCore;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::model::{CURRENT_MODEL_VERSION, DeploymentBundle};
@@ -23,6 +26,83 @@ pub struct LocalRuntimeInstance {
     pub bootstrap_secret: String,
     pub sharing_secret: String,
     pub service_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflareDeployDefaults {
+    pub worker_name: String,
+    pub public_base_url: String,
+    pub deployment_region: String,
+    pub max_inline_bytes: String,
+    pub retention_days: String,
+    pub rate_limit_per_minute: String,
+    pub rate_limit_per_hour: String,
+    pub bucket_name: String,
+    pub preview_bucket_name: String,
+    pub sharing_token_secret: String,
+    pub bootstrap_token_secret: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CloudflareDeployOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inline_bytes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_minute: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_hour: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_bucket_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedCloudflareDeployConfig {
+    pub worker_name: String,
+    pub public_base_url: String,
+    pub deployment_region: String,
+    pub max_inline_bytes: String,
+    pub retention_days: String,
+    pub rate_limit_per_minute: String,
+    pub rate_limit_per_hour: String,
+    pub bucket_name: String,
+    pub preview_bucket_name: String,
+    pub sharing_token_secret: String,
+    pub bootstrap_token_secret: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflareDeploymentResult {
+    pub success: bool,
+    pub worker_name: String,
+    pub deploy_url: String,
+    pub effective_public_base_url: String,
+    pub bucket_name: String,
+    pub preview_bucket_name: String,
+    pub deployment_region: String,
+    #[serde(default)]
+    pub generated_secrets: CloudflareGeneratedSecrets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CloudflareGeneratedSecrets {
+    pub sharing_token_secret: bool,
+    pub bootstrap_token_secret: bool,
 }
 
 pub fn start_local_runtime(
@@ -92,6 +172,144 @@ pub fn start_local_runtime(
             service_root,
         })
     }
+}
+
+pub fn derive_cloudflare_defaults(profile_name: &str, user_id: &str, device_id: &str) -> CloudflareDeployDefaults {
+    let worker_name = sanitize_cloudflare_name(&format!(
+        "tapchat-{}-{}",
+        profile_name,
+        short_identifier(user_id, 8)
+    ));
+    let bucket_name = format!("{worker_name}-storage");
+    let preview_bucket_name = format!("{worker_name}-storage-preview");
+    let _ = device_id;
+    CloudflareDeployDefaults {
+        worker_name,
+        public_base_url: String::new(),
+        deployment_region: "global".into(),
+        max_inline_bytes: "4096".into(),
+        retention_days: "30".into(),
+        rate_limit_per_minute: "60".into(),
+        rate_limit_per_hour: "600".into(),
+        bucket_name,
+        preview_bucket_name,
+        sharing_token_secret: std::env::var("TAPCHAT_CLOUDFLARE_SHARING_SECRET")
+            .unwrap_or_else(|_| generate_hex_secret()),
+        bootstrap_token_secret: std::env::var("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET")
+            .unwrap_or_else(|_| generate_hex_secret()),
+    }
+}
+
+pub fn resolve_cloudflare_config(
+    defaults: &CloudflareDeployDefaults,
+    overrides: &CloudflareDeployOverrides,
+) -> ResolvedCloudflareDeployConfig {
+    ResolvedCloudflareDeployConfig {
+        worker_name: overrides
+            .worker_name
+            .clone()
+            .unwrap_or_else(|| defaults.worker_name.clone()),
+        public_base_url: overrides
+            .public_base_url
+            .clone()
+            .unwrap_or_else(|| defaults.public_base_url.clone()),
+        deployment_region: overrides
+            .deployment_region
+            .clone()
+            .unwrap_or_else(|| defaults.deployment_region.clone()),
+        max_inline_bytes: overrides
+            .max_inline_bytes
+            .clone()
+            .unwrap_or_else(|| defaults.max_inline_bytes.clone()),
+        retention_days: overrides
+            .retention_days
+            .clone()
+            .unwrap_or_else(|| defaults.retention_days.clone()),
+        rate_limit_per_minute: overrides
+            .rate_limit_per_minute
+            .clone()
+            .unwrap_or_else(|| defaults.rate_limit_per_minute.clone()),
+        rate_limit_per_hour: overrides
+            .rate_limit_per_hour
+            .clone()
+            .unwrap_or_else(|| defaults.rate_limit_per_hour.clone()),
+        bucket_name: overrides
+            .bucket_name
+            .clone()
+            .unwrap_or_else(|| defaults.bucket_name.clone()),
+        preview_bucket_name: overrides
+            .preview_bucket_name
+            .clone()
+            .unwrap_or_else(|| defaults.preview_bucket_name.clone()),
+        sharing_token_secret: defaults.sharing_token_secret.clone(),
+        bootstrap_token_secret: defaults.bootstrap_token_secret.clone(),
+    }
+}
+
+pub fn prompt_cloudflare_overrides(defaults: &CloudflareDeployDefaults) -> Result<CloudflareDeployOverrides> {
+    Ok(CloudflareDeployOverrides {
+        worker_name: prompt_override("worker_name", &defaults.worker_name)?,
+        public_base_url: prompt_override_allow_blank(
+            "public_base_url",
+            "leave blank to use deployed worker URL / request origin",
+            &defaults.public_base_url,
+        )?,
+        deployment_region: prompt_override("deployment_region", &defaults.deployment_region)?,
+        max_inline_bytes: prompt_override("max_inline_bytes", &defaults.max_inline_bytes)?,
+        retention_days: prompt_override("retention_days", &defaults.retention_days)?,
+        rate_limit_per_minute: prompt_override(
+            "rate_limit_per_minute",
+            &defaults.rate_limit_per_minute,
+        )?,
+        rate_limit_per_hour: prompt_override(
+            "rate_limit_per_hour",
+            &defaults.rate_limit_per_hour,
+        )?,
+        bucket_name: prompt_override("bucket_name", &defaults.bucket_name)?,
+        preview_bucket_name: prompt_override(
+            "preview_bucket_name",
+            &defaults.preview_bucket_name,
+        )?,
+    })
+}
+
+pub async fn deploy_cloudflare_runtime(
+    service_root: &Path,
+    config: &ResolvedCloudflareDeployConfig,
+) -> Result<CloudflareDeploymentResult> {
+    if let Ok(stub) = std::env::var("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT") {
+        return serde_json::from_str(&stub).context("decode TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT");
+    }
+    let script_path = service_root.join("scripts").join("deploy-cloudflare.mjs");
+    if !script_path.exists() {
+        bail!(
+            "cloudflare deploy script not found at {}; run from a workspace containing services/cloudflare",
+            script_path.display()
+        );
+    }
+    let config_json = serde_json::to_string(config)?;
+    let node = std::env::var("TAPCHAT_NODE_PATH").unwrap_or_else(|_| "node".into());
+    let output = Command::new(node)
+        .arg(&script_path)
+        .current_dir(service_root)
+        .env("TAPCHAT_CLOUDFLARE_DEPLOY_CONFIG_JSON", config_json)
+        .env("TAPCHAT_CLOUDFLARE_DEPLOY_OUTPUT", "json")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("run cloudflare deploy script")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("cloudflare deploy script failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .ok_or_else(|| anyhow::anyhow!("cloudflare deploy script did not emit a JSON result"))?;
+    serde_json::from_str(json_line).context("decode cloudflare deploy result")
 }
 
 #[cfg(windows)]
@@ -396,4 +614,84 @@ fn reserve_port() -> Result<u16> {
     let port = listener.local_addr().context("get local addr")?.port();
     drop(listener);
     Ok(port)
+}
+
+fn prompt_override(label: &str, default_value: &str) -> Result<Option<String>> {
+    let answer = prompt_line(&format!(
+        "Override {label}? [default: {}] Leave blank to keep default: ",
+        display_default(default_value)
+    ))?;
+    if answer.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(answer))
+    }
+}
+
+fn prompt_override_allow_blank(label: &str, blank_note: &str, default_value: &str) -> Result<Option<String>> {
+    let answer = prompt_line(&format!(
+        "Override {label}? [default: {}] Leave blank to keep default; use '-' for empty ({blank_note}): ",
+        display_default(default_value)
+    ))?;
+    if answer.is_empty() {
+        Ok(None)
+    } else if answer == "-" {
+        Ok(Some(String::new()))
+    } else {
+        Ok(Some(answer))
+    }
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush().context("flush stdout")?;
+    let mut buffer = String::new();
+    io::stdin()
+        .read_line(&mut buffer)
+        .context("read stdin")?;
+    Ok(buffer.trim().to_string())
+}
+
+fn display_default(value: &str) -> &str {
+    if value.is_empty() {
+        "<empty>"
+    } else {
+        value
+    }
+}
+
+fn generate_hex_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn short_identifier(value: &str, max_len: usize) -> String {
+    value.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(max_len)
+        .collect()
+}
+
+fn sanitize_cloudflare_name(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        output.push(mapped);
+    }
+    let trimmed = output.trim_matches('-');
+    let collapsed = trimmed
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "tapchat-cloudflare".into()
+    } else {
+        collapsed
+    }
 }

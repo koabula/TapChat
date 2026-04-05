@@ -595,6 +595,17 @@ mod tests {
             if notification.status == crate::ffi_api::SystemStatus::MessageQueuedForApproval
                 && notification.message.contains("queued as a message request")
         )));
+        let append_result = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.append_result.as_ref())
+            .expect("append result");
+        assert!(append_result.accepted);
+        assert_eq!(
+            append_result.delivered_to,
+            crate::transport_contract::AppendDeliveryDisposition::MessageRequest
+        );
+        assert_eq!(append_result.request_id.as_deref(), Some("request:user:bob"));
     }
 
     #[test]
@@ -645,6 +656,50 @@ mod tests {
             if notification.status == crate::ffi_api::SystemStatus::MessageRejectedByPolicy
                 && notification.message.contains("rejected by inbox policy")
         )));
+        let append_result = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.append_result.as_ref())
+            .expect("append result");
+        assert!(append_result.accepted);
+        assert_eq!(
+            append_result.delivered_to,
+            crate::transport_contract::AppendDeliveryDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn append_inbox_result_exposes_structured_append_result() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+
+        let output = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":3,"delivered_to":"inbox"}"#.into()),
+            })
+            .expect("inbox response");
+
+        let append_result = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.append_result.as_ref())
+            .expect("append result");
+        assert!(append_result.accepted);
+        assert_eq!(append_result.seq, Some(3));
+        assert_eq!(
+            append_result.delivered_to,
+            crate::transport_contract::AppendDeliveryDisposition::Inbox
+        );
     }
 
     #[test]

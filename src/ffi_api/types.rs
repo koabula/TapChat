@@ -13,7 +13,7 @@ use crate::model::{
 use crate::persistence::{CorePersistenceSnapshot, PersistOp};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    AllowlistDocument, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    AllowlistDocument, AppendDeliveryDisposition, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
     FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestAction,
     MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
     PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
@@ -412,6 +412,18 @@ pub struct MessageRequestActionSummary {
     pub action: MessageRequestAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendResultSummary {
+    pub accepted: bool,
+    pub delivered_to: AppendDeliveryDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_as_request: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CoreViewModel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -428,6 +440,8 @@ pub struct CoreViewModel {
     pub allowlist: Option<AllowlistDocument>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_request_action: Option<MessageRequestActionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_result: Option<AppendResultSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -57,6 +57,18 @@ pub enum ProfileSubcommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    List,
+    Activate {
+        #[arg(long, conflicts_with = "name")]
+        profile: Option<PathBuf>,
+        #[arg(long, conflicts_with = "profile")]
+        name: Option<String>,
+    },
+    Current,
+    Remove {
+        #[arg(long)]
+        profile: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -338,13 +350,65 @@ pub enum RuntimeSubcommand {
         #[arg(long)]
         profile: PathBuf,
     },
+    Cloudflare(CloudflareRuntimeCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct CloudflareRuntimeCommand {
+    #[command(subcommand)]
+    pub command: CloudflareRuntimeSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CloudflareRuntimeSubcommand {
+    Provision(CloudflareProvisionCommand),
+    Status {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Redeploy {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    RotateSecrets {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Detach {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct CloudflareProvisionCommand {
+    #[command(subcommand)]
+    pub command: CloudflareProvisionSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CloudflareProvisionSubcommand {
+    Auto {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Custom {
+        #[arg(long)]
+        profile: PathBuf,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
 
-    use super::{Cli, Command, OutputFormat, ProfileCommand, ProfileSubcommand};
+    use super::{
+        Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
+        CloudflareRuntimeSubcommand, Command, OutputFormat, ProfileCommand, ProfileSubcommand,
+        RuntimeCommand, RuntimeSubcommand,
+    };
 
     #[test]
     fn cli_parses_profile_init() {
@@ -364,6 +428,44 @@ mod tests {
             Command::Profile(ProfileCommand {
                 command: ProfileSubcommand::Init { name, .. },
             }) => assert_eq!(name, "alice"),
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_profile_activate_by_name() {
+        let cli = Cli::parse_from(["tapchat", "profile", "activate", "--name", "alice"]);
+        match cli.command {
+            Command::Profile(ProfileCommand {
+                command: ProfileSubcommand::Activate { name, profile },
+            }) => {
+                assert_eq!(name.as_deref(), Some("alice"));
+                assert!(profile.is_none());
+            }
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_runtime_cloudflare_provision_auto() {
+        let cli = Cli::parse_from([
+            "tapchat",
+            "runtime",
+            "cloudflare",
+            "provision",
+            "auto",
+            "--profile",
+            "state/alice",
+        ]);
+        match cli.command {
+            Command::Runtime(RuntimeCommand {
+                command: RuntimeSubcommand::Cloudflare(CloudflareRuntimeCommand {
+                    command:
+                        CloudflareRuntimeSubcommand::Provision(CloudflareProvisionCommand {
+                            command: CloudflareProvisionSubcommand::Auto { profile },
+                        }),
+                }),
+            }) => assert_eq!(profile, PathBuf::from("state/alice")),
             _ => panic!("unexpected command shape"),
         }
     }

@@ -145,6 +145,10 @@ impl CloudflareRuntimeHandle {
         &self.websocket_base_url
     }
 
+    pub fn bootstrap_secret(&self) -> &str {
+        &self.bootstrap_secret
+    }
+
     pub async fn bootstrap_device_bundle(
         &self,
         user_id: &str,

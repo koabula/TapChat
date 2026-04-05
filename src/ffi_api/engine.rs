@@ -3731,8 +3731,24 @@ impl CoreEngine {
             .find(|item| item.envelope.message_id == message_id)
             .map(|item| item.peer_user_id.clone())
             .unwrap_or_else(|| "peer".into());
+        let append_result = AppendResultSummary {
+            accepted: result.accepted,
+            delivered_to: result.delivered_to.clone(),
+            queued_as_request: result.queued_as_request,
+            request_id: result.request_id.clone(),
+            seq: Some(result.seq),
+        };
         let (status, message, banner) = match result.delivered_to {
-            AppendDeliveryDisposition::Inbox => return CoreOutput::default(),
+            AppendDeliveryDisposition::Inbox => {
+                return CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![],
+                    view_model: Some(CoreViewModel {
+                        append_result: Some(append_result),
+                        ..CoreViewModel::default()
+                    }),
+                };
+            }
             AppendDeliveryDisposition::MessageRequest => (
                 SystemStatus::MessageQueuedForApproval,
                 format!("message {message_id} for {peer_user_id} is queued as a message request"),
@@ -3753,6 +3769,7 @@ impl CoreEngine {
                 notification: UserNotificationEffect { status, message },
             }],
             view_model: Some(CoreViewModel {
+                append_result: Some(append_result),
                 banners: vec![SystemBanner {
                     status,
                     message: banner,
@@ -4154,6 +4171,16 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
             base_view.messages.append(&mut next_view.messages);
             base_view.contacts.append(&mut next_view.contacts);
             base_view.banners.append(&mut next_view.banners);
+            base_view.message_requests.append(&mut next_view.message_requests);
+            if next_view.allowlist.is_some() {
+                base_view.allowlist = next_view.allowlist.take();
+            }
+            if next_view.message_request_action.is_some() {
+                base_view.message_request_action = next_view.message_request_action.take();
+            }
+            if next_view.append_result.is_some() {
+                base_view.append_result = next_view.append_result.take();
+            }
         }
         (None, Some(next_view)) => base.view_model = Some(next_view),
         _ => {}

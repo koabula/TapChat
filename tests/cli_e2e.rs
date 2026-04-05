@@ -135,6 +135,140 @@ fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
 }
 
 #[test]
+fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
+    let _guard = test_lock();
+    let workspace_root = workspace_root();
+    let runtime = runtime_handle(&workspace_root)?;
+    let temp_root = repo_temp_dir("cloudflare-provision-auto")?;
+    let registry_path = temp_root.path().join("device-profiles.json");
+    let alice_profile = temp_root.path().join("alice");
+    let bob_profile = temp_root.path().join("bob");
+
+    let registry_env = registry_path.to_string_lossy().to_string();
+
+    run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "profile",
+            "init",
+            "--name",
+            "alice",
+            "--root",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "profile",
+            "init",
+            "--name",
+            "bob",
+            "--root",
+            &bob_profile.to_string_lossy(),
+        ],
+    )?;
+
+    let listed = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        ["profile", "list"],
+    )?;
+    assert_eq!(listed["profiles"].as_array().map(|value| value.len()), Some(2));
+    assert_eq!(
+        listed["active_profile"].as_str(),
+        Some(alice_profile.to_string_lossy().as_ref())
+    );
+
+    run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        ["profile", "activate", "--profile", &bob_profile.to_string_lossy()],
+    )?;
+    let current = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        ["profile", "current"],
+    )?;
+    assert_eq!(current["name"].as_str(), Some("bob"));
+    assert_eq!(
+        current["root_dir"].as_str(),
+        Some(bob_profile.to_string_lossy().as_ref())
+    );
+
+    let identity = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "device",
+            "create",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+            "--device-name",
+            "phone",
+        ],
+    )?;
+    let user_id = required_str(&identity, "user_id")?;
+    let device_id = required_str(&identity, "device_id")?;
+
+    let deploy_stub = serde_json::json!({
+        "success": true,
+        "worker_name": "tapchat-test-worker",
+        "deploy_url": runtime.base_url(),
+        "effective_public_base_url": runtime.base_url(),
+        "bucket_name": "tapchat-test-worker-storage",
+        "preview_bucket_name": "tapchat-test-worker-storage-preview",
+        "deployment_region": "global",
+        "generated_secrets": {
+            "sharing_token_secret": false,
+            "bootstrap_token_secret": false
+        },
+        "mode": "stub"
+    })
+    .to_string();
+    let bootstrap_secret = runtime.bootstrap_secret().to_string();
+
+    let provisioned = run_cli_json_with_env(
+        [
+            ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
+            ("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT", deploy_stub.as_str()),
+            ("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET", bootstrap_secret.as_str()),
+        ],
+        [
+            "runtime",
+            "cloudflare",
+            "provision",
+            "auto",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(provisioned["provisioned"], Value::Bool(true));
+    assert_eq!(provisioned["mode"].as_str(), Some("cloudflare"));
+    assert_eq!(provisioned["user_id"].as_str(), Some(user_id.as_str()));
+    assert_eq!(provisioned["device_id"].as_str(), Some(device_id.as_str()));
+
+    let status = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "runtime",
+            "cloudflare",
+            "status",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(status["mode"].as_str(), Some("cloudflare"));
+    assert_eq!(status["deployment_bound"], Value::Bool(true));
+    assert_eq!(status["worker_name"].as_str(), Some("tapchat-test-worker"));
+    assert_eq!(status["public_base_url"].as_str(), Some(runtime.base_url()));
+
+    let removed = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        ["profile", "remove", "--profile", &bob_profile.to_string_lossy()],
+    )?;
+    assert_eq!(removed["removed"], Value::Bool(true));
+
+    Ok(())
+}
+
+#[test]
 fn cli_message_request_accept_flow_works() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -421,6 +555,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     ])?;
     assert_eq!(first_send["sent"], Value::Bool(true));
     assert_eq!(first_send["pending_outbox"], Value::from(0));
+    assert_append_result(&first_send, "message_request", true, Some(true))?;
     assert!(
         first_send["latest_notification"]
             .as_str()
@@ -466,6 +601,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     ])?;
     assert_eq!(second_send["sent"], Value::Bool(true));
     assert_eq!(second_send["pending_outbox"], Value::from(0));
+    assert_append_result(&second_send, "rejected", true, None)?;
     assert!(
         second_send["latest_notification"]
             .as_str()
@@ -773,6 +909,7 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
     ])?;
     assert_eq!(third_send["sent"], Value::Bool(true));
     assert_eq!(third_send["pending_outbox"], Value::from(0));
+    assert_append_result(&third_send, "inbox", true, None)?;
     assert!(third_send["latest_notification"].is_null());
 
     let delivered_sync = sync_once(&bob_profile)?;
@@ -906,6 +1043,7 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
         "policy recovery post heal",
     ])?;
     assert_eq!(bob_messages_after_recovery["sent"], Value::Bool(true));
+    assert_append_result(&bob_messages_after_recovery, "inbox", true, None)?;
     assert!(bob_messages_after_recovery["latest_notification"].is_null());
 
     let post_heal_sync = sync_once(&ctx.bob_profile)?;
@@ -1064,6 +1202,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "policy refresh request",
     ])?;
     assert_eq!(first_send["sent"], Value::Bool(true));
+    assert_append_result(&first_send, "message_request", true, Some(true))?;
     assert!(
         first_send["latest_notification"]
             .as_str()
@@ -1114,6 +1253,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "policy refresh rejected",
     ])?;
     assert_eq!(second_send["sent"], Value::Bool(true));
+    assert_append_result(&second_send, "rejected", true, None)?;
     assert!(
         second_send["latest_notification"]
             .as_str()
@@ -1304,6 +1444,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "policy refresh after heal",
     ])?;
     assert_eq!(fourth_send["sent"], Value::Bool(true));
+    assert_append_result(&fourth_send, "inbox", true, None)?;
     assert!(fourth_send["latest_notification"].is_null());
 
     let laptop_sync_after_heal = sync_once(&laptop.laptop_profile)?;
@@ -1338,6 +1479,274 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
 
     let laptop_after_reconcile = conversation_show(&laptop.laptop_profile, &ctx.conversation_id)?;
     assert_conversation_show_healthy(&laptop_after_reconcile);
+
+    Ok(())
+}
+
+#[test]
+fn cli_needs_rebuild_surfaces_escalation_reason_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("needs-rebuild-escalation")?;
+
+    let baseline_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "before corruption",
+    ])?;
+    assert_append_result(&baseline_send, "inbox", true, None)?;
+    let baseline_sync = sync_once(&ctx.bob_profile)?;
+    let baseline_acked = required_u64(&baseline_sync["checkpoint"], "last_acked_seq")?;
+    assert!(baseline_acked > 0);
+
+    corrupt_first_mls_state(&ctx.alice_profile)?;
+
+    let alice_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_needs_rebuild(&alice_show, "mls_marked_unrecoverable")?;
+    let alice_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    let rebuild_phase = assert_recovery_conversation_matches(
+        &alice_status,
+        &ctx.conversation_id,
+        &["NeedsRebuild"],
+        &["missing_commit"],
+        &["escalated_to_rebuild"],
+        Some(true),
+    )?;
+    assert_eq!(rebuild_phase, "escalated_to_rebuild");
+    assert_eq!(
+        find_recovery_conversation(&alice_status, &ctx.conversation_id)?["escalation_reason"]
+            .as_str(),
+        Some("mls_marked_unrecoverable")
+    );
+
+    let rebuilt = run_cli_json([
+        "conversation",
+        "rebuild",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(rebuilt["rebuilt"], Value::Bool(true));
+
+    run_cli_json([
+        "device",
+        "rotate-key-package",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+    ])?;
+    publish_identity_bundle_for_profile(
+        ctx.temp_root.path(),
+        &ctx.runtime,
+        bundle_auth(&ctx.bob_bundle)?,
+        &ctx.bob_profile,
+        "bob-post-rebuild-identity.json",
+    )?;
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+
+    let mut last_acked = baseline_acked;
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let sync = sync_once(&ctx.bob_profile)?;
+        let acked = required_u64(&sync["checkpoint"], "last_acked_seq")?;
+        assert!(acked >= last_acked);
+        last_acked = acked;
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    let healed_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_healthy(&healed_show);
+    let healed_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert!(recovery_conversations(&healed_status)?.is_empty());
+
+    let after_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "after rebuild",
+    ])?;
+    assert_append_result(&after_send, "inbox", true, None)?;
+    let final_sync = sync_once(&ctx.bob_profile)?;
+    let final_acked = required_u64(&final_sync["checkpoint"], "last_acked_seq")?;
+    assert!(final_acked >= last_acked);
+    let bob_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(count_plaintext_messages(&bob_messages, "after rebuild"), 1);
+
+    Ok(())
+}
+
+#[test]
+fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("rebuild-policy-exhausted")?;
+
+    let baseline_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "before policy exhausted rebuild",
+    ])?;
+    assert_append_result(&baseline_send, "inbox", true, None)?;
+    let baseline_sync = sync_once(&ctx.bob_profile)?;
+    let mut last_acked = required_u64(&baseline_sync["checkpoint"], "last_acked_seq")?;
+
+    let rebuilt = run_cli_json([
+        "conversation",
+        "rebuild",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(rebuilt["rebuilt"], Value::Bool(true));
+
+    let alice_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_needs_rebuild(&alice_show, "mls_marked_unrecoverable")?;
+    let alice_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert_recovery_conversation_matches(
+        &alice_status,
+        &ctx.conversation_id,
+        &["NeedsRebuild"],
+        &["identity_changed", "missing_commit"],
+        &["escalated_to_rebuild"],
+        Some(true),
+    )?;
+    assert_eq!(
+        find_recovery_conversation(&alice_status, &ctx.conversation_id)?["escalation_reason"]
+            .as_str(),
+        Some("mls_marked_unrecoverable")
+    );
+
+    run_cli_json([
+        "device",
+        "rotate-key-package",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+    ])?;
+    publish_identity_bundle_for_profile(
+        ctx.temp_root.path(),
+        &ctx.runtime,
+        bundle_auth(&ctx.bob_bundle)?,
+        &ctx.bob_profile,
+        "bob-post-policy-rebuild-identity.json",
+    )?;
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let sync = sync_once(&ctx.bob_profile)?;
+        let acked = required_u64(&sync["checkpoint"], "last_acked_seq")?;
+        assert!(acked >= last_acked);
+        last_acked = acked;
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    let healed_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_healthy(&healed_show);
+    let healed_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert!(recovery_conversations(&healed_status)?.is_empty());
+
+    let after_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "after stable rebuild escalation",
+    ])?;
+    assert_append_result(&after_send, "inbox", true, None)?;
+    let final_sync = sync_once(&ctx.bob_profile)?;
+    let final_acked = required_u64(&final_sync["checkpoint"], "last_acked_seq")?;
+    assert!(final_acked >= last_acked);
+    let bob_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&bob_messages, "after stable rebuild escalation"),
+        1
+    );
 
     Ok(())
 }
@@ -1583,7 +1992,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("direct")?;
 
-    run_cli_json([
+    let text_send = run_cli_json([
         "message",
         "send-text",
         "--profile",
@@ -1593,6 +2002,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--text",
         "hello from cli e2e",
     ])?;
+    assert_append_result(&text_send, "inbox", true, None)?;
     let first_sync = run_cli_json([
         "sync",
         "once",
@@ -1662,6 +2072,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
     assert_eq!(attachment_send["queued"], Value::Bool(true));
     assert_eq!(attachment_send["pending_outbox"].as_u64(), Some(0));
     assert_eq!(attachment_send["pending_blob_uploads"].as_u64(), Some(0));
+    assert_append_result(&attachment_send, "inbox", true, None)?;
 
     let alice_sync_status = run_cli_json([
         "sync",
@@ -2851,6 +3262,208 @@ fn cli_repeated_realtime_and_sync_do_not_duplicate_delivery_e2e_work() -> Result
 }
 
 #[test]
+fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("multi-device-restart-rebuild")?;
+    let laptop = start_bob_laptop_recovery(&ctx)?;
+
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let _ = sync_once(&laptop.laptop_profile)?;
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    let pre_rebuild_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "before multi device rebuild",
+    ])?;
+    assert_append_result(&pre_rebuild_send, "inbox", true, None)?;
+    let laptop_sync_before = sync_once(&laptop.laptop_profile)?;
+    let baseline_acked = required_u64(&laptop_sync_before["checkpoint"], "last_acked_seq")?;
+    assert!(baseline_acked > 0);
+
+    corrupt_first_mls_state(&ctx.alice_profile)?;
+    let rebuild_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_needs_rebuild(&rebuild_show, "mls_marked_unrecoverable")?;
+
+    let rebuild_cmd = run_cli_json([
+        "conversation",
+        "rebuild",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(rebuild_cmd["rebuilt"], Value::Bool(true));
+
+    run_cli_json([
+        "device",
+        "rotate-key-package",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "device",
+        "rotate-key-package",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+    ])?;
+    let merged_identity = publish_merged_identity_bundle_for_profiles(
+        ctx.temp_root.path(),
+        &ctx.runtime,
+        bundle_auth(&ctx.bob_bundle)?,
+        &ctx.bob_bundle,
+        &ctx.bob_profile,
+        &[
+            (&ctx.bob_profile, "bob-phone-post-rebuild-identity.json"),
+            (&laptop.laptop_profile, "bob-laptop-post-rebuild-identity.json"),
+        ],
+    )?;
+    patch_profile_local_bundle(&laptop.laptop_profile, &merged_identity)?;
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+
+    let sync_after_rebuild_one = sync_once(&ctx.bob_profile)?;
+    let phone_acked_after_one =
+        required_u64(&sync_after_rebuild_one["checkpoint"], "last_acked_seq")?;
+    let phone_sync_after_rebuild_two = sync_once(&ctx.bob_profile)?;
+    let phone_acked_after_two =
+        required_u64(&phone_sync_after_rebuild_two["checkpoint"], "last_acked_seq")?;
+    assert!(phone_acked_after_two >= phone_acked_after_one);
+
+    let sync_after_rebuild_one = sync_once(&laptop.laptop_profile)?;
+    let acked_after_one =
+        required_u64(&sync_after_rebuild_one["checkpoint"], "last_acked_seq")?;
+    let sync_after_rebuild_two = sync_once(&laptop.laptop_profile)?;
+    let acked_after_two =
+        required_u64(&sync_after_rebuild_two["checkpoint"], "last_acked_seq")?;
+    assert!(acked_after_two >= acked_after_one);
+
+    for _ in 0..4 {
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        run_cli_json([
+            "conversation",
+            "reconcile",
+            "--profile",
+            &ctx.alice_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?;
+        let phone_sync_one = sync_once(&ctx.bob_profile)?;
+        let phone_sync_two = sync_once(&ctx.bob_profile)?;
+        let phone_seq_one = required_u64(&phone_sync_one["checkpoint"], "last_acked_seq")?;
+        let phone_seq_two = required_u64(&phone_sync_two["checkpoint"], "last_acked_seq")?;
+        assert!(phone_seq_two >= phone_seq_one);
+        let laptop_sync_one = sync_once(&laptop.laptop_profile)?;
+        let laptop_sync_two = sync_once(&laptop.laptop_profile)?;
+        let laptop_seq_one = required_u64(&laptop_sync_one["checkpoint"], "last_acked_seq")?;
+        let laptop_seq_two = required_u64(&laptop_sync_two["checkpoint"], "last_acked_seq")?;
+        assert!(laptop_seq_two >= laptop_seq_one);
+        if conversation_recovery_status(&ctx.alice_profile, &ctx.conversation_id)?.as_deref()
+            == Some("Healthy")
+        {
+            break;
+        }
+    }
+
+    let final_alice_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_healthy(&final_alice_show);
+    let final_alice_status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert!(recovery_conversations(&final_alice_status)?.is_empty());
+
+    let post_rebuild_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "after multi device rebuild",
+    ])?;
+    assert_append_result(&post_rebuild_send, "inbox", true, None)?;
+    let final_phone_sync_one = sync_once(&ctx.bob_profile)?;
+    let final_phone_sync_two = sync_once(&ctx.bob_profile)?;
+    let final_phone_seq_one =
+        required_u64(&final_phone_sync_one["checkpoint"], "last_acked_seq")?;
+    let final_phone_seq_two =
+        required_u64(&final_phone_sync_two["checkpoint"], "last_acked_seq")?;
+    assert!(final_phone_seq_two >= final_phone_seq_one);
+    let final_sync_one = sync_once(&laptop.laptop_profile)?;
+    let final_sync_two = sync_once(&laptop.laptop_profile)?;
+    let final_seq_one = required_u64(&final_sync_one["checkpoint"], "last_acked_seq")?;
+    let final_seq_two = required_u64(&final_sync_two["checkpoint"], "last_acked_seq")?;
+    assert!(final_seq_two >= final_seq_one);
+    assert!(final_seq_two >= baseline_acked);
+
+    let laptop_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &laptop.laptop_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&laptop_messages, "before multi device rebuild"),
+        1
+    );
+    assert_eq!(
+        count_plaintext_messages(&laptop_messages, "after multi device rebuild"),
+        1
+    );
+    let bob_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&bob_messages, "after multi device rebuild"),
+        1
+    );
+
+    Ok(())
+}
+
+#[test]
 fn cli_revoke_with_delayed_sync_keeps_revoked_device_isolated() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("revoke-delayed-sync")?;
@@ -3107,11 +3720,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    run_cli_json_with_env(std::iter::empty::<(&str, &str)>(), args)
+}
+
+fn run_cli_json_with_env<I, S, K, V>(envs: impl IntoIterator<Item = (K, V)>, args: I) -> Result<Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
     let mut command = Command::new(binary_path());
     command
         .current_dir(workspace_root())
         .arg("--output")
         .arg("json");
+    for (key, value) in envs {
+        command.env(key.as_ref(), value.as_ref());
+    }
     for arg in args {
         command.arg(arg.as_ref());
     }
@@ -3160,6 +3786,18 @@ fn conversation_exists(profile: &Path, conversation_id: &str) -> Result<bool> {
         .context("conversation list not array")?
         .iter()
         .any(|row| row["conversation_id"].as_str() == Some(conversation_id)))
+}
+
+fn corrupt_first_mls_state(profile: &Path) -> Result<()> {
+    let snapshot_path = profile.join("snapshot.json");
+    let mut snapshot: Value = read_json_file(&snapshot_path)?;
+    let states = snapshot["snapshot"]["mls_states"]
+        .as_array_mut()
+        .context("snapshot mls_states missing")?;
+    let first = states.first_mut().context("missing persisted mls state")?;
+    first["serialized_group_state"] = Value::String("{broken".into());
+    fs::write(snapshot_path, serde_json::to_vec_pretty(&snapshot)?)?;
+    Ok(())
 }
 
 fn conversation_recovery_status(profile: &Path, conversation_id: &str) -> Result<Option<String>> {
@@ -3224,6 +3862,33 @@ fn count_plaintext_messages(messages: &Value, plaintext: &str) -> usize {
                 .count()
         })
         .unwrap_or_default()
+}
+
+fn append_result<'a>(value: &'a Value) -> Result<&'a Value> {
+    value.get("append_result")
+        .context("append_result missing")?
+        .as_object()
+        .map(|_| &value["append_result"])
+        .context("append_result not object")
+}
+
+fn assert_append_result(
+    value: &Value,
+    delivered_to: &str,
+    accepted: bool,
+    request_expected: Option<bool>,
+) -> Result<()> {
+    let result = append_result(value)?;
+    assert_eq!(result["accepted"].as_bool(), Some(accepted));
+    assert_eq!(result["delivered_to"].as_str(), Some(delivered_to));
+    match request_expected {
+        Some(expected) => assert_eq!(result["queued_as_request"].as_bool(), Some(expected)),
+        None => assert!(
+            result["queued_as_request"].as_bool() == Some(false)
+                || result["queued_as_request"].is_null()
+        ),
+    }
+    Ok(())
 }
 
 fn assert_realtime_not_connected(snapshot: &Value) {
@@ -3334,6 +3999,21 @@ fn assert_conversation_show_recovery(
 fn assert_conversation_show_healthy(value: &Value) {
     assert_eq!(value["recovery_status"].as_str(), Some("Healthy"));
     assert!(value["recovery"].is_null());
+}
+
+fn assert_conversation_show_needs_rebuild(
+    value: &Value,
+    expected_escalation_reason: &str,
+) -> Result<()> {
+    assert_eq!(value["recovery_status"].as_str(), Some("NeedsRebuild"));
+    let recovery = &value["recovery"];
+    assert_recovery_object_shape(recovery)?;
+    assert_eq!(recovery["phase"].as_str(), Some("escalated_to_rebuild"));
+    assert_eq!(
+        recovery["escalation_reason"].as_str(),
+        Some(expected_escalation_reason)
+    );
+    Ok(())
 }
 
 fn recovery_phase_rank(phase: &str) -> u8 {
@@ -3729,6 +4409,37 @@ fn patch_profile_local_bundle(profile: &Path, bundle: &IdentityBundle) -> Result
         serde_json::to_vec_pretty(&snapshot)?,
     )?;
     Ok(())
+}
+
+fn publish_identity_bundle_for_profile(
+    root: &Path,
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    profile: &Path,
+    name: &str,
+) -> Result<IdentityBundle> {
+    let identity_path = export_identity_bundle_to_path(root, profile, name)?;
+    let identity_bundle: IdentityBundle = read_json_file(&identity_path)?;
+    runtime_put_identity_bundle(runtime, auth, &identity_bundle)?;
+    Ok(identity_bundle)
+}
+
+fn publish_merged_identity_bundle_for_profiles(
+    root: &Path,
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    deployment: &DeploymentBundle,
+    signer_profile: &Path,
+    profiles: &[(&Path, &str)],
+) -> Result<IdentityBundle> {
+    let mut exported = Vec::with_capacity(profiles.len());
+    for (profile, name) in profiles {
+        let identity_path = export_identity_bundle_to_path(root, profile, name)?;
+        exported.push(read_json_file::<IdentityBundle>(&identity_path)?);
+    }
+    let merged_identity = merge_identity_bundles(deployment, signer_profile, &exported)?;
+    runtime_put_identity_bundle(runtime, auth, &merged_identity)?;
+    Ok(merged_identity)
 }
 
 fn bundle_auth(bundle: &DeploymentBundle) -> Result<&DeviceRuntimeAuth> {

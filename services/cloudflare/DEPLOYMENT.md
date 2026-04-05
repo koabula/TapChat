@@ -1,89 +1,91 @@
-# Cloudflare Manual Deployment
+# Cloudflare Deployment
 
-This document turns the current Cloudflare reference implementation into a repeatable manual Wrangler deployment flow.
+Use the local deployment wizard to provision the Cloudflare reference transport into a real Cloudflare account. This flow runs on your machine, not in the Cloudflare dashboard.
 
-## Scope
+Recommended user entry:
 
-This deployment guide covers:
+- `cargo run --bin tapchat -- --output json runtime cloudflare provision auto --profile <profile-dir>`
+- `cargo run --bin tapchat -- --output json runtime cloudflare provision custom --profile <profile-dir>`
+
+The standalone script remains available for development and operator debugging:
+
+- `npm run deploy:cloudflare`
+
+## What the script does
+
+`npm run deploy:cloudflare` performs the full operator flow:
+- verifies local prerequisites
+- checks Wrangler authentication and auto-starts `wrangler login` if needed
+- collects deployment vars and secrets interactively
+- creates or reuses the required R2 buckets
+- writes Cloudflare secrets
+- runs `npm run check`, `npm test`, and `npm run test:integration`
+- deploys the Worker with a temporary Wrangler config
+
+The script deploys:
 
 - Worker + Durable Object inbox
 - R2-backed storage
 - WebSocket `Inbox.Subscribe`
-- device bootstrap and deployment bundle issuance
-- shared-state and keypackage writes
+- bootstrap, shared-state, and keypackage routes
 
 This guide does not cover:
 
 - Wakeup bridge
-- Terraform or one-click provisioning
-- multi-region failover
+- Terraform
+- direct device bootstrap automation inside TapChat CLI
 
 ## Prerequisites
 
 - Cloudflare account with Workers, Durable Objects, and R2 enabled
 - Node.js 22+
-- npm dependencies installed in `services/cloudflare`
-- Wrangler authenticated against the target account
+- npm dependencies installed in `D:\Code\TapChat\services\cloudflare`
+- local terminal access on the machine that will run the deployment
 
-## Required bindings
+The script uses your local Wrangler session as the Cloudflare permission source. If you are not logged in, it opens the standard Cloudflare browser login flow.
 
-`services/cloudflare/wrangler.toml` already defines the base topology:
+## Usage
 
-- Durable Object binding: `INBOX`
-- R2 bucket binding: `TAPCHAT_STORAGE`
-- Worker entrypoint: `src/index.ts`
+```powershell
+cd D:\Code\TapChat\services\cloudflare
+npm run deploy:cloudflare
+```
 
-Before first deploy, create the R2 bucket and ensure the Durable Object migration tag remains in sync with the deployed schema.
+The script runs locally and deploys to the real Cloudflare environment tied to your Wrangler login.
 
-## Required vars and secrets
+## Inputs the script asks for
 
-Set these per environment before deploying:
+Vars:
 
+- `worker_name`
 - `PUBLIC_BASE_URL`
-  - The final HTTPS origin for the Worker, such as `https://tapchat-worker.example.workers.dev`
 - `DEPLOYMENT_REGION`
-  - A stable operator label such as `us-east-1` or `global`
-- `MAX_INLINE_BYTES`
-  - Recommended initial value: `4096`
-- `RETENTION_DAYS`
-  - Recommended initial value: `30`
-- `RATE_LIMIT_PER_MINUTE`
-  - Recommended initial value: `60`
-- `RATE_LIMIT_PER_HOUR`
-  - Recommended initial value: `600`
+- `MAX_INLINE_BYTES` default `4096`
+- `RETENTION_DAYS` default `30`
+- `RATE_LIMIT_PER_MINUTE` default `60`
+- `RATE_LIMIT_PER_HOUR` default `600`
+- `bucket_name` default `<worker_name>-storage`
+- `preview_bucket_name` default `<worker_name>-storage-preview`
 
 Secrets:
 
 - `SHARING_TOKEN_SECRET`
-  - Signs device runtime tokens, shared-state write tokens, keypackage write tokens, and storage sharing URLs
 - `BOOTSTRAP_TOKEN_SECRET`
-  - Signs bootstrap tokens used to issue a device deployment bundle
 
-Example commands:
+Secrets are written with `wrangler secret put` and are not stored in the temporary Wrangler config file.
 
-```powershell
-cd D:\Code\TapChat\services\cloudflare
-npx wrangler secret put SHARING_TOKEN_SECRET
-npx wrangler secret put BOOTSTRAP_TOKEN_SECRET
-```
+## Result after deploy
 
-## Deploy
+After the script succeeds, the target Cloudflare account has:
 
-```powershell
-cd D:\Code\TapChat\services\cloudflare
-npm run check
-npm test
-npm run test:integration
-npx wrangler deploy
-```
+- a deployed Worker
+- the required Durable Object migration
+- the required R2 bucket bindings
+- the configured vars and secrets
 
-After deploy, confirm the Worker URL matches `PUBLIC_BASE_URL`.
+The script prints the Worker name, `PUBLIC_BASE_URL`, and storage bucket names. The next manual step is still to bootstrap a device and import the returned deployment bundle into a TapChat profile.
 
-## Deployment bundle flow
-
-TapChat clients do not consume raw Wrangler output. They consume a deployment bundle issued by the bootstrap route.
-
-The bundle must include:
+The bootstrap route returns a deployment bundle that includes:
 
 - `inbox_http_endpoint`
 - `inbox_websocket_endpoint`
@@ -91,86 +93,50 @@ The bundle must include:
 - `runtime_config`
 - `device_runtime_auth`
 
-Manual issuance flow:
+## Bootstrap and publishing flow
 
-1. Construct a bootstrap token signed with `BOOTSTRAP_TOKEN_SECRET`.
-2. Call `POST /v1/bootstrap/device` with:
-   - `userId`
-   - `deviceId`
-   - model `version`
+After deployment:
+
+1. Mint a bootstrap token signed with `BOOTSTRAP_TOKEN_SECRET`.
+2. Call `POST /v1/bootstrap/device` with `userId`, `deviceId`, and model `version`.
 3. Import the returned deployment bundle into the client profile.
-4. Publish the local identity bundle using `device_runtime_auth`.
+4. Publish the local identity bundle, device status, and keypackage refs/objects using `device_runtime_auth`.
 
-The bootstrap token must:
+Clients should never receive a Cloudflare management API token.
 
-- use service `bootstrap`
-- include `operations: ["issue_device_bundle"]`
-- match the target `userId`
-- match the target `deviceId`
-- have a short expiry
+## Troubleshooting
 
-## Shared-state and keypackage publishing
+### Wrangler login fails
 
-After importing the deployment bundle, the client should publish:
+- Re-run `npx wrangler login`
+- Confirm the browser-based Cloudflare authorization completes
+- Re-run `npm run deploy:cloudflare`
 
-- identity bundle
-- device status
-- keypackage refs and objects
+### Bucket creation fails
 
-Those writes use the `device_runtime_auth` token returned in the deployment bundle. No long-lived Cloudflare API token should be embedded in the client.
+- Confirm the target account has R2 enabled
+- Check whether the bucket name is already taken in the target account
+- Re-run the script with a different bucket name if required
 
-## Smoke checklist
+### Secret write fails
 
-After every deploy, run this checklist against the deployed Worker:
+- Confirm Wrangler is authenticated against the correct account
+- Verify you have permission to update Worker secrets in that account
 
-1. `POST /v1/bootstrap/device` returns a deployment bundle with `deviceRuntimeAuth`.
-2. `GET /v1/inbox/{deviceId}/head` succeeds with the returned runtime token.
-3. `GET /v1/inbox/{deviceId}/messages?fromSeq=1&limit=10` succeeds with the returned runtime token.
-4. `POST /v1/inbox/{deviceId}/ack` succeeds with the returned runtime token.
-5. `GET /v1/inbox/{deviceId}/subscribe` upgrades to WebSocket with the returned runtime token.
-6. `POST /v1/storage/prepare-upload` returns upload and download targets.
-7. Upload and download both succeed for a prepared blob.
-8. `PUT /v1/shared-state/{userId}/identity-bundle` succeeds with the returned runtime token.
-9. message requests and allowlist routes behave as expected for a non-allowlisted sender.
+### Pre-deploy tests fail
 
-## Token lifecycle
+- Fix the failing local check before deploying
+- The script intentionally blocks deployment when `check`, `test`, or `test:integration` is red
 
-Recommended operational rules:
+### Deploy URL and `PUBLIC_BASE_URL` do not match
 
-- Bootstrap tokens should be short-lived and minted only for operator-assisted provisioning.
-- `device_runtime_auth` should be treated as an environment-scoped runtime capability, not a permanent credential.
-- Storage sharing URLs should be treated as short-lived bearer URLs.
-- Rotation of `SHARING_TOKEN_SECRET` invalidates previously issued runtime tokens and sharing URLs.
-- Rotation of `BOOTSTRAP_TOKEN_SECRET` invalidates previously issued bootstrap tokens, but does not revoke already issued runtime tokens.
+- If you use a `*.workers.dev` origin, they should match directly
+- If you use a custom domain, confirm the Worker route and DNS mapping manually
 
-## Rotation workflow
-
-### Rotate `BOOTSTRAP_TOKEN_SECRET`
-
-Use when bootstrap tokens leak.
-
-1. Write a new `BOOTSTRAP_TOKEN_SECRET`.
-2. Redeploy the Worker.
-3. Reissue bootstrap tokens for any still-pending provisioning flow.
-
-Existing runtime tokens continue to work.
-
-### Rotate `SHARING_TOKEN_SECRET`
-
-Use when runtime tokens or sharing URLs leak.
-
-1. Write a new `SHARING_TOKEN_SECRET`.
-2. Redeploy the Worker.
-3. Re-bootstrap affected devices to obtain a fresh deployment bundle.
-4. Re-import the deployment bundle into those devices.
-5. Re-publish identity bundle, device status, and keypackage refs if required by the recovery flow.
-
-After this rotation, old runtime tokens and old blob sharing URLs should fail authorization.
-
-## Failure modes
+### Common runtime errors
 
 - `401 invalid_capability`
-  - token missing, expired, signed with the wrong secret, or malformed
+  - token missing, expired, malformed, or signed with the wrong secret
 - `403 invalid_capability`
   - token service, scope, path binding, or object binding does not match the request
 - `413`
@@ -178,9 +144,3 @@ After this rotation, old runtime tokens and old blob sharing URLs should fail au
 - `429`
   - sender-recipient rate limit triggered
 
-## Operator notes
-
-- The Cloudflare Worker is the only public edge entrypoint.
-- Durable Objects and R2 stay behind Worker routing and secrets.
-- Clients should never receive a Cloudflare management API token.
-- Desktop continues to rely on `Inbox.Subscribe` plus `head + fetch + ack` recovery; Wakeup remains out of scope for this deployment.
