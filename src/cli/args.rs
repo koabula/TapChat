@@ -44,16 +44,16 @@ pub enum ProfileSubcommand {
     },
     Show {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     ImportDeployment {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         bundle_file: PathBuf,
     },
     ExportIdentity {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -67,7 +67,7 @@ pub enum ProfileSubcommand {
     Current,
     Remove {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
 }
 
@@ -81,7 +81,7 @@ pub struct DeviceCommand {
 pub enum DeviceSubcommand {
     Create {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         device_name: String,
         #[arg(long)]
@@ -89,7 +89,7 @@ pub enum DeviceSubcommand {
     },
     Recover {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         device_name: String,
         #[arg(long)]
@@ -97,7 +97,7 @@ pub enum DeviceSubcommand {
     },
     Add {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         device_name: String,
         #[arg(long)]
@@ -105,15 +105,15 @@ pub enum DeviceSubcommand {
     },
     RotateKeyPackage {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Status {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Revoke {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         target_device_id: String,
     },
@@ -129,24 +129,24 @@ pub struct ContactCommand {
 pub enum ContactSubcommand {
     ImportIdentity {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         bundle_file: PathBuf,
     },
     Refresh {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         user_id: String,
     },
     Show {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         user_id: String,
     },
     List {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Requests(ContactRequestsCommand),
     Allowlist(ContactAllowlistCommand),
@@ -162,17 +162,17 @@ pub struct ContactRequestsCommand {
 pub enum ContactRequestsSubcommand {
     List {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Accept {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         request_id: String,
     },
     Reject {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         request_id: String,
     },
@@ -188,17 +188,17 @@ pub struct ContactAllowlistCommand {
 pub enum ContactAllowlistSubcommand {
     List {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Add {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         user_id: String,
     },
     Remove {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         user_id: String,
     },
@@ -214,35 +214,35 @@ pub struct ConversationCommand {
 pub enum ConversationSubcommand {
     CreateDirect {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         peer_user_id: String,
     },
     List {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Show {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
     },
     Members {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
     },
     Rebuild {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
     },
     Reconcile {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
     },
@@ -258,7 +258,7 @@ pub struct MessageCommand {
 pub enum MessageSubcommand {
     SendText {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
         #[arg(long)]
@@ -266,7 +266,7 @@ pub enum MessageSubcommand {
     },
     SendAttachment {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
         #[arg(long)]
@@ -274,7 +274,7 @@ pub enum MessageSubcommand {
     },
     DownloadAttachment {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
         #[arg(long)]
@@ -286,7 +286,7 @@ pub enum MessageSubcommand {
     },
     List {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
     },
@@ -302,27 +302,27 @@ pub struct SyncCommand {
 pub enum SyncSubcommand {
     Once {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Foreground {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     RealtimeConnect {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     RealtimeClose {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Status {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Head {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         device_id: Option<String>,
     },
@@ -338,17 +338,17 @@ pub struct RuntimeCommand {
 pub enum RuntimeSubcommand {
     LocalStart {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
         #[arg(long)]
         workspace_root: Option<PathBuf>,
     },
     LocalStop {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     LocalStatus {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Cloudflare(CloudflareRuntimeCommand),
 }
@@ -364,19 +364,19 @@ pub enum CloudflareRuntimeSubcommand {
     Provision(CloudflareProvisionCommand),
     Status {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Redeploy {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     RotateSecrets {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Detach {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
 }
 
@@ -390,11 +390,11 @@ pub struct CloudflareProvisionCommand {
 pub enum CloudflareProvisionSubcommand {
     Auto {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
     Custom {
         #[arg(long)]
-        profile: PathBuf,
+        profile: Option<PathBuf>,
     },
 }
 
@@ -465,8 +465,9 @@ mod tests {
                             command: CloudflareProvisionSubcommand::Auto { profile },
                         }),
                 }),
-            }) => assert_eq!(profile, PathBuf::from("state/alice")),
+            }) => assert_eq!(profile, Some(PathBuf::from("state/alice"))),
             _ => panic!("unexpected command shape"),
         }
     }
 }
+

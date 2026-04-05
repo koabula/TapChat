@@ -8,3 +8,4 @@ node_modules/
 /.cli-smoke*.txt
 /services/cloudflare/.cli-smoke*/
 /services/cloudflare/.wrangler/tmp/
+/.prod-smoke/

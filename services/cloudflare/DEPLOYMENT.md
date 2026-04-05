@@ -144,3 +144,19 @@ Clients should never receive a Cloudflare management API token.
 - `429`
   - sender-recipient rate limit triggered
 
+
+## Real Cloudflare Smoke Runbook
+
+After `runtime cloudflare provision auto/custom` succeeds, verify the real deployment in this order:
+
+1. Run `cargo run --bin tapchat -- --output json runtime cloudflare status --profile <profile-dir>` and confirm `mode`, `worker_name`, `public_base_url`, and `deployment_bound`.
+2. Export the local identity bundle and import it into a second profile bound to the same deployment.
+3. Create a direct conversation between the two profiles and send one text message.
+4. Run `sync once` on the receiver and verify the message lands exactly once.
+5. Send one attachment, run `sync once`, and download it on the receiver.
+6. Run `sync status` and confirm `checkpoint`, `realtime`, `pending_outbox`, and `pending_blob_uploads` are healthy.
+7. Run `runtime cloudflare redeploy --profile <profile-dir>` and verify `runtime cloudflare status` still reports the same deployment binding.
+8. Run `runtime cloudflare rotate-secrets --profile <profile-dir>` and verify bootstrap/import still succeeds for the current device.
+9. Run `runtime cloudflare detach --profile <profile-dir>` only on a disposable test profile and confirm `deployment_bound` becomes `false`.
+
+Use staging or a low-risk Worker first. Do not treat the environment as end-user production-ready until the full runbook is green.

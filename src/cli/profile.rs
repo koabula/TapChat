@@ -374,18 +374,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
     use tempfile::tempdir;
 
     use super::{Profile, ProfileRegistry};
     use crate::persistence::CorePersistenceSnapshot;
 
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+    }
+
     #[test]
     fn init_creates_profile_layout_and_snapshot() {
+        let _guard = env_lock();
         let dir = tempdir().expect("tempdir");
         unsafe {
             std::env::set_var(
                 "TAPCHAT_PROFILE_REGISTRY_PATH",
-                dir.path().join("profiles.json"),
+                dir.path().join("config").join("profiles.json"),
             );
         }
         let profile = Profile::init("alice", dir.path()).expect("init profile");
@@ -403,11 +411,12 @@ mod tests {
 
     #[test]
     fn registry_updates_identity_fields() {
+        let _guard = env_lock();
         let dir = tempdir().expect("tempdir");
         unsafe {
             std::env::set_var(
                 "TAPCHAT_PROFILE_REGISTRY_PATH",
-                dir.path().join("profiles.json"),
+                dir.path().join("config").join("profiles.json"),
             );
         }
         let mut profile = Profile::init("alice", dir.path().join("alice")).expect("init profile");

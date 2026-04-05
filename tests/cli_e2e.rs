@@ -259,6 +259,73 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
     assert_eq!(status["worker_name"].as_str(), Some("tapchat-test-worker"));
     assert_eq!(status["public_base_url"].as_str(), Some(runtime.base_url()));
 
+    run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        ["profile", "activate", "--name", "alice"],
+    )?;
+    let device_status = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        ["device", "status"],
+    )?;
+    assert_eq!(device_status["user_id"].as_str(), Some(user_id.as_str()));
+    assert_eq!(device_status["device_id"].as_str(), Some(device_id.as_str()));
+
+    let redeployed = run_cli_json_with_env(
+        [
+            ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
+            ("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT", deploy_stub.as_str()),
+        ],
+        [
+            "runtime",
+            "cloudflare",
+            "redeploy",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(redeployed["provisioned"], Value::Bool(true));
+
+    let rotated = run_cli_json_with_env(
+        [
+            ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
+            ("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT", deploy_stub.as_str()),
+            ("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET", bootstrap_secret.as_str()),
+        ],
+        [
+            "runtime",
+            "cloudflare",
+            "rotate-secrets",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(rotated["provisioned"], Value::Bool(true));
+
+    let detached = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "runtime",
+            "cloudflare",
+            "detach",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(detached["detached"], Value::Bool(true));
+
+    let detached_status = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "runtime",
+            "cloudflare",
+            "status",
+            "--profile",
+            &alice_profile.to_string_lossy(),
+        ],
+    )?;
+    assert!(detached_status["mode"].is_null());
+    assert_eq!(detached_status["deployment_bound"], Value::Bool(false));
+
     let removed = run_cli_json_with_env(
         [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
         ["profile", "remove", "--profile", &bob_profile.to_string_lossy()],

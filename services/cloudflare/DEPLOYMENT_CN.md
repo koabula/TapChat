@@ -144,3 +144,19 @@ bootstrap 路由返回的 deployment bundle 包含：
 - `429`
   - 触发 sender-recipient 级 rate limit
 
+
+## 真实 Cloudflare Smoke Runbook
+
+当 `runtime cloudflare provision auto/custom` 成功后，建议按这个顺序验证真实部署：
+
+1. 运行 `cargo run --bin tapchat -- --output json runtime cloudflare status --profile <profile-dir>`，确认 `mode`、`worker_name`、`public_base_url`、`deployment_bound`。
+2. 导出当前本地 identity bundle，并把它导入到另一个绑定同一 deployment 的 profile。
+3. 用两个 profile 建立 direct conversation，并发送一条文本消息。
+4. 在接收端执行 `sync once`，确认消息只落盘一次。
+5. 发送一个附件，再次 `sync once`，并在接收端完成下载。
+6. 运行 `sync status`，确认 `checkpoint`、`realtime`、`pending_outbox`、`pending_blob_uploads` 状态健康。
+7. 运行 `runtime cloudflare redeploy --profile <profile-dir>`，确认 `runtime cloudflare status` 仍报告相同 deployment 绑定。
+8. 运行 `runtime cloudflare rotate-secrets --profile <profile-dir>`，确认当前设备仍可 bootstrap/import。
+9. 只在一次性测试 profile 上运行 `runtime cloudflare detach --profile <profile-dir>`，确认 `deployment_bound` 变为 `false`。
+
+建议先在 staging 或低风险 Worker 上完成这一整套 runbook，再考虑继续扩展到更正式的生产流量。

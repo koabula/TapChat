@@ -60,7 +60,7 @@ impl CliApp {
                 self.print_value(profile.metadata())
             }
             ProfileSubcommand::Show { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
                 self.print_value(&serde_json::json!({
                     "profile": profile.metadata(),
@@ -71,7 +71,7 @@ impl CliApp {
                 profile,
                 bundle_file,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let bundle = Profile::load_deployment_bundle_file(&bundle_file)?;
                 bundle.validate().map_err(anyhow::Error::from)?;
                 let mut driver = load_driver(&profile)?;
@@ -89,7 +89,7 @@ impl CliApp {
                 }))
             }
             ProfileSubcommand::ExportIdentity { profile, out } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let bundle = driver.local_bundle().cloned().ok_or_else(|| {
                     anyhow!("local identity bundle is unavailable; import deployment first")
@@ -132,6 +132,7 @@ impl CliApp {
                 self.print_value(registry.current()?)
             }
             ProfileSubcommand::Remove { profile } => {
+                let profile = resolve_profile_path(profile)?;
                 let mut registry = ProfileRegistry::load()?;
                 registry.remove(&profile);
                 registry.save()?;
@@ -171,7 +172,7 @@ impl CliApp {
                     .await
             }
             DeviceSubcommand::RotateKeyPackage { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .run_command_until_idle(CoreCommand::RotateLocalKeyPackage)
@@ -180,7 +181,7 @@ impl CliApp {
                 self.print_value(&serde_json::json!({ "rotated": true }))
             }
             DeviceSubcommand::Status { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let identity = driver
                     .local_identity()
@@ -197,7 +198,7 @@ impl CliApp {
                 profile,
                 target_device_id,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .run_command_until_idle(CoreCommand::UpdateLocalDeviceStatus {
@@ -220,7 +221,7 @@ impl CliApp {
                 profile,
                 bundle_file,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let bundle = Profile::load_identity_bundle_file(bundle_file)?;
                 let mut driver = load_driver(&profile)?;
                 driver
@@ -240,7 +241,7 @@ impl CliApp {
                 }))
             }
             ContactSubcommand::Refresh { profile, user_id } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .run_command_until_idle(CoreCommand::RefreshIdentityState {
@@ -251,7 +252,7 @@ impl CliApp {
                 self.print_value(&serde_json::json!({ "refreshed": true, "user_id": user_id }))
             }
             ContactSubcommand::Show { profile, user_id } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let bundle = driver
                     .contact_bundle(&user_id)
@@ -259,7 +260,7 @@ impl CliApp {
                 self.print_value(bundle)
             }
             ContactSubcommand::List { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let snapshot = profile.load_snapshot()?;
                 let driver = load_driver(&profile)?;
                 let contacts: Vec<_> = snapshot
@@ -282,7 +283,7 @@ impl CliApp {
     async fn run_contact_requests(&self, command: ContactRequestsCommand) -> Result<()> {
         match command.command {
             ContactRequestsSubcommand::List { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let output = driver
                     .run_command_until_idle(CoreCommand::ListMessageRequests)
@@ -293,7 +294,7 @@ impl CliApp {
                 profile,
                 request_id,
             } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let output = driver
                     .run_command_until_idle(CoreCommand::ActOnMessageRequest {
@@ -314,7 +315,7 @@ impl CliApp {
                 profile,
                 request_id,
             } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let output = driver
                     .run_command_until_idle(CoreCommand::ActOnMessageRequest {
@@ -337,7 +338,7 @@ impl CliApp {
     async fn run_contact_allowlist(&self, command: ContactAllowlistCommand) -> Result<()> {
         match command.command {
             ContactAllowlistSubcommand::List { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let output = driver
                     .run_command_until_idle(CoreCommand::ListAllowlist)
@@ -345,7 +346,7 @@ impl CliApp {
                 self.print_value(allowlist_from_output(&output)?)
             }
             ContactAllowlistSubcommand::Add { profile, user_id } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let output = driver
                     .run_command_until_idle(CoreCommand::AddAllowlistUser {
@@ -359,7 +360,7 @@ impl CliApp {
                 }))
             }
             ContactAllowlistSubcommand::Remove { profile, user_id } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let output = driver
                     .run_command_until_idle(CoreCommand::RemoveAllowlistUser {
@@ -380,7 +381,7 @@ impl CliApp {
                 profile,
                 peer_user_id,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .run_command_until_idle(CoreCommand::CreateConversation {
@@ -401,7 +402,7 @@ impl CliApp {
                 }))
             }
             ConversationSubcommand::List { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let snapshot = profile.load_snapshot()?;
                 let driver = load_driver(&profile)?;
                 let rows: Vec<_> = snapshot
@@ -423,7 +424,7 @@ impl CliApp {
                 profile,
                 conversation_id,
             } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let state = driver
                     .conversation_state(&conversation_id)
@@ -445,7 +446,7 @@ impl CliApp {
                 profile,
                 conversation_id,
             } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 self.print_value(&driver.conversation_members(&conversation_id))
             }
@@ -453,7 +454,7 @@ impl CliApp {
                 profile,
                 conversation_id,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .run_command_until_idle(CoreCommand::RebuildConversation {
@@ -469,7 +470,7 @@ impl CliApp {
                 profile,
                 conversation_id,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
@@ -491,7 +492,7 @@ impl CliApp {
                 conversation_id,
                 text,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let notification_offset = driver.notifications().len();
                 let output = driver
@@ -514,7 +515,7 @@ impl CliApp {
                 conversation_id,
                 file,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let descriptor = attachment_descriptor(&file)?;
                 let notification_offset = driver.notifications().len();
@@ -542,7 +543,7 @@ impl CliApp {
                 reference,
                 out,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let destination = out.unwrap_or_else(|| {
                     profile
                         .metadata()
@@ -570,7 +571,7 @@ impl CliApp {
                 profile,
                 conversation_id,
             } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let state = driver
                     .conversation_state(&conversation_id)
@@ -583,7 +584,7 @@ impl CliApp {
     async fn run_sync(&self, command: SyncCommand) -> Result<()> {
         match command.command {
             SyncSubcommand::Once { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let device_id = local_device_id(&driver)?;
                 driver
@@ -603,7 +604,7 @@ impl CliApp {
                 }))
             }
             SyncSubcommand::Foreground { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .inject_event_until_idle(CoreEvent::AppForegrounded)
@@ -612,7 +613,7 @@ impl CliApp {
                 self.print_value(&serde_json::json!({ "foreground_sync": true }))
             }
             SyncSubcommand::RealtimeConnect { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver
                     .inject_event_until_idle(CoreEvent::AppForegrounded)
@@ -638,7 +639,7 @@ impl CliApp {
                 Ok(())
             }
             SyncSubcommand::RealtimeClose { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let device_id = local_device_id(&driver)?;
                 driver.close_realtime(&device_id).await?;
@@ -648,7 +649,7 @@ impl CliApp {
                 )
             }
             SyncSubcommand::Status { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let device_id = local_device_id(&driver)?;
                 self.print_value(&serde_json::json!({
@@ -662,7 +663,7 @@ impl CliApp {
                 }))
             }
             SyncSubcommand::Head { profile, device_id } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let driver = load_driver(&profile)?;
                 let deployment = load_deployment_from_snapshot(profile.load_snapshot()?)?;
                 let device_id = device_id.unwrap_or(local_device_id(&driver)?);
@@ -681,7 +682,7 @@ impl CliApp {
                 profile,
                 workspace_root,
             } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let identity = driver
                     .local_identity()
@@ -742,7 +743,7 @@ impl CliApp {
                 }))
             }
             RuntimeSubcommand::LocalStop { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
                 let pid = runtime
                     .pid
@@ -752,7 +753,7 @@ impl CliApp {
                 self.print_value(&serde_json::json!({ "stopped": true, "pid": pid }))
             }
             RuntimeSubcommand::LocalStatus { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
                 self.print_value(&serde_json::json!({
                     "pid": runtime.pid,
@@ -775,7 +776,7 @@ impl CliApp {
                 self.run_cloudflare_provision(command).await
             }
             CloudflareRuntimeSubcommand::Status { profile } => {
-                let profile = Profile::open(profile)?;
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
                 self.print_value(&serde_json::json!({
                     "mode": runtime.mode,
@@ -792,7 +793,7 @@ impl CliApp {
                 }))
             }
             CloudflareRuntimeSubcommand::Redeploy { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
                 ensure_cloudflare_runtime_metadata(&runtime)?;
                 let mut driver = load_driver(&profile)?;
@@ -816,7 +817,7 @@ impl CliApp {
                 .await
             }
             CloudflareRuntimeSubcommand::RotateSecrets { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
                 ensure_cloudflare_runtime_metadata(&runtime)?;
                 let mut driver = load_driver(&profile)?;
@@ -859,7 +860,7 @@ impl CliApp {
                 .await
             }
             CloudflareRuntimeSubcommand::Detach { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut snapshot = profile.load_snapshot()?;
                 snapshot.deployment = None;
                 profile.save_snapshot(&snapshot)?;
@@ -876,7 +877,7 @@ impl CliApp {
     async fn run_cloudflare_provision(&self, command: CloudflareProvisionCommand) -> Result<()> {
         match command.command {
             CloudflareProvisionSubcommand::Auto { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let identity = driver
                     .local_identity()
@@ -906,7 +907,7 @@ impl CliApp {
                 .await
             }
             CloudflareProvisionSubcommand::Custom { profile } => {
-                let mut profile = Profile::open(profile)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 let identity = driver
                     .local_identity()
@@ -937,12 +938,12 @@ impl CliApp {
     }
     async fn run_identity_command(
         &self,
-        profile_root: PathBuf,
+        profile_root: Option<PathBuf>,
         device_name: String,
         mnemonic_file: Option<PathBuf>,
         additional: bool,
     ) -> Result<()> {
-        let mut profile = Profile::open(profile_root)?;
+        let mut profile = Profile::open(resolve_profile_path(profile_root)?)?;
         let mut driver = load_driver(&profile)?;
         let mnemonic = match mnemonic_file {
             Some(path) => Some(read_trimmed_string(path)?),
@@ -1034,6 +1035,13 @@ impl CliApp {
         }
         Ok(())
     }
+}
+
+fn resolve_profile_path(profile: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(profile) = profile {
+        return Ok(profile);
+    }
+    Ok(ProfileRegistry::load()?.current()?.root_dir.clone())
 }
 
 fn persist_driver(profile: &mut Profile, driver: &CoreDriver) -> Result<()> {
@@ -1206,3 +1214,4 @@ async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadR
     let body = response.text().await?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
 }
+
