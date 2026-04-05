@@ -27,6 +27,8 @@ export interface Env {
   DEPLOYMENT_REGION?: string;
   MAX_INLINE_BYTES?: string;
   RETENTION_DAYS?: string;
+  RATE_LIMIT_PER_MINUTE?: string;
+  RATE_LIMIT_PER_HOUR?: string;
   SHARING_TOKEN_SECRET?: string;
   BOOTSTRAP_TOKEN_SECRET?: string;
 }

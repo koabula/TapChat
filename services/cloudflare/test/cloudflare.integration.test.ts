@@ -6,10 +6,10 @@ import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import {
   CURRENT_MODEL_VERSION,
-  type AppendEnvelopeRequest,
   type BootstrapDeviceRequest,
   type DeploymentBundle,
   type InboxAppendCapability,
+  type MessageRequestListResult,
   type PrepareBlobUploadRequest
 } from "../src/types/contracts";
 import { signSharingPayload } from "../src/storage/sharing";
@@ -33,7 +33,7 @@ async function ensureWorkerBundle(): Promise<string> {
   return WORKER_BUNDLE;
 }
 
-async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?: string }) {
+async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?: string; rateLimitPerMinute?: string; rateLimitPerHour?: string }) {
   const scriptPath = await ensureWorkerBundle();
   const mf = new Miniflare({
     scriptPath,
@@ -44,6 +44,8 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       DEPLOYMENT_REGION: "local",
       MAX_INLINE_BYTES: options?.maxInlineBytes ?? "128",
       RETENTION_DAYS: options?.retentionDays ?? "1",
+      RATE_LIMIT_PER_MINUTE: options?.rateLimitPerMinute ?? "60",
+      RATE_LIMIT_PER_HOUR: options?.rateLimitPerHour ?? "600",
       SHARING_TOKEN_SECRET: "secret",
       BOOTSTRAP_TOKEN_SECRET: "bootstrap-secret"
     },
@@ -89,7 +91,7 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   return (await response.json()) as DeploymentBundle;
 }
 
-function sampleAppend(deviceId: string, messageId: string, ciphertext: string): AppendEnvelopeRequest {
+function sampleAppend(deviceId: string, messageId: string, ciphertext: string, senderUserId = "user:alice") {
   return {
     version: CURRENT_MODEL_VERSION,
     recipientDeviceId: deviceId,
@@ -97,8 +99,8 @@ function sampleAppend(deviceId: string, messageId: string, ciphertext: string): 
       version: CURRENT_MODEL_VERSION,
       messageId,
       conversationId: "conv:alice:bob",
-      senderUserId: "user:alice",
-      senderDeviceId: "device:alice:phone",
+      senderUserId,
+      senderDeviceId: `${senderUserId.replace("user", "device")}:phone`,
       recipientDeviceId: deviceId,
       createdAt: Date.now(),
       messageType: "mls_application",
@@ -127,9 +129,15 @@ function sampleCapability(deviceId: string): InboxAppendCapability {
   };
 }
 
-async function appendEnvelope(mf: Miniflare, deviceId: string, messageId: string, ciphertext: string): Promise<{ accepted: boolean; seq: number }> {
+async function appendEnvelope(
+  mf: Miniflare,
+  deviceId: string,
+  messageId: string,
+  ciphertext: string,
+  senderUserId = "user:alice"
+): Promise<Record<string, unknown>> {
   const capability = sampleCapability(deviceId);
-  const request = sampleAppend(deviceId, messageId, ciphertext);
+  const request = sampleAppend(deviceId, messageId, ciphertext, senderUserId);
   const response = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages`, {
     method: "POST",
     headers: {
@@ -139,8 +147,22 @@ async function appendEnvelope(mf: Miniflare, deviceId: string, messageId: string
     },
     body: JSON.stringify(request)
   });
+  return {
+    status: response.status,
+    ...(await response.json() as object)
+  };
+}
+
+async function setAllowlist(mf: Miniflare, token: string, deviceId: string, allowedSenderUserIds: string[]): Promise<void> {
+  const response = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/allowlist`, {
+    method: "PUT",
+    headers: {
+      ...authHeaders(token),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ allowedSenderUserIds, rejectedSenderUserIds: [] })
+  });
   assert.equal(response.status, 200);
-  return (await response.json()) as { accepted: boolean; seq: number };
 }
 
 type RuntimeWebSocket = {
@@ -200,6 +222,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const deviceId = "device:bob:phone";
   const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
   const token = bundle.deviceRuntimeAuth!.token;
+  await setAllowlist(mf, token, deviceId, ["user:alice"]);
 
   const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
     headers: {
@@ -217,6 +240,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const append1 = await appendEnvelope(mf, deviceId, "msg:1", "cipher-1");
   assert.equal(append1.accepted, true);
   assert.equal(append1.seq, 1);
+  assert.equal(append1.deliveredTo, "inbox");
 
   const pushed = (await firstMessage) as { event: string; seq: number; record?: { seq: number; messageId: string } };
   assert.equal(pushed.event, "head_updated");
@@ -271,6 +295,63 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   assert.equal(ack.ackSeq, 2);
 
   await waitForCleanup(mf, token, deviceId, 1, `inbox-payload/${deviceId}/2.json`);
+});
+
+test("runtime integration: message requests do not push until accepted", async (t) => {
+  const mf = await createRuntime();
+  t.after(async () => {
+    await mf.dispose();
+  });
+
+  const deviceId = "device:bob:phone";
+  const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
+  const token = bundle.deviceRuntimeAuth!.token;
+
+  const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
+    headers: {
+      ...authHeaders(token),
+      Upgrade: "websocket",
+      Connection: "Upgrade"
+    }
+  });
+  assert.equal(subscribeResponse.status, 101);
+  assert.ok(subscribeResponse.webSocket);
+  const socket = subscribeResponse.webSocket as unknown as RuntimeWebSocket;
+  await waitForSubscribeReady(socket);
+
+  const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
+  assert.equal(queued.deliveredTo, "message_request");
+  assert.equal(queued.queuedAsRequest, true);
+
+  const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
+    headers: authHeaders(token)
+  });
+  const head = (await headResponse.json()) as { headSeq: number };
+  assert.equal(head.headSeq, 0);
+
+  const requestsResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests`, {
+    headers: authHeaders(token)
+  });
+  assert.equal(requestsResponse.status, 200);
+  const requests = (await requestsResponse.json()) as MessageRequestListResult;
+  assert.equal(requests.requests.length, 1);
+
+  const acceptResponse = await mf.dispatchFetch(
+    `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`,
+    {
+      method: "POST",
+      headers: authHeaders(token)
+    }
+  );
+  assert.equal(acceptResponse.status, 200);
+
+  const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
+    headers: authHeaders(token)
+  });
+  const fetched = (await fetchResponse.json()) as { records: Array<{ messageId: string }> };
+  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1"]);
+
+  socket.close(1000, "done");
 });
 
 test("runtime integration: storage prepare-upload/upload/download uses real R2 binding", async (t) => {

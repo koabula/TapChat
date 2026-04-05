@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::model::{CURRENT_MODEL_VERSION, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
@@ -272,6 +273,56 @@ pub async fn put_identity_bundle(auth: &DeviceRuntimeAuth, bundle: &IdentityBund
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct CliAllowlistDocument {
+    allowed_sender_user_ids: Vec<String>,
+    rejected_sender_user_ids: Vec<String>,
+}
+
+pub async fn allow_sender_user(auth: &DeviceRuntimeAuth, base_url: &str, sender_user_id: &str) -> Result<()> {
+    let client = Client::builder().build().context("build reqwest client")?;
+    let allowlist_url = format!(
+        "{}/v1/inbox/{}/allowlist",
+        base_url.trim_end_matches('/'),
+        urlencoding::encode(&auth.device_id)
+    );
+    let existing = client
+        .get(&allowlist_url)
+        .header("Authorization", format!("Bearer {}", auth.token))
+        .send()
+        .await
+        .context("get allowlist")?;
+    let mut allowed_sender_user_ids = Vec::new();
+    let mut rejected_sender_user_ids = Vec::new();
+    if existing.status().is_success() {
+        let body = existing.text().await.context("read allowlist response")?;
+        let normalized = to_snake_case_json_string(&body)?;
+        let document: CliAllowlistDocument = serde_json::from_str(&normalized)?;
+        allowed_sender_user_ids = document.allowed_sender_user_ids;
+        rejected_sender_user_ids = document.rejected_sender_user_ids;
+    }
+    if !allowed_sender_user_ids.iter().any(|user_id| user_id == sender_user_id) {
+        allowed_sender_user_ids.push(sender_user_id.to_string());
+        allowed_sender_user_ids.sort();
+        allowed_sender_user_ids.dedup();
+    }
+    rejected_sender_user_ids.retain(|user_id| user_id != sender_user_id);
+    let response = client
+        .put(&allowlist_url)
+        .header("Authorization", format!("Bearer {}", auth.token))
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&json!({
+            "allowedSenderUserIds": allowed_sender_user_ids,
+            "rejectedSenderUserIds": rejected_sender_user_ids,
+        }))?)
+        .send()
+        .await
+        .context("put allowlist")?;
+    if !response.status().is_success() {
+        bail!("put allowlist failed with status {}", response.status());
+    }
+    Ok(())
+}
 pub fn stop_local_runtime(pid: u32) -> Result<()> {
     #[cfg(windows)]
     {
@@ -314,3 +365,5 @@ fn reserve_port() -> Result<u16> {
     drop(listener);
     Ok(port)
 }
+
+

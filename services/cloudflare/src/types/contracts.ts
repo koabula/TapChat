@@ -20,6 +20,7 @@ export interface WakeHint {
 export interface CapabilityConstraints {
   maxBytes?: number;
   maxOpsPerMinute?: number;
+  maxOpsPerHour?: number;
 }
 
 export type MessageType =
@@ -72,6 +73,9 @@ export interface AppendEnvelopeRequest {
 export interface AppendEnvelopeResult {
   accepted: boolean;
   seq: number;
+  deliveredTo: "inbox" | "message_request" | "rejected";
+  queuedAsRequest?: boolean;
+  requestId?: string;
 }
 
 export interface FetchMessagesRequest {
@@ -133,6 +137,7 @@ export type DeviceRuntimeScope =
   | "inbox_read"
   | "inbox_ack"
   | "inbox_subscribe"
+  | "inbox_manage"
   | "storage_prepare_upload"
   | "shared_state_write"
   | "keypackage_write";
@@ -306,3 +311,34 @@ export interface RealtimeEvent {
   seq: number;
   record?: InboxRecord;
 }
+
+export interface AllowlistDocument {
+  version: string;
+  deviceId: string;
+  updatedAt: number;
+  allowedSenderUserIds: string[];
+  rejectedSenderUserIds: string[];
+}
+
+export interface MessageRequestItem {
+  requestId: string;
+  recipientDeviceId: string;
+  senderUserId: string;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  messageCount: number;
+  lastMessageId: string;
+  lastConversationId: string;
+}
+
+export interface MessageRequestListResult {
+  requests: MessageRequestItem[];
+}
+
+export interface MessageRequestActionResult {
+  accepted: boolean;
+  requestId: string;
+  senderUserId: string;
+  promotedCount?: number;
+}
+

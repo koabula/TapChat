@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tapchat_core::identity::{IdentityManager, LocalIdentityState};
 use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
-use tapchat_transport_adapter::CloudflareRuntimeHandle;
+use tapchat_transport_adapter::{CloudflareRuntimeHandle, RuntimeMessageRequest};
 use tempfile::{Builder, TempDir};
 
 const ALICE_MNEMONIC: &str =
@@ -118,6 +118,128 @@ fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn cli_message_request_accept_flow_works() -> Result<()> {
+    let _guard = test_lock();
+    let workspace_root = workspace_root();
+    let runtime = runtime_handle(&workspace_root)?;
+    let temp_root = repo_temp_dir("message-requests")?;
+    let alice_profile = temp_root.path().join("alice");
+    let bob_profile = temp_root.path().join("bob");
+    let alice_mnemonic = write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
+    let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
+
+    run_cli_json(["profile", "init", "--name", "alice", "--root", &alice_profile.to_string_lossy()])?;
+    run_cli_json(["profile", "init", "--name", "bob", "--root", &bob_profile.to_string_lossy()])?;
+
+    let alice_identity = run_cli_json([
+        "device",
+        "recover",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--device-name",
+        "phone",
+        "--mnemonic-file",
+        &alice_mnemonic.to_string_lossy(),
+    ])?;
+    let bob_identity = run_cli_json([
+        "device",
+        "recover",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--device-name",
+        "phone",
+        "--mnemonic-file",
+        &bob_mnemonic.to_string_lossy(),
+    ])?;
+
+    let alice_user_id = required_str(&alice_identity, "user_id")?;
+    let alice_device_id = required_str(&alice_identity, "device_id")?;
+    let bob_user_id = required_str(&bob_identity, "user_id")?;
+    let bob_device_id = required_str(&bob_identity, "device_id")?;
+
+    let alice_bundle = runtime_bootstrap_device_bundle(&runtime, &alice_user_id, &alice_device_id)?;
+    let bob_bundle = runtime_bootstrap_device_bundle(&runtime, &bob_user_id, &bob_device_id)?;
+    let alice_bundle_path = write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
+    let bob_bundle_path = write_json_file(temp_root.path(), "bob-deployment.json", &bob_bundle)?;
+
+    run_cli_json([
+        "profile",
+        "import-deployment",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        &alice_bundle_path.to_string_lossy(),
+    ])?;
+    run_cli_json([
+        "profile",
+        "import-deployment",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        &bob_bundle_path.to_string_lossy(),
+    ])?;
+
+    let alice_identity_path = export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
+    let bob_identity_path = export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
+    let alice_identity_bundle: IdentityBundle = read_json_file(&alice_identity_path)?;
+    let bob_identity_bundle: IdentityBundle = read_json_file(&bob_identity_path)?;
+    runtime_put_identity_bundle(&runtime, bundle_auth(&alice_bundle)?, &alice_identity_bundle)?;
+    runtime_put_identity_bundle(&runtime, bundle_auth(&bob_bundle)?, &bob_identity_bundle)?;
+
+    run_cli_json([
+        "contact",
+        "import-identity",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        &bob_identity_path.to_string_lossy(),
+    ])?;
+
+    let created = run_cli_json([
+        "conversation",
+        "create-direct",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--peer-user-id",
+        &bob_user_id,
+    ])?;
+    let conversation_id = required_str(&created, "conversation_id")?;
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--text",
+        "pending request message",
+    ])?;
+
+    let requests = runtime_list_message_requests(&runtime, bundle_auth(&bob_bundle)?)?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].sender_user_id, alice_user_id);
+    assert!(requests[0].message_count >= 1);
+
+    let pre_accept_sync = sync_once(&bob_profile)?;
+    assert_eq!(required_u64(&pre_accept_sync["checkpoint"], "last_acked_seq")?, 0);
+
+    runtime_accept_message_request(&runtime, bundle_auth(&bob_bundle)?, &requests[0].request_id)?;
+
+    let post_accept_sync = sync_once(&bob_profile)?;
+    assert_eq!(post_accept_sync["synced"], Value::Bool(true));
+    assert!(required_u64(&post_accept_sync["checkpoint"], "last_acked_seq")? >= 1);
+
+    let messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    assert_eq!(count_plaintext_messages(&messages, "pending request message"), 1);
+
+    Ok(())
+}
 #[test]
 fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
     let _guard = test_lock();
@@ -943,6 +1065,7 @@ fn start_bob_laptop_recovery(ctx: &CliPairContext) -> Result<CliLaptopContext> {
     )?;
     let merged_identity_path = write_json_file(ctx.temp_root.path(), "bob-identity-merged.json", &merged_identity)?;
     runtime_put_identity_bundle(&ctx.runtime, bundle_auth(&laptop_bundle)?, &merged_identity)?;
+    runtime_put_allowlist(&ctx.runtime, bundle_auth(&laptop_bundle)?, std::slice::from_ref(&ctx.alice_user_id))?;
     let runtime_identity = runtime_get_identity_bundle(&ctx.runtime, &ctx.bob_user_id)?;
     assert!(runtime_identity
         .devices
@@ -1088,6 +1211,13 @@ fn runtime_bootstrap_device_bundle(
     with_tokio(|| async { runtime.bootstrap_device_bundle(user_id, device_id).await })
 }
 
+fn runtime_put_allowlist(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    allowed_sender_user_ids: &[String],
+) -> Result<()> {
+    with_tokio(|| async { runtime.put_allowlist(auth, allowed_sender_user_ids).await })
+}
 fn runtime_put_identity_bundle(
     runtime: &CloudflareRuntimeHandle,
     auth: &DeviceRuntimeAuth,
@@ -1096,6 +1226,20 @@ fn runtime_put_identity_bundle(
     with_tokio(|| async { runtime.put_identity_bundle(auth, bundle).await })
 }
 
+fn runtime_list_message_requests(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+) -> Result<Vec<RuntimeMessageRequest>> {
+    with_tokio(|| async { runtime.list_message_requests(auth).await })
+}
+
+fn runtime_accept_message_request(
+    runtime: &CloudflareRuntimeHandle,
+    auth: &DeviceRuntimeAuth,
+    request_id: &str,
+) -> Result<()> {
+    with_tokio(|| async { runtime.accept_message_request(auth, request_id).await })
+}
 fn runtime_get_identity_bundle(
     runtime: &CloudflareRuntimeHandle,
     user_id: &str,
@@ -1114,3 +1258,9 @@ where
         .context("build tokio runtime for cli e2e helper")?
         .block_on(build())
 }
+
+
+
+
+
+

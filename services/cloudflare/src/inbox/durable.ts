@@ -1,6 +1,11 @@
 import { HttpError } from "../auth/capability";
 import { InboxService } from "./service";
-import type { AckRequest, AppendEnvelopeRequest, FetchMessagesRequest } from "../types/contracts";
+import type {
+  AckRequest,
+  AllowlistDocument,
+  AppendEnvelopeRequest,
+  FetchMessagesRequest
+} from "../types/contracts";
 import type { DurableObjectStorageLike, Env, JsonBlobStore, SessionSink } from "../types/runtime";
 
 class DurableObjectStorageAdapter implements DurableObjectStorageLike {
@@ -101,6 +106,8 @@ export async function handleInboxDurableRequest(
     sessions: SessionSink[];
     maxInlineBytes: number;
     retentionDays: number;
+    rateLimitPerMinute: number;
+    rateLimitPerHour: number;
     onUpgrade?: () => Response;
     now?: number;
   }
@@ -111,7 +118,9 @@ export async function handleInboxDurableRequest(
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: deps.retentionDays,
-    maxInlineBytes: deps.maxInlineBytes
+    maxInlineBytes: deps.maxInlineBytes,
+    rateLimitPerMinute: deps.rateLimitPerMinute,
+    rateLimitPerHour: deps.rateLimitPerHour
   });
 
   try {
@@ -125,10 +134,38 @@ export async function handleInboxDurableRequest(
       return deps.onUpgrade();
     }
 
+    if (url.pathname.endsWith("/message-requests") && request.method === "GET") {
+      return jsonResponse({ requests: await service.listMessageRequests() });
+    }
+
+    const requestActionMatch = url.pathname.match(/\/message-requests\/([^/]+)\/(accept|reject)$/);
+    if (requestActionMatch && request.method === "POST") {
+      const requestId = decodeURIComponent(requestActionMatch[1]);
+      const action = requestActionMatch[2];
+      const result = action === "accept"
+        ? await service.acceptMessageRequest(requestId, now)
+        : await service.rejectMessageRequest(requestId, now);
+      return jsonResponse(result);
+    }
+
+    if (url.pathname.endsWith("/allowlist") && request.method === "GET") {
+      return jsonResponse(await service.getAllowlist(now));
+    }
+
+    if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
+      const body = (await request.json()) as Partial<AllowlistDocument>;
+      const result = await service.replaceAllowlist(
+        body.allowedSenderUserIds ?? [],
+        body.rejectedSenderUserIds ?? [],
+        now
+      );
+      return jsonResponse(result);
+    }
+
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = (await request.json()) as AppendEnvelopeRequest;
       const result = await service.appendEnvelope(body, now);
-      return jsonResponse({ accepted: result.accepted, seq: result.seq });
+      return jsonResponse(result);
     }
 
     if (url.pathname.endsWith("/messages") && request.method === "GET") {
@@ -200,6 +237,8 @@ export class InboxDurableObject extends DurableObjectBase {
       ),
       maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
+      rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
+      rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
@@ -232,7 +271,9 @@ export class InboxDurableObject extends DurableObjectBase {
         headSeq: 0,
         ackedSeq: 0,
         retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
-        maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096")
+        maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
+        rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
+        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600")
       }
     );
     await service.cleanExpiredRecords(Date.now());
@@ -271,8 +312,6 @@ class ManagedSession {
   }
 
   private dispatch(payload: string): void {
-    // Deliver on the next task turn so back-to-back publish events are not lost
-    // by the Miniflare test client while it swaps message listeners.
     setTimeout(() => {
       this.socket.send(payload);
     }, 0);

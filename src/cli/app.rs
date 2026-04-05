@@ -19,7 +19,7 @@ use super::args::{
 use super::driver::CoreDriver;
 use super::profile::{Profile, RuntimeMetadata};
 use super::runtime::{
-    bootstrap_device_bundle, put_identity_bundle, start_local_runtime, stop_local_runtime,
+    allow_sender_user, bootstrap_device_bundle, put_identity_bundle, start_local_runtime, stop_local_runtime,
     wait_until_ready,
 };
 use super::util::to_snake_case_json_string;
@@ -193,6 +193,12 @@ impl CliApp {
                     &bundle,
                     &format!("identity_{}.json", bundle.user_id.replace(':', "_")),
                 )?;
+                if let Some(deployment_bundle_path) = profile.metadata().deployment_bundle_path.clone() {
+                    let deployment = Profile::load_deployment_bundle_file(&deployment_bundle_path)?;
+                    if let Some(auth) = deployment.device_runtime_auth.as_ref() {
+                        allow_sender_user(auth, &deployment.inbox_http_endpoint, &bundle.user_id).await?;
+                    }
+                }
                 persist_driver(&mut profile, &driver)?;
                 self.print_value(&serde_json::json!({
                     "imported": true,
@@ -733,3 +739,5 @@ async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadR
     let body = response.text().await?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
 }
+
+

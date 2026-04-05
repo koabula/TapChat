@@ -12,6 +12,7 @@ import { SharedStateService } from "../storage/shared-state";
 import { StorageService } from "../storage/service";
 import {
   CURRENT_MODEL_VERSION,
+  type AllowlistDocument,
   type AppendEnvelopeRequest,
   type BootstrapDeviceRequest,
   type DeploymentBundle,
@@ -99,6 +100,7 @@ function runtimeScopes(): DeviceRuntimeAuth["scopes"] {
     "inbox_read",
     "inbox_ack",
     "inbox_subscribe",
+    "inbox_manage",
     "storage_prepare_upload",
     "shared_state_write",
     "keypackage_write"
@@ -142,7 +144,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
       keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
-      features: ["generic_sync", "attachment_v1"]
+      features: ["generic_sync", "attachment_v1", "message_requests", "allowlist", "rate_limit"]
     }
   };
 }
@@ -198,7 +200,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse(bundle);
     }
 
-    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe)$/);
+    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
       const operation = inboxMatch[2];
@@ -214,6 +216,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_ack", now);
       } else if (operation === "subscribe") {
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_subscribe", now);
+      } else if (
+        operation === "allowlist" ||
+        operation === "message-requests" ||
+        operation.startsWith("message-requests/")
+      ) {
+        await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_manage", now);
       }
 
       return stub.fetch(request);
