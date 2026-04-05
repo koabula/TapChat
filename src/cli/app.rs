@@ -6,11 +6,9 @@ use reqwest::Client;
 use serde::Serialize;
 
 use crate::ffi_api::{AttachmentDescriptor, CoreCommand, CoreEvent};
-use crate::model::{
-    ConversationKind, DeploymentBundle, DeviceRuntimeAuth, DeviceStatusKind, Validate,
-};
+use crate::model::{ConversationKind, DeploymentBundle, DeviceStatusKind, Validate};
 use crate::persistence::CorePersistenceSnapshot;
-use crate::transport_contract::GetHeadResult;
+use crate::transport_contract::{AllowlistDocument, GetHeadResult, MessageRequestItem};
 
 use super::args::{
     Cli, Command, ContactAllowlistCommand, ContactAllowlistSubcommand, ContactCommand,
@@ -22,9 +20,8 @@ use super::args::{
 use super::driver::CoreDriver;
 use super::profile::{Profile, RuntimeMetadata};
 use super::runtime::{
-    add_allowlist_user, allow_sender_user, bootstrap_device_bundle, list_allowlist,
-    put_identity_bundle, remove_allowlist_user, resolve_service_root, resolve_workspace_root,
-    start_local_runtime, stop_local_runtime, wait_until_ready,
+    bootstrap_device_bundle, resolve_service_root, resolve_workspace_root, start_local_runtime,
+    stop_local_runtime, wait_until_ready,
 };
 use super::util::to_snake_case_json_string;
 pub async fn run() -> Result<()> {
@@ -169,7 +166,6 @@ impl CliApp {
                         status: DeviceStatusKind::Revoked,
                     })
                     .await?;
-                publish_local_bundle_if_runtime_available(&profile, &driver).await?;
                 persist_driver(&mut profile, &driver)?;
                 self.print_value(&serde_json::json!({
                     "revoked": true,
@@ -197,9 +193,6 @@ impl CliApp {
                     &bundle,
                     &format!("identity_{}.json", bundle.user_id.replace(':', "_")),
                 )?;
-                if let Some((auth, base_url)) = runtime_auth_and_base_url(&profile)? {
-                    allow_sender_user(&auth, &base_url, &bundle.user_id).await?;
-                }
                 persist_driver(&mut profile, &driver)?;
                 self.print_value(&serde_json::json!({
                     "imported": true,
@@ -251,80 +244,53 @@ impl CliApp {
         match command.command {
             ContactRequestsSubcommand::List { profile } => {
                 let profile = Profile::open(profile)?;
-                let (auth, base_url) = require_runtime_auth_and_base_url(&profile)?;
-                let client = Client::builder().build().context("build reqwest client")?;
-                let response = client
-                    .get(format!(
-                        "{}/v1/inbox/{}/message-requests",
-                        base_url.trim_end_matches('/'),
-                        urlencoding::encode(&auth.device_id)
-                    ))
-                    .header("Authorization", format!("Bearer {}", auth.token))
-                    .send()
-                    .await
-                    .context("list message requests")?;
-                if !response.status().is_success() {
-                    bail!(
-                        "list message requests failed with status {}",
-                        response.status()
-                    );
-                }
-                let body = response.text().await?;
-                let normalized = to_snake_case_json_string(&body)?;
-                let value: serde_json::Value = serde_json::from_str(&normalized)?;
-                self.print_value(&value["requests"])
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ListMessageRequests)
+                    .await?;
+                self.print_value(message_requests_from_output(&output)?)
             }
             ContactRequestsSubcommand::Accept {
                 profile,
                 request_id,
             } => {
                 let profile = Profile::open(profile)?;
-                let (auth, base_url) = require_runtime_auth_and_base_url(&profile)?;
-                let client = Client::builder().build().context("build reqwest client")?;
-                let response = client
-                    .post(format!(
-                        "{}/v1/inbox/{}/message-requests/{}/accept",
-                        base_url.trim_end_matches('/'),
-                        urlencoding::encode(&auth.device_id),
-                        urlencoding::encode(&request_id)
-                    ))
-                    .header("Authorization", format!("Bearer {}", auth.token))
-                    .send()
-                    .await
-                    .context("accept message request")?;
-                if !response.status().is_success() {
-                    bail!(
-                        "accept message request failed with status {}",
-                        response.status()
-                    );
-                }
-                self.print_value(&serde_json::json!({ "accepted": true, "request_id": request_id }))
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ActOnMessageRequest {
+                        request_id,
+                        action: crate::transport_contract::MessageRequestAction::Accept,
+                    })
+                    .await?;
+                let result = message_request_action_from_output(&output)?;
+                self.print_value(&serde_json::json!({
+                    "accepted": result.accepted,
+                    "request_id": result.request_id,
+                    "sender_user_id": result.sender_user_id,
+                    "promoted_count": result.promoted_count,
+                    "action": result.action,
+                }))
             }
             ContactRequestsSubcommand::Reject {
                 profile,
                 request_id,
             } => {
                 let profile = Profile::open(profile)?;
-                let (auth, base_url) = require_runtime_auth_and_base_url(&profile)?;
-                let client = Client::builder().build().context("build reqwest client")?;
-                let response = client
-                    .post(format!(
-                        "{}/v1/inbox/{}/message-requests/{}/reject",
-                        base_url.trim_end_matches('/'),
-                        urlencoding::encode(&auth.device_id),
-                        urlencoding::encode(&request_id)
-                    ))
-                    .header("Authorization", format!("Bearer {}", auth.token))
-                    .send()
-                    .await
-                    .context("reject message request")?;
-                if !response.status().is_success() {
-                    bail!(
-                        "reject message request failed with status {}",
-                        response.status()
-                    );
-                }
-                self.print_value(&serde_json::json!({ "rejected": true, "request_id": request_id }))
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ActOnMessageRequest {
+                        request_id,
+                        action: crate::transport_contract::MessageRequestAction::Reject,
+                    })
+                    .await?;
+                let result = message_request_action_from_output(&output)?;
+                self.print_value(&serde_json::json!({
+                    "rejected": result.accepted,
+                    "request_id": result.request_id,
+                    "sender_user_id": result.sender_user_id,
+                    "promoted_count": result.promoted_count,
+                    "action": result.action,
+                }))
             }
         }
     }
@@ -333,28 +299,38 @@ impl CliApp {
         match command.command {
             ContactAllowlistSubcommand::List { profile } => {
                 let profile = Profile::open(profile)?;
-                let (auth, base_url) = require_runtime_auth_and_base_url(&profile)?;
-                let document = list_allowlist(&auth, &base_url).await?;
-                self.print_value(&document)
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ListAllowlist)
+                    .await?;
+                self.print_value(allowlist_from_output(&output)?)
             }
             ContactAllowlistSubcommand::Add { profile, user_id } => {
                 let profile = Profile::open(profile)?;
-                let (auth, base_url) = require_runtime_auth_and_base_url(&profile)?;
-                let document = add_allowlist_user(&auth, &base_url, &user_id).await?;
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::AddAllowlistUser {
+                        user_id: user_id.clone(),
+                    })
+                    .await?;
                 self.print_value(&serde_json::json!({
                     "updated": true,
                     "user_id": user_id,
-                    "allowlist": document,
+                    "allowlist": allowlist_from_output(&output)?,
                 }))
             }
             ContactAllowlistSubcommand::Remove { profile, user_id } => {
                 let profile = Profile::open(profile)?;
-                let (auth, base_url) = require_runtime_auth_and_base_url(&profile)?;
-                let document = remove_allowlist_user(&auth, &base_url, &user_id).await?;
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::RemoveAllowlistUser {
+                        user_id: user_id.clone(),
+                    })
+                    .await?;
                 self.print_value(&serde_json::json!({
                     "updated": true,
                     "user_id": user_id,
-                    "allowlist": document,
+                    "allowlist": allowlist_from_output(&output)?,
                 }))
             }
         }
@@ -478,6 +454,7 @@ impl CliApp {
             } => {
                 let mut profile = Profile::open(profile)?;
                 let mut driver = load_driver(&profile)?;
+                let notification_offset = driver.notifications().len();
                 driver
                     .run_command_until_idle(CoreCommand::SendTextMessage {
                         conversation_id: conversation_id.clone(),
@@ -489,7 +466,7 @@ impl CliApp {
                     "sent": true,
                     "conversation_id": conversation_id,
                     "pending_outbox": driver.pending_outbox_count(),
-                    "latest_notification": driver.latest_notification(),
+                    "latest_notification": latest_notification_since(&driver, notification_offset),
                 }))
             }
             MessageSubcommand::SendAttachment {
@@ -500,6 +477,7 @@ impl CliApp {
                 let mut profile = Profile::open(profile)?;
                 let mut driver = load_driver(&profile)?;
                 let descriptor = attachment_descriptor(&file)?;
+                let notification_offset = driver.notifications().len();
                 driver
                     .run_command_until_idle(CoreCommand::SendAttachmentMessage {
                         conversation_id: conversation_id.clone(),
@@ -513,7 +491,7 @@ impl CliApp {
                     "file": file,
                     "pending_outbox": driver.pending_outbox_count(),
                     "pending_blob_uploads": driver.pending_blob_upload_count(),
-                    "latest_notification": driver.latest_notification(),
+                    "latest_notification": latest_notification_since(&driver, notification_offset),
                 }))
             }
             MessageSubcommand::DownloadAttachment {
@@ -580,6 +558,7 @@ impl CliApp {
                     "checkpoint": driver.sync_checkpoint_snapshot(&device_id),
                     "realtime": driver.realtime_session_snapshot(&device_id),
                     "notifications": driver.notifications(),
+                    "recovery_conversations": driver.recovery_conversations(),
                 }))
             }
             SyncSubcommand::Foreground { profile } => {
@@ -638,6 +617,7 @@ impl CliApp {
                     "notifications": driver.notifications(),
                     "pending_outbox": driver.pending_outbox_count(),
                     "pending_blob_uploads": driver.pending_blob_upload_count(),
+                    "recovery_conversations": driver.recovery_conversations(),
                 }))
             }
             SyncSubcommand::Head { profile, device_id } => {
@@ -690,14 +670,6 @@ impl CliApp {
                         bundle: bundle.clone(),
                     })
                     .await?;
-                let auth = bundle.device_runtime_auth.as_ref().ok_or_else(|| {
-                    anyhow!("local runtime bootstrap did not return device runtime auth")
-                })?;
-                let local_bundle = driver
-                    .local_bundle()
-                    .cloned()
-                    .ok_or_else(|| anyhow!("local bundle unavailable after deployment import"))?;
-                put_identity_bundle(&auth, &local_bundle).await?;
                 profile.save_deployment_bundle(&bundle)?;
                 profile.save_runtime_metadata(&RuntimeMetadata {
                     pid: Some(instance.pid),
@@ -855,35 +827,37 @@ fn local_device_id(driver: &CoreDriver) -> Result<String> {
         .ok_or_else(|| anyhow!("local identity is not initialized"))
 }
 
-fn runtime_auth_and_base_url(profile: &Profile) -> Result<Option<(DeviceRuntimeAuth, String)>> {
-    let Some(deployment_bundle_path) = profile.metadata().deployment_bundle_path.clone() else {
-        return Ok(None);
-    };
-    let deployment = Profile::load_deployment_bundle_file(deployment_bundle_path)?;
-    let Some(auth) = deployment.device_runtime_auth.clone() else {
-        return Ok(None);
-    };
-    Ok(Some((auth, deployment.inbox_http_endpoint)))
+fn message_requests_from_output(output: &crate::ffi_api::CoreOutput) -> Result<&Vec<MessageRequestItem>> {
+    output
+        .view_model
+        .as_ref()
+        .and_then(|view| Some(&view.message_requests))
+        .ok_or_else(|| anyhow!("message requests were not returned by core"))
 }
 
-fn require_runtime_auth_and_base_url(profile: &Profile) -> Result<(DeviceRuntimeAuth, String)> {
-    runtime_auth_and_base_url(profile)?.ok_or_else(|| {
-        anyhow!("deployment bundle missing device runtime auth; import deployment first")
-    })
+fn message_request_action_from_output(
+    output: &crate::ffi_api::CoreOutput,
+) -> Result<&crate::ffi_api::MessageRequestActionSummary> {
+    output
+        .view_model
+        .as_ref()
+        .and_then(|view| view.message_request_action.as_ref())
+        .ok_or_else(|| anyhow!("message request action result was not returned by core"))
 }
 
-async fn publish_local_bundle_if_runtime_available(
-    profile: &Profile,
-    driver: &CoreDriver,
-) -> Result<()> {
-    let Some((auth, _)) = runtime_auth_and_base_url(profile)? else {
-        return Ok(());
-    };
-    let local_bundle = driver
-        .local_bundle()
-        .cloned()
-        .ok_or_else(|| anyhow!("local identity bundle is unavailable"))?;
-    put_identity_bundle(&auth, &local_bundle).await
+fn allowlist_from_output(output: &crate::ffi_api::CoreOutput) -> Result<&AllowlistDocument> {
+    output
+        .view_model
+        .as_ref()
+        .and_then(|view| view.allowlist.as_ref())
+        .ok_or_else(|| anyhow!("allowlist document was not returned by core"))
+}
+
+fn latest_notification_since(driver: &crate::cli::driver::CoreDriver, offset: usize) -> Option<String> {
+    driver
+        .notifications()
+        .get(offset..)
+        .and_then(|notifications| notifications.last().cloned())
 }
 
 async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadResult> {

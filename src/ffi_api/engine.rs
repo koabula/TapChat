@@ -24,10 +24,14 @@ use crate::persistence::{
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
-    AckRequest, AckResult, AppendDeliveryDisposition, AppendEnvelopeRequest, AppendEnvelopeResult,
-    BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest, FetchMessagesRequest,
-    FetchMessagesResult, GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    RealtimeSubscriptionRequest,
+    AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
+    AppendEnvelopeResult, BlobDownloadRequest, BlobUploadRequest, DeviceStatusDocument,
+    DeviceStatusRecord, FetchAllowlistRequest, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult, GetHeadResult,
+    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
+    MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    SharedStateDocumentKind,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -104,6 +108,14 @@ impl CoreEngine {
                 last_error: context.last_error.clone(),
                 escalation_reason: context.escalation_reason,
             })
+    }
+
+    pub fn recovery_conversations_snapshot(&self) -> Vec<RecoveryDiagnostics> {
+        self.state
+            .conversations
+            .keys()
+            .filter_map(|conversation_id| self.recovery_snapshot_for_conversation(conversation_id))
+            .collect()
     }
 
     pub fn sync_checkpoint_snapshot(&self, device_id: &str) -> Option<SyncCheckpointSnapshot> {
@@ -373,6 +385,7 @@ impl CoreEngine {
                 request_nonce: 0,
                 message_nonce: snapshot.message_nonce,
                 recovery_contexts,
+                pending_allowlist_mutation: None,
             },
         };
 
@@ -459,6 +472,13 @@ impl CoreEngine {
             } => self.download_attachment(conversation_id, message_id, reference, destination),
             CoreCommand::SyncInbox { device_id, .. } => self.sync_inbox(device_id),
             CoreCommand::RefreshIdentityState { user_id } => self.refresh_identity_state(user_id),
+            CoreCommand::ListMessageRequests => self.list_message_requests(),
+            CoreCommand::ActOnMessageRequest { request_id, action } => {
+                self.act_on_message_request(request_id, action)
+            }
+            CoreCommand::ListAllowlist => self.list_allowlist(),
+            CoreCommand::AddAllowlistUser { user_id } => self.add_allowlist_user(user_id),
+            CoreCommand::RemoveAllowlistUser { user_id } => self.remove_allowlist_user(user_id),
             CoreCommand::CreateAdditionalDeviceIdentity {
                 mnemonic,
                 device_name,
@@ -522,6 +542,94 @@ impl CoreEngine {
                     }
                 }),
             ),
+            CoreEvent::MessageRequestsFetched { requests } => {
+                Ok(self.message_requests_output(requests))
+            }
+            CoreEvent::MessageRequestsFetchFailed { retryable: _, detail } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| "message request query failed".into()),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::MessageRequestActionCompleted { result } => {
+                Ok(self.message_request_action_output(result))
+            }
+            CoreEvent::MessageRequestActionFailed {
+                request_id,
+                action,
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("message request {:?} failed for {}", action, request_id)
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::AllowlistFetched { document } => self.handle_allowlist_fetched(document),
+            CoreEvent::AllowlistFetchFailed { retryable: _, detail } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| "allowlist query failed".into()),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::AllowlistReplaced { document } => Ok(self.allowlist_output(document, true)),
+            CoreEvent::AllowlistReplaceFailed { retryable: _, detail } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| "allowlist update failed".into()),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::SharedStatePublished { .. } => Ok(CoreOutput::default()),
+            CoreEvent::SharedStatePublishFailed {
+                document_kind,
+                reference: _,
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("shared state publish failed for {:?}", document_kind)
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
             CoreEvent::AttachmentBytesLoaded {
                 task_id,
                 plaintext_b64,
@@ -553,7 +661,7 @@ impl CoreEngine {
         bundle.validate()?;
         self.state.deployment_bundle = Some(bundle);
         self.refresh_local_bundle()?;
-        Ok(CoreOutput {
+        let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: self.state.local_bundle.is_some(),
                 checkpoints_changed: true,
@@ -564,24 +672,32 @@ impl CoreEngine {
                 vec![PersistOp::SaveDeployment, PersistOp::SaveLocalIdentity],
             )],
             view_model: None,
-        })
+        };
+        output.effects.extend(self.local_shared_state_publish_effects()?);
+        Ok(output)
     }
 
     fn import_identity_bundle(&mut self, bundle: IdentityBundle) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
         let user_id = bundle.user_id.clone();
         self.state.contacts.insert(user_id.clone(), bundle);
-        Ok(CoreOutput {
+        let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
                 ..CoreStateUpdate::default()
             },
             effects: vec![persist_effect(
                 &self.state,
-                vec![PersistOp::SaveContact { user_id }],
+                vec![PersistOp::SaveContact {
+                    user_id: user_id.clone(),
+                }],
             )],
             view_model: None,
-        })
+        };
+        if self.state.deployment_bundle.is_some() {
+            output = merge_outputs(output, self.add_allowlist_user(user_id)?);
+        }
+        Ok(output)
     }
 
     fn apply_identity_bundle_update(&mut self, bundle: IdentityBundle) -> CoreResult<CoreOutput> {
@@ -804,7 +920,7 @@ impl CoreEngine {
             local_bundle.updated_at
         };
         self.refresh_local_bundle_with_updated_at(updated_at)?;
-        Ok(CoreOutput {
+        let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
                 ..CoreStateUpdate::default()
@@ -814,7 +930,9 @@ impl CoreEngine {
                 vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
             )],
             view_model: None,
-        })
+        };
+        output.effects.extend(self.local_shared_state_publish_effects()?);
+        Ok(output)
     }
 
     fn create_conversation(
@@ -1429,6 +1547,176 @@ impl CoreEngine {
         let mut headers = BTreeMap::new();
         headers.insert("Authorization".into(), format!("Bearer {}", auth.token));
         Ok(headers)
+    }
+
+    fn local_device_id_required(&self) -> CoreResult<String> {
+        self.state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.device_identity.device_id.clone())
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))
+    }
+
+    fn inbox_management_endpoint(&self, suffix: &str) -> CoreResult<String> {
+        let deployment = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        let device_id = self.local_device_id_required()?;
+        Ok(format!(
+            "{}/v1/inbox/{}/{}",
+            deployment.inbox_http_endpoint.trim_end_matches('/'),
+            urlencoding::encode(&device_id),
+            suffix.trim_start_matches('/')
+        ))
+    }
+
+    fn local_device_status_document(&self) -> CoreResult<DeviceStatusDocument> {
+        let bundle = self
+            .state
+            .local_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity bundle is unavailable"))?;
+        Ok(DeviceStatusDocument {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            user_id: bundle.user_id.clone(),
+            updated_at: bundle.updated_at,
+            devices: bundle
+                .devices
+                .iter()
+                .map(|device| DeviceStatusRecord {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    user_id: bundle.user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    status: device.status,
+                    updated_at: bundle.updated_at,
+                })
+                .collect(),
+        })
+    }
+
+    fn local_shared_state_publish_effects(&self) -> CoreResult<Vec<CoreEffect>> {
+        let mut effects = Vec::new();
+        let Some(bundle) = self.state.local_bundle.as_ref() else {
+            return Ok(effects);
+        };
+        let headers = self.device_runtime_headers()?;
+        if let Some(reference) = bundle.identity_bundle_ref.clone() {
+            effects.push(CoreEffect::PublishSharedState {
+                publish: PublishSharedStateRequest {
+                    reference,
+                    document_kind: SharedStateDocumentKind::IdentityBundle,
+                    body: serde_json::to_string(bundle).map_err(|error| {
+                        CoreError::invalid_input(format!(
+                            "failed to encode local identity bundle: {error}"
+                        ))
+                    })?,
+                    headers: headers.clone(),
+                },
+            });
+        }
+        if let Some(reference) = bundle.device_status_ref.clone() {
+            let document = self.local_device_status_document()?;
+            effects.push(CoreEffect::PublishSharedState {
+                publish: PublishSharedStateRequest {
+                    reference,
+                    document_kind: SharedStateDocumentKind::DeviceStatus,
+                    body: serde_json::to_string(&document).map_err(|error| {
+                        CoreError::invalid_input(format!(
+                            "failed to encode local device status document: {error}"
+                        ))
+                    })?,
+                    headers,
+                },
+            });
+        }
+        Ok(effects)
+    }
+
+    fn list_message_requests(&mut self) -> CoreResult<CoreOutput> {
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::FetchMessageRequests {
+                fetch: FetchMessageRequestsRequest {
+                    device_id: self.local_device_id_required()?,
+                    endpoint: self.inbox_management_endpoint("message-requests")?,
+                    headers: self.device_runtime_headers()?,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn act_on_message_request(
+        &mut self,
+        request_id: String,
+        action: MessageRequestAction,
+    ) -> CoreResult<CoreOutput> {
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::ActOnMessageRequest {
+                action: MessageRequestActionRequest {
+                    device_id: self.local_device_id_required()?,
+                    request_id,
+                    action,
+                    endpoint: self.inbox_management_endpoint("message-requests")?,
+                    headers: self.device_runtime_headers()?,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn list_allowlist(&mut self) -> CoreResult<CoreOutput> {
+        let device_id = self.local_device_id_required()?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::FetchAllowlist {
+                fetch: FetchAllowlistRequest {
+                    device_id,
+                    endpoint: self.inbox_management_endpoint("allowlist")?,
+                    headers: self.device_runtime_headers()?,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn add_allowlist_user(&mut self, user_id: String) -> CoreResult<CoreOutput> {
+        let device_id = self.local_device_id_required()?;
+        self.state.pending_allowlist_mutation = Some(PendingAllowlistMutation::Add {
+            user_id: user_id.clone(),
+        });
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::FetchAllowlist {
+                fetch: FetchAllowlistRequest {
+                    device_id,
+                    endpoint: self.inbox_management_endpoint("allowlist")?,
+                    headers: self.device_runtime_headers()?,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn remove_allowlist_user(&mut self, user_id: String) -> CoreResult<CoreOutput> {
+        let device_id = self.local_device_id_required()?;
+        self.state.pending_allowlist_mutation = Some(PendingAllowlistMutation::Remove {
+            user_id: user_id.clone(),
+        });
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::FetchAllowlist {
+                fetch: FetchAllowlistRequest {
+                    device_id,
+                    endpoint: self.inbox_management_endpoint("allowlist")?,
+                    headers: self.device_runtime_headers()?,
+                },
+            }],
+            view_model: None,
+        })
     }
 
     fn refresh_identity_state(&mut self, user_id: String) -> CoreResult<CoreOutput> {
@@ -3472,6 +3760,110 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         }
+    }
+
+    fn message_requests_output(&self, requests: Vec<MessageRequestItem>) -> CoreOutput {
+        CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![],
+            view_model: Some(CoreViewModel {
+                message_requests: requests,
+                ..CoreViewModel::default()
+            }),
+        }
+    }
+
+    fn message_request_action_output(&self, result: MessageRequestActionResult) -> CoreOutput {
+        let message = match result.action {
+            MessageRequestAction::Accept => {
+                format!("accepted message request {}", result.request_id)
+            }
+            MessageRequestAction::Reject => {
+                format!("rejected message request {}", result.request_id)
+            }
+        };
+        CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::EmitUserNotification {
+                notification: UserNotificationEffect {
+                    status: SystemStatus::SyncInProgress,
+                    message: message.clone(),
+                },
+            }],
+            view_model: Some(CoreViewModel {
+                message_request_action: Some(MessageRequestActionSummary {
+                    accepted: result.accepted,
+                    request_id: result.request_id,
+                    sender_user_id: result.sender_user_id,
+                    promoted_count: result.promoted_count,
+                    action: result.action,
+                }),
+                banners: vec![SystemBanner {
+                    status: SystemStatus::SyncInProgress,
+                    message,
+                }],
+                ..CoreViewModel::default()
+            }),
+        }
+    }
+
+    fn allowlist_output(&self, document: AllowlistDocument, updated: bool) -> CoreOutput {
+        let message = if updated {
+            "allowlist updated"
+        } else {
+            "allowlist loaded"
+        };
+        CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![],
+            view_model: Some(CoreViewModel {
+                allowlist: Some(document),
+                banners: if updated {
+                    vec![SystemBanner {
+                        status: SystemStatus::SyncInProgress,
+                        message: message.into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..CoreViewModel::default()
+            }),
+        }
+    }
+
+    fn handle_allowlist_fetched(&mut self, mut document: AllowlistDocument) -> CoreResult<CoreOutput> {
+        let Some(mutation) = self.state.pending_allowlist_mutation.take() else {
+            return Ok(self.allowlist_output(document, false));
+        };
+        match mutation {
+            PendingAllowlistMutation::Add { user_id } => {
+                if !document.allowed_sender_user_ids.iter().any(|existing| existing == &user_id) {
+                    document.allowed_sender_user_ids.push(user_id.clone());
+                    document.allowed_sender_user_ids.sort();
+                    document.allowed_sender_user_ids.dedup();
+                }
+                document
+                    .rejected_sender_user_ids
+                    .retain(|existing| existing != &user_id);
+            }
+            PendingAllowlistMutation::Remove { user_id } => {
+                document
+                    .allowed_sender_user_ids
+                    .retain(|existing| existing != &user_id);
+            }
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::ReplaceAllowlist {
+                update: ReplaceAllowlistRequest {
+                    device_id: self.local_device_id_required()?,
+                    endpoint: self.inbox_management_endpoint("allowlist")?,
+                    headers: self.device_runtime_headers()?,
+                    document,
+                },
+            }],
+            view_model: None,
+        })
     }
 
     fn handle_identity_refresh_failure(

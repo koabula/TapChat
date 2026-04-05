@@ -135,6 +135,113 @@ pub struct FetchIdentityBundleResult {
     pub bundle: IdentityBundle,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRequestItem {
+    pub request_id: String,
+    pub recipient_device_id: String,
+    pub sender_user_id: String,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub message_count: u64,
+    pub last_message_id: String,
+    pub last_conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchMessageRequestsRequest {
+    pub device_id: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchMessageRequestsResult {
+    pub requests: Vec<MessageRequestItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRequestAction {
+    Accept,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRequestActionRequest {
+    pub device_id: String,
+    pub request_id: String,
+    pub action: MessageRequestAction,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRequestActionResult {
+    pub accepted: bool,
+    pub request_id: String,
+    pub sender_user_id: String,
+    pub promoted_count: u64,
+    pub action: MessageRequestAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowlistDocument {
+    pub allowed_sender_user_ids: Vec<String>,
+    pub rejected_sender_user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchAllowlistRequest {
+    pub device_id: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceAllowlistRequest {
+    pub device_id: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    pub document: AllowlistDocument,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedStateDocumentKind {
+    IdentityBundle,
+    DeviceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStatusRecord {
+    pub version: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub status: crate::model::DeviceStatusKind,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceStatusDocument {
+    pub version: String,
+    pub user_id: String,
+    pub updated_at: u64,
+    pub devices: Vec<DeviceStatusRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishSharedStateRequest {
+    pub reference: String,
+    pub document_kind: SharedStateDocumentKind,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +302,25 @@ mod tests {
         assert_eq!(decoded.delivered_to, AppendDeliveryDisposition::MessageRequest);
         assert_eq!(decoded.queued_as_request, Some(true));
         assert_eq!(decoded.request_id.as_deref(), Some("request:user:alice"));
+    }
+
+    #[test]
+    fn management_contract_types_round_trip_without_platform_fields() {
+        let request = ReplaceAllowlistRequest {
+            device_id: "device:bob:phone".into(),
+            endpoint: "https://transport.example/v1/inbox/device%3Abob%3Aphone/allowlist".into(),
+            headers: BTreeMap::from([("Authorization".into(), "Bearer token".into())]),
+            document: AllowlistDocument {
+                allowed_sender_user_ids: vec!["user:alice".into()],
+                rejected_sender_user_ids: vec!["user:mallory".into()],
+            },
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(!json.contains("cloudflare"));
+        assert!(!json.contains("durable"));
+
+        let decoded: ReplaceAllowlistRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.document.allowed_sender_user_ids, vec!["user:alice"]);
     }
 }

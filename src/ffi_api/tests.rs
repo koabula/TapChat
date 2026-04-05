@@ -1803,6 +1803,180 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reimported_deployment_publishes_local_shared_state_documents() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+            })
+            .expect("identity");
+
+        let output = engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("reimport deployment");
+
+        assert_eq!(publish_shared_state_effects(&output).len(), 2);
+        assert!(publish_shared_state_effects(&output)
+            .iter()
+            .any(|publish| publish.document_kind
+                == crate::transport_contract::SharedStateDocumentKind::IdentityBundle));
+        assert!(publish_shared_state_effects(&output)
+            .iter()
+            .any(|publish| publish.document_kind
+                == crate::transport_contract::SharedStateDocumentKind::DeviceStatus));
+    }
+
+    #[test]
+    fn updating_local_device_status_publishes_shared_state_documents() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+            })
+            .expect("identity");
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("local identity")
+            .device_identity
+            .device_id
+            .clone();
+
+        let output = engine
+            .handle_command(CoreCommand::UpdateLocalDeviceStatus {
+                target_device_id: device_id,
+                status: crate::model::DeviceStatusKind::Revoked,
+            })
+            .expect("update device status");
+
+        assert_eq!(publish_shared_state_effects(&output).len(), 2);
+    }
+
+    #[test]
+    fn list_message_requests_emits_fetch_management_effect() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+            })
+            .expect("identity");
+
+        let output = engine
+            .handle_command(CoreCommand::ListMessageRequests)
+            .expect("list requests");
+
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchMessageRequests { fetch }
+                if fetch.endpoint.ends_with("/message-requests")
+        )));
+    }
+
+    #[test]
+    fn add_allowlist_user_fetches_then_replaces_allowlist_document() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+            })
+            .expect("identity");
+
+        let fetch = engine
+            .handle_command(CoreCommand::AddAllowlistUser {
+                user_id: "user:bob".into(),
+            })
+            .expect("add allowlist user");
+        assert!(fetch.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchAllowlist { fetch } if fetch.endpoint.ends_with("/allowlist")
+        )));
+
+        let replaced = engine
+            .handle_event(CoreEvent::AllowlistFetched {
+                document: crate::transport_contract::AllowlistDocument {
+                    allowed_sender_user_ids: vec![],
+                    rejected_sender_user_ids: vec!["user:bob".into()],
+                },
+            })
+            .expect("allowlist fetched");
+
+        let replace = replaced
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReplaceAllowlist { update } => Some(update),
+                _ => None,
+            })
+            .expect("replace allowlist effect");
+        assert_eq!(replace.document.allowed_sender_user_ids, vec!["user:bob"]);
+        assert!(replace.document.rejected_sender_user_ids.is_empty());
+        assert!(engine.state.pending_allowlist_mutation.is_none());
+    }
+
+    #[test]
+    fn allowlist_fetch_without_pending_mutation_returns_view_model() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+            })
+            .expect("identity");
+
+        let output = engine
+            .handle_event(CoreEvent::AllowlistFetched {
+                document: crate::transport_contract::AllowlistDocument {
+                    allowed_sender_user_ids: vec!["user:bob".into()],
+                    rejected_sender_user_ids: vec![],
+                },
+            })
+            .expect("allowlist fetched");
+
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .and_then(|view| view.allowlist.as_ref())
+                .expect("allowlist view model")
+                .allowed_sender_user_ids,
+            vec!["user:bob"]
+        );
+        assert!(output.effects.is_empty());
+    }
+
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
         let mut engine = CoreEngine::new();
         engine
@@ -1958,6 +2132,19 @@ mod tests {
                 _ => None,
             })
             .expect("persist snapshot")
+    }
+
+    fn publish_shared_state_effects(
+        output: &crate::ffi_api::CoreOutput,
+    ) -> Vec<&crate::transport_contract::PublishSharedStateRequest> {
+        output
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PublishSharedState { publish } => Some(publish),
+                _ => None,
+            })
+            .collect()
     }
 
     fn sample_deployment() -> DeploymentBundle {

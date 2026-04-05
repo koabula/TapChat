@@ -7,14 +7,13 @@ use std::time::{Duration, Instant};
 #[cfg(not(windows))]
 use std::io::{BufRead, BufReader};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::model::{CURRENT_MODEL_VERSION, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
+use crate::model::{CURRENT_MODEL_VERSION, DeploymentBundle};
 
-use super::util::{sign_hmac_token, to_camel_case_json_string, to_snake_case_json_string};
+use super::util::{sign_hmac_token, to_snake_case_json_string};
 
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeInstance {
@@ -24,12 +23,6 @@ pub struct LocalRuntimeInstance {
     pub bootstrap_secret: String,
     pub sharing_secret: String,
     pub service_root: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CliAllowlistDocument {
-    pub allowed_sender_user_ids: Vec<String>,
-    pub rejected_sender_user_ids: Vec<String>,
 }
 
 pub fn start_local_runtime(
@@ -264,142 +257,6 @@ pub async fn bootstrap_device_bundle(
     }
     let body = response.text().await.context("read bootstrap response")?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
-}
-
-pub async fn put_identity_bundle(auth: &DeviceRuntimeAuth, bundle: &IdentityBundle) -> Result<()> {
-    let reference = bundle
-        .identity_bundle_ref
-        .clone()
-        .ok_or_else(|| anyhow!("identity bundle missing identity_bundle_ref"))?
-        .replace("{userId}", &bundle.user_id);
-    let client = Client::builder().build().context("build reqwest client")?;
-    let body = serde_json::to_string(bundle)?;
-    let response = client
-        .put(reference)
-        .header("Authorization", format!("Bearer {}", auth.token))
-        .header("Content-Type", "application/json")
-        .body(to_camel_case_json_string(&body)?)
-        .send()
-        .await
-        .context("put identity bundle")?;
-    if !response.status().is_success() {
-        bail!(
-            "put identity bundle failed with status {}",
-            response.status()
-        );
-    }
-    Ok(())
-}
-
-pub async fn list_allowlist(
-    auth: &DeviceRuntimeAuth,
-    base_url: &str,
-) -> Result<CliAllowlistDocument> {
-    let client = Client::builder().build().context("build reqwest client")?;
-    let allowlist_url = format!(
-        "{}/v1/inbox/{}/allowlist",
-        base_url.trim_end_matches('/'),
-        urlencoding::encode(&auth.device_id)
-    );
-    let response = client
-        .get(&allowlist_url)
-        .header("Authorization", format!("Bearer {}", auth.token))
-        .send()
-        .await
-        .context("get allowlist")?;
-    if !response.status().is_success() {
-        bail!("get allowlist failed with status {}", response.status());
-    }
-    let body = response.text().await.context("read allowlist response")?;
-    let normalized = to_snake_case_json_string(&body)?;
-    Ok(serde_json::from_str(&normalized)?)
-}
-
-pub async fn put_allowlist(
-    auth: &DeviceRuntimeAuth,
-    base_url: &str,
-    allowed_sender_user_ids: &[String],
-    rejected_sender_user_ids: &[String],
-) -> Result<()> {
-    let client = Client::builder().build().context("build reqwest client")?;
-    let allowlist_url = format!(
-        "{}/v1/inbox/{}/allowlist",
-        base_url.trim_end_matches('/'),
-        urlencoding::encode(&auth.device_id)
-    );
-    let response = client
-        .put(&allowlist_url)
-        .header("Authorization", format!("Bearer {}", auth.token))
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_string(&json!({
-            "allowedSenderUserIds": allowed_sender_user_ids,
-            "rejectedSenderUserIds": rejected_sender_user_ids,
-        }))?)
-        .send()
-        .await
-        .context("put allowlist")?;
-    if !response.status().is_success() {
-        bail!("put allowlist failed with status {}", response.status());
-    }
-    Ok(())
-}
-
-pub async fn add_allowlist_user(
-    auth: &DeviceRuntimeAuth,
-    base_url: &str,
-    sender_user_id: &str,
-) -> Result<CliAllowlistDocument> {
-    let mut document = list_allowlist(auth, base_url).await?;
-    if !document
-        .allowed_sender_user_ids
-        .iter()
-        .any(|user_id| user_id == sender_user_id)
-    {
-        document
-            .allowed_sender_user_ids
-            .push(sender_user_id.to_string());
-        document.allowed_sender_user_ids.sort();
-        document.allowed_sender_user_ids.dedup();
-    }
-    document
-        .rejected_sender_user_ids
-        .retain(|user_id| user_id != sender_user_id);
-    put_allowlist(
-        auth,
-        base_url,
-        &document.allowed_sender_user_ids,
-        &document.rejected_sender_user_ids,
-    )
-    .await?;
-    Ok(document)
-}
-
-pub async fn remove_allowlist_user(
-    auth: &DeviceRuntimeAuth,
-    base_url: &str,
-    sender_user_id: &str,
-) -> Result<CliAllowlistDocument> {
-    let mut document = list_allowlist(auth, base_url).await?;
-    document
-        .allowed_sender_user_ids
-        .retain(|user_id| user_id != sender_user_id);
-    put_allowlist(
-        auth,
-        base_url,
-        &document.allowed_sender_user_ids,
-        &document.rejected_sender_user_ids,
-    )
-    .await?;
-    Ok(document)
-}
-
-pub async fn allow_sender_user(
-    auth: &DeviceRuntimeAuth,
-    base_url: &str,
-    sender_user_id: &str,
-) -> Result<()> {
-    let _ = add_allowlist_user(auth, base_url, sender_user_id).await?;
-    Ok(())
 }
 
 pub fn resolve_workspace_root(

@@ -297,6 +297,59 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   await waitForCleanup(mf, token, deviceId, 1, `inbox-payload/${deviceId}/2.json`);
 });
 
+test("runtime integration: cleanup keeps head monotonic across repeated recovery fetches", async (t) => {
+  const mf = await createRuntime({ maxInlineBytes: "96", retentionDays: "0" });
+  t.after(async () => {
+    await mf.dispose();
+  });
+
+  const deviceId = "device:bob:cleanup";
+  const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
+  const token = bundle.deviceRuntimeAuth!.token;
+  await setAllowlist(mf, token, deviceId, ["user:alice"]);
+
+  const append1 = await appendEnvelope(mf, deviceId, "msg:cleanup-1", "cipher-cleanup-1");
+  const append2 = await appendEnvelope(mf, deviceId, "msg:cleanup-2", "cipher-cleanup-2");
+  assert.equal(append1.seq, 1);
+  assert.equal(append2.seq, 2);
+
+  const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/ack`, {
+    method: "POST",
+    headers: {
+      ...authHeaders(token),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      ack: {
+        deviceId,
+        ackSeq: 2,
+        ackedAt: Date.now(),
+        ackedMessageIds: ["msg:cleanup-1", "msg:cleanup-2"]
+      }
+    })
+  });
+  assert.equal(ackResponse.status, 200);
+
+  await waitForCleanup(mf, token, deviceId, 1, `inbox-payload/${deviceId}/2.json`);
+
+  for (const fromSeq of [1, 2]) {
+    const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
+      headers: authHeaders(token)
+    });
+    assert.equal(headResponse.status, 200);
+    const head = (await headResponse.json()) as { headSeq: number };
+    assert.equal(head.headSeq, 2);
+
+    const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=${fromSeq}&limit=10`, {
+      headers: authHeaders(token)
+    });
+    assert.equal(fetchResponse.status, 200);
+    const fetched = (await fetchResponse.json()) as { toSeq: number; records: unknown[] };
+    assert.equal(fetched.toSeq, 2);
+    assert.deepEqual(fetched.records, []);
+  }
+});
+
 test("runtime integration: message requests do not push until accepted", async (t) => {
   const mf = await createRuntime();
   t.after(async () => {

@@ -13,8 +13,11 @@ use crate::model::{
 use crate::persistence::{CorePersistenceSnapshot, PersistOp};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest, PrepareBlobUploadRequest,
-    PrepareBlobUploadResult, RealtimeSubscriptionRequest,
+    AllowlistDocument, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestAction,
+    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
+    PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, SharedStateDocumentKind,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -69,6 +72,18 @@ pub enum CoreCommand {
         reason: Option<String>,
     },
     RefreshIdentityState {
+        user_id: String,
+    },
+    ListMessageRequests,
+    ActOnMessageRequest {
+        request_id: String,
+        action: MessageRequestAction,
+    },
+    ListAllowlist,
+    AddAllowlistUser {
+        user_id: String,
+    },
+    RemoveAllowlistUser {
         user_id: String,
     },
     CreateAdditionalDeviceIdentity {
@@ -129,6 +144,46 @@ pub enum CoreEvent {
     },
     IdentityBundleFetchFailed {
         user_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    MessageRequestsFetched {
+        requests: Vec<MessageRequestItem>,
+    },
+    MessageRequestsFetchFailed {
+        retryable: bool,
+        detail: Option<String>,
+    },
+    MessageRequestActionCompleted {
+        result: MessageRequestActionResult,
+    },
+    MessageRequestActionFailed {
+        request_id: String,
+        action: MessageRequestAction,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    AllowlistFetched {
+        document: AllowlistDocument,
+    },
+    AllowlistFetchFailed {
+        retryable: bool,
+        detail: Option<String>,
+    },
+    AllowlistReplaced {
+        document: AllowlistDocument,
+    },
+    AllowlistReplaceFailed {
+        retryable: bool,
+        detail: Option<String>,
+    },
+    SharedStatePublished {
+        document_kind: SharedStateDocumentKind,
+        reference: String,
+    },
+    SharedStatePublishFailed {
+        document_kind: SharedStateDocumentKind,
+        reference: String,
         retryable: bool,
         detail: Option<String>,
     },
@@ -253,6 +308,21 @@ pub enum CoreEffect {
     FetchIdentityBundle {
         fetch: FetchIdentityBundleRequest,
     },
+    FetchMessageRequests {
+        fetch: FetchMessageRequestsRequest,
+    },
+    ActOnMessageRequest {
+        action: MessageRequestActionRequest,
+    },
+    FetchAllowlist {
+        fetch: FetchAllowlistRequest,
+    },
+    ReplaceAllowlist {
+        update: ReplaceAllowlistRequest,
+    },
+    PublishSharedState {
+        publish: PublishSharedStateRequest,
+    },
     ReadAttachmentBytes {
         read: ReadAttachmentBytesEffect,
     },
@@ -333,6 +403,15 @@ pub struct SystemBanner {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageRequestActionSummary {
+    pub accepted: bool,
+    pub request_id: String,
+    pub sender_user_id: String,
+    pub promoted_count: u64,
+    pub action: MessageRequestAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CoreViewModel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -343,6 +422,12 @@ pub struct CoreViewModel {
     pub contacts: Vec<ContactSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banners: Vec<SystemBanner>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_requests: Vec<MessageRequestItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowlist: Option<AllowlistDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_request_action: Option<MessageRequestActionSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -403,6 +488,16 @@ pub(crate) struct RealtimeSessionState {
     pub(crate) needs_reconnect: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PendingAllowlistMutation {
+    Add {
+        user_id: String,
+    },
+    Remove {
+        user_id: String,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct CoreState {
     pub(crate) local_identity: Option<LocalIdentityState>,
@@ -424,6 +519,7 @@ pub(crate) struct CoreState {
     pub(crate) request_nonce: u64,
     pub(crate) message_nonce: u64,
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
+    pub(crate) pending_allowlist_mutation: Option<PendingAllowlistMutation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +622,7 @@ impl Default for CoreState {
             request_nonce: 0,
             message_nonce: 0,
             recovery_contexts: BTreeMap::new(),
+            pending_allowlist_mutation: None,
         }
     }
 }

@@ -13,13 +13,16 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 use crate::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
-    RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
+    RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, RecoveryDiagnostics,
+    SyncCheckpointSnapshot,
 };
 use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::transport_contract::{
-    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
-    PrepareBlobUploadRequest, RealtimeSubscriptionRequest,
+    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
+    PrepareBlobUploadRequest, PublishSharedStateRequest, RealtimeSubscriptionRequest,
+    ReplaceAllowlistRequest,
 };
 
 use super::util::{to_camel_case_json_string, to_snake_case_json_string};
@@ -108,10 +111,6 @@ impl CoreDriver {
 
     pub fn notifications(&self) -> &[String] {
         &self.runtime.notifications
-    }
-
-    pub fn latest_notification(&self) -> Option<&str> {
-        self.runtime.notifications.last().map(String::as_str)
     }
 
     pub fn pending_outbox_count(&self) -> usize {
@@ -309,6 +308,10 @@ impl CoreDriver {
         self.engine.recovery_context_snapshot(conversation_id)
     }
 
+    pub fn recovery_conversations(&self) -> Vec<RecoveryDiagnostics> {
+        self.engine.recovery_conversations_snapshot()
+    }
+
     pub fn sync_checkpoint_snapshot(&self, device_id: &str) -> Option<SyncCheckpointSnapshot> {
         self.engine.sync_checkpoint_snapshot(device_id)
     }
@@ -447,6 +450,13 @@ impl CoreDriver {
                 Ok(Vec::new())
             }
             CoreEffect::FetchIdentityBundle { fetch } => self.fetch_identity_bundle(fetch).await,
+            CoreEffect::FetchMessageRequests { fetch } => self.fetch_message_requests(fetch).await,
+            CoreEffect::ActOnMessageRequest { action } => {
+                self.act_on_message_request(action).await
+            }
+            CoreEffect::FetchAllowlist { fetch } => self.fetch_allowlist(fetch).await,
+            CoreEffect::ReplaceAllowlist { update } => self.replace_allowlist(update).await,
+            CoreEffect::PublishSharedState { publish } => self.publish_shared_state(publish).await,
             CoreEffect::ReadAttachmentBytes { read } => self.read_attachment_bytes(read).await,
             CoreEffect::PrepareBlobUpload { upload } => self.prepare_blob_upload(upload).await,
             CoreEffect::UploadBlob { upload } => self.upload_blob(upload).await,
@@ -614,6 +624,189 @@ impl CoreDriver {
             }]),
             Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn fetch_message_requests(
+        &mut self,
+        fetch: FetchMessageRequestsRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let mut request = self.runtime.client.get(fetch.endpoint);
+        for (key, value) in &fetch.headers {
+            request = request.header(key, value);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let normalized = to_snake_case_json_string(&body)?;
+                let value: serde_json::Value = serde_json::from_str(&normalized)?;
+                let requests = serde_json::from_value(
+                    value.get("requests").cloned().unwrap_or_else(|| serde_json::json!([])),
+                )?;
+                Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                retryable: false,
+                detail: Some(format!("list message requests failed with status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn act_on_message_request(
+        &mut self,
+        action: MessageRequestActionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let mut request = self.runtime.client.post(format!(
+            "{}/{}/{}",
+            action.endpoint.trim_end_matches('/'),
+            urlencoding::encode(&action.request_id),
+            match action.action {
+                crate::transport_contract::MessageRequestAction::Accept => "accept",
+                crate::transport_contract::MessageRequestAction::Reject => "reject",
+            }
+        ));
+        for (key, value) in &action.headers {
+            request = request.header(key, value);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let normalized = to_snake_case_json_string(&body)?;
+                let value: serde_json::Value = serde_json::from_str(&normalized)?;
+                let result = crate::transport_contract::MessageRequestActionResult {
+                    accepted: value
+                        .get("accepted")
+                        .and_then(|field| field.as_bool())
+                        .unwrap_or(false),
+                    request_id: value
+                        .get("request_id")
+                        .and_then(|field| field.as_str())
+                        .unwrap_or(&action.request_id)
+                        .to_string(),
+                    sender_user_id: value
+                        .get("sender_user_id")
+                        .and_then(|field| field.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    promoted_count: value
+                        .get("promoted_count")
+                        .and_then(|field| field.as_u64())
+                        .unwrap_or_default(),
+                    action: action.action,
+                };
+                Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::MessageRequestActionFailed {
+                request_id: action.request_id,
+                action: action.action,
+                retryable: false,
+                detail: Some(format!(
+                    "message request action failed with status {}",
+                    response.status()
+                )),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
+                request_id: action.request_id,
+                action: action.action,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
+        let mut request = self.runtime.client.get(fetch.endpoint);
+        for (key, value) in &fetch.headers {
+            request = request.header(key, value);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+                Ok(vec![CoreEvent::AllowlistFetched { document }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+                retryable: false,
+                detail: Some(format!("get allowlist failed with status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn replace_allowlist(
+        &mut self,
+        update: ReplaceAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let mut request = self.runtime.client.put(update.endpoint);
+        for (key, value) in &update.headers {
+            request = request.header(key, value);
+        }
+        let body = serde_json::to_string(&serde_json::json!({
+            "allowedSenderUserIds": update.document.allowed_sender_user_ids,
+            "rejectedSenderUserIds": update.document.rejected_sender_user_ids,
+        }))?;
+        match request
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+                Ok(vec![CoreEvent::AllowlistReplaced { document }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                retryable: false,
+                detail: Some(format!("put allowlist failed with status {}", response.status())),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn publish_shared_state(
+        &mut self,
+        publish: PublishSharedStateRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let mut request = self.runtime.client.put(publish.reference.clone());
+        for (key, value) in &publish.headers {
+            request = request.header(key, value);
+        }
+        match request
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&publish.body)?)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::SharedStatePublished {
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+            }]),
+            Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+                retryable: false,
+                detail: Some(format!(
+                    "shared state publish failed with status {}",
+                    response.status()
+                )),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+                document_kind: publish.document_kind,
+                reference: publish.reference,
                 retryable: true,
                 detail: Some(error.to_string()),
             }]),
