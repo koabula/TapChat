@@ -485,9 +485,12 @@ impl CliApp {
                     })
                     .await?;
                 persist_driver(&mut profile, &driver)?;
-                self.print_value(
-                    &serde_json::json!({ "sent": true, "conversation_id": conversation_id }),
-                )
+                self.print_value(&serde_json::json!({
+                    "sent": true,
+                    "conversation_id": conversation_id,
+                    "pending_outbox": driver.pending_outbox_count(),
+                    "latest_notification": driver.latest_notification(),
+                }))
             }
             MessageSubcommand::SendAttachment {
                 profile,

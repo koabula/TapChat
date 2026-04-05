@@ -546,6 +546,108 @@ mod tests {
     }
 
     #[test]
+    fn append_message_request_result_emits_policy_notification_and_clears_outbox() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+        let pending_message_id = alice
+            .state
+            .pending_outbox
+            .last()
+            .expect("pending outbox")
+            .envelope
+            .message_id
+            .clone();
+
+        let output = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(
+                    r#"{"accepted":true,"seq":0,"delivered_to":"message_request","queued_as_request":true,"request_id":"request:user:bob"}"#.into(),
+                ),
+            })
+            .expect("message request response");
+
+        assert!(
+            !alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| item.envelope.message_id == pending_message_id)
+        );
+        assert!(
+            output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval)
+        );
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::EmitUserNotification { notification }
+            if notification.status == crate::ffi_api::SystemStatus::MessageQueuedForApproval
+                && notification.message.contains("queued as a message request")
+        )));
+    }
+
+    #[test]
+    fn append_rejected_result_emits_policy_notification_and_clears_outbox() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+        let pending_message_id = alice
+            .state
+            .pending_outbox
+            .last()
+            .expect("pending outbox")
+            .envelope
+            .message_id
+            .clone();
+
+        let output = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":0,"delivered_to":"rejected"}"#.into()),
+            })
+            .expect("rejected response");
+
+        assert!(
+            !alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| item.envelope.message_id == pending_message_id)
+        );
+        assert!(
+            output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy)
+        );
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::EmitUserNotification { notification }
+            if notification.status == crate::ffi_api::SystemStatus::MessageRejectedByPolicy
+                && notification.message.contains("rejected by inbox policy")
+        )));
+    }
+
+    #[test]
     fn ack_requires_explicit_accepted_result() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);

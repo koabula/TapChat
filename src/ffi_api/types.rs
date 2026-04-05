@@ -287,6 +287,8 @@ pub enum SystemStatus {
     ConversationNeedsRebuild,
     AttachmentUploadFailed,
     TemporaryNetworkFailure,
+    MessageQueuedForApproval,
+    MessageRejectedByPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

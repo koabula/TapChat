@@ -268,6 +268,12 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
     let post_accept_sync = sync_once(&bob_profile)?;
     assert_eq!(post_accept_sync["synced"], Value::Bool(true));
     assert!(required_u64(&post_accept_sync["checkpoint"], "last_acked_seq")? >= 1);
+    let repeat_sync = sync_once(&bob_profile)?;
+    assert_eq!(repeat_sync["synced"], Value::Bool(true));
+    assert!(
+        required_u64(&repeat_sync["checkpoint"], "last_acked_seq")?
+            >= required_u64(&post_accept_sync["checkpoint"], "last_acked_seq")?
+    );
 
     let messages = run_cli_json([
         "message",
@@ -279,6 +285,18 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
     ])?;
     assert_eq!(
         count_plaintext_messages(&messages, "pending request message"),
+        1
+    );
+    let repeat_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&repeat_messages, "pending request message"),
         1
     );
 
@@ -391,7 +409,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     ])?;
     let conversation_id = required_str(&created, "conversation_id")?;
 
-    run_cli_json([
+    let first_send = run_cli_json([
         "message",
         "send-text",
         "--profile",
@@ -401,6 +419,14 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
         "--text",
         "policy request 1",
     ])?;
+    assert_eq!(first_send["sent"], Value::Bool(true));
+    assert_eq!(first_send["pending_outbox"], Value::from(0));
+    assert!(
+        first_send["latest_notification"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("queued as a message request")
+    );
 
     let requests = run_cli_json([
         "contact",
@@ -428,7 +454,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     ])?;
     assert_eq!(rejected["rejected"], Value::Bool(true));
 
-    run_cli_json([
+    let second_send = run_cli_json([
         "message",
         "send-text",
         "--profile",
@@ -438,6 +464,14 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
         "--text",
         "policy request 2",
     ])?;
+    assert_eq!(second_send["sent"], Value::Bool(true));
+    assert_eq!(second_send["pending_outbox"], Value::from(0));
+    assert!(
+        second_send["latest_notification"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rejected by inbox policy")
+    );
     let blocked_sync = sync_once(&bob_profile)?;
     assert_eq!(
         required_u64(&blocked_sync["checkpoint"], "last_acked_seq")?,

@@ -24,9 +24,10 @@ use crate::persistence::{
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
-    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, BlobDownloadRequest,
-    BlobUploadRequest, FetchIdentityBundleRequest, FetchMessagesRequest, FetchMessagesResult,
-    GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult, RealtimeSubscriptionRequest,
+    AckRequest, AckResult, AppendDeliveryDisposition, AppendEnvelopeRequest, AppendEnvelopeResult,
+    BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest, FetchMessagesRequest,
+    FetchMessagesResult, GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    RealtimeSubscriptionRequest,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -2523,10 +2524,11 @@ impl CoreEngine {
                         "append response was not accepted",
                     ));
                 }
+                let request_output = self.handle_append_delivery_result(&message_id, &result);
                 self.state
                     .pending_outbox
                     .retain(|item| item.envelope.message_id != message_id);
-                self.flush_pending_transport()
+                Ok(merge_outputs(request_output, self.flush_pending_transport()?))
             }
             PendingRequest::Ack { device_id, .. } => {
                 let result: AckResult = serde_json::from_str(
@@ -3425,6 +3427,49 @@ impl CoreEngine {
                     },
                 }],
                 view_model: None,
+            }),
+        }
+    }
+
+    fn handle_append_delivery_result(
+        &self,
+        message_id: &str,
+        result: &AppendEnvelopeResult,
+    ) -> CoreOutput {
+        let peer_user_id = self
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_id == message_id)
+            .map(|item| item.peer_user_id.clone())
+            .unwrap_or_else(|| "peer".into());
+        let (status, message, banner) = match result.delivered_to {
+            AppendDeliveryDisposition::Inbox => return CoreOutput::default(),
+            AppendDeliveryDisposition::MessageRequest => (
+                SystemStatus::MessageQueuedForApproval,
+                format!("message {message_id} for {peer_user_id} is queued as a message request"),
+                "message queued for recipient approval".to_string(),
+            ),
+            AppendDeliveryDisposition::Rejected => (
+                SystemStatus::MessageRejectedByPolicy,
+                format!("message {message_id} for {peer_user_id} was rejected by inbox policy"),
+                "message rejected by recipient policy".to_string(),
+            ),
+        };
+        CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![status],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::EmitUserNotification {
+                notification: UserNotificationEffect { status, message },
+            }],
+            view_model: Some(CoreViewModel {
+                banners: vec![SystemBanner {
+                    status,
+                    message: banner,
+                }],
+                ..CoreViewModel::default()
             }),
         }
     }

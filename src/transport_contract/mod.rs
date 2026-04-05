@@ -11,9 +11,29 @@ pub struct AppendEnvelopeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppendDeliveryDisposition {
+    Inbox,
+    MessageRequest,
+    Rejected,
+}
+
+impl Default for AppendDeliveryDisposition {
+    fn default() -> Self {
+        Self::Inbox
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEnvelopeResult {
     pub accepted: bool,
     pub seq: u64,
+    #[serde(default)]
+    pub delivered_to: AppendDeliveryDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_as_request: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,5 +177,23 @@ mod tests {
         assert!(!json.contains("worker"));
         let decoded: AppendEnvelopeRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.recipient_device_id, "device:bob:phone");
+    }
+
+    #[test]
+    fn append_result_round_trips_policy_outcome() {
+        let result = AppendEnvelopeResult {
+            accepted: true,
+            seq: 0,
+            delivered_to: AppendDeliveryDisposition::MessageRequest,
+            queued_as_request: Some(true),
+            request_id: Some("request:user:alice".into()),
+        };
+
+        let json = serde_json::to_string(&result).expect("serialize");
+        let decoded: AppendEnvelopeResult = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded.delivered_to, AppendDeliveryDisposition::MessageRequest);
+        assert_eq!(decoded.queued_as_request, Some(true));
+        assert_eq!(decoded.request_id.as_deref(), Some("request:user:alice"));
     }
 }
