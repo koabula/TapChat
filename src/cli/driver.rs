@@ -17,6 +17,10 @@ use crate::ffi_api::{
     SyncCheckpointSnapshot,
 };
 use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
+use crate::platform_ports::{
+    BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
+    TransportPort, execute_platform_effect,
+};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
@@ -435,52 +439,15 @@ impl CoreDriver {
     }
 
     async fn execute_effect(&mut self, effect: CoreEffect) -> Result<Vec<CoreEvent>> {
-        match effect {
-            CoreEffect::ExecuteHttpRequest { request } => self.execute_http_request(request).await,
-            CoreEffect::OpenRealtimeConnection { connection } => {
-                if self.suppress_realtime {
+        if self.suppress_realtime {
+            match effect {
+                CoreEffect::OpenRealtimeConnection { .. } | CoreEffect::CloseRealtimeConnection { .. } => {
                     return Ok(Vec::new());
                 }
-                self.open_realtime(connection.subscription).await
-            }
-            CoreEffect::CloseRealtimeConnection { device_id } => {
-                if let Some(task) = self.runtime.websocket_tasks.remove(&device_id) {
-                    task.abort();
-                }
-                Ok(Vec::new())
-            }
-            CoreEffect::FetchIdentityBundle { fetch } => self.fetch_identity_bundle(fetch).await,
-            CoreEffect::FetchMessageRequests { fetch } => self.fetch_message_requests(fetch).await,
-            CoreEffect::ActOnMessageRequest { action } => {
-                self.act_on_message_request(action).await
-            }
-            CoreEffect::FetchAllowlist { fetch } => self.fetch_allowlist(fetch).await,
-            CoreEffect::ReplaceAllowlist { update } => self.replace_allowlist(update).await,
-            CoreEffect::PublishSharedState { publish } => self.publish_shared_state(publish).await,
-            CoreEffect::ReadAttachmentBytes { read } => self.read_attachment_bytes(read).await,
-            CoreEffect::PrepareBlobUpload { upload } => self.prepare_blob_upload(upload).await,
-            CoreEffect::UploadBlob { upload } => self.upload_blob(upload).await,
-            CoreEffect::DownloadBlob { download } => self.download_blob(download).await,
-            CoreEffect::WriteDownloadedAttachment { write } => {
-                self.write_downloaded_attachment(write).await
-            }
-            CoreEffect::PersistState { persist } => {
-                self.persist_state(persist);
-                Ok(Vec::new())
-            }
-            CoreEffect::ScheduleTimer { timer } => {
-                self.runtime.scheduled_timers.push(ScheduledTimer {
-                    timer_id: timer.timer_id,
-                    delay_ms: timer.delay_ms,
-                    scheduled_at: Instant::now(),
-                });
-                Ok(Vec::new())
-            }
-            CoreEffect::EmitUserNotification { notification } => {
-                self.runtime.notifications.push(notification.message);
-                Ok(Vec::new())
+                _ => {}
             }
         }
+        execute_platform_effect(self, effect).await
     }
 
     async fn execute_http_request(
@@ -984,6 +951,133 @@ impl CoreDriver {
         self.runtime.latest_snapshot = Some(self.engine.refresh_snapshot());
     }
 }
+
+impl TransportPort for CoreDriver {
+    async fn execute_http_request(
+        &mut self,
+        request: crate::ffi_api::HttpRequestEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::execute_http_request(self, request).await
+    }
+
+    async fn fetch_identity_bundle(
+        &mut self,
+        fetch: FetchIdentityBundleRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::fetch_identity_bundle(self, fetch).await
+    }
+
+    async fn fetch_message_requests(
+        &mut self,
+        fetch: FetchMessageRequestsRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::fetch_message_requests(self, fetch).await
+    }
+
+    async fn act_on_message_request(
+        &mut self,
+        action: MessageRequestActionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::act_on_message_request(self, action).await
+    }
+
+    async fn fetch_allowlist(
+        &mut self,
+        fetch: FetchAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::fetch_allowlist(self, fetch).await
+    }
+
+    async fn replace_allowlist(
+        &mut self,
+        update: ReplaceAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::replace_allowlist(self, update).await
+    }
+
+    async fn publish_shared_state(
+        &mut self,
+        publish: PublishSharedStateRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::publish_shared_state(self, publish).await
+    }
+}
+
+impl RealtimePort for CoreDriver {
+    async fn open_realtime(
+        &mut self,
+        subscription: RealtimeSubscriptionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::open_realtime(self, subscription).await
+    }
+
+    async fn close_realtime(&mut self, device_id: String) -> Result<Vec<CoreEvent>> {
+        if let Some(task) = self.runtime.websocket_tasks.remove(&device_id) {
+            task.abort();
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl BlobIoPort for CoreDriver {
+    async fn read_attachment_bytes(
+        &mut self,
+        read: crate::ffi_api::ReadAttachmentBytesEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::read_attachment_bytes(self, read).await
+    }
+
+    async fn prepare_blob_upload(
+        &mut self,
+        upload: PrepareBlobUploadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::prepare_blob_upload(self, upload).await
+    }
+
+    async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
+        CoreDriver::upload_blob(self, upload).await
+    }
+
+    async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
+        CoreDriver::download_blob(self, download).await
+    }
+
+    async fn write_downloaded_attachment(
+        &mut self,
+        write: crate::ffi_api::WriteDownloadedAttachmentEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::write_downloaded_attachment(self, write).await
+    }
+}
+
+impl PersistencePort for CoreDriver {
+    fn persist_state(&mut self, persist: PersistStateEffect) {
+        CoreDriver::persist_state(self, persist);
+    }
+}
+
+impl TimerPort for CoreDriver {
+    fn schedule_timer(&mut self, timer_id: String, delay_ms: u64) -> Result<Vec<CoreEvent>> {
+        self.runtime.scheduled_timers.push(ScheduledTimer {
+            timer_id,
+            delay_ms,
+            scheduled_at: Instant::now(),
+        });
+        Ok(Vec::new())
+    }
+}
+
+impl NotificationPort for CoreDriver {
+    fn emit_user_notification(
+        &mut self,
+        notification: crate::ffi_api::UserNotificationEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        self.runtime.notifications.push(notification.message);
+        Ok(Vec::new())
+    }
+}
+
+impl SecureStoragePort for CoreDriver {}
 
 fn looks_like_json(value: &str) -> bool {
     let trimmed = value.trim();

@@ -8,6 +8,7 @@ pub mod identity;
 pub mod logging;
 pub mod mls_adapter;
 pub mod model;
+pub mod platform_ports;
 pub mod persistence;
 pub mod sync_engine;
 pub mod transport_contract;

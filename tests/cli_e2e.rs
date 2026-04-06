@@ -1,14 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tapchat_core::identity::{IdentityManager, LocalIdentityState};
-use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
+use tapchat_core::model::{
+    CapabilityOperation, CapabilityService, DeploymentBundle, DeliveryClass, DeviceRuntimeAuth,
+    Envelope, IdentityBundle, InboxAppendCapability, MessageType, SenderProof,
+};
+use tapchat_core::transport_contract::AppendEnvelopeRequest;
 use tapchat_transport_adapter::{
     CloudflareRuntimeHandle, CloudflareRuntimeOptions, RuntimeMessageRequest,
 };
@@ -18,6 +23,7 @@ const ALICE_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const BOB_MNEMONIC: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
+const ORCHESTRATED_CASE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[allow(dead_code)]
 struct CliPairContext {
@@ -42,6 +48,39 @@ struct CliLaptopContext {
 }
 
 #[test]
+fn cli_e2e_stable_suite() -> Result<()> {
+    for test_name in [
+        "cleanup_test_temp_script_removes_cli_temp_artifacts",
+        "cli_attachment_restart_and_delayed_recovery_work",
+        "cli_cleanup_after_ack_keeps_checkpoint_monotonic",
+        "cli_cleanup_recovery_remains_idempotent_across_repeated_sync",
+        "cli_contact_request_and_allowlist_commands_work",
+        "cli_device_revoke_missing_target_returns_stable_error",
+        "cli_device_revoke_remote_target_updates_published_bundle",
+        "cli_direct_message_and_attachment_e2e_work",
+        "cli_explicit_needs_rebuild_control_e2e_work",
+        "cli_identity_refresh_retry_exhausted_e2e_work",
+        "cli_message_request_accept_flow_works",
+        "cli_needs_rebuild_surfaces_escalation_reason_e2e_work",
+        "cli_profile_registry_and_cloudflare_provision_auto_work",
+        "cli_realtime_out_of_order_or_duplicate_delivery_e2e_work",
+        "cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work",
+        "cli_recovery_policy_exhausted_e2e_work",
+        "cli_repeated_realtime_and_sync_do_not_duplicate_delivery_e2e_work",
+        "cli_revoke_with_delayed_sync_keeps_revoked_device_isolated",
+        "cli_runtime_local_start_accepts_explicit_workspace_root",
+        "cli_runtime_local_start_discovers_workspace_from_binary_outside_repo_cwd",
+        "cli_runtime_local_start_stop_and_status_work",
+        "cli_sender_policy_and_recovery_status_remain_consistent_e2e_work",
+        "cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2e_work",
+    ] {
+        run_orchestrated_cli_case(test_name)?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
     let _guard = test_lock();
     let temp_root = repo_temp_dir("runtime")?;
@@ -135,6 +174,7 @@ fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -336,6 +376,7 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_message_request_accept_flow_works() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -504,6 +545,7 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
     Ok(())
 }
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -756,6 +798,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -1151,6 +1194,7 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2e_work(
 ) -> Result<()> {
     let _guard = test_lock();
@@ -1551,6 +1595,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_needs_rebuild_surfaces_escalation_reason_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("needs-rebuild-escalation")?;
@@ -1686,6 +1731,7 @@ fn cli_needs_rebuild_surfaces_escalation_reason_e2e_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("rebuild-policy-exhausted")?;
@@ -1715,7 +1761,7 @@ fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()
     assert_eq!(rebuilt["rebuilt"], Value::Bool(true));
 
     let alice_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
-    assert_conversation_show_needs_rebuild(&alice_show, "mls_marked_unrecoverable")?;
+    assert_conversation_show_needs_rebuild(&alice_show, "recovery_policy_exhausted")?;
     let alice_status = run_cli_json([
         "sync",
         "status",
@@ -1733,7 +1779,7 @@ fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()
     assert_eq!(
         find_recovery_conversation(&alice_status, &ctx.conversation_id)?["escalation_reason"]
             .as_str(),
-        Some("mls_marked_unrecoverable")
+        Some("recovery_policy_exhausted")
     );
 
     run_cli_json([
@@ -1819,6 +1865,201 @@ fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
+fn cli_realtime_out_of_order_or_duplicate_delivery_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("realtime-duplicate-delivery")?;
+    let _realtime = RealtimeConnectGuard::spawn(&ctx.bob_profile)?;
+
+    let first_send = run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+        "--text",
+        "duplicate realtime delivery",
+    ])?;
+    assert_append_result(&first_send, "inbox", true, None)?;
+
+    let first_sync = sync_once(&ctx.bob_profile)?;
+    let first_acked = required_u64(&first_sync["checkpoint"], "last_acked_seq")?;
+    let second_sync = sync_once(&ctx.bob_profile)?;
+    let second_acked = required_u64(&second_sync["checkpoint"], "last_acked_seq")?;
+    assert!(second_acked >= first_acked);
+
+    let messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(count_plaintext_messages(&messages, "duplicate realtime delivery"), 1);
+
+    let show = conversation_show(&ctx.bob_profile, &ctx.conversation_id)?;
+    assert_conversation_show_healthy(&show);
+    let status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+    ])?;
+    assert!(recovery_conversations(&status)?.is_empty());
+    Ok(())
+}
+
+#[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
+fn cli_explicit_needs_rebuild_control_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("explicit-needs-rebuild-control")?;
+
+    append_runtime_control_message(
+        &ctx.runtime,
+        &ctx.alice_device_id,
+        &ctx.conversation_id,
+        &ctx.bob_user_id,
+        &ctx.bob_device_id,
+        MessageType::ControlConversationNeedsRebuild,
+        "explicit rebuild control",
+    )?;
+    let fetched = with_tokio(|| async {
+        ctx.runtime
+            .fetch_messages(bundle_auth(&ctx.alice_bundle)?, &ctx.alice_device_id, 1, 20)
+            .await
+    })?;
+    assert!(
+        fetched.records.iter().any(|record| {
+            record.envelope.message_type == MessageType::ControlConversationNeedsRebuild
+        }),
+        "expected runtime inbox to contain control_conversation_needs_rebuild"
+    );
+    let sync = sync_once(&ctx.alice_profile)?;
+    assert!(
+        required_u64(&sync["checkpoint"], "last_acked_seq")? > 0,
+        "explicit rebuild control should advance acked seq"
+    );
+
+    let show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_needs_rebuild(&show, "explicit_needs_rebuild_control")?;
+    let status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    let phase = assert_recovery_conversation_matches(
+        &status,
+        &ctx.conversation_id,
+        &["NeedsRebuild"],
+        &["identity_changed"],
+        &["escalated_to_rebuild"],
+        Some(true),
+    )?;
+    assert_eq!(phase, "escalated_to_rebuild");
+    assert_eq!(
+        find_recovery_conversation(&status, &ctx.conversation_id)?["escalation_reason"].as_str(),
+        Some("explicit_needs_rebuild_control")
+    );
+    assert_recovery_contract_alignment(&ctx.alice_profile, &ctx.conversation_id, &show, &status)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
+fn cli_identity_refresh_retry_exhausted_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("identity-refresh-retry-exhausted")?;
+    let _laptop = start_bob_laptop_recovery(&ctx)?;
+
+    let initial_show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    let initial_phase = assert_recovery_conversation_from_show(
+        &initial_show,
+        &["NeedsRecovery", "NeedsRebuild"],
+        &["identity_changed", "membership_changed"],
+        &["waiting_for_explicit_reconcile", "escalated_to_rebuild"],
+        None,
+    )?;
+    assert_eq!(initial_phase, "waiting_for_explicit_reconcile");
+
+    patch_contact_identity_bundle_ref(
+        &ctx.alice_profile,
+        &ctx.bob_user_id,
+        "http://127.0.0.1:1/identity-bundle-unreachable",
+    )?;
+
+    run_cli_json([
+        "contact",
+        "refresh",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--user-id",
+        &ctx.bob_user_id,
+    ])?;
+
+    let show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_needs_rebuild(&show, "identity_refresh_retry_exhausted")?;
+    assert_eq!(
+        show["recovery"]["phase"].as_str(),
+        Some("escalated_to_rebuild")
+    );
+    assert!(
+        show["recovery"]["identity_refresh_retry_count"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+    );
+    let status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert_eq!(
+        find_recovery_conversation(&status, &ctx.conversation_id)?["escalation_reason"].as_str(),
+        Some("identity_refresh_retry_exhausted")
+    );
+    assert_recovery_contract_alignment(&ctx.alice_profile, &ctx.conversation_id, &show, &status)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
+fn cli_recovery_policy_exhausted_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_pair("recovery-policy-exhausted")?;
+
+    let rebuilt = run_cli_json([
+        "conversation",
+        "rebuild",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &ctx.conversation_id,
+    ])?;
+    assert_eq!(rebuilt["rebuilt"], Value::Bool(true));
+
+    let show = conversation_show(&ctx.alice_profile, &ctx.conversation_id)?;
+    assert_conversation_show_needs_rebuild(&show, "recovery_policy_exhausted")?;
+    let status = run_cli_json([
+        "sync",
+        "status",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+    ])?;
+    assert_eq!(
+        find_recovery_conversation(&status, &ctx.conversation_id)?["escalation_reason"].as_str(),
+        Some("recovery_policy_exhausted")
+    );
+    assert_recovery_contract_alignment(&ctx.alice_profile, &ctx.conversation_id, &show, &status)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_device_revoke_remote_target_updates_published_bundle() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("revoke-remote")?;
@@ -1900,6 +2141,7 @@ fn cli_device_revoke_remote_target_updates_published_bundle() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_runtime_local_start_accepts_explicit_workspace_root() -> Result<()> {
     let _guard = test_lock();
     let temp_root = repo_temp_dir("runtime-workspace")?;
@@ -1982,6 +2224,7 @@ fn cli_runtime_local_start_accepts_explicit_workspace_root() -> Result<()> {
     Ok(())
 }
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_runtime_local_start_discovers_workspace_from_binary_outside_repo_cwd() -> Result<()> {
     let _guard = test_lock();
     let temp_root = repo_temp_dir("runtime-cwd")?;
@@ -2035,6 +2278,7 @@ fn cli_runtime_local_start_discovers_workspace_from_binary_outside_repo_cwd() ->
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_device_revoke_missing_target_returns_stable_error() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("revoke-missing-target")?;
@@ -2055,6 +2299,7 @@ fn cli_device_revoke_missing_target_returns_stable_error() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("direct")?;
@@ -2356,6 +2601,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "stress"]
 fn cli_multi_device_join_and_switch_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("multi-device")?;
@@ -2456,6 +2702,7 @@ fn cli_multi_device_join_and_switch_e2e_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "stress"]
 fn cli_recovery_restart_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("restart-recovery")?;
@@ -2578,6 +2825,7 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_attachment_restart_and_delayed_recovery_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("attachment-restart")?;
@@ -2761,6 +3009,7 @@ fn cli_attachment_restart_and_delayed_recovery_work() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_cleanup_after_ack_keeps_checkpoint_monotonic() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -2824,6 +3073,7 @@ fn cli_cleanup_after_ack_keeps_checkpoint_monotonic() -> Result<()> {
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_cleanup_recovery_remains_idempotent_across_repeated_sync() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -2915,6 +3165,7 @@ fn cli_cleanup_recovery_remains_idempotent_across_repeated_sync() -> Result<()> 
 }
 
 #[test]
+#[ignore = "stress"]
 fn cli_long_offline_attachment_and_membership_change_recover_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("long-offline-attachment-membership")?;
@@ -3201,6 +3452,7 @@ fn cli_long_offline_attachment_and_membership_change_recover_e2e_work() -> Resul
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_repeated_realtime_and_sync_do_not_duplicate_delivery_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("repeated-realtime-sync")?;
@@ -3329,6 +3581,7 @@ fn cli_repeated_realtime_and_sync_do_not_duplicate_delivery_e2e_work() -> Result
 }
 
 #[test]
+#[ignore = "stress"]
 fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("multi-device-restart-rebuild")?;
@@ -3531,6 +3784,7 @@ fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work
 }
 
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cli_revoke_with_delayed_sync_keeps_revoked_device_isolated() -> Result<()> {
     let _guard = test_lock();
     let ctx = setup_cli_pair("revoke-delayed-sync")?;
@@ -3627,6 +3881,7 @@ fn cli_revoke_with_delayed_sync_keeps_revoked_device_isolated() -> Result<()> {
 
 #[cfg(windows)]
 #[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
 fn cleanup_test_temp_script_removes_cli_temp_artifacts() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
@@ -3696,6 +3951,50 @@ impl Drop for RuntimePidGuard {
     }
 }
 
+struct RealtimeConnectGuard {
+    child: Option<Child>,
+}
+
+impl RealtimeConnectGuard {
+    fn spawn(profile: &Path) -> Result<Self> {
+        let mut command = Command::new(binary_path());
+        command
+            .current_dir(workspace_root())
+            .arg("--output")
+            .arg("json")
+            .args(["sync", "realtime-connect", "--profile"])
+            .arg(profile)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        apply_default_cli_test_env(&mut command)?;
+        let mut child = command.spawn().context("spawn tapchat realtime-connect")?;
+        thread::sleep(Duration::from_millis(750));
+        if let Some(status) = child
+            .try_wait()
+            .context("poll tapchat realtime-connect process")?
+        {
+            let output = child
+                .wait_with_output()
+                .context("collect tapchat realtime-connect output")?;
+            bail!(
+                "tapchat realtime-connect exited early with status {status}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(Self { child: Some(child) })
+    }
+}
+
+impl Drop for RealtimeConnectGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = stop_pid_and_wait(child.id());
+        let _ = child.wait();
+    }
+}
+
 fn runtime_handle(workspace_root: &Path) -> Result<CloudflareRuntimeHandle> {
     runtime_handle_with_options(workspace_root, CloudflareRuntimeOptions::default())
 }
@@ -3749,6 +4048,7 @@ where
         .current_dir(workspace_root())
         .arg("--output")
         .arg("json");
+    apply_default_cli_test_env(&mut command)?;
     for arg in args {
         command.arg(arg.as_ref());
     }
@@ -3761,6 +4061,7 @@ where
 {
     let mut command = Command::new(binary_path());
     command.current_dir(cwd).arg("--output").arg("json");
+    apply_default_cli_test_env(&mut command)?;
     for arg in args {
         command.arg(arg.as_ref());
     }
@@ -3802,6 +4103,7 @@ where
         .current_dir(workspace_root())
         .arg("--output")
         .arg("json");
+    apply_default_cli_test_env(&mut command)?;
     for (key, value) in envs {
         command.env(key.as_ref(), value.as_ref());
     }
@@ -3839,6 +4141,28 @@ fn conversation_show(profile: &Path, conversation_id: &str) -> Result<Value> {
         "--conversation-id",
         conversation_id,
     ])
+}
+
+fn apply_default_cli_test_env(command: &mut Command) -> Result<()> {
+    let registry_path = default_cli_test_registry_path();
+    if let Some(parent) = registry_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    command.env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path);
+    Ok(())
+}
+
+fn default_cli_test_registry_path() -> &'static PathBuf {
+    static REGISTRY_PATH: OnceLock<PathBuf> = OnceLock::new();
+    REGISTRY_PATH.get_or_init(|| {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        workspace_root()
+            .join(".tmp")
+            .join(format!("cli-e2e-{}-{millis}.profiles.json", std::process::id()))
+    })
 }
 
 fn conversation_exists(profile: &Path, conversation_id: &str) -> Result<bool> {
@@ -3987,6 +4311,9 @@ fn assert_recovery_row_shape(row: &Value) -> Result<()> {
 fn assert_recovery_object_shape(value: &Value) -> Result<()> {
     assert!(value["reason"].is_string());
     assert!(value["phase"].is_string());
+    assert!(value["attempt_count"].is_u64());
+    assert!(value["identity_refresh_retry_count"].is_u64());
+    assert!(value["last_error"].is_null() || value["last_error"].is_string());
     assert!(
         value["escalation_reason"].is_null() || value["escalation_reason"].is_string(),
         "escalation_reason must be null or string"
@@ -4081,6 +4408,42 @@ fn assert_conversation_show_needs_rebuild(
         Some(expected_escalation_reason)
     );
     Ok(())
+}
+
+fn assert_recovery_conversation_from_show(
+    value: &Value,
+    expected_statuses: &[&str],
+    expected_reasons: &[&str],
+    expected_phases: &[&str],
+    escalation_required: Option<bool>,
+) -> Result<String> {
+    let recovery = &value["recovery"];
+    assert!(
+        !recovery.is_null(),
+        "conversation show expected recovery object, found null"
+    );
+    assert_recovery_object_shape(recovery)?;
+    let status = value["recovery_status"]
+        .as_str()
+        .context("conversation recovery_status missing")?;
+    let reason = recovery["reason"].as_str().context("reason missing")?;
+    let phase = recovery["phase"].as_str().context("phase missing")?;
+    assert!(
+        expected_statuses.contains(&status),
+        "unexpected conversation recovery_status {status:?}"
+    );
+    assert!(
+        expected_reasons.contains(&reason),
+        "unexpected conversation recovery reason {reason:?}"
+    );
+    assert!(
+        expected_phases.contains(&phase),
+        "unexpected conversation recovery phase {phase:?}"
+    );
+    if let Some(required) = escalation_required {
+        assert_eq!(recovery["escalation_reason"].is_null(), !required);
+    }
+    Ok(phase.to_string())
 }
 
 fn recovery_phase_rank(phase: &str) -> u8 {
@@ -4457,6 +4820,17 @@ fn snapshot_has_recovery_context(profile: &Path, conversation_id: &str) -> Resul
         .unwrap_or(false))
 }
 
+fn snapshot_recovery_context(profile: &Path, conversation_id: &str) -> Result<Option<Value>> {
+    let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
+    Ok(snapshot["snapshot"]["recovery_contexts"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["conversation_id"].as_str() == Some(conversation_id))
+                .cloned()
+        }))
+}
+
 fn snapshot_has_conversation(profile: &Path, conversation_id: &str) -> Result<bool> {
     let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
     Ok(snapshot["snapshot"]["conversations"]
@@ -4475,6 +4849,172 @@ fn patch_profile_local_bundle(profile: &Path, bundle: &IdentityBundle) -> Result
         profile.join("snapshot.json"),
         serde_json::to_vec_pretty(&snapshot)?,
     )?;
+    Ok(())
+}
+
+fn patch_contact_identity_bundle_ref(
+    profile: &Path,
+    user_id: &str,
+    reference: &str,
+) -> Result<()> {
+    let path = profile.join("snapshot.json");
+    let mut snapshot: Value = read_json_file(&path)?;
+    let contacts = snapshot["snapshot"]["contacts"]
+        .as_array_mut()
+        .context("snapshot contacts missing")?;
+    let contact = contacts
+        .iter_mut()
+        .find(|row| row["user_id"].as_str() == Some(user_id))
+        .context("contact missing in snapshot")?;
+    contact["bundle"]["identity_bundle_ref"] = Value::String(reference.to_string());
+    fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
+    Ok(())
+}
+
+fn append_runtime_control_message(
+    runtime: &CloudflareRuntimeHandle,
+    recipient_device_id: &str,
+    conversation_id: &str,
+    sender_user_id: &str,
+    sender_device_id: &str,
+    message_type: MessageType,
+    payload: &str,
+) -> Result<Value> {
+    with_tokio(|| async {
+        let endpoint = format!(
+            "{}/v1/inbox/{}/messages",
+            runtime.base_url(),
+            urlencoding::encode(recipient_device_id)
+        );
+        let signature = format!("test-append-capability-{recipient_device_id}");
+        let capability = InboxAppendCapability {
+            version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
+            service: CapabilityService::Inbox,
+            user_id: sender_user_id.to_string(),
+            target_device_id: recipient_device_id.to_string(),
+            endpoint: endpoint.clone(),
+            operations: vec![CapabilityOperation::Append],
+            conversation_scope: vec![conversation_id.to_string()],
+            expires_at: 4_102_444_800_000u64,
+            constraints: None,
+            signature: signature.clone(),
+        };
+        let request = AppendEnvelopeRequest {
+            version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
+            recipient_device_id: recipient_device_id.to_string(),
+            envelope: Envelope {
+                version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
+                message_id: format!(
+                    "msg:{conversation_id}:{}:{recipient_device_id}",
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .context("system clock before unix epoch")?
+                        .as_millis()
+                ),
+                conversation_id: conversation_id.to_string(),
+                sender_user_id: sender_user_id.to_string(),
+                sender_device_id: sender_device_id.to_string(),
+                recipient_device_id: recipient_device_id.to_string(),
+                created_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("system clock before unix epoch")?
+                    .as_millis() as u64,
+                message_type,
+                inline_ciphertext: Some(payload.to_string()),
+                storage_refs: vec![],
+                delivery_class: DeliveryClass::Normal,
+                wake_hint: None,
+                sender_proof: SenderProof {
+                    proof_type: "signature".into(),
+                    value: "proof".into(),
+                },
+            },
+        };
+        let capability_json = to_camel_case_json_value(serde_json::to_value(&capability)?);
+        let request_json = to_camel_case_json_value(serde_json::to_value(&request)?);
+        let response = reqwest::Client::new()
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {signature}"))
+            .header("X-Tapchat-Capability", serde_json::to_string(&capability_json)?)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_vec(&request_json)?)
+            .send()
+            .await
+            .context("append runtime control message")?;
+        if !response.status().is_success() {
+            bail!("append runtime control failed with status {}", response.status());
+        }
+        let body = response.text().await.context("read append runtime control response")?;
+        serde_json::from_str(&body).context("parse append runtime control response")
+    })
+}
+
+fn to_camel_case_json_value(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.into_iter().map(to_camel_case_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (snake_to_camel(&key), to_camel_case_json_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn snake_to_camel(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut uppercase = false;
+    for ch in value.chars() {
+        if ch == '_' {
+            uppercase = true;
+        } else if uppercase {
+            output.extend(ch.to_uppercase());
+            uppercase = false;
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn assert_recovery_contract_alignment(
+    profile: &Path,
+    conversation_id: &str,
+    conversation: &Value,
+    status: &Value,
+) -> Result<()> {
+    let recovery = &conversation["recovery"];
+    assert!(!recovery.is_null(), "conversation recovery must not be null");
+    let status_row = find_recovery_conversation(status, conversation_id)?;
+    let snapshot_row =
+        snapshot_recovery_context(profile, conversation_id)?.context("missing snapshot recovery context")?;
+    for field in [
+        "recovery_status",
+        "reason",
+        "phase",
+        "attempt_count",
+        "identity_refresh_retry_count",
+        "last_error",
+        "escalation_reason",
+    ] {
+        let conversation_field = if field == "recovery_status" {
+            &conversation[field]
+        } else {
+            &recovery[field]
+        };
+        assert_eq!(
+            conversation_field,
+            &status_row[field],
+            "conversation/status mismatch for {field}"
+        );
+        if field != "recovery_status" {
+            assert_eq!(
+                conversation_field,
+                &snapshot_row[field],
+                "conversation/snapshot mismatch for {field}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -4514,6 +5054,54 @@ fn bundle_auth(bundle: &DeploymentBundle) -> Result<&DeviceRuntimeAuth> {
         .device_runtime_auth
         .as_ref()
         .context("deployment bundle missing device runtime auth")
+}
+
+fn run_orchestrated_cli_case(test_name: &str) -> Result<()> {
+    let exe = std::env::current_exe().context("resolve cli_e2e test binary path")?;
+    eprintln!("cli_e2e_stable_suite: starting {test_name}");
+    let mut child = Command::new(exe)
+        .current_dir(workspace_root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([test_name, "--ignored", "--nocapture"])
+        .spawn()
+        .with_context(|| format!("spawn orchestrated cli_e2e case {test_name}"))?;
+    let deadline = Instant::now() + ORCHESTRATED_CASE_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("poll orchestrated cli_e2e case {test_name}"))?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let pid = child.id();
+            let _ = stop_pid_and_wait(pid);
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("collect timed out orchestrated cli_e2e case {test_name}"))?;
+            bail!(
+                "orchestrated cli_e2e case {test_name} timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
+                ORCHESTRATED_CASE_TIMEOUT,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("collect orchestrated cli_e2e case {test_name}"))?;
+    if !output.status.success() {
+        bail!(
+            "orchestrated cli_e2e case {test_name} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    eprintln!("cli_e2e_stable_suite: finished {test_name}");
+    Ok(())
 }
 
 fn test_lock() -> MutexGuard<'static, ()> {

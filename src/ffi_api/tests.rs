@@ -929,6 +929,17 @@ mod tests {
                 .status,
             crate::model::MlsStateStatus::NeedsRebuild
         );
+        let recovery = restored
+            .recovery_context_snapshot(&conversation_id)
+            .expect("recovery context");
+        assert_eq!(
+            recovery.phase,
+            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
+        );
+        assert_eq!(
+            recovery.escalation_reason,
+            Some(crate::ffi_api::RecoveryEscalationReason::MlsMarkedUnrecoverable)
+        );
     }
 
     #[test]
@@ -1146,6 +1157,145 @@ mod tests {
                 .conversation
                 .state,
             crate::model::ConversationState::NeedsRebuild
+        );
+        let recovery = alice
+            .recovery_context_snapshot(&conversation_id)
+            .expect("recovery context");
+        assert_eq!(
+            recovery.phase,
+            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
+        );
+        assert_eq!(
+            recovery.escalation_reason,
+            Some(crate::ffi_api::RecoveryEscalationReason::IdentityRefreshRetryExhausted)
+        );
+    }
+
+    #[test]
+    fn control_needs_rebuild_record_sets_explicit_rebuild_escalation_reason() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let device_id = alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+        let local_user_id = alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let peer_user_id = alice.state.contacts.keys().next().expect("contact").clone();
+        let peer_device_id = alice
+            .state
+            .contacts
+            .values()
+            .next()
+            .expect("contact")
+            .devices[0]
+            .device_id
+            .clone();
+        let record = sample_control_record_with_type(
+            &device_id,
+            1,
+            &local_user_id,
+            &peer_user_id,
+            &peer_device_id,
+            MessageType::ControlConversationNeedsRebuild,
+        );
+        let conversation_id = record.envelope.conversation_id.clone();
+
+        alice
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id,
+                records: vec![record],
+                to_seq: 1,
+            })
+            .expect("ingest control rebuild");
+
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            crate::model::ConversationState::NeedsRebuild
+        );
+        let recovery = alice
+            .recovery_context_snapshot(&conversation_id)
+            .expect("recovery context");
+        assert_eq!(
+            recovery.phase,
+            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
+        );
+        assert_eq!(
+            recovery.escalation_reason,
+            Some(crate::ffi_api::RecoveryEscalationReason::ExplicitNeedsRebuildControl)
+        );
+    }
+
+    #[test]
+    fn rebuild_command_sets_recovery_policy_exhausted_escalation_reason() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        alice
+            .handle_command(CoreCommand::RebuildConversation {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("rebuild conversation");
+
+        let recovery = alice
+            .recovery_context_snapshot(&conversation_id)
+            .expect("recovery context");
+        assert_eq!(
+            recovery.phase,
+            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
+        );
+        assert_eq!(
+            recovery.escalation_reason,
+            Some(crate::ffi_api::RecoveryEscalationReason::RecoveryPolicyExhausted)
+        );
+    }
+
+    #[test]
+    fn restored_needs_rebuild_preserves_existing_escalation_reason() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let rebuild_output = alice
+            .handle_command(CoreCommand::RebuildConversation {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("rebuild conversation");
+        let snapshot = extract_snapshot(&rebuild_output);
+        let restored = CoreEngine::from_restored_state(snapshot);
+
+        let recovery = restored
+            .recovery_context_snapshot(&conversation_id)
+            .expect("restored recovery context");
+        assert_eq!(
+            recovery.escalation_reason,
+            Some(crate::ffi_api::RecoveryEscalationReason::RecoveryPolicyExhausted)
+        );
+        assert_eq!(
+            restored
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("restored conversation")
+                .recovery_status,
+            crate::conversation::RecoveryStatus::NeedsRebuild
         );
     }
 
@@ -2133,6 +2283,24 @@ mod tests {
         sender_user_id: &str,
         sender_device_id: &str,
     ) -> InboxRecord {
+        sample_control_record_with_type(
+            device_id,
+            seq,
+            local_user_id,
+            sender_user_id,
+            sender_device_id,
+            MessageType::ControlIdentityStateUpdated,
+        )
+    }
+
+    fn sample_control_record_with_type(
+        device_id: &str,
+        seq: u64,
+        local_user_id: &str,
+        sender_user_id: &str,
+        sender_device_id: &str,
+        message_type: MessageType,
+    ) -> InboxRecord {
         let mut users = [local_user_id.to_string(), sender_user_id.to_string()];
         users.sort();
         InboxRecord {
@@ -2150,7 +2318,7 @@ mod tests {
                 sender_device_id: sender_device_id.into(),
                 recipient_device_id: device_id.into(),
                 created_at: seq,
-                message_type: MessageType::ControlIdentityStateUpdated,
+                message_type,
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: vec![],
                 delivery_class: DeliveryClass::Normal,

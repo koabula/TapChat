@@ -238,12 +238,16 @@ pub struct AttachmentDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadAttachmentBytesEffect {
     pub task_id: String,
+    // Platform-defined attachment handle. It may be a path-like string in the CLI,
+    // but core treats it as an opaque identifier owned by BlobIoPort.
     pub attachment_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteDownloadedAttachmentEffect {
     pub task_id: String,
+    // Platform-defined destination handle. The CLI currently resolves it to a file path,
+    // but core only promises an opaque identifier for BlobIoPort to interpret.
     pub destination_id: String,
     pub plaintext_b64: String,
 }

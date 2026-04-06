@@ -544,6 +544,10 @@ impl MlsAdapter {
 
         for (conversation_id, summary, serialized_state) in persisted_states {
             let Some(serialized_state) = serialized_state.as_ref() else {
+                if summary.status == MlsStateStatus::NeedsRebuild {
+                    parsed_states.push((conversation_id.clone(), summary.clone()));
+                    continue;
+                }
                 failed_conversation_ids.push(conversation_id.clone());
                 continue;
             };
@@ -621,6 +625,10 @@ impl MlsAdapter {
         let mut summaries = BTreeMap::new();
 
         for (conversation_id, mut summary) in parsed_states {
+            if summary.status == MlsStateStatus::NeedsRebuild {
+                summaries.insert(conversation_id, summary);
+                continue;
+            }
             let group_id = GroupId::from_slice(conversation_id.as_bytes());
             let Some(group) =
                 MlsGroup::load(adapter.provider.storage(), &group_id).map_err(|error| {
