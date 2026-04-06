@@ -2,6 +2,7 @@ pub mod attachment_crypto;
 pub mod capability;
 pub mod cli;
 pub mod conversation;
+pub mod desktop_app;
 pub mod error;
 pub mod ffi_api;
 pub mod identity;

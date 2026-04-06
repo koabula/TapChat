@@ -1,8 +1,8 @@
 mod app;
 mod args;
-mod driver;
-mod profile;
-mod runtime;
-mod util;
+pub mod driver;
+pub mod profile;
+pub mod runtime;
+pub mod util;
 
 pub use app::run;
