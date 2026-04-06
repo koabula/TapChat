@@ -4,6 +4,9 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  allowlistAdd,
+  allowlistGet,
+  allowlistRemove,
   appBackgroundMode,
   appSetBackgroundMode,
   appBootstrap,
@@ -15,10 +18,15 @@ import {
   contactImportIdentity,
   contactRefresh,
   conversationCreateDirect,
+  conversationRebuild,
+  conversationReconcile,
   deploymentImport,
   directShell,
   identityCreate,
   identityRecover,
+  messageRequestAccept,
+  messageRequestReject,
+  messageRequestsList,
   messageDownloadAttachmentBackground,
   messageSendAttachments,
   messageSendText,
@@ -30,11 +38,13 @@ import {
   syncRealtimeConnect,
 } from "./lib/commands";
 import type {
+  AllowlistView,
   AppBootstrapView,
   AttachmentPreviewView,
   BatchSendAttachmentResultView,
   CloudflareDeployOverrides,
   DirectShellView,
+  MessageRequestItemView,
   ProfileSummary,
   SendMessageResultView,
 } from "./lib/types";
@@ -49,6 +59,8 @@ type ViewState = {
   selectedConversationId: string | null;
   lastSend: SendMessageResultView | null;
   lastAttachmentSend: BatchSendAttachmentResultView | null;
+  messageRequests: MessageRequestItemView[];
+  allowlist: AllowlistView | null;
 };
 
 const emptyOverrides: CloudflareDeployOverrides = {
@@ -74,6 +86,8 @@ export default function App() {
     selectedConversationId: null,
     lastSend: null,
     lastAttachmentSend: null,
+    messageRequests: [],
+    allowlist: null,
   });
   const [createName, setCreateName] = useState("alice");
   const [createRoot, setCreateRoot] = useState("");
@@ -88,6 +102,7 @@ export default function App() {
   const [preview, setPreview] = useState<AttachmentPreviewView | null>(null);
   const [dropActive, setDropActive] = useState(false);
   const [backgroundEnabled, setBackgroundEnabled] = useState(true);
+  const [allowlistDraft, setAllowlistDraft] = useState("");
 
   useEffect(() => {
     void refreshBootstrap();
@@ -151,6 +166,14 @@ export default function App() {
     };
   }, [state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step]);
 
+  useEffect(() => {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    if (!profilePath || state.bootstrap?.onboarding.step !== "complete") {
+      return;
+    }
+    void refreshDirectShell(profilePath);
+  }, [state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step, state.selectedConversationId, state.selectedContactUserId]);
+
   async function refreshBootstrap(message?: string) {
     setState((current) => ({ ...current, loading: true, error: null, success: message ?? current.success }));
     try {
@@ -195,6 +218,23 @@ export default function App() {
       ...current,
       shell,
       loading: false,
+    }));
+    await refreshPolicyState(profilePath);
+  }
+
+  async function refreshPolicyState(explicitProfilePath?: string | null) {
+    const profilePath = explicitProfilePath ?? state.bootstrap?.active_profile?.path ?? null;
+    if (!profilePath) {
+      return;
+    }
+    const [messageRequests, allowlist] = await Promise.all([
+      messageRequestsList(profilePath),
+      allowlistGet(profilePath),
+    ]);
+    setState((current) => ({
+      ...current,
+      messageRequests,
+      allowlist,
     }));
   }
 
@@ -291,6 +331,8 @@ export default function App() {
         selectedConversationId: null,
         lastSend: null,
         lastAttachmentSend: null,
+        messageRequests: [],
+        allowlist: null,
       }));
       setSelectedAttachmentPaths([]);
       setPreview(null);
@@ -484,6 +526,77 @@ export default function App() {
       await syncOnce(profilePath);
       await refreshDirectShell(profilePath);
       setState((current) => ({ ...current, success: "Sync complete." }));
+    });
+  }
+
+  async function handleMessageRequest(requestId: string, action: "accept" | "reject") {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    if (!profilePath) {
+      return;
+    }
+    await runTask(async () => {
+      const result = action === "accept"
+        ? await messageRequestAccept(profilePath, requestId)
+        : await messageRequestReject(profilePath, requestId);
+      await refreshDirectShell(profilePath);
+      setState((current) => ({
+        ...current,
+        success: `${action === "accept" ? "Accepted" : "Rejected"} request from ${result.sender_user_id}.`,
+      }));
+    });
+  }
+
+  async function handleAllowlistAdd() {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    const nextUserId = allowlistDraft.trim();
+    if (!profilePath || !nextUserId) {
+      return;
+    }
+    await runTask(async () => {
+      const next = await allowlistAdd(profilePath, nextUserId);
+      setAllowlistDraft("");
+      setState((current) => ({
+        ...current,
+        allowlist: next,
+        success: `Added ${nextUserId} to allowlist.`,
+      }));
+      await refreshDirectShell(profilePath);
+    });
+  }
+
+  async function handleAllowlistRemove(userId: string) {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    if (!profilePath) {
+      return;
+    }
+    await runTask(async () => {
+      const next = await allowlistRemove(profilePath, userId);
+      setState((current) => ({
+        ...current,
+        allowlist: next,
+        success: `Removed ${userId} from allowlist.`,
+      }));
+      await refreshDirectShell(profilePath);
+    });
+  }
+
+  async function handleConversationRepair(action: "reconcile" | "rebuild") {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    const conversationId = state.selectedConversationId;
+    if (!profilePath || !conversationId) {
+      return;
+    }
+    await runTask(async () => {
+      if (action === "reconcile") {
+        await conversationReconcile(profilePath, conversationId);
+      } else {
+        await conversationRebuild(profilePath, conversationId);
+      }
+      await refreshDirectShell(profilePath);
+      setState((current) => ({
+        ...current,
+        success: `${action === "reconcile" ? "Reconciled" : "Rebuilt"} conversation state.`,
+      }));
     });
   }
 
@@ -689,7 +802,15 @@ export default function App() {
                       <h3>{activeConversation.peer_user_id}</h3>
                       <p>{activeConversation.recovery_status}</p>
                     </div>
-                    <span className="status-chip inline">{activeConversation.conversation_state}</span>
+                    <div className="button-row">
+                      <button className="ghost-button" disabled={state.loading} onClick={() => void handleConversationRepair("reconcile")}>
+                        Reconcile
+                      </button>
+                      <button className="ghost-button" disabled={state.loading} onClick={() => void handleConversationRepair("rebuild")}>
+                        Rebuild
+                      </button>
+                      <span className="status-chip inline">{activeConversation.conversation_state}</span>
+                    </div>
                   </div>
                   <div className={dropActive ? "message-list drop-active" : "message-list"}>
                     {state.shell?.messages.map((message) => (
@@ -845,6 +966,24 @@ export default function App() {
                   ["Realtime", statusLabel],
                   ["Background downloads", backgroundEnabled ? "Enabled" : "Disabled"],
                 ]} />
+                {activeConversation && (
+                  <InfoCard title="Diagnostics" rows={[
+                    ["Conversation", activeConversation.conversation_id],
+                    ["Recovery", activeConversation.recovery_status],
+                    ["MLS", activeConversation.mls_status ?? "Pending"],
+                    ["Reason", activeConversation.recovery?.reason ?? "None"],
+                    ["Phase", activeConversation.recovery?.phase ?? "None"],
+                    ["Attempts", String(activeConversation.recovery?.attempt_count ?? 0)],
+                    ["Refresh retries", String(activeConversation.recovery?.identity_refresh_retry_count ?? 0)],
+                    ["Last error", activeConversation.recovery?.last_error ?? "None"],
+                  ]} />
+                )}
+                {state.shell.sync.recovery_conversations.length > 0 && (
+                  <InfoCard title="Recovery queue" rows={state.shell.sync.recovery_conversations.map((item) => [
+                    item.conversation_id,
+                    `${item.recovery_status} · ${item.phase} · ${item.reason}`,
+                  ])} />
+                )}
                 {selectedContact && (
                   <InfoCard title="Selected contact" rows={[
                     ["User", selectedContact.user_id],
@@ -852,6 +991,68 @@ export default function App() {
                     ["Bundle ref", selectedContact.identity_bundle_ref ?? "Pending"],
                   ]} />
                 )}
+                <div className="info-card">
+                  <div className="info-card-title">Message requests</div>
+                  <div className="info-card-rows">
+                    {state.messageRequests.length === 0 ? (
+                      <div className="info-row">
+                        <span>Requests</span>
+                        <strong>None</strong>
+                      </div>
+                    ) : (
+                      state.messageRequests.map((request) => (
+                        <div className="info-row" key={request.request_id}>
+                          <span>{request.sender_user_id}</span>
+                          <div className="button-row">
+                            <small>{request.message_count} msg</small>
+                            <button className="ghost-button" disabled={state.loading} onClick={() => void handleMessageRequest(request.request_id, "accept")}>
+                              Accept
+                            </button>
+                            <button className="ghost-button" disabled={state.loading} onClick={() => void handleMessageRequest(request.request_id, "reject")}>
+                              Reject
+                            </button>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+                <div className="info-card">
+                  <div className="info-card-title">Allowlist</div>
+                  <div className="info-card-rows">
+                    <div className="inline-field">
+                      <input
+                        placeholder="user_id"
+                        value={allowlistDraft}
+                        onChange={(event) => setAllowlistDraft(event.target.value)}
+                      />
+                      <button className="ghost-button" disabled={state.loading || !allowlistDraft.trim()} onClick={() => void handleAllowlistAdd()}>
+                        Add
+                      </button>
+                    </div>
+                    {(state.allowlist?.allowed_sender_user_ids ?? []).length === 0 ? (
+                      <div className="info-row">
+                        <span>Allowed</span>
+                        <strong>Empty</strong>
+                      </div>
+                    ) : (
+                      state.allowlist?.allowed_sender_user_ids.map((userId) => (
+                        <div className="info-row" key={userId}>
+                          <span>{userId}</span>
+                          <button className="ghost-button" disabled={state.loading} onClick={() => void handleAllowlistRemove(userId)}>
+                            Remove
+                          </button>
+                        </div>
+                      ))
+                    )}
+                    {(state.allowlist?.rejected_sender_user_ids ?? []).length > 0 && (
+                      <InfoCard
+                        title="Rejected senders"
+                        rows={(state.allowlist?.rejected_sender_user_ids ?? []).map((userId) => [userId, "Rejected"])}
+                      />
+                    )}
+                  </div>
+                </div>
                 {state.shell.attachment_transfers.length > 0 && (
                   <InfoCard title="Transfers" rows={state.shell.attachment_transfers.map((transfer, index) => [
                     `${transfer.task_kind} ${index + 1}`,

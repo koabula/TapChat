@@ -82,6 +82,30 @@ export type ContactDetailView = {
   last_refresh_error?: string | null;
 };
 
+export type MessageRequestItemView = {
+  request_id: string;
+  recipient_device_id: string;
+  sender_user_id: string;
+  first_seen_at: number;
+  last_seen_at: number;
+  message_count: number;
+  last_message_id: string;
+  last_conversation_id: string;
+};
+
+export type MessageRequestActionView = {
+  accepted: boolean;
+  request_id: string;
+  sender_user_id: string;
+  promoted_count: number;
+  action: string;
+};
+
+export type AllowlistView = {
+  allowed_sender_user_ids: string[];
+  rejected_sender_user_ids: string[];
+};
+
 export type ConversationListItem = {
   conversation_id: string;
   peer_user_id: string;

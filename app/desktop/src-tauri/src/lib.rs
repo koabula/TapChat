@@ -341,6 +341,62 @@ fn contact_show(
 }
 
 #[tauri::command]
+async fn message_requests_list(
+    profile_path: String,
+) -> Result<Vec<desktop_app::MessageRequestItemView>, String> {
+    desktop_app::message_requests_list(profile_path)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn message_request_accept(
+    profile_path: String,
+    request_id: String,
+) -> Result<desktop_app::MessageRequestActionView, String> {
+    desktop_app::message_request_accept(profile_path, &request_id)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn message_request_reject(
+    profile_path: String,
+    request_id: String,
+) -> Result<desktop_app::MessageRequestActionView, String> {
+    desktop_app::message_request_reject(profile_path, &request_id)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn allowlist_get(profile_path: String) -> Result<desktop_app::AllowlistView, String> {
+    desktop_app::allowlist_get(profile_path)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn allowlist_add(
+    profile_path: String,
+    user_id: String,
+) -> Result<desktop_app::AllowlistView, String> {
+    desktop_app::allowlist_add(profile_path, &user_id)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn allowlist_remove(
+    profile_path: String,
+    user_id: String,
+) -> Result<desktop_app::AllowlistView, String> {
+    desktop_app::allowlist_remove(profile_path, &user_id)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
 async fn contact_refresh(
     profile_path: String,
     user_id: String,
@@ -356,6 +412,26 @@ async fn conversation_create_direct(
     peer_user_id: String,
 ) -> Result<desktop_app::ConversationDetailView, String> {
     desktop_app::conversation_create_direct(profile_path, &peer_user_id)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn conversation_reconcile(
+    profile_path: String,
+    conversation_id: String,
+) -> Result<desktop_app::ConversationDetailView, String> {
+    desktop_app::conversation_reconcile(profile_path, &conversation_id)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn conversation_rebuild(
+    profile_path: String,
+    conversation_id: String,
+) -> Result<desktop_app::ConversationDetailView, String> {
+    desktop_app::conversation_rebuild(profile_path, &conversation_id)
         .await
         .map_err(into_string_error)
 }
@@ -678,8 +754,16 @@ pub fn run() {
             contact_list,
             contact_import_identity,
             contact_show,
+            message_requests_list,
+            message_request_accept,
+            message_request_reject,
+            allowlist_get,
+            allowlist_add,
+            allowlist_remove,
             contact_refresh,
             conversation_create_direct,
+            conversation_reconcile,
+            conversation_rebuild,
             message_send_text,
             message_send_attachment,
             message_send_attachments,

@@ -14,11 +14,12 @@ use crate::cli::runtime::{
 };
 use crate::conversation::StoredMessage;
 use crate::ffi_api::{
-    AppendResultSummary, AttachmentDescriptor, CoreCommand, CoreEvent, RealtimeSessionSnapshot,
-    RecoveryContextSnapshot, SyncCheckpointSnapshot,
+    AppendResultSummary, AttachmentDescriptor, CoreCommand, CoreEvent, CoreOutput,
+    RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
 };
 use crate::model::{DeploymentBundle, IdentityBundle, MessageType, StorageRef, Validate};
 use crate::persistence::PersistedPendingBlobTransfer;
+use crate::transport_contract::{AllowlistDocument, MessageRequestAction, MessageRequestItem};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfileSummary {
@@ -114,6 +115,33 @@ pub struct ContactDetailView {
     pub identity_bundle_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageRequestItemView {
+    pub request_id: String,
+    pub recipient_device_id: String,
+    pub sender_user_id: String,
+    pub first_seen_at: u64,
+    pub last_seen_at: u64,
+    pub message_count: u64,
+    pub last_message_id: String,
+    pub last_conversation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MessageRequestActionView {
+    pub accepted: bool,
+    pub request_id: String,
+    pub sender_user_id: String,
+    pub promoted_count: u64,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AllowlistView {
+    pub allowed_sender_user_ids: Vec<String>,
+    pub rejected_sender_user_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -580,6 +608,96 @@ pub async fn contact_refresh(
     contact_show(profile.root(), user_id)
 }
 
+pub async fn message_requests_list(
+    profile_path: impl AsRef<Path>,
+) -> Result<Vec<MessageRequestItemView>> {
+    let profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::ListMessageRequests)
+        .await?;
+    Ok(message_requests_from_output(&output)?
+        .iter()
+        .cloned()
+        .map(map_message_request)
+        .collect())
+}
+
+pub async fn message_request_accept(
+    profile_path: impl AsRef<Path>,
+    request_id: &str,
+) -> Result<MessageRequestActionView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::ActOnMessageRequest {
+            request_id: request_id.to_string(),
+            action: MessageRequestAction::Accept,
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    Ok(map_message_request_action(
+        message_request_action_from_output(&output)?,
+    ))
+}
+
+pub async fn message_request_reject(
+    profile_path: impl AsRef<Path>,
+    request_id: &str,
+) -> Result<MessageRequestActionView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::ActOnMessageRequest {
+            request_id: request_id.to_string(),
+            action: MessageRequestAction::Reject,
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    Ok(map_message_request_action(
+        message_request_action_from_output(&output)?,
+    ))
+}
+
+pub async fn allowlist_get(profile_path: impl AsRef<Path>) -> Result<AllowlistView> {
+    let profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::ListAllowlist)
+        .await?;
+    Ok(map_allowlist(allowlist_from_output(&output)?))
+}
+
+pub async fn allowlist_add(
+    profile_path: impl AsRef<Path>,
+    user_id: &str,
+) -> Result<AllowlistView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::AddAllowlistUser {
+            user_id: user_id.to_string(),
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    Ok(map_allowlist(allowlist_from_output(&output)?))
+}
+
+pub async fn allowlist_remove(
+    profile_path: impl AsRef<Path>,
+    user_id: &str,
+) -> Result<AllowlistView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::RemoveAllowlistUser {
+            user_id: user_id.to_string(),
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    Ok(map_allowlist(allowlist_from_output(&output)?))
+}
+
 pub fn conversation_list(profile_path: impl AsRef<Path>) -> Result<Vec<ConversationListItem>> {
     let profile = Profile::open(profile_path)?;
     let snapshot = profile.load_snapshot()?;
@@ -646,6 +764,36 @@ pub fn conversation_show(
         mls_status: driver.mls_status(conversation_id).map(|status| format!("{:?}", status)),
         recovery: driver.recovery_context_snapshot(conversation_id),
     })
+}
+
+pub async fn conversation_rebuild(
+    profile_path: impl AsRef<Path>,
+    conversation_id: &str,
+) -> Result<ConversationDetailView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    driver
+        .run_command_until_idle(CoreCommand::RebuildConversation {
+            conversation_id: conversation_id.to_string(),
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    conversation_show(profile.root(), conversation_id)
+}
+
+pub async fn conversation_reconcile(
+    profile_path: impl AsRef<Path>,
+    conversation_id: &str,
+) -> Result<ConversationDetailView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    driver
+        .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
+            conversation_id: conversation_id.to_string(),
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    conversation_show(profile.root(), conversation_id)
 }
 
 pub fn message_list(
@@ -1257,6 +1405,38 @@ fn map_contact_devices(devices: Vec<ContactDeviceSnapshot>) -> Vec<ContactDevice
         .collect()
 }
 
+fn map_message_request(item: MessageRequestItem) -> MessageRequestItemView {
+    MessageRequestItemView {
+        request_id: item.request_id,
+        recipient_device_id: item.recipient_device_id,
+        sender_user_id: item.sender_user_id,
+        first_seen_at: item.first_seen_at,
+        last_seen_at: item.last_seen_at,
+        message_count: item.message_count,
+        last_message_id: item.last_message_id,
+        last_conversation_id: item.last_conversation_id,
+    }
+}
+
+fn map_message_request_action(
+    summary: &crate::ffi_api::MessageRequestActionSummary,
+) -> MessageRequestActionView {
+    MessageRequestActionView {
+        accepted: summary.accepted,
+        request_id: summary.request_id.clone(),
+        sender_user_id: summary.sender_user_id.clone(),
+        promoted_count: summary.promoted_count,
+        action: format!("{:?}", summary.action).to_lowercase(),
+    }
+}
+
+fn map_allowlist(document: &AllowlistDocument) -> AllowlistView {
+    AllowlistView {
+        allowed_sender_user_ids: document.allowed_sender_user_ids.clone(),
+        rejected_sender_user_ids: document.rejected_sender_user_ids.clone(),
+    }
+}
+
 fn map_message(
     conversation_id: &str,
     message: &StoredMessage,
@@ -1327,6 +1507,32 @@ fn latest_notification_since(driver: &CoreDriver, offset: usize) -> Option<Strin
         .notifications()
         .get(offset..)
         .and_then(|notifications| notifications.last().cloned())
+}
+
+fn message_requests_from_output(output: &CoreOutput) -> Result<&Vec<MessageRequestItem>> {
+    output
+        .view_model
+        .as_ref()
+        .map(|view| &view.message_requests)
+        .ok_or_else(|| anyhow!("message requests were not returned by core"))
+}
+
+fn message_request_action_from_output(
+    output: &CoreOutput,
+) -> Result<&crate::ffi_api::MessageRequestActionSummary> {
+    output
+        .view_model
+        .as_ref()
+        .and_then(|view| view.message_request_action.as_ref())
+        .ok_or_else(|| anyhow!("message request action result was not returned by core"))
+}
+
+fn allowlist_from_output(output: &CoreOutput) -> Result<&AllowlistDocument> {
+    output
+        .view_model
+        .as_ref()
+        .and_then(|view| view.allowlist.as_ref())
+        .ok_or_else(|| anyhow!("allowlist document was not returned by core"))
 }
 
 fn message_preview(message: &StoredMessage) -> Option<String> {

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AllowlistView,
   AppBootstrapView,
   AttachmentPreviewView,
   CloudflareDeployOverrides,
@@ -11,6 +12,8 @@ import type {
   DownloadAttachmentResultView,
   DirectShellView,
   IdentitySummaryView,
+  MessageRequestActionView,
+  MessageRequestItemView,
   ProfileSummary,
   ProvisionProgressView,
   RuntimeStatusView,
@@ -87,12 +90,44 @@ export function contactShow(profilePath: string, userId: string) {
   return invoke<ContactDetailView>("contact_show", { profilePath, userId });
 }
 
+export function messageRequestsList(profilePath: string) {
+  return invoke<MessageRequestItemView[]>("message_requests_list", { profilePath });
+}
+
+export function messageRequestAccept(profilePath: string, requestId: string) {
+  return invoke<MessageRequestActionView>("message_request_accept", { profilePath, requestId });
+}
+
+export function messageRequestReject(profilePath: string, requestId: string) {
+  return invoke<MessageRequestActionView>("message_request_reject", { profilePath, requestId });
+}
+
+export function allowlistGet(profilePath: string) {
+  return invoke<AllowlistView>("allowlist_get", { profilePath });
+}
+
+export function allowlistAdd(profilePath: string, userId: string) {
+  return invoke<AllowlistView>("allowlist_add", { profilePath, userId });
+}
+
+export function allowlistRemove(profilePath: string, userId: string) {
+  return invoke<AllowlistView>("allowlist_remove", { profilePath, userId });
+}
+
 export function contactRefresh(profilePath: string, userId: string) {
   return invoke<ContactDetailView>("contact_refresh", { profilePath, userId });
 }
 
 export function conversationCreateDirect(profilePath: string, peerUserId: string) {
   return invoke<ConversationDetailView>("conversation_create_direct", { profilePath, peerUserId });
+}
+
+export function conversationReconcile(profilePath: string, conversationId: string) {
+  return invoke<ConversationDetailView>("conversation_reconcile", { profilePath, conversationId });
+}
+
+export function conversationRebuild(profilePath: string, conversationId: string) {
+  return invoke<ConversationDetailView>("conversation_rebuild", { profilePath, conversationId });
 }
 
 export function messageSendText(profilePath: string, conversationId: string, text: string) {
