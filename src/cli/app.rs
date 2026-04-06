@@ -982,6 +982,7 @@ impl CliApp {
         config: super::runtime::ResolvedCloudflareDeployConfig,
     ) -> Result<()> {
         let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
+        wait_until_ready(&deployment.effective_public_base_url).await?;
         let bundle = bootstrap_device_bundle(
             &deployment.effective_public_base_url,
             &config.bootstrap_token_secret,
@@ -1214,4 +1215,5 @@ async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadR
     let body = response.text().await?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
 }
+
 

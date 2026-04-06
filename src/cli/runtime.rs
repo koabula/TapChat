@@ -299,11 +299,30 @@ pub async fn deploy_cloudflare_runtime(
         .stderr(Stdio::piped())
         .output()
         .context("run cloudflare deploy script")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("cloudflare deploy script failed: {}", stderr.trim());
-    }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        if let Some(json_line) = stdout
+            .lines()
+            .rev()
+            .find(|line| line.trim_start().starts_with('{'))
+        {
+            if let Ok(parsed) = serde_json::from_str::<CloudflareDeploymentResult>(json_line) {
+                let detail = parsed
+                    .stderr_summary
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_string());
+                bail!("cloudflare deploy script failed: {detail}");
+            }
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout_fallback = stdout.trim();
+        let detail = if stderr.trim().is_empty() {
+            stdout_fallback
+        } else {
+            stderr.trim()
+        };
+        bail!("cloudflare deploy script failed: {}", detail);
+    }
     let json_line = stdout
         .lines()
         .rev()
@@ -431,11 +450,17 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
             .await;
         if let Ok(response) = response {
             if response.status().is_success() {
-                return Ok(());
+                if let Ok(body) = response.text().await {
+                    if let Ok(json_body) = to_snake_case_json_string(&body) {
+                        if serde_json::from_str::<DeploymentBundle>(&json_body).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("cloudflare runtime did not become ready in time");
+            bail!("cloudflare runtime did not become ready in time for {base_url}");
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
@@ -459,8 +484,9 @@ pub async fn bootstrap_device_bundle(
         }),
     )?;
     let client = Client::builder().build().context("build reqwest client")?;
+    let bootstrap_url = format!("{base_url}/v1/bootstrap/device");
     let response = client
-        .post(format!("{base_url}/v1/bootstrap/device"))
+        .post(&bootstrap_url)
         .header("Authorization", format!("Bearer {token}"))
         .json(&json!({
             "version": CURRENT_MODEL_VERSION,
@@ -471,7 +497,12 @@ pub async fn bootstrap_device_bundle(
         .await
         .context("bootstrap request failed")?;
     if !response.status().is_success() {
-        bail!("bootstrap failed with status {}", response.status());
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| String::from("<response body unavailable>"));
+        bail!("bootstrap failed for {} with status {}: {}", bootstrap_url, status, body.trim());
     }
     let body = response.text().await.context("read bootstrap response")?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
@@ -695,3 +726,5 @@ fn sanitize_cloudflare_name(value: &str) -> String {
         collapsed
     }
 }
+
+

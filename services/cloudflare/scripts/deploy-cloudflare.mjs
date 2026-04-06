@@ -77,18 +77,28 @@ function wranglerArgs(...args) {
 }
 
 function npmArgs(...args) {
-  return NPM_EXEC_PATH ? [NPM_EXEC_PATH, ...args] : args;
+  if (NPM_EXEC_PATH) {
+    return [NPM_EXEC_PATH, ...args];
+  }
+  if (process.platform === "win32") {
+    return ["/d", "/s", "/c", NPM_COMMAND, ...args];
+  }
+  return args;
 }
 
 function npmCommand() {
-  return NPM_EXEC_PATH ? NODE_COMMAND : NPM_COMMAND;
+  if (NPM_EXEC_PATH) {
+    return NODE_COMMAND;
+  }
+  if (process.platform === "win32") {
+    return process.env.ComSpec ?? "cmd.exe";
+  }
+  return NPM_COMMAND;
 }
-
 function isWranglerUnauthenticated(result) {
   const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
   return output.includes("you are not authenticated") || output.includes("please run `wrangler login`") || output.includes("please run wrangler login");
 }
-
 function isBucketAlreadyExists(result) {
   const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.toLowerCase();
   return output.includes("already exists") || output.includes("bucket name is not available") || output.includes("the bucket you are trying to create already exists");
@@ -252,15 +262,17 @@ function renderVarsBlock(config) {
 }
 
 function updateConfig(baseConfig, config) {
-  let rendered = baseConfig.replace(/^name\s*=\s*".*"$/m, `name = \"${config.workerName}\"`);
+  const entryPoint = path.join(SERVICE_DIR, "src", "index.ts").replace(/\\/g, "/");
+  let rendered = baseConfig.replace(/^name\s*=\s*".*"$/m, `name = "${config.workerName}"`);
+  rendered = rendered.replace(/^main\s*=\s*".*"$/m, `main = "${entryPoint}"`);
   rendered = rendered.replace(
     /\[vars\][\s\S]*?\n(?=\[\[durable_objects\.bindings\]\])/m,
     `${renderVarsBlock(config)}`
   );
-  rendered = rendered.replace(/bucket_name\s*=\s*".*"$/m, `bucket_name = \"${config.bucketName}\"`);
+  rendered = rendered.replace(/bucket_name\s*=\s*".*"$/m, `bucket_name = "${config.bucketName}"`);
   rendered = rendered.replace(
     /preview_bucket_name\s*=\s*".*"$/m,
-    `preview_bucket_name = \"${config.previewBucketName}\"`
+    `preview_bucket_name = "${config.previewBucketName}"`
   );
   return rendered;
 }
@@ -303,8 +315,21 @@ async function putSecret(configPath, name, value) {
 }
 
 function parseDeployUrl(output) {
-  const match = output.match(/https:\/\/[^\s]+/);
-  return match ? match[0].replace(/\/+$/, "") : null;
+  const matches = [...output.matchAll(/https:\/\/[^\s]+/g)].map((match) => match[0].replace(/\/+$/, ""));
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const preferred = matches.filter((candidate) => {
+    try {
+      const url = new URL(candidate);
+      return url.hostname.endsWith(".workers.dev") || (url.pathname === "" || url.pathname === "/");
+    } catch {
+      return false;
+    }
+  });
+
+  return (preferred.at(-1) ?? matches.at(-1)) ?? null;
 }
 
 function validateDeployUrl(publicBaseUrl, deployUrl) {
@@ -493,6 +518,12 @@ async function main() {
 }
 
 main().catch((error) => {
+  const stderrSummary =
+    error && typeof error === "object" && "result" in error
+      ? `${error.result?.stdout ?? ""}\n${error.result?.stderr ?? ""}`.trim() || (error instanceof Error ? error.message : String(error))
+      : error instanceof Error
+        ? error.message
+        : String(error);
   if (JSON_OUTPUT) {
     printStructuredResult({
       success: false,
@@ -508,12 +539,20 @@ main().catch((error) => {
       },
       mode: NON_INTERACTIVE_CONFIG ? "non_interactive" : "interactive",
       failure_class: process.exitCode ? String(process.exitCode) : "unknown",
-      stderr_summary: error instanceof Error ? error.message : String(error)
+      stderr_summary: stderrSummary
     });
   }
   if (!process.exitCode) {
     process.exitCode = EXIT_CODES.environment;
   }
-  const message = error instanceof Error ? error.message : String(error);
+  const message = stderrSummary;
   console.error(`Deployment failed: ${message}`);
 });
+
+
+
+
+
+
+
+
