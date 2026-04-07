@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  CloudflareActionResultView,
   AllowlistView,
   AppBootstrapView,
   AttachmentPreviewView,
+  CloudflarePreflightView,
   CloudflareDeployOverrides,
+  CloudflareRuntimeDetailsView,
   ContactDetailView,
   ContactListItem,
   ConversationDetailView,
@@ -61,6 +64,10 @@ export function cloudflareProvisionAuto(profilePath: string) {
   return invoke<ProvisionProgressView>("cloudflare_provision_auto", { profilePath });
 }
 
+export function cloudflarePreflight(profilePath: string) {
+  return invoke<CloudflarePreflightView>("cloudflare_preflight", { profilePath });
+}
+
 export function cloudflareProvisionCustom(
   profilePath: string,
   overrides: CloudflareDeployOverrides,
@@ -73,6 +80,22 @@ export function cloudflareProvisionCustom(
 
 export function cloudflareStatus(profilePath: string) {
   return invoke<RuntimeStatusView>("cloudflare_status", { profilePath });
+}
+
+export function cloudflareRuntimeDetails(profilePath: string) {
+  return invoke<CloudflareRuntimeDetailsView>("cloudflare_runtime_details", { profilePath });
+}
+
+export function cloudflareRedeploy(profilePath: string) {
+  return invoke<CloudflareActionResultView>("cloudflare_redeploy", { profilePath });
+}
+
+export function cloudflareRotateSecrets(profilePath: string) {
+  return invoke<CloudflareActionResultView>("cloudflare_rotate_secrets", { profilePath });
+}
+
+export function cloudflareDetach(profilePath: string) {
+  return invoke<CloudflareActionResultView>("cloudflare_detach", { profilePath });
 }
 
 export function contactList(profilePath: string) {

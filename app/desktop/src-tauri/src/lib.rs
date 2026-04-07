@@ -303,6 +303,13 @@ async fn cloudflare_provision_auto(
 }
 
 #[tauri::command]
+fn cloudflare_preflight(
+    profile_path: String,
+) -> Result<desktop_app::CloudflarePreflightView, String> {
+    desktop_app::cloudflare_preflight(profile_path).map_err(into_string_error)
+}
+
+#[tauri::command]
 async fn cloudflare_provision_custom(
     profile_path: String,
     overrides: CloudflareDeployOverrides,
@@ -315,6 +322,38 @@ async fn cloudflare_provision_custom(
 #[tauri::command]
 fn cloudflare_status(profile_path: String) -> Result<desktop_app::RuntimeStatusView, String> {
     desktop_app::cloudflare_status(profile_path).map_err(into_string_error)
+}
+
+#[tauri::command]
+fn cloudflare_runtime_details(
+    profile_path: String,
+) -> Result<desktop_app::CloudflareRuntimeDetailsView, String> {
+    desktop_app::cloudflare_runtime_details(profile_path).map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn cloudflare_redeploy(
+    profile_path: String,
+) -> Result<desktop_app::CloudflareActionResultView, String> {
+    desktop_app::cloudflare_redeploy(profile_path)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn cloudflare_rotate_secrets(
+    profile_path: String,
+) -> Result<desktop_app::CloudflareActionResultView, String> {
+    desktop_app::cloudflare_rotate_secrets(profile_path)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+fn cloudflare_detach(
+    profile_path: String,
+) -> Result<desktop_app::CloudflareActionResultView, String> {
+    desktop_app::cloudflare_detach(profile_path).map_err(into_string_error)
 }
 
 #[tauri::command]
@@ -749,8 +788,13 @@ pub fn run() {
             identity_recover,
             deployment_import,
             cloudflare_provision_auto,
+            cloudflare_preflight,
             cloudflare_provision_custom,
             cloudflare_status,
+            cloudflare_runtime_details,
+            cloudflare_redeploy,
+            cloudflare_rotate_secrets,
+            cloudflare_detach,
             contact_list,
             contact_import_identity,
             contact_show,

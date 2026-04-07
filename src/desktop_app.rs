@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::cli::driver::{ContactDeviceSnapshot, CoreDriver};
 use crate::cli::profile::{Profile, ProfileRegistry, RuntimeMetadata};
 use crate::cli::runtime::{
-    CloudflareDeployOverrides, ResolvedCloudflareDeployConfig, bootstrap_device_bundle,
-    deploy_cloudflare_runtime, derive_cloudflare_defaults, resolve_cloudflare_config,
-    resolve_service_root,
+    CloudflareDeployOverrides, CloudflarePreflight, ResolvedCloudflareDeployConfig,
+    bootstrap_device_bundle, cloudflare_preflight as runtime_cloudflare_preflight,
+    deploy_cloudflare_runtime,
+    derive_cloudflare_defaults, ensure_cloudflare_runtime_metadata, rebuild_cloudflare_config,
+    resolve_cloudflare_config, resolve_service_root,
 };
 use crate::conversation::StoredMessage;
 use crate::ffi_api::{
@@ -54,6 +56,51 @@ pub struct RuntimeStatusView {
     pub provisioned_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CloudflarePreflightView {
+    pub workspace_root_found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_root: Option<PathBuf>,
+    pub wrangler_available: bool,
+    pub wrangler_logged_in: bool,
+    pub runtime_bound: bool,
+    pub deployment_bundle_present: bool,
+    pub identity_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CloudflareRuntimeDetailsView {
+    #[serde(flatten)]
+    pub runtime: RuntimeStatusView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_bucket_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_bundle_path: Option<PathBuf>,
+    pub bootstrap_secret_present: bool,
+    pub sharing_secret_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CloudflareActionResultView {
+    pub action: String,
+    pub updated_runtime: bool,
+    pub deployment_bound: bool,
+    pub banner: BannerView,
+    pub runtime: CloudflareRuntimeDetailsView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -500,6 +547,18 @@ pub async fn cloudflare_provision_auto(
     .await
 }
 
+pub fn cloudflare_preflight(profile_path: impl AsRef<Path>) -> Result<CloudflarePreflightView> {
+    let profile = Profile::open(profile_path)?;
+    let driver = load_driver(&profile)?;
+    let preflight = runtime_cloudflare_preflight(Some(profile.root()));
+    Ok(map_cloudflare_preflight(
+        &profile,
+        profile.metadata().deployment_bundle_path.is_some(),
+        driver.local_identity().is_some(),
+        preflight,
+    ))
+}
+
 pub async fn cloudflare_provision_custom(
     profile_path: impl AsRef<Path>,
     overrides: CloudflareDeployOverrides,
@@ -531,6 +590,105 @@ pub async fn cloudflare_provision_custom(
 pub fn cloudflare_status(profile_path: impl AsRef<Path>) -> Result<RuntimeStatusView> {
     let profile = Profile::open(profile_path)?;
     runtime_status_from_profile(&profile)
+}
+
+pub fn cloudflare_runtime_details(
+    profile_path: impl AsRef<Path>,
+) -> Result<CloudflareRuntimeDetailsView> {
+    let profile = Profile::open(profile_path)?;
+    cloudflare_runtime_details_from_profile(&profile)
+}
+
+pub async fn cloudflare_redeploy(
+    profile_path: impl AsRef<Path>,
+) -> Result<CloudflareActionResultView> {
+    let mut profile = Profile::open(profile_path)?;
+    let runtime = profile.load_runtime_metadata()?;
+    ensure_cloudflare_runtime_metadata(&runtime)?;
+    let mut driver = load_driver(&profile)?;
+    let identity = driver
+        .local_identity()
+        .cloned()
+        .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+    let service_root = runtime
+        .service_root
+        .clone()
+        .ok_or_else(|| anyhow!("cloudflare service_root is not recorded"))?;
+    let config = rebuild_cloudflare_config(&runtime)?;
+    provision_cloudflare_action(
+        "redeploy",
+        &mut profile,
+        &mut driver,
+        &identity.user_identity.user_id,
+        &identity.device_identity.device_id,
+        &service_root,
+        config,
+    )
+    .await
+}
+
+pub async fn cloudflare_rotate_secrets(
+    profile_path: impl AsRef<Path>,
+) -> Result<CloudflareActionResultView> {
+    let mut profile = Profile::open(profile_path)?;
+    let runtime = profile.load_runtime_metadata()?;
+    ensure_cloudflare_runtime_metadata(&runtime)?;
+    let mut driver = load_driver(&profile)?;
+    let identity = driver
+        .local_identity()
+        .cloned()
+        .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+    let service_root = runtime
+        .service_root
+        .clone()
+        .ok_or_else(|| anyhow!("cloudflare service_root is not recorded"))?;
+    let mut defaults = derive_cloudflare_defaults(
+        &profile.metadata().name,
+        &identity.user_identity.user_id,
+        &identity.device_identity.device_id,
+    );
+    defaults.worker_name = runtime.worker_name.clone().unwrap_or(defaults.worker_name);
+    defaults.public_base_url = runtime.public_base_url.clone().unwrap_or_default();
+    defaults.deployment_region = runtime
+        .deployment_region
+        .clone()
+        .unwrap_or(defaults.deployment_region);
+    defaults.bucket_name = runtime.bucket_name.clone().unwrap_or(defaults.bucket_name);
+    defaults.preview_bucket_name = runtime
+        .preview_bucket_name
+        .clone()
+        .unwrap_or(defaults.preview_bucket_name);
+    let config = resolve_cloudflare_config(&defaults, &CloudflareDeployOverrides::default());
+    provision_cloudflare_action(
+        "rotate_secrets",
+        &mut profile,
+        &mut driver,
+        &identity.user_identity.user_id,
+        &identity.device_identity.device_id,
+        &service_root,
+        config,
+    )
+    .await
+}
+
+pub fn cloudflare_detach(profile_path: impl AsRef<Path>) -> Result<CloudflareActionResultView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut snapshot = profile.load_snapshot()?;
+    snapshot.deployment = None;
+    profile.save_snapshot(&snapshot)?;
+    profile.clear_runtime_metadata()?;
+    profile.clear_deployment_bundle_path()?;
+    let runtime = cloudflare_runtime_details_from_profile(&profile)?;
+    Ok(CloudflareActionResultView {
+        action: "detach".into(),
+        updated_runtime: true,
+        deployment_bound: runtime.runtime.deployment_bound,
+        banner: BannerView {
+            severity: "success".into(),
+            message: "Detached current profile from Cloudflare runtime. Cloud resources were not deleted.".into(),
+        },
+        runtime,
+    })
 }
 
 pub fn contact_list(profile_path: impl AsRef<Path>) -> Result<Vec<ContactListItem>> {
@@ -1235,6 +1393,56 @@ fn runtime_status_from_profile(profile: &Profile) -> Result<RuntimeStatusView> {
     })
 }
 
+fn cloudflare_runtime_details_from_profile(profile: &Profile) -> Result<CloudflareRuntimeDetailsView> {
+    let runtime = profile.load_runtime_metadata()?;
+    let workspace_root = runtime.workspace_root.clone();
+    Ok(CloudflareRuntimeDetailsView {
+        runtime: RuntimeStatusView {
+            mode: runtime.mode.clone(),
+            deployment_bound: profile.metadata().deployment_bundle_path.is_some(),
+            public_base_url: runtime.public_base_url.clone().or(runtime.base_url.clone()),
+            worker_name: runtime.worker_name.clone(),
+            provisioned_at: runtime.last_deployed_at.clone(),
+            last_error: None,
+        },
+        deploy_url: runtime.deploy_url,
+        deployment_region: runtime.deployment_region,
+        bucket_name: runtime.bucket_name,
+        preview_bucket_name: runtime.preview_bucket_name,
+        service_root: runtime.service_root,
+        workspace_root,
+        deployment_bundle_path: profile.metadata().deployment_bundle_path.clone(),
+        bootstrap_secret_present: runtime.bootstrap_secret.is_some(),
+        sharing_secret_present: runtime.sharing_secret.is_some(),
+    })
+}
+
+fn map_cloudflare_preflight(
+    profile: &Profile,
+    deployment_bundle_present: bool,
+    identity_ready: bool,
+    preflight: CloudflarePreflight,
+) -> CloudflarePreflightView {
+    let runtime_bound = profile
+        .load_runtime_metadata()
+        .map(|runtime| runtime.mode.as_deref() == Some("cloudflare"))
+        .unwrap_or(false);
+    CloudflarePreflightView {
+        workspace_root_found: preflight.workspace_root_found,
+        service_root: preflight.service_root,
+        wrangler_available: preflight.wrangler_available,
+        wrangler_logged_in: preflight.wrangler_logged_in,
+        runtime_bound,
+        deployment_bundle_present,
+        identity_ready,
+        blocking_error: if !identity_ready {
+            Some("Local identity is not initialized.".into())
+        } else {
+            preflight.blocking_error
+        },
+    }
+}
+
 fn onboarding_step(
     has_profiles: bool,
     has_identity: bool,
@@ -1360,6 +1568,43 @@ async fn provision_cloudflare_profile(
         mode: "cloudflare".into(),
         runtime,
         identity,
+    })
+}
+
+async fn provision_cloudflare_action(
+    action: &str,
+    profile: &mut Profile,
+    driver: &mut CoreDriver,
+    user_id: &str,
+    device_id: &str,
+    service_root: &Path,
+    config: ResolvedCloudflareDeployConfig,
+) -> Result<CloudflareActionResultView> {
+    let _ = provision_cloudflare_profile(
+        profile,
+        driver,
+        user_id,
+        device_id,
+        service_root,
+        config,
+    )
+    .await?;
+    let runtime = cloudflare_runtime_details_from_profile(profile)?;
+    Ok(CloudflareActionResultView {
+        action: action.into(),
+        updated_runtime: true,
+        deployment_bound: runtime.runtime.deployment_bound,
+        banner: BannerView {
+            severity: "success".into(),
+            message: match action {
+                "redeploy" => "Cloudflare runtime redeployed.".into(),
+                "rotate_secrets" => {
+                    "Cloudflare secrets rotated and deployment rebound.".into()
+                }
+                _ => "Cloudflare runtime updated.".into(),
+            },
+        },
+        runtime,
     })
 }
 

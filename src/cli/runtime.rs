@@ -99,6 +99,19 @@ pub struct CloudflareDeploymentResult {
     pub stderr_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudflarePreflight {
+    pub workspace_root_found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_root: Option<PathBuf>,
+    pub wrangler_available: bool,
+    pub wrangler_logged_in: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CloudflareGeneratedSecrets {
     pub sharing_token_secret: bool,
@@ -508,6 +521,98 @@ pub async fn bootstrap_device_bundle(
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
 }
 
+pub fn cloudflare_preflight(profile_root: Option<&Path>) -> CloudflarePreflight {
+    let workspace_root = resolve_workspace_root(None, profile_root).ok();
+    let service_root = workspace_root
+        .as_ref()
+        .map(|root| root.join("services").join("cloudflare"))
+        .filter(|path| path.exists());
+    let wrangler_entry = service_root.as_ref().map(|root| {
+        root.join("node_modules")
+            .join("wrangler")
+            .join("bin")
+            .join("wrangler.js")
+    });
+    let wrangler_available = wrangler_entry
+        .as_ref()
+        .is_some_and(|path| path.exists());
+    let wrangler_logged_in = if wrangler_available {
+        check_wrangler_logged_in(service_root.as_deref()).unwrap_or(false)
+    } else {
+        false
+    };
+    let blocking_error = if workspace_root.is_none() {
+        Some(
+            "Workspace root not found. Expected services/cloudflare/scripts/transport-runtime.mjs."
+                .into(),
+        )
+    } else if service_root.is_none() {
+        Some("Cloudflare service root not found.".into())
+    } else if !wrangler_available {
+        Some(
+            "Wrangler is not available. Run npm install in services/cloudflare first.".into(),
+        )
+    } else if !wrangler_logged_in {
+        Some("Wrangler is not logged in. Run wrangler login.".into())
+    } else {
+        None
+    };
+
+    CloudflarePreflight {
+        workspace_root_found: workspace_root.is_some(),
+        workspace_root,
+        service_root,
+        wrangler_available,
+        wrangler_logged_in,
+        blocking_error,
+    }
+}
+
+pub fn ensure_cloudflare_runtime_metadata(
+    runtime: &crate::cli::profile::RuntimeMetadata,
+) -> Result<()> {
+    if runtime.mode.as_deref() != Some("cloudflare") {
+        bail!("runtime metadata is not bound to a cloudflare deployment");
+    }
+    Ok(())
+}
+
+pub fn rebuild_cloudflare_config(
+    runtime: &crate::cli::profile::RuntimeMetadata,
+) -> Result<ResolvedCloudflareDeployConfig> {
+    Ok(ResolvedCloudflareDeployConfig {
+        worker_name: runtime
+            .worker_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("cloudflare worker_name is not recorded"))?,
+        public_base_url: runtime.public_base_url.clone().unwrap_or_default(),
+        deployment_region: runtime
+            .deployment_region
+            .clone()
+            .unwrap_or_else(|| "global".into()),
+        max_inline_bytes: "4096".into(),
+        retention_days: "30".into(),
+        rate_limit_per_minute: "60".into(),
+        rate_limit_per_hour: "600".into(),
+        bucket_name: runtime
+            .bucket_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("cloudflare bucket_name is not recorded"))?,
+        preview_bucket_name: runtime
+            .preview_bucket_name
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("cloudflare preview_bucket_name is not recorded"))?,
+        sharing_token_secret: runtime
+            .sharing_secret
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("cloudflare sharing_secret is not recorded"))?,
+        bootstrap_token_secret: runtime
+            .bootstrap_secret
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("cloudflare bootstrap_secret is not recorded"))?,
+    })
+}
+
 pub fn resolve_workspace_root(
     explicit: Option<&Path>,
     profile_root: Option<&Path>,
@@ -638,6 +743,44 @@ fn process_is_running(pid: u32) -> Result<bool> {
             .context("run kill -0")?;
         Ok(output.status.success())
     }
+}
+
+fn check_wrangler_logged_in(service_root: Option<&Path>) -> Result<bool> {
+    let Some(service_root) = service_root else {
+        return Ok(false);
+    };
+    let wrangler_entry = service_root
+        .join("node_modules")
+        .join("wrangler")
+        .join("bin")
+        .join("wrangler.js");
+    if !wrangler_entry.exists() {
+        return Ok(false);
+    }
+    let node = std::env::var("TAPCHAT_NODE_PATH").unwrap_or_else(|_| "node".into());
+    let output = Command::new(node)
+        .arg(&wrangler_entry)
+        .arg("whoami")
+        .current_dir(service_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let Ok(output) = output else {
+        return Ok(false);
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        if stderr.contains("not authenticated")
+            || stderr.contains("wrangler login")
+            || stdout.contains("not authenticated")
+            || stdout.contains("wrangler login")
+        {
+            return Ok(false);
+        }
+    }
+    Ok(output.status.success())
 }
 
 fn reserve_port() -> Result<u16> {

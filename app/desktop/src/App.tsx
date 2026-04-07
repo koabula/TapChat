@@ -12,8 +12,13 @@ import {
   appBootstrap,
   attachmentOpenLocal,
   attachmentPreviewSource,
+  cloudflareDetach,
+  cloudflarePreflight,
   cloudflareProvisionAuto,
   cloudflareProvisionCustom,
+  cloudflareRedeploy,
+  cloudflareRotateSecrets,
+  cloudflareRuntimeDetails,
   cloudflareStatus,
   contactImportIdentity,
   contactRefresh,
@@ -42,6 +47,8 @@ import type {
   AppBootstrapView,
   AttachmentPreviewView,
   BatchSendAttachmentResultView,
+  CloudflarePreflightView,
+  CloudflareRuntimeDetailsView,
   CloudflareDeployOverrides,
   DirectShellView,
   MessageRequestItemView,
@@ -61,6 +68,8 @@ type ViewState = {
   lastAttachmentSend: BatchSendAttachmentResultView | null;
   messageRequests: MessageRequestItemView[];
   allowlist: AllowlistView | null;
+  cloudflarePreflight: CloudflarePreflightView | null;
+  cloudflareRuntime: CloudflareRuntimeDetailsView | null;
 };
 
 const emptyOverrides: CloudflareDeployOverrides = {
@@ -88,6 +97,8 @@ export default function App() {
     lastAttachmentSend: null,
     messageRequests: [],
     allowlist: null,
+    cloudflarePreflight: null,
+    cloudflareRuntime: null,
   });
   const [createName, setCreateName] = useState("alice");
   const [createRoot, setCreateRoot] = useState("");
@@ -192,11 +203,16 @@ export default function App() {
       if (bootstrap.onboarding.step === "complete") {
         await refreshDirectShell(bootstrap.active_profile?.path ?? null);
       }
+      if (bootstrap.active_profile?.path) {
+        await refreshCloudflareState(bootstrap.active_profile.path);
+      }
     } catch (error) {
       setState((current) => ({
         ...current,
         bootstrap: null,
         shell: null,
+        cloudflarePreflight: null,
+        cloudflareRuntime: null,
         loading: false,
         error: formatError(error),
         success: null,
@@ -220,6 +236,22 @@ export default function App() {
       loading: false,
     }));
     await refreshPolicyState(profilePath);
+  }
+
+  async function refreshCloudflareState(explicitProfilePath?: string | null) {
+    const profilePath = explicitProfilePath ?? state.bootstrap?.active_profile?.path ?? null;
+    if (!profilePath) {
+      return;
+    }
+    const [preflight, runtime] = await Promise.all([
+      cloudflarePreflight(profilePath),
+      cloudflareRuntimeDetails(profilePath),
+    ]);
+    setState((current) => ({
+      ...current,
+      cloudflarePreflight: preflight,
+      cloudflareRuntime: runtime,
+    }));
   }
 
   async function refreshPolicyState(explicitProfilePath?: string | null) {
@@ -333,6 +365,8 @@ export default function App() {
         lastAttachmentSend: null,
         messageRequests: [],
         allowlist: null,
+        cloudflarePreflight: null,
+        cloudflareRuntime: null,
       }));
       setSelectedAttachmentPaths([]);
       setPreview(null);
@@ -392,7 +426,47 @@ export default function App() {
     }
     await runTask(async () => {
       await cloudflareStatus(profilePath);
-      await refreshBootstrap("Runtime status refreshed.");
+      await refreshCloudflareState(profilePath);
+      setState((current) => ({ ...current, loading: false, success: "Runtime status refreshed." }));
+    });
+  }
+
+  async function handleCloudflareRedeploy() {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    if (!profilePath) {
+      return;
+    }
+    await runTask(async () => {
+      const result = await cloudflareRedeploy(profilePath);
+      await refreshBootstrap(result.banner.message);
+    });
+  }
+
+  async function handleCloudflareRotateSecrets() {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    if (!profilePath) {
+      return;
+    }
+    if (!window.confirm("Rotate Cloudflare secrets and re-bootstrap the current device? This will not delete cloud resources.")) {
+      return;
+    }
+    await runTask(async () => {
+      const result = await cloudflareRotateSecrets(profilePath);
+      await refreshBootstrap(result.banner.message);
+    });
+  }
+
+  async function handleCloudflareDetach() {
+    const profilePath = state.bootstrap?.active_profile?.path;
+    if (!profilePath) {
+      return;
+    }
+    if (!window.confirm("Detach this profile from the Cloudflare runtime? This only unbinds the profile and does not delete cloud resources.")) {
+      return;
+    }
+    await runTask(async () => {
+      const result = await cloudflareDetach(profilePath);
+      await refreshBootstrap(result.banner.message);
     });
   }
 
@@ -607,6 +681,8 @@ export default function App() {
   const selectedContact = state.shell?.selected_contact ?? null;
   const selectedConversationId = state.selectedConversationId;
   const selectedContactUserId = state.selectedContactUserId;
+  const runtimeDetails = state.cloudflareRuntime;
+  const preflight = state.cloudflarePreflight;
 
   const statusLabel = useMemo(() => {
     if (!state.shell?.realtime) {
@@ -951,12 +1027,42 @@ export default function App() {
               ["User", activeProfile.user_id ?? "Pending"],
               ["Device", activeProfile.device_id ?? "Pending"],
             ]} />
-            <InfoCard title="Runtime" rows={[
-              ["Mode", bootstrap?.runtime?.mode ?? "Not bound"],
-              ["Bound", bootstrap?.runtime?.deployment_bound ? "Yes" : "No"],
-              ["Base URL", bootstrap?.runtime?.public_base_url ?? "Pending"],
-              ["Worker", bootstrap?.runtime?.worker_name ?? "Pending"],
+            <InfoCard title="Runtime binding" rows={[
+              ["Mode", runtimeDetails?.mode ?? bootstrap?.runtime?.mode ?? "none"],
+              ["Bound", runtimeDetails?.deployment_bound ? "Yes" : "No"],
+              ["Base URL", runtimeDetails?.public_base_url ?? bootstrap?.runtime?.public_base_url ?? "Pending"],
+              ["Worker", runtimeDetails?.worker_name ?? bootstrap?.runtime?.worker_name ?? "Pending"],
             ]} />
+            <InfoCard title="Deployment details" rows={[
+              ["Deploy URL", runtimeDetails?.deploy_url ?? "Missing"],
+              ["Region", runtimeDetails?.deployment_region ?? "Missing"],
+              ["Bucket", runtimeDetails?.bucket_name ?? "Missing"],
+              ["Preview bucket", runtimeDetails?.preview_bucket_name ?? "Missing"],
+              ["Bundle path", runtimeDetails?.deployment_bundle_path ?? "Missing"],
+              ["Last deployed", runtimeDetails?.provisioned_at ?? "Missing"],
+              ["Bootstrap secret", runtimeDetails?.bootstrap_secret_present ? "Present" : "Missing"],
+              ["Sharing secret", runtimeDetails?.sharing_secret_present ? "Present" : "Missing"],
+            ]} />
+            <InfoCard title="Preflight" rows={[
+              ["Workspace", preflight?.workspace_root_found ? "Found" : "Missing"],
+              ["Service root", preflight?.service_root ?? "Missing"],
+              ["Wrangler", preflight?.wrangler_available ? "Available" : "Missing"],
+              ["Wrangler login", preflight?.wrangler_logged_in ? "Ready" : "Missing"],
+              ["Identity", preflight?.identity_ready ? "Ready" : "Missing"],
+              ["Bundle", preflight?.deployment_bundle_present ? "Present" : "Missing"],
+              ["Blocking", preflight?.blocking_error ?? "None"],
+            ]} />
+            <div className="button-row">
+              <button className="ghost-button" disabled={state.loading || !!preflight?.blocking_error} onClick={() => void handleProvisionAuto()}>
+                Provision automatically
+              </button>
+              <button className="ghost-button" disabled={state.loading || !!preflight?.blocking_error} onClick={() => setCustomProvision(true)}>
+                Provision with overrides
+              </button>
+              <button className="ghost-button" disabled={state.loading} onClick={() => void chooseDeploymentBundle()}>
+                Import deployment bundle
+              </button>
+            </div>
             {step === "complete" && state.shell && (
               <>
                 <InfoCard title="Sync" rows={[
@@ -1062,31 +1168,54 @@ export default function App() {
               </>
             )}
             {step === "complete" && (
-              <button
-                className="ghost-button full-width"
-                disabled={state.loading || !activeProfile}
-                onClick={() => {
-                  if (!activeProfile) {
-                    return;
-                  }
-                  void runTask(async () => {
-                    const enabled = await appSetBackgroundMode(activeProfile.path, !backgroundEnabled);
-                    setBackgroundEnabled(enabled);
-                    setState((current) => ({
-                      ...current,
-                      success: enabled
-                        ? "Background downloads enabled. Closing the window will keep TapChat in the tray."
-                        : "Background downloads disabled for this profile.",
-                    }));
-                  });
-                }}
-              >
-                {backgroundEnabled ? "Disable background downloads" : "Enable background downloads"}
-              </button>
+              <>
+                <button
+                  className="ghost-button full-width"
+                  disabled={state.loading || !activeProfile}
+                  onClick={() => {
+                    if (!activeProfile) {
+                      return;
+                    }
+                    void runTask(async () => {
+                      const enabled = await appSetBackgroundMode(activeProfile.path, !backgroundEnabled);
+                      setBackgroundEnabled(enabled);
+                      setState((current) => ({
+                        ...current,
+                        success: enabled
+                          ? "Background downloads enabled. Closing the window will keep TapChat in the tray."
+                          : "Background downloads disabled for this profile.",
+                      }));
+                    });
+                  }}
+                >
+                  {backgroundEnabled ? "Disable background downloads" : "Enable background downloads"}
+                </button>
+                <button className="ghost-button full-width" disabled={state.loading} onClick={() => void handleRefreshRuntimeStatus()}>
+                  Refresh runtime status
+                </button>
+                <button
+                  className="ghost-button full-width"
+                  disabled={state.loading || !runtimeDetails?.deployment_bound}
+                  onClick={() => void handleCloudflareRedeploy()}
+                >
+                  Redeploy runtime
+                </button>
+                <button
+                  className="ghost-button full-width"
+                  disabled={state.loading || !runtimeDetails?.deployment_bound}
+                  onClick={() => void handleCloudflareRotateSecrets()}
+                >
+                  Rotate secrets
+                </button>
+                <button
+                  className="ghost-button full-width"
+                  disabled={state.loading || !runtimeDetails?.deployment_bound}
+                  onClick={() => void handleCloudflareDetach()}
+                >
+                  Detach runtime
+                </button>
+              </>
             )}
-            <button className="ghost-button full-width" disabled={state.loading} onClick={() => void handleRefreshRuntimeStatus()}>
-              Refresh runtime status
-            </button>
           </div>
         )}
       </aside>
@@ -1126,6 +1255,7 @@ function OnboardingPane(props: {
   const { state } = props;
   const bootstrap = state.bootstrap;
   const activeProfile = bootstrap?.active_profile ?? null;
+  const preflight = state.cloudflarePreflight;
 
   return (
     <div className="content-grid">
@@ -1178,9 +1308,16 @@ function OnboardingPane(props: {
               {props.customProvision ? "Use auto provision" : "Customize provision"}
             </button>
           </div>
+          <InfoCard title="Preflight" rows={[
+            ["Workspace", preflight?.workspace_root_found ? "Found" : "Missing"],
+            ["Service root", preflight?.service_root ?? "Missing"],
+            ["Wrangler", preflight?.wrangler_available ? "Available" : "Missing"],
+            ["Wrangler login", preflight?.wrangler_logged_in ? "Ready" : "Missing"],
+            ["Blocking", preflight?.blocking_error ?? "None"],
+          ]} />
           {!props.customProvision ? (
             <div className="button-row">
-              <button className="primary-button" disabled={state.loading} onClick={() => void props.handleProvisionAuto()}>Provision Cloudflare</button>
+              <button className="primary-button" disabled={state.loading || !!preflight?.blocking_error} onClick={() => void props.handleProvisionAuto()}>Provision Cloudflare</button>
               <button className="ghost-button" disabled={state.loading} onClick={() => void props.chooseDeploymentBundle()}>Import deployment bundle</button>
             </div>
           ) : (
@@ -1194,7 +1331,7 @@ function OnboardingPane(props: {
                 ))}
               </div>
               <div className="button-row">
-                <button className="primary-button" disabled={state.loading} onClick={() => void props.handleProvisionCustom()}>Provision with overrides</button>
+                <button className="primary-button" disabled={state.loading || !!preflight?.blocking_error} onClick={() => void props.handleProvisionCustom()}>Provision with overrides</button>
                 <button className="ghost-button" disabled={state.loading} onClick={() => void props.chooseDeploymentBundle()}>Import deployment bundle</button>
               </div>
             </>

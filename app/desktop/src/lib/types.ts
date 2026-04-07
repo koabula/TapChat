@@ -23,6 +23,43 @@ export type RuntimeStatusView = {
   last_error?: string | null;
 };
 
+export type CloudflarePreflightView = {
+  workspace_root_found: boolean;
+  service_root?: string | null;
+  wrangler_available: boolean;
+  wrangler_logged_in: boolean;
+  runtime_bound: boolean;
+  deployment_bundle_present: boolean;
+  identity_ready: boolean;
+  blocking_error?: string | null;
+};
+
+export type CloudflareRuntimeDetailsView = {
+  mode?: string | null;
+  deployment_bound: boolean;
+  public_base_url?: string | null;
+  worker_name?: string | null;
+  provisioned_at?: string | null;
+  last_error?: string | null;
+  deploy_url?: string | null;
+  deployment_region?: string | null;
+  bucket_name?: string | null;
+  preview_bucket_name?: string | null;
+  service_root?: string | null;
+  workspace_root?: string | null;
+  deployment_bundle_path?: string | null;
+  bootstrap_secret_present: boolean;
+  sharing_secret_present: boolean;
+};
+
+export type CloudflareActionResultView = {
+  action: string;
+  updated_runtime: boolean;
+  deployment_bound: boolean;
+  banner: BannerView;
+  runtime: CloudflareRuntimeDetailsView;
+};
+
 export type BannerView = {
   severity: string;
   message: string;
