@@ -250,13 +250,19 @@ impl IdentityManager {
             key_package_ref,
             key_package_expires_at,
         )?;
-        Self::export_identity_bundle_with_devices(local_identity, deployment, vec![device_profile])
+        Self::export_identity_bundle_with_devices(
+            local_identity,
+            deployment,
+            vec![device_profile],
+            None,
+        )
     }
 
     pub fn export_identity_bundle_with_devices(
         local_identity: &LocalIdentityState,
         deployment: &DeploymentBundle,
         devices: Vec<crate::model::DeviceContactProfile>,
+        bundle_share_id: Option<String>,
     ) -> CoreResult<IdentityBundle> {
         let encoded_user_id =
             urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
@@ -265,6 +271,7 @@ impl IdentityManager {
             user_id: local_identity.user_identity.user_id.clone(),
             user_public_key: local_identity.user_identity.user_public_key.clone(),
             devices,
+            bundle_share_id: Some(bundle_share_id.unwrap_or_else(generate_bundle_share_id)),
             // Deployment runtime config may provide bootstrap references for publishing the
             // local user's shared state. Contact refresh must not infer these values.
             identity_bundle_ref: deployment
@@ -381,6 +388,7 @@ fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
         bundle.user_id.clone(),
         bundle.user_public_key.clone(),
         bundle.updated_at.to_string(),
+        bundle.bundle_share_id.clone().unwrap_or_default(),
         bundle.identity_bundle_ref.clone().unwrap_or_default(),
         bundle.device_status_ref.clone().unwrap_or_default(),
         bundle
@@ -403,6 +411,12 @@ fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
         parts.push(device.keypackage_ref.expires_at.to_string());
     }
     parts.join("|")
+}
+
+fn generate_bundle_share_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    encode_hex(&bytes)
 }
 
 fn short_fingerprint(bytes: &[u8], len: usize) -> String {
@@ -578,6 +592,7 @@ mod tests {
                     expires_at: 999,
                 },
             }],
+            bundle_share_id: Some("share-id".into()),
             identity_bundle_ref: None,
             device_status_ref: None,
             storage_profile: None,

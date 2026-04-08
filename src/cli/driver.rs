@@ -40,6 +40,7 @@ pub struct DriverRuntime {
     notifications: Vec<String>,
     scheduled_timers: Vec<ScheduledTimer>,
     storage_prepare_url: Option<String>,
+    contact_share_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
 }
@@ -84,6 +85,7 @@ impl CoreDriver {
     pub fn from_snapshot(
         snapshot: CorePersistenceSnapshot,
         base_url: Option<String>,
+        contact_share_url: Option<String>,
     ) -> Result<Self> {
         let latest_snapshot = snapshot.clone();
         let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
@@ -102,6 +104,7 @@ impl CoreDriver {
                 storage_prepare_url: base_url.map(|value| {
                     format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
                 }),
+                contact_share_url,
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
             },
@@ -471,8 +474,55 @@ impl CoreDriver {
         }
         if let Some(body) = request.body.as_deref() {
             if request.url.contains("/messages") {
-                let append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
-                self.runtime.recent_appends.push(append_request.envelope);
+                let mut append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
+                if append_request.sender_bundle_share_url.is_none() {
+                    append_request.sender_bundle_share_url =
+                        self.runtime.contact_share_url.clone();
+                }
+                if append_request.sender_bundle_hash.is_none() {
+                    append_request.sender_bundle_hash = self
+                        .engine
+                        .local_bundle()
+                        .map(|bundle| bundle.signature.clone());
+                }
+                self.runtime
+                    .recent_appends
+                    .push(append_request.envelope.clone());
+                let converted = to_camel_case_json_string(&serde_json::to_string(&append_request)?)?;
+                builder = builder.body(converted);
+                return match builder.send().await {
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        let content_type = response
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let body = response
+                            .text()
+                            .await
+                            .ok()
+                            .filter(|value| !value.is_empty())
+                            .map(|value| {
+                                if content_type.contains("application/json") {
+                                    to_snake_case_json_string(&value).unwrap_or(value)
+                                } else {
+                                    value
+                                }
+                            });
+                        Ok(vec![CoreEvent::HttpResponseReceived {
+                            request_id: request.request_id,
+                            status,
+                            body,
+                        }])
+                    }
+                    Err(error) => Ok(vec![CoreEvent::HttpRequestFailed {
+                        request_id: request.request_id,
+                        retryable: true,
+                        detail: Some(error.to_string()),
+                    }]),
+                };
             }
             let converted = if looks_like_json(body) {
                 to_camel_case_json_string(body)?
@@ -667,6 +717,18 @@ impl CoreDriver {
                         .and_then(|field| field.as_u64())
                         .unwrap_or_default(),
                     action: action.action,
+                    sender_bundle_share_url: value
+                        .get("sender_bundle_share_url")
+                        .and_then(|field| field.as_str())
+                        .map(|value| value.to_string()),
+                    sender_bundle_hash: value
+                        .get("sender_bundle_hash")
+                        .and_then(|field| field.as_str())
+                        .map(|value| value.to_string()),
+                    sender_display_name: value
+                        .get("sender_display_name")
+                        .and_then(|field| field.as_str())
+                        .map(|value| value.to_string()),
                 };
                 Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
             }

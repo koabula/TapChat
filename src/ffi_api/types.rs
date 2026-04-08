@@ -98,6 +98,7 @@ pub enum CoreCommand {
         target_device_id: String,
         status: crate::model::DeviceStatusKind,
     },
+    RotateContactShareLink,
     RebuildConversation {
         conversation_id: String,
     },

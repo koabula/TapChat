@@ -1592,6 +1592,7 @@ mod tests {
             &laptop_identity,
             &sample_deployment(),
             vec![bob_phone_bundle.devices[0].clone(), laptop_profile.clone()],
+            None,
         )
         .expect("merged bundle");
         alice
@@ -1706,6 +1707,7 @@ mod tests {
             &bob_laptop,
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile.clone()],
+            None,
         )
         .expect("merged bundle");
 
@@ -1753,6 +1755,7 @@ mod tests {
             &bob_laptop,
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile.clone()],
+            None,
         )
         .expect("merged bundle");
 
@@ -1805,6 +1808,7 @@ mod tests {
             &bob_laptop,
             &deployment,
             vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
+            None,
         )
         .expect("active bundle");
 
@@ -1816,6 +1820,7 @@ mod tests {
             &bob_laptop,
             &deployment,
             vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
+            None,
         )
         .expect("revoked bundle");
         let pending_before = alice.state.pending_outbox.len();
@@ -1875,6 +1880,7 @@ mod tests {
             &bob_laptop,
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile],
+            None,
         )
         .expect("merged bundle");
 
@@ -1916,6 +1922,7 @@ mod tests {
             &bob_laptop,
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile],
+            None,
         )
         .expect("merged bundle");
 

@@ -298,6 +298,8 @@ pub struct IdentityBundle {
     pub user_id: String,
     pub user_public_key: String,
     pub devices: Vec<DeviceContactProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_share_id: Option<String>,
     // Canonical shared-state reference for this identity bundle. Contact refresh must only
     // use this explicit reference and must not infer object locations from storage hints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +318,9 @@ impl Validate for IdentityBundle {
         validate_required("user_id", &self.user_id)?;
         validate_required("user_public_key", &self.user_public_key)?;
         validate_required("signature", &self.signature)?;
+        if let Some(bundle_share_id) = &self.bundle_share_id {
+            validate_required("bundle_share_id", bundle_share_id)?;
+        }
         if let Some(identity_bundle_ref) = &self.identity_bundle_ref {
             validate_required("identity_bundle_ref", identity_bundle_ref)?;
         }
@@ -1038,6 +1043,7 @@ mod tests {
             version: CURRENT_MODEL_VERSION.to_string(),
             user_id: "user:alice".into(),
             user_public_key: "alice-pub".into(),
+            bundle_share_id: Some("share-alice".into()),
             devices: vec![DeviceContactProfile {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 device_id: "device:alice:phone".into(),

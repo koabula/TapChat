@@ -455,7 +455,7 @@ fn escape_ps_double_quoted(value: &str) -> String {
 
 pub async fn wait_until_ready(base_url: &str) -> Result<()> {
     let client = Client::builder().build().context("build reqwest client")?;
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
     loop {
         let response = client
             .get(format!("{base_url}/v1/deployment-bundle"))
@@ -473,7 +473,7 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("cloudflare runtime did not become ready in time for {base_url}");
+            bail!("runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}");
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }

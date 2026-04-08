@@ -1065,7 +1065,7 @@ fn load_driver(profile: &Profile) -> Result<CoreDriver> {
         .deployment
         .as_ref()
         .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone());
-    CoreDriver::from_snapshot(snapshot, base_url)
+    CoreDriver::from_snapshot(snapshot, base_url, None)
 }
 
 fn load_deployment_from_snapshot(snapshot: CorePersistenceSnapshot) -> Result<DeploymentBundle> {

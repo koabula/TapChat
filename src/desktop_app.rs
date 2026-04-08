@@ -14,11 +14,13 @@ use crate::cli::runtime::{
     derive_cloudflare_defaults, ensure_cloudflare_runtime_metadata, rebuild_cloudflare_config,
     resolve_cloudflare_config, resolve_service_root,
 };
+use crate::cli::util::{sign_hmac_token, to_snake_case_json_string};
 use crate::conversation::StoredMessage;
 use crate::ffi_api::{
     AppendResultSummary, AttachmentDescriptor, CoreCommand, CoreEvent, CoreOutput,
     RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
 };
+use crate::identity::IdentityManager;
 use crate::model::{DeploymentBundle, IdentityBundle, MessageType, StorageRef, Validate};
 use crate::persistence::PersistedPendingBlobTransfer;
 use crate::transport_contract::{AllowlistDocument, MessageRequestAction, MessageRequestItem};
@@ -104,6 +106,23 @@ pub struct CloudflareActionResultView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CloudflareWizardStatusView {
+    pub state: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_name: Option<String>,
+    pub bundle_imported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BannerView {
     pub severity: String,
     pub message: String,
@@ -159,6 +178,8 @@ pub struct ContactDetailView {
     pub user_id: String,
     pub devices: Vec<ContactDeviceView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_share_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_bundle_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh_error: Option<String>,
@@ -169,6 +190,12 @@ pub struct MessageRequestItemView {
     pub request_id: String,
     pub recipient_device_id: String,
     pub sender_user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_share_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
     pub first_seen_at: u64,
     pub last_seen_at: u64,
     pub message_count: u64,
@@ -183,6 +210,15 @@ pub struct MessageRequestActionView {
     pub sender_user_id: String,
     pub promoted_count: u64,
     pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_share_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContactShareLinkView {
+    pub profile_path: PathBuf,
+    pub user_id: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -482,6 +518,23 @@ pub fn profile_create(name: &str, root: impl AsRef<Path>) -> Result<ProfileSumma
     })
 }
 
+pub fn profile_open_or_import(root_dir: impl AsRef<Path>) -> Result<ProfileSummary> {
+    let profile = Profile::open(root_dir.as_ref()).map_err(|_| anyhow!("not_a_profile_directory"))?;
+    profile.sync_registry_entry()?;
+    let registry = ProfileRegistry::load()?;
+    let active = registry
+        .active_profile
+        .as_ref()
+        .is_some_and(|path| path == profile.root());
+    Ok(ProfileSummary {
+        name: profile.metadata().name.clone(),
+        path: profile.root().to_path_buf(),
+        is_active: active,
+        user_id: profile.metadata().user_id.clone(),
+        device_id: profile.metadata().device_id.clone(),
+    })
+}
+
 pub async fn identity_create(
     profile_path: impl AsRef<Path>,
     device_name: &str,
@@ -691,6 +744,126 @@ pub fn cloudflare_detach(profile_path: impl AsRef<Path>) -> Result<CloudflareAct
     })
 }
 
+pub async fn cloudflare_setup_wizard_execute<F>(
+    profile_path: impl AsRef<Path>,
+    mode: &str,
+    overrides: Option<CloudflareDeployOverrides>,
+    mut update: F,
+) -> Result<CloudflareWizardStatusView>
+where
+    F: FnMut(CloudflareWizardStatusView) + Send,
+{
+    let profile_path = profile_path.as_ref().to_path_buf();
+    let mut emit = |status: CloudflareWizardStatusView| {
+        update(status);
+    };
+
+    emit(cloudflare_wizard_status(
+        "preflight",
+        "Checking Cloudflare workspace and profile readiness.",
+        None,
+        None,
+        false,
+    ));
+
+    let mut profile = Profile::open(&profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let identity = driver
+        .local_identity()
+        .cloned()
+        .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+    let preflight = runtime_cloudflare_preflight(Some(profile.root()));
+
+    if !preflight.workspace_root_found || preflight.service_root.is_none() {
+        let status =
+            cloudflare_wizard_failure("workspace_not_found", "workspace_not_found", None, None);
+        emit(status.clone());
+        return Err(anyhow!("workspace_not_found"));
+    }
+
+    if !preflight.wrangler_available {
+        let status = cloudflare_wizard_failure("wrangler_missing", "wrangler_missing", None, None);
+        emit(status.clone());
+        return Err(anyhow!("wrangler_missing"));
+    }
+
+    if !preflight.wrangler_logged_in {
+        emit(cloudflare_wizard_status(
+            "waiting_for_login",
+            "Cloudflare authorization is required. Your browser will open for Wrangler login, then deployment will continue automatically.",
+            None,
+            None,
+            false,
+        ));
+    }
+
+    let service_root = resolve_service_root(None, Some(profile.metadata().root_dir.as_path()))?;
+    let defaults = derive_cloudflare_defaults(
+        &profile.metadata().name,
+        &identity.user_identity.user_id,
+        &identity.device_identity.device_id,
+    );
+    let overrides = overrides.unwrap_or_default();
+    let config = match mode {
+        "custom" => resolve_cloudflare_config(&defaults, &overrides),
+        _ => resolve_cloudflare_config(&defaults, &CloudflareDeployOverrides::default()),
+    };
+
+    let result = provision_cloudflare_profile_with_progress(
+        &mut profile,
+        &mut driver,
+        &identity.user_identity.user_id,
+        &identity.device_identity.device_id,
+        &service_root,
+        config,
+        |stage, deployment| match stage {
+            "deploying" => emit(cloudflare_wizard_status(
+                "deploying",
+                "Deploying Cloudflare transport resources.",
+                None,
+                None,
+                false,
+            )),
+            "bootstrapping" => emit(cloudflare_wizard_status(
+                "bootstrapping",
+                "Cloudflare deployed. Bootstrapping this device.",
+                deployment.map(|value| value.deploy_url.clone()),
+                deployment.map(|value| value.worker_name.clone()),
+                false,
+            )),
+            "importing_bundle" => emit(cloudflare_wizard_status(
+                "importing_bundle",
+                "Importing the deployment bundle into this profile.",
+                deployment.map(|value| value.deploy_url.clone()),
+                deployment.map(|value| value.worker_name.clone()),
+                false,
+            )),
+            _ => {}
+        },
+    )
+    .await;
+
+    match result {
+        Ok(provisioned) => {
+            let status = cloudflare_wizard_status(
+                "completed",
+                "Cloudflare transport is ready.",
+                Some(provisioned.deployment.deploy_url),
+                Some(provisioned.deployment.worker_name),
+                true,
+            );
+            emit(status.clone());
+            Ok(status)
+        }
+        Err(error) => {
+            let (code, detail) = classify_cloudflare_error(&error);
+            let status = cloudflare_wizard_failure(code, detail, None, None);
+            emit(status.clone());
+            Err(error)
+        }
+    }
+}
+
 pub fn contact_list(profile_path: impl AsRef<Path>) -> Result<Vec<ContactListItem>> {
     let profile = Profile::open(profile_path)?;
     let snapshot = profile.load_snapshot()?;
@@ -737,6 +910,68 @@ pub async fn contact_import_identity(
     contact_show(profile.root(), &bundle.user_id)
 }
 
+pub async fn contact_import_share_link(
+    profile_path: impl AsRef<Path>,
+    url: &str,
+) -> Result<ContactDetailView> {
+    let mut profile = Profile::open(profile_path)?;
+    let bundle = fetch_identity_bundle_from_url(url).await?;
+    let mut driver = load_driver(&profile)?;
+    driver
+        .run_command_until_idle(CoreCommand::ImportIdentityBundle {
+            bundle: bundle.clone(),
+        })
+        .await?;
+    profile.save_identity_bundle(
+        &bundle,
+        &format!("identity_{}.json", bundle.user_id.replace(':', "_")),
+    )?;
+    persist_driver(&mut profile, &driver)?;
+    contact_show(profile.root(), &bundle.user_id)
+}
+
+pub async fn contact_share_link_get(profile_path: impl AsRef<Path>) -> Result<ContactShareLinkView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    let bundle = if driver
+        .local_bundle()
+        .and_then(|bundle| bundle.bundle_share_id.clone())
+        .is_none()
+    {
+        driver
+            .run_command_until_idle(CoreCommand::RotateContactShareLink)
+            .await?;
+        persist_driver(&mut profile, &driver)?;
+        driver
+            .local_bundle()
+            .cloned()
+            .ok_or_else(|| anyhow!("local identity bundle is not available"))?
+    } else {
+        driver
+            .local_bundle()
+            .cloned()
+            .ok_or_else(|| anyhow!("local identity bundle is not available"))?
+    };
+    let url = build_contact_share_url(&profile, &bundle)?;
+    Ok(ContactShareLinkView {
+        profile_path: profile.root().to_path_buf(),
+        user_id: bundle.user_id,
+        url,
+    })
+}
+
+pub async fn contact_share_link_rotate(
+    profile_path: impl AsRef<Path>,
+) -> Result<ContactShareLinkView> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    driver
+        .run_command_until_idle(CoreCommand::RotateContactShareLink)
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    contact_share_link_get(profile.root()).await
+}
+
 pub fn contact_show(profile_path: impl AsRef<Path>, user_id: &str) -> Result<ContactDetailView> {
     let profile = Profile::open(profile_path)?;
     let driver = load_driver(&profile)?;
@@ -746,6 +981,7 @@ pub fn contact_show(profile_path: impl AsRef<Path>, user_id: &str) -> Result<Con
     Ok(ContactDetailView {
         user_id: bundle.user_id.clone(),
         devices: map_contact_devices(driver.contact_devices(user_id)),
+        bundle_share_url: contact_bundle_share_url(&profile, &bundle),
         identity_bundle_ref: bundle.identity_bundle_ref.clone(),
         last_refresh_error: None,
     })
@@ -787,12 +1023,42 @@ pub async fn message_request_accept(
 ) -> Result<MessageRequestActionView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
+    let request = list_message_requests_from_driver(&mut driver)
+        .await?
+        .into_iter()
+        .find(|item| item.request_id == request_id)
+        .ok_or_else(|| anyhow!("message request not found"))?;
+    let sender_bundle_share_url = request
+        .sender_bundle_share_url
+        .clone()
+        .ok_or_else(|| anyhow!("sender bundle share url is missing"))?;
+    let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
+    driver
+        .run_command_until_idle(CoreCommand::ImportIdentityBundle {
+            bundle: bundle.clone(),
+        })
+        .await?;
+    profile.save_identity_bundle(
+        &bundle,
+        &format!("identity_{}.json", bundle.user_id.replace(':', "_")),
+    )?;
     let output = driver
         .run_command_until_idle(CoreCommand::ActOnMessageRequest {
             request_id: request_id.to_string(),
             action: MessageRequestAction::Accept,
         })
         .await?;
+    if let Some(device_id) = driver
+        .local_identity()
+        .map(|identity| identity.device_identity.device_id.clone())
+    {
+        let _ = driver
+            .run_command_until_idle_without_realtime(CoreCommand::SyncInbox {
+                device_id,
+                reason: Some("message request accepted".into()),
+            })
+            .await?;
+    }
     persist_driver(&mut profile, &driver)?;
     Ok(map_message_request_action(
         message_request_action_from_output(&output)?,
@@ -1417,6 +1683,109 @@ fn cloudflare_runtime_details_from_profile(profile: &Profile) -> Result<Cloudfla
     })
 }
 
+#[derive(Debug, Clone)]
+struct ProvisionedCloudflareState {
+    progress: ProvisionProgressView,
+    deployment: crate::cli::runtime::CloudflareDeploymentResult,
+}
+
+fn cloudflare_wizard_status(
+    state: &str,
+    message: impl Into<String>,
+    deploy_url: Option<String>,
+    worker_name: Option<String>,
+    bundle_imported: bool,
+) -> CloudflareWizardStatusView {
+    CloudflareWizardStatusView {
+        state: state.into(),
+        message: message.into(),
+        blocking_error: None,
+        deploy_url,
+        worker_name,
+        bundle_imported,
+        last_error_code: None,
+        last_error_detail: None,
+    }
+}
+
+fn cloudflare_wizard_failure(
+    code: &str,
+    detail: impl Into<String>,
+    deploy_url: Option<String>,
+    worker_name: Option<String>,
+) -> CloudflareWizardStatusView {
+    let detail = detail.into();
+    CloudflareWizardStatusView {
+        state: "failed".into(),
+        message: match code {
+            "not_a_profile_directory" => {
+                "This folder is not a TapChat profile. Choose a folder that already contains profile.json.".into()
+            }
+            "wrangler_missing" => {
+                "Wrangler is not available in the Cloudflare service workspace. Run npm install in services/cloudflare first.".into()
+            }
+            "wrangler_not_logged_in" => {
+                "Cloudflare authorization is required. TapChat will open the Wrangler login flow in your browser.".into()
+            }
+            "workspace_not_found" => {
+                "The Cloudflare service workspace could not be found from this checkout.".into()
+            }
+            "identity_not_ready" => {
+                "Create or recover this profile identity before setting up transport.".into()
+            }
+            "deploy_failed" => {
+                "Cloudflare deployment failed before runtime setup completed.".into()
+            }
+            "runtime_not_ready_in_time" => {
+                "Cloudflare deployed, but the runtime did not become reachable in time. You can refresh status or retry in a moment.".into()
+            }
+            "bootstrap_failed" => "Cloudflare deployed, but device bootstrap failed.".into(),
+            "bundle_import_failed" => {
+                "Deployment succeeded, but TapChat could not import the deployment bundle.".into()
+            }
+            "runtime_not_bound" => {
+                "This profile is not currently bound to a Cloudflare deployment.".into()
+            }
+            _ => detail.clone(),
+        },
+        blocking_error: Some(detail.clone()),
+        deploy_url,
+        worker_name,
+        bundle_imported: false,
+        last_error_code: Some(code.into()),
+        last_error_detail: Some(detail),
+    }
+}
+
+fn classify_cloudflare_error(error: &anyhow::Error) -> (&'static str, String) {
+    let detail = error.to_string();
+    let lower = detail.to_lowercase();
+    if lower.contains("not_a_profile_directory") || lower.contains("profile.json not found") {
+        ("not_a_profile_directory", detail)
+    } else if lower.contains("workspace root") || lower.contains("service root") || lower.contains("cloudflare service root not found") {
+        ("workspace_not_found", detail)
+    } else if lower.contains("wrangler is not available") {
+        ("wrangler_missing", detail)
+    } else if lower.contains("local identity is not initialized") {
+        ("identity_not_ready", detail)
+    } else if lower.contains("runtime metadata is not bound") {
+        ("runtime_not_bound", detail)
+    } else if lower.contains("runtime_not_ready_in_time")
+        || lower.contains("runtime did not become ready in time")
+    {
+        ("runtime_not_ready_in_time", detail)
+    } else if lower.contains("bootstrap failed") {
+        ("bootstrap_failed", detail)
+    } else if lower.contains("importdeploymentbundle")
+        || lower.contains("import deployment bundle")
+        || lower.contains("deployment bundle")
+    {
+        ("bundle_import_failed", detail)
+    } else {
+        ("deploy_failed", detail)
+    }
+}
+
 fn map_cloudflare_preflight(
     profile: &Profile,
     deployment_bundle_present: bool,
@@ -1466,7 +1835,11 @@ fn load_driver(profile: &Profile) -> Result<CoreDriver> {
         .deployment
         .as_ref()
         .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone());
-    CoreDriver::from_snapshot(snapshot, base_url)
+    let contact_share_url = profile
+        .load_runtime_metadata()
+        .ok()
+        .and_then(|runtime| build_contact_share_url_from_snapshot(&snapshot, &runtime).ok());
+    CoreDriver::from_snapshot(snapshot, base_url, contact_share_url)
 }
 
 fn persist_driver(profile: &mut Profile, driver: &CoreDriver) -> Result<()> {
@@ -1516,15 +1889,21 @@ async fn run_identity_command(
     })
 }
 
-async fn provision_cloudflare_profile(
+async fn provision_cloudflare_profile_with_progress<F>(
     profile: &mut Profile,
     driver: &mut CoreDriver,
     user_id: &str,
     device_id: &str,
     service_root: &Path,
     config: ResolvedCloudflareDeployConfig,
-) -> Result<ProvisionProgressView> {
+    mut update: F,
+) -> Result<ProvisionedCloudflareState>
+where
+    F: FnMut(&str, Option<&crate::cli::runtime::CloudflareDeploymentResult>),
+{
+    update("deploying", None);
     let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
+    update("bootstrapping", Some(&deployment));
     crate::cli::runtime::wait_until_ready(&deployment.effective_public_base_url).await?;
     let bundle = bootstrap_device_bundle(
         &deployment.effective_public_base_url,
@@ -1533,6 +1912,7 @@ async fn provision_cloudflare_profile(
         device_id,
     )
     .await?;
+    update("importing_bundle", Some(&deployment));
     driver
         .run_command_until_idle(CoreCommand::ImportDeploymentBundle {
             bundle: bundle.clone(),
@@ -1563,12 +1943,38 @@ async fn provision_cloudflare_profile(
     let identity = identity_summary_from_profile(profile)?
         .ok_or_else(|| anyhow!("local identity is not available after provision"))?;
     let runtime = runtime_status_from_profile(profile)?;
-    Ok(ProvisionProgressView {
-        provisioned: true,
-        mode: "cloudflare".into(),
-        runtime,
-        identity,
+    Ok(ProvisionedCloudflareState {
+        progress: ProvisionProgressView {
+            provisioned: true,
+            mode: "cloudflare".into(),
+            runtime,
+            identity,
+        },
+        deployment,
     })
+}
+
+async fn provision_cloudflare_profile(
+    profile: &mut Profile,
+    driver: &mut CoreDriver,
+    user_id: &str,
+    device_id: &str,
+    service_root: &Path,
+    config: ResolvedCloudflareDeployConfig,
+) -> Result<ProvisionProgressView> {
+    Ok(
+        provision_cloudflare_profile_with_progress(
+            profile,
+            driver,
+            user_id,
+            device_id,
+            service_root,
+            config,
+            |_, _| {},
+        )
+        .await?
+        .progress,
+    )
 }
 
 async fn provision_cloudflare_action(
@@ -1650,11 +2056,101 @@ fn map_contact_devices(devices: Vec<ContactDeviceSnapshot>) -> Vec<ContactDevice
         .collect()
 }
 
+async fn list_message_requests_from_driver(
+    driver: &mut CoreDriver,
+) -> Result<Vec<MessageRequestItem>> {
+    let output = driver
+        .run_command_until_idle(CoreCommand::ListMessageRequests)
+        .await?;
+    Ok(message_requests_from_output(&output)?.clone())
+}
+
+async fn fetch_identity_bundle_from_url(url: &str) -> Result<IdentityBundle> {
+    let response = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("fetch contact share link {url}"))?;
+    let status = response.status();
+    let body = response.text().await.context("read contact share response body")?;
+    if !status.is_success() {
+        return Err(anyhow!("contact share link fetch failed with status {status}: {body}"));
+    }
+    let normalized = to_snake_case_json_string(&body).context("normalize contact share json")?;
+    let bundle: IdentityBundle =
+        serde_json::from_str(&normalized).context("decode contact share bundle")?;
+    bundle.validate().map_err(|error| anyhow!(error.to_string()))?;
+    IdentityManager::verify_identity_bundle(&bundle)
+        .map_err(|error| anyhow!(error.to_string()))?;
+    Ok(bundle)
+}
+
+fn build_contact_share_url(profile: &Profile, bundle: &IdentityBundle) -> Result<String> {
+    let runtime = profile.load_runtime_metadata()?;
+    build_contact_share_url_from_runtime(bundle, &runtime)
+}
+
+fn contact_bundle_share_url(profile: &Profile, bundle: &IdentityBundle) -> Option<String> {
+    build_contact_share_url(profile, bundle).ok()
+}
+
+fn build_contact_share_url_from_snapshot(
+    snapshot: &crate::persistence::CorePersistenceSnapshot,
+    runtime: &RuntimeMetadata,
+) -> Result<String> {
+    let bundle = snapshot
+        .deployment
+        .as_ref()
+        .and_then(|deployment| deployment.local_bundle.as_ref())
+        .ok_or_else(|| anyhow!("local identity bundle is not available"))?;
+    build_contact_share_url_from_runtime(bundle, runtime)
+}
+
+fn build_contact_share_url_from_runtime(
+    bundle: &IdentityBundle,
+    runtime: &RuntimeMetadata,
+) -> Result<String> {
+    let base_url = runtime
+        .public_base_url
+        .clone()
+        .or(runtime.base_url.clone())
+        .ok_or_else(|| anyhow!("runtime public base url is not recorded"))?;
+    let secret = runtime
+        .sharing_secret
+        .clone()
+        .ok_or_else(|| anyhow!("runtime sharing secret is not recorded"))?;
+    let share_id = bundle
+        .bundle_share_id
+        .clone()
+        .ok_or_else(|| anyhow!("bundle share id is not recorded"))?;
+    let token = sign_hmac_token(
+        &secret,
+        &contact_share_token_payload(&bundle.user_id, &share_id),
+    )?;
+    Ok(format!(
+        "{}/v1/contact-share/{}",
+        base_url.trim_end_matches('/'),
+        token
+    ))
+}
+
+fn contact_share_token_payload(user_id: &str, share_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": crate::model::CURRENT_MODEL_VERSION,
+        "service": "contact_share",
+        "userId": user_id,
+        "shareId": share_id,
+    })
+}
+
 fn map_message_request(item: MessageRequestItem) -> MessageRequestItemView {
     MessageRequestItemView {
         request_id: item.request_id,
         recipient_device_id: item.recipient_device_id,
         sender_user_id: item.sender_user_id,
+        sender_bundle_share_url: item.sender_bundle_share_url,
+        sender_bundle_hash: item.sender_bundle_hash,
+        sender_display_name: item.sender_display_name,
         first_seen_at: item.first_seen_at,
         last_seen_at: item.last_seen_at,
         message_count: item.message_count,
@@ -1672,6 +2168,7 @@ fn map_message_request_action(
         sender_user_id: summary.sender_user_id.clone(),
         promoted_count: summary.promoted_count,
         action: format!("{:?}", summary.action).to_lowercase(),
+        sender_bundle_share_url: None,
     }
 }
 
@@ -2052,7 +2549,9 @@ pub fn map_realtime_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn onboarding_step_transitions_match_expected_order() {
@@ -2088,5 +2587,32 @@ mod tests {
             ),
             "complete"
         );
+    }
+
+    #[test]
+    fn contact_share_token_payload_uses_cloudflare_field_names() {
+        let payload = contact_share_token_payload("user:alice", "share-123");
+        assert_eq!(payload["service"], "contact_share");
+        assert_eq!(payload["userId"], "user:alice");
+        assert_eq!(payload["shareId"], "share-123");
+        assert!(payload.get("user_id").is_none());
+        assert!(payload.get("share_id").is_none());
+    }
+
+    #[test]
+    fn contact_share_token_encodes_cloudflare_payload_shape() {
+        let token = sign_hmac_token(
+            "secret",
+            &contact_share_token_payload("user:alice", "share-123"),
+        )
+        .expect("token should be signed");
+        let payload = token.split('.').next().expect("payload segment");
+        let decoded = URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("payload should decode");
+        let value: Value = serde_json::from_slice(&decoded).expect("payload should be valid json");
+        assert_eq!(value["service"], "contact_share");
+        assert_eq!(value["userId"], "user:alice");
+        assert_eq!(value["shareId"], "share-123");
     }
 }

@@ -12,12 +12,25 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "TapChat Desktop",
-        "width": 1360,
-        "height": 920,
+        "width": 1180,
+        "height": 780,
         "minWidth": 980,
-        "minHeight": 760,
-        "resizable": true
+        "minHeight": 700,
+        "resizable": true,
+        "visible": true
+      },
+      {
+        "label": "onboarding",
+        "title": "TapChat Setup",
+        "width": 760,
+        "height": 640,
+        "minWidth": 680,
+        "minHeight": 560,
+        "resizable": true,
+        "visible": false,
+        "center": true
       }
     ],
     "security": {

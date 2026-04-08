@@ -4779,6 +4779,7 @@ fn merge_identity_bundles(
         &local_identity,
         &deployment,
         devices,
+        None,
     )?)
 }
 
@@ -4902,6 +4903,9 @@ fn append_runtime_control_message(
         let request = AppendEnvelopeRequest {
             version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
             recipient_device_id: recipient_device_id.to_string(),
+            sender_bundle_share_url: None,
+            sender_bundle_hash: None,
+            sender_display_name: None,
             envelope: Envelope {
                 version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
                 message_id: format!(

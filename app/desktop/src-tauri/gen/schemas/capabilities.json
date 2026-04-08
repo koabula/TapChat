@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default desktop capability","local":true,"windows":["main"],"permissions":["core:default","dialog:default","notification:default"]}}
+{"default":{"identifier":"default","description":"Default desktop capability","local":true,"windows":["main","onboarding"],"permissions":["core:default","dialog:default","notification:default"]}}

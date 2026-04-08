@@ -7,7 +7,7 @@ import {
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization
 } from "../auth/capability";
-import { signSharingPayload } from "../storage/sharing";
+import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
 import { SharedStateService } from "../storage/shared-state";
 import { StorageService } from "../storage/service";
 import {
@@ -183,6 +183,27 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   try {
     if (request.method === "GET" && url.pathname === "/v1/deployment-bundle") {
       return jsonResponse(publicDeploymentBundle(request, env));
+    }
+
+    const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
+    if (contactShareMatch && request.method === "GET") {
+      type ContactSharePayload = {
+        version?: string;
+        service?: string;
+        userId?: string;
+        shareId?: string;
+        expiresAt?: number;
+      };
+      const token = decodeURIComponent(contactShareMatch[1]);
+      const payload = await verifySharingPayload<ContactSharePayload>(sharedStateSecret(env), token, now);
+      if (payload.service !== "contact_share" || !payload.userId || !payload.shareId) {
+        throw new HttpError(403, "invalid_capability", "invalid contact share token");
+      }
+      const bundle = await sharedState.getIdentityBundle(payload.userId);
+      if (!bundle || bundle.bundleShareId !== payload.shareId) {
+        return jsonResponse({ error: "not_found", message: "contact share not found" }, 404);
+      }
+      return jsonResponse(bundle);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/bootstrap/device") {

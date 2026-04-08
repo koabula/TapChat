@@ -8,6 +8,12 @@ pub struct AppendEnvelopeRequest {
     pub version: String,
     pub recipient_device_id: String,
     pub envelope: Envelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_share_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +146,12 @@ pub struct MessageRequestItem {
     pub request_id: String,
     pub recipient_device_id: String,
     pub sender_user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_share_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
     pub first_seen_at: u64,
     pub last_seen_at: u64,
     pub message_count: u64,
@@ -184,6 +196,12 @@ pub struct MessageRequestActionResult {
     pub sender_user_id: String,
     pub promoted_count: u64,
     pub action: MessageRequestAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_share_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_bundle_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,6 +296,9 @@ mod tests {
                     value: "proof".into(),
                 },
             },
+            sender_bundle_share_url: None,
+            sender_bundle_hash: None,
+            sender_display_name: None,
         };
         let json = serde_json::to_string(&append).expect("serialize");
         assert!(!json.contains("cloudflare"));

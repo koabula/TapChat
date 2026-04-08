@@ -60,6 +60,17 @@ export type CloudflareActionResultView = {
   runtime: CloudflareRuntimeDetailsView;
 };
 
+export type CloudflareWizardStatusView = {
+  state: string;
+  message: string;
+  blocking_error?: string | null;
+  deploy_url?: string | null;
+  worker_name?: string | null;
+  bundle_imported: boolean;
+  last_error_code?: string | null;
+  last_error_detail?: string | null;
+};
+
 export type BannerView = {
   severity: string;
   message: string;
@@ -115,14 +126,24 @@ export type ContactListItem = {
 export type ContactDetailView = {
   user_id: string;
   devices: ContactDeviceView[];
+  bundle_share_url?: string | null;
   identity_bundle_ref?: string | null;
   last_refresh_error?: string | null;
+};
+
+export type ContactShareLinkView = {
+  profile_path: string;
+  user_id: string;
+  url: string;
 };
 
 export type MessageRequestItemView = {
   request_id: string;
   recipient_device_id: string;
   sender_user_id: string;
+  sender_bundle_share_url?: string | null;
+  sender_bundle_hash?: string | null;
+  sender_display_name?: string | null;
   first_seen_at: number;
   last_seen_at: number;
   message_count: number;
@@ -136,6 +157,7 @@ export type MessageRequestActionView = {
   sender_user_id: string;
   promoted_count: number;
   action: string;
+  sender_bundle_share_url?: string | null;
 };
 
 export type AllowlistView = {

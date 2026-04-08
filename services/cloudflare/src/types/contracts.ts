@@ -68,6 +68,9 @@ export interface AppendEnvelopeRequest {
   version: string;
   recipientDeviceId: string;
   envelope: Envelope;
+  senderBundleShareUrl?: string;
+  senderBundleHash?: string;
+  senderDisplayName?: string;
 }
 
 export interface AppendEnvelopeResult {
@@ -215,6 +218,7 @@ export interface IdentityBundle {
   userId: string;
   userPublicKey: string;
   devices: DeviceContactProfile[];
+  bundleShareId?: string;
   identityBundleRef?: string;
   deviceStatusRef?: string;
   storageProfile?: StorageProfile;
@@ -324,6 +328,9 @@ export interface MessageRequestItem {
   requestId: string;
   recipientDeviceId: string;
   senderUserId: string;
+  senderBundleShareUrl?: string;
+  senderBundleHash?: string;
+  senderDisplayName?: string;
   firstSeenAt: number;
   lastSeenAt: number;
   messageCount: number;
@@ -339,6 +346,10 @@ export interface MessageRequestActionResult {
   accepted: boolean;
   requestId: string;
   senderUserId: string;
+  senderBundleShareUrl?: string;
+  senderBundleHash?: string;
+  senderDisplayName?: string;
   promotedCount?: number;
 }
+
 

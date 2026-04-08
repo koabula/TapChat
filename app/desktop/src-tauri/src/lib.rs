@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::webview::WebviewWindowBuilder;
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
 use tapchat_core::cli::runtime::CloudflareDeployOverrides;
@@ -38,6 +39,12 @@ struct BackgroundDownloadTask {
 struct BackgroundDownloadManager {
     active: Mutex<HashMap<String, BackgroundDownloadTask>>,
     last_error: Mutex<Option<String>>,
+}
+
+#[derive(Default)]
+struct CloudflareWizardManager {
+    statuses: Mutex<HashMap<String, desktop_app::CloudflareWizardStatusView>>,
+    generations: Mutex<HashMap<String, u64>>,
 }
 
 fn into_string_error(error: anyhow::Error) -> String {
@@ -76,6 +83,57 @@ fn set_last_background_error(manager: &BackgroundDownloadManager, error: Option<
     }
 }
 
+fn bump_wizard_generation(manager: &CloudflareWizardManager, profile_path: &str) -> u64 {
+    let mut generations = manager.generations.lock().expect("wizard generations lock poisoned");
+    let next = generations.get(profile_path).copied().unwrap_or_default().saturating_add(1);
+    generations.insert(profile_path.to_string(), next);
+    next
+}
+
+fn wizard_generation_matches(
+    manager: &CloudflareWizardManager,
+    profile_path: &str,
+    generation: u64,
+) -> bool {
+    manager
+        .generations
+        .lock()
+        .ok()
+        .and_then(|generations| generations.get(profile_path).copied())
+        .is_some_and(|current| current == generation)
+}
+
+fn set_wizard_status(
+    manager: &CloudflareWizardManager,
+    profile_path: &str,
+    status: desktop_app::CloudflareWizardStatusView,
+) {
+    if let Ok(mut statuses) = manager.statuses.lock() {
+        statuses.insert(profile_path.to_string(), status);
+    }
+}
+
+fn wizard_status_for(
+    manager: &CloudflareWizardManager,
+    profile_path: &str,
+) -> desktop_app::CloudflareWizardStatusView {
+    manager
+        .statuses
+        .lock()
+        .ok()
+        .and_then(|statuses| statuses.get(profile_path).cloned())
+        .unwrap_or(desktop_app::CloudflareWizardStatusView {
+            state: "idle".into(),
+            message: "Ready to set up Cloudflare transport.".into(),
+            blocking_error: None,
+            deploy_url: None,
+            worker_name: None,
+            bundle_imported: false,
+            last_error_code: None,
+            last_error_detail: None,
+        })
+}
+
 fn update_tray_tooltip(app: &AppHandle, active_profile: Option<&str>) {
     let Some(tray) = app.tray_by_id("tapchat-tray") else {
         return;
@@ -97,6 +155,54 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn ensure_onboarding_window(app: &AppHandle) -> tauri::Result<()> {
+    if app.get_webview_window("onboarding").is_some() {
+        return Ok(());
+    }
+    let builder = WebviewWindowBuilder::new(app, "onboarding", WebviewUrl::default())
+        .title("TapChat Setup")
+        .inner_size(760.0, 640.0)
+        .min_inner_size(680.0, 560.0)
+        .center()
+        .visible(false)
+        .resizable(true);
+    let _ = builder.build()?;
+    Ok(())
+}
+
+fn sync_window_visibility_from_bootstrap(app: &AppHandle) -> tauri::Result<String> {
+    let bootstrap = desktop_app::app_bootstrap()
+        .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error.to_string())))?;
+    let onboarding_complete = bootstrap.onboarding.step == "complete";
+    let main = app.get_webview_window("main");
+
+    if onboarding_complete {
+        if let Some(onboarding) = app.get_webview_window("onboarding") {
+            let _ = onboarding.hide();
+        }
+        if let Some(main) = main {
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+        if let Some(profile) = bootstrap.active_profile.as_ref() {
+            let profile_path = profile.path.to_string_lossy().to_string();
+            update_tray_tooltip(app, Some(&profile_path));
+        }
+        return Ok(String::from("main"));
+    }
+
+    if let Some(main) = main {
+        let _ = main.hide();
+    }
+    ensure_onboarding_window(app)?;
+    if let Some(onboarding) = app.get_webview_window("onboarding") {
+        let _ = onboarding.show();
+        let _ = onboarding.set_focus();
+    }
+    update_tray_tooltip(app, bootstrap.active_profile.as_ref().map(|profile| profile.path.to_string_lossy()).as_deref());
+    Ok(String::from("onboarding"))
 }
 
 fn notify_attachment_event(
@@ -240,6 +346,11 @@ fn app_bootstrap() -> Result<desktop_app::AppBootstrapView, String> {
 }
 
 #[tauri::command]
+fn sync_window_visibility(app: AppHandle) -> Result<String, String> {
+    sync_window_visibility_from_bootstrap(&app).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn profile_list() -> Result<Vec<desktop_app::ProfileSummary>, String> {
     desktop_app::profile_list().map_err(into_string_error)
 }
@@ -260,6 +371,45 @@ fn profile_activate(
 #[tauri::command]
 fn profile_create(name: String, root: String) -> Result<desktop_app::ProfileSummary, String> {
     desktop_app::profile_create(&name, root).map_err(into_string_error)
+}
+
+#[tauri::command]
+fn profile_open_or_import(root_dir: String) -> Result<desktop_app::ProfileSummary, String> {
+    desktop_app::profile_open_or_import(root_dir).map_err(into_string_error)
+}
+
+#[tauri::command]
+fn profile_reveal_in_shell(profile_path: String) -> Result<bool, String> {
+    let path = std::path::PathBuf::from(profile_path);
+    if !path.exists() {
+        return Err("profile path does not exist".into());
+    }
+    open::that_detached(path).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn show_onboarding_window(app: AppHandle) -> Result<String, String> {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    ensure_onboarding_window(&app).map_err(|error| error.to_string())?;
+    if let Some(onboarding) = app.get_webview_window("onboarding") {
+        let _ = onboarding.show();
+        let _ = onboarding.set_focus();
+    }
+    Ok(String::from("onboarding"))
+}
+
+#[tauri::command]
+fn complete_onboarding_handoff(app: AppHandle) -> Result<desktop_app::AppBootstrapView, String> {
+    let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
+    if bootstrap.onboarding.step != "complete" {
+        return Err(String::from("onboarding is not complete"));
+    }
+    sync_window_visibility_from_bootstrap(&app).map_err(|error| error.to_string())?;
+    let _ = app.emit("tapchat://bootstrap-dirty", &bootstrap);
+    Ok(bootstrap)
 }
 
 #[tauri::command]
@@ -357,6 +507,85 @@ fn cloudflare_detach(
 }
 
 #[tauri::command]
+fn cloudflare_setup_wizard_status(
+    profile_path: String,
+    manager: State<'_, CloudflareWizardManager>,
+) -> Result<desktop_app::CloudflareWizardStatusView, String> {
+    Ok(wizard_status_for(&manager, &profile_path))
+}
+
+#[tauri::command]
+fn cloudflare_setup_wizard_cancel(
+    profile_path: String,
+    manager: State<'_, CloudflareWizardManager>,
+) -> Result<desktop_app::CloudflareWizardStatusView, String> {
+    let _ = bump_wizard_generation(&manager, &profile_path);
+    let status = desktop_app::CloudflareWizardStatusView {
+        state: "idle".into(),
+        message: "Cloudflare setup canceled.".into(),
+        blocking_error: None,
+        deploy_url: None,
+        worker_name: None,
+        bundle_imported: false,
+        last_error_code: None,
+        last_error_detail: None,
+    };
+    set_wizard_status(&manager, &profile_path, status.clone());
+    Ok(status)
+}
+
+#[tauri::command]
+fn cloudflare_setup_wizard_start(
+    profile_path: String,
+    mode: String,
+    overrides: Option<CloudflareDeployOverrides>,
+    app: AppHandle,
+    manager: State<'_, CloudflareWizardManager>,
+) -> Result<desktop_app::CloudflareWizardStatusView, String> {
+    let generation = bump_wizard_generation(&manager, &profile_path);
+    let initial = desktop_app::CloudflareWizardStatusView {
+        state: "preflight".into(),
+        message: "Checking Cloudflare workspace and profile readiness.".into(),
+        blocking_error: None,
+        deploy_url: None,
+        worker_name: None,
+        bundle_imported: false,
+        last_error_code: None,
+        last_error_detail: None,
+    };
+    set_wizard_status(&manager, &profile_path, initial.clone());
+
+    let app_for_task = app.clone();
+    let profile_for_task = profile_path.clone();
+    let mode_for_task = mode.clone();
+    let overrides_for_task = overrides.clone();
+    tauri::async_runtime::spawn(async move {
+        let manager = app_for_task.state::<CloudflareWizardManager>();
+        let result = desktop_app::cloudflare_setup_wizard_execute(
+            &profile_for_task,
+            &mode_for_task,
+            overrides_for_task,
+            |status| {
+                if wizard_generation_matches(&manager, &profile_for_task, generation) {
+                    set_wizard_status(&manager, &profile_for_task, status.clone());
+                    let _ = app_for_task.emit("tapchat://cloudflare-wizard", &status);
+                }
+            },
+        )
+        .await;
+
+        if wizard_generation_matches(&manager, &profile_for_task, generation) {
+            if let Ok(status) = result {
+                set_wizard_status(&manager, &profile_for_task, status);
+                let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+            }
+        }
+    });
+
+    Ok(initial)
+}
+
+#[tauri::command]
 fn contact_list(profile_path: String) -> Result<Vec<desktop_app::ContactListItem>, String> {
     desktop_app::contact_list(profile_path).map_err(into_string_error)
 }
@@ -367,6 +596,34 @@ async fn contact_import_identity(
     bundle_json_or_path: String,
 ) -> Result<desktop_app::ContactDetailView, String> {
     desktop_app::contact_import_identity(profile_path, &bundle_json_or_path)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn contact_import_share_link(
+    profile_path: String,
+    url: String,
+) -> Result<desktop_app::ContactDetailView, String> {
+    desktop_app::contact_import_share_link(profile_path, &url)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn contact_share_link_get(
+    profile_path: String,
+) -> Result<desktop_app::ContactShareLinkView, String> {
+    desktop_app::contact_share_link_get(profile_path)
+        .await
+        .map_err(into_string_error)
+}
+
+#[tauri::command]
+async fn contact_share_link_rotate(
+    profile_path: String,
+) -> Result<desktop_app::ContactShareLinkView, String> {
+    desktop_app::contact_share_link_rotate(profile_path)
         .await
         .map_err(into_string_error)
 }
@@ -734,6 +991,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(RealtimeManager::default())
         .manage(BackgroundDownloadManager::default())
+        .manage(CloudflareWizardManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
@@ -744,30 +1002,26 @@ pub fn run() {
                 .tooltip("TapChat Desktop")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
+                    "show" => {
+                        let _ = sync_window_visibility_from_bootstrap(app);
+                        show_main_window(app);
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
-
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-            }
-
-            if let Ok(bootstrap) = desktop_app::app_bootstrap() {
-                if bootstrap.onboarding.step == "complete" {
+            let routed = sync_window_visibility_from_bootstrap(app.handle()).ok();
+            if routed.as_deref() == Some("main") {
+                if let Ok(bootstrap) = desktop_app::app_bootstrap() {
                     if let Some(profile) = bootstrap.active_profile.as_ref() {
                         let profile_path = profile.path.to_string_lossy().to_string();
                         if desktop_app::app_background_mode(&profile_path).unwrap_or(true)
                             && desktop_app::attachment_transfers(&profile_path, None)
-                                .map(|transfers| {
-                                    transfers.iter().any(|transfer| transfer.task_kind == "download")
-                                })
+                                .map(|transfers| transfers.iter().any(|transfer| transfer.task_kind == "download"))
                                 .unwrap_or(false)
                         {
                             spawn_resume_pending_downloads(app.handle().clone(), profile_path.clone());
                         }
-                        update_tray_tooltip(app.handle(), Some(&profile_path));
                     }
                 }
             }
@@ -775,15 +1029,29 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else if window.label() == "onboarding" {
+                    let onboarding_complete = desktop_app::app_bootstrap()
+                        .map(|bootstrap| bootstrap.onboarding.step == "complete")
+                        .unwrap_or(false);
+                    if !onboarding_complete {
+                        window.app_handle().exit(0);
+                    }
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
             app_bootstrap,
+            sync_window_visibility,
             profile_list,
             profile_activate,
             profile_create,
+            profile_open_or_import,
+            profile_reveal_in_shell,
+            show_onboarding_window,
+            complete_onboarding_handoff,
             identity_create,
             identity_recover,
             deployment_import,
@@ -795,8 +1063,14 @@ pub fn run() {
             cloudflare_redeploy,
             cloudflare_rotate_secrets,
             cloudflare_detach,
+            cloudflare_setup_wizard_start,
+            cloudflare_setup_wizard_status,
+            cloudflare_setup_wizard_cancel,
             contact_list,
             contact_import_identity,
+            contact_import_share_link,
+            contact_share_link_get,
+            contact_share_link_rotate,
             contact_show,
             message_requests_list,
             message_request_accept,

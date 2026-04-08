@@ -38,6 +38,9 @@ interface MessageRequestEntry {
   requestId: string;
   recipientDeviceId: string;
   senderUserId: string;
+  senderBundleShareUrl?: string;
+  senderBundleHash?: string;
+  senderDisplayName?: string;
   firstSeenAt: number;
   lastSeenAt: number;
   messageCount: number;
@@ -231,6 +234,9 @@ export class InboxService {
       accepted: true,
       requestId: entry.requestId,
       senderUserId: entry.senderUserId,
+      senderBundleShareUrl: entry.senderBundleShareUrl,
+      senderBundleHash: entry.senderBundleHash,
+      senderDisplayName: entry.senderDisplayName,
       promotedCount
     };
   }
@@ -251,6 +257,9 @@ export class InboxService {
       accepted: true,
       requestId: entry.requestId,
       senderUserId: entry.senderUserId,
+      senderBundleShareUrl: entry.senderBundleShareUrl,
+      senderBundleHash: entry.senderBundleHash,
+      senderDisplayName: entry.senderDisplayName,
       promotedCount: 0
     };
   }
@@ -350,6 +359,9 @@ export class InboxService {
       requestId,
       recipientDeviceId: this.deviceId,
       senderUserId,
+      senderBundleShareUrl: input.senderBundleShareUrl,
+      senderBundleHash: input.senderBundleHash,
+      senderDisplayName: input.senderDisplayName,
       firstSeenAt: now,
       lastSeenAt: now,
       messageCount: 0,
@@ -357,6 +369,9 @@ export class InboxService {
       lastConversationId: input.envelope.conversationId,
       pendingRequests: []
     };
+    entry.senderBundleShareUrl ??= input.senderBundleShareUrl;
+    entry.senderBundleHash ??= input.senderBundleHash;
+    entry.senderDisplayName ??= input.senderDisplayName;
     entry.lastSeenAt = now;
     entry.messageCount += 1;
     entry.lastMessageId = input.envelope.messageId;
@@ -479,6 +494,9 @@ export class InboxService {
       requestId: entry.requestId,
       recipientDeviceId: entry.recipientDeviceId,
       senderUserId: entry.senderUserId,
+      senderBundleShareUrl: entry.senderBundleShareUrl,
+      senderBundleHash: entry.senderBundleHash,
+      senderDisplayName: entry.senderDisplayName,
       firstSeenAt: entry.firstSeenAt,
       lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
@@ -487,6 +505,7 @@ export class InboxService {
     };
   }
 }
+
 
 
 

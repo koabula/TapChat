@@ -563,6 +563,7 @@ mod tests {
                     user_id: "user:bob".into(),
                     user_public_key: "pub".into(),
                     devices: vec![],
+                    bundle_share_id: Some("share-bob".into()),
                     identity_bundle_ref: Some("ref:identity-bob".into()),
                     device_status_ref: None,
                     storage_profile: None,
@@ -758,6 +759,7 @@ mod tests {
                     user_id: "user:alice".into(),
                     user_public_key: "pub".into(),
                     devices: vec![sample_contact_device("user:alice", "device:alice:phone")],
+                    bundle_share_id: Some("share-alice".into()),
                     identity_bundle_ref: Some("ref:identity-local".into()),
                     device_status_ref: Some("ref:device-status-local".into()),
                     storage_profile: Some(crate::model::StorageProfile {
@@ -777,6 +779,7 @@ mod tests {
                     user_id: "user:bob".into(),
                     user_public_key: "pub-bob".into(),
                     devices: vec![sample_contact_device("user:bob", "device:bob:phone")],
+                    bundle_share_id: Some("share-bob".into()),
                     identity_bundle_ref: Some("ref:identity-bob".into()),
                     device_status_ref: Some("ref:device-status-bob".into()),
                     storage_profile: Some(crate::model::StorageProfile {

@@ -7,8 +7,10 @@ import type {
   CloudflarePreflightView,
   CloudflareDeployOverrides,
   CloudflareRuntimeDetailsView,
+  CloudflareWizardStatusView,
   ContactDetailView,
   ContactListItem,
+  ContactShareLinkView,
   ConversationDetailView,
   BackgroundDownloadTicketView,
   BatchSendAttachmentResultView,
@@ -29,6 +31,10 @@ export function appBootstrap() {
   return invoke<AppBootstrapView>("app_bootstrap");
 }
 
+export function syncWindowVisibility() {
+  return invoke<string>("sync_window_visibility");
+}
+
 export function profileList() {
   return invoke<ProfileSummary[]>("profile_list");
 }
@@ -39,6 +45,22 @@ export function profileActivate(profileIdOrPath: string) {
 
 export function profileCreate(name: string, root: string) {
   return invoke<ProfileSummary>("profile_create", { name, root });
+}
+
+export function profileOpenOrImport(rootDir: string) {
+  return invoke<ProfileSummary>("profile_open_or_import", { rootDir });
+}
+
+export function profileRevealInShell(profilePath: string) {
+  return invoke<boolean>("profile_reveal_in_shell", { profilePath });
+}
+
+export function showOnboardingWindow() {
+  return invoke<string>("show_onboarding_window");
+}
+
+export function completeOnboardingHandoff() {
+  return invoke<AppBootstrapView>("complete_onboarding_handoff");
 }
 
 export function identityCreate(profilePath: string, deviceName: string) {
@@ -98,6 +120,26 @@ export function cloudflareDetach(profilePath: string) {
   return invoke<CloudflareActionResultView>("cloudflare_detach", { profilePath });
 }
 
+export function cloudflareSetupWizardStart(
+  profilePath: string,
+  mode: "auto" | "custom",
+  overrides?: CloudflareDeployOverrides | null,
+) {
+  return invoke<CloudflareWizardStatusView>("cloudflare_setup_wizard_start", {
+    profilePath,
+    mode,
+    overrides,
+  });
+}
+
+export function cloudflareSetupWizardStatus(profilePath: string) {
+  return invoke<CloudflareWizardStatusView>("cloudflare_setup_wizard_status", { profilePath });
+}
+
+export function cloudflareSetupWizardCancel(profilePath: string) {
+  return invoke<CloudflareWizardStatusView>("cloudflare_setup_wizard_cancel", { profilePath });
+}
+
 export function contactList(profilePath: string) {
   return invoke<ContactListItem[]>("contact_list", { profilePath });
 }
@@ -107,6 +149,21 @@ export function contactImportIdentity(profilePath: string, bundleJsonOrPath: str
     profilePath,
     bundleJsonOrPath,
   });
+}
+
+export function contactImportShareLink(profilePath: string, url: string) {
+  return invoke<ContactDetailView>("contact_import_share_link", {
+    profilePath,
+    url,
+  });
+}
+
+export function contactShareLinkGet(profilePath: string) {
+  return invoke<ContactShareLinkView>("contact_share_link_get", { profilePath });
+}
+
+export function contactShareLinkRotate(profilePath: string) {
+  return invoke<ContactShareLinkView>("contact_share_link_rotate", { profilePath });
 }
 
 export function contactShow(profilePath: string, userId: string) {

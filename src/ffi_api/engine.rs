@@ -491,6 +491,7 @@ impl CoreEngine {
                 target_device_id,
                 status,
             } => self.update_local_device_status(target_device_id, status),
+            CoreCommand::RotateContactShareLink => self.rotate_contact_share_link(),
             CoreCommand::RebuildConversation { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
             }
@@ -2050,6 +2051,11 @@ impl CoreEngine {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let bundle_share_id = self
+            .state
+            .local_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.bundle_share_id.clone());
         devices.push(
             crate::capability::CapabilityManager::build_device_contact_profile(
                 &signing_identity,
@@ -2063,6 +2069,91 @@ impl CoreEngine {
             &signing_identity,
             deployment,
             devices,
+            bundle_share_id,
+        )?;
+        self.state.local_bundle = Some(bundle);
+        Ok(())
+    }
+
+    fn rotate_contact_share_link(&mut self) -> CoreResult<CoreOutput> {
+        let updated_at = self
+            .state
+            .local_bundle
+            .as_ref()
+            .map(|bundle| bundle.updated_at.saturating_add(1))
+            .unwrap_or_else(|| {
+                self.state
+                    .local_identity
+                    .as_ref()
+                    .map(|identity| identity.device_status.updated_at.saturating_add(1))
+                    .unwrap_or(1)
+            });
+        self.refresh_local_bundle_with_share_id(updated_at, None)?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveDeployment],
+            )],
+            view_model: Some(CoreViewModel {
+                banners: vec![SystemBanner {
+                    status: SystemStatus::SyncInProgress,
+                    message: "contact link rotated".into(),
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn refresh_local_bundle_with_share_id(
+        &mut self,
+        updated_at: u64,
+        bundle_share_id: Option<String>,
+    ) -> CoreResult<()> {
+        let Some(local_identity) = self.state.local_identity.as_ref() else {
+            return Ok(());
+        };
+        let Some(deployment) = self.state.deployment_bundle.as_ref() else {
+            self.state.local_bundle = None;
+            return Ok(());
+        };
+        let package = self
+            .state
+            .published_key_package
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("published key package missing"))?;
+        let mut signing_identity = local_identity.clone();
+        signing_identity.device_status.updated_at = updated_at;
+        let mut devices = self
+            .state
+            .local_bundle
+            .as_ref()
+            .map(|bundle| {
+                bundle
+                    .devices
+                    .iter()
+                    .filter(|device| device.device_id != local_identity.device_identity.device_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        devices.push(
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &signing_identity,
+                deployment,
+                package.key_package_ref.clone(),
+                package.expires_at,
+            )?,
+        );
+        devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        let bundle = IdentityManager::export_identity_bundle_with_devices(
+            &signing_identity,
+            deployment,
+            devices,
+            bundle_share_id,
         )?;
         self.state.local_bundle = Some(bundle);
         Ok(())
@@ -2645,6 +2736,9 @@ impl CoreEngine {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             recipient_device_id: item.envelope.recipient_device_id.clone(),
             envelope: item.envelope.clone(),
+            sender_bundle_share_url: None,
+            sender_bundle_hash: None,
+            sender_display_name: None,
         };
         let mut headers = BTreeMap::new();
         headers.insert(
