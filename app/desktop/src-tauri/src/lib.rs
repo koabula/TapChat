@@ -1447,11 +1447,13 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else if window.label() == "onboarding" {
+                    // Don't close the onboarding window if it's in the middle of setup
                     let onboarding_complete = desktop_app::app_bootstrap()
                         .map(|bootstrap| bootstrap.onboarding.step == "complete")
                         .unwrap_or(false);
                     if !onboarding_complete {
-                        window.app_handle().exit(0);
+                        // Prevent closing if onboarding is not complete
+                        api.prevent_close();
                     }
                 }
             }
