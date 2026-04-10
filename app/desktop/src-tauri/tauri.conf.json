@@ -20,17 +20,6 @@
         "minHeight": 700,
         "resizable": true,
         "visible": true
-      },
-      {
-        "label": "onboarding",
-        "title": "TapChat Setup",
-        "width": 760,
-        "height": 640,
-        "minWidth": 680,
-        "minHeight": 560,
-        "resizable": true,
-        "visible": false,
-        "center": true
       }
     ],
     "security": {

@@ -328,7 +328,10 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serialize");
         let decoded: AppendEnvelopeResult = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(decoded.delivered_to, AppendDeliveryDisposition::MessageRequest);
+        assert_eq!(
+            decoded.delivered_to,
+            AppendDeliveryDisposition::MessageRequest
+        );
         assert_eq!(decoded.queued_as_request, Some(true));
         assert_eq!(decoded.request_id.as_deref(), Some("request:user:alice"));
     }

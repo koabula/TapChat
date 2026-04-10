@@ -48,7 +48,6 @@ import {
   syncOnce,
   syncRealtimeClose,
   syncRealtimeConnect,
-  syncWindowVisibility,
 } from "../lib/commands";
 import type {
   AllowlistView,
@@ -156,11 +155,37 @@ export function useDesktopController(windowLabel: string): DesktopController {
     selectedContactUserId: null,
   });
   const onboardingHandoffRef = useRef(false);
+  const transportPhaseRef = useRef<{
+    profilePath: string | null;
+    phase: "idle" | "handoff" | "starting_transport" | "steady";
+  }>({
+    profilePath: null,
+    phase: "idle",
+  });
   const transportStaleError = "__tapchat_transport_startup_stale__";
+
+  function logTransportTelemetry(message: string, details?: Record<string, unknown>) {
+    console.info("[tapchat][transport]", message, details ?? {});
+  }
+
+  function setTransportPhase(
+    profilePath: string | null,
+    phase: "idle" | "handoff" | "starting_transport" | "steady",
+  ) {
+    transportPhaseRef.current = { profilePath, phase };
+    logTransportTelemetry("phase", { profilePath, phase });
+  }
 
   function isTransportStartupActive(profilePath?: string | null) {
     if (!profilePath) {
       return false;
+    }
+    if (
+      transportPhaseRef.current.profilePath === profilePath &&
+      (transportPhaseRef.current.phase === "handoff" ||
+        transportPhaseRef.current.phase === "starting_transport")
+    ) {
+      return true;
     }
     return (
       transportConnectRef.current.promise !== null &&
@@ -175,6 +200,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     if (!isTransportStartupActive(profilePath)) {
       return;
     }
+    logTransportTelemetry("queue-refresh-during-startup", { profilePath, kind });
     if (kind === "shell") {
       transportConnectRef.current.pendingShellRefresh = true;
       return;
@@ -211,6 +237,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
           markPendingTransportRefresh(event.payload, "shell");
           return;
         }
+        logTransportTelemetry("direct-shell-dirty", { profilePath: event.payload });
         void refreshDirectShell(undefined, undefined, undefined, false);
       }
     }).then((dispose) => {
@@ -223,6 +250,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
           markPendingTransportRefresh(event.payload, "messageRequests");
           return;
         }
+        logTransportTelemetry("message-requests-dirty", { profilePath: event.payload });
         void refreshMessageRequestsState(event.payload);
       }
     }).then((dispose) => {
@@ -301,6 +329,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
   }, [activeSection]);
 
   useEffect(() => {
+    if (!isOnboardingWindow) {
+      return;
+    }
     let unlistenWizard: (() => void) | undefined;
     void listen("tapchat://cloudflare-wizard", (event) => {
       const payload = event.payload as CloudflareWizardStatusView | null;
@@ -308,7 +339,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
         return;
       }
       setState((current) => ({ ...current, cloudflareWizard: payload }));
-      if (payload.state === "completed") {
+      if (payload.state === "completed" && !onboardingHandoffRef.current) {
         void performOnboardingHandoff();
       }
     }).then((dispose) => {
@@ -317,7 +348,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     return () => {
       unlistenWizard?.();
     };
-  }, []);
+  }, [isOnboardingWindow]);
 
   useEffect(() => {
     if (isOnboardingWindow) {
@@ -367,11 +398,17 @@ export function useDesktopController(windowLabel: string): DesktopController {
     if (!profilePath || state.bootstrap?.onboarding.step !== "complete") {
       return;
     }
+    if (isTransportStartupActive(profilePath)) {
+      return;
+    }
     void refreshDirectShell(profilePath);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step, state.selectedConversationId, state.selectedContactUserId]);
 
   useEffect(() => {
+    if (!isOnboardingWindow) {
+      return;
+    }
     const profilePath = state.bootstrap?.active_profile?.path;
     const wizard = state.cloudflareWizard;
     if (!profilePath || !wizard) {
@@ -382,9 +419,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
     }
     const timer = window.setTimeout(() => {
       void cloudflareSetupWizardStatus(profilePath)
-          .then((status) => {
+        .then((status) => {
             setState((current) => ({ ...current, cloudflareWizard: status }));
-            if (status.state === "completed") {
+            if (status.state === "completed" && !onboardingHandoffRef.current) {
               void performOnboardingHandoff();
             }
           })
@@ -394,7 +431,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     }, 1000);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.bootstrap?.active_profile?.path, state.cloudflareWizard]);
+  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.cloudflareWizard]);
 
   useEffect(() => {
     if (isOnboardingWindow) {
@@ -473,10 +510,6 @@ export function useDesktopController(windowLabel: string): DesktopController {
       }
       setPostOnboardingHandoffPending(false);
       setOnboardingStepOverride(null);
-      await syncWindowVisibility().catch(() => null);
-      if (bootstrap.onboarding.step === "complete" && !isOnboardingWindow) {
-        await refreshDirectShell(bootstrap.active_profile?.path ?? null);
-      }
       if (bootstrap.active_profile?.path) {
         await refreshCloudflareState(bootstrap.active_profile.path);
         await refreshContactShareLink(bootstrap.active_profile.path);
@@ -499,39 +532,23 @@ export function useDesktopController(windowLabel: string): DesktopController {
   }
 
   async function performOnboardingHandoff() {
+    if (!isOnboardingWindow) {
+      logTransportTelemetry("handoff-ignored", { windowLabel });
+      return;
+    }
+    if (onboardingHandoffRef.current) {
+      return;
+    }
     setPostOnboardingHandoffPending(true);
     onboardingHandoffRef.current = true;
     try {
       const profilePath = state.bootstrap?.active_profile?.path ?? null;
-      await completeOnboardingHandoff(profilePath);
-      const bootstrap = await appBootstrap();
-      selectionRef.current = {
-        selectedConversationId: null,
-        selectedContactUserId: null,
-      };
-      setState((current) => ({
-        ...current,
-        bootstrap,
-        loading: false,
-        error: null,
-        success: "Cloudflare transport is ready. Next, add a contact to start chatting.",
-        shell: bootstrap.onboarding.step === "complete" ? current.shell : null,
-      }));
-      if (!createRoot && bootstrap.active_profile?.path) {
-        setCreateRoot(bootstrap.active_profile.path);
-      }
-      setOnboardingStepOverride(null);
-      const activeProfilePath = bootstrap.active_profile?.path ?? null;
-      if (!activeProfilePath || bootstrap.onboarding.step !== "complete") {
-        throw new Error("Onboarding handoff did not produce an active completed profile.");
-      }
-      if (!isOnboardingWindow) {
-        await refreshCloudflareState(activeProfilePath);
-        await refreshContactShareLink(activeProfilePath);
-        await refreshDirectShell(activeProfilePath, null, null, false);
-        await refreshPolicyState(activeProfilePath, { suppressTransientErrors: true });
-        await connectTransport(activeProfilePath, "connecting");
-      }
+      setTransportPhase(profilePath, "handoff");
+      const bootstrap = await completeOnboardingHandoff(profilePath);
+      logTransportTelemetry("handoff-complete", {
+        profilePath: bootstrap.active_profile?.path ?? profilePath,
+        onboardingStep: bootstrap.onboarding.step,
+      });
     } catch (error) {
       setState((current) => ({
         ...current,
@@ -539,6 +556,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
         error: `Onboarding handoff failed: ${formatError(error)}`,
       }));
     } finally {
+      if (transportPhaseRef.current.phase === "handoff") {
+        setTransportPhase(null, "idle");
+      }
       onboardingHandoffRef.current = false;
       setPostOnboardingHandoffPending(false);
     }
@@ -547,6 +567,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   async function connectTransport(profilePath: string, health: ConnectionHealth) {
     const existing = transportConnectRef.current;
     if (existing.promise && existing.profilePath === profilePath) {
+      logTransportTelemetry("connect-reused", { profilePath, health });
       setConnectionHealth(health);
       return existing.promise;
     }
@@ -562,20 +583,50 @@ export function useDesktopController(windowLabel: string): DesktopController {
     };
 
     const promise = (async () => {
+      setTransportPhase(profilePath, "starting_transport");
       setConnectionHealth(health);
       setLastTransportError(null);
+      logTransportTelemetry("connect-begin", { profilePath, health, token });
       try {
-        await syncRealtimeClose(profilePath).catch(() => false);
+        logTransportTelemetry("connect-stage-begin", { profilePath, token, stage: "sync_realtime_close" });
+        await syncRealtimeClose(profilePath)
+          .then((closed) => {
+            logTransportTelemetry("connect-stage-complete", {
+              profilePath,
+              token,
+              stage: "sync_realtime_close",
+              closed,
+            });
+          })
+          .catch((error) => {
+            logTransportTelemetry("connect-stage-error", {
+              profilePath,
+              token,
+              stage: "sync_realtime_close",
+              error: formatError(error),
+            });
+            return false;
+          });
         assertCurrent();
+        logTransportTelemetry("connect-stage-begin", { profilePath, token, stage: "sync_foreground" });
         await syncForeground(profilePath);
+        logTransportTelemetry("connect-stage-complete", { profilePath, token, stage: "sync_foreground" });
         assertCurrent();
-        await refreshDirectShell(profilePath, undefined, undefined, false, { allowDuringTransportStartup: true });
-        assertCurrent();
+        logTransportTelemetry("connect-stage-begin", { profilePath, token, stage: "sync_realtime_connect" });
         await syncRealtimeConnect(profilePath);
+        logTransportTelemetry("connect-stage-complete", { profilePath, token, stage: "sync_realtime_connect" });
         assertCurrent();
+        logTransportTelemetry("connect-stage-begin", { profilePath, token, stage: "app_background_mode" });
         const enabled = await appBackgroundMode(profilePath);
+        logTransportTelemetry("connect-stage-complete", {
+          profilePath,
+          token,
+          stage: "app_background_mode",
+          enabled,
+        });
         assertCurrent();
         setBackgroundEnabled(enabled);
+        logTransportTelemetry("connect-stage-begin", { profilePath, token, stage: "refresh_direct_shell" });
         const latestShell = await refreshDirectShell(
           profilePath,
           undefined,
@@ -583,24 +634,47 @@ export function useDesktopController(windowLabel: string): DesktopController {
           false,
           { allowDuringTransportStartup: true },
         );
+        logTransportTelemetry("connect-stage-complete", {
+          profilePath,
+          token,
+          stage: "refresh_direct_shell",
+          connected: latestShell?.realtime?.connected ?? false,
+          needsReconnect: latestShell?.realtime?.needs_reconnect ?? false,
+        });
         assertCurrent();
+        logTransportTelemetry("connect-stage-begin", { profilePath, token, stage: "refresh_policy_state" });
         await refreshPolicyState(profilePath, {
           suppressTransientErrors: true,
           allowDuringTransportStartup: true,
         });
+        logTransportTelemetry("connect-stage-complete", {
+          profilePath,
+          token,
+          stage: "refresh_policy_state",
+        });
         assertCurrent();
+        setTransportPhase(profilePath, "steady");
         setConnectionHealth(latestShell?.realtime?.connected ? "connected" : "ready");
         setLastTransportError(null);
+        logTransportTelemetry("connect-complete", {
+          profilePath,
+          connected: latestShell?.realtime?.connected ?? false,
+          needsReconnect: latestShell?.realtime?.needs_reconnect ?? false,
+        });
       } catch (error) {
         if (isStaleTransportConnect(error)) {
+          logTransportTelemetry("connect-stale", { profilePath, token });
           return;
         }
+        setTransportPhase(null, "idle");
         const formatted = formatError(error);
         setLastTransportError(formatted);
         setConnectionHealth((current) => (current === "degraded" ? "degraded" : "disconnected"));
         setState((current) => ({ ...current, error: formatted, loading: false }));
+        logTransportTelemetry("connect-failed", { profilePath, token, error: formatted });
       } finally {
         if (!isCurrent()) {
+          logTransportTelemetry("connect-finished-stale", { profilePath, token });
           return;
         }
         const pendingShellRefresh = transportConnectRef.current.pendingShellRefresh;
@@ -615,13 +689,22 @@ export function useDesktopController(windowLabel: string): DesktopController {
           pendingMessageRequestsRefresh: false,
         };
         if (pendingShellRefresh) {
+          logTransportTelemetry("flush-pending-shell-refresh", { profilePath });
           await refreshDirectShell(profilePath, undefined, undefined, false).catch(() => null);
         }
         if (pendingMessageRequestsRefresh) {
+          logTransportTelemetry("flush-pending-message-requests-refresh", { profilePath });
           await refreshMessageRequestsState(profilePath).catch(() => null);
         }
         if (pendingPolicyRefresh) {
+          logTransportTelemetry("flush-pending-policy-refresh", { profilePath });
           await refreshPolicyState(profilePath, { suppressTransientErrors: true }).catch(() => null);
+        }
+        if (
+          transportPhaseRef.current.profilePath === profilePath &&
+          transportPhaseRef.current.phase !== "steady"
+        ) {
+          setTransportPhase(null, "idle");
         }
       }
     })();
@@ -649,6 +732,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
       return null;
     }
     if (!options?.allowDuringTransportStartup && isTransportStartupActive(profilePath)) {
+      logTransportTelemetry("skip-shell-refresh-during-startup", { profilePath });
       markPendingTransportRefresh(profilePath, "shell");
       return state.shell;
     }
@@ -668,6 +752,13 @@ export function useDesktopController(windowLabel: string): DesktopController {
     ) {
       shell = await directShell(profilePath, selectedConversationId, selectedContactUserId);
     }
+    logTransportTelemetry("shell-refreshed", {
+      profilePath,
+      selectedConversationId,
+      selectedContactUserId,
+      realtimeConnected: shell.realtime.connected,
+      realtimeNeedsReconnect: shell.realtime.needs_reconnect,
+    });
     setState((current) => ({ ...current, shell, loading: false }));
     if (refreshPolicy && state.bootstrap?.onboarding.step === "complete") {
       await refreshPolicyState(profilePath, {

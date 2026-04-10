@@ -203,7 +203,11 @@ pub fn start_local_runtime(
     }
 }
 
-pub fn derive_cloudflare_defaults(profile_name: &str, user_id: &str, device_id: &str) -> CloudflareDeployDefaults {
+pub fn derive_cloudflare_defaults(
+    profile_name: &str,
+    user_id: &str,
+    device_id: &str,
+) -> CloudflareDeployDefaults {
     let worker_name = sanitize_cloudflare_name(&format!(
         "tapchat-{}-{}",
         profile_name,
@@ -275,7 +279,9 @@ pub fn resolve_cloudflare_config(
     }
 }
 
-pub fn prompt_cloudflare_overrides(defaults: &CloudflareDeployDefaults) -> Result<CloudflareDeployOverrides> {
+pub fn prompt_cloudflare_overrides(
+    defaults: &CloudflareDeployDefaults,
+) -> Result<CloudflareDeployOverrides> {
     Ok(CloudflareDeployOverrides {
         worker_name: prompt_override("worker_name", &defaults.worker_name)?,
         public_base_url: prompt_override_allow_blank(
@@ -290,15 +296,9 @@ pub fn prompt_cloudflare_overrides(defaults: &CloudflareDeployDefaults) -> Resul
             "rate_limit_per_minute",
             &defaults.rate_limit_per_minute,
         )?,
-        rate_limit_per_hour: prompt_override(
-            "rate_limit_per_hour",
-            &defaults.rate_limit_per_hour,
-        )?,
+        rate_limit_per_hour: prompt_override("rate_limit_per_hour", &defaults.rate_limit_per_hour)?,
         bucket_name: prompt_override("bucket_name", &defaults.bucket_name)?,
-        preview_bucket_name: prompt_override(
-            "preview_bucket_name",
-            &defaults.preview_bucket_name,
-        )?,
+        preview_bucket_name: prompt_override("preview_bucket_name", &defaults.preview_bucket_name)?,
     })
 }
 
@@ -331,9 +331,7 @@ pub async fn deploy_cloudflare_runtime(
         command.env("TAPCHAT_DESKTOP_BUNDLED", "1");
     }
     apply_windows_command_flags(&mut command);
-    let output = command
-        .output()
-        .context("run cloudflare deploy script")?;
+    let output = command.output().context("run cloudflare deploy script")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         if let Some(json_line) = stdout
@@ -507,7 +505,9 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}");
+            bail!(
+                "runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}"
+            );
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
@@ -690,7 +690,9 @@ pub async fn bootstrap_device_bundle(
             }))
             .send()
             .await
-            .with_context(|| format!("bootstrap request failed (attempt {attempt}/{max_attempts})"))?;
+            .with_context(|| {
+                format!("bootstrap request failed (attempt {attempt}/{max_attempts})")
+            })?;
 
         if response.status().is_success() {
             let body = response.text().await.context("read bootstrap response")?;
@@ -718,8 +720,8 @@ pub async fn bootstrap_device_bundle(
             max_attempts,
             body_snippet: body_snippet(&body),
         };
-        let detail_json =
-            serde_json::to_string(&detail).unwrap_or_else(|_| String::from("{\"error\":\"serialization_failed\"}"));
+        let detail_json = serde_json::to_string(&detail)
+            .unwrap_or_else(|_| String::from("{\"error\":\"serialization_failed\"}"));
         bail!("bootstrap_failed_detail: {detail_json}");
     }
 }
@@ -737,9 +739,7 @@ pub fn cloudflare_preflight(profile_root: Option<&Path>) -> CloudflarePreflight 
             .join("bin")
             .join("wrangler.js")
     });
-    let wrangler_available = wrangler_entry
-        .as_ref()
-        .is_some_and(|path| path.exists());
+    let wrangler_available = wrangler_entry.as_ref().is_some_and(|path| path.exists());
     let wrangler_logged_in = if wrangler_available {
         check_wrangler_logged_in(service_root.as_deref()).unwrap_or(false)
     } else {
@@ -895,9 +895,8 @@ pub fn resolve_embedded_workspace_root() -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|path| path.exists())
         .or_else(|| {
-            resolve_embedded_service_root().and_then(|service_root| {
-                service_root.parent().map(PathBuf::from)
-            })
+            resolve_embedded_service_root()
+                .and_then(|service_root| service_root.parent().map(PathBuf::from))
         })
 }
 
@@ -1093,7 +1092,11 @@ fn prompt_override(label: &str, default_value: &str) -> Result<Option<String>> {
     }
 }
 
-fn prompt_override_allow_blank(label: &str, blank_note: &str, default_value: &str) -> Result<Option<String>> {
+fn prompt_override_allow_blank(
+    label: &str,
+    blank_note: &str,
+    default_value: &str,
+) -> Result<Option<String>> {
     let answer = prompt_line(&format!(
         "Override {label}? [default: {}] Leave blank to keep default; use '-' for empty ({blank_note}): ",
         display_default(default_value)
@@ -1111,18 +1114,12 @@ fn prompt_line(prompt: &str) -> Result<String> {
     print!("{prompt}");
     io::stdout().flush().context("flush stdout")?;
     let mut buffer = String::new();
-    io::stdin()
-        .read_line(&mut buffer)
-        .context("read stdin")?;
+    io::stdin().read_line(&mut buffer).context("read stdin")?;
     Ok(buffer.trim().to_string())
 }
 
 fn display_default(value: &str) -> &str {
-    if value.is_empty() {
-        "<empty>"
-    } else {
-        value
-    }
+    if value.is_empty() { "<empty>" } else { value }
 }
 
 fn generate_hex_secret() -> String {
@@ -1132,7 +1129,8 @@ fn generate_hex_secret() -> String {
 }
 
 fn short_identifier(value: &str, max_len: usize) -> String {
-    value.chars()
+    value
+        .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .take(max_len)
         .collect()
@@ -1160,5 +1158,3 @@ fn sanitize_cloudflare_name(value: &str) -> String {
         collapsed
     }
 }
-
-

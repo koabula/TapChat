@@ -18,9 +18,9 @@ use super::args::{
     Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
     CloudflareRuntimeSubcommand, Command, ContactAllowlistCommand, ContactAllowlistSubcommand,
     ContactCommand, ContactRequestsCommand, ContactRequestsSubcommand, ContactSubcommand,
-    ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand,
-    MessageCommand, MessageSubcommand, OutputFormat, ProfileCommand, ProfileSubcommand,
-    RuntimeCommand, RuntimeSubcommand, SyncCommand, SyncSubcommand,
+    ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand, MessageCommand,
+    MessageSubcommand, OutputFormat, ProfileCommand, ProfileSubcommand, RuntimeCommand,
+    RuntimeSubcommand, SyncCommand, SyncSubcommand,
 };
 use super::driver::CoreDriver;
 use super::profile::{Profile, ProfileRegistry, RuntimeMetadata};
@@ -878,10 +878,8 @@ impl CliApp {
                     .local_identity()
                     .cloned()
                     .ok_or_else(|| anyhow!("local identity is not initialized"))?;
-                let service_root = resolve_service_root(
-                    None,
-                    Some(profile.metadata().root_dir.as_path()),
-                )?;
+                let service_root =
+                    resolve_service_root(None, Some(profile.metadata().root_dir.as_path()))?;
                 let defaults = derive_cloudflare_defaults(
                     &profile.metadata().name,
                     &identity.user_identity.user_id,
@@ -908,10 +906,8 @@ impl CliApp {
                     .local_identity()
                     .cloned()
                     .ok_or_else(|| anyhow!("local identity is not initialized"))?;
-                let service_root = resolve_service_root(
-                    None,
-                    Some(profile.metadata().root_dir.as_path()),
-                )?;
+                let service_root =
+                    resolve_service_root(None, Some(profile.metadata().root_dir.as_path()))?;
                 let defaults = derive_cloudflare_defaults(
                     &profile.metadata().name,
                     &identity.user_identity.user_id,
@@ -998,7 +994,10 @@ impl CliApp {
             bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
             sharing_secret: Some(config.sharing_token_secret.clone()),
             mode: Some("cloudflare".into()),
-            workspace_root: service_root.parent().and_then(|value| value.parent()).map(PathBuf::from),
+            workspace_root: service_root
+                .parent()
+                .and_then(|value| value.parent())
+                .map(PathBuf::from),
             service_root: Some(service_root.to_path_buf()),
             worker_name: Some(deployment.worker_name.clone()),
             public_base_url: Some(deployment.effective_public_base_url.clone()),
@@ -1097,7 +1096,10 @@ fn allowlist_from_output(output: &crate::ffi_api::CoreOutput) -> Result<&Allowli
         .ok_or_else(|| anyhow!("allowlist document was not returned by core"))
 }
 
-fn latest_notification_since(driver: &crate::cli::driver::CoreDriver, offset: usize) -> Option<String> {
+fn latest_notification_since(
+    driver: &crate::cli::driver::CoreDriver,
+    offset: usize,
+) -> Option<String> {
     driver
         .notifications()
         .get(offset..)
@@ -1178,5 +1180,3 @@ async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadR
     let body = response.text().await?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
 }
-
-

@@ -459,15 +459,15 @@ mod tests {
         ]);
         match cli.command {
             Command::Runtime(RuntimeCommand {
-                command: RuntimeSubcommand::Cloudflare(CloudflareRuntimeCommand {
-                    command:
-                        CloudflareRuntimeSubcommand::Provision(CloudflareProvisionCommand {
-                            command: CloudflareProvisionSubcommand::Auto { profile },
-                        }),
-                }),
+                command:
+                    RuntimeSubcommand::Cloudflare(CloudflareRuntimeCommand {
+                        command:
+                            CloudflareRuntimeSubcommand::Provision(CloudflareProvisionCommand {
+                                command: CloudflareProvisionSubcommand::Auto { profile },
+                            }),
+                    }),
             }) => assert_eq!(profile, Some(PathBuf::from("state/alice"))),
             _ => panic!("unexpected command shape"),
         }
     }
 }
-

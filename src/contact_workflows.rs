@@ -67,7 +67,10 @@ pub async fn fetch_identity_bundle_from_url(url: &str) -> Result<IdentityBundle>
         .await
         .with_context(|| format!("fetch contact share link {url}"))?;
     let status = response.status();
-    let body = response.text().await.context("read contact share response body")?;
+    let body = response
+        .text()
+        .await
+        .context("read contact share response body")?;
     if !status.is_success() {
         return Err(anyhow!(
             "contact share link fetch failed with status {status}: {body}"
@@ -79,7 +82,9 @@ pub async fn fetch_identity_bundle_from_url(url: &str) -> Result<IdentityBundle>
     if bundle.identity_bundle_ref.is_none() {
         bundle.identity_bundle_ref = Some(url.to_string());
     }
-    bundle.validate().map_err(|error| anyhow!(error.to_string()))?;
+    bundle
+        .validate()
+        .map_err(|error| anyhow!(error.to_string()))?;
     IdentityManager::verify_identity_bundle(&bundle).map_err(|error| anyhow!(error.to_string()))?;
     Ok(bundle)
 }
