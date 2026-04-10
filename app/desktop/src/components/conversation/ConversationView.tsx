@@ -1,14 +1,23 @@
 import { useLayoutEffect, useRef, type Dispatch, type SetStateAction } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import type { ContactDetailView, ConversationDetailView, DirectShellView } from "../../lib/types";
+import type {
+  ContactDetailView,
+  ContactShareLinkView,
+  ConversationDetailView,
+  DirectShellView,
+} from "../../lib/types";
 import AttachmentDraftQueue from "../shared/AttachmentDraftQueue";
 
 export default function ConversationView({
   loading,
   step,
+  activeSection,
   activeConversation,
   selectedContact,
   shell,
+  contactShareLink,
+  contactLinkDraft,
+  setContactLinkDraft,
   selectedAttachmentPaths,
   setSelectedAttachmentPaths,
   downloadingMessageId,
@@ -18,6 +27,11 @@ export default function ConversationView({
   composerStatus,
   onCreateDirectConversation,
   onRefreshContact,
+  onCopyContactLink,
+  onRotateContactLink,
+  onShowQr,
+  onImportLink,
+  onImportBundle,
   onPreviewAttachment,
   onOpenAttachment,
   onDownloadAttachment,
@@ -27,9 +41,13 @@ export default function ConversationView({
 }: {
   loading: boolean;
   step: string;
+  activeSection: "chats" | "contacts" | "requests";
   activeConversation: ConversationDetailView | null;
   selectedContact: ContactDetailView | null;
   shell: DirectShellView | null;
+  contactShareLink: ContactShareLinkView | null;
+  contactLinkDraft: string;
+  setContactLinkDraft: Dispatch<SetStateAction<string>>;
   selectedAttachmentPaths: string[];
   setSelectedAttachmentPaths: Dispatch<SetStateAction<string[]>>;
   downloadingMessageId: string | null;
@@ -39,6 +57,11 @@ export default function ConversationView({
   composerStatus: string;
   onCreateDirectConversation: () => Promise<void>;
   onRefreshContact: (userId: string) => Promise<void>;
+  onCopyContactLink: () => Promise<void>;
+  onRotateContactLink: () => Promise<void>;
+  onShowQr: () => void;
+  onImportLink: () => Promise<void>;
+  onImportBundle: () => Promise<void>;
   onPreviewAttachment: (messageId: string, reference: string) => Promise<void>;
   onOpenAttachment: (messageId: string) => Promise<void>;
   onDownloadAttachment: (messageId: string, reference: string) => Promise<void>;
@@ -80,22 +103,111 @@ export default function ConversationView({
     );
   }
 
-  if (!activeConversation && selectedContact) {
-    return (
-      <div className="conversation-stage conversation-scroll">
-        <div className="conversation-action-panel">
-          <h3>{selectedContact.user_id}</h3>
-          <p>Create a direct conversation to start chatting.</p>
-          <div className="button-row">
-            <button className="primary-button" disabled={loading} onClick={() => void onCreateDirectConversation()}>Create direct conversation</button>
-            <button className="ghost-button" disabled={loading} onClick={() => void onRefreshContact(selectedContact.user_id)}>Refresh contact</button>
+  if (!activeConversation) {
+    if (activeSection === "contacts") {
+      return (
+        <div className="conversation-stage conversation-scroll">
+          <div className="contact-management-stage">
+            <div className="contact-onboarding-card">
+              <div className="contact-onboarding-copy">
+                <strong>Share my contact link</strong>
+                <small>Send this link to a contact so they can add you and start a chat request.</small>
+              </div>
+              <div className="stacked-field">
+                <input
+                  readOnly
+                  value={contactShareLink?.url ?? "Contact link will be available after transport setup."}
+                />
+                <div className="button-row contact-link-actions">
+                  <button
+                    className="ghost-button compact-button"
+                    disabled={loading || !contactShareLink?.url}
+                    onClick={() => void onCopyContactLink()}
+                  >
+                    Copy link
+                  </button>
+                  <button
+                    className="ghost-button compact-button"
+                    disabled={loading || !contactShareLink?.url}
+                    onClick={onShowQr}
+                  >
+                    Show QR
+                  </button>
+                  <button
+                    className="ghost-button compact-button"
+                    disabled={loading || !contactShareLink?.url}
+                    onClick={() => void onRotateContactLink()}
+                  >
+                    Rotate link
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="contact-onboarding-card">
+              <div className="contact-onboarding-copy">
+                <strong>Add contact</strong>
+                <small>Ask your contact for their contact link, then paste it here to add them.</small>
+              </div>
+              <div className="stacked-field contact-import-field">
+                <input
+                  className="contact-link-input"
+                  value={contactLinkDraft}
+                  placeholder="Paste contact link"
+                  onChange={(event) => setContactLinkDraft(event.target.value)}
+                />
+                <div className="button-row contact-import-actions">
+                  <button
+                    className="primary-button compact-button"
+                    disabled={loading || !contactLinkDraft.trim()}
+                    onClick={() => void onImportLink()}
+                  >
+                    Add contact by link
+                  </button>
+                  <button
+                    className="ghost-button compact-button"
+                    disabled={loading}
+                    onClick={() => void onImportBundle()}
+                  >
+                    Import contact bundle file
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {selectedContact ? (
+              <div className="conversation-action-panel">
+                <h3>{selectedContact.user_id}</h3>
+                <p>Create a direct conversation to start chatting.</p>
+                <div className="button-row">
+                  <button className="primary-button" disabled={loading} onClick={() => void onCreateDirectConversation()}>Create direct conversation</button>
+                  <button className="ghost-button" disabled={loading} onClick={() => void onRefreshContact(selectedContact.user_id)}>Refresh contact</button>
+                </div>
+              </div>
+            ) : (
+              <div className="empty-state conversation-empty-state">
+                <h3>Select a contact to continue</h3>
+                <p>Add a contact from the actions above, or pick one from the list on the left to create a direct conversation.</p>
+              </div>
+            )}
           </div>
         </div>
-      </div>
-    );
-  }
-
-  if (!activeConversation) {
+      );
+    }
+    if (selectedContact) {
+      return (
+        <div className="conversation-stage conversation-scroll">
+          <div className="conversation-action-panel">
+            <h3>{selectedContact.user_id}</h3>
+            <p>Create a direct conversation to start chatting.</p>
+            <div className="button-row">
+              <button className="primary-button" disabled={loading} onClick={() => void onCreateDirectConversation()}>Create direct conversation</button>
+              <button className="ghost-button" disabled={loading} onClick={() => void onRefreshContact(selectedContact.user_id)}>Refresh contact</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="conversation-stage conversation-scroll">
         <div className="empty-state conversation-empty-state">

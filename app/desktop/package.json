@@ -6,8 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "prepare:desktop-runtime": "node scripts/prepare-desktop-runtime.mjs",
+    "build:release-assets": "npm run build && npm run prepare:desktop-runtime",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "bundle:portable": "node scripts/build-portable.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

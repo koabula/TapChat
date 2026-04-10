@@ -1,6 +1,7 @@
 pub mod attachment_crypto;
 pub mod capability;
 pub mod cli;
+pub mod contact_workflows;
 pub mod conversation;
 pub mod desktop_app;
 pub mod error;

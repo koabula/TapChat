@@ -20,7 +20,8 @@ export default function MainApp({ controller }: { controller: DesktopController 
   const nextToastId = useRef(1);
   const lastSuccessRef = useRef<string | null>(null);
   const lastErrorRef = useRef<string | null>(null);
-  const activeConversation = controller.activeConversation ?? null;
+  const activeConversation =
+    controller.activeSection === "chats" ? controller.activeConversation ?? null : null;
   const selectedContact = controller.selectedContact ?? null;
   const conversationSubtitleParts = [controller.statusLabel];
 
@@ -133,15 +134,6 @@ export default function MainApp({ controller }: { controller: DesktopController 
                 <ContactsPane
                   contacts={state.shell?.contacts ?? []}
                   selectedContactUserId={controller.selectedContactUserId}
-                  onImportBundle={controller.chooseIdentityBundle}
-                  onImportLink={controller.handleImportContactLink}
-                  contactLinkDraft={controller.contactLinkDraft}
-                  setContactLinkDraft={controller.setContactLinkDraft}
-                  contactShareLink={controller.contactShareLink}
-                  onCopyContactLink={controller.handleCopyContactLink}
-                  onRotateContactLink={controller.handleRotateContactLink}
-                  onShowQr={() => controller.setShowContactQr(true)}
-                  loading={state.loading}
                   onSelect={(contact) =>
                     controller.selectContact(
                       contact.user_id,
@@ -212,9 +204,13 @@ export default function MainApp({ controller }: { controller: DesktopController 
           <ConversationView
             loading={state.loading}
             step={step}
+            activeSection={controller.activeSection}
             activeConversation={activeConversation}
             selectedContact={selectedContact}
             shell={state.shell}
+            contactShareLink={controller.contactShareLink}
+            contactLinkDraft={controller.contactLinkDraft}
+            setContactLinkDraft={controller.setContactLinkDraft}
             selectedAttachmentPaths={controller.selectedAttachmentPaths}
             setSelectedAttachmentPaths={controller.setSelectedAttachmentPaths}
             downloadingMessageId={controller.downloadingMessageId}
@@ -224,6 +220,11 @@ export default function MainApp({ controller }: { controller: DesktopController 
             composerStatus={controller.composerStatus}
             onCreateDirectConversation={controller.handleCreateDirectConversation}
             onRefreshContact={controller.handleRefreshContact}
+            onCopyContactLink={controller.handleCopyContactLink}
+            onRotateContactLink={controller.handleRotateContactLink}
+            onShowQr={() => controller.setShowContactQr(true)}
+            onImportLink={controller.handleImportContactLink}
+            onImportBundle={controller.chooseIdentityBundle}
             onPreviewAttachment={controller.handlePreviewAttachment}
             onOpenAttachment={controller.handleOpenAttachment}
             onDownloadAttachment={controller.handleDownloadAttachment}

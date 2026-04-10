@@ -59,8 +59,8 @@ export function showOnboardingWindow() {
   return invoke<string>("show_onboarding_window");
 }
 
-export function completeOnboardingHandoff() {
-  return invoke<AppBootstrapView>("complete_onboarding_handoff");
+export function completeOnboardingHandoff(profilePath?: string | null) {
+  return invoke<AppBootstrapView>("complete_onboarding_handoff", { profilePath });
 }
 
 export function identityCreate(profilePath: string, deviceName: string) {

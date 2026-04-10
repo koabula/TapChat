@@ -229,7 +229,7 @@ export class InboxService {
       await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
       promotedCount += delivered.seq === undefined ? 0 : 1;
     }
-    await this.deleteMessageRequest(entry.senderUserId);
+    await this.deleteMessageRequest(entry.senderUserId, "accepted");
     return {
       accepted: true,
       requestId: entry.requestId,
@@ -252,7 +252,7 @@ export class InboxService {
       [...allowlist.rejectedSenderUserIds, entry.senderUserId],
       now
     );
-    await this.deleteMessageRequest(entry.senderUserId);
+    await this.deleteMessageRequest(entry.senderUserId, "rejected");
     return {
       accepted: true,
       requestId: entry.requestId,
@@ -379,6 +379,13 @@ export class InboxService {
     entry.pendingRequests.push(input);
     await this.state.put(key, entry);
     await this.addMessageRequestIndex(senderUserId);
+    this.publish({
+      event: "message_request_changed",
+      deviceId: this.deviceId,
+      senderUserId,
+      requestId,
+      change: "queued"
+    });
     return {
       accepted: true,
       seq: 0,
@@ -471,13 +478,26 @@ export class InboxService {
     }
   }
 
-  private async deleteMessageRequest(senderUserId: string): Promise<void> {
+  private async deleteMessageRequest(
+    senderUserId: string,
+    change: "accepted" | "rejected"
+  ): Promise<void> {
+    const existing = await this.state.get<MessageRequestEntry>(this.messageRequestKey(senderUserId));
     await this.state.delete(this.messageRequestKey(senderUserId));
     const index = (await this.state.get<string[]>(this.messageRequestIndexKey())) ?? [];
     await this.state.put(
       this.messageRequestIndexKey(),
       index.filter((entry) => entry !== senderUserId)
     );
+    if (existing) {
+      this.publish({
+        event: "message_request_changed",
+        deviceId: this.deviceId,
+        senderUserId,
+        requestId: existing.requestId,
+        change
+      });
+    }
   }
 
   private async findMessageRequest(requestId: string): Promise<MessageRequestEntry | null> {

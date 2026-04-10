@@ -81,6 +81,12 @@ const emptyOverrides: CloudflareDeployOverrides = {
   preview_bucket_name: "",
 };
 
+function waitForNextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
 export function useDesktopController(windowLabel: string): DesktopController {
   const isOnboardingWindow = windowLabel === "onboarding";
   const [state, setState] = useState<ViewState>({
@@ -103,6 +109,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   const [createRoot, setCreateRoot] = useState("");
   const [deviceName, setDeviceName] = useState("phone");
   const [mnemonic, setMnemonic] = useState("");
+  const [mnemonicBackupPending, setMnemonicBackupPending] = useState(false);
   const [overrides, setOverrides] = useState<CloudflareDeployOverrides>(emptyOverrides);
   const [activeSection, setActiveSection] = useState<ActiveSection>("chats");
   const [drawerMode, setDrawerMode] = useState<DrawerMode>("closed");
@@ -126,6 +133,21 @@ export function useDesktopController(windowLabel: string): DesktopController {
   const [postOnboardingHandoffPending, setPostOnboardingHandoffPending] = useState(false);
   const { theme, setTheme } = useTheme();
   const reconnectTimerRef = useRef<number | null>(null);
+  const transportConnectRef = useRef<{
+    token: number;
+    profilePath: string | null;
+    promise: Promise<void> | null;
+    pendingShellRefresh: boolean;
+    pendingPolicyRefresh: boolean;
+    pendingMessageRequestsRefresh: boolean;
+  }>({
+    token: 0,
+    profilePath: null,
+    promise: null,
+    pendingShellRefresh: false,
+    pendingPolicyRefresh: false,
+    pendingMessageRequestsRefresh: false,
+  });
   const selectionRef = useRef<{
     selectedConversationId: string | null;
     selectedContactUserId: string | null;
@@ -133,6 +155,40 @@ export function useDesktopController(windowLabel: string): DesktopController {
     selectedConversationId: null,
     selectedContactUserId: null,
   });
+  const onboardingHandoffRef = useRef(false);
+  const transportStaleError = "__tapchat_transport_startup_stale__";
+
+  function isTransportStartupActive(profilePath?: string | null) {
+    if (!profilePath) {
+      return false;
+    }
+    return (
+      transportConnectRef.current.promise !== null &&
+      transportConnectRef.current.profilePath === profilePath
+    );
+  }
+
+  function markPendingTransportRefresh(
+    profilePath: string,
+    kind: "shell" | "policy" | "messageRequests",
+  ) {
+    if (!isTransportStartupActive(profilePath)) {
+      return;
+    }
+    if (kind === "shell") {
+      transportConnectRef.current.pendingShellRefresh = true;
+      return;
+    }
+    if (kind === "policy") {
+      transportConnectRef.current.pendingPolicyRefresh = true;
+      return;
+    }
+    transportConnectRef.current.pendingMessageRequestsRefresh = true;
+  }
+
+  function isStaleTransportConnect(error: unknown) {
+    return error instanceof Error && error.message === transportStaleError;
+  }
 
   useEffect(() => {
     void refreshBootstrap();
@@ -144,19 +200,43 @@ export function useDesktopController(windowLabel: string): DesktopController {
       return;
     }
     let unlistenDirty: (() => void) | undefined;
+    let unlistenMessageRequests: (() => void) | undefined;
     let unlistenBackground: (() => void) | undefined;
     let unlistenDrop: (() => void) | undefined;
     let unlistenBootstrap: (() => void) | undefined;
 
     void listen<string>("tapchat://direct-shell-dirty", (event) => {
       if (event.payload && event.payload === state.bootstrap?.active_profile?.path) {
-        void refreshDirectShell();
+        if (isTransportStartupActive(event.payload)) {
+          markPendingTransportRefresh(event.payload, "shell");
+          return;
+        }
+        void refreshDirectShell(undefined, undefined, undefined, false);
       }
     }).then((dispose) => {
       unlistenDirty = dispose;
     });
 
+    void listen<string>("tapchat://message-requests-dirty", (event) => {
+      if (event.payload && event.payload === state.bootstrap?.active_profile?.path) {
+        if (isTransportStartupActive(event.payload)) {
+          markPendingTransportRefresh(event.payload, "messageRequests");
+          return;
+        }
+        void refreshMessageRequestsState(event.payload);
+      }
+    }).then((dispose) => {
+      unlistenMessageRequests = dispose;
+    });
+
     void listen("tapchat://background-download-complete", () => {
+      if (isTransportStartupActive(state.bootstrap?.active_profile?.path)) {
+        const profilePath = state.bootstrap?.active_profile?.path;
+        if (profilePath) {
+          markPendingTransportRefresh(profilePath, "shell");
+        }
+        return;
+      }
       void refreshDirectShell();
     }).then((dispose) => {
       unlistenBackground = dispose;
@@ -188,6 +268,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
 
     return () => {
       unlistenDirty?.();
+      unlistenMessageRequests?.();
       unlistenBackground?.();
       unlistenDrop?.();
       unlistenBootstrap?.();
@@ -201,6 +282,23 @@ export function useDesktopController(windowLabel: string): DesktopController {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (activeSection === "chats") {
+      return;
+    }
+    selectionRef.current = {
+      ...selectionRef.current,
+      selectedConversationId: null,
+    };
+    setSelectedAttachmentPaths([]);
+    setPreview(null);
+    setState((current) => (
+      current.selectedConversationId === null
+        ? current
+        : { ...current, selectedConversationId: null }
+    ));
+  }, [activeSection]);
 
   useEffect(() => {
     let unlistenWizard: (() => void) | undefined;
@@ -226,6 +324,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
       return;
     }
     const profilePath = state.bootstrap?.active_profile?.path;
+    if (onboardingHandoffRef.current || postOnboardingHandoffPending) {
+      return;
+    }
     if (!profilePath || state.bootstrap?.onboarding.step !== "complete") {
       setConnectionHealth("disconnected");
       return;
@@ -238,7 +339,12 @@ export function useDesktopController(windowLabel: string): DesktopController {
       }
       void syncRealtimeClose(profilePath);
     };
-  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step]);
+  }, [
+    isOnboardingWindow,
+    postOnboardingHandoffPending,
+    state.bootstrap?.active_profile?.path,
+    state.bootstrap?.onboarding.step,
+  ]);
 
   useEffect(() => {
     function handleEscape(event: KeyboardEvent) {
@@ -362,6 +468,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
       if (!createRoot && bootstrap.active_profile?.path) {
         setCreateRoot(bootstrap.active_profile.path);
       }
+      if (!bootstrap.onboarding.has_identity || bootstrap.onboarding.step === "complete") {
+        setMnemonicBackupPending(false);
+      }
       setPostOnboardingHandoffPending(false);
       setOnboardingStepOverride(null);
       await syncWindowVisibility().catch(() => null);
@@ -391,8 +500,11 @@ export function useDesktopController(windowLabel: string): DesktopController {
 
   async function performOnboardingHandoff() {
     setPostOnboardingHandoffPending(true);
+    onboardingHandoffRef.current = true;
     try {
-      const bootstrap = await completeOnboardingHandoff();
+      const profilePath = state.bootstrap?.active_profile?.path ?? null;
+      await completeOnboardingHandoff(profilePath);
+      const bootstrap = await appBootstrap();
       selectionRef.current = {
         selectedConversationId: null,
         selectedContactUserId: null,
@@ -409,50 +521,136 @@ export function useDesktopController(windowLabel: string): DesktopController {
         setCreateRoot(bootstrap.active_profile.path);
       }
       setOnboardingStepOverride(null);
-      if (!isOnboardingWindow && bootstrap.active_profile?.path) {
-        await refreshCloudflareState(bootstrap.active_profile.path);
-        await refreshContactShareLink(bootstrap.active_profile.path);
-        await connectTransport(bootstrap.active_profile.path, "connecting");
+      const activeProfilePath = bootstrap.active_profile?.path ?? null;
+      if (!activeProfilePath || bootstrap.onboarding.step !== "complete") {
+        throw new Error("Onboarding handoff did not produce an active completed profile.");
+      }
+      if (!isOnboardingWindow) {
+        await refreshCloudflareState(activeProfilePath);
+        await refreshContactShareLink(activeProfilePath);
+        await refreshDirectShell(activeProfilePath, null, null, false);
+        await refreshPolicyState(activeProfilePath, { suppressTransientErrors: true });
+        await connectTransport(activeProfilePath, "connecting");
       }
     } catch (error) {
       setState((current) => ({
         ...current,
         loading: false,
-        error: formatError(error),
+        error: `Onboarding handoff failed: ${formatError(error)}`,
       }));
     } finally {
-      if (isOnboardingWindow) {
-        setPostOnboardingHandoffPending(false);
-      }
+      onboardingHandoffRef.current = false;
+      setPostOnboardingHandoffPending(false);
     }
   }
 
   async function connectTransport(profilePath: string, health: ConnectionHealth) {
-    setConnectionHealth(health);
-    try {
-      await syncForeground(profilePath);
-      await refreshDirectShell(profilePath);
-      await syncRealtimeConnect(profilePath);
-      await appBackgroundMode(profilePath).then((enabled) => setBackgroundEnabled(enabled));
-      const latestShell = await refreshDirectShell(profilePath);
-      setConnectionHealth(latestShell?.realtime?.connected ? "connected" : "ready");
-      setLastTransportError(null);
-    } catch (error) {
-      const formatted = formatError(error);
-      setLastTransportError(formatted);
-      setConnectionHealth((current) => (current === "degraded" ? "degraded" : "disconnected"));
-      setState((current) => ({ ...current, error: formatted, loading: false }));
+    const existing = transportConnectRef.current;
+    if (existing.promise && existing.profilePath === profilePath) {
+      setConnectionHealth(health);
+      return existing.promise;
     }
+
+    const token = existing.token + 1;
+    const isCurrent = () =>
+      transportConnectRef.current.token === token &&
+      transportConnectRef.current.profilePath === profilePath;
+    const assertCurrent = () => {
+      if (!isCurrent()) {
+        throw new Error(transportStaleError);
+      }
+    };
+
+    const promise = (async () => {
+      setConnectionHealth(health);
+      setLastTransportError(null);
+      try {
+        await syncRealtimeClose(profilePath).catch(() => false);
+        assertCurrent();
+        await syncForeground(profilePath);
+        assertCurrent();
+        await refreshDirectShell(profilePath, undefined, undefined, false, { allowDuringTransportStartup: true });
+        assertCurrent();
+        await syncRealtimeConnect(profilePath);
+        assertCurrent();
+        const enabled = await appBackgroundMode(profilePath);
+        assertCurrent();
+        setBackgroundEnabled(enabled);
+        const latestShell = await refreshDirectShell(
+          profilePath,
+          undefined,
+          undefined,
+          false,
+          { allowDuringTransportStartup: true },
+        );
+        assertCurrent();
+        await refreshPolicyState(profilePath, {
+          suppressTransientErrors: true,
+          allowDuringTransportStartup: true,
+        });
+        assertCurrent();
+        setConnectionHealth(latestShell?.realtime?.connected ? "connected" : "ready");
+        setLastTransportError(null);
+      } catch (error) {
+        if (isStaleTransportConnect(error)) {
+          return;
+        }
+        const formatted = formatError(error);
+        setLastTransportError(formatted);
+        setConnectionHealth((current) => (current === "degraded" ? "degraded" : "disconnected"));
+        setState((current) => ({ ...current, error: formatted, loading: false }));
+      } finally {
+        if (!isCurrent()) {
+          return;
+        }
+        const pendingShellRefresh = transportConnectRef.current.pendingShellRefresh;
+        const pendingPolicyRefresh = transportConnectRef.current.pendingPolicyRefresh;
+        const pendingMessageRequestsRefresh = transportConnectRef.current.pendingMessageRequestsRefresh;
+        transportConnectRef.current = {
+          token,
+          profilePath: null,
+          promise: null,
+          pendingShellRefresh: false,
+          pendingPolicyRefresh: false,
+          pendingMessageRequestsRefresh: false,
+        };
+        if (pendingShellRefresh) {
+          await refreshDirectShell(profilePath, undefined, undefined, false).catch(() => null);
+        }
+        if (pendingMessageRequestsRefresh) {
+          await refreshMessageRequestsState(profilePath).catch(() => null);
+        }
+        if (pendingPolicyRefresh) {
+          await refreshPolicyState(profilePath, { suppressTransientErrors: true }).catch(() => null);
+        }
+      }
+    })();
+
+    transportConnectRef.current = {
+      token,
+      profilePath,
+      promise,
+      pendingShellRefresh: false,
+      pendingPolicyRefresh: false,
+      pendingMessageRequestsRefresh: false,
+    };
+    return promise;
   }
 
   async function refreshDirectShell(
     explicitProfilePath?: string | null,
     explicitConversationId?: string | null,
     explicitContactUserId?: string | null,
+    refreshPolicy = true,
+    options?: { allowDuringTransportStartup?: boolean },
   ) {
     const profilePath = explicitProfilePath ?? state.bootstrap?.active_profile?.path ?? null;
     if (!profilePath) {
       return null;
+    }
+    if (!options?.allowDuringTransportStartup && isTransportStartupActive(profilePath)) {
+      markPendingTransportRefresh(profilePath, "shell");
+      return state.shell;
     }
     const selectedConversationId =
       explicitConversationId !== undefined
@@ -471,7 +669,12 @@ export function useDesktopController(windowLabel: string): DesktopController {
       shell = await directShell(profilePath, selectedConversationId, selectedContactUserId);
     }
     setState((current) => ({ ...current, shell, loading: false }));
-    await refreshPolicyState(profilePath);
+    if (refreshPolicy && state.bootstrap?.onboarding.step === "complete") {
+      await refreshPolicyState(profilePath, {
+        suppressTransientErrors: true,
+        allowDuringTransportStartup: options?.allowDuringTransportStartup,
+      });
+    }
     return shell;
   }
 
@@ -498,16 +701,74 @@ export function useDesktopController(windowLabel: string): DesktopController {
     setContactShareLink(link);
   }
 
-  async function refreshPolicyState(explicitProfilePath?: string | null) {
+  function shouldSuppressPolicyError(message: string) {
+    return (
+      message.includes("message requests were not returned by core") ||
+      message.includes("allowlist document was not returned by core")
+    );
+  }
+
+  async function refreshPolicyState(
+    explicitProfilePath?: string | null,
+    options?: { suppressTransientErrors?: boolean; allowDuringTransportStartup?: boolean },
+  ) {
     const profilePath = explicitProfilePath ?? state.bootstrap?.active_profile?.path ?? null;
-    if (!profilePath) {
+    const onboardingComplete = state.bootstrap?.onboarding.step === "complete";
+    if (!profilePath || !onboardingComplete) {
       return;
     }
-    const [messageRequests, allowlist] = await Promise.all([
+    if (!options?.allowDuringTransportStartup && isTransportStartupActive(profilePath)) {
+      markPendingTransportRefresh(profilePath, "policy");
+      return;
+    }
+    const [messageRequestsResult, allowlistResult] = await Promise.allSettled([
       messageRequestsList(profilePath),
       allowlistGet(profilePath),
     ]);
-    setState((current) => ({ ...current, messageRequests, allowlist }));
+    const nextState: Partial<ViewState> = {};
+    let transientError: string | null = null;
+    if (messageRequestsResult.status === "fulfilled") {
+      nextState.messageRequests = messageRequestsResult.value;
+    } else {
+      transientError = formatError(messageRequestsResult.reason);
+    }
+    if (allowlistResult.status === "fulfilled") {
+      nextState.allowlist = allowlistResult.value;
+    } else if (!transientError) {
+      transientError = formatError(allowlistResult.reason);
+    }
+    setState((current) => ({ ...current, ...nextState }));
+    if (
+      transientError &&
+      !(options?.suppressTransientErrors && shouldSuppressPolicyError(transientError)) &&
+      !onboardingHandoffRef.current
+    ) {
+      setState((current) => ({ ...current, error: transientError }));
+    }
+  }
+
+  async function refreshMessageRequestsState(
+    explicitProfilePath?: string | null,
+    options?: { allowDuringTransportStartup?: boolean },
+  ) {
+    const profilePath = explicitProfilePath ?? state.bootstrap?.active_profile?.path ?? null;
+    const onboardingComplete = state.bootstrap?.onboarding.step === "complete";
+    if (!profilePath || !onboardingComplete) {
+      return;
+    }
+    if (!options?.allowDuringTransportStartup && isTransportStartupActive(profilePath)) {
+      markPendingTransportRefresh(profilePath, "messageRequests");
+      return;
+    }
+    try {
+      const messageRequests = await messageRequestsList(profilePath);
+      setState((current) => ({ ...current, messageRequests }));
+    } catch (error) {
+      const formatted = formatError(error);
+      if (!shouldSuppressPolicyError(formatted)) {
+        throw error;
+      }
+    }
   }
 
   async function runTask(task: () => Promise<void>) {
@@ -713,6 +974,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
       selectedConversationId: null,
       selectedContactUserId: null,
     };
+    setMnemonicBackupPending(false);
     setOnboardingStepOverride("choose_profile");
     await showOnboardingWindow();
   }
@@ -754,6 +1016,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
         cloudflareWizard: null,
       }));
       setOnboardingStepOverride(null);
+      setMnemonicBackupPending(false);
       setSelectedAttachmentPaths([]);
       setPreview(null);
       setShowContactQr(false);
@@ -772,10 +1035,12 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     if (!profilePath) return;
     await runTask(async () => {
+      await waitForNextFrame();
       const identity = await identityCreate(profilePath, deviceName);
       setMnemonic(identity.mnemonic);
-      setOnboardingStepOverride(null);
+      setMnemonicBackupPending(true);
       await refreshBootstrap("Identity created.");
+      setOnboardingStepOverride("mnemonic_backup");
     });
   }
 
@@ -783,10 +1048,18 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     if (!profilePath) return;
     await runTask(async () => {
+      await waitForNextFrame();
       await identityRecover(profilePath, deviceName, mnemonic);
+      setMnemonicBackupPending(false);
       setOnboardingStepOverride(null);
       await refreshBootstrap("Identity recovered.");
     });
+  }
+
+  function handleConfirmMnemonicBackup() {
+    setMnemonicBackupPending(false);
+    setOnboardingStepOverride(null);
+    setState((current) => ({ ...current, success: "Recovery phrase backup confirmed." }));
   }
 
   function handleOnboardingBack() {
@@ -795,6 +1068,10 @@ export function useDesktopController(windowLabel: string): DesktopController {
       return;
     }
     if (wizardRunning) {
+      return;
+    }
+    if (onboardingViewStep === "mnemonic_backup") {
+      setOnboardingStepOverride("identity");
       return;
     }
     if (bootstrap.has_identity && !bootstrap.has_runtime_binding) {
@@ -958,27 +1235,43 @@ export function useDesktopController(windowLabel: string): DesktopController {
       const result = action === "accept"
         ? await messageRequestAccept(profilePath, requestId)
         : await messageRequestReject(profilePath, requestId);
-      const shell = await refreshDirectShell(
-        profilePath,
-        null,
-        action === "accept" ? result.sender_user_id : undefined,
-      );
-      const acceptedConversation = action === "accept"
-        ? shell?.conversations.find((conversation) => conversation.peer_user_id === result.sender_user_id)
-        : null;
-      selectionRef.current = {
-        selectedConversationId: acceptedConversation?.conversation_id ?? selectionRef.current.selectedConversationId,
-        selectedContactUserId: action === "accept" ? result.sender_user_id : selectionRef.current.selectedContactUserId,
-      };
+      await refreshMessageRequestsState(profilePath);
+      if (action === "accept") {
+        const selectedConversationId = result.conversation_id ?? null;
+        const selectedContactUserId = result.sender_user_id;
+        selectionRef.current = {
+          selectedConversationId,
+          selectedContactUserId,
+        };
+        setActiveSection("chats");
+        setState((current) => ({
+          ...current,
+          selectedConversationId,
+          selectedContactUserId,
+        }));
+        await refreshDirectShell(
+          profilePath,
+          selectedConversationId ?? undefined,
+          selectedContactUserId,
+          false,
+        );
+        setState((current) => ({
+          ...current,
+          selectedConversationId,
+          selectedContactUserId,
+          success: result.auto_created_conversation
+            ? "Request accepted. Direct conversation created."
+            : "Request accepted. Direct conversation ready.",
+        }));
+        return;
+      }
+
+      await refreshDirectShell(profilePath, undefined, undefined, false);
+      setActiveSection("requests");
       setState((current) => ({
         ...current,
-        selectedConversationId: acceptedConversation?.conversation_id ?? current.selectedConversationId,
-        selectedContactUserId: action === "accept" ? result.sender_user_id : current.selectedContactUserId,
-        success: action === "accept"
-          ? "Contact added and direct conversation ready."
-          : `Rejected request from ${result.sender_user_id}.`,
+        success: `Rejected request from ${result.sender_user_id}.`,
       }));
-      setActiveSection(action === "accept" ? "chats" : "requests");
     });
   }
 
@@ -1092,6 +1385,8 @@ export function useDesktopController(windowLabel: string): DesktopController {
       ? "choose_profile"
       : onboardingStepOverride === "identity" && (actualOnboardingViewStep === "identity" || actualOnboardingViewStep === "runtime")
         ? "identity"
+        : mnemonicBackupPending && actualOnboardingViewStep === "runtime"
+          ? "mnemonic_backup"
         : onboardingStepOverride === "runtime" && actualOnboardingViewStep === "runtime"
           ? "runtime"
           : actualOnboardingViewStep;
@@ -1136,6 +1431,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   const transferRows = state.shell?.attachment_transfers ?? [];
   const wizardRunning = !!cloudflareWizard && !["idle", "completed", "failed"].includes(cloudflareWizard.state);
   const canGoBackInOnboarding = onboardingViewStep === "identity"
+    || onboardingViewStep === "mnemonic_backup"
     || (onboardingViewStep === "runtime" && !wizardRunning);
 
   return {
@@ -1149,6 +1445,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     setDeviceName,
     mnemonic,
     setMnemonic,
+    handleConfirmMnemonicBackup,
     overrides,
     setOverrides,
     activeSection,

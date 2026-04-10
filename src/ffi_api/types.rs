@@ -16,7 +16,7 @@ use crate::transport_contract::{
     AllowlistDocument, AppendDeliveryDisposition, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
     FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestAction,
     MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
-    PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
+    MessageRequestRealtimeChange, PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, SharedStateDocumentKind,
 };
 
@@ -225,6 +225,11 @@ pub enum RealtimeEvent {
     InboxRecordAvailable {
         seq: u64,
         record: Option<InboxRecord>,
+    },
+    MessageRequestChanged {
+        sender_user_id: String,
+        request_id: String,
+        change: MessageRequestRealtimeChange,
     },
 }
 

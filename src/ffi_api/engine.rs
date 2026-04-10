@@ -951,15 +951,18 @@ impl CoreEngine {
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let contact_bundle = self.state.contacts.get(&peer_user_id).ok_or_else(|| {
-            CoreError::invalid_input("peer identity bundle has not been imported")
-        })?;
+        let contact_bundle = self.direct_peer_contact_bundle(&peer_user_id)?.clone();
         let peer_device_ids: Vec<String> = contact_bundle
             .devices
             .iter()
             .filter(|d| matches!(d.status, crate::model::DeviceStatusKind::Active))
             .map(|d| d.device_id.clone())
             .collect();
+        if peer_device_ids.is_empty() {
+            return Err(CoreError::invalid_input(
+                "peer identity bundle does not contain any active devices",
+            ));
+        }
         let local_conversation = ConversationManager::create_direct_conversation(
             &local_identity.user_identity.user_id,
             &local_identity.device_identity.device_id,
@@ -967,6 +970,28 @@ impl CoreEngine {
             &peer_device_ids,
         )?;
         let conversation_id = local_conversation.conversation.conversation_id.clone();
+        if let Some(existing) = self.state.conversations.get(&conversation_id) {
+            let recovery = self.recovery_snapshot_for_conversation(&conversation_id);
+            let existing_last_message_type = existing.last_message_type;
+            if !self.state.mls_summaries.contains_key(&conversation_id) {
+                return Err(CoreError::invalid_state(format!(
+                    "conversation {conversation_id} already exists but the MLS state is incomplete"
+                )));
+            }
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: Vec::new(),
+                view_model: Some(CoreViewModel {
+                    conversations: vec![ConversationSummary {
+                        conversation_id,
+                        state: format!("{:?}", existing.conversation.state).to_lowercase(),
+                        last_message_type: existing_last_message_type,
+                        recovery,
+                    }],
+                    ..CoreViewModel::default()
+                }),
+            });
+        }
         let peer_keypackages: Vec<PeerDeviceKeyPackage> = contact_bundle
             .devices
             .iter()
@@ -1952,6 +1977,7 @@ impl CoreEngine {
                     }
                 }
             }
+            RealtimeEvent::MessageRequestChanged { .. } => self.list_message_requests(),
         }
     }
 
@@ -2173,9 +2199,7 @@ impl CoreEngine {
     }
 
     fn peer_active_device_ids(&self, peer_user_id: &str) -> CoreResult<Vec<String>> {
-        let bundle = self.state.contacts.get(peer_user_id).ok_or_else(|| {
-            CoreError::invalid_input("peer identity bundle has not been imported")
-        })?;
+        let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
         let devices: Vec<String> = bundle
             .devices
             .iter()
@@ -2196,9 +2220,7 @@ impl CoreEngine {
         device_ids: &[String],
     ) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
         let wanted: BTreeSet<String> = device_ids.iter().cloned().collect();
-        let bundle = self.state.contacts.get(peer_user_id).ok_or_else(|| {
-            CoreError::invalid_input("peer identity bundle has not been imported")
-        })?;
+        let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
         Ok(bundle
             .devices
             .iter()
@@ -2242,6 +2264,29 @@ impl CoreEngine {
             .collect())
     }
 
+    fn direct_peer_contact_bundle(&self, peer_user_id: &str) -> CoreResult<&IdentityBundle> {
+        let bundle = self
+            .state
+            .contacts
+            .get(peer_user_id)
+            .ok_or_else(|| CoreError::invalid_input("peer contact is missing"))?;
+        if bundle.identity_bundle_ref.is_none() {
+            return Err(CoreError::invalid_input(
+                "peer identity bundle reference is missing",
+            ));
+        }
+        if !bundle
+            .devices
+            .iter()
+            .any(|device| matches!(device.status, crate::model::DeviceStatusKind::Active))
+        {
+            return Err(CoreError::invalid_input(
+                "peer identity bundle does not contain any active devices",
+            ));
+        }
+        Ok(bundle)
+    }
+
     fn enqueue_envelopes(&mut self, peer_user_id: String, envelopes: Vec<Envelope>) {
         for envelope in envelopes {
             self.state.outbox.push(envelope.clone());
@@ -2275,6 +2320,7 @@ impl CoreEngine {
                 "conversation membership is still recovering",
             ));
         }
+        self.direct_peer_contact_bundle(&conversation.peer_user_id)?;
         Ok(())
     }
 
@@ -2715,10 +2761,7 @@ impl CoreEngine {
 
     fn build_append_request(&mut self, item: &PendingOutboxItem) -> CoreResult<HttpRequestEffect> {
         let device_profile = self
-            .state
-            .contacts
-            .get(&item.peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer identity bundle has not been imported"))?
+            .direct_peer_contact_bundle(&item.peer_user_id)?
             .devices
             .iter()
             .find(|device| device.device_id == item.envelope.recipient_device_id)
@@ -2732,11 +2775,16 @@ impl CoreEngine {
                 peer_user_id: item.peer_user_id.clone(),
             },
         );
+        let sender_bundle_share_url = self
+            .state
+            .local_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.identity_bundle_ref.clone());
         let body = AppendEnvelopeRequest {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             recipient_device_id: item.envelope.recipient_device_id.clone(),
             envelope: item.envelope.clone(),
-            sender_bundle_share_url: None,
+            sender_bundle_share_url,
             sender_bundle_hash: None,
             sender_display_name: None,
         };

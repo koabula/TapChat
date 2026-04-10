@@ -60,6 +60,15 @@ export default function CloudflareSetupStep({
         <div className="wizard-status-row"><span>Workspace</span><strong>{preflight?.workspace_root_found ? "Found" : "Missing"}</strong></div>
         <div className="wizard-status-row"><span>Wrangler</span><strong>{preflight?.wrangler_available ? "Available" : "Missing"}</strong></div>
         <div className="wizard-status-row"><span>Identity</span><strong>{preflight?.identity_ready ? "Ready" : "Missing"}</strong></div>
+        {failed && wizard?.diagnostic_bootstrap_url && (
+          <div className="wizard-status-row"><span>Bootstrap URL</span><strong>{wizard.diagnostic_bootstrap_url}</strong></div>
+        )}
+        {failed && wizard?.diagnostic_deploy_url && (
+          <div className="wizard-status-row"><span>Deploy URL</span><strong>{wizard.diagnostic_deploy_url}</strong></div>
+        )}
+        {failed && wizard?.diagnostic_runtime_url && (
+          <div className="wizard-status-row"><span>Runtime URL</span><strong>{wizard.diagnostic_runtime_url}</strong></div>
+        )}
         {failed && wizard?.last_error_detail && <small className="muted">{wizard.last_error_detail}</small>}
       </div>
 

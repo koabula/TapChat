@@ -505,7 +505,17 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
         0
     );
 
-    runtime_accept_message_request(&runtime, bundle_auth(&bob_bundle)?, &requests[0].request_id)?;
+    let accepted = run_cli_json([
+        "contact",
+        "requests",
+        "accept",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--request-id",
+        &requests[0].request_id,
+    ])?;
+    assert_eq!(accepted["accepted"], Value::Bool(true));
+    assert_eq!(accepted["sender_user_id"].as_str(), Some(alice_user_id.as_str()));
 
     let post_accept_sync = sync_once(&bob_profile)?;
     assert_eq!(post_accept_sync["synced"], Value::Bool(true));
@@ -539,6 +549,58 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
     ])?;
     assert_eq!(
         count_plaintext_messages(&repeat_messages, "pending request message"),
+        1
+    );
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--text",
+        "accepted reply from bob",
+    ])?;
+
+    let alice_after_reply = sync_once(&alice_profile)?;
+    assert_eq!(alice_after_reply["synced"], Value::Bool(true));
+    let alice_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&alice_messages, "accepted reply from bob"),
+        1
+    );
+
+    run_cli_json([
+        "message",
+        "send-text",
+        "--profile",
+        &alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--text",
+        "follow-up from alice",
+    ])?;
+
+    let bob_after_follow_up = sync_once(&bob_profile)?;
+    assert_eq!(bob_after_follow_up["synced"], Value::Bool(true));
+    let bob_messages = run_cli_json([
+        "message",
+        "list",
+        "--profile",
+        &bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&bob_messages, "follow-up from alice"),
         1
     );
 
@@ -5145,13 +5207,6 @@ fn runtime_list_message_requests(
     with_tokio(|| async { runtime.list_message_requests(auth).await })
 }
 
-fn runtime_accept_message_request(
-    runtime: &CloudflareRuntimeHandle,
-    auth: &DeviceRuntimeAuth,
-    request_id: &str,
-) -> Result<()> {
-    with_tokio(|| async { runtime.accept_message_request(auth, request_id).await })
-}
 fn runtime_get_identity_bundle(
     runtime: &CloudflareRuntimeHandle,
     user_id: &str,

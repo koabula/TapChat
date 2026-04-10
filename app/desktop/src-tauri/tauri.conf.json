@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build"
+    "beforeBuildCommand": "npm run build:release-assets"
   },
   "app": {
     "windows": [
@@ -38,6 +38,9 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["msi", "dmg", "app", "deb", "appimage"],
+    "resources": ["../runtime/dist/**/*"],
+    "icon": ["icons/icon.ico"]
   }
 }

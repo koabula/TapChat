@@ -38,7 +38,7 @@ export default function IdentityStep({
         </label>
         <label>
           <span>Recovery mnemonic</span>
-          <textarea rows={5} value={mnemonic} onChange={(event) => setMnemonic(event.target.value)} placeholder="Only required when recovering an existing identity." />
+          <textarea rows={3} value={mnemonic} onChange={(event) => setMnemonic(event.target.value)} placeholder="Only required when recovering an existing identity." />
         </label>
       </div>
       <div className="button-row">

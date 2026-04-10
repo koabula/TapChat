@@ -1170,6 +1170,24 @@ fn parse_realtime_event(device_id: &str, text: &str) -> Result<CoreEvent> {
                 .map(|record| serde_json::from_value(record.clone()))
                 .transpose()?,
         },
+        "message_request_changed" => RealtimeEvent::MessageRequestChanged {
+            sender_user_id: value
+                .get("sender_user_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("missing sender_user_id"))?
+                .to_string(),
+            request_id: value
+                .get("request_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("missing request_id"))?
+                .to_string(),
+            change: value
+                .get("change")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .ok_or_else(|| anyhow!("missing change"))?,
+        },
         other => return Err(anyhow!("unsupported realtime event {other}")),
     };
     Ok(CoreEvent::RealtimeEventReceived {
@@ -1227,6 +1245,29 @@ mod tests {
                 assert!(matches!(
                     event,
                     crate::ffi_api::RealtimeEvent::HeadUpdated { seq: 7 }
+                ));
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn websocket_message_request_payload_maps_to_core_event() {
+        let event = parse_realtime_event(
+            "device:bob:phone",
+            r#"{"event":"message_request_changed","sender_user_id":"user:alice","request_id":"request:user:alice","change":"queued"}"#,
+        )
+        .expect("parse");
+        match event {
+            crate::CoreEvent::RealtimeEventReceived { device_id, event } => {
+                assert_eq!(device_id, "device:bob:phone");
+                assert!(matches!(
+                    event,
+                    crate::ffi_api::RealtimeEvent::MessageRequestChanged {
+                        sender_user_id,
+                        request_id,
+                        change: crate::transport_contract::MessageRequestRealtimeChange::Queued,
+                    } if sender_user_id == "user:alice" && request_id == "request:user:alice"
                 ));
             }
             _ => panic!("unexpected event"),

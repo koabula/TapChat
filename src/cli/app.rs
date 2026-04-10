@@ -5,10 +5,14 @@ use clap::Parser;
 use reqwest::Client;
 use serde::Serialize;
 
+use crate::contact_workflows::{
+    accept_message_request_with_bundle_import, import_identity_bundle_into_profile,
+    message_request_action_from_output, message_requests_from_output, persist_driver,
+};
 use crate::ffi_api::{AttachmentDescriptor, CoreCommand, CoreEvent};
 use crate::model::{ConversationKind, DeploymentBundle, DeviceStatusKind, Validate};
 use crate::persistence::CorePersistenceSnapshot;
-use crate::transport_contract::{AllowlistDocument, GetHeadResult, MessageRequestItem};
+use crate::transport_contract::{AllowlistDocument, GetHeadResult};
 
 use super::args::{
     Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
@@ -224,16 +228,8 @@ impl CliApp {
                 let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let bundle = Profile::load_identity_bundle_file(bundle_file)?;
                 let mut driver = load_driver(&profile)?;
-                driver
-                    .run_command_until_idle(CoreCommand::ImportIdentityBundle {
-                        bundle: bundle.clone(),
-                    })
-                    .await?;
-                profile.save_identity_bundle(
-                    &bundle,
-                    &format!("identity_{}.json", bundle.user_id.replace(':', "_")),
-                )?;
-                persist_driver(&mut profile, &driver)?;
+                let bundle =
+                    import_identity_bundle_into_profile(&mut profile, &mut driver, bundle).await?;
                 self.print_value(&serde_json::json!({
                     "imported": true,
                     "user_id": bundle.user_id,
@@ -294,15 +290,14 @@ impl CliApp {
                 profile,
                 request_id,
             } => {
-                let profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
-                let output = driver
-                    .run_command_until_idle(CoreCommand::ActOnMessageRequest {
-                        request_id,
-                        action: crate::transport_contract::MessageRequestAction::Accept,
-                    })
-                    .await?;
-                let result = message_request_action_from_output(&output)?;
+                let result = accept_message_request_with_bundle_import(
+                    &mut profile,
+                    &mut driver,
+                    &request_id,
+                )
+                .await?;
                 self.print_value(&serde_json::json!({
                     "accepted": result.accepted,
                     "request_id": result.request_id,
@@ -1045,20 +1040,6 @@ fn resolve_profile_path(profile: Option<PathBuf>) -> Result<PathBuf> {
     Ok(ProfileRegistry::load()?.current()?.root_dir.clone())
 }
 
-fn persist_driver(profile: &mut Profile, driver: &CoreDriver) -> Result<()> {
-    if let Some(snapshot) = driver.latest_snapshot() {
-        profile.save_snapshot(snapshot)?;
-    }
-    let user_id = driver
-        .local_identity()
-        .map(|identity| identity.user_identity.user_id.clone());
-    let device_id = driver
-        .local_identity()
-        .map(|identity| identity.device_identity.device_id.clone());
-    profile.update_identity(user_id, device_id)?;
-    Ok(())
-}
-
 fn load_driver(profile: &Profile) -> Result<CoreDriver> {
     let snapshot = profile.load_snapshot()?;
     let base_url = snapshot
@@ -1106,24 +1087,6 @@ fn local_device_id(driver: &CoreDriver) -> Result<String> {
         .local_identity()
         .map(|identity| identity.device_identity.device_id.clone())
         .ok_or_else(|| anyhow!("local identity is not initialized"))
-}
-
-fn message_requests_from_output(output: &crate::ffi_api::CoreOutput) -> Result<&Vec<MessageRequestItem>> {
-    output
-        .view_model
-        .as_ref()
-        .and_then(|view| Some(&view.message_requests))
-        .ok_or_else(|| anyhow!("message requests were not returned by core"))
-}
-
-fn message_request_action_from_output(
-    output: &crate::ffi_api::CoreOutput,
-) -> Result<&crate::ffi_api::MessageRequestActionSummary> {
-    output
-        .view_model
-        .as_ref()
-        .and_then(|view| view.message_request_action.as_ref())
-        .ok_or_else(|| anyhow!("message request action result was not returned by core"))
 }
 
 fn allowlist_from_output(output: &crate::ffi_api::CoreOutput) -> Result<&AllowlistDocument> {

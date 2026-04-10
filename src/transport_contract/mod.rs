@@ -24,6 +24,14 @@ pub enum AppendDeliveryDisposition {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRequestRealtimeChange {
+    Queued,
+    Accepted,
+    Rejected,
+}
+
 impl Default for AppendDeliveryDisposition {
     fn default() -> Self {
         Self::Inbox

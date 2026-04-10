@@ -47,6 +47,42 @@ mod tests {
     }
 
     #[test]
+    fn create_direct_conversation_is_idempotent_for_existing_peer() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let first_summary = alice
+            .mls_summary(&conversation_id)
+            .expect("first mls summary")
+            .clone();
+
+        let second = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("second create");
+
+        assert!(second.effects.is_empty());
+        assert_eq!(alice.state.conversations.len(), 1);
+        assert_eq!(
+            alice
+                .mls_summary(&conversation_id)
+                .expect("existing mls summary"),
+            &first_summary
+        );
+        assert_eq!(
+            second
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .conversations[0]
+                .conversation_id,
+            conversation_id
+        );
+    }
+
+    #[test]
     fn realtime_head_updated_triggers_fetch() {
         let mut engine = CoreEngine::new();
         engine

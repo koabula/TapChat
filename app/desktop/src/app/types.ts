@@ -34,7 +34,7 @@ export type ViewState = {
 
 export type ActiveSection = "chats" | "contacts" | "requests";
 export type DrawerMode = "closed" | "runtime" | "policy" | "diagnostics";
-export type OnboardingViewStep = "choose_profile" | "identity" | "runtime" | "complete";
+export type OnboardingViewStep = "choose_profile" | "identity" | "mnemonic_backup" | "runtime" | "complete";
 export type ConnectionHealth = "ready" | "connecting" | "connected" | "reconnecting" | "degraded" | "disconnected";
 
 export type DesktopController = {
@@ -48,6 +48,7 @@ export type DesktopController = {
   setDeviceName: (value: string) => void;
   mnemonic: string;
   setMnemonic: (value: string) => void;
+  handleConfirmMnemonicBackup: () => void;
   overrides: CloudflareDeployOverrides;
   setOverrides: Dispatch<SetStateAction<CloudflareDeployOverrides>>;
   activeSection: ActiveSection;

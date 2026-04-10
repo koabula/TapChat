@@ -182,6 +182,21 @@ function waitForWebSocketMessage(socket: RuntimeWebSocket, timeoutMs = 3_000): P
   });
 }
 
+async function waitForMatchingWebSocketMessage<T>(
+  socket: RuntimeWebSocket,
+  matcher: (value: unknown) => value is T,
+  timeoutMs = 3_000
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const message = await waitForWebSocketMessage(socket, Math.max(1, deadline - Date.now()));
+    if (matcher(message)) {
+      return message;
+    }
+  }
+  throw new Error(`timed out waiting for matching websocket message after ${timeoutMs}ms`);
+}
+
 async function waitForSubscribeReady(socket: RuntimeWebSocket): Promise<void> {
   socket.accept();
   await new Promise((resolve) => setTimeout(resolve, 25));
@@ -351,7 +366,7 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
   }
 });
 
-test("runtime integration: message requests do not push until accepted", async (t) => {
+test("runtime integration: message request changes push over realtime and inbox stays empty until accepted", async (t) => {
   const mf = await createRuntime();
   t.after(async () => {
     await mf.dispose();
@@ -372,10 +387,22 @@ test("runtime integration: message requests do not push until accepted", async (
   assert.ok(subscribeResponse.webSocket);
   const socket = subscribeResponse.webSocket as unknown as RuntimeWebSocket;
   await waitForSubscribeReady(socket);
+  const queuedMessage = waitForWebSocketMessage(socket);
 
   const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
   assert.equal(queued.deliveredTo, "message_request");
   assert.equal(queued.queuedAsRequest, true);
+  const queuedEvent = (await queuedMessage) as {
+    event: string;
+    deviceId: string;
+    senderUserId: string;
+    requestId: string;
+    change: string;
+  };
+  assert.equal(queuedEvent.event, "message_request_changed");
+  assert.equal(queuedEvent.deviceId, deviceId);
+  assert.equal(queuedEvent.senderUserId, "user:mallory");
+  assert.equal(queuedEvent.change, "queued");
 
   const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
     headers: authHeaders(token)
@@ -398,6 +425,27 @@ test("runtime integration: message requests do not push until accepted", async (
     }
   );
   assert.equal(acceptResponse.status, 200);
+  const acceptedEvent = await waitForMatchingWebSocketMessage(socket, (value): value is {
+    event: string;
+    senderUserId: string;
+    requestId: string;
+    change: string;
+  } => {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+    const candidate = value as Record<string, unknown>;
+    return (
+      candidate.event === "message_request_changed" &&
+      candidate.change === "accepted" &&
+      candidate.senderUserId === "user:mallory" &&
+      candidate.requestId === requests.requests[0].requestId
+    );
+  });
+  assert.equal(acceptedEvent.event, "message_request_changed");
+  assert.equal(acceptedEvent.senderUserId, "user:mallory");
+  assert.equal(acceptedEvent.requestId, requests.requests[0].requestId);
+  assert.equal(acceptedEvent.change, "accepted");
 
   const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
     headers: authHeaders(token)

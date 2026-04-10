@@ -310,10 +310,13 @@ export interface DeviceRuntimeToken {
 }
 
 export interface RealtimeEvent {
-  event: "head_updated" | "inbox_record_available";
+  event: "head_updated" | "inbox_record_available" | "message_request_changed";
   deviceId: string;
-  seq: number;
+  seq?: number;
   record?: InboxRecord;
+  senderUserId?: string;
+  requestId?: string;
+  change?: "queued" | "accepted" | "rejected";
 }
 
 export interface AllowlistDocument {

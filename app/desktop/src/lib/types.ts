@@ -69,6 +69,9 @@ export type CloudflareWizardStatusView = {
   bundle_imported: boolean;
   last_error_code?: string | null;
   last_error_detail?: string | null;
+  diagnostic_bootstrap_url?: string | null;
+  diagnostic_deploy_url?: string | null;
+  diagnostic_runtime_url?: string | null;
 };
 
 export type BannerView = {
@@ -157,6 +160,10 @@ export type MessageRequestActionView = {
   sender_user_id: string;
   promoted_count: number;
   action: string;
+  contact_available: boolean;
+  conversation_available: boolean;
+  auto_created_conversation: boolean;
+  conversation_id?: string | null;
   sender_bundle_share_url?: string | null;
 };
 

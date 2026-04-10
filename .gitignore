@@ -9,3 +9,5 @@ node_modules/
 /services/cloudflare/.cli-smoke*/
 /services/cloudflare/.wrangler/tmp/
 /.prod-smoke/
+/app/desktop/runtime/dist/
+/app/desktop/src-tauri/target/portable/

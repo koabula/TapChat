@@ -26,6 +26,7 @@ const TEMP_DIR_PREFIX = path.join(os.tmpdir(), "tapchat-cloudflare-deploy-");
 const TEMP_CONFIG_NAME = ".wrangler.deploy.toml";
 const NON_INTERACTIVE_CONFIG = process.env.TAPCHAT_CLOUDFLARE_DEPLOY_CONFIG_JSON;
 const JSON_OUTPUT = process.env.TAPCHAT_CLOUDFLARE_DEPLOY_OUTPUT === "json";
+const DESKTOP_BUNDLED = process.env.TAPCHAT_DESKTOP_BUNDLED === "1";
 
 const DEFAULTS = {
   workerName: "tapchat-cloudflare",
@@ -121,21 +122,28 @@ async function runCommand(command, args, options = {}) {
     const child = spawn(command, args, {
       cwd,
       env: env ? { ...process.env, ...env } : process.env,
-      stdio: capture ? ["pipe", "pipe", "pipe"] : ["pipe", "inherit", "inherit"],
-      shell: false
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true
     });
 
     let stdoutBuffer = "";
     let stderrBuffer = "";
 
-    if (capture) {
-      child.stdout.on("data", (chunk) => {
-        stdoutBuffer += chunk.toString();
-      });
-      child.stderr.on("data", (chunk) => {
-        stderrBuffer += chunk.toString();
-      });
-    }
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      stdoutBuffer += text;
+      if (!capture) {
+        stdout.write(text);
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      stderrBuffer += text;
+      if (!capture) {
+        process.stderr.write(text);
+      }
+    });
 
     child.on("error", (error) => {
       reject(error);
@@ -442,14 +450,18 @@ async function main() {
     await putSecret(tempConfigPath, "SHARING_TOKEN_SECRET", config.sharingTokenSecret);
     await putSecret(tempConfigPath, "BOOTSTRAP_TOKEN_SECRET", config.bootstrapTokenSecret);
 
-    logStep("Running pre-deploy checks");
-    try {
-      await runCommand(npmCommand(), npmArgs("run", "check"));
-      await runCommand(npmCommand(), npmArgs("test"));
-      await runCommand(npmCommand(), npmArgs("run", "test:integration"));
-    } catch (error) {
-      process.exitCode = EXIT_CODES.test;
-      throw error;
+    if (DESKTOP_BUNDLED) {
+      logStep("Skipping pre-deploy checks in desktop bundled mode");
+    } else {
+      logStep("Running pre-deploy checks");
+      try {
+        await runCommand(npmCommand(), npmArgs("run", "check"));
+        await runCommand(npmCommand(), npmArgs("test"));
+        await runCommand(npmCommand(), npmArgs("run", "test:integration"));
+      } catch (error) {
+        process.exitCode = EXIT_CODES.test;
+        throw error;
+      }
     }
 
     logStep("Deploying to Cloudflare");

@@ -8,7 +8,8 @@
     "test": "tsx --test test/cloudflare.test.ts",
     "test:integration": "tsx --test test/*.integration.test.ts",
     "transport:runtime": "node scripts/transport-runtime.mjs",
-    "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs"
+    "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
+    "cleanup:cloudflare": "node scripts/cleanup-cloudflare.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",
