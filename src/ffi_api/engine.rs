@@ -546,10 +546,7 @@ impl CoreEngine {
             CoreEvent::MessageRequestsFetched { requests } => {
                 Ok(self.message_requests_output(requests))
             }
-            CoreEvent::MessageRequestsFetchFailed {
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
+            CoreEvent::MessageRequestsFetchFailed { retryable: _, detail } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -586,10 +583,7 @@ impl CoreEngine {
                 view_model: None,
             }),
             CoreEvent::AllowlistFetched { document } => self.handle_allowlist_fetched(document),
-            CoreEvent::AllowlistFetchFailed {
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
+            CoreEvent::AllowlistFetchFailed { retryable: _, detail } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -603,10 +597,7 @@ impl CoreEngine {
                 view_model: None,
             }),
             CoreEvent::AllowlistReplaced { document } => Ok(self.allowlist_output(document, true)),
-            CoreEvent::AllowlistReplaceFailed {
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
+            CoreEvent::AllowlistReplaceFailed { retryable: _, detail } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -683,9 +674,7 @@ impl CoreEngine {
             )],
             view_model: None,
         };
-        output
-            .effects
-            .extend(self.local_shared_state_publish_effects()?);
+        output.effects.extend(self.local_shared_state_publish_effects()?);
         Ok(output)
     }
 
@@ -943,9 +932,7 @@ impl CoreEngine {
             )],
             view_model: None,
         };
-        output
-            .effects
-            .extend(self.local_shared_state_publish_effects()?);
+        output.effects.extend(self.local_shared_state_publish_effects()?);
         Ok(output)
     }
 
@@ -2133,7 +2120,10 @@ impl CoreEngine {
                 contacts_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveDeployment],
+            )],
             view_model: Some(CoreViewModel {
                 banners: vec![SystemBanner {
                     status: SystemStatus::SyncInProgress,
@@ -2968,10 +2958,7 @@ impl CoreEngine {
                 self.state
                     .pending_outbox
                     .retain(|item| item.envelope.message_id != message_id);
-                Ok(merge_outputs(
-                    request_output,
-                    self.flush_pending_transport()?,
-                ))
+                Ok(merge_outputs(request_output, self.flush_pending_transport()?))
             }
             PendingRequest::Ack { device_id, .. } => {
                 let result: AckResult = serde_json::from_str(
@@ -4003,20 +3990,13 @@ impl CoreEngine {
         }
     }
 
-    fn handle_allowlist_fetched(
-        &mut self,
-        mut document: AllowlistDocument,
-    ) -> CoreResult<CoreOutput> {
+    fn handle_allowlist_fetched(&mut self, mut document: AllowlistDocument) -> CoreResult<CoreOutput> {
         let Some(mutation) = self.state.pending_allowlist_mutation.take() else {
             return Ok(self.allowlist_output(document, false));
         };
         match mutation {
             PendingAllowlistMutation::Add { user_id } => {
-                if !document
-                    .allowed_sender_user_ids
-                    .iter()
-                    .any(|existing| existing == &user_id)
-                {
+                if !document.allowed_sender_user_ids.iter().any(|existing| existing == &user_id) {
                     document.allowed_sender_user_ids.push(user_id.clone());
                     document.allowed_sender_user_ids.sort();
                     document.allowed_sender_user_ids.dedup();
@@ -4333,9 +4313,7 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
             base_view.messages.append(&mut next_view.messages);
             base_view.contacts.append(&mut next_view.contacts);
             base_view.banners.append(&mut next_view.banners);
-            base_view
-                .message_requests
-                .append(&mut next_view.message_requests);
+            base_view.message_requests.append(&mut next_view.message_requests);
             if next_view.allowlist.is_some() {
                 base_view.allowlist = next_view.allowlist.take();
             }

@@ -1,13 +1,10 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::Write;
-use std::panic;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
@@ -15,16 +12,12 @@ use tauri::webview::WebviewWindowBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
+use tapchat_core::cli::runtime::CloudflareDeployOverrides;
 use tapchat_core::cli::driver::CoreDriver;
 use tapchat_core::cli::profile::Profile;
-use tapchat_core::cli::runtime::CloudflareDeployOverrides;
-use tapchat_core::desktop_app;
 use tapchat_core::ffi_api::CoreOutput;
 use tapchat_core::CoreEvent;
-
-static APP_LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
-static ACTIVE_PROFILE_LOG_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-static ONBOARDING_HANDOFF_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+use tapchat_core::desktop_app;
 
 #[derive(Debug, Clone, Default)]
 struct SessionStatus {
@@ -68,289 +61,8 @@ struct CloudflareWizardManager {
     generations: Mutex<HashMap<String, u64>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowRoute {
-    Main,
-    Onboarding,
-}
-
-#[derive(Debug, Clone, Default)]
-struct WindowRoutingSnapshot {
-    route: Option<WindowRoute>,
-    onboarding_complete: bool,
-    active_profile_path: Option<String>,
-}
-
-#[derive(Default)]
-struct WindowRoutingState {
-    snapshot: Mutex<WindowRoutingSnapshot>,
-    deferred_onboarding_close_in_flight: AtomicBool,
-}
-
-fn window_route_label(route: WindowRoute) -> &'static str {
-    match route {
-        WindowRoute::Main => "main",
-        WindowRoute::Onboarding => "onboarding",
-    }
-}
-
-fn route_is_unchanged(current: Option<WindowRoute>, next: WindowRoute) -> bool {
-    current.is_some_and(|value| value == next)
-}
-
-fn route_target_available(app: &AppHandle, route: WindowRoute) -> bool {
-    match route {
-        WindowRoute::Main => app.get_webview_window("main").is_some(),
-        WindowRoute::Onboarding => app.get_webview_window("onboarding").is_some(),
-    }
-}
-
-fn should_exit_on_onboarding_close(onboarding_complete: bool) -> bool {
-    !onboarding_complete
-}
-
-fn cache_window_bootstrap_state(
-    app: &AppHandle,
-    active_profile_path: Option<&str>,
-    onboarding_complete: bool,
-) {
-    if let Ok(mut snapshot) = app.state::<WindowRoutingState>().snapshot.lock() {
-        snapshot.onboarding_complete = onboarding_complete;
-        snapshot.active_profile_path = active_profile_path.map(str::to_string);
-    }
-}
-
-fn cache_window_route_state(
-    app: &AppHandle,
-    route: WindowRoute,
-    active_profile_path: Option<&str>,
-    onboarding_complete: bool,
-) {
-    if let Ok(mut snapshot) = app.state::<WindowRoutingState>().snapshot.lock() {
-        snapshot.route = Some(route);
-        snapshot.onboarding_complete = onboarding_complete;
-        snapshot.active_profile_path = active_profile_path.map(str::to_string);
-    }
-}
-
-fn cached_window_snapshot(app: &AppHandle) -> WindowRoutingSnapshot {
-    app.state::<WindowRoutingState>()
-        .snapshot
-        .lock()
-        .ok()
-        .map(|snapshot| snapshot.clone())
-        .unwrap_or_default()
-}
-
-fn active_profile_log_root() -> &'static Mutex<Option<PathBuf>> {
-    ACTIVE_PROFILE_LOG_ROOT.get_or_init(|| Mutex::new(None))
-}
-
-fn update_active_profile_log_root(profile_path: Option<&str>) {
-    if let Ok(mut current) = active_profile_log_root().lock() {
-        *current = profile_path.map(PathBuf::from);
-    }
-}
-
-fn default_app_log_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
-            return PathBuf::from(local_app_data)
-                .join("TapChat Desktop")
-                .join("logs");
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Logs")
-                .join("TapChat Desktop");
-        }
-    }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        if let Ok(xdg_state_home) = env::var("XDG_STATE_HOME") {
-            return PathBuf::from(xdg_state_home)
-                .join("tapchat-desktop")
-                .join("logs");
-        }
-        if let Ok(home) = env::var("HOME") {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("state")
-                .join("tapchat-desktop")
-                .join("logs");
-        }
-    }
-    env::temp_dir().join("tapchat-desktop").join("logs")
-}
-
-fn register_app_log_dir(app: Option<&AppHandle>) -> PathBuf {
-    let path = app
-        .and_then(|handle| handle.path().app_log_dir().ok())
-        .unwrap_or_else(default_app_log_dir);
-    let _ = fs::create_dir_all(&path);
-    let _ = APP_LOG_DIR.set(path.clone());
-    path
-}
-
-fn resolve_log_path(profile_path: Option<&str>) -> PathBuf {
-    if let Some(profile_path) = profile_path {
-        return PathBuf::from(profile_path).join("logs").join("desktop.log");
-    }
-    if let Ok(current) = active_profile_log_root().lock() {
-        if let Some(profile_root) = current.as_ref() {
-            return profile_root.join("logs").join("desktop.log");
-        }
-    }
-    APP_LOG_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(default_app_log_dir)
-        .join("desktop.log")
-}
-
-fn append_log(profile_path: Option<&str>, level: &str, scope: &str, message: impl AsRef<str>) {
-    let path = resolve_log_path(profile_path);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(
-            file,
-            "[{timestamp}] [{level}] [{scope}] {}",
-            message.as_ref().replace('\n', " | ")
-        );
-    }
-}
-
-fn install_panic_hook() {
-    panic::set_hook(Box::new(|panic_info| {
-        let payload = panic_info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|value| (*value).to_string())
-            .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic payload".into());
-        let location = panic_info
-            .location()
-            .map(|location| {
-                format!(
-                    "{}:{}:{}",
-                    location.file(),
-                    location.line(),
-                    location.column()
-                )
-            })
-            .unwrap_or_else(|| "unknown location".into());
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        let message = format!(
-            "thread={} payload={} location={} backtrace={backtrace}",
-            std::thread::current().name().unwrap_or("unnamed"),
-            payload,
-            location
-        );
-        // Always write to the app-level log.
-        append_log(None, "ERROR", "panic", &message);
-        // Also write to the active profile log so crash details appear in the
-        // same file that the frontend reads for diagnostics.
-        if let Ok(current) = active_profile_log_root().lock() {
-            if let Some(profile_root) = current.as_ref() {
-                append_log(
-                    Some(profile_root.to_string_lossy().as_ref()),
-                    "ERROR",
-                    "panic",
-                    &message,
-                );
-            }
-        }
-    }));
-}
-
-struct OnboardingHandoffGuard;
-
-impl OnboardingHandoffGuard {
-    fn try_acquire() -> Option<Self> {
-        ONBOARDING_HANDOFF_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()?;
-        Some(Self)
-    }
-}
-
-impl Drop for OnboardingHandoffGuard {
-    fn drop(&mut self) {
-        ONBOARDING_HANDOFF_IN_FLIGHT.store(false, Ordering::SeqCst);
-    }
-}
-
-fn log_command_error(command: &str, profile_path: Option<&str>, error: &str) {
-    append_log(
-        profile_path,
-        "ERROR",
-        "command",
-        format!("{command} failed: {error}"),
-    );
-}
-
 fn into_string_error(error: anyhow::Error) -> String {
-    let rendered = error.to_string();
-    append_log(None, "ERROR", "command", &rendered);
-    rendered
-}
-
-fn into_string_error_for(
-    command: &str,
-    profile_path: Option<&str>,
-    error: anyhow::Error,
-) -> String {
-    let rendered = error.to_string();
-    log_command_error(command, profile_path, &rendered);
-    rendered
-}
-
-fn log_realtime_transition(
-    profile_path: &str,
-    status: &Arc<Mutex<SessionStatus>>,
-    device_id: Option<&str>,
-    connected: bool,
-    needs_reconnect: bool,
-    last_known_seq: Option<u64>,
-    reason: &str,
-) {
-    if let Ok(mut current) = status.lock() {
-        let changed = current.connected != connected
-            || current.needs_reconnect != needs_reconnect
-            || last_known_seq.is_some_and(|seq| seq != current.last_known_seq)
-            || device_id.map(str::to_string) != current.device_id;
-        current.connected = connected;
-        current.needs_reconnect = needs_reconnect;
-        if let Some(seq) = last_known_seq {
-            current.last_known_seq = seq;
-        }
-        current.device_id = device_id.map(str::to_string);
-        if changed {
-            append_log(
-                Some(profile_path),
-                "INFO",
-                "realtime",
-                format!(
-                    "session status reason={reason} device_id={:?} connected={} needs_reconnect={} last_known_seq={}",
-                    current.device_id,
-                    current.connected,
-                    current.needs_reconnect,
-                    current.last_known_seq
-                ),
-            );
-        }
-    }
+    error.to_string()
 }
 
 fn desktop_runtime_platform_dir() -> &'static str {
@@ -412,20 +124,15 @@ fn active_download_count(manager: &BackgroundDownloadManager, profile_path: Opti
         .lock()
         .ok()
         .map(|tasks| {
-            tasks
-                .values()
-                .filter(|task| profile_path.is_none_or(|value| value == task.profile_path))
-                .count()
+            tasks.values().filter(|task| {
+                profile_path.is_none_or(|value| value == task.profile_path)
+            }).count()
         })
         .unwrap_or_default()
 }
 
 fn last_background_error(manager: &BackgroundDownloadManager) -> Option<String> {
-    manager
-        .last_error
-        .lock()
-        .ok()
-        .and_then(|value| value.clone())
+    manager.last_error.lock().ok().and_then(|value| value.clone())
 }
 
 fn set_last_background_error(manager: &BackgroundDownloadManager, error: Option<String>) {
@@ -488,12 +195,6 @@ async fn stop_realtime_session(
     manager: &RealtimeManager,
     profile_path: &str,
 ) -> Result<bool, String> {
-    append_log(
-        Some(profile_path),
-        "INFO",
-        "realtime",
-        "stop session requested",
-    );
     let _ = bump_realtime_generation(manager, profile_path)?;
     let handle = {
         let mut sessions = manager
@@ -503,26 +204,10 @@ async fn stop_realtime_session(
         sessions.remove(profile_path)
     };
     let Some(handle) = handle else {
-        append_log(
-            Some(profile_path),
-            "INFO",
-            "realtime",
-            "stop session skipped because no active session existed",
-        );
         return Ok(false);
     };
     let _ = handle.stop.send(());
-    handle.task.await.map_err(|error| {
-        let rendered = error.to_string();
-        log_command_error("stop_realtime_session", Some(profile_path), &rendered);
-        rendered
-    })?;
-    append_log(
-        Some(profile_path),
-        "INFO",
-        "realtime",
-        "stop session completed",
-    );
+    handle.task.await.map_err(|error| error.to_string())?;
     Ok(true)
 }
 
@@ -535,12 +220,6 @@ async fn run_with_paused_realtime<T, Fut>(
 where
     Fut: Future<Output = Result<T, String>>,
 {
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "realtime",
-        "run_with_paused_realtime begin",
-    );
     let should_resume = stop_realtime_session(manager, &profile_path).await?;
     let result = task.await;
     let resume_result = if should_resume {
@@ -548,26 +227,8 @@ where
     } else {
         Ok(())
     };
-    if let Err(error) = result.as_ref() {
-        log_command_error("run_with_paused_realtime.task", Some(&profile_path), error);
-    }
-    if let Err(error) = resume_result.as_ref() {
-        log_command_error(
-            "run_with_paused_realtime.resume",
-            Some(&profile_path),
-            error,
-        );
-    }
     match (result, resume_result) {
-        (Ok(value), Ok(())) => {
-            append_log(
-                Some(&profile_path),
-                "INFO",
-                "realtime",
-                "run_with_paused_realtime completed",
-            );
-            Ok(value)
-        }
+        (Ok(value), Ok(())) => Ok(value),
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(_resume_error)) => Err(error),
@@ -600,11 +261,7 @@ fn bump_wizard_generation(
         .generations
         .lock()
         .map_err(|_| "wizard generations lock poisoned".to_string())?;
-    let next = generations
-        .get(profile_path)
-        .copied()
-        .unwrap_or_default()
-        .saturating_add(1);
+    let next = generations.get(profile_path).copied().unwrap_or_default().saturating_add(1);
     generations.insert(profile_path.to_string(), next);
     Ok(next)
 }
@@ -672,35 +329,9 @@ fn update_tray_tooltip(app: &AppHandle, active_profile: Option<&str>) {
     let _ = tray.set_tooltip(Some(tooltip));
 }
 
-fn window_route_for_onboarding_complete(onboarding_complete: bool) -> WindowRoute {
-    if onboarding_complete {
-        WindowRoute::Main
-    } else {
-        WindowRoute::Onboarding
-    }
-}
-
-fn active_profile_path(bootstrap: &desktop_app::AppBootstrapView) -> Option<String> {
-    bootstrap
-        .active_profile
-        .as_ref()
-        .map(|profile| profile.path.to_string_lossy().to_string())
-}
-
-fn log_window_action(profile_path: Option<&str>, window_label: &str, action: &str) {
-    append_log(
-        profile_path,
-        "INFO",
-        "window",
-        format!("{window_label} {action}"),
-    );
-}
-
-fn show_main_window(app: &AppHandle, profile_path: Option<&str>) {
+fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        log_window_action(profile_path, "main", "show");
         let _ = window.show();
-        log_window_action(profile_path, "main", "focus");
         let _ = window.set_focus();
     }
 }
@@ -720,159 +351,50 @@ fn ensure_onboarding_window(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_onboarding_window_internal(
-    app: &AppHandle,
-    profile_path: Option<&str>,
-) -> tauri::Result<()> {
-    ensure_onboarding_window(app)?;
-    if let Some(onboarding) = app.get_webview_window("onboarding") {
-        log_window_action(profile_path, "onboarding", "show");
-        let _ = onboarding.show();
-        log_window_action(profile_path, "onboarding", "focus");
-        let _ = onboarding.set_focus();
-    }
-    Ok(())
-}
-
-fn hide_main_window(app: &AppHandle, profile_path: Option<&str>) {
-    if let Some(main) = app.get_webview_window("main") {
-        log_window_action(profile_path, "main", "hide");
-        let _ = main.hide();
-    }
-}
-
-fn close_onboarding_window(app: &AppHandle, profile_path: Option<&str>) {
-    if let Some(onboarding) = app.get_webview_window("onboarding") {
-        log_window_action(profile_path, "onboarding", "close");
-        let _ = onboarding.close();
-    }
-}
-
-fn close_onboarding_window_deferred(app: AppHandle, profile_path: Option<String>) {
-    if app
-        .state::<WindowRoutingState>()
-        .deferred_onboarding_close_in_flight
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        append_log(
-            profile_path.as_deref(),
-            "INFO",
-            "window",
-            "close_deferred skipped because another deferred close is in flight",
-        );
-        return;
-    }
-    append_log(
-        profile_path.as_deref(),
-        "INFO",
-        "window",
-        "close_deferred scheduled",
-    );
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        close_onboarding_window(&app, profile_path.as_deref());
-        append_log(profile_path.as_deref(), "INFO", "window", "close_deferred completed");
-        app.state::<WindowRoutingState>()
-            .deferred_onboarding_close_in_flight
-            .store(false, Ordering::SeqCst);
-    });
-}
-
-fn apply_window_route(
-    app: &AppHandle,
-    route: WindowRoute,
-    active_profile_path: Option<&str>,
-    onboarding_complete: bool,
-    close_onboarding_immediately: bool,
-) -> tauri::Result<String> {
-    let cached = cached_window_snapshot(app);
-    append_log(
-        active_profile_path,
-        "INFO",
-        "window",
-        format!(
-            "route_apply_enter target={route:?} current={:?} onboarding_complete={onboarding_complete}",
-            cached.route
-        ),
-    );
-    if route_is_unchanged(cached.route, route) && route_target_available(app, route) {
-        append_log(
-            active_profile_path,
-            "INFO",
-            "window",
-            format!("route_apply_skip unchanged route={route:?}"),
-        );
-        cache_window_route_state(app, route, active_profile_path, onboarding_complete);
-        return Ok(String::from(window_route_label(route)));
-    }
-
-    match route {
-        WindowRoute::Main => {
-            if close_onboarding_immediately {
-                close_onboarding_window(app, active_profile_path);
-            } else {
-                append_log(
-                    active_profile_path,
-                    "INFO",
-                    "window",
-                    "route_apply_main deferred onboarding close",
-                );
-            }
-            show_main_window(app, active_profile_path);
-            if let Some(profile_path) = active_profile_path {
-                update_tray_tooltip(app, Some(profile_path));
-            }
-            cache_window_route_state(app, route, active_profile_path, onboarding_complete);
-            append_log(
-                active_profile_path,
-                "INFO",
-                "window",
-                "route_apply_exit route=Main",
-            );
-            Ok(String::from(window_route_label(route)))
-        }
-        WindowRoute::Onboarding => {
-            hide_main_window(app, active_profile_path);
-            show_onboarding_window_internal(app, active_profile_path)?;
-            update_tray_tooltip(app, active_profile_path);
-            cache_window_route_state(app, route, active_profile_path, onboarding_complete);
-            append_log(
-                active_profile_path,
-                "INFO",
-                "window",
-                "route_apply_exit route=Onboarding",
-            );
-            Ok(String::from(window_route_label(route)))
-        }
-    }
-}
-
 fn sync_window_visibility_from_bootstrap(app: &AppHandle) -> tauri::Result<String> {
     let bootstrap = desktop_app::app_bootstrap()
         .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error.to_string())))?;
     let onboarding_complete = bootstrap.onboarding.step == "complete";
-    let route = window_route_for_onboarding_complete(onboarding_complete);
-    let active_profile_path = active_profile_path(&bootstrap);
-    update_active_profile_log_root(active_profile_path.as_deref());
-    cache_window_bootstrap_state(app, active_profile_path.as_deref(), onboarding_complete);
-    append_log(
-        active_profile_path.as_deref(),
-        "INFO",
-        "window",
-        format!("sync_window_visibility onboarding_complete={onboarding_complete}"),
-    );
-    apply_window_route(
-        app,
-        route,
-        active_profile_path.as_deref(),
-        onboarding_complete,
-        true,
-    )
+    let main = app.get_webview_window("main");
+
+    if onboarding_complete {
+        if let Some(onboarding) = app.get_webview_window("onboarding") {
+            let _ = onboarding.hide();
+        }
+        if let Some(main) = main {
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+        if let Some(profile) = bootstrap.active_profile.as_ref() {
+            let profile_path = profile.path.to_string_lossy().to_string();
+            update_tray_tooltip(app, Some(&profile_path));
+        }
+        return Ok(String::from("main"));
+    }
+
+    if let Some(main) = main {
+        let _ = main.hide();
+    }
+    ensure_onboarding_window(app)?;
+    if let Some(onboarding) = app.get_webview_window("onboarding") {
+        let _ = onboarding.show();
+        let _ = onboarding.set_focus();
+    }
+    update_tray_tooltip(app, bootstrap.active_profile.as_ref().map(|profile| profile.path.to_string_lossy()).as_deref());
+    Ok(String::from("onboarding"))
 }
 
-fn notify_attachment_event(app: &AppHandle, title: &str, body: &str) {
-    let _ = app.notification().builder().title(title).body(body).show();
+fn notify_attachment_event(
+    app: &AppHandle,
+    title: &str,
+    body: &str,
+) {
+    let _ = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
 }
 
 fn start_realtime_session(
@@ -880,13 +402,6 @@ fn start_realtime_session(
     app: AppHandle,
     manager: &RealtimeManager,
 ) -> Result<bool, String> {
-    update_active_profile_log_root(Some(&profile_path));
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "realtime",
-        "start session requested",
-    );
     let generation = bump_realtime_generation(manager, &profile_path)?;
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
     let status = Arc::new(Mutex::new(SessionStatus::default()));
@@ -896,72 +411,22 @@ fn start_realtime_session(
 
     let task = tauri::async_runtime::spawn(async move {
         let manager_state = app_for_task.state::<RealtimeManager>();
-        let should_emit_dirty =
-            || realtime_generation_matches(&manager_state, &profile_for_task, generation);
-        append_log(
-            Some(&profile_for_task),
-            "INFO",
-            "realtime",
-            format!("spawned session task generation={generation}"),
-        );
         let mut profile = match Profile::open(&profile_for_task) {
-            Ok(profile) => {
-                append_log(
-                    Some(&profile_for_task),
-                    "INFO",
-                    "realtime",
-                    "stage=profile_open ok",
-                );
-                profile
-            }
-            Err(error) => {
-                log_realtime_transition(
-                    &profile_for_task,
-                    &status_for_task,
-                    None,
-                    false,
-                    true,
-                    Some(0),
-                    "profile_open_failed",
-                );
-                log_command_error(
-                    "realtime.profile_open",
-                    Some(&profile_for_task),
-                    &error.to_string(),
-                );
-                if should_emit_dirty() {
-                    let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+            Ok(profile) => profile,
+            Err(_) => {
+                if let Ok(mut current) = status_for_task.lock() {
+                    current.connected = false;
+                    current.needs_reconnect = true;
                 }
                 return;
             }
         };
         let mut driver = match load_realtime_driver(&profile) {
-            Ok(driver) => {
-                append_log(
-                    Some(&profile_for_task),
-                    "INFO",
-                    "realtime",
-                    "stage=driver_load ok",
-                );
-                driver
-            }
-            Err(error) => {
-                log_realtime_transition(
-                    &profile_for_task,
-                    &status_for_task,
-                    None,
-                    false,
-                    true,
-                    Some(0),
-                    "driver_load_failed",
-                );
-                log_command_error(
-                    "realtime.driver_load",
-                    Some(&profile_for_task),
-                    &error.to_string(),
-                );
-                if should_emit_dirty() {
-                    let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+            Ok(driver) => driver,
+            Err(_) => {
+                if let Ok(mut current) = status_for_task.lock() {
+                    current.connected = false;
+                    current.needs_reconnect = true;
                 }
                 return;
             }
@@ -970,61 +435,28 @@ fn start_realtime_session(
             .local_identity()
             .map(|identity| identity.device_identity.device_id.clone())
         else {
-            log_realtime_transition(
-                &profile_for_task,
-                &status_for_task,
-                None,
-                false,
-                true,
-                Some(0),
-                "local_device_missing",
-            );
-            log_command_error(
-                "realtime.local_device",
-                Some(&profile_for_task),
-                "local identity device_id is missing",
-            );
-            if should_emit_dirty() {
-                let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+            if let Ok(mut current) = status_for_task.lock() {
+                current.connected = false;
+                current.needs_reconnect = true;
             }
             return;
         };
-        append_log(
-            Some(&profile_for_task),
-            "INFO",
-            "realtime",
-            format!("stage=local_device_resolved device_id={device_id}"),
-        );
         let mut reconnect_attempt = 0u32;
         let mut initialized = false;
-        let mut emit_shutdown_dirty = true;
         loop {
             if stop_rx.try_recv().is_ok()
                 || !realtime_generation_matches(&manager_state, &profile_for_task, generation)
             {
-                emit_shutdown_dirty = false;
                 break;
             }
             let mut emit_dirty = false;
             let step_result = if !initialized {
                 initialized = true;
-                append_log(
-                    Some(&profile_for_task),
-                    "INFO",
-                    "realtime",
-                    "stage=foreground_sync begin",
-                );
                 driver
                     .inject_event_until_idle(CoreEvent::AppForegrounded)
                     .await
                     .map(|_| Vec::new())
             } else {
-                append_log(
-                    Some(&profile_for_task),
-                    "INFO",
-                    "realtime",
-                    format!("stage=pump begin reconnect_attempt={reconnect_attempt}"),
-                );
                 driver.pump_until_idle(Duration::from_secs(45)).await
             };
 
@@ -1032,118 +464,63 @@ fn start_realtime_session(
                 Ok(outputs) => {
                     reconnect_attempt = 0;
                     if !outputs.is_empty() {
-                        if realtime_generation_matches(
-                            &manager_state,
-                            &profile_for_task,
-                            generation,
-                        ) {
-                            if let Err(error) = persist_realtime_driver(&mut profile, &driver) {
-                                log_command_error(
-                                    "realtime.persist",
-                                    Some(&profile_for_task),
-                                    &error.to_string(),
-                                );
-                            } else {
-                                append_log(
-                                    Some(&profile_for_task),
-                                    "INFO",
-                                    "realtime",
-                                    "stage=persist ok",
-                                );
-                            }
+                        if realtime_generation_matches(&manager_state, &profile_for_task, generation)
+                        {
+                            let _ = persist_realtime_driver(&mut profile, &driver);
                             emit_dirty = true;
-                            if outputs_changed_message_requests(&outputs) && should_emit_dirty() {
-                                let _ = app_for_task
-                                    .emit("tapchat://message-requests-dirty", &profile_for_task);
+                            if outputs_changed_message_requests(&outputs) {
+                                let _ = app_for_task.emit(
+                                    "tapchat://message-requests-dirty",
+                                    &profile_for_task,
+                                );
                             }
                         } else {
                             break;
                         }
                     }
                     if let Some(snapshot) = driver.realtime_session_snapshot(&device_id) {
-                        let connected = !snapshot.needs_reconnect;
-                        let previous = status_for_task.lock().ok().map(|current| current.clone());
-                        log_realtime_transition(
-                            &profile_for_task,
-                            &status_for_task,
-                            Some(&device_id),
-                            connected,
-                            snapshot.needs_reconnect,
-                            Some(snapshot.last_known_seq),
-                            "snapshot",
-                        );
-                        let changed = previous.is_none_or(|current| {
-                            current.connected != connected
+                        if let Ok(mut current) = status_for_task.lock() {
+                            let connected = !snapshot.needs_reconnect;
+                            let changed = current.connected != connected
                                 || current.needs_reconnect != snapshot.needs_reconnect
-                                || current.last_known_seq != snapshot.last_known_seq
-                        });
-                        if changed {
-                            emit_dirty = true;
+                                || current.last_known_seq != snapshot.last_known_seq;
+                            current.connected = connected;
+                            current.needs_reconnect = snapshot.needs_reconnect;
+                            current.last_known_seq = snapshot.last_known_seq;
+                            current.device_id = Some(device_id.clone());
+                            if changed {
+                                emit_dirty = true;
+                            }
                         }
                     }
-                    if emit_dirty && should_emit_dirty() {
+                    if emit_dirty {
                         let _ =
                             app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
                         update_tray_tooltip(&app_for_task, Some(&profile_for_task));
-                        append_log(
-                            Some(&profile_for_task),
-                            "INFO",
-                            "realtime",
-                            "emitted direct-shell-dirty",
-                        );
                     }
                 }
-                Err(error) => {
+                Err(_) => {
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    log_command_error(
-                        "realtime.step",
-                        Some(&profile_for_task),
-                        &format!("attempt={reconnect_attempt} error={error}"),
-                    );
-                    log_realtime_transition(
-                        &profile_for_task,
-                        &status_for_task,
-                        Some(&device_id),
-                        false,
-                        true,
-                        None,
-                        "step_error",
-                    );
-                    if should_emit_dirty() {
-                        let _ =
-                            app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+                    if let Ok(mut current) = status_for_task.lock() {
+                        current.connected = false;
+                        current.needs_reconnect = true;
+                        current.device_id = Some(device_id.clone());
                     }
+                    let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
                     let delay_seconds = [1u64, 2, 4, 8, 15]
                         [usize::min(reconnect_attempt.saturating_sub(1) as usize, 4)];
                     tokio::select! {
-                        _ = &mut stop_rx => {
-                            emit_shutdown_dirty = false;
-                            break;
-                        },
+                        _ = &mut stop_rx => break,
                         _ = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
                     }
                 }
             }
         }
 
-        log_realtime_transition(
-            &profile_for_task,
-            &status_for_task,
-            Some(&device_id),
-            false,
-            false,
-            None,
-            "task_shutdown",
-        );
-        if emit_shutdown_dirty && should_emit_dirty() {
-            let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+        if let Ok(mut current) = status_for_task.lock() {
+            current.connected = false;
         }
-        append_log(
-            Some(&profile_for_task),
-            "INFO",
-            "realtime",
-            "session task exited",
-        );
+        let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
     });
 
     let mut sessions = manager
@@ -1151,7 +528,7 @@ fn start_realtime_session(
         .lock()
         .map_err(|_| "lock poisoned".to_string())?;
     let previous = sessions.insert(
-        profile_path.clone(),
+        profile_path,
         SessionHandle {
             status,
             stop: stop_tx,
@@ -1165,23 +542,18 @@ fn start_realtime_session(
             let _ = handle.task.await;
         });
     }
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "realtime",
-        format!("session registered generation={generation}"),
-    );
     Ok(true)
 }
 
 fn spawn_resume_pending_downloads(app: AppHandle, profile_path: String) {
     tauri::async_runtime::spawn(async move {
         let manager = app.state::<RealtimeManager>();
-        let result = run_with_paused_realtime(app.clone(), &manager, profile_path.clone(), async {
-            desktop_app::sync_foreground(&profile_path)
-                .await
-                .map_err(into_string_error)
-        })
+        let result = run_with_paused_realtime(
+            app.clone(),
+            &manager,
+            profile_path.clone(),
+            async { desktop_app::sync_foreground(&profile_path).await.map_err(into_string_error) },
+        )
         .await;
         if let Err(error) = result {
             let background = app.state::<BackgroundDownloadManager>();
@@ -1303,22 +675,8 @@ fn spawn_background_download(
 }
 
 #[tauri::command]
-fn app_bootstrap(app: AppHandle) -> Result<desktop_app::AppBootstrapView, String> {
-    let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
-    let active_profile_path = bootstrap
-        .active_profile
-        .as_ref()
-        .map(|profile| profile.path.to_string_lossy().to_string());
-    let onboarding_complete = bootstrap.onboarding.step == "complete";
-    update_active_profile_log_root(active_profile_path.as_deref());
-    cache_window_bootstrap_state(&app, active_profile_path.as_deref(), onboarding_complete);
-    append_log(
-        active_profile_path.as_deref(),
-        "INFO",
-        "command",
-        "app_bootstrap completed",
-    );
-    Ok(bootstrap)
+fn app_bootstrap() -> Result<desktop_app::AppBootstrapView, String> {
+    desktop_app::app_bootstrap().map_err(into_string_error)
 }
 
 #[tauri::command]
@@ -1336,28 +694,10 @@ fn profile_activate(
     profile_id_or_path: String,
     app: AppHandle,
 ) -> Result<desktop_app::AppBootstrapView, String> {
-    let bootstrap = desktop_app::profile_activate(&profile_id_or_path)
-        .map_err(|error| into_string_error_for("profile_activate", None, error))?;
-    let active_profile_path = bootstrap
-        .active_profile
-        .as_ref()
-        .map(|profile| profile.path.to_string_lossy().to_string());
-    update_active_profile_log_root(active_profile_path.as_deref());
-    append_log(
-        active_profile_path.as_deref(),
-        "INFO",
-        "command",
-        format!("profile_activate requested={profile_id_or_path}"),
-    );
-    let onboarding_complete = bootstrap.onboarding.step == "complete";
-    let route = window_route_for_onboarding_complete(onboarding_complete);
-    cache_window_bootstrap_state(&app, active_profile_path.as_deref(), onboarding_complete);
-    let _ = apply_window_route(
+    let bootstrap = desktop_app::profile_activate(&profile_id_or_path).map_err(into_string_error)?;
+    update_tray_tooltip(
         &app,
-        route,
-        active_profile_path.as_deref(),
-        onboarding_complete,
-        true,
+        bootstrap.active_profile.as_ref().map(|profile| profile.path.to_string_lossy()).as_deref(),
     );
     Ok(bootstrap)
 }
@@ -1384,20 +724,15 @@ fn profile_reveal_in_shell(profile_path: String) -> Result<bool, String> {
 
 #[tauri::command]
 fn show_onboarding_window(app: AppHandle) -> Result<String, String> {
-    let bootstrap = desktop_app::app_bootstrap().map_err(|error| {
-        into_string_error_for("show_onboarding_window.app_bootstrap", None, error)
-    })?;
-    let active_profile_path = active_profile_path(&bootstrap);
-    let onboarding_complete = bootstrap.onboarding.step == "complete";
-    cache_window_bootstrap_state(&app, active_profile_path.as_deref(), onboarding_complete);
-    apply_window_route(
-        &app,
-        WindowRoute::Onboarding,
-        active_profile_path.as_deref(),
-        onboarding_complete,
-        true,
-    )
-    .map_err(|error| error.to_string())
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.hide();
+    }
+    ensure_onboarding_window(&app).map_err(|error| error.to_string())?;
+    if let Some(onboarding) = app.get_webview_window("onboarding") {
+        let _ = onboarding.show();
+        let _ = onboarding.set_focus();
+    }
+    Ok(String::from("onboarding"))
 }
 
 #[tauri::command]
@@ -1405,91 +740,20 @@ fn complete_onboarding_handoff(
     app: AppHandle,
     profile_path: Option<String>,
 ) -> Result<desktop_app::AppBootstrapView, String> {
-    let _handoff_guard = match OnboardingHandoffGuard::try_acquire() {
-        Some(guard) => guard,
-        None => {
-            append_log(
-                profile_path.as_deref(),
-                "INFO",
-                "command",
-                "complete_onboarding_handoff coalesced while another handoff is in progress",
-            );
-            return desktop_app::app_bootstrap().map_err(|error| {
-                into_string_error_for(
-                    "complete_onboarding_handoff.coalesced_app_bootstrap",
-                    profile_path.as_deref(),
-                    error,
-                )
-            });
-        }
-    };
-    append_log(
-        profile_path.as_deref(),
-        "INFO",
-        "command",
-        "complete_onboarding_handoff begin",
-    );
     if let Some(profile_path) = profile_path.as_deref() {
-        let _ = desktop_app::profile_activate(profile_path).map_err(|error| {
-            into_string_error_for(
-                "complete_onboarding_handoff.profile_activate",
-                Some(profile_path),
-                error,
-            )
-        })?;
+        let _ = desktop_app::profile_activate(profile_path).map_err(into_string_error)?;
     }
-    let bootstrap = desktop_app::app_bootstrap().map_err(|error| {
-        into_string_error_for(
-            "complete_onboarding_handoff.app_bootstrap",
-            profile_path.as_deref(),
-            error,
-        )
-    })?;
+    let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
     if bootstrap.onboarding.step != "complete" {
-        log_command_error(
-            "complete_onboarding_handoff",
-            profile_path.as_deref(),
-            "onboarding is not complete",
-        );
         return Err(String::from("onboarding is not complete"));
     }
     if let Some(active_profile) = bootstrap.active_profile.as_ref() {
         let active_profile_path = active_profile.path.to_string_lossy().to_string();
-        let _ = desktop_app::profile_activate(&active_profile_path).map_err(|error| {
-            into_string_error_for(
-                "complete_onboarding_handoff.active_profile_activate",
-                Some(&active_profile_path),
-                error,
-            )
-        })?;
+        let _ = desktop_app::profile_activate(&active_profile_path).map_err(into_string_error)?;
     }
-    let bootstrap = desktop_app::app_bootstrap().map_err(|error| {
-        into_string_error_for(
-            "complete_onboarding_handoff.final_bootstrap",
-            profile_path.as_deref(),
-            error,
-        )
-    })?;
-    let active_profile_path = active_profile_path(&bootstrap);
-    update_active_profile_log_root(active_profile_path.as_deref());
-    let onboarding_complete = bootstrap.onboarding.step == "complete";
-    cache_window_bootstrap_state(&app, active_profile_path.as_deref(), onboarding_complete);
-    apply_window_route(
-        &app,
-        WindowRoute::Main,
-        active_profile_path.as_deref(),
-        onboarding_complete,
-        false,
-    )
-    .map_err(|error| error.to_string())?;
+    let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
+    sync_window_visibility_from_bootstrap(&app).map_err(|error| error.to_string())?;
     let _ = app.emit("tapchat://bootstrap-dirty", &bootstrap);
-    close_onboarding_window_deferred(app.clone(), active_profile_path.clone());
-    append_log(
-        active_profile_path.as_deref(),
-        "INFO",
-        "command",
-        "complete_onboarding_handoff completed",
-    );
     Ok(bootstrap)
 }
 
@@ -2025,19 +1289,10 @@ async fn sync_foreground(
     app: AppHandle,
     manager: State<'_, RealtimeManager>,
 ) -> Result<desktop_app::SyncStatusView, String> {
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "command",
-        "sync_foreground begin",
-    );
-    let profile_for_log = profile_path.clone();
     run_with_paused_realtime(app, &manager, profile_path.clone(), async move {
         desktop_app::sync_foreground(profile_path)
             .await
-            .map_err(|error| {
-                into_string_error_for("sync_foreground", Some(&profile_for_log), error)
-            })
+            .map_err(into_string_error)
     })
     .await
 }
@@ -2049,22 +1304,12 @@ fn direct_shell(
     selected_contact_user_id: Option<String>,
     manager: State<'_, RealtimeManager>,
 ) -> Result<desktop_app::DirectShellView, String> {
-    update_active_profile_log_root(Some(&profile_path));
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "command",
-        format!(
-            "direct_shell refresh selected_conversation_id={:?} selected_contact_user_id={:?}",
-            selected_conversation_id, selected_contact_user_id
-        ),
-    );
     let mut shell = desktop_app::direct_shell(
         &profile_path,
         selected_conversation_id.as_deref(),
         selected_contact_user_id.as_deref(),
     )
-    .map_err(|error| into_string_error_for("direct_shell", Some(&profile_path), error))?;
+    .map_err(into_string_error)?;
     let snapshot = session_status_for(&manager, &profile_path);
     shell.realtime = desktop_app::map_realtime_snapshot(
         snapshot
@@ -2072,24 +1317,12 @@ fn direct_shell(
             .and_then(|value| value.device_id.clone())
             .or(shell.sync.device_id.clone()),
         None,
-        snapshot
-            .as_ref()
-            .map(|value| value.connected)
-            .unwrap_or(false),
+        snapshot.as_ref().map(|value| value.connected).unwrap_or(false),
     );
     if let Some(status) = snapshot {
         shell.realtime.last_known_seq = status.last_known_seq;
         shell.realtime.needs_reconnect = status.needs_reconnect;
     }
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "command",
-        format!(
-            "direct_shell completed connected={} needs_reconnect={} last_known_seq={}",
-            shell.realtime.connected, shell.realtime.needs_reconnect, shell.realtime.last_known_seq
-        ),
-    );
     Ok(shell)
 }
 
@@ -2107,12 +1340,6 @@ async fn sync_realtime_close(
     profile_path: String,
     manager: State<'_, RealtimeManager>,
 ) -> Result<bool, String> {
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "command",
-        "sync_realtime_close begin",
-    );
     stop_realtime_session(&manager, &profile_path).await
 }
 
@@ -2122,37 +1349,13 @@ async fn sync_realtime_connect(
     app: AppHandle,
     manager: State<'_, RealtimeManager>,
 ) -> Result<bool, String> {
-    append_log(
-        Some(&profile_path),
-        "INFO",
-        "command",
-        "sync_realtime_connect begin",
-    );
     let _ = stop_realtime_session(&manager, &profile_path).await?;
     start_realtime_session(profile_path, app, &manager)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::sync::atomic::Ordering;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::{
-        active_profile_log_root, bump_realtime_generation, default_app_log_dir,
-        realtime_generation_matches, resolve_log_path, route_is_unchanged,
-        should_exit_on_onboarding_close, window_route_for_onboarding_complete,
-        window_route_label, OnboardingHandoffGuard, RealtimeManager, WindowRoute,
-        ONBOARDING_HANDOFF_IN_FLIGHT,
-    };
-
-    fn unique_temp_profile(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("tapchat-{name}-{stamp}"))
-    }
+    use super::{bump_realtime_generation, realtime_generation_matches, RealtimeManager};
 
     #[test]
     fn realtime_generation_bump_invalidates_prior_session() {
@@ -2176,77 +1379,7 @@ mod tests {
         assert_eq!(other, 1);
         assert!(realtime_generation_matches(&manager, "profile-a", first));
         assert!(realtime_generation_matches(&manager, "profile-b", other));
-        assert!(!realtime_generation_matches(
-            &manager,
-            "profile-a",
-            other + 1
-        ));
-    }
-
-    #[test]
-    fn resolve_log_path_prefers_explicit_profile_root() {
-        let profile_root = unique_temp_profile("profile-log");
-        let resolved = resolve_log_path(Some(profile_root.to_string_lossy().as_ref()));
-        assert_eq!(resolved, profile_root.join("logs").join("desktop.log"));
-    }
-
-    #[test]
-    fn resolve_log_path_uses_active_profile_root_when_available() {
-        let profile_root = unique_temp_profile("active-profile-log");
-        {
-            let mut current = active_profile_log_root().lock().unwrap();
-            *current = Some(profile_root.clone());
-        }
-        let resolved = resolve_log_path(None);
-        assert_eq!(resolved, profile_root.join("logs").join("desktop.log"));
-    }
-
-    #[test]
-    fn default_app_log_dir_has_logs_suffix() {
-        assert!(default_app_log_dir().ends_with("logs"));
-    }
-
-    #[test]
-    fn window_route_maps_onboarding_state() {
-        assert_eq!(
-            window_route_for_onboarding_complete(false),
-            WindowRoute::Onboarding
-        );
-        assert_eq!(
-            window_route_for_onboarding_complete(true),
-            WindowRoute::Main
-        );
-    }
-
-    #[test]
-    fn route_helpers_are_deterministic() {
-        assert!(route_is_unchanged(Some(WindowRoute::Main), WindowRoute::Main));
-        assert!(!route_is_unchanged(
-            Some(WindowRoute::Onboarding),
-            WindowRoute::Main
-        ));
-        assert!(!route_is_unchanged(None, WindowRoute::Main));
-        assert_eq!(window_route_label(WindowRoute::Main), "main");
-        assert_eq!(window_route_label(WindowRoute::Onboarding), "onboarding");
-    }
-
-    #[test]
-    fn onboarding_close_policy_matches_bootstrap_state() {
-        assert!(should_exit_on_onboarding_close(false));
-        assert!(!should_exit_on_onboarding_close(true));
-    }
-
-    #[test]
-    fn onboarding_handoff_guard_is_exclusive() {
-        ONBOARDING_HANDOFF_IN_FLIGHT.store(false, Ordering::SeqCst);
-        let first = OnboardingHandoffGuard::try_acquire();
-        assert!(first.is_some());
-        assert!(OnboardingHandoffGuard::try_acquire().is_none());
-        drop(first);
-        let second = OnboardingHandoffGuard::try_acquire();
-        assert!(second.is_some());
-        drop(second);
-        ONBOARDING_HANDOFF_IN_FLIGHT.store(false, Ordering::SeqCst);
+        assert!(!realtime_generation_matches(&manager, "profile-a", other + 1));
     }
 }
 
@@ -2256,13 +1389,9 @@ pub fn run() {
         .manage(BackgroundDownloadManager::default())
         .manage(CloudflareWizardManager::default())
         .manage(LifecycleManager::default())
-        .manage(WindowRoutingState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            register_app_log_dir(Some(app.handle()));
-            install_panic_hook();
-            append_log(None, "INFO", "startup", "desktop host setup begin");
             configure_embedded_cloudflare_runtime(app.handle());
             let show = MenuItemBuilder::with_id("show", "Show TapChat").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
@@ -2273,15 +1402,13 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => {
                         let _ = sync_window_visibility_from_bootstrap(app);
-                        show_main_window(app, None);
+                        show_main_window(app);
                     }
                     "quit" => {
                         let lifecycle = app.state::<LifecycleManager>();
                         lifecycle.quitting.store(true, Ordering::SeqCst);
                         stop_all_realtime_sessions(&app.state::<RealtimeManager>());
-                        if let Ok(mut active) =
-                            app.state::<BackgroundDownloadManager>().active.lock()
-                        {
+                        if let Ok(mut active) = app.state::<BackgroundDownloadManager>().active.lock() {
                             active.clear();
                         }
                         app.exit(0)
@@ -2294,20 +1421,12 @@ pub fn run() {
                 if let Ok(bootstrap) = desktop_app::app_bootstrap() {
                     if let Some(profile) = bootstrap.active_profile.as_ref() {
                         let profile_path = profile.path.to_string_lossy().to_string();
-                        update_active_profile_log_root(Some(&profile_path));
                         if desktop_app::app_background_mode(&profile_path).unwrap_or(true)
                             && desktop_app::attachment_transfers(&profile_path, None)
-                                .map(|transfers| {
-                                    transfers
-                                        .iter()
-                                        .any(|transfer| transfer.task_kind == "download")
-                                })
+                                .map(|transfers| transfers.iter().any(|transfer| transfer.task_kind == "download"))
                                 .unwrap_or(false)
                         {
-                            spawn_resume_pending_downloads(
-                                app.handle().clone(),
-                                profile_path.clone(),
-                            );
+                            spawn_resume_pending_downloads(app.handle().clone(), profile_path.clone());
                         }
                     }
                 }
@@ -2324,40 +1443,15 @@ pub fn run() {
                 if quitting {
                     return;
                 }
-                let snapshot = cached_window_snapshot(&window.app_handle());
-                let active_profile_path = snapshot.active_profile_path;
-                let onboarding_complete = snapshot.onboarding_complete;
-                append_log(
-                    active_profile_path.as_deref(),
-                    "INFO",
-                    "window",
-                    format!(
-                        "close_requested label={} onboarding_complete={} route={:?}",
-                        window.label(),
-                        onboarding_complete,
-                        snapshot.route
-                    ),
-                );
                 if window.label() == "main" {
                     api.prevent_close();
-                    log_window_action(active_profile_path.as_deref(), "main", "hide");
                     let _ = window.hide();
                 } else if window.label() == "onboarding" {
-                    if should_exit_on_onboarding_close(onboarding_complete) {
-                        append_log(
-                            active_profile_path.as_deref(),
-                            "INFO",
-                            "window",
-                            "onboarding close requested while incomplete; exiting app",
-                        );
+                    let onboarding_complete = desktop_app::app_bootstrap()
+                        .map(|bootstrap| bootstrap.onboarding.step == "complete")
+                        .unwrap_or(false);
+                    if !onboarding_complete {
                         window.app_handle().exit(0);
-                    } else {
-                        append_log(
-                            active_profile_path.as_deref(),
-                            "INFO",
-                            "window",
-                            "onboarding close allowed because onboarding is complete",
-                        );
                     }
                 }
             }

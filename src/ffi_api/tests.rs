@@ -641,10 +641,7 @@ mod tests {
             append_result.delivered_to,
             crate::transport_contract::AppendDeliveryDisposition::MessageRequest
         );
-        assert_eq!(
-            append_result.request_id.as_deref(),
-            Some("request:user:bob")
-        );
+        assert_eq!(append_result.request_id.as_deref(), Some("request:user:bob"));
     }
 
     #[test]
@@ -2076,18 +2073,14 @@ mod tests {
             .expect("reimport deployment");
 
         assert_eq!(publish_shared_state_effects(&output).len(), 2);
-        assert!(
-            publish_shared_state_effects(&output)
-                .iter()
-                .any(|publish| publish.document_kind
-                    == crate::transport_contract::SharedStateDocumentKind::IdentityBundle)
-        );
-        assert!(
-            publish_shared_state_effects(&output)
-                .iter()
-                .any(|publish| publish.document_kind
-                    == crate::transport_contract::SharedStateDocumentKind::DeviceStatus)
-        );
+        assert!(publish_shared_state_effects(&output)
+            .iter()
+            .any(|publish| publish.document_kind
+                == crate::transport_contract::SharedStateDocumentKind::IdentityBundle));
+        assert!(publish_shared_state_effects(&output)
+            .iter()
+            .any(|publish| publish.document_kind
+                == crate::transport_contract::SharedStateDocumentKind::DeviceStatus));
     }
 
     #[test]

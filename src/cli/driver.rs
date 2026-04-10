@@ -17,11 +17,11 @@ use crate::ffi_api::{
     SyncCheckpointSnapshot,
 };
 use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
-use crate::persistence::CorePersistenceSnapshot;
 use crate::platform_ports::{
     BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
     TransportPort, execute_platform_effect,
 };
+use crate::persistence::CorePersistenceSnapshot;
 use crate::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
     FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
@@ -357,19 +357,6 @@ impl CoreDriver {
         Ok(output)
     }
 
-    pub async fn inject_event_until_idle_without_realtime(
-        &mut self,
-        event: CoreEvent,
-    ) -> Result<CoreOutput> {
-        self.suppress_realtime = true;
-        let output = self.engine.handle_event(event)?;
-        let output = self.execute_until_idle(output).await?;
-        self.suppress_realtime = false;
-        self.sync_latest_snapshot();
-        self.record_observed_output(&output);
-        Ok(output)
-    }
-
     pub async fn pump_until_idle(&mut self, max_wait: Duration) -> Result<Vec<CoreOutput>> {
         let deadline = Instant::now() + max_wait;
         let mut outputs = Vec::new();
@@ -457,8 +444,7 @@ impl CoreDriver {
     async fn execute_effect(&mut self, effect: CoreEffect) -> Result<Vec<CoreEvent>> {
         if self.suppress_realtime {
             match effect {
-                CoreEffect::OpenRealtimeConnection { .. }
-                | CoreEffect::CloseRealtimeConnection { .. } => {
+                CoreEffect::OpenRealtimeConnection { .. } | CoreEffect::CloseRealtimeConnection { .. } => {
                     return Ok(Vec::new());
                 }
                 _ => {}
@@ -490,7 +476,8 @@ impl CoreDriver {
             if request.url.contains("/messages") {
                 let mut append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
                 if append_request.sender_bundle_share_url.is_none() {
-                    append_request.sender_bundle_share_url = self.runtime.contact_share_url.clone();
+                    append_request.sender_bundle_share_url =
+                        self.runtime.contact_share_url.clone();
                 }
                 if append_request.sender_bundle_hash.is_none() {
                     append_request.sender_bundle_hash = self
@@ -501,8 +488,7 @@ impl CoreDriver {
                 self.runtime
                     .recent_appends
                     .push(append_request.envelope.clone());
-                let converted =
-                    to_camel_case_json_string(&serde_json::to_string(&append_request)?)?;
+                let converted = to_camel_case_json_string(&serde_json::to_string(&append_request)?)?;
                 builder = builder.body(converted);
                 return match builder.send().await {
                     Ok(response) => {
@@ -675,19 +661,13 @@ impl CoreDriver {
                 let normalized = to_snake_case_json_string(&body)?;
                 let value: serde_json::Value = serde_json::from_str(&normalized)?;
                 let requests = serde_json::from_value(
-                    value
-                        .get("requests")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([])),
+                    value.get("requests").cloned().unwrap_or_else(|| serde_json::json!([])),
                 )?;
                 Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
             }
             Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
                 retryable: false,
-                detail: Some(format!(
-                    "list message requests failed with status {}",
-                    response.status()
-                )),
+                detail: Some(format!("list message requests failed with status {}", response.status())),
             }]),
             Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
                 retryable: true,
@@ -783,10 +763,7 @@ impl CoreDriver {
             }
             Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
                 retryable: false,
-                detail: Some(format!(
-                    "get allowlist failed with status {}",
-                    response.status()
-                )),
+                detail: Some(format!("get allowlist failed with status {}", response.status())),
             }]),
             Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
                 retryable: true,
@@ -820,10 +797,7 @@ impl CoreDriver {
             }
             Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
                 retryable: false,
-                detail: Some(format!(
-                    "put allowlist failed with status {}",
-                    response.status()
-                )),
+                detail: Some(format!("put allowlist failed with status {}", response.status())),
             }]),
             Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
                 retryable: true,
@@ -846,12 +820,10 @@ impl CoreDriver {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {
-                Ok(vec![CoreEvent::SharedStatePublished {
-                    document_kind: publish.document_kind,
-                    reference: publish.reference,
-                }])
-            }
+            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::SharedStatePublished {
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+            }]),
             Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
                 document_kind: publish.document_kind,
                 reference: publish.reference,
@@ -1071,7 +1043,10 @@ impl TransportPort for CoreDriver {
         CoreDriver::act_on_message_request(self, action).await
     }
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
+    async fn fetch_allowlist(
+        &mut self,
+        fetch: FetchAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>> {
         CoreDriver::fetch_allowlist(self, fetch).await
     }
 
@@ -1232,15 +1207,11 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
     left.effects.extend(right.effects);
     match (&mut left.view_model, right.view_model) {
         (Some(left_view), Some(mut right_view)) => {
-            left_view
-                .conversations
-                .append(&mut right_view.conversations);
+            left_view.conversations.append(&mut right_view.conversations);
             left_view.messages.append(&mut right_view.messages);
             left_view.contacts.append(&mut right_view.contacts);
             left_view.banners.append(&mut right_view.banners);
-            left_view
-                .message_requests
-                .append(&mut right_view.message_requests);
+            left_view.message_requests.append(&mut right_view.message_requests);
             if right_view.allowlist.is_some() {
                 left_view.allowlist = right_view.allowlist.take();
             }

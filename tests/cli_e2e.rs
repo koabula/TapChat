@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use tapchat_core::identity::{IdentityManager, LocalIdentityState};
 use tapchat_core::model::{
-    CapabilityOperation, CapabilityService, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth,
+    CapabilityOperation, CapabilityService, DeploymentBundle, DeliveryClass, DeviceRuntimeAuth,
     Envelope, IdentityBundle, InboxAppendCapability, MessageType, SenderProof,
 };
 use tapchat_core::transport_contract::AppendEnvelopeRequest;
@@ -213,10 +213,7 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
         [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
         ["profile", "list"],
     )?;
-    assert_eq!(
-        listed["profiles"].as_array().map(|value| value.len()),
-        Some(2)
-    );
+    assert_eq!(listed["profiles"].as_array().map(|value| value.len()), Some(2));
     assert_eq!(
         listed["active_profile"].as_str(),
         Some(alice_profile.to_string_lossy().as_ref())
@@ -224,12 +221,7 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
 
     run_cli_json_with_env(
         [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
-        [
-            "profile",
-            "activate",
-            "--profile",
-            &bob_profile.to_string_lossy(),
-        ],
+        ["profile", "activate", "--profile", &bob_profile.to_string_lossy()],
     )?;
     let current = run_cli_json_with_env(
         [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
@@ -275,14 +267,8 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
     let provisioned = run_cli_json_with_env(
         [
             ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
-            (
-                "TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT",
-                deploy_stub.as_str(),
-            ),
-            (
-                "TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET",
-                bootstrap_secret.as_str(),
-            ),
+            ("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT", deploy_stub.as_str()),
+            ("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET", bootstrap_secret.as_str()),
         ],
         [
             "runtime",
@@ -322,18 +308,12 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
         ["device", "status"],
     )?;
     assert_eq!(device_status["user_id"].as_str(), Some(user_id.as_str()));
-    assert_eq!(
-        device_status["device_id"].as_str(),
-        Some(device_id.as_str())
-    );
+    assert_eq!(device_status["device_id"].as_str(), Some(device_id.as_str()));
 
     let redeployed = run_cli_json_with_env(
         [
             ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
-            (
-                "TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT",
-                deploy_stub.as_str(),
-            ),
+            ("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT", deploy_stub.as_str()),
         ],
         [
             "runtime",
@@ -348,14 +328,8 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
     let rotated = run_cli_json_with_env(
         [
             ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
-            (
-                "TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT",
-                deploy_stub.as_str(),
-            ),
-            (
-                "TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET",
-                bootstrap_secret.as_str(),
-            ),
+            ("TAPCHAT_CLOUDFLARE_DEPLOY_STUB_RESULT", deploy_stub.as_str()),
+            ("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET", bootstrap_secret.as_str()),
         ],
         [
             "runtime",
@@ -394,12 +368,7 @@ fn cli_profile_registry_and_cloudflare_provision_auto_work() -> Result<()> {
 
     let removed = run_cli_json_with_env(
         [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
-        [
-            "profile",
-            "remove",
-            "--profile",
-            &bob_profile.to_string_lossy(),
-        ],
+        ["profile", "remove", "--profile", &bob_profile.to_string_lossy()],
     )?;
     assert_eq!(removed["removed"], Value::Bool(true));
 
@@ -546,10 +515,7 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
         &requests[0].request_id,
     ])?;
     assert_eq!(accepted["accepted"], Value::Bool(true));
-    assert_eq!(
-        accepted["sender_user_id"].as_str(),
-        Some(alice_user_id.as_str())
-    );
+    assert_eq!(accepted["sender_user_id"].as_str(), Some(alice_user_id.as_str()));
 
     let post_accept_sync = sync_once(&bob_profile)?;
     assert_eq!(post_accept_sync["synced"], Value::Bool(true));
@@ -1119,7 +1085,9 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
     assert!(third_send["latest_notification"].is_null());
 
     let delivered_sync = sync_once(&bob_profile)?;
-    assert!(required_u64(&delivered_sync["checkpoint"], "last_acked_seq")? > 0);
+    assert!(
+        required_u64(&delivered_sync["checkpoint"], "last_acked_seq")? > 0
+    );
     assert!(delivered_sync["notifications"].is_array());
     assert!(delivered_sync.get("realtime").is_some());
     assert!(delivered_sync["recovery_conversations"].is_array());
@@ -1140,7 +1108,9 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
         count_plaintext_messages(&bob_messages, "policy recovery rejected"),
         0
     );
-    assert!(count_plaintext_messages(&bob_messages, "policy recovery delivered") <= 1);
+    assert!(
+        count_plaintext_messages(&bob_messages, "policy recovery delivered") <= 1
+    );
 
     let ctx = CliPairContext {
         runtime,
@@ -1287,8 +1257,8 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
 
 #[test]
 #[ignore = "orchestrated by cli_e2e_stable_suite"]
-fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2e_work()
--> Result<()> {
+fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2e_work(
+) -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
     let runtime = runtime_handle(&workspace_root)?;
@@ -1538,19 +1508,21 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "sender must fail closed while recovery is still in progress"
     );
 
-    let laptop_messages_before_heal =
-        if conversation_exists(&laptop.laptop_profile, &ctx.conversation_id)? {
-            run_cli_json([
-                "message",
-                "list",
-                "--profile",
-                &laptop.laptop_profile.to_string_lossy(),
-                "--conversation-id",
-                &ctx.conversation_id,
-            ])?
-        } else {
-            Value::Array(Vec::new())
-        };
+    let laptop_messages_before_heal = if conversation_exists(
+        &laptop.laptop_profile,
+        &ctx.conversation_id,
+    )? {
+        run_cli_json([
+            "message",
+            "list",
+            "--profile",
+            &laptop.laptop_profile.to_string_lossy(),
+            "--conversation-id",
+            &ctx.conversation_id,
+        ])?
+    } else {
+        Value::Array(Vec::new())
+    };
     assert_eq!(
         count_plaintext_messages(&laptop_messages_before_heal, "policy refresh request"),
         0
@@ -1650,7 +1622,9 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
 
     let laptop_sync_after_heal = sync_once(&laptop.laptop_profile)?;
     assert_eq!(laptop_sync_after_heal["synced"], Value::Bool(true));
-    assert!(required_u64(&laptop_sync_after_heal["checkpoint"], "last_acked_seq")? > 0);
+    assert!(
+        required_u64(&laptop_sync_after_heal["checkpoint"], "last_acked_seq")? > 0
+    );
 
     let laptop_messages = run_cli_json([
         "message",
@@ -1668,7 +1642,9 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         count_plaintext_messages(&laptop_messages, "policy refresh rejected"),
         0
     );
-    assert!(count_plaintext_messages(&laptop_messages, "policy refresh during recovery") == 0);
+    assert!(
+        count_plaintext_messages(&laptop_messages, "policy refresh during recovery") == 0
+    );
     assert_eq!(
         count_plaintext_messages(&laptop_messages, "policy refresh after heal"),
         1
@@ -1983,10 +1959,7 @@ fn cli_realtime_out_of_order_or_duplicate_delivery_e2e_work() -> Result<()> {
         "--conversation-id",
         &ctx.conversation_id,
     ])?;
-    assert_eq!(
-        count_plaintext_messages(&messages, "duplicate realtime delivery"),
-        1
-    );
+    assert_eq!(count_plaintext_messages(&messages, "duplicate realtime delivery"), 1);
 
     let show = conversation_show(&ctx.bob_profile, &ctx.conversation_id)?;
     assert_conversation_show_healthy(&show);
@@ -3197,11 +3170,7 @@ fn cli_cleanup_recovery_remains_idempotent_across_repeated_sync() -> Result<()> 
     let acked_seq = required_u64(&first_sync["checkpoint"], "last_acked_seq")?;
     assert_eq!(
         acked_seq,
-        runtime_get_head(
-            &ctx.runtime,
-            bundle_auth(&ctx.bob_bundle)?,
-            &ctx.bob_device_id
-        )?
+        runtime_get_head(&ctx.runtime, bundle_auth(&ctx.bob_bundle)?, &ctx.bob_device_id)?
     );
 
     wait_for_runtime_cleanup(
@@ -3234,10 +3203,7 @@ fn cli_cleanup_recovery_remains_idempotent_across_repeated_sync() -> Result<()> 
     ])?;
     assert_eq!(status["pending_outbox"].as_u64(), Some(0));
     assert_eq!(status["pending_blob_uploads"].as_u64(), Some(0));
-    assert_eq!(
-        required_u64(&status["checkpoint"], "last_acked_seq")?,
-        acked_seq
-    );
+    assert_eq!(required_u64(&status["checkpoint"], "last_acked_seq")?, acked_seq);
     assert!(status["realtime"].is_object());
 
     let messages = run_cli_json([
@@ -3288,10 +3254,7 @@ fn cli_long_offline_attachment_and_membership_change_recover_e2e_work() -> Resul
     assert_eq!(alice_initial["recovery_status"].as_str(), Some("Healthy"));
     assert!(alice_initial["checkpoint"].is_object());
     let laptop_initial = conversation_show(&laptop.laptop_profile, &ctx.conversation_id)?;
-    assert_eq!(
-        laptop_initial["conversation_state"].as_str(),
-        Some("active")
-    );
+    assert_eq!(laptop_initial["conversation_state"].as_str(), Some("active"));
     assert_eq!(laptop_initial["recovery_status"].as_str(), Some("Healthy"));
     let alice_initial_status = run_cli_json([
         "sync",
@@ -3309,10 +3272,7 @@ fn cli_long_offline_attachment_and_membership_change_recover_e2e_work() -> Resul
     assert!(laptop_initial_status.get("realtime").is_some());
 
     let attachment_path = ctx.temp_root.path().join("long-offline-attachment.txt");
-    fs::write(
-        &attachment_path,
-        "attachment during long offline membership change",
-    )?;
+    fs::write(&attachment_path, "attachment during long offline membership change")?;
     let attachment_send = run_cli_json([
         "message",
         "send-attachment",
@@ -3445,7 +3405,8 @@ fn cli_long_offline_attachment_and_membership_change_recover_e2e_work() -> Resul
 
     let delayed_phone_sync = sync_once(&ctx.bob_profile)?;
     assert_eq!(delayed_phone_sync["synced"], Value::Bool(true));
-    let delayed_phone_seq = required_u64(&delayed_phone_sync["checkpoint"], "last_acked_seq")?;
+    let delayed_phone_seq =
+        required_u64(&delayed_phone_sync["checkpoint"], "last_acked_seq")?;
     assert!(delayed_phone_seq >= 1);
 
     let phone_status = run_cli_json([
@@ -3754,10 +3715,7 @@ fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work
         &ctx.bob_profile,
         &[
             (&ctx.bob_profile, "bob-phone-post-rebuild-identity.json"),
-            (
-                &laptop.laptop_profile,
-                "bob-laptop-post-rebuild-identity.json",
-            ),
+            (&laptop.laptop_profile, "bob-laptop-post-rebuild-identity.json"),
         ],
     )?;
     patch_profile_local_bundle(&laptop.laptop_profile, &merged_identity)?;
@@ -3774,16 +3732,16 @@ fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work
     let phone_acked_after_one =
         required_u64(&sync_after_rebuild_one["checkpoint"], "last_acked_seq")?;
     let phone_sync_after_rebuild_two = sync_once(&ctx.bob_profile)?;
-    let phone_acked_after_two = required_u64(
-        &phone_sync_after_rebuild_two["checkpoint"],
-        "last_acked_seq",
-    )?;
+    let phone_acked_after_two =
+        required_u64(&phone_sync_after_rebuild_two["checkpoint"], "last_acked_seq")?;
     assert!(phone_acked_after_two >= phone_acked_after_one);
 
     let sync_after_rebuild_one = sync_once(&laptop.laptop_profile)?;
-    let acked_after_one = required_u64(&sync_after_rebuild_one["checkpoint"], "last_acked_seq")?;
+    let acked_after_one =
+        required_u64(&sync_after_rebuild_one["checkpoint"], "last_acked_seq")?;
     let sync_after_rebuild_two = sync_once(&laptop.laptop_profile)?;
-    let acked_after_two = required_u64(&sync_after_rebuild_two["checkpoint"], "last_acked_seq")?;
+    let acked_after_two =
+        required_u64(&sync_after_rebuild_two["checkpoint"], "last_acked_seq")?;
     assert!(acked_after_two >= acked_after_one);
 
     for _ in 0..4 {
@@ -3843,8 +3801,10 @@ fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work
     assert_append_result(&post_rebuild_send, "inbox", true, None)?;
     let final_phone_sync_one = sync_once(&ctx.bob_profile)?;
     let final_phone_sync_two = sync_once(&ctx.bob_profile)?;
-    let final_phone_seq_one = required_u64(&final_phone_sync_one["checkpoint"], "last_acked_seq")?;
-    let final_phone_seq_two = required_u64(&final_phone_sync_two["checkpoint"], "last_acked_seq")?;
+    let final_phone_seq_one =
+        required_u64(&final_phone_sync_one["checkpoint"], "last_acked_seq")?;
+    let final_phone_seq_two =
+        required_u64(&final_phone_sync_two["checkpoint"], "last_acked_seq")?;
     assert!(final_phone_seq_two >= final_phone_seq_one);
     let final_sync_one = sync_once(&laptop.laptop_profile)?;
     let final_sync_two = sync_once(&laptop.laptop_profile)?;
@@ -4193,10 +4153,7 @@ where
     run_cli_json_with_env(std::iter::empty::<(&str, &str)>(), args)
 }
 
-fn run_cli_json_with_env<I, S, K, V>(
-    envs: impl IntoIterator<Item = (K, V)>,
-    args: I,
-) -> Result<Value>
+fn run_cli_json_with_env<I, S, K, V>(envs: impl IntoIterator<Item = (K, V)>, args: I) -> Result<Value>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -4264,10 +4221,9 @@ fn default_cli_test_registry_path() -> &'static PathBuf {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        workspace_root().join(".tmp").join(format!(
-            "cli-e2e-{}-{millis}.profiles.json",
-            std::process::id()
-        ))
+        workspace_root()
+            .join(".tmp")
+            .join(format!("cli-e2e-{}-{millis}.profiles.json", std::process::id()))
     })
 }
 
@@ -4362,8 +4318,7 @@ fn count_plaintext_messages(messages: &Value, plaintext: &str) -> usize {
 }
 
 fn append_result<'a>(value: &'a Value) -> Result<&'a Value> {
-    value
-        .get("append_result")
+    value.get("append_result")
         .context("append_result missing")?
         .as_object()
         .map(|_| &value["append_result"])
@@ -4960,7 +4915,11 @@ fn patch_profile_local_bundle(profile: &Path, bundle: &IdentityBundle) -> Result
     Ok(())
 }
 
-fn patch_contact_identity_bundle_ref(profile: &Path, user_id: &str, reference: &str) -> Result<()> {
+fn patch_contact_identity_bundle_ref(
+    profile: &Path,
+    user_id: &str,
+    reference: &str,
+) -> Result<()> {
     let path = profile.join("snapshot.json");
     let mut snapshot: Value = read_json_file(&path)?;
     let contacts = snapshot["snapshot"]["contacts"]
@@ -5042,34 +5001,23 @@ fn append_runtime_control_message(
         let response = reqwest::Client::new()
             .post(endpoint)
             .header("Authorization", format!("Bearer {signature}"))
-            .header(
-                "X-Tapchat-Capability",
-                serde_json::to_string(&capability_json)?,
-            )
+            .header("X-Tapchat-Capability", serde_json::to_string(&capability_json)?)
             .header("Content-Type", "application/json")
             .body(serde_json::to_vec(&request_json)?)
             .send()
             .await
             .context("append runtime control message")?;
         if !response.status().is_success() {
-            bail!(
-                "append runtime control failed with status {}",
-                response.status()
-            );
+            bail!("append runtime control failed with status {}", response.status());
         }
-        let body = response
-            .text()
-            .await
-            .context("read append runtime control response")?;
+        let body = response.text().await.context("read append runtime control response")?;
         serde_json::from_str(&body).context("parse append runtime control response")
     })
 }
 
 fn to_camel_case_json_value(value: Value) -> Value {
     match value {
-        Value::Array(items) => {
-            Value::Array(items.into_iter().map(to_camel_case_json_value).collect())
-        }
+        Value::Array(items) => Value::Array(items.into_iter().map(to_camel_case_json_value).collect()),
         Value::Object(map) => Value::Object(
             map.into_iter()
                 .map(|(key, value)| (snake_to_camel(&key), to_camel_case_json_value(value)))
@@ -5102,13 +5050,10 @@ fn assert_recovery_contract_alignment(
     status: &Value,
 ) -> Result<()> {
     let recovery = &conversation["recovery"];
-    assert!(
-        !recovery.is_null(),
-        "conversation recovery must not be null"
-    );
+    assert!(!recovery.is_null(), "conversation recovery must not be null");
     let status_row = find_recovery_conversation(status, conversation_id)?;
-    let snapshot_row = snapshot_recovery_context(profile, conversation_id)?
-        .context("missing snapshot recovery context")?;
+    let snapshot_row =
+        snapshot_recovery_context(profile, conversation_id)?.context("missing snapshot recovery context")?;
     for field in [
         "recovery_status",
         "reason",
@@ -5124,12 +5069,14 @@ fn assert_recovery_contract_alignment(
             &recovery[field]
         };
         assert_eq!(
-            conversation_field, &status_row[field],
+            conversation_field,
+            &status_row[field],
             "conversation/status mismatch for {field}"
         );
         if field != "recovery_status" {
             assert_eq!(
-                conversation_field, &snapshot_row[field],
+                conversation_field,
+                &snapshot_row[field],
                 "conversation/snapshot mismatch for {field}"
             );
         }
@@ -5197,9 +5144,9 @@ fn run_orchestrated_cli_case(test_name: &str) -> Result<()> {
         if Instant::now() >= deadline {
             let pid = child.id();
             let _ = stop_pid_and_wait(pid);
-            let output = child.wait_with_output().with_context(|| {
-                format!("collect timed out orchestrated cli_e2e case {test_name}")
-            })?;
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("collect timed out orchestrated cli_e2e case {test_name}"))?;
             bail!(
                 "orchestrated cli_e2e case {test_name} timed out after {:?}\nstdout:\n{}\nstderr:\n{}",
                 ORCHESTRATED_CASE_TIMEOUT,

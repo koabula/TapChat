@@ -13,12 +13,11 @@ use crate::model::{
 use crate::persistence::{CorePersistenceSnapshot, PersistOp};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    AllowlistDocument, AppendDeliveryDisposition, BlobDownloadRequest, BlobUploadRequest,
-    FetchAllowlistRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
-    MessageRequestItem, MessageRequestRealtimeChange, PrepareBlobUploadRequest,
-    PrepareBlobUploadResult, PublishSharedStateRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest, SharedStateDocumentKind,
+    AllowlistDocument, AppendDeliveryDisposition, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestAction,
+    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
+    MessageRequestRealtimeChange, PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, SharedStateDocumentKind,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -515,8 +514,12 @@ pub(crate) struct RealtimeSessionState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PendingAllowlistMutation {
-    Add { user_id: String },
-    Remove { user_id: String },
+    Add {
+        user_id: String,
+    },
+    Remove {
+        user_id: String,
+    },
 }
 
 #[derive(Debug)]

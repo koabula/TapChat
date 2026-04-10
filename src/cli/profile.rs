@@ -271,7 +271,10 @@ impl ProfileRegistry {
     }
 
     pub fn save(&self) -> Result<()> {
-        write_atomic(&profile_registry_path()?, &serde_json::to_vec_pretty(self)?)
+        write_atomic(
+            &profile_registry_path()?,
+            &serde_json::to_vec_pretty(self)?,
+        )
     }
 
     pub fn upsert(&mut self, entry: ProfileRegistryEntry) {
@@ -284,11 +287,8 @@ impl ProfileRegistry {
             return;
         }
         self.profiles.push(entry);
-        self.profiles.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
-                .then(left.root_dir.cmp(&right.root_dir))
-        });
+        self.profiles
+            .sort_by(|left, right| left.name.cmp(&right.name).then(left.root_dir.cmp(&right.root_dir)));
     }
 
     pub fn remove(&mut self, root_dir: &Path) {
@@ -304,10 +304,7 @@ impl ProfileRegistry {
 
     pub fn set_active(&mut self, root_dir: &Path) -> Result<()> {
         if !self.profiles.iter().any(|entry| entry.root_dir == root_dir) {
-            bail!(
-                "profile {} is not registered on this device",
-                root_dir.display()
-            );
+            bail!("profile {} is not registered on this device", root_dir.display());
         }
         self.active_profile = Some(root_dir.to_path_buf());
         Ok(())
@@ -325,9 +322,7 @@ impl ProfileRegistry {
                 self.active_profile = Some(entry.root_dir.clone());
                 Ok(entry.root_dir.clone())
             }
-            _ => bail!(
-                "multiple registered profiles share the name {name}; activate by path instead"
-            ),
+            _ => bail!("multiple registered profiles share the name {name}; activate by path instead"),
         }
     }
 
@@ -339,12 +334,7 @@ impl ProfileRegistry {
         self.profiles
             .iter()
             .find(|entry| &entry.root_dir == active)
-            .ok_or_else(|| {
-                anyhow!(
-                    "active profile {} is no longer registered",
-                    active.display()
-                )
-            })
+            .ok_or_else(|| anyhow!("active profile {} is no longer registered", active.display()))
     }
 }
 
@@ -393,9 +383,7 @@ mod tests {
 
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
     }
 
     #[test]

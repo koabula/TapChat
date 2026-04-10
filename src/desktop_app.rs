@@ -10,9 +10,9 @@ use crate::cli::profile::{Profile, ProfileRegistry, RuntimeMetadata};
 use crate::cli::runtime::{
     CloudflareDeployOverrides, CloudflarePreflight, ResolvedCloudflareDeployConfig,
     bootstrap_device_bundle, cloudflare_preflight as runtime_cloudflare_preflight,
-    deploy_cloudflare_runtime, derive_cloudflare_defaults, ensure_cloudflare_runtime_metadata,
-    rebuild_cloudflare_config, resolve_cloudflare_config, resolve_service_root,
-    wait_until_bootstrap_ready,
+    deploy_cloudflare_runtime,
+    derive_cloudflare_defaults, ensure_cloudflare_runtime_metadata, rebuild_cloudflare_config,
+    resolve_cloudflare_config, resolve_service_root, wait_until_bootstrap_ready,
 };
 use crate::cli::util::sign_hmac_token;
 use crate::contact_workflows::{
@@ -463,12 +463,10 @@ struct RecordedAttachmentTransfer {
 pub fn app_bootstrap() -> Result<AppBootstrapView> {
     let registry = ProfileRegistry::load()?;
     let profiles = registry_summaries(&registry);
-    let active_profile = registry.active_profile.clone().and_then(|path| {
-        profiles
-            .iter()
-            .find(|profile| profile.path == path)
-            .cloned()
-    });
+    let active_profile = registry
+        .active_profile
+        .clone()
+        .and_then(|path| profiles.iter().find(|profile| profile.path == path).cloned());
     let (identity, runtime) = if let Some(profile) = active_profile.as_ref() {
         let profile = Profile::open(&profile.path)?;
         (
@@ -536,8 +534,7 @@ pub fn profile_create(name: &str, root: impl AsRef<Path>) -> Result<ProfileSumma
 }
 
 pub fn profile_open_or_import(root_dir: impl AsRef<Path>) -> Result<ProfileSummary> {
-    let profile =
-        Profile::open(root_dir.as_ref()).map_err(|_| anyhow!("not_a_profile_directory"))?;
+    let profile = Profile::open(root_dir.as_ref()).map_err(|_| anyhow!("not_a_profile_directory"))?;
     profile.sync_registry_entry()?;
     let registry = ProfileRegistry::load()?;
     let active = registry
@@ -959,9 +956,7 @@ pub async fn contact_import_share_link(
     contact_show(profile.root(), &bundle.user_id)
 }
 
-pub async fn contact_share_link_get(
-    profile_path: impl AsRef<Path>,
-) -> Result<ContactShareLinkView> {
+pub async fn contact_share_link_get(profile_path: impl AsRef<Path>) -> Result<ContactShareLinkView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
     let bundle = if driver
@@ -1150,7 +1145,10 @@ pub async fn allowlist_get(profile_path: impl AsRef<Path>) -> Result<AllowlistVi
     Ok(map_allowlist(allowlist_from_output(&output)?))
 }
 
-pub async fn allowlist_add(profile_path: impl AsRef<Path>, user_id: &str) -> Result<AllowlistView> {
+pub async fn allowlist_add(
+    profile_path: impl AsRef<Path>,
+    user_id: &str,
+) -> Result<AllowlistView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
     let output = driver
@@ -1240,9 +1238,7 @@ pub fn conversation_show(
         conversation_state: format!("{:?}", state.conversation.state),
         recovery_status: format!("{:?}", state.recovery_status),
         message_count: state.messages.len(),
-        mls_status: driver
-            .mls_status(conversation_id)
-            .map(|status| format!("{:?}", status)),
+        mls_status: driver.mls_status(conversation_id).map(|status| format!("{:?}", status)),
         recovery: driver.recovery_context_snapshot(conversation_id),
     })
 }
@@ -1321,9 +1317,7 @@ pub async fn message_send_text(
             plaintext: text.to_string(),
         })
         .await
-        .map_err(|error| {
-            annotate_peer_bundle_error(error, conversation_id, peer_user_id.as_deref())
-        })?;
+        .map_err(|error| annotate_peer_bundle_error(error, conversation_id, peer_user_id.as_deref()))?;
     persist_driver(&mut profile, &driver)?;
     Ok(SendMessageResultView {
         conversation_id: conversation_id.to_string(),
@@ -1355,9 +1349,7 @@ pub async fn message_send_attachment(
             attachment_descriptor: descriptor,
         })
         .await
-        .map_err(|error| {
-            annotate_peer_bundle_error(error, conversation_id, peer_user_id.as_deref())
-        })?;
+        .map_err(|error| annotate_peer_bundle_error(error, conversation_id, peer_user_id.as_deref()))?;
     persist_driver(&mut profile, &driver)?;
     Ok(SendAttachmentResultView {
         conversation_id: conversation_id.to_string(),
@@ -1510,7 +1502,10 @@ pub fn attachment_preview_source(
     })
 }
 
-pub fn attachment_open_local(profile_path: impl AsRef<Path>, message_id: &str) -> Result<bool> {
+pub fn attachment_open_local(
+    profile_path: impl AsRef<Path>,
+    message_id: &str,
+) -> Result<bool> {
     let profile = Profile::open(profile_path.as_ref())?;
     let mut desktop_state = load_desktop_profile_state(profile.root())?;
     let local_path = attachment_local_path(&profile, &desktop_state, message_id)
@@ -1595,9 +1590,7 @@ pub fn attachment_transfers(
         .into_iter()
         .filter(|transfer| {
             conversation_id.is_none_or(|value| value == transfer.conversation_id)
-                && !pending
-                    .iter()
-                    .any(|item| item.transfer_id == transfer.transfer_id)
+                && !pending.iter().any(|item| item.transfer_id == transfer.transfer_id)
         })
         .map(map_recorded_transfer)
         .collect::<Vec<_>>();
@@ -1637,15 +1630,8 @@ pub fn sync_status(profile_path: impl AsRef<Path>) -> Result<SyncStatusView> {
 pub async fn sync_foreground(profile_path: impl AsRef<Path>) -> Result<SyncStatusView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
-    // Use without_realtime to suppress WebSocket connections: sync_foreground is
-    // a one-shot HTTP-level catch-up intended to run before the persistent
-    // realtime session is started.  Allowing OpenRealtimeConnection here causes
-    // a transient WebSocket to be opened inside the short-lived driver, which
-    // is immediately aborted when the driver is dropped and can crash the
-    // process when the connection attempt fails or races with the realtime
-    // session that connectTransport starts right afterwards.
     driver
-        .inject_event_until_idle_without_realtime(CoreEvent::AppForegrounded)
+        .inject_event_until_idle(CoreEvent::AppForegrounded)
         .await?;
     persist_driver(&mut profile, &driver)?;
     let device_id = local_device_id(&driver).ok();
@@ -1661,8 +1647,8 @@ pub fn direct_shell(
     let contacts = contact_list(profile.root())?;
     let conversations = conversation_list(profile.root())?;
     let sync = sync_status(profile.root())?;
-    let selected_conversation = selected_conversation_id
-        .and_then(|conversation_id| conversation_show(profile.root(), conversation_id).ok());
+    let selected_conversation =
+        selected_conversation_id.and_then(|conversation_id| conversation_show(profile.root(), conversation_id).ok());
     let selected_contact =
         selected_contact_user_id.and_then(|user_id| contact_show(profile.root(), user_id).ok());
     let messages = if let Some(conversation) = selected_conversation.as_ref() {
@@ -1670,11 +1656,9 @@ pub fn direct_shell(
     } else {
         Vec::new()
     };
-    let attachment_filter = selected_conversation_id.map(str::to_string).or_else(|| {
-        selected_conversation
-            .as_ref()
-            .map(|value| value.conversation_id.clone())
-    });
+    let attachment_filter = selected_conversation_id
+        .map(str::to_string)
+        .or_else(|| selected_conversation.as_ref().map(|value| value.conversation_id.clone()));
     Ok(DirectShellView {
         contacts,
         conversations,
@@ -1730,9 +1714,7 @@ fn runtime_status_from_profile(profile: &Profile) -> Result<RuntimeStatusView> {
     })
 }
 
-fn cloudflare_runtime_details_from_profile(
-    profile: &Profile,
-) -> Result<CloudflareRuntimeDetailsView> {
+fn cloudflare_runtime_details_from_profile(profile: &Profile) -> Result<CloudflareRuntimeDetailsView> {
     let runtime = profile.load_runtime_metadata()?;
     let workspace_root = runtime.workspace_root.clone();
     Ok(CloudflareRuntimeDetailsView {
@@ -2130,17 +2112,19 @@ async fn provision_cloudflare_profile(
     service_root: &Path,
     config: ResolvedCloudflareDeployConfig,
 ) -> Result<ProvisionProgressView> {
-    Ok(provision_cloudflare_profile_with_progress(
-        profile,
-        driver,
-        user_id,
-        device_id,
-        service_root,
-        config,
-        |_, _| {},
+    Ok(
+        provision_cloudflare_profile_with_progress(
+            profile,
+            driver,
+            user_id,
+            device_id,
+            service_root,
+            config,
+            |_, _| {},
+        )
+        .await?
+        .progress,
     )
-    .await?
-    .progress)
 }
 
 async fn provision_cloudflare_action(
@@ -2152,8 +2136,15 @@ async fn provision_cloudflare_action(
     service_root: &Path,
     config: ResolvedCloudflareDeployConfig,
 ) -> Result<CloudflareActionResultView> {
-    let _ = provision_cloudflare_profile(profile, driver, user_id, device_id, service_root, config)
-        .await?;
+    let _ = provision_cloudflare_profile(
+        profile,
+        driver,
+        user_id,
+        device_id,
+        service_root,
+        config,
+    )
+    .await?;
     let runtime = cloudflare_runtime_details_from_profile(profile)?;
     Ok(CloudflareActionResultView {
         action: action.into(),
@@ -2163,7 +2154,9 @@ async fn provision_cloudflare_action(
             severity: "success".into(),
             message: match action {
                 "redeploy" => "Cloudflare runtime redeployed.".into(),
-                "rotate_secrets" => "Cloudflare secrets rotated and deployment rebound.".into(),
+                "rotate_secrets" => {
+                    "Cloudflare secrets rotated and deployment rebound.".into()
+                }
                 _ => "Cloudflare runtime updated.".into(),
             },
         },
@@ -2320,20 +2313,17 @@ fn map_message(
     profile: Option<&Profile>,
 ) -> MessageItemView {
     let local_user_id = local_identity.map(|identity| identity.user_identity.user_id.as_str());
-    let local_device_id =
-        local_identity.map(|identity| identity.device_identity.device_id.as_str());
+    let local_device_id = local_identity.map(|identity| identity.device_identity.device_id.as_str());
     let is_outgoing = local_device_id == Some(message.sender_device_id.as_str());
     let sender_user_id = if is_outgoing {
         local_user_id.map(ToOwned::to_owned)
     } else {
         Some(peer_user_id.to_string())
     };
-    let primary_attachment_local_path = attachment_state.and_then(|state| {
-        profile.and_then(|profile| attachment_local_path(profile, state, &message.message_id))
-    });
-    let primary_attachment_display_name = attachment_state.map(|state| {
-        attachment_display_name(state, &message.message_id, message.storage_refs.first())
-    });
+    let primary_attachment_local_path = attachment_state
+        .and_then(|state| profile.and_then(|profile| attachment_local_path(profile, state, &message.message_id)));
+    let primary_attachment_display_name = attachment_state
+        .map(|state| attachment_display_name(state, &message.message_id, message.storage_refs.first()));
     let primary_attachment_previewable = primary_attachment_local_path
         .as_ref()
         .is_some_and(|path| path.exists())
@@ -2450,9 +2440,7 @@ fn save_desktop_profile_state(profile_root: &Path, state: &DesktopProfileState) 
 
 fn record_recent_transfer(profile_root: &Path, transfer: RecordedAttachmentTransfer) -> Result<()> {
     let mut state = load_desktop_profile_state(profile_root)?;
-    state
-        .recent_transfers
-        .retain(|item| item.transfer_id != transfer.transfer_id);
+    state.recent_transfers.retain(|item| item.transfer_id != transfer.transfer_id);
     state.recent_transfers.insert(0, transfer);
     state.recent_transfers.truncate(20);
     save_desktop_profile_state(profile_root, &state)
@@ -2528,11 +2516,9 @@ fn find_message_with_attachment(
             .into_iter()
             .find(|message| message.message_id == message_id)
         {
-            let attachment_ref = message
-                .storage_refs
-                .iter()
-                .find(|item| reference.is_none_or(|value| value == item.object_ref.as_str()))
-                .cloned();
+            let attachment_ref = message.storage_refs.iter().find(|item| {
+                reference.is_none_or(|value| value == item.object_ref.as_str())
+            }).cloned();
             return Ok((message, attachment_ref));
         }
     }
@@ -2682,17 +2668,15 @@ pub fn map_realtime_snapshot(
     RealtimeStatusView {
         device_id,
         connected,
-        last_known_seq: snapshot
-            .map(|value| value.last_known_seq)
-            .unwrap_or_default(),
+        last_known_seq: snapshot.map(|value| value.last_known_seq).unwrap_or_default(),
         needs_reconnect: snapshot.map(|value| value.needs_reconnect).unwrap_or(false),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use super::*;
     use serde_json::Value;
 
     #[test]

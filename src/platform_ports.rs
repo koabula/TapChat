@@ -3,8 +3,8 @@
 use anyhow::Result;
 
 use crate::ffi_api::{
-    CoreEffect, CoreEvent, PersistStateEffect, ReadAttachmentBytesEffect, UserNotificationEffect,
-    WriteDownloadedAttachmentEffect,
+    CoreEffect, CoreEvent, PersistStateEffect, ReadAttachmentBytesEffect,
+    UserNotificationEffect, WriteDownloadedAttachmentEffect,
 };
 use crate::transport_contract::{
     BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest, FetchIdentityBundleRequest,
@@ -33,7 +33,10 @@ pub trait TransportPort {
         action: MessageRequestActionRequest,
     ) -> Result<Vec<CoreEvent>>;
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>>;
+    async fn fetch_allowlist(
+        &mut self,
+        fetch: FetchAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>>;
 
     async fn replace_allowlist(
         &mut self,
@@ -131,7 +134,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_api::{HttpMethod, HttpRequestEffect, SystemStatus, TimerEffect};
+    use crate::ffi_api::{
+        HttpMethod, HttpRequestEffect, SystemStatus, TimerEffect,
+    };
     use std::collections::BTreeMap;
 
     #[derive(Default)]
