@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs::{self, OpenOptions};
 use std::future::Future;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
@@ -42,6 +44,14 @@ struct RealtimeManager {
 #[derive(Default)]
 struct LifecycleManager {
     quitting: AtomicBool,
+    onboarding_handoff: Mutex<OnboardingHandoffState>,
+    onboarding_handoff_ready: Condvar,
+}
+
+#[derive(Default)]
+struct OnboardingHandoffState {
+    running: bool,
+    last_completed_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +117,61 @@ fn configure_embedded_cloudflare_runtime(app: &AppHandle) {
         env::set_var("TAPCHAT_CLOUDFLARE_WORKSPACE_ROOT", &runtime_root);
         break;
     }
+}
+
+fn desktop_trace_path(app: &AppHandle) -> PathBuf {
+    let base = app
+        .path()
+        .app_local_data_dir()
+        .or_else(|_| app.path().app_data_dir())
+        .unwrap_or_else(|_| env::temp_dir().join("tapchat-desktop"));
+    base.join("logs").join("desktop-trace.log")
+}
+
+fn append_desktop_trace(
+    app: &AppHandle,
+    scope: &str,
+    window_label: Option<&str>,
+    profile_path: Option<&str>,
+    message: &str,
+) {
+    let path = desktop_trace_path(app);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let line = format!(
+        "[{timestamp}] scope={scope} window={} profile={} {message}\n",
+        window_label.unwrap_or("-"),
+        profile_path.unwrap_or("-"),
+    );
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+    eprintln!("{}", line.trim_end());
+}
+
+fn can_reuse_completed_handoff(
+    state: &OnboardingHandoffState,
+    onboarding_complete: bool,
+    active_profile_path: Option<&str>,
+) -> bool {
+    onboarding_complete && state.last_completed_profile.as_deref() == active_profile_path
+}
+
+fn should_emit_completed_handoff(
+    state: &mut OnboardingHandoffState,
+    active_profile_path: Option<&str>,
+) -> bool {
+    let next = active_profile_path.map(str::to_string);
+    let should_emit = state.last_completed_profile != next;
+    if should_emit {
+        state.last_completed_profile = next;
+    }
+    should_emit
 }
 
 fn session_status_for(
@@ -352,35 +417,70 @@ fn ensure_onboarding_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn sync_window_visibility_from_bootstrap(app: &AppHandle) -> tauri::Result<String> {
+    append_desktop_trace(app, "window-visibility", None, None, "sync_window_visibility_from_bootstrap start");
+    eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: START");
     let bootstrap = desktop_app::app_bootstrap()
         .map_err(|error| tauri::Error::Anyhow(anyhow::anyhow!(error.to_string())))?;
     let onboarding_complete = bootstrap.onboarding.step == "complete";
+    eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: onboarding.step={}, onboarding_complete={}", bootstrap.onboarding.step, onboarding_complete);
     let main = app.get_webview_window("main");
+    eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: main window exists={}", main.is_some());
 
     if onboarding_complete {
+        eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: ONBOARDING COMPLETE - switching to main window");
         if let Some(onboarding) = app.get_webview_window("onboarding") {
+            eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: hiding onboarding window");
             let _ = onboarding.hide();
         }
         if let Some(main) = main {
+            eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: showing main window");
             let _ = main.show();
             let _ = main.set_focus();
         }
         if let Some(profile) = bootstrap.active_profile.as_ref() {
             let profile_path = profile.path.to_string_lossy().to_string();
+            eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: updating tray tooltip with profile {:?}", profile_path);
             update_tray_tooltip(app, Some(&profile_path));
         }
+        eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: returning 'main'");
+        let active_profile_path = bootstrap
+            .active_profile
+            .as_ref()
+            .map(|profile| profile.path.to_string_lossy().to_string());
+        append_desktop_trace(
+            app,
+            "window-visibility",
+            None,
+            active_profile_path.as_deref(),
+            "sync_window_visibility_from_bootstrap routed to main",
+        );
         return Ok(String::from("main"));
     }
 
+    eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: ONBOARDING NOT COMPLETE - showing onboarding window");
     if let Some(main) = main {
+        eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: hiding main window");
         let _ = main.hide();
     }
     ensure_onboarding_window(app)?;
     if let Some(onboarding) = app.get_webview_window("onboarding") {
+        eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: showing onboarding window");
         let _ = onboarding.show();
         let _ = onboarding.set_focus();
     }
     update_tray_tooltip(app, bootstrap.active_profile.as_ref().map(|profile| profile.path.to_string_lossy()).as_deref());
+    eprintln!("[DEBUG] sync_window_visibility_from_bootstrap: returning 'onboarding'");
+    let active_profile_path = bootstrap
+        .active_profile
+        .as_ref()
+        .map(|profile| profile.path.to_string_lossy().to_string());
+    append_desktop_trace(
+        app,
+        "window-visibility",
+        None,
+        active_profile_path.as_deref(),
+        "sync_window_visibility_from_bootstrap routed to onboarding",
+    );
     Ok(String::from("onboarding"))
 }
 
@@ -402,7 +502,16 @@ fn start_realtime_session(
     app: AppHandle,
     manager: &RealtimeManager,
 ) -> Result<bool, String> {
+    append_desktop_trace(
+        &app,
+        "realtime-session",
+        None,
+        Some(&profile_path),
+        "start_realtime_session invoked",
+    );
+    eprintln!("[DEBUG] start_realtime_session: START for profile {:?}", profile_path);
     let generation = bump_realtime_generation(manager, &profile_path)?;
+    eprintln!("[DEBUG] start_realtime_session: generation={}", generation);
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
     let status = Arc::new(Mutex::new(SessionStatus::default()));
     let status_for_task = Arc::clone(&status);
@@ -410,10 +519,15 @@ fn start_realtime_session(
     let app_for_task = app.clone();
 
     let task = tauri::async_runtime::spawn(async move {
+        eprintln!("[DEBUG] start_realtime_session task: spawned async task");
         let manager_state = app_for_task.state::<RealtimeManager>();
         let mut profile = match Profile::open(&profile_for_task) {
-            Ok(profile) => profile,
-            Err(_) => {
+            Ok(profile) => {
+                eprintln!("[DEBUG] start_realtime_session task: Profile opened successfully");
+                profile
+            },
+            Err(error) => {
+                eprintln!("[DEBUG] start_realtime_session task: ERROR opening profile: {:?}", error);
                 if let Ok(mut current) = status_for_task.lock() {
                     current.connected = false;
                     current.needs_reconnect = true;
@@ -422,8 +536,12 @@ fn start_realtime_session(
             }
         };
         let mut driver = match load_realtime_driver(&profile) {
-            Ok(driver) => driver,
-            Err(_) => {
+            Ok(driver) => {
+                eprintln!("[DEBUG] start_realtime_session task: realtime driver loaded successfully");
+                driver
+            },
+            Err(error) => {
+                eprintln!("[DEBUG] start_realtime_session task: ERROR loading realtime driver: {:?}", error);
                 if let Ok(mut current) = status_for_task.lock() {
                     current.connected = false;
                     current.needs_reconnect = true;
@@ -435,33 +553,56 @@ fn start_realtime_session(
             .local_identity()
             .map(|identity| identity.device_identity.device_id.clone())
         else {
+            eprintln!("[DEBUG] start_realtime_session task: ERROR - no local identity found");
             if let Ok(mut current) = status_for_task.lock() {
                 current.connected = false;
                 current.needs_reconnect = true;
             }
             return;
         };
+        eprintln!("[DEBUG] start_realtime_session task: device_id={}", device_id);
         let mut reconnect_attempt = 0u32;
         let mut initialized = false;
+        eprintln!("[DEBUG] start_realtime_session task: entering main loop");
         loop {
             if stop_rx.try_recv().is_ok()
                 || !realtime_generation_matches(&manager_state, &profile_for_task, generation)
             {
+                eprintln!("[DEBUG] start_realtime_session task: stopping (stop signal or generation mismatch)");
                 break;
             }
             let mut emit_dirty = false;
             let step_result = if !initialized {
+                append_desktop_trace(
+                    &app_for_task,
+                    "realtime-session",
+                    None,
+                    Some(&profile_for_task),
+                    "first iteration AppForegrounded begin",
+                );
+                eprintln!("[DEBUG] start_realtime_session task: first iteration - injecting AppForegrounded event");
                 initialized = true;
                 driver
                     .inject_event_until_idle(CoreEvent::AppForegrounded)
                     .await
-                    .map(|_| Vec::new())
+                    .map(|_| {
+                        append_desktop_trace(
+                            &app_for_task,
+                            "realtime-session",
+                            None,
+                            Some(&profile_for_task),
+                            "first iteration AppForegrounded done",
+                        );
+                        Vec::new()
+                    })
             } else {
+                eprintln!("[DEBUG] start_realtime_session task: pumping until idle (45s timeout)");
                 driver.pump_until_idle(Duration::from_secs(45)).await
             };
 
             match step_result {
                 Ok(outputs) => {
+                    eprintln!("[DEBUG] start_realtime_session task: step completed successfully, outputs count={}", outputs.len());
                     reconnect_attempt = 0;
                     if !outputs.is_empty() {
                         if realtime_generation_matches(&manager_state, &profile_for_task, generation)
@@ -496,6 +637,13 @@ fn start_realtime_session(
                     if emit_dirty {
                         let _ =
                             app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
+                        append_desktop_trace(
+                            &app_for_task,
+                            "realtime-session",
+                            None,
+                            Some(&profile_for_task),
+                            "emitted direct-shell-dirty",
+                        );
                         update_tray_tooltip(&app_for_task, Some(&profile_for_task));
                     }
                 }
@@ -740,21 +888,188 @@ fn complete_onboarding_handoff(
     app: AppHandle,
     profile_path: Option<String>,
 ) -> Result<desktop_app::AppBootstrapView, String> {
-    if let Some(profile_path) = profile_path.as_deref() {
-        let _ = desktop_app::profile_activate(profile_path).map_err(into_string_error)?;
+    append_desktop_trace(
+        &app,
+        "handoff",
+        None,
+        profile_path.as_deref(),
+        "complete_onboarding_handoff entered",
+    );
+    let lifecycle = app.state::<LifecycleManager>();
+    {
+        let mut handoff = lifecycle
+            .onboarding_handoff
+            .lock()
+            .map_err(|_| "onboarding handoff lock poisoned".to_string())?;
+        while handoff.running {
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                profile_path.as_deref(),
+                "waiting for concurrent handoff to finish",
+            );
+            handoff = lifecycle
+                .onboarding_handoff_ready
+                .wait(handoff)
+                .map_err(|_| "onboarding handoff lock poisoned".to_string())?;
+        }
     }
-    let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
-    if bootstrap.onboarding.step != "complete" {
-        return Err(String::from("onboarding is not complete"));
+
+    let current_bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
+    let completed_profile = current_bootstrap
+        .active_profile
+        .as_ref()
+        .map(|profile| profile.path.to_string_lossy().to_string());
+    let handoff_state = lifecycle
+        .onboarding_handoff
+        .lock()
+        .map_err(|_| "onboarding handoff lock poisoned".to_string())?;
+    let already_completed = can_reuse_completed_handoff(
+        &handoff_state,
+        current_bootstrap.onboarding.step == "complete",
+        completed_profile.as_deref(),
+    );
+    drop(handoff_state);
+    if already_completed {
+        append_desktop_trace(
+            &app,
+            "handoff",
+            None,
+            completed_profile.as_deref(),
+            "reused completed handoff without re-emitting side effects",
+        );
+        return Ok(current_bootstrap);
     }
-    if let Some(active_profile) = bootstrap.active_profile.as_ref() {
-        let active_profile_path = active_profile.path.to_string_lossy().to_string();
-        let _ = desktop_app::profile_activate(&active_profile_path).map_err(into_string_error)?;
+
+    {
+        let mut handoff = lifecycle
+            .onboarding_handoff
+            .lock()
+            .map_err(|_| "onboarding handoff lock poisoned".to_string())?;
+        handoff.running = true;
     }
-    let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
-    sync_window_visibility_from_bootstrap(&app).map_err(|error| error.to_string())?;
-    let _ = app.emit("tapchat://bootstrap-dirty", &bootstrap);
-    Ok(bootstrap)
+
+    let result = (|| {
+        if let Some(profile_path) = profile_path.as_deref() {
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                Some(profile_path),
+                "activating requested profile for handoff",
+            );
+            let _ = desktop_app::profile_activate(profile_path).map_err(into_string_error)?;
+        }
+
+        let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
+        if bootstrap.onboarding.step != "complete" {
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                profile_path.as_deref(),
+                "handoff aborted because onboarding is not complete",
+            );
+            return Err(String::from("onboarding is not complete"));
+        }
+
+        if let Some(active_profile) = bootstrap.active_profile.as_ref() {
+            let active_profile_path = active_profile.path.to_string_lossy().to_string();
+            let _ = desktop_app::profile_activate(&active_profile_path).map_err(into_string_error)?;
+        }
+
+        let bootstrap = desktop_app::app_bootstrap().map_err(into_string_error)?;
+        let active_profile_path = bootstrap
+            .active_profile
+            .as_ref()
+            .map(|profile| profile.path.to_string_lossy().to_string());
+        let should_emit = {
+            let mut handoff = lifecycle
+                .onboarding_handoff
+                .lock()
+                .map_err(|_| "onboarding handoff lock poisoned".to_string())?;
+            should_emit_completed_handoff(&mut handoff, active_profile_path.as_deref())
+        };
+        if should_emit {
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                active_profile_path.as_deref(),
+                "syncing window visibility after completed handoff",
+            );
+            sync_window_visibility_from_bootstrap(&app).map_err(|error| error.to_string())?;
+            let _ = app.emit("tapchat://bootstrap-dirty", &bootstrap);
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                active_profile_path.as_deref(),
+                "emitted bootstrap-dirty after completed handoff",
+            );
+        } else {
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                active_profile_path.as_deref(),
+                "skipped duplicate handoff side effects",
+            );
+        }
+        Ok(bootstrap)
+    })();
+
+    {
+        let mut handoff = lifecycle
+            .onboarding_handoff
+            .lock()
+            .map_err(|_| "onboarding handoff lock poisoned".to_string())?;
+        handoff.running = false;
+        lifecycle.onboarding_handoff_ready.notify_all();
+    }
+
+    match &result {
+        Ok(bootstrap) => {
+            let active_profile_path = bootstrap
+                .active_profile
+                .as_ref()
+                .map(|profile| profile.path.to_string_lossy().to_string());
+            append_desktop_trace(
+                &app,
+                "handoff",
+                None,
+                active_profile_path.as_deref(),
+                "complete_onboarding_handoff completed",
+            )
+        }
+        Err(error) => append_desktop_trace(
+            &app,
+            "handoff",
+            None,
+            profile_path.as_deref(),
+            &format!("complete_onboarding_handoff failed: {error}"),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+fn desktop_debug_log(
+    app: AppHandle,
+    scope: String,
+    message: String,
+    window_label: Option<String>,
+    profile_path: Option<String>,
+) -> Result<bool, String> {
+    append_desktop_trace(
+        &app,
+        &scope,
+        window_label.as_deref(),
+        profile_path.as_deref(),
+        &message,
+    );
+    Ok(true)
 }
 
 #[tauri::command]
@@ -1289,12 +1604,37 @@ async fn sync_foreground(
     app: AppHandle,
     manager: State<'_, RealtimeManager>,
 ) -> Result<desktop_app::SyncStatusView, String> {
-    run_with_paused_realtime(app, &manager, profile_path.clone(), async move {
-        desktop_app::sync_foreground(profile_path)
+    append_desktop_trace(
+        &app,
+        "syncForeground",
+        None,
+        Some(&profile_path),
+        "sync_foreground started",
+    );
+    let task_profile_path = profile_path.clone();
+    let result = run_with_paused_realtime(app.clone(), &manager, profile_path.clone(), async move {
+        desktop_app::sync_foreground(task_profile_path)
             .await
             .map_err(into_string_error)
     })
-    .await
+    .await;
+    match &result {
+        Ok(_) => append_desktop_trace(
+            &app,
+            "syncForeground",
+            None,
+            Some(&profile_path),
+            "sync_foreground completed",
+        ),
+        Err(error) => append_desktop_trace(
+            &app,
+            "syncForeground",
+            None,
+            Some(&profile_path),
+            &format!("sync_foreground failed: {error}"),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -1349,13 +1689,44 @@ async fn sync_realtime_connect(
     app: AppHandle,
     manager: State<'_, RealtimeManager>,
 ) -> Result<bool, String> {
+    append_desktop_trace(
+        &app,
+        "syncRealtimeConnect",
+        None,
+        Some(&profile_path),
+        "sync_realtime_connect started",
+    );
     let _ = stop_realtime_session(&manager, &profile_path).await?;
-    start_realtime_session(profile_path, app, &manager)
+    let result = start_realtime_session(profile_path.clone(), app.clone(), &manager);
+    match &result {
+        Ok(_) => append_desktop_trace(
+            &app,
+            "syncRealtimeConnect",
+            None,
+            Some(&profile_path),
+            "sync_realtime_connect completed",
+        ),
+        Err(error) => append_desktop_trace(
+            &app,
+            "syncRealtimeConnect",
+            None,
+            Some(&profile_path),
+            &format!("sync_realtime_connect failed: {error}"),
+        ),
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bump_realtime_generation, realtime_generation_matches, RealtimeManager};
+    use super::{
+        bump_realtime_generation,
+        can_reuse_completed_handoff,
+        realtime_generation_matches,
+        should_emit_completed_handoff,
+        OnboardingHandoffState,
+        RealtimeManager,
+    };
 
     #[test]
     fn realtime_generation_bump_invalidates_prior_session() {
@@ -1380,6 +1751,26 @@ mod tests {
         assert!(realtime_generation_matches(&manager, "profile-a", first));
         assert!(realtime_generation_matches(&manager, "profile-b", other));
         assert!(!realtime_generation_matches(&manager, "profile-a", other + 1));
+    }
+
+    #[test]
+    fn handoff_side_effects_emit_once_per_profile() {
+        let mut state = OnboardingHandoffState::default();
+        assert!(should_emit_completed_handoff(&mut state, Some("profile-a")));
+        assert!(!should_emit_completed_handoff(&mut state, Some("profile-a")));
+        assert!(should_emit_completed_handoff(&mut state, Some("profile-b")));
+    }
+
+    #[test]
+    fn handoff_reuse_requires_completed_onboarding_and_same_profile() {
+        let state = OnboardingHandoffState {
+            running: false,
+            last_completed_profile: Some("profile-a".into()),
+        };
+        assert!(can_reuse_completed_handoff(&state, true, Some("profile-a")));
+        assert!(!can_reuse_completed_handoff(&state, false, Some("profile-a")));
+        assert!(!can_reuse_completed_handoff(&state, true, Some("profile-b")));
+        assert!(!can_reuse_completed_handoff(&state, true, None));
     }
 }
 
@@ -1447,13 +1838,15 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else if window.label() == "onboarding" {
-                    // Don't close the onboarding window if it's in the middle of setup
+                    // Keep onboarding close requests from tearing down the process while
+                    // the async handoff is switching visibility between windows.
+                    api.prevent_close();
                     let onboarding_complete = desktop_app::app_bootstrap()
                         .map(|bootstrap| bootstrap.onboarding.step == "complete")
                         .unwrap_or(false);
-                    if !onboarding_complete {
-                        // Prevent closing if onboarding is not complete
-                        api.prevent_close();
+                    if onboarding_complete {
+                        let _ = sync_window_visibility_from_bootstrap(window.app_handle());
+                        let _ = window.hide();
                     }
                 }
             }
@@ -1468,6 +1861,7 @@ pub fn run() {
             profile_reveal_in_shell,
             show_onboarding_window,
             complete_onboarding_handoff,
+            desktop_debug_log,
             identity_create,
             identity_recover,
             deployment_import,

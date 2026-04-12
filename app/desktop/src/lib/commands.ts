@@ -63,6 +63,20 @@ export function completeOnboardingHandoff(profilePath?: string | null) {
   return invoke<AppBootstrapView>("complete_onboarding_handoff", { profilePath });
 }
 
+export function desktopDebugLog(
+  scope: string,
+  message: string,
+  windowLabel?: string | null,
+  profilePath?: string | null,
+) {
+  return invoke<boolean>("desktop_debug_log", {
+    scope,
+    message,
+    windowLabel,
+    profilePath,
+  });
+}
+
 export function identityCreate(profilePath: string, deviceName: string) {
   return invoke<IdentitySummaryView>("identity_create", { profilePath, deviceName });
 }

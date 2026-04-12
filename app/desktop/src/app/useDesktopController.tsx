@@ -29,6 +29,7 @@ import {
   conversationCreateDirect,
   conversationRebuild,
   conversationReconcile,
+  desktopDebugLog,
   deploymentImport,
   directShell,
   identityCreate,
@@ -44,7 +45,6 @@ import {
   profileRevealInShell,
   profileOpenOrImport,
   showOnboardingWindow,
-  syncForeground,
   syncOnce,
   syncRealtimeClose,
   syncRealtimeConnect,
@@ -157,6 +157,15 @@ export function useDesktopController(windowLabel: string): DesktopController {
   });
   const onboardingHandoffRef = useRef(false);
   const transportStaleError = "__tapchat_transport_startup_stale__";
+
+  function traceDesktop(
+    scope: string,
+    message: string,
+    profilePath?: string | null,
+  ) {
+    void desktopDebugLog(scope, message, windowLabel, profilePath ?? state.bootstrap?.active_profile?.path ?? null)
+      .catch(() => null);
+  }
 
   function isTransportStartupActive(profilePath?: string | null) {
     if (!profilePath) {
@@ -301,6 +310,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
   }, [activeSection]);
 
   useEffect(() => {
+    if (!isOnboardingWindow) {
+      return;
+    }
     let unlistenWizard: (() => void) | undefined;
     void listen("tapchat://cloudflare-wizard", (event) => {
       const payload = event.payload as CloudflareWizardStatusView | null;
@@ -309,6 +321,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
       }
       setState((current) => ({ ...current, cloudflareWizard: payload }));
       if (payload.state === "completed") {
+        traceDesktop("wizard", "received completed event", state.bootstrap?.active_profile?.path ?? null);
         void performOnboardingHandoff();
       }
     }).then((dispose) => {
@@ -317,7 +330,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     return () => {
       unlistenWizard?.();
     };
-  }, []);
+  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path]);
 
   useEffect(() => {
     if (isOnboardingWindow) {
@@ -372,6 +385,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
   }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step, state.selectedConversationId, state.selectedContactUserId]);
 
   useEffect(() => {
+    if (!isOnboardingWindow) {
+      return;
+    }
     const profilePath = state.bootstrap?.active_profile?.path;
     const wizard = state.cloudflareWizard;
     if (!profilePath || !wizard) {
@@ -385,6 +401,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
           .then((status) => {
             setState((current) => ({ ...current, cloudflareWizard: status }));
             if (status.state === "completed") {
+              traceDesktop("wizard", "poll observed completed state", profilePath);
               void performOnboardingHandoff();
             }
           })
@@ -394,7 +411,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     }, 1000);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.bootstrap?.active_profile?.path, state.cloudflareWizard]);
+  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.cloudflareWizard]);
 
   useEffect(() => {
     if (isOnboardingWindow) {
@@ -499,10 +516,19 @@ export function useDesktopController(windowLabel: string): DesktopController {
   }
 
   async function performOnboardingHandoff() {
+    if (!isOnboardingWindow) {
+      traceDesktop("handoff", "ignored handoff request outside onboarding window");
+      return;
+    }
+    if (onboardingHandoffRef.current) {
+      traceDesktop("handoff", "ignored duplicate handoff request while one is already running");
+      return;
+    }
     setPostOnboardingHandoffPending(true);
     onboardingHandoffRef.current = true;
     try {
       const profilePath = state.bootstrap?.active_profile?.path ?? null;
+      traceDesktop("handoff", "starting onboarding handoff", profilePath);
       await completeOnboardingHandoff(profilePath);
       const bootstrap = await appBootstrap();
       selectionRef.current = {
@@ -525,14 +551,15 @@ export function useDesktopController(windowLabel: string): DesktopController {
       if (!activeProfilePath || bootstrap.onboarding.step !== "complete") {
         throw new Error("Onboarding handoff did not produce an active completed profile.");
       }
-      if (!isOnboardingWindow) {
-        await refreshCloudflareState(activeProfilePath);
-        await refreshContactShareLink(activeProfilePath);
-        await refreshDirectShell(activeProfilePath, null, null, false);
-        await refreshPolicyState(activeProfilePath, { suppressTransientErrors: true });
-        await connectTransport(activeProfilePath, "connecting");
-      }
+      await refreshCloudflareState(activeProfilePath);
+      await refreshContactShareLink(activeProfilePath);
+      traceDesktop("handoff", "completed onboarding handoff", activeProfilePath);
     } catch (error) {
+      traceDesktop(
+        "handoff",
+        `handoff failed: ${formatError(error)}`,
+        state.bootstrap?.active_profile?.path ?? null,
+      );
       setState((current) => ({
         ...current,
         loading: false,
@@ -544,7 +571,37 @@ export function useDesktopController(windowLabel: string): DesktopController {
     }
   }
 
+  async function continueTransportWarmup(profilePath: string, token: number) {
+    const isCurrentToken = () => transportConnectRef.current.token === token;
+    traceDesktop("connectTransport", "starting background warmup", profilePath);
+    try {
+      const latestShell = await refreshDirectShell(profilePath, undefined, undefined, false);
+      if (!isCurrentToken()) {
+        return;
+      }
+      await refreshPolicyState(profilePath, { suppressTransientErrors: true });
+      if (!isCurrentToken()) {
+        return;
+      }
+      setConnectionHealth(latestShell?.realtime?.connected ? "connected" : "ready");
+      setLastTransportError(null);
+      traceDesktop("connectTransport", "background warmup completed", profilePath);
+    } catch (error) {
+      if (!isCurrentToken() || isStaleTransportConnect(error)) {
+        return;
+      }
+      const formatted = formatError(error);
+      setLastTransportError(formatted);
+      setState((current) => ({ ...current, error: formatted, loading: false }));
+      traceDesktop("connectTransport", `background warmup failed: ${formatted}`, profilePath);
+    }
+  }
+
   async function connectTransport(profilePath: string, health: ConnectionHealth) {
+    if (isOnboardingWindow) {
+      traceDesktop("connectTransport", "ignored connect request from onboarding window", profilePath);
+      return;
+    }
     const existing = transportConnectRef.current;
     if (existing.promise && existing.profilePath === profilePath) {
       setConnectionHealth(health);
@@ -564,10 +621,10 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const promise = (async () => {
       setConnectionHealth(health);
       setLastTransportError(null);
+      let shouldWarmup = false;
+      traceDesktop("connectTransport", `starting connect with health=${health}`, profilePath);
       try {
         await syncRealtimeClose(profilePath).catch(() => false);
-        assertCurrent();
-        await syncForeground(profilePath);
         assertCurrent();
         await refreshDirectShell(profilePath, undefined, undefined, false, { allowDuringTransportStartup: true });
         assertCurrent();
@@ -584,13 +641,14 @@ export function useDesktopController(windowLabel: string): DesktopController {
           { allowDuringTransportStartup: true },
         );
         assertCurrent();
-        await refreshPolicyState(profilePath, {
-          suppressTransientErrors: true,
-          allowDuringTransportStartup: true,
-        });
-        assertCurrent();
         setConnectionHealth(latestShell?.realtime?.connected ? "connected" : "ready");
         setLastTransportError(null);
+        shouldWarmup = true;
+        traceDesktop(
+          "connectTransport",
+          `initial connect completed with health=${latestShell?.realtime?.connected ? "connected" : "ready"}`,
+          profilePath,
+        );
       } catch (error) {
         if (isStaleTransportConnect(error)) {
           return;
@@ -599,6 +657,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
         setLastTransportError(formatted);
         setConnectionHealth((current) => (current === "degraded" ? "degraded" : "disconnected"));
         setState((current) => ({ ...current, error: formatted, loading: false }));
+        traceDesktop("connectTransport", `connect failed: ${formatted}`, profilePath);
       } finally {
         if (!isCurrent()) {
           return;
@@ -622,6 +681,9 @@ export function useDesktopController(windowLabel: string): DesktopController {
         }
         if (pendingPolicyRefresh) {
           await refreshPolicyState(profilePath, { suppressTransientErrors: true }).catch(() => null);
+        }
+        if (shouldWarmup && transportConnectRef.current.token === token) {
+          void continueTransportWarmup(profilePath, token);
         }
       }
     })();
