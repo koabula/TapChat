@@ -286,18 +286,34 @@ where
     Fut: Future<Output = Result<T, String>>,
 {
     let should_resume = stop_realtime_session(manager, &profile_path).await?;
-    let result = task.await;
-    let resume_result = if should_resume {
-        start_realtime_session(profile_path.clone(), app, manager).map(|_| ())
-    } else {
-        Ok(())
-    };
-    match (result, resume_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(_resume_error)) => Err(error),
+    if should_resume {
+        append_desktop_trace(
+            &app,
+            "run_with_paused_realtime",
+            None,
+            Some(&profile_path),
+            "paused existing session",
+        );
     }
+    let result = task.await;
+    if should_resume {
+        append_desktop_trace(
+            &app,
+            "run_with_paused_realtime",
+            None,
+            Some(&profile_path),
+            "command finished",
+        );
+        let _ = app.emit("tapchat://transport-reconnect-needed", &profile_path);
+        append_desktop_trace(
+            &app,
+            "run_with_paused_realtime",
+            None,
+            Some(&profile_path),
+            "emitted transport-reconnect-needed",
+        );
+    }
+    result
 }
 
 fn outputs_changed_message_requests(outputs: &[CoreOutput]) -> bool {
@@ -560,6 +576,12 @@ fn start_realtime_session(
             }
             return;
         };
+        if let Ok(mut current) = status_for_task.lock() {
+            current.connected = false;
+            current.needs_reconnect = false;
+            current.device_id = Some(device_id.clone());
+            current.last_known_seq = 0;
+        }
         eprintln!("[DEBUG] start_realtime_session task: device_id={}", device_id);
         let mut reconnect_attempt = 0u32;
         let mut initialized = false;
@@ -667,6 +689,7 @@ fn start_realtime_session(
 
         if let Ok(mut current) = status_for_task.lock() {
             current.connected = false;
+            current.needs_reconnect = false;
         }
         let _ = app_for_task.emit("tapchat://direct-shell-dirty", &profile_for_task);
     });
@@ -1288,12 +1311,37 @@ async fn contact_import_share_link(
     app: AppHandle,
     manager: State<'_, RealtimeManager>,
 ) -> Result<desktop_app::ContactDetailView, String> {
-    run_with_paused_realtime(app, &manager, profile_path.clone(), async move {
+    let trace_profile_path = profile_path.clone();
+    append_desktop_trace(
+        &app,
+        "contacts",
+        None,
+        Some(&trace_profile_path),
+        "contact_import_share_link entered",
+    );
+    let result = run_with_paused_realtime(app.clone(), &manager, profile_path.clone(), async move {
         desktop_app::contact_import_share_link(profile_path, &url)
             .await
             .map_err(into_string_error)
     })
-    .await
+    .await;
+    match &result {
+        Ok(contact) => append_desktop_trace(
+            &app,
+            "contacts",
+            None,
+            Some(&trace_profile_path),
+            &format!("contact_import_share_link completed user={}", contact.user_id),
+        ),
+        Err(error) => append_desktop_trace(
+            &app,
+            "contacts",
+            None,
+            Some(&trace_profile_path),
+            &format!("contact_import_share_link failed: {error}"),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -1642,8 +1690,22 @@ fn direct_shell(
     profile_path: String,
     selected_conversation_id: Option<String>,
     selected_contact_user_id: Option<String>,
+    app: AppHandle,
     manager: State<'_, RealtimeManager>,
 ) -> Result<desktop_app::DirectShellView, String> {
+    if selected_conversation_id.is_some() || selected_contact_user_id.is_some() {
+        append_desktop_trace(
+            &app,
+            "directShell",
+            None,
+            Some(&profile_path),
+            &format!(
+                "direct_shell entered conversation={:?} contact={:?}",
+                selected_conversation_id,
+                selected_contact_user_id
+            ),
+        );
+    }
     let mut shell = desktop_app::direct_shell(
         &profile_path,
         selected_conversation_id.as_deref(),
@@ -1662,6 +1724,21 @@ fn direct_shell(
     if let Some(status) = snapshot {
         shell.realtime.last_known_seq = status.last_known_seq;
         shell.realtime.needs_reconnect = status.needs_reconnect;
+    }
+    if selected_conversation_id.is_some() || selected_contact_user_id.is_some() {
+        append_desktop_trace(
+            &app,
+            "directShell",
+            None,
+            Some(&profile_path),
+            &format!(
+                "direct_shell completed contacts={} conversations={} selected_contact={} selected_conversation={}",
+                shell.contacts.len(),
+                shell.conversations.len(),
+                shell.selected_contact.as_ref().map(|value| value.user_id.as_str()).unwrap_or("-"),
+                shell.selected_conversation.as_ref().map(|value| value.conversation_id.as_str()).unwrap_or("-"),
+            ),
+        );
     }
     Ok(shell)
 }

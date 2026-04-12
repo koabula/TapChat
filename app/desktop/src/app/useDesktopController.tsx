@@ -67,6 +67,7 @@ import type {
 } from "../lib/types";
 import { dedupePaths, formatError, normalizeOverrides } from "./formatters";
 import type { ActiveSection, ConnectionHealth, DesktopController, DrawerMode, OnboardingViewStep, ViewState } from "./types";
+import { updateRendererSnapshot } from "./rendererDiagnostics";
 import { useTheme } from "./useTheme";
 
 const emptyOverrides: CloudflareDeployOverrides = {
@@ -156,6 +157,24 @@ export function useDesktopController(windowLabel: string): DesktopController {
     selectedContactUserId: null,
   });
   const onboardingHandoffRef = useRef(false);
+  const commandMutationDepthRef = useRef(0);
+  const shellRealtimeRef = useRef<DirectShellView["realtime"] | null>(null);
+  const activeProfilePathRef = useRef<string | null>(null);
+  const initialConnectProfileRef = useRef<string | null>(null);
+  const reconnectStabilityRef = useRef<{
+    profilePath: string | null;
+    suppressUntil: number;
+  }>({
+    profilePath: null,
+    suppressUntil: 0,
+  });
+  const pendingReconnectRef = useRef<{
+    profilePath: string | null;
+    health: ConnectionHealth;
+  }>({
+    profilePath: null,
+    health: "connecting",
+  });
   const transportStaleError = "__tapchat_transport_startup_stale__";
 
   function traceDesktop(
@@ -199,6 +218,179 @@ export function useDesktopController(windowLabel: string): DesktopController {
     return error instanceof Error && error.message === transportStaleError;
   }
 
+  function markReconnectStabilizing(profilePath: string, milliseconds: number) {
+    reconnectStabilityRef.current = {
+      profilePath,
+      suppressUntil: Date.now() + milliseconds,
+    };
+    traceDesktop(
+      "connectTransport",
+      `suppressing needs_reconnect until startup stabilizes (${milliseconds}ms)`,
+      profilePath,
+    );
+  }
+
+  function clearReconnectStabilizing(profilePath?: string | null) {
+    if (!profilePath || reconnectStabilityRef.current.profilePath === profilePath) {
+      reconnectStabilityRef.current = {
+        profilePath: null,
+        suppressUntil: 0,
+      };
+    }
+  }
+
+  function reconnectStabilizationRemaining(profilePath: string) {
+    if (reconnectStabilityRef.current.profilePath !== profilePath) {
+      return 0;
+    }
+    return Math.max(0, reconnectStabilityRef.current.suppressUntil - Date.now());
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }
+
+  function clearPendingTransportReconnect(profilePath?: string | null) {
+    if (!profilePath || pendingReconnectRef.current.profilePath === profilePath) {
+      pendingReconnectRef.current = {
+        profilePath: null,
+        health: "connecting",
+      };
+    }
+  }
+
+  function rememberPendingTransportReconnect(
+    profilePath: string,
+    health: ConnectionHealth,
+    message: string,
+  ) {
+    pendingReconnectRef.current = { profilePath, health };
+    traceDesktop("connectTransport", message, profilePath);
+  }
+
+  function requestTransportReconnect(
+    profilePath: string,
+    reason: string,
+    health: ConnectionHealth,
+  ) {
+    const activeProfilePath = state.bootstrap?.active_profile?.path ?? null;
+    if (isOnboardingWindow) {
+      traceDesktop("connectTransport", `ignored reconnect request from onboarding window (${reason})`, profilePath);
+      return;
+    }
+    if (!activeProfilePath || profilePath !== activeProfilePath) {
+      return;
+    }
+    if (reason === "needs_reconnect" && reconnectStabilizationRemaining(profilePath) > 0) {
+      rememberPendingTransportReconnect(
+        profilePath,
+        health,
+        `request reconnect ignored during startup stabilization (${reason})`,
+      );
+      return;
+    }
+    if (commandMutationDepthRef.current > 0) {
+      clearReconnectTimer();
+      rememberPendingTransportReconnect(
+        profilePath,
+        health,
+        `request reconnect deferred during mutating command (${reason})`,
+      );
+      return;
+    }
+    if (isTransportStartupActive(profilePath)) {
+      rememberPendingTransportReconnect(
+        profilePath,
+        health,
+        `request reconnect skipped because startup active (${reason})`,
+      );
+      return;
+    }
+    traceDesktop("connectTransport", `starting reconnect (${reason})`, profilePath);
+    void connectTransport(profilePath, health);
+  }
+
+  async function flushPendingTransportReconnect(reason: string) {
+    const pending = pendingReconnectRef.current;
+    const profilePath = pending.profilePath;
+    const activeProfilePath = state.bootstrap?.active_profile?.path ?? null;
+    if (!profilePath || !activeProfilePath || profilePath !== activeProfilePath) {
+      clearPendingTransportReconnect(profilePath);
+      return;
+    }
+    if (isTransportStartupActive(profilePath)) {
+      traceDesktop("connectTransport", `request reconnect skipped because startup active (${reason})`, profilePath);
+      return;
+    }
+    clearPendingTransportReconnect(profilePath);
+    traceDesktop("connectTransport", `flushing deferred reconnect after command (${reason})`, profilePath);
+    traceDesktop("connectTransport", "starting reconnect after gate flush", profilePath);
+    await connectTransport(
+      profilePath,
+      pending.health,
+    );
+  }
+
+  async function runTransportMutatingTask(task: () => Promise<void>) {
+    const activeProfilePath = state.bootstrap?.active_profile?.path ?? null;
+    if (reconnectTimerRef.current !== null && activeProfilePath) {
+      clearReconnectTimer();
+      rememberPendingTransportReconnect(
+        activeProfilePath,
+        connectionHealth === "degraded" ? "degraded" : "reconnecting",
+        "request reconnect deferred during mutating command (mutating task start)",
+      );
+    }
+    commandMutationDepthRef.current += 1;
+    setState((current) => ({ ...current, loading: true, error: null, success: null }));
+    try {
+      await task();
+    } catch (error) {
+      setState((current) => ({ ...current, loading: false, error: formatError(error), success: null }));
+    } finally {
+      commandMutationDepthRef.current = Math.max(0, commandMutationDepthRef.current - 1);
+      if (commandMutationDepthRef.current === 0) {
+        clearReconnectTimer();
+        await flushPendingTransportReconnect("mutating task").catch(() => null);
+      }
+    }
+  }
+
+  useEffect(() => {
+    shellRealtimeRef.current = state.shell?.realtime ?? null;
+    activeProfilePathRef.current = state.bootstrap?.active_profile?.path ?? null;
+  }, [state.bootstrap?.active_profile?.path, state.shell?.realtime]);
+
+  useEffect(() => {
+    updateRendererSnapshot({
+      windowLabel,
+      activeSection,
+      activeProfilePath: state.bootstrap?.active_profile?.path ?? null,
+      selectedContactUserId: state.selectedContactUserId,
+      selectedConversationId: state.selectedConversationId,
+    });
+  }, [
+    activeSection,
+    state.bootstrap?.active_profile?.path,
+    state.selectedContactUserId,
+    state.selectedConversationId,
+    windowLabel,
+  ]);
+
+  useEffect(() => {
+    const profilePath = state.bootstrap?.active_profile?.path ?? null;
+    if (isOnboardingWindow || state.bootstrap?.onboarding.step !== "complete") {
+      initialConnectProfileRef.current = null;
+      return;
+    }
+    if (initialConnectProfileRef.current && initialConnectProfileRef.current !== profilePath) {
+      initialConnectProfileRef.current = null;
+    }
+  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step]);
+
   useEffect(() => {
     void refreshBootstrap();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -213,6 +405,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     let unlistenBackground: (() => void) | undefined;
     let unlistenDrop: (() => void) | undefined;
     let unlistenBootstrap: (() => void) | undefined;
+    let unlistenTransportReconnect: (() => void) | undefined;
 
     void listen<string>("tapchat://direct-shell-dirty", (event) => {
       if (event.payload && event.payload === state.bootstrap?.active_profile?.path) {
@@ -257,6 +450,20 @@ export function useDesktopController(windowLabel: string): DesktopController {
       unlistenBootstrap = dispose;
     });
 
+    void listen<string>("tapchat://transport-reconnect-needed", (event) => {
+      if (!event.payload || event.payload !== state.bootstrap?.active_profile?.path) {
+        return;
+      }
+      traceDesktop("connectTransport", "received transport-reconnect-needed", event.payload);
+      requestTransportReconnect(
+        event.payload,
+        "transport-reconnect-needed",
+        state.shell?.realtime?.connected ? "reconnecting" : "connecting",
+      );
+    }).then((dispose) => {
+      unlistenTransportReconnect = dispose;
+    });
+
     void getCurrentWindow().onDragDropEvent((event) => {
       const { payload } = event;
       if (payload.type === "enter" || payload.type === "over") {
@@ -281,14 +488,13 @@ export function useDesktopController(windowLabel: string): DesktopController {
       unlistenBackground?.();
       unlistenDrop?.();
       unlistenBootstrap?.();
+      unlistenTransportReconnect?.();
     };
-  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path]);
+  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.shell?.realtime?.connected]);
 
   useEffect(() => {
     return () => {
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-      }
+      clearReconnectTimer();
     };
   }, []);
 
@@ -337,26 +543,40 @@ export function useDesktopController(windowLabel: string): DesktopController {
       return;
     }
     const profilePath = state.bootstrap?.active_profile?.path;
+    const runtimeBound = !!state.cloudflareRuntime?.deployment_bound;
     if (onboardingHandoffRef.current || postOnboardingHandoffPending) {
       return;
     }
     if (!profilePath || state.bootstrap?.onboarding.step !== "complete") {
+      initialConnectProfileRef.current = null;
+      clearReconnectStabilizing();
       setConnectionHealth("disconnected");
       return;
     }
+    if (!runtimeBound) {
+      return;
+    }
+    if (isTransportStartupActive(profilePath) || state.shell?.realtime || connectionHealth !== "disconnected") {
+      return;
+    }
+    if (initialConnectProfileRef.current === profilePath) {
+      traceDesktop("connectTransport", "skipping duplicate initial connect request", profilePath);
+      return;
+    }
+    initialConnectProfileRef.current = profilePath;
     void connectTransport(profilePath, "connecting");
     return () => {
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
+      clearReconnectTimer();
       void syncRealtimeClose(profilePath);
     };
   }, [
     isOnboardingWindow,
     postOnboardingHandoffPending,
+    state.cloudflareRuntime?.deployment_bound,
     state.bootstrap?.active_profile?.path,
     state.bootstrap?.onboarding.step,
+    state.shell?.realtime,
+    connectionHealth,
   ]);
 
   useEffect(() => {
@@ -371,18 +591,6 @@ export function useDesktopController(windowLabel: string): DesktopController {
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
   }, []);
-
-  useEffect(() => {
-    if (isOnboardingWindow) {
-      return;
-    }
-    const profilePath = state.bootstrap?.active_profile?.path;
-    if (!profilePath || state.bootstrap?.onboarding.step !== "complete") {
-      return;
-    }
-    void refreshDirectShell(profilePath);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isOnboardingWindow, state.bootstrap?.active_profile?.path, state.bootstrap?.onboarding.step, state.selectedConversationId, state.selectedContactUserId]);
 
   useEffect(() => {
     if (!isOnboardingWindow) {
@@ -421,12 +629,18 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const onboardingComplete = state.bootstrap?.onboarding.step === "complete";
     const runtimeBound = !!state.cloudflareRuntime?.deployment_bound;
     if (!profilePath || !onboardingComplete) {
+      clearReconnectTimer();
+      clearReconnectStabilizing();
+      clearPendingTransportReconnect();
       setConnectionHealth("disconnected");
       setReconnectAttempt(0);
       setLastTransportError(null);
       return;
     }
     if (!runtimeBound) {
+      clearReconnectTimer();
+      clearReconnectStabilizing(profilePath);
+      clearPendingTransportReconnect(profilePath);
       setConnectionHealth("ready");
       setReconnectAttempt(0);
       return;
@@ -435,21 +649,50 @@ export function useDesktopController(windowLabel: string): DesktopController {
       setConnectionHealth("connected");
       setReconnectAttempt(0);
       setLastTransportError(null);
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
+      clearReconnectTimer();
+      clearReconnectStabilizing(profilePath);
+      clearPendingTransportReconnect(profilePath);
       return;
     }
     if (state.shell?.realtime?.needs_reconnect && reconnectTimerRef.current === null) {
       const nextAttempt = reconnectAttempt + 1;
       const delay = [1000, 3000, 5000, 10000][Math.min(nextAttempt - 1, 3)];
-      setConnectionHealth(nextAttempt >= 4 ? "degraded" : "reconnecting");
+      const reconnectHealth = nextAttempt >= 4 ? "degraded" : "reconnecting";
+      if (commandMutationDepthRef.current > 0) {
+        rememberPendingTransportReconnect(
+          profilePath,
+          reconnectHealth,
+          "request reconnect deferred during mutating command (needs_reconnect)",
+        );
+        return;
+      }
+      const stabilityDelay = reconnectStabilizationRemaining(profilePath);
+      const scheduledDelay = Math.max(delay, stabilityDelay);
+      if (stabilityDelay > 0) {
+        traceDesktop(
+          "connectTransport",
+          `ignoring immediate needs_reconnect during startup stabilization (${stabilityDelay}ms remaining)`,
+          profilePath,
+        );
+      } else {
+        setConnectionHealth(reconnectHealth);
+        traceDesktop("connectTransport", "request reconnect scheduled by needs_reconnect", profilePath);
+      }
       reconnectTimerRef.current = window.setTimeout(() => {
         reconnectTimerRef.current = null;
+        if (activeProfilePathRef.current !== profilePath) {
+          return;
+        }
+        const realtime = shellRealtimeRef.current;
+        if (!realtime?.needs_reconnect || realtime.connected) {
+          traceDesktop("connectTransport", "skipped reconnect because realtime state stabilized", profilePath);
+          return;
+        }
         setReconnectAttempt(nextAttempt);
-        void connectTransport(profilePath, nextAttempt >= 4 ? "degraded" : "reconnecting");
-      }, delay);
+        setConnectionHealth(reconnectHealth);
+        traceDesktop("connectTransport", "needs_reconnect timer fired", profilePath);
+        requestTransportReconnect(profilePath, "needs_reconnect", reconnectHealth);
+      }, scheduledDelay);
       return;
     }
     if (!state.shell?.realtime) {
@@ -641,6 +884,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
           { allowDuringTransportStartup: true },
         );
         assertCurrent();
+        markReconnectStabilizing(profilePath, 3000);
         setConnectionHealth(latestShell?.realtime?.connected ? "connected" : "ready");
         setLastTransportError(null);
         shouldWarmup = true;
@@ -653,10 +897,14 @@ export function useDesktopController(windowLabel: string): DesktopController {
         if (isStaleTransportConnect(error)) {
           return;
         }
+        if (health === "connecting" && initialConnectProfileRef.current === profilePath) {
+          initialConnectProfileRef.current = null;
+        }
         const formatted = formatError(error);
         setLastTransportError(formatted);
         setConnectionHealth((current) => (current === "degraded" ? "degraded" : "disconnected"));
         setState((current) => ({ ...current, error: formatted, loading: false }));
+        clearReconnectStabilizing(profilePath);
         traceDesktop("connectTransport", `connect failed: ${formatted}`, profilePath);
       } finally {
         if (!isCurrent()) {
@@ -922,7 +1170,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     });
     const profilePath = state.bootstrap?.active_profile?.path;
     if (typeof selected === "string" && profilePath) {
-      await runTask(async () => {
+      await runTransportMutatingTask(async () => {
         const contact = await contactImportIdentity(profilePath, selected);
         setActiveSection("contacts");
         selectionRef.current = {
@@ -971,17 +1219,25 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     const url = contactLinkDraft.trim();
     if (!profilePath || !url) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
+      traceDesktop("contacts", "handleImportContactLink start", profilePath);
       const contact = await contactImportShareLink(profilePath, url);
+      traceDesktop("contacts", `contact_import_share_link completed user=${contact.user_id}`, profilePath);
       setContactLinkDraft("");
       setActiveSection("contacts");
+      traceDesktop("contacts", `setActiveSection contacts after import user=${contact.user_id}`, profilePath);
       selectionRef.current = {
         selectedConversationId: null,
         selectedContactUserId: contact.user_id,
       };
       setState((current) => ({ ...current, selectedConversationId: null, selectedContactUserId: contact.user_id }));
+      traceDesktop("contacts", `selection updated after import user=${contact.user_id}`, profilePath);
+      await waitForNextFrame();
+      traceDesktop("contacts", `refreshDirectShell after import start user=${contact.user_id}`, profilePath);
       await refreshDirectShell(profilePath, null, contact.user_id);
+      traceDesktop("contacts", `refreshDirectShell after import completed user=${contact.user_id}`, profilePath);
       setState((current) => ({ ...current, success: "Contact imported. Select them to start a direct conversation." }));
+      traceDesktop("contacts", `handleImportContactLink completed user=${contact.user_id}`, profilePath);
     });
   }
 
@@ -1083,8 +1339,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
       setPreview(null);
       setShowContactQr(false);
       if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
+        clearReconnectTimer();
       }
       setReconnectAttempt(0);
       setLastTransportError(null);
@@ -1187,7 +1442,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   async function handleRefreshContact(userId: string) {
     const profilePath = state.bootstrap?.active_profile?.path;
     if (!profilePath) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       await contactRefresh(profilePath, userId);
       await refreshDirectShell(profilePath);
       setState((current) => ({ ...current, success: `Refreshed ${userId}.` }));
@@ -1198,7 +1453,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     const peerUserId = state.selectedContactUserId;
     if (!profilePath || !peerUserId) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       const conversation = await conversationCreateDirect(profilePath, peerUserId);
       setActiveSection("chats");
       selectionRef.current = {
@@ -1216,7 +1471,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     const conversationId = state.selectedConversationId;
     if (!profilePath || !conversationId || !composerText.trim()) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       const result = await messageSendText(profilePath, conversationId, composerText.trim());
       setComposerText("");
       setState((current) => ({ ...current, lastSend: result }));
@@ -1229,7 +1484,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     const conversationId = state.selectedConversationId;
     if (!profilePath || !conversationId || selectedAttachmentPaths.length === 0) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       const result = await messageSendAttachments(profilePath, conversationId, selectedAttachmentPaths);
       setSelectedAttachmentPaths([]);
       setState((current) => ({ ...current, lastAttachmentSend: result }));
@@ -1282,7 +1537,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   async function handleManualSync() {
     const profilePath = state.bootstrap?.active_profile?.path;
     if (!profilePath) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       await syncOnce(profilePath);
       setReconnectAttempt(0);
       await refreshDirectShell(profilePath);
@@ -1293,7 +1548,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   async function handleMessageRequest(requestId: string, action: "accept" | "reject") {
     const profilePath = state.bootstrap?.active_profile?.path;
     if (!profilePath) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       const result = action === "accept"
         ? await messageRequestAccept(profilePath, requestId)
         : await messageRequestReject(profilePath, requestId);
@@ -1341,7 +1596,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     const nextUserId = allowlistDraft.trim();
     if (!profilePath || !nextUserId) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       const next = await allowlistAdd(profilePath, nextUserId);
       setAllowlistDraft("");
       setState((current) => ({ ...current, allowlist: next, success: `Added ${nextUserId} to allowlist.` }));
@@ -1352,7 +1607,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
   async function handleAllowlistRemove(userId: string) {
     const profilePath = state.bootstrap?.active_profile?.path;
     if (!profilePath) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       const next = await allowlistRemove(profilePath, userId);
       setState((current) => ({ ...current, allowlist: next, success: `Removed ${userId} from allowlist.` }));
       await refreshDirectShell(profilePath);
@@ -1363,7 +1618,7 @@ export function useDesktopController(windowLabel: string): DesktopController {
     const profilePath = state.bootstrap?.active_profile?.path;
     const conversationId = state.selectedConversationId;
     if (!profilePath || !conversationId) return;
-    await runTask(async () => {
+    await runTransportMutatingTask(async () => {
       if (action === "reconcile") {
         await conversationReconcile(profilePath, conversationId);
       } else {
