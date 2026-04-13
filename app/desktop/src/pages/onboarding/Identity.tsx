@@ -2,6 +2,12 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
+interface CreateIdentityResult {
+  user_id: string;
+  device_id: string;
+  mnemonic: string | null;
+}
+
 export default function Identity() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -17,12 +23,12 @@ export default function Identity() {
     setError(null);
 
     try {
-      const result = await invoke<{ mnemonic: string }>("create_or_load_identity", {
+      const result = await invoke<CreateIdentityResult>("create_or_load_identity", {
         mnemonic: isRecover ? mnemonic : null,
         deviceName,
       });
 
-      // Store mnemonic for backup step
+      // Store mnemonic for backup step (only for new identity creation)
       if (!isRecover && result.mnemonic) {
         // Pass mnemonic to next step via state
         navigate("/onboarding/backup", { state: { mnemonic: result.mnemonic } });

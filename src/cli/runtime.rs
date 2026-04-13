@@ -489,27 +489,56 @@ fn escape_ps_double_quoted(value: &str) -> String {
 
 pub async fn wait_until_ready(base_url: &str) -> Result<()> {
     let client = Client::builder().build().context("build reqwest client")?;
+
+    // Initial wait for global deployment propagation (Cloudflare needs ~3-5 seconds)
+    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
+    let mut last_error = String::new();
+    let mut attempt = 0u32;
     loop {
+        attempt += 1;
         let response = client
             .get(format!("{base_url}/v1/deployment-bundle"))
             .send()
             .await;
-        if let Ok(response) = response {
-            if response.status().is_success() {
-                if let Ok(body) = response.text().await {
-                    if let Ok(json_body) = to_snake_case_json_string(&body) {
-                        if serde_json::from_str::<DeploymentBundle>(&json_body).is_ok() {
-                            return Ok(());
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    if let Ok(body) = resp.text().await {
+                        if let Ok(json_body) = to_snake_case_json_string(&body) {
+                            match serde_json::from_str::<DeploymentBundle>(&json_body) {
+                                Ok(_) => return Ok(()),
+                                Err(e) => {
+                                    last_error = format!("Parse error: {} (body: {})", e, &body[..body.len().min(200)]);
+                                }
+                            }
+                        } else {
+                            last_error = format!("JSON conversion failed (body: {})", &body[..body.len().min(200)]);
                         }
+                    } else {
+                        last_error = "Failed to read response body".to_string();
+                    }
+                } else {
+                    if let Ok(body) = resp.text().await {
+                        last_error = format!("HTTP {} (body: {})", status, &body[..body.len().min(200)]);
+                    } else {
+                        last_error = format!("HTTP {}", status);
                     }
                 }
             }
+            Err(e) => {
+                last_error = format!("Request error: {}", e);
+            }
+        }
+        if attempt % 10 == 0 {
+            eprintln!("wait_until_ready attempt {} - last error: {}", attempt, last_error);
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}");
+            bail!("runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}. Last error: {last_error}");
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 }
 

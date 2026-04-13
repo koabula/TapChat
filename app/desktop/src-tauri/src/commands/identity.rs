@@ -14,13 +14,23 @@ pub struct IdentityInfo {
     pub mnemonic: String,
 }
 
+/// Result of identity creation/recovery
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateIdentityResult {
+    pub user_id: String,
+    pub device_id: String,
+    pub mnemonic: Option<String>,
+}
+
 #[tauri::command]
 pub async fn create_or_load_identity(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     mnemonic: Option<String>,
     device_name: Option<String>,
-) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+) -> Result<CreateIdentityResult, String> {
+    // Run the core command
+    let _output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::CreateOrLoadIdentity {
             mnemonic,
@@ -28,7 +38,26 @@ pub async fn create_or_load_identity(
         }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Get the identity info from state
+    let inner = state.inner.read().await;
+    let identity = inner.engine.local_identity();
+    let bundle = inner.engine.local_bundle();
+
+    match (identity, bundle) {
+        (Some(id), Some(b)) => Ok(CreateIdentityResult {
+            user_id: b.user_id.clone(),
+            device_id: id.device_identity.device_id.clone(),
+            mnemonic: Some(id.mnemonic.clone()),
+        }),
+        (Some(id), None) => Ok(CreateIdentityResult {
+            user_id: id.user_identity.user_id.clone(),
+            device_id: id.device_identity.device_id.clone(),
+            mnemonic: Some(id.mnemonic.clone()),
+        }),
+        _ => Err("Identity creation failed - no local identity found".to_string()),
+    }
 }
 
 #[tauri::command]

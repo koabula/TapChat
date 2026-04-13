@@ -2,35 +2,65 @@
  * TapChat Cloudflare OAuth Login
  *
  * Minimal OAuth implementation for Cloudflare authorization.
- * This replaces the need for full wrangler installation.
+ * Uses PKCE (Proof Key for Code Exchange) as required by wrangler 4.x.
  *
  * Usage: node login.mjs
  * Output: JSON with accessToken, refreshToken, accountId, accountName
  */
 
 import http from 'http';
+import crypto from 'crypto';
 import { spawn } from 'child_process';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 
-// Cloudflare OAuth configuration (wrangler's official client_id)
-const CLIENT_ID = '54d11594-84e4-41f6-923c-5e63c7af5a3d';
+// Cloudflare OAuth configuration (wrangler's official client_id - updated 2025)
+const CLIENT_ID = '54d11594-84e4-41aa-b438-e81b8fa78ee7';
 const REDIRECT_PORT = 8976;
 const REDIRECT_PATH = '/oauth/callback';
 const TOKEN_URL = 'https://dash.cloudflare.com/oauth2/token';
 const AUTH_URL = 'https://dash.cloudflare.com/oauth2/authorize';
 
-// Required scopes for Workers deployment
+// Required scopes for Workers deployment (updated to match wrangler 4.x)
 const SCOPES = [
   'account:read',
-  'account:write',
-  'workers:write',
-  'workers:tail',
-  'workers:r2:read',
-  'workers:r2:write',
   'user:read',
+  'workers:write',
+  'workers_kv:write',
+  'workers_scripts:write',
+  'workers_tail:read',
+  'd1:write',
+  'offline_access',
 ].join(' ');
+
+/**
+ * Generate a random code_verifier for PKCE
+ * Must be 43-128 characters, using unreserved characters: A-Z, a-z, 0-9, -, ., _, ~
+ */
+function generateCodeVerifier() {
+  // Generate 32 random bytes (256 bits) and base64url encode
+  const randomBytes = crypto.randomBytes(32);
+  return base64urlEncode(randomBytes);
+}
+
+/**
+ * Compute code_challenge from code_verifier using SHA256
+ */
+function generateCodeChallenge(codeVerifier) {
+  const hash = crypto.createHash('sha256').update(codeVerifier).digest();
+  return base64urlEncode(hash);
+}
+
+/**
+ * Base64url encoding (no padding, URL-safe characters)
+ */
+function base64urlEncode(buffer) {
+  return buffer.toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+}
 
 /**
  * Open browser URL cross-platform
@@ -98,12 +128,12 @@ async function waitForCallback(server) {
       }
 
       // Success response
-      res.writeHead(200);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`
         <html>
           <head><title>TapChat Authorization Success</title></head>
           <body style="font-family: system-ui; text-align: center; padding: 40px;">
-            <h1 style="color: #10b981;">✓ Authorization Successful</h1>
+            <h1 style="color: #10b981;">Authorization Successful</h1>
             <p>You can close this window and return to TapChat.</p>
             <script>setTimeout(() => window.close(), 1000);</script>
           </body>
@@ -122,9 +152,9 @@ async function waitForCallback(server) {
 }
 
 /**
- * Exchange authorization code for tokens
+ * Exchange authorization code for tokens (with PKCE)
  */
-async function exchangeCodeForToken(code) {
+async function exchangeCodeForToken(code, codeVerifier) {
   const redirectUri = `http://localhost:${REDIRECT_PORT}${REDIRECT_PATH}`;
 
   const response = await fetch(TOKEN_URL, {
@@ -138,6 +168,7 @@ async function exchangeCodeForToken(code) {
       code,
       client_id: CLIENT_ID,
       redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
     }).toString(),
   });
 
@@ -153,7 +184,8 @@ async function exchangeCodeForToken(code) {
  * Get account information using access token
  */
 async function getAccountInfo(accessToken) {
-  const response = await fetch('https://api.cloudflare.com/client/v4/user/accounts', {
+  // Correct endpoint: /accounts (not /user/accounts)
+  const response = await fetch('https://api.cloudflare.com/client/v4/accounts', {
     headers: {
       'Authorization': `Bearer ${accessToken}`,
       'Accept': 'application/json',
@@ -161,12 +193,21 @@ async function getAccountInfo(accessToken) {
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to get accounts (${response.status})`);
+    const text = await response.text();
+    console.log(JSON.stringify({
+      status: 'error',
+      message: `getAccountInfo failed (${response.status}): ${text}`,
+    }));
+    throw new Error(`Failed to get accounts (${response.status}): ${text}`);
   }
 
   const data = await response.json();
 
   if (!data.success || !data.result || data.result.length === 0) {
+    console.log(JSON.stringify({
+      status: 'error',
+      message: `No accounts found: ${JSON.stringify(data)}`,
+    }));
     throw new Error('No Cloudflare accounts found');
   }
 
@@ -202,22 +243,28 @@ account_id = "${accountId}"
 }
 
 /**
- * Main login flow
+ * Main login flow with PKCE
  */
 async function login() {
   const redirectUri = `http://localhost:${REDIRECT_PORT}${REDIRECT_PATH}`;
 
-  // Build authorization URL
+  // Generate PKCE code_verifier and code_challenge
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+
+  // Build authorization URL with PKCE parameters
   const authUrl = new URL(AUTH_URL);
   authUrl.searchParams.set('client_id', CLIENT_ID);
   authUrl.searchParams.set('response_type', 'code');
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('scope', SCOPES);
   authUrl.searchParams.set('state', Date.now().toString());
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
 
   console.log(JSON.stringify({
     status: 'starting',
-    message: 'Starting OAuth login flow',
+    message: 'Starting OAuth login flow with PKCE',
     authUrl: authUrl.toString(),
   }));
 
@@ -242,8 +289,8 @@ async function login() {
     message: 'Exchanging authorization code for tokens',
   }));
 
-  // Exchange code for tokens
-  const tokens = await exchangeCodeForToken(code);
+  // Exchange code for tokens (with code_verifier)
+  const tokens = await exchangeCodeForToken(code, codeVerifier);
 
   console.log(JSON.stringify({
     status: 'account',
@@ -256,14 +303,14 @@ async function login() {
   // Save tokens
   const configFile = saveTokens(tokens.access_token, tokens.refresh_token, accountInfo.accountId);
 
-  // Output final result
+  // Output final result with snake_case field names (matching Rust struct)
   const result = {
     success: true,
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-    expiresIn: tokens.expires_in,
-    accountId: accountInfo.accountId,
-    accountName: accountInfo.accountName,
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    expires_in: tokens.expires_in,
+    account_id: accountInfo.accountId,
+    account_name: accountInfo.accountName,
     configFile,
   };
 

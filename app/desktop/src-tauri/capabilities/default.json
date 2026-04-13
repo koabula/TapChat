@@ -1,0 +1,32 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main", "onboarding"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "dialog:default",
+    "notification:default",
+    "clipboard-manager:default",
+    "updater:default",
+    "process:default",
+    {
+      "identifier": "core:event:default",
+      "allow": [
+        { "event": "core-update" },
+        { "event": "session-status" },
+        { "event": "realtime-event" },
+        { "event": "websocket-connected" },
+        { "event": "websocket-disconnected" }
+      ]
+    },
+    {
+      "identifier": "core:window:default",
+      "allow": [
+        { "window": "main" },
+        { "window": "onboarding" }
+      ]
+    }
+  ]
+}

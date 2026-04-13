@@ -4,22 +4,68 @@ mod platform;
 mod ports;
 mod state;
 
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 
 pub use state::{AppState, SessionState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Updater public key for signature verification
+    let updater_pubkey = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExOTAyMUI4NTBDM0U1QjAKUldTdzVjTlF1Q0dRb1VPeGZYQ3M1dC9kcEJ5S1hidHNFVFQrZVRzWks2RGQ3NEZWSGI0YkpTQVQK";
+
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // When a second instance tries to start, focus the main window instead
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(updater_pubkey)
+                .build()
+        )
         .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Create tray menu
+            let show_item = MenuItem::with_id(app, "show", "Show TapChat", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            // Build tray icon with menu
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            // Show the main window
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            // Set quitting state and exit
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+
+            // Spawn app ready handler
             tauri::async_runtime::spawn(async move {
                 lifecycle::on_app_ready(&handle).await;
             });

@@ -252,11 +252,10 @@ pub async fn cloudflare_deploy(
 ) -> Result<DeployResult, String> {
     let inner = state.inner.read().await;
 
-    // Get identity info
+    // Get identity info - identity must exist, but bundle is optional for first deployment
     let identity = inner.engine.local_identity();
-    let bundle = inner.engine.local_bundle();
 
-    if identity.is_none() || bundle.is_none() {
+    if identity.is_none() {
         return Ok(DeployResult {
             success: false,
             worker_name: "".into(),
@@ -268,8 +267,9 @@ pub async fn cloudflare_deploy(
         });
     }
 
-    let user_id = bundle.unwrap().user_id.clone();
-    let device_id = identity.unwrap().device_identity.device_id.clone();
+    let identity_ref = identity.unwrap();
+    let user_id = identity_ref.user_identity.user_id.clone();
+    let device_id = identity_ref.device_identity.device_id.clone();
 
     // Get profile name
     let profile_name = inner.profile_manager.get_active_metadata().await

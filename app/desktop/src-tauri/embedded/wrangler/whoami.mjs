@@ -90,7 +90,8 @@ async function getUserInfo(accessToken) {
  * Get account information
  */
 async function getAccountInfo(accessToken) {
-  const response = await fetch('https://api.cloudflare.com/client/v4/user/accounts', {
+  // Correct endpoint: /accounts (not /user/accounts)
+  const response = await fetch('https://api.cloudflare.com/client/v4/accounts', {
     headers: {
       'Authorization': `Bearer ${accessToken}`,
       'Accept': 'application/json',
@@ -107,9 +108,10 @@ async function getAccountInfo(accessToken) {
     return null;
   }
 
+  // Use snake_case field names for Rust compatibility
   return data.result.map(account => ({
-    accountId: account.id,
-    accountName: account.name,
+    account_id: account.id,
+    account_name: account.name,
   }));
 }
 
@@ -151,13 +153,13 @@ async function whoami() {
     return;
   }
 
-  // Output result
+  // Output result with snake_case field names for Rust compatibility
   console.log(JSON.stringify({
     authenticated: true,
     email: userInfo.email,
     name: `${userInfo.firstName || ''} ${userInfo.lastName || ''}`.trim() || undefined,
     accounts,
-    activeAccountId: stored.accountId || accounts[0].accountId,
+    active_account_id: stored.accountId || accounts[0].account_id,
   }));
 }
 

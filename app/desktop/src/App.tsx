@@ -31,20 +31,72 @@ import { useNotifications } from "./hooks/useNotifications";
 
 import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
 
-function App() {
-  const { sessionState, setSessionState, setWsConnected } = useSessionStore();
-  const [loading, setLoading] = useState(true);
+/**
+ * Inner app component that has Router context.
+ * Hooks that use useNavigate() must be called here, inside BrowserRouter.
+ */
+function AppInner() {
+  const { sessionState } = useSessionStore();
 
   // Connect to core-update events
   useCoreUpdate();
 
-  // Register global keyboard shortcuts (only when active)
+  // Register global keyboard shortcuts (only when active - requires Router context)
   useGlobalShortcuts();
 
   // Handle OS native notifications
   useNotifications();
 
-  // Subscribe to Tauri events on mount
+  // Route based on session state
+  const isOnboarding = sessionState.startsWith("onboarding") || sessionState === "uninitialized";
+
+  return (
+    <>
+      {/* System banners for sync status and errors */}
+      {!isOnboarding && <SystemBanner />}
+
+      {/* Update notification */}
+      {!isOnboarding && <UpdateNotification />}
+
+      <Routes>
+        {/* Onboarding routes - accessible only when not active */}
+        {isOnboarding && (
+          <>
+            <Route path="/onboarding" element={<Welcome />} />
+            <Route path="/onboarding/identity" element={<Identity />} />
+            <Route path="/onboarding/backup" element={<BackupMnemonic />} />
+            <Route path="/onboarding/cloudflare" element={<CloudflareSetup />} />
+            <Route path="/onboarding/complete" element={<Complete />} />
+            <Route path="*" element={<Navigate to="/onboarding" replace />} />
+          </>
+        )}
+
+        {/* Main app routes - accessible only when active */}
+        {!isOnboarding && (
+          <>
+            <Route path="/" element={<ChatLayout />}>
+              <Route index element={<ChatView />} />
+              <Route path="chat/:id" element={<ChatView />} />
+            </Route>
+            <Route path="/contacts" element={<ContactList />} />
+            <Route path="/contacts/:id" element={<ContactDetail />} />
+            <Route path="/requests" element={<MessageRequests />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/settings/devices" element={<Devices />} />
+            <Route path="/settings/runtime" element={<Runtime />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </>
+        )}
+      </Routes>
+    </>
+  );
+}
+
+function App() {
+  const { setSessionState, setWsConnected } = useSessionStore();
+  const [loading, setLoading] = useState(true);
+
+  // Subscribe to Tauri events on mount (these don't need Router context)
   useEffect(() => {
     // Subscribe to session-status events
     const unlistenSessionStatus = listen<SessionStatus>("session-status", (event) => {
@@ -113,47 +165,9 @@ function App() {
     );
   }
 
-  // Route based on session state
-  const isOnboarding = sessionState.startsWith("onboarding") || sessionState === "uninitialized";
-
   return (
     <BrowserRouter>
-      {/* System banners for sync status and errors */}
-      {!isOnboarding && <SystemBanner />}
-
-      {/* Update notification */}
-      {!isOnboarding && <UpdateNotification />}
-
-      <Routes>
-        {/* Onboarding routes - accessible only when not active */}
-        {isOnboarding && (
-          <>
-            <Route path="/onboarding" element={<Welcome />} />
-            <Route path="/onboarding/identity" element={<Identity />} />
-            <Route path="/onboarding/backup" element={<BackupMnemonic />} />
-            <Route path="/onboarding/cloudflare" element={<CloudflareSetup />} />
-            <Route path="/onboarding/complete" element={<Complete />} />
-            <Route path="*" element={<Navigate to="/onboarding" replace />} />
-          </>
-        )}
-
-        {/* Main app routes - accessible only when active */}
-        {!isOnboarding && (
-          <>
-            <Route path="/" element={<ChatLayout />}>
-              <Route index element={<ChatView />} />
-              <Route path="chat/:id" element={<ChatView />} />
-            </Route>
-            <Route path="/contacts" element={<ContactList />} />
-            <Route path="/contacts/:id" element={<ContactDetail />} />
-            <Route path="/requests" element={<MessageRequests />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/settings/devices" element={<Devices />} />
-            <Route path="/settings/runtime" element={<Runtime />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </>
-        )}
-      </Routes>
+      <AppInner />
     </BrowserRouter>
   );
 }

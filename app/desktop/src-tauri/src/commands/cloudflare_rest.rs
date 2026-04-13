@@ -181,64 +181,48 @@ pub async fn upload_worker_script(
         "bindings": [
             {
                 "type": "durable_object_namespace",
-                "binding_id": "INBOX",
                 "name": "INBOX",
                 "class_name": "InboxDurableObject",
-                "script_name": worker_name,
             },
             {
                 "type": "r2_bucket",
-                "binding_id": "STORAGE",
-                "name": "STORAGE",
+                "name": "TAPCHAT_STORAGE",
                 "bucket_name": config.bucket_name,
             },
             {
-                "type": "r2_bucket",
-                "binding_id": "STORAGE_PREVIEW",
-                "name": "STORAGE_PREVIEW",
-                "bucket_name": config.preview_bucket_name,
-            },
-            {
-                "type": "var_text",
-                "binding_id": "DEPLOYMENT_REGION",
+                "type": "plain_text",
                 "name": "DEPLOYMENT_REGION",
                 "text": config.deployment_region,
             },
             {
-                "type": "var_text",
-                "binding_id": "MAX_INLINE_BYTES",
+                "type": "plain_text",
                 "name": "MAX_INLINE_BYTES",
                 "text": config.max_inline_bytes.to_string(),
             },
             {
-                "type": "var_text",
-                "binding_id": "RETENTION_DAYS",
+                "type": "plain_text",
                 "name": "RETENTION_DAYS",
                 "text": config.retention_days.to_string(),
             },
             {
-                "type": "var_text",
-                "binding_id": "RATE_LIMIT_PER_MINUTE",
+                "type": "plain_text",
                 "name": "RATE_LIMIT_PER_MINUTE",
                 "text": config.rate_limit_per_minute.to_string(),
             },
             {
-                "type": "var_text",
-                "binding_id": "RATE_LIMIT_PER_HOUR",
+                "type": "plain_text",
                 "name": "RATE_LIMIT_PER_HOUR",
                 "text": config.rate_limit_per_hour.to_string(),
             },
         ],
-        "migrations": [
-            {
-                "tag": "v1",
-                "new_classes": ["InboxDurableObject"],
-            }
-        ],
+        "migrations": {
+            "tag": "v1",
+            "new_sqlite_classes": ["InboxDurableObject"],
+        },
     });
 
     // Build multipart form data
-    // Cloudflare expects: metadata (JSON) + script (JS)
+    // Cloudflare expects: metadata (JSON) + script (JS file named 'worker.js')
     let form = reqwest::multipart::Form::new()
         .part("metadata", reqwest::multipart::Part::text(metadata.to_string())
             .mime_str("application/json")
@@ -246,10 +230,9 @@ pub async fn upload_worker_script(
         .part("worker.js", reqwest::multipart::Part::text(worker_script.to_string())
             .file_name("worker.js")
             .mime_str("application/javascript+module")
-            .map_err(|e| format!("MIME type error: {}", e))?)
-        .text("main_module", "worker.js");
+            .map_err(|e| format!("MIME type error: {}", e))?);
 
-    let url = format!("{}/accounts/{}/workers/scripts/{}/contents",
+    let url = format!("{}/accounts/{}/workers/scripts/{}",
         CF_API_BASE, account_id, worker_name);
 
     let response = client
@@ -330,14 +313,57 @@ pub async fn write_worker_secret(
     Ok(())
 }
 
-/// Get Worker deployment info
-pub async fn get_worker_info(
+/// Enable workers.dev subdomain routing for a Worker
+/// This creates a workers.dev route that makes the Worker accessible via workers.dev URL
+pub async fn enable_workers_dev_routing(
     client: &Client,
     api_token: &str,
     account_id: &str,
     worker_name: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<(), String> {
+    // First ensure the account has a workers.dev subdomain
+    let subdomain = ensure_account_workers_dev_subdomain(client, api_token, account_id).await?;
+    eprintln!("Account workers.dev subdomain: {}", subdomain);
+
+    // POST to this endpoint enables workers.dev routing for the worker
+    // The worker will be accessible at https://{worker_name}.{subdomain}.workers.dev
     let url = format!("{}/accounts/{}/workers/scripts/{}/subdomain",
+        CF_API_BASE, account_id, worker_name);
+
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&serde_json::json!({
+            "enabled": true,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Workers.dev routing request failed: {}", e))?;
+
+    let status = response.status();
+    let response_body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    if !status.is_success() {
+        // Log detailed error for debugging
+        eprintln!("Error enabling workers.dev routing: HTTP {} - {}", status, response_body);
+        return Err(format!("Failed to enable workers.dev routing: HTTP {} - {}", status, response_body));
+    }
+
+    eprintln!("Successfully enabled workers.dev routing for {}: {}", worker_name, response_body);
+    Ok(())
+}
+
+/// Check if a Worker script exists
+pub async fn check_worker_exists(
+    client: &Client,
+    api_token: &str,
+    account_id: &str,
+    worker_name: &str,
+) -> Result<bool, String> {
+    let url = format!("{}/accounts/{}/workers/scripts/{}/",
         CF_API_BASE, account_id, worker_name);
 
     let response = client
@@ -345,7 +371,27 @@ pub async fn get_worker_info(
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
-        .map_err(|e| format!("Worker info request failed: {}", e))?;
+        .map_err(|e| format!("Worker check request failed: {}", e))?;
+
+    Ok(response.status().is_success())
+}
+
+/// Get Worker deployment info (account's workers.dev subdomain)
+pub async fn get_worker_subdomain(
+    client: &Client,
+    api_token: &str,
+    account_id: &str,
+) -> Result<String, String> {
+    // Get the account's workers.dev subdomain
+    let url = format!("{}/accounts/{}/workers/subdomain",
+        CF_API_BASE, account_id);
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Worker subdomain request failed: {}", e))?;
 
     let status = response.status();
 
@@ -355,13 +401,90 @@ pub async fn get_worker_info(
             .await
             .map_err(|e| format!("Failed to read error response: {}", e))?;
 
-        return Err(format!("Failed to get worker info: HTTP {} - {}", status, error_body));
+        return Err(format!("Failed to get worker subdomain: HTTP {} - {}", status, error_body));
     }
 
-    response
+    let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse worker info response: {}", e))
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    // Extract subdomain from response
+    body.get("result")
+        .and_then(|r| r.get("subdomain"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "No subdomain found in response".to_string())
+}
+
+/// Ensure account has a workers.dev subdomain set (required for workers.dev routing)
+/// Returns the account's workers.dev subdomain
+pub async fn ensure_account_workers_dev_subdomain(
+    client: &Client,
+    api_token: &str,
+    account_id: &str,
+) -> Result<String, String> {
+    // Get the existing subdomain - most accounts already have one set
+    let subdomain_result = get_worker_subdomain(client, api_token, account_id).await;
+
+    match subdomain_result {
+        Ok(subdomain) => {
+            eprintln!("Account workers.dev subdomain exists: {}", subdomain);
+            return Ok(subdomain);
+        }
+        Err(err) => {
+            eprintln!("Could not get existing subdomain: {}", err);
+            // Account might not have a subdomain set yet
+            // Try to create one using the account ID as a fallback identifier
+            // (Cloudflare requires a subdomain name for PUT)
+        }
+    }
+
+    // If no subdomain exists, try to set one
+    // Use account_id prefix as a reasonable subdomain name
+    // (most accounts already have a subdomain, so this is a fallback)
+    let url = format!("{}/accounts/{}/workers/subdomain",
+        CF_API_BASE, account_id);
+
+    // Use a short identifier derived from account_id
+    let subdomain_name = format!("tc-{}", &account_id[..8.min(account_id.len())]);
+
+    eprintln!("Attempting to create workers.dev subdomain: {}", subdomain_name);
+
+    let response = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&serde_json::json!({
+            "subdomain": subdomain_name,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Create subdomain request failed: {}", e))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let error_body = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read error response: {}", e))?;
+        eprintln!("Failed to set workers.dev subdomain: HTTP {} - {}", status, error_body);
+        return Err(format!("Failed to set workers.dev subdomain: HTTP {} - {}", status, error_body));
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    eprintln!("Workers.dev subdomain response: {:?}", body);
+
+    // Extract subdomain from response
+    body.get("result")
+        .and_then(|r| r.get("subdomain"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "No subdomain in response".to_string())
 }
 
 /// Full deployment flow via REST API
@@ -395,6 +518,15 @@ pub async fn deploy_via_rest_api(
 
     upload_worker_script(&client, api_token, account_id, &config.worker_name, worker_script, config).await?;
 
+    // Phase 2.5: Enable workers.dev subdomain routing
+    progress_callback(DeployProgress {
+        phase: DeployPhase::UploadingWorker,
+        message: "Enabling workers.dev routing...".into(),
+        progress_percent: 50,
+    });
+
+    enable_workers_dev_routing(&client, api_token, account_id, &config.worker_name).await?;
+
     // Phase 3: Write secrets
     progress_callback(DeployProgress {
         phase: DeployPhase::WritingSecrets,
@@ -419,27 +551,48 @@ pub async fn deploy_via_rest_api(
         if !public_url.is_empty() {
             public_url.clone()
         } else {
-            format!("https://{}.workers.dev", config.worker_name)
+            // Get the account's workers.dev subdomain and construct URL
+            match get_worker_subdomain(&client, api_token, account_id).await {
+                Ok(subdomain) => format!("https://{}.{}.workers.dev", config.worker_name, subdomain),
+                Err(_) => format!("https://{}.workers.dev", config.worker_name),
+            }
         }
     } else {
-        // Try to get the actual workers.dev subdomain
-        let subdomain_info = get_worker_info(&client, api_token, account_id, &config.worker_name)
-            .await.ok();
-
-        // Extract subdomain as String to avoid lifetime issues
-        let subdomain = subdomain_info
-            .and_then(|v| {
-                v.get("result")
-                    .and_then(|r| r.get("subdomain"))
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-            });
-
-        match subdomain {
-            Some(s) => format!("https://{}.{}.workers.dev", config.worker_name, s),
-            None => format!("https://{}.workers.dev", config.worker_name),
+        // Get the account's workers.dev subdomain and construct URL
+        match get_worker_subdomain(&client, api_token, account_id).await {
+            Ok(subdomain) => format!("https://{}.{}.workers.dev", config.worker_name, subdomain),
+            Err(_) => format!("https://{}.workers.dev", config.worker_name),
         }
     };
+
+    // Verify Worker exists before returning
+    progress_callback(DeployProgress {
+        phase: DeployPhase::VerifyingDeployment,
+        message: "Verifying Worker deployment...".into(),
+        progress_percent: 85,
+    });
+
+    // Wait for Worker to be globally deployed (check existence first)
+    let worker_exists = check_worker_exists(&client, api_token, account_id, &config.worker_name)
+        .await
+        .unwrap_or(false);
+
+    if !worker_exists {
+        // Worker might still be deploying, wait a bit and retry
+        for i in 0..5 {
+            progress_callback(DeployProgress {
+                phase: DeployPhase::VerifyingDeployment,
+                message: format!("Waiting for deployment... (attempt {})", i + 1),
+                progress_percent: 85 + i as u8,
+            });
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            if check_worker_exists(&client, api_token, account_id, &config.worker_name)
+                .await
+                .unwrap_or(false) {
+                break;
+            }
+        }
+    }
 
     // Phase 5: Complete
     progress_callback(DeployProgress {
