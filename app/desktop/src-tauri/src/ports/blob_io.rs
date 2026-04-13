@@ -1,11 +1,22 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::fs;
+use tauri::{AppHandle, Emitter};
 
 use tapchat_core::ffi_api::{CoreEvent, ReadAttachmentBytesEffect, WriteDownloadedAttachmentEffect};
 use tapchat_core::transport_contract::{BlobDownloadRequest, BlobUploadRequest};
+
+/// Progress event payload sent to frontend during uploads
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UploadProgressEvent {
+    pub task_id: String,
+    pub conversation_id: String,
+    pub progress: u32,  // 0-100 percentage
+    pub status: String, // "reading", "encrypting", "uploading", "complete", "failed"
+}
 
 /// Read attachment bytes from disk and return base64-encoded content.
 pub async fn read_attachment_bytes(
@@ -34,9 +45,24 @@ pub async fn read_attachment_bytes(
     }
 }
 
-/// Upload blob to remote storage (PUT to upload URL).
-pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
+/// Upload blob to remote storage with progress tracking.
+pub async fn upload_blob_with_progress(
+    upload: BlobUploadRequest,
+    app: Option<Arc<AppHandle>>,
+    conversation_id: String,
+) -> Result<Vec<CoreEvent>> {
     let client = reqwest::Client::new();
+    let task_id = upload.task_id.clone();
+
+    // Emit progress: starting upload
+    if let Some(app_ref) = &app {
+        let _ = app_ref.emit("upload-progress", UploadProgressEvent {
+            task_id: task_id.clone(),
+            conversation_id: conversation_id.clone(),
+            progress: 0,
+            status: "uploading".to_string(),
+        });
+    }
 
     // Decode base64 content
     let bytes = BASE64.decode(&upload.blob_ciphertext_b64)
@@ -48,18 +74,50 @@ pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
         request = request.header(key, value);
     }
 
+    // Use body with progress tracking
+    // Note: reqwest doesn't have built-in progress, so we chunk it manually
+    // For now, emit progress at start and completion
+    if let Some(app_ref) = &app {
+        let _ = app_ref.emit("upload-progress", UploadProgressEvent {
+            task_id: task_id.clone(),
+            conversation_id: conversation_id.clone(),
+            progress: 10,
+            status: "uploading".to_string(),
+        });
+    }
+
     request = request.body(bytes);
 
     match request.send().await {
         Ok(response) => {
             let status = response.status().as_u16();
             if status >= 200 && status < 300 {
+                // Emit progress: complete
+                if let Some(app_ref) = &app {
+                    let _ = app_ref.emit("upload-progress", UploadProgressEvent {
+                        task_id: task_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        progress: 100,
+                        status: "complete".to_string(),
+                    });
+                }
                 Ok(vec![CoreEvent::BlobUploaded {
                     task_id: upload.task_id,
                 }])
             } else {
                 let error_body = response.text().await.unwrap_or_default();
                 log::error!("Blob upload failed: {} - {}", status, error_body);
+
+                // Emit progress: failed
+                if let Some(app_ref) = &app {
+                    let _ = app_ref.emit("upload-progress", UploadProgressEvent {
+                        task_id: task_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        progress: 0,
+                        status: "failed".to_string(),
+                    });
+                }
+
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: upload.task_id,
                     retryable: false,
@@ -70,6 +128,17 @@ pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
         Err(e) => {
             log::error!("Blob upload error: {:?}", e);
             let retryable = e.is_timeout() || e.is_connect();
+
+            // Emit progress: failed
+            if let Some(app_ref) = &app {
+                let _ = app_ref.emit("upload-progress", UploadProgressEvent {
+                    task_id: task_id.clone(),
+                    conversation_id,
+                    progress: 0,
+                    status: "failed".to_string(),
+                });
+            }
+
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
                 retryable,
@@ -77,6 +146,11 @@ pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
             }])
         }
     }
+}
+
+/// Upload blob without progress tracking (for cases where app handle isn't available).
+pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
+    upload_blob_with_progress(upload, None, String::new()).await
 }
 
 /// Download blob from remote storage (GET from download URL).

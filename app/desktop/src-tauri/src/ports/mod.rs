@@ -22,6 +22,7 @@ use tapchat_core::transport_contract::{
     PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
 };
 use tokio::sync::RwLock;
+use tauri::{AppHandle, Emitter};
 
 use crate::platform::profile::{ProfileManager, ProfileManagerInner};
 use crate::platform::transport::DesktopTransport;
@@ -34,6 +35,10 @@ pub struct DesktopPlatformPorts {
     pub transport: DesktopTransport,
     pub realtime: RealtimeManager,
     pub persistence: DesktopPersistence,
+    /// AppHandle for emitting progress events
+    app_handle: Option<Arc<AppHandle>>,
+    /// Current conversation ID for upload progress context
+    current_conversation_id: Option<String>,
     // Timer and notification use spawn/emit directly
 }
 
@@ -43,7 +48,19 @@ impl DesktopPlatformPorts {
             transport: DesktopTransport::new(profile_inner.clone()),
             realtime: RealtimeManager::new(profile_inner.clone()),
             persistence: DesktopPersistence::new(profile_inner),
+            app_handle: None,
+            current_conversation_id: None,
         }
+    }
+
+    /// Set the app handle for emitting events
+    pub fn set_app_handle(&mut self, handle: Arc<AppHandle>) {
+        self.app_handle = Some(handle);
+    }
+
+    /// Set the current conversation ID for upload progress context
+    pub fn set_conversation_context(&mut self, conversation_id: String) {
+        self.current_conversation_id = Some(conversation_id);
     }
 }
 
@@ -134,6 +151,17 @@ impl BlobIoPort for DesktopPlatformPorts {
     ) -> Result<Vec<CoreEvent>> {
         // Read from inbox/outbox attachments dir via persistence
         let dir = self.persistence.inbox_attachments_dir().await;
+
+        // Emit progress event if we have app handle
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("upload-progress", blob_io::UploadProgressEvent {
+                task_id: read.task_id.clone(),
+                conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
+                progress: 5,
+                status: "reading".to_string(),
+            });
+        }
+
         blob_io::read_attachment_bytes(read, dir).await
     }
 
@@ -143,6 +171,17 @@ impl BlobIoPort for DesktopPlatformPorts {
     ) -> Result<Vec<CoreEvent>> {
         // Use transport to prepare upload
         let result = self.transport.prepare_blob_upload(upload.clone()).await?;
+
+        // Emit progress event
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("upload-progress", blob_io::UploadProgressEvent {
+                task_id: upload.task_id.clone(),
+                conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
+                progress: 10,
+                status: "preparing".to_string(),
+            });
+        }
+
         Ok(vec![CoreEvent::BlobUploadPrepared {
             task_id: upload.task_id,
             result,
@@ -150,11 +189,39 @@ impl BlobIoPort for DesktopPlatformPorts {
     }
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
-        blob_io::upload_blob(upload).await
+        let conversation_id = self.current_conversation_id.clone().unwrap_or_default();
+        let app_handle = self.app_handle.clone();
+
+        blob_io::upload_blob_with_progress(upload, app_handle, conversation_id).await
     }
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
-        blob_io::download_blob(download).await
+        let conversation_id = self.current_conversation_id.clone().unwrap_or_default();
+        let task_id = download.task_id.clone();
+
+        // Emit download progress
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("download-progress", blob_io::UploadProgressEvent {
+                task_id: task_id.clone(),
+                conversation_id: conversation_id.clone(),
+                progress: 50,
+                status: "downloading".to_string(),
+            });
+        }
+
+        let result = blob_io::download_blob(download).await;
+
+        // Emit complete
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("download-progress", blob_io::UploadProgressEvent {
+                task_id,
+                conversation_id,
+                progress: 100,
+                status: "complete".to_string(),
+            });
+        }
+
+        result
     }
 
     async fn write_downloaded_attachment(

@@ -2,6 +2,7 @@ use serde::Serialize;
 use tauri::State;
 
 use tapchat_core::{CoreCommand, CoreOutput};
+use tapchat_core::model::DeviceStatusKind;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::AppState;
@@ -70,4 +71,40 @@ pub async fn get_share_link(
         }
         _ => Ok(None),
     }
+}
+
+#[tauri::command]
+pub async fn rotate_share_link(
+    app: tauri::AppHandle,
+) -> Result<CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::RotateContactShareLink),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn update_device_status(
+    app: tauri::AppHandle,
+    target_device_id: String,
+    status: String,
+) -> Result<CoreOutput, String> {
+    // Parse status string to DeviceStatusKind
+    let device_status = match status.to_lowercase().as_str() {
+        "active" => DeviceStatusKind::Active,
+        "revoked" => DeviceStatusKind::Revoked,
+        _ => return Err(format!("Invalid device status: {}", status)),
+    };
+
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::UpdateLocalDeviceStatus {
+            target_device_id,
+            status: device_status,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }

@@ -1,10 +1,9 @@
 import { Outlet, useNavigate } from "react-router";
 import ConversationList from "./ConversationList";
-import { useSessionStore } from "@/store/session";
+import { NetworkIndicator } from "@/components/SystemBanner";
 
 export default function ChatLayout() {
   const navigate = useNavigate();
-  const { wsConnected } = useSessionStore();
 
   return (
     <div className="flex h-screen bg-base">
@@ -14,14 +13,13 @@ export default function ChatLayout() {
         <div className="flex items-center p-3 border-b border-default">
           <h1 className="font-semibold text-primary-color">TapChat</h1>
           <div className="ml-auto flex items-center gap-1">
-            {/* Connection status indicator */}
-            <span
-              className={`w-2 h-2 rounded-full ${
-                wsConnected ? "status-success" : "status-warning"
-              }`}
-            />
+            {/* Keyboard shortcut hint */}
+            <span className="text-xs text-muted-color">Ctrl+N</span>
           </div>
         </div>
+
+        {/* Network status indicator */}
+        <NetworkIndicator />
 
         {/* Search */}
         <div className="p-2">
@@ -51,21 +49,21 @@ export default function ChatLayout() {
         <div className="flex items-center justify-around p-2 border-t border-default">
           <button
             className="btn btn-ghost px-2"
-            title="New conversation"
+            title="New conversation (Ctrl+N)"
             onClick={() => navigate("/contacts")}
           >
             +
           </button>
           <button
             className="btn btn-ghost px-2"
-            title="Contacts"
+            title="Contacts (Ctrl+2)"
             onClick={() => navigate("/contacts")}
           >
             👥
           </button>
           <button
             className="btn btn-ghost px-2"
-            title="Settings"
+            title="Settings (Ctrl+S)"
             onClick={() => navigate("/settings")}
           >
             ⚙

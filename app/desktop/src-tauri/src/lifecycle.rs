@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
 use tauri::webview::WebviewWindowBuilder;
@@ -145,8 +147,12 @@ pub async fn drive_core_with_handle(
     input: CoreInput,
 ) -> Result<CoreOutput> {
     let state = app.state::<AppState>();
+    let app_arc = Arc::new(app.clone());
+
     let output = {
         let mut inner = state.inner.write().await;
+        // Set app handle on ports for progress events
+        inner.ports.set_app_handle(app_arc.clone());
         match input {
             CoreInput::Command(cmd) => inner.engine.handle_command(cmd)?,
             CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
@@ -169,6 +175,8 @@ pub async fn drive_core_with_handle(
     for effect in effects {
         let events = {
             let mut inner = state.inner.write().await;
+            // Ensure app handle is set
+            inner.ports.set_app_handle(app_arc.clone());
             execute_platform_effect(&mut inner.ports, effect).await?
         };
         for event in events {

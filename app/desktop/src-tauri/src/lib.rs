@@ -15,6 +15,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .setup(|app| {
             let handle = app.handle().clone();
@@ -29,6 +31,8 @@ pub fn run() {
             commands::identity::create_or_load_identity,
             commands::identity::get_identity_info,
             commands::identity::get_share_link,
+            commands::identity::rotate_share_link,
+            commands::identity::update_device_status,
             // Conversations
             commands::conversation::list_conversations,
             commands::conversation::create_conversation,
@@ -37,6 +41,7 @@ pub fn run() {
             commands::message::send_text,
             commands::message::send_attachment,
             commands::message::download_attachment,
+            commands::message::get_attachment_preview,
             // Contacts
             commands::contact::import_contact_by_link,
             commands::contact::list_contacts,
@@ -58,6 +63,11 @@ pub fn run() {
             commands::session::stop_realtime_session,
             commands::session::sync_now,
             commands::session::get_session_status,
+            // Utility
+            commands::utility::open_file,
+            commands::utility::check_notification_permission,
+            commands::utility::request_notification_permission,
+            commands::utility::show_notification,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TapChat");

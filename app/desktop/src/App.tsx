@@ -18,9 +18,16 @@ import ContactDetail from "./pages/contacts/ContactDetail";
 import MessageRequests from "./pages/requests/MessageRequests";
 
 import Settings from "./pages/settings/Settings";
+import Devices from "./pages/settings/Devices";
+import Runtime from "./pages/settings/Runtime";
+
+import SystemBanner from "./components/SystemBanner";
+import { UpdateNotification } from "./hooks/useAutoUpdate";
 
 import { useSessionStore } from "./store/session";
 import { useCoreUpdate } from "./hooks/useCoreUpdate";
+import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useNotifications } from "./hooks/useNotifications";
 
 import type { SessionStatus } from "./lib/types";
 
@@ -31,6 +38,12 @@ function App() {
   // Connect to core-update events
   useCoreUpdate();
 
+  // Register global keyboard shortcuts (only when active)
+  useGlobalShortcuts();
+
+  // Handle OS native notifications
+  useNotifications();
+
   // Subscribe to Tauri events on mount
   useEffect(() => {
     // Subscribe to session-status events
@@ -38,6 +51,17 @@ function App() {
       console.log("[App] session-status:", event.payload);
       setSessionState(event.payload.state);
       setWsConnected(event.payload.ws_connected);
+    });
+
+    // Subscribe to websocket connection events
+    const unlistenWsConnect = listen<{ device_id: string }>("websocket-connected", (event) => {
+      console.log("[App] WebSocket connected:", event.payload);
+      setWsConnected(true);
+    });
+
+    const unlistenWsDisconnect = listen<{ device_id: string; reason?: string }>("websocket-disconnected", (event) => {
+      console.log("[App] WebSocket disconnected:", event.payload);
+      setWsConnected(false);
     });
 
     // Fetch initial session status
@@ -54,6 +78,8 @@ function App() {
 
     return () => {
       unlistenSessionStatus.then((fn) => fn());
+      unlistenWsConnect.then((fn) => fn());
+      unlistenWsDisconnect.then((fn) => fn());
     };
   }, [setSessionState, setWsConnected]);
 
@@ -70,6 +96,12 @@ function App() {
 
   return (
     <BrowserRouter>
+      {/* System banners for sync status and errors */}
+      {!isOnboarding && <SystemBanner />}
+
+      {/* Update notification */}
+      {!isOnboarding && <UpdateNotification />}
+
       <Routes>
         {/* Onboarding routes - accessible only when not active */}
         {isOnboarding && (
@@ -94,6 +126,8 @@ function App() {
             <Route path="/contacts/:id" element={<ContactDetail />} />
             <Route path="/requests" element={<MessageRequests />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/settings/devices" element={<Devices />} />
+            <Route path="/settings/runtime" element={<Runtime />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </>
         )}
