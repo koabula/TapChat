@@ -158,6 +158,13 @@ export interface SessionStatus {
   ws_connected: boolean;
 }
 
+// Realtime WebSocket event payload
+export interface RealtimeEventPayload {
+  device_id: string;
+  event_type: "connected" | "disconnected" | "head_updated" | "inbox_record_available" | "message_request_changed" | "error";
+  data?: string;
+}
+
 // Core events (for Tauri event listening)
 export interface CoreUpdateEvent {
   state_update: CoreStateUpdate;

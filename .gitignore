@@ -9,8 +9,10 @@ node_modules/
 /services/cloudflare/.cli-smoke*/
 /services/cloudflare/.wrangler/tmp/
 /.prod-smoke/
+# Build output
+/app/desktop/dist/
 /app/desktop/runtime/dist/
-/app/desktop/src-tauri/target/portable/
+/app/desktop/src-tauri/target/
 /.claude
 /Log
 
@@ -18,3 +20,21 @@ node_modules/
 /app/desktop/.env.signing
 *.key
 *.key.pub
+
+# Test and debug files
+*.log
+*.trace
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Profile data (user-specific runtime data)
+/profiles/
+/app/desktop/src-tauri/profiles/

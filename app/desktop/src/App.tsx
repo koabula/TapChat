@@ -29,7 +29,7 @@ import { useCoreUpdate } from "./hooks/useCoreUpdate";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
 
-import type { SessionStatus } from "./lib/types";
+import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
 
 function App() {
   const { sessionState, setSessionState, setWsConnected } = useSessionStore();
@@ -53,7 +53,28 @@ function App() {
       setWsConnected(event.payload.ws_connected);
     });
 
-    // Subscribe to websocket connection events
+    // Subscribe to realtime WebSocket events
+    const unlistenRealtime = listen<RealtimeEventPayload>("realtime-event", (event) => {
+      console.log("[App] realtime-event:", event.payload);
+      const { event_type } = event.payload;
+
+      switch (event_type) {
+        case "connected":
+          setWsConnected(true);
+          break;
+        case "disconnected":
+          setWsConnected(false);
+          break;
+        case "head_updated":
+        case "inbox_record_available":
+        case "message_request_changed":
+          // These events should trigger a sync or refresh
+          // The core-update event will handle the actual data refresh
+          break;
+      }
+    });
+
+    // Subscribe to websocket connection events (legacy)
     const unlistenWsConnect = listen<{ device_id: string }>("websocket-connected", (event) => {
       console.log("[App] WebSocket connected:", event.payload);
       setWsConnected(true);
@@ -78,6 +99,7 @@ function App() {
 
     return () => {
       unlistenSessionStatus.then((fn) => fn());
+      unlistenRealtime.then((fn) => fn());
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
