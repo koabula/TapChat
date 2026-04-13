@@ -1,5 +1,5 @@
-use tauri::State;
-use base64::Engine;
+use tauri::{Manager, State};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use tapchat_core::{CoreCommand, CoreOutput};
 use tapchat_core::ffi_api::AttachmentDescriptor;
@@ -71,22 +71,61 @@ pub async fn download_attachment(
     .map_err(|e| e.to_string())
 }
 
+/// Generate a thumbnail/preview for an image attachment.
+/// Returns base64-encoded image data suitable for inline display.
 #[tauri::command]
 pub async fn get_attachment_preview(
     app: tauri::AppHandle,
-    conversation_id: String,
-    message_id: String,
+    _conversation_id: String,
+    _message_id: String,
     reference: String,
 ) -> Result<Option<String>, String> {
-    // For now, return a placeholder - actual implementation would:
-    // 1. Check if attachment is an image
-    // 2. Load from blob storage
-    // 3. Resize to thumbnail size
-    // 4. Return as base64
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
 
-    // TODO: Implement actual preview loading via BlobIoPort
-    // This requires the attachment to be downloaded first or cached
+    // Get the attachments directory from persistence
+    let attachments_dir = inner.ports.persistence.inbox_attachments_dir().await;
 
-    // Placeholder: return None to show fallback icon
-    Ok(None)
+    // The reference is the attachment ID
+    let file_path = attachments_dir
+        .as_ref()
+        .map(|dir| dir.join(&reference));
+
+    drop(inner);
+
+    // Check if directory and file exist
+    let file_path = match file_path {
+        Some(path) if path.exists() => path,
+        _ => return Ok(None),
+    };
+
+    // Load and resize image
+    generate_thumbnail(&file_path).await
+        .map_err(|e| format!("Failed to generate thumbnail: {}", e))
+}
+
+/// Generate a thumbnail from an image file.
+/// Returns base64-encoded JPEG data.
+async fn generate_thumbnail(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    use image::ImageReader;
+
+    // Try to load the image
+    let img = match ImageReader::open(path)?.decode() {
+        Ok(img) => img,
+        Err(_) => return Ok(None), // Not a valid image
+    };
+
+    // Resize to max 200x200 while maintaining aspect ratio
+    let thumbnail = img.resize(
+        200,
+        200,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    // Convert to JPEG and encode as base64
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    thumbnail.write_to(&mut buffer, image::ImageFormat::Jpeg)?;
+
+    let encoded = BASE64.encode(buffer.into_inner());
+    Ok(Some(encoded))
 }

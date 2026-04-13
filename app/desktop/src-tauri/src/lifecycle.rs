@@ -189,7 +189,8 @@ pub async fn drive_core_with_handle(
 
 /// Transition from onboarding to active session.
 /// Called when onboarding completes successfully.
-pub async fn complete_onboarding(app: &AppHandle) -> Result<()> {
+#[tauri::command]
+pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
 
     // Get device_id from profile
@@ -208,27 +209,42 @@ pub async fn complete_onboarding(app: &AppHandle) -> Result<()> {
 
     // Close onboarding window
     if let Some(onboarding_window) = app.get_webview_window("onboarding") {
-        onboarding_window.close()?;
+        onboarding_window.close().map_err(|e| e.to_string())?;
     }
 
     // Show main window
     if let Some(main_window) = app.get_webview_window("main") {
-        main_window.show()?;
+        main_window.show().map_err(|e| e.to_string())?;
     }
 
     // Start session with AppStarted event
-    drive_core_with_handle(app, CoreInput::Event(CoreEvent::AppStarted)).await?;
+    drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppStarted))
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
 /// Update onboarding step. Called by frontend when advancing through setup.
-pub async fn set_onboarding_step(app: &AppHandle, step: crate::state::OnboardingStep) -> Result<()> {
+#[tauri::command]
+pub async fn set_onboarding_step(app: AppHandle, step: String) -> Result<(), String> {
     let state = app.state::<AppState>();
+
+    // Parse step string to OnboardingStep enum
+    let onboarding_step = match step.to_lowercase().as_str() {
+        "welcome" => crate::state::OnboardingStep::Welcome,
+        "create_identity" | "createidentity" => crate::state::OnboardingStep::CreateIdentity,
+        "recover_identity" | "recoveridentity" => crate::state::OnboardingStep::RecoverIdentity,
+        "backup_mnemonic" | "backupmnemonic" => crate::state::OnboardingStep::BackupMnemonic,
+        "cloudflare_setup" | "cloudflaresetup" => crate::state::OnboardingStep::CloudflareSetup,
+        "complete" => crate::state::OnboardingStep::Complete,
+        _ => return Err(format!("Invalid onboarding step: {}", step)),
+    };
+
     let mut inner = state.inner.write().await;
 
     if let SessionState::Onboarding { .. } = &inner.session {
-        inner.session = SessionState::Onboarding { step };
+        inner.session = SessionState::Onboarding { step: onboarding_step };
     }
 
     Ok(())

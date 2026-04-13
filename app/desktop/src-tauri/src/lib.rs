@@ -63,6 +63,9 @@ pub fn run() {
             commands::session::stop_realtime_session,
             commands::session::sync_now,
             commands::session::get_session_status,
+            // Lifecycle (onboarding)
+            lifecycle::complete_onboarding,
+            lifecycle::set_onboarding_step,
             // Utility
             commands::utility::open_file,
             commands::utility::check_notification_permission,

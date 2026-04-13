@@ -1,15 +1,72 @@
+use std::sync::Arc;
+use tauri::AppHandle;
+
 use tapchat_core::ffi_api::UserNotificationEffect;
 
-/// Emit a user notification using the Tauri notification plugin.
-pub fn emit_user_notification(notification: UserNotificationEffect) {
-    // Use tauri_plugin_notification for OS-level notifications
-    // The notification plugin is initialized in lib.rs
+/// Notification manager that holds app handle for proper OS notifications.
+pub struct NotificationManager {
+    app_handle: Option<Arc<AppHandle>>,
+}
 
-    // The notification has status and message fields
-    let title = format_status_title(&notification.status);
-    let body = &notification.message;
+impl NotificationManager {
+    pub fn new() -> Self {
+        Self { app_handle: None }
+    }
 
-    emit_notification(&title, body);
+    /// Set the app handle for emitting notifications.
+    pub fn set_app_handle(&mut self, handle: Arc<AppHandle>) {
+        self.app_handle = Some(handle);
+    }
+
+    /// Emit a user notification using the Tauri notification plugin.
+    pub fn emit_user_notification(&self, notification: UserNotificationEffect) -> anyhow::Result<()> {
+        let title = format_status_title(&notification.status);
+        let body = &notification.message;
+
+        self.show_notification(&title, body)
+    }
+
+    /// Show notification using Tauri plugin with app handle.
+    pub fn show_notification(&self, title: &str, body: &str) -> anyhow::Result<()> {
+        if let Some(app) = &self.app_handle {
+            use tauri_plugin_notification::NotificationExt;
+
+            app.notification()
+                .builder()
+                .title(title)
+                .body(body)
+                .show()?;
+        } else {
+            // Fallback to logging if no app handle
+            log::info!("Notification (no handle): {} - {}", title, body);
+        }
+
+        Ok(())
+    }
+
+    /// Show notification with custom icon.
+    pub fn show_notification_with_icon(&self, title: &str, body: &str, icon_path: &str) -> anyhow::Result<()> {
+        if let Some(app) = &self.app_handle {
+            use tauri_plugin_notification::NotificationExt;
+
+            app.notification()
+                .builder()
+                .title(title)
+                .body(body)
+                .icon(icon_path)
+                .show()?;
+        } else {
+            log::info!("Notification (no handle): {} - {}", title, body);
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for NotificationManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn format_status_title(status: &tapchat_core::ffi_api::SystemStatus) -> String {
@@ -22,74 +79,5 @@ fn format_status_title(status: &tapchat_core::ffi_api::SystemStatus) -> String {
         SystemStatus::ConversationNeedsRebuild => "Conversation".to_string(),
         SystemStatus::MessageQueuedForApproval => "Pending".to_string(),
         SystemStatus::MessageRejectedByPolicy => "Blocked".to_string(),
-    }
-}
-
-fn emit_notification(title: &str, body: &str) {
-    // Note: Tauri notification requires app handle context
-    // In production, we'd pass the handle through NotificationManager pattern
-    // For now, log the notification
-    log::info!("Notification: {} - {}", title, body);
-
-    // TODO: Use tauri_plugin_notification::NotificationBuilder
-    // Example:
-    // Notification::new(app_handle)
-    //     .title(title)
-    //     .body(body)
-    //     .show()
-}
-
-/// Notification manager that holds app handle for proper OS notifications.
-pub struct NotificationManager {
-    // Store reference to emit notifications with app handle
-}
-
-impl NotificationManager {
-    pub fn new() -> Self {
-        Self {}
-    }
-
-    /// Show notification using Tauri plugin with app handle.
-    pub fn show_notification(
-        &self,
-        app: &tauri::AppHandle,
-        title: &str,
-        body: &str,
-    ) -> anyhow::Result<()> {
-        use tauri_plugin_notification::NotificationExt;
-
-        app.notification()
-            .builder()
-            .title(title)
-            .body(body)
-            .show()?;
-
-        Ok(())
-    }
-
-    /// Show notification with custom icon.
-    pub fn show_notification_with_icon(
-        &self,
-        app: &tauri::AppHandle,
-        title: &str,
-        body: &str,
-        icon_path: &str,
-    ) -> anyhow::Result<()> {
-        use tauri_plugin_notification::NotificationExt;
-
-        app.notification()
-            .builder()
-            .title(title)
-            .body(body)
-            .icon(icon_path)
-            .show()?;
-
-        Ok(())
-    }
-}
-
-impl Default for NotificationManager {
-    fn default() -> Self {
-        Self::new()
     }
 }

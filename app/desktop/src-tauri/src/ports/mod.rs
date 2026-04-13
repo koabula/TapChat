@@ -24,7 +24,7 @@ use tapchat_core::transport_contract::{
 use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter};
 
-use crate::platform::profile::{ProfileManager, ProfileManagerInner};
+use crate::platform::profile::ProfileManagerInner;
 use crate::platform::transport::DesktopTransport;
 use crate::platform::realtime::RealtimeManager;
 use crate::platform::persistence::DesktopPersistence;
@@ -35,11 +35,14 @@ pub struct DesktopPlatformPorts {
     pub transport: DesktopTransport,
     pub realtime: RealtimeManager,
     pub persistence: DesktopPersistence,
+    pub notification: notification::NotificationManager,
+    /// HTTP client for transport operations
+    client: reqwest::Client,
     /// AppHandle for emitting progress events
     app_handle: Option<Arc<AppHandle>>,
     /// Current conversation ID for upload progress context
     current_conversation_id: Option<String>,
-    // Timer and notification use spawn/emit directly
+    // Timer uses spawn directly
 }
 
 impl DesktopPlatformPorts {
@@ -48,6 +51,8 @@ impl DesktopPlatformPorts {
             transport: DesktopTransport::new(profile_inner.clone()),
             realtime: RealtimeManager::new(profile_inner.clone()),
             persistence: DesktopPersistence::new(profile_inner),
+            notification: notification::NotificationManager::new(),
+            client: reqwest::Client::new(),
             app_handle: None,
             current_conversation_id: None,
         }
@@ -55,7 +60,9 @@ impl DesktopPlatformPorts {
 
     /// Set the app handle for emitting events
     pub fn set_app_handle(&mut self, handle: Arc<AppHandle>) {
-        self.app_handle = Some(handle);
+        self.app_handle = Some(handle.clone());
+        self.realtime.set_app_handle(handle.clone());
+        self.notification.set_app_handle(handle);
     }
 
     /// Set the current conversation ID for upload progress context
@@ -92,40 +99,35 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         fetch: FetchMessageRequestsRequest,
     ) -> Result<Vec<CoreEvent>> {
-        // TODO: Implement message requests fetch via transport
-        transport::fetch_message_requests_stub(fetch).await
+        transport::fetch_message_requests(&self.client, fetch).await
     }
 
     async fn act_on_message_request(
         &mut self,
         action: MessageRequestActionRequest,
     ) -> Result<Vec<CoreEvent>> {
-        // TODO: Implement message request action via transport
-        transport::act_on_message_request_stub(action).await
+        transport::act_on_message_request(&self.client, action).await
     }
 
     async fn fetch_allowlist(
         &mut self,
         fetch: FetchAllowlistRequest,
     ) -> Result<Vec<CoreEvent>> {
-        // TODO: Implement allowlist fetch via transport
-        transport::fetch_allowlist_stub(fetch).await
+        transport::fetch_allowlist(&self.client, fetch).await
     }
 
     async fn replace_allowlist(
         &mut self,
         update: ReplaceAllowlistRequest,
     ) -> Result<Vec<CoreEvent>> {
-        // TODO: Implement allowlist replace via transport
-        transport::replace_allowlist_stub(update).await
+        transport::replace_allowlist(&self.client, update).await
     }
 
     async fn publish_shared_state(
         &mut self,
         publish: PublishSharedStateRequest,
     ) -> Result<Vec<CoreEvent>> {
-        // TODO: Implement shared state publish via transport
-        transport::publish_shared_state_stub(publish).await
+        transport::publish_shared_state(&self.client, publish).await
     }
 }
 
@@ -263,7 +265,9 @@ impl NotificationPort for DesktopPlatformPorts {
         &mut self,
         notification: UserNotificationEffect,
     ) -> Result<Vec<CoreEvent>> {
-        notification::emit_user_notification(notification);
+        if let Err(e) = self.notification.emit_user_notification(notification) {
+            log::error!("Notification error: {:?}", e);
+        }
         Ok(Vec::new())
     }
 }

@@ -4,5 +4,6 @@ pub mod message;
 pub mod contact;
 pub mod request;
 pub mod cloudflare;
+pub mod cloudflare_rest;
 pub mod session;
 pub mod utility;

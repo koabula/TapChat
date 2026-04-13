@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tauri::{AppHandle, Emitter};
 
 use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::transport_contract::RealtimeSubscriptionRequest;
@@ -17,6 +18,7 @@ use crate::platform::profile::ProfileManagerInner;
 pub struct RealtimeManager {
     sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
     profile_inner: Arc<RwLock<ProfileManagerInner>>,
+    app_handle: Option<Arc<AppHandle>>,
 }
 
 struct RealtimeSession {
@@ -44,7 +46,13 @@ impl RealtimeManager {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             profile_inner,
+            app_handle: None,
         }
+    }
+
+    /// Set the app handle for emitting events to frontend.
+    pub fn set_app_handle(&mut self, handle: Arc<AppHandle>) {
+        self.app_handle = Some(handle);
     }
 
     /// Open a realtime WebSocket connection.
@@ -86,6 +94,15 @@ impl RealtimeManager {
             .await
             .context("websocket connect")?;
 
+        // Emit WebSocketConnected to frontend
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("realtime-event", RealtimeEventPayload {
+                device_id: device_id.clone(),
+                event_type: "connected".to_string(),
+                data: None,
+            });
+        }
+
         // Store session
         {
             let mut sessions = self.sessions.write().await;
@@ -103,8 +120,9 @@ impl RealtimeManager {
         // Spawn background task to read messages
         let sessions_clone = self.sessions.clone();
         let device_id_clone = device_id.clone();
+        let app_handle_clone = self.app_handle.clone();
         tokio::spawn(async move {
-            Self::read_loop(ws_stream, sessions_clone, device_id_clone, stop_rx).await;
+            Self::read_loop(ws_stream, sessions_clone, device_id_clone, stop_rx, app_handle_clone).await;
         });
 
         Ok(vec![CoreEvent::WebSocketConnected { device_id }])
@@ -117,6 +135,15 @@ impl RealtimeManager {
         if let Some(session) = sessions.remove(device_id) {
             // Send stop signal
             let _ = session.stop_tx.send(()).await;
+        }
+
+        // Emit WebSocketDisconnected to frontend
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("realtime-event", RealtimeEventPayload {
+                device_id: device_id.to_string(),
+                event_type: "disconnected".to_string(),
+                data: None,
+            });
         }
 
         Ok(vec![CoreEvent::WebSocketDisconnected {
@@ -162,6 +189,7 @@ impl RealtimeManager {
         sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
         device_id: String,
         mut stop_rx: mpsc::Receiver<()>,
+        app_handle: Option<Arc<AppHandle>>,
     ) {
         let (mut write, mut read) = ws_stream.split();
 
@@ -170,6 +198,14 @@ impl RealtimeManager {
                 // Stop signal
                 _ = stop_rx.recv() => {
                     let _ = write.close().await;
+                    // Emit disconnect event
+                    if let Some(app) = &app_handle {
+                        let _ = app.emit("realtime-event", RealtimeEventPayload {
+                            device_id: device_id.clone(),
+                            event_type: "disconnected".to_string(),
+                            data: None,
+                        });
+                    }
                     break;
                 }
 
@@ -177,20 +213,35 @@ impl RealtimeManager {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            // Parse and emit as CoreEvent
+                            // Parse and emit as realtime event to frontend
                             if let Ok(event) = serde_json::from_str::<WsServerEvent>(&text) {
-                                // TODO: Emit event via Tauri
                                 log::info!("WS event for {}: {:?}", device_id, event);
+
+                                // Emit to frontend
+                                if let Some(app) = &app_handle {
+                                    let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                        device_id: device_id.clone(),
+                                        event_type: event.event_type_name(),
+                                        data: Some(text.to_string()),
+                                    });
+                                }
                             }
                         }
                         Some(Ok(Message::Ping(data))) => {
                             let _ = write.send(Message::Pong(data)).await;
                         }
                         Some(Ok(Message::Close(_))) => {
-                            // Mark disconnected
+                            // Mark disconnected and emit event
                             let mut sessions = sessions.write().await;
                             if let Some(session) = sessions.get_mut(&device_id) {
                                 session.connected = false;
+                            }
+                            if let Some(app) = &app_handle {
+                                let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                    device_id: device_id.clone(),
+                                    event_type: "disconnected".to_string(),
+                                    data: None,
+                                });
                             }
                             break;
                         }
@@ -200,6 +251,14 @@ impl RealtimeManager {
                             if let Some(session) = sessions.get_mut(&device_id) {
                                 session.connected = false;
                             }
+                            // Emit error event
+                            if let Some(app) = &app_handle {
+                                let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                    device_id: device_id.clone(),
+                                    event_type: "error".to_string(),
+                                    data: Some(e.to_string()),
+                                });
+                            }
                             break;
                         }
                         None => break,
@@ -208,5 +267,23 @@ impl RealtimeManager {
                 }
             }
         }
+    }
+}
+
+/// Event payload sent to frontend via Tauri event.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RealtimeEventPayload {
+    pub device_id: String,
+    pub event_type: String,
+    pub data: Option<String>,
+}
+
+impl WsServerEvent {
+    fn event_type_name(&self) -> String {
+        match self {
+            WsServerEvent::HeadUpdated { .. } => "head_updated",
+            WsServerEvent::InboxRecordAvailable { .. } => "inbox_record_available",
+            WsServerEvent::MessageRequestChanged { .. } => "message_request_changed",
+        }.to_string()
     }
 }

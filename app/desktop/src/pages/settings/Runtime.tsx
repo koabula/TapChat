@@ -8,37 +8,67 @@ interface RuntimeStatus {
   endpoint: string | null;
 }
 
-interface DeployProgress {
-  phase: string;
-  message: string;
-  complete: boolean;
+interface AccountInfo {
+  account_id: string;
+  account_name: string;
+  email?: string;
 }
 
 interface PreflightResult {
-  wrangler_installed: boolean;
-  wrangler_logged_in: boolean;
+  authenticated: boolean;
+  token_stored: boolean;
+  embedded_available: boolean;
   ready: boolean;
   error: string | null;
+  account: AccountInfo | null;
 }
+
+interface DeployProgress {
+  phase: string;
+  message: string;
+  progress_percent: number;
+}
+
+interface DeployResult {
+  success: boolean;
+  worker_name: string;
+  worker_url: string;
+  error: string | null;
+}
+
+const PHASE_LABELS: Record<string, string> = {
+  Preflight: "Checking prerequisites...",
+  CreatingBuckets: "Creating storage buckets...",
+  UploadingWorker: "Uploading Worker script...",
+  WritingSecrets: "Writing authentication secrets...",
+  ConfiguringBindings: "Configuring bindings...",
+  VerifyingDeployment: "Verifying deployment...",
+  Complete: "Complete!",
+  Failed: "Failed",
+};
 
 export default function Runtime() {
   const navigate = useNavigate();
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  const [preflight, setPreflight] = useState<PreflightResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [deploying, setDeploying] = useState(false);
   const [progress, setProgress] = useState<DeployProgress | null>(null);
-  const [preflight, setPreflight] = useState<PreflightResult | null>(null);
+  const [deployResult, setDeployResult] = useState<DeployResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     loadStatus();
+    checkPreflight();
 
     // Listen for deploy progress
     const unlisten = listen<DeployProgress>("cloudflare-progress", (event) => {
       setProgress(event.payload);
-      if (event.payload.complete) {
+      if (event.payload.phase === "Complete" || event.payload.phase === "Failed") {
         setDeploying(false);
-        loadStatus();
+        if (event.payload.phase === "Complete") {
+          loadStatus();
+        }
       }
     });
 
@@ -48,7 +78,6 @@ export default function Runtime() {
   }, []);
 
   const loadStatus = async () => {
-    setLoading(true);
     try {
       const result = await invoke<RuntimeStatus>("cloudflare_status");
       setStatus(result);
@@ -72,11 +101,11 @@ export default function Runtime() {
   const handleLogin = async () => {
     setError(null);
     try {
-      const success = await invoke<boolean>("cloudflare_login");
-      if (success) {
-        checkPreflight();
+      const result = await invoke<{ success: boolean; error?: string }>("cloudflare_login");
+      if (result.success) {
+        await checkPreflight();
       } else {
-        setError("Login failed");
+        setError(result.error || "Login failed");
       }
     } catch (err) {
       setError(String(err));
@@ -86,25 +115,25 @@ export default function Runtime() {
   const handleDeploy = async () => {
     setError(null);
     setDeploying(true);
+    setProgress(null);
+    setDeployResult(null);
     try {
-      await invoke("cloudflare_deploy");
+      const result = await invoke<DeployResult>("cloudflare_deploy");
+      setDeployResult(result);
+      if (!result.success) {
+        setError(result.error || "Deployment failed");
+      }
     } catch (err) {
       setError(String(err));
       setDeploying(false);
     }
   };
 
-  const handleRedeploy = async () => {
-    setError(null);
-    setDeploying(true);
-    checkPreflight();
-  };
-
   return (
     <div className="flex flex-col h-screen bg-base">
       {/* Header */}
-      <header className="flex items-center p-3 border-b border-default">
-        <button className="btn btn-ghost px-2" onClick={() => navigate("/settings")}>
+      <header className="flex items-center p-3 border-b border-default animate-fade-in-down">
+        <button className="btn btn-ghost px-2 transition-fast" onClick={() => navigate("/settings")}>
           ← Back
         </button>
         <h1 className="ml-2 text-lg font-medium text-primary-color">Runtime Management</h1>
@@ -113,35 +142,33 @@ export default function Runtime() {
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4">
         {loading && (
-          <div className="text-center text-muted-color">Loading...</div>
+          <div className="text-center text-muted-color animate-pulse">Loading...</div>
         )}
 
         {!loading && (
           <>
             {/* Current status */}
-            <div className="card mb-4">
+            <div className="card mb-4 animate-fade-in-up">
               <h2 className="text-sm font-medium text-muted-color mb-3">Current Runtime</h2>
 
               <div className="flex items-center gap-3 mb-3">
-                <span className={`w-3 h-3 rounded-full ${status?.bound ? "status-success" : "status-error"}`} />
-                <span className="text-primary-color">
+                <span className={`w-3 h-3 rounded-full animate-scale-in ${status?.bound ? "bg-frost.1" : "bg-surface-elevated"}`} />
+                <span className="text-primary-color font-medium">
                   {status?.bound ? "Deployed and Active" : "Not Deployed"}
                 </span>
               </div>
 
               {status?.endpoint && (
-                <div className="space-y-1">
-                  <div className="flex justify-between">
-                    <span className="text-secondary-color">Endpoint</span>
-                    <span className="text-primary-color text-sm truncate max-w-[200px]">
-                      {status.endpoint}
-                    </span>
-                  </div>
+                <div className="bg-surface-elevated rounded px-3 py-2">
+                  <span className="text-xs text-muted-color">Endpoint</span>
+                  <span className="text-primary-color text-sm block truncate">
+                    {status.endpoint}
+                  </span>
                 </div>
               )}
 
               {!status?.bound && (
-                <p className="text-muted-color text-sm mt-2">
+                <p className="text-muted-color text-sm mt-3">
                   Deploy your personal inbox server to Cloudflare to start messaging.
                 </p>
               )}
@@ -149,89 +176,129 @@ export default function Runtime() {
 
             {/* Deploy progress */}
             {deploying && progress && (
-              <div className="card mb-4">
-                <h2 className="text-sm font-medium text-muted-color mb-2">Deployment Progress</h2>
-                <div className="flex items-center gap-2 mb-2">
-                  <span className={`w-2 h-2 rounded-full ${progress.complete ? "status-success" : "status-warning animate-pulse"}`} />
-                  <span className="text-primary-color">{progress.message}</span>
+              <div className="card mb-4 animate-fade-in-up">
+                <h2 className="text-sm font-medium text-muted-color mb-3">Deployment Progress</h2>
+
+                <div className="flex items-center gap-3 mb-3">
+                  <span className={`w-6 h-6 rounded-full flex items-center justify-center text-sm ${
+                    progress.phase === "Complete" ? "bg-frost.1 text-white" :
+                    progress.phase === "Failed" ? "bg-error text-white" :
+                    "bg-primary animate-pulse text-white"
+                  }`}>
+                    {progress.phase === "Complete" ? "✓" :
+                     progress.phase === "Failed" ? "✗" : "⏳"}
+                  </span>
+                  <span className="text-primary-color">
+                    {PHASE_LABELS[progress.phase] || progress.message}
+                  </span>
                 </div>
-                <div className="text-muted-color text-xs">
-                  Phase: {progress.phase}
+
+                {/* Progress bar */}
+                <div className="w-full bg-surface-elevated rounded-full h-2 mb-2">
+                  <div
+                    className={`rounded-full h-2 transition-all ${
+                      progress.phase === "Failed" ? "bg-error" :
+                      progress.phase === "Complete" ? "bg-frost.1" : "bg-primary"
+                    }`}
+                    style={{ width: `${progress.progress_percent}%` }}
+                  />
                 </div>
+
+                <p className="text-xs text-muted-color">{progress.message}</p>
+              </div>
+            )}
+
+            {/* Deploy result */}
+            {deployResult && !deploying && (
+              <div className="card mb-4 animate-fade-in-up">
+                <h2 className="text-sm font-medium text-muted-color mb-2">Deployment Result</h2>
+
+                {deployResult.success ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="w-5 h-5 rounded-full bg-frost.1 text-white flex items-center justify-center text-sm">✓</span>
+                      <span className="text-primary-color font-medium">Successfully deployed</span>
+                    </div>
+                    <div className="text-sm text-muted-color">
+                      <span className="text-secondary-color">Worker:</span> {deployResult.worker_name}
+                    </div>
+                    <div className="text-sm text-muted-color">
+                      <span className="text-secondary-color">URL:</span> {deployResult.worker_url}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-error">{deployResult.error}</div>
+                )}
               </div>
             )}
 
             {/* Error display */}
             {error && (
-              <div className="card status-error mb-4">
-                <span className="text-sm">{error}</span>
+              <div className="card mb-4 animate-fade-in-up bg-error/10">
+                <span className="text-error text-sm">{error}</span>
               </div>
             )}
 
             {/* Deploy controls */}
-            {!status?.bound && !deploying && (
-              <>
-                {!preflight && (
-                  <button className="btn btn-primary w-full" onClick={checkPreflight}>
-                    Check Prerequisites
+            {!status?.bound && !deploying && !deployResult && preflight && (
+              <div className="card mb-4 animate-fade-in-up">
+                <h2 className="text-sm font-medium text-muted-color mb-3">Prerequisites</h2>
+
+                <div className="space-y-3 mb-4">
+                  {/* Embedded runtime */}
+                  <div className="flex items-center gap-3">
+                    <span className={`w-5 h-5 rounded-full flex items-center justify-center text-sm ${preflight.embedded_available ? "bg-frost.1 text-white" : "bg-surface-elevated text-muted-color"}`}>
+                      {preflight.embedded_available ? "✓" : "○"}
+                    </span>
+                    <span className="text-primary-color">Embedded runtime</span>
+                  </div>
+
+                  {/* Authentication */}
+                  <div className="flex items-center gap-3">
+                    <span className={`w-5 h-5 rounded-full flex items-center justify-center text-sm ${preflight.authenticated ? "bg-frost.1 text-white" : "bg-surface-elevated text-muted-color"}`}>
+                      {preflight.authenticated ? "✓" : "○"}
+                    </span>
+                    <div className="flex-1">
+                      <span className="text-primary-color">Cloudflare connected</span>
+                      {preflight.account && (
+                        <span className="text-xs text-muted-color block">{preflight.account.account_name}</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Login button */}
+                {preflight.embedded_available && !preflight.authenticated && (
+                  <button className="btn btn-primary w-full transition-fast" onClick={handleLogin}>
+                    Connect Cloudflare
                   </button>
                 )}
 
-                {preflight && (
-                  <div className="card mb-4">
-                    <h2 className="text-sm font-medium text-muted-color mb-2">Prerequisites</h2>
-
-                    <div className="space-y-2 mb-4">
-                      <div className="flex items-center gap-2">
-                        <span className={preflight.wrangler_installed ? "status-success" : "status-error"}>
-                          {preflight.wrangler_installed ? "✓" : "✗"}
-                        </span>
-                        <span className="text-primary-color">Wrangler CLI installed</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className={preflight.wrangler_logged_in ? "status-success" : "text-muted-color"}>
-                          {preflight.wrangler_logged_in ? "✓" : "○"}
-                        </span>
-                        <span className="text-primary-color">Cloudflare account authorized</span>
-                      </div>
-                    </div>
-
-                    {!preflight.wrangler_installed && (
-                      <a
-                        href="https://developers.cloudflare.com/workers/wrangler/install/"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="btn btn-secondary w-full text-center block mb-2"
-                      >
-                        Install Wrangler Guide
-                      </a>
-                    )}
-
-                    {preflight.wrangler_installed && !preflight.wrangler_logged_in && (
-                      <button className="btn btn-primary w-full mb-2" onClick={handleLogin}>
-                        Log in to Cloudflare
-                      </button>
-                    )}
-
-                    {preflight.ready && (
-                      <button className="btn btn-primary w-full" onClick={handleDeploy}>
-                        Deploy Runtime
-                      </button>
-                    )}
-                  </div>
+                {/* Deploy button */}
+                {preflight.ready && (
+                  <button className="btn btn-primary w-full transition-fast animate-scale-in" onClick={handleDeploy}>
+                    Deploy Runtime
+                  </button>
                 )}
-              </>
+
+                {/* Reinstall prompt */}
+                {!preflight.embedded_available && (
+                  <p className="text-muted-color text-sm text-center">
+                    Embedded runtime not found. Please reinstall TapChat.
+                  </p>
+                )}
+              </div>
             )}
 
-            {/* Redeploy option for existing deployment */}
+            {/* Redeploy option */}
             {status?.bound && !deploying && (
-              <button className="btn btn-secondary w-full" onClick={handleRedeploy}>
+              <button className="btn btn-secondary w-full transition-fast" onClick={handleDeploy}>
                 Update / Redeploy
               </button>
             )}
 
             {/* Info section */}
-            <div className="card mt-4">
+            <div className="card mt-4 animate-fade-in-up" style={{ animationDelay: "200ms" }}>
               <h2 className="text-sm font-medium text-muted-color mb-2">About Runtime</h2>
               <p className="text-secondary-color text-sm">
                 Your runtime is a personal inbox server deployed to Cloudflare Workers.

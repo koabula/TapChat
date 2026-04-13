@@ -1,0 +1,15 @@
+{
+  "name": "tapchat-wrangler-mini",
+  "version": "1.0.0",
+  "description": "Minimal Cloudflare OAuth login for TapChat Desktop",
+  "type": "module",
+  "scripts": {
+    "login": "node login.mjs",
+    "whoami": "node whoami.mjs"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}
