@@ -22,12 +22,17 @@ interface UploadProgressEvent {
   status: string;
 }
 
+interface DragDropPayload {
+  paths: string[];
+}
+
 export default function MessageInput({ conversationId, onSent }: MessageInputProps) {
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
   const [attachment, setAttachment] = useState<AttachmentInfo | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Listen for upload progress events
@@ -55,10 +60,45 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       }
     });
 
+    // Listen for Tauri drag-drop events (provides file paths)
+    const unlistenDragDrop = listen<DragDropPayload>("tauri://drag-drop", (event) => {
+      const paths = event.payload.paths;
+      if (paths.length > 0) {
+        const filePath = paths[0];
+        handleFileFromPath(filePath);
+      }
+      setIsDragging(false);
+    });
+
+    const unlistenDragEnter = listen<void>("tauri://drag-enter", () => {
+      setIsDragging(true);
+    });
+
+    const unlistenDragLeave = listen<void>("tauri://drag-leave", () => {
+      setIsDragging(false);
+    });
+
     return () => {
       unlisten.then((fn) => fn());
+      unlistenDragDrop.then((fn) => fn());
+      unlistenDragEnter.then((fn) => fn());
+      unlistenDragLeave.then((fn) => fn());
     };
   }, [conversationId, onSent]);
+
+  // Handle file from path (from drag-drop or file picker)
+  const handleFileFromPath = (filePath: string) => {
+    const name = filePath.split(/[/\\]/).pop() || "file";
+    const ext = name.split(".").pop()?.toLowerCase() || "";
+    const mimeType = getMimeType(ext);
+
+    setAttachment({
+      path: filePath,
+      name,
+      size: 0, // Backend will determine
+      mimeType,
+    });
+  };
 
   const handleSendText = async () => {
     if (!inputText.trim()) return;
@@ -104,57 +144,81 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
 
   const handleAttachClick = async () => {
     try {
-      // Use Tauri dialog plugin for file selection
       const selected = await open({
         multiple: false,
         title: "Select file to attach",
       });
 
       if (selected) {
-        const path = selected as string;
-        const name = path.split(/[/\\]/).pop() || "file";
-
-        // Determine MIME type from extension
-        const ext = name.split(".").pop()?.toLowerCase() || "";
-        const mimeType = getMimeType(ext);
-
-        // For now, we don't have file size from dialog
-        // The backend will need to get it from the file
-        setAttachment({
-          path,
-          name,
-          size: 0, // Backend will determine
-          mimeType,
-        });
+        handleFileFromPath(selected as string);
       }
     } catch (err) {
       console.error("File selection failed:", err);
     }
   };
 
+  // DOM drag events as fallback (for web context)
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (!isDragging) setIsDragging(true);
+  }, [isDragging]);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Only set false if leaving the container entirely
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX;
+    const y = e.clientY;
+    if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) {
+      setIsDragging(false);
+    }
   }, []);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    setIsDragging(false);
 
+    // In Tauri, the tauri://drag-drop event handles this
+    // But we also handle DOM drop as fallback
     const files = e.dataTransfer.files;
     if (files.length > 0) {
+      // In browser/webview context, we can't get full paths from File objects
+      // We need to read the file content instead
       const file = files[0];
-      // For drag-drop, we get a File object but need the path for Tauri
-      // In web context, we'd read the file; in Tauri, we need the path
-      // This is a limitation - drag-drop from outside the app won't work well
-      // Users should use the file picker button instead
-      console.log("Drag-drop file:", file.name, file.type, file.size);
-
-      // We can't get the path from File object in browser context
-      // So we'll show a message to use the picker instead
-      alert("Please use the attachment button to select files");
+      handleFileObject(file);
     }
   }, []);
+
+  // Handle File object (from DOM drop in web context)
+  const handleFileObject = async (file: File) => {
+    // Read file as ArrayBuffer and convert to base64
+    // Then we need to write it to a temp location for Tauri to access
+    // This is a workaround for browser-based drag-drop
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const base64 = btoa(
+        new Uint8Array(arrayBuffer).reduce(
+          (data, byte) => data + String.fromCharCode(byte),
+          ""
+        )
+      );
+
+      // Write to temp file via backend
+      const tempPath = await invoke<string>("write_temp_file", {
+        fileName: file.name,
+        contentBase64: base64,
+      });
+
+      handleFileFromPath(tempPath);
+    } catch (err) {
+      console.error("Failed to handle dropped file:", err);
+      // Fallback: show alert to use picker
+      alert("Please use the attachment button to select files");
+    }
+  };
 
   const handleRemoveAttachment = () => {
     setAttachment(null);
@@ -200,13 +264,26 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
 
   return (
     <div
-      className="p-3 border-t border-default"
+      className={`p-3 border-t border-default transition-all ${
+        isDragging ? "bg-primary/10 border-primary" : ""
+      }`}
       onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
+      {/* Drag overlay */}
+      {isDragging && (
+        <div className="absolute inset-0 drag-overlay flex items-center justify-center z-10">
+          <div className="text-center">
+            <div className="text-4xl mb-2 animate-bounce">📎</div>
+            <p className="text-primary-color font-medium">Drop file to attach</p>
+          </div>
+        </div>
+      )}
+
       {/* Attachment preview */}
       {attachment && (
-        <div className="mb-2 p-2 card flex items-center gap-2">
+        <div className="mb-2 p-2 card flex items-center gap-2 animate-fade-in-up">
           <span className="text-lg">
             {attachment.mimeType.startsWith("image/") ? "🖼️" :
              attachment.mimeType.startsWith("audio/") ? "🎵" :
@@ -219,10 +296,10 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
           {uploadProgress !== null && (
             <div className="w-24">
               <div className="text-xs text-muted-color mb-1">{formatStatus(uploadStatus || "")}</div>
-              <div className="w-full bg-surface rounded-full h-1.5">
+              <div className="w-full bg-surface rounded-full h-1.5 progress-bar">
                 <div
                   className={`rounded-full h-1.5 transition-all ${
-                    uploadStatus === "failed" ? "bg-aurora.red" :
+                    uploadStatus === "failed" ? "bg-error" :
                     uploadStatus === "complete" ? "status-success" : "bg-primary"
                   }`}
                   style={{ width: `${uploadProgress}%` }}
@@ -231,7 +308,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
             </div>
           )}
           <button
-            className="btn btn-ghost px-1 text-sm"
+            className="btn btn-ghost px-1 text-sm transition-fast hover:bg-error/20"
             onClick={handleRemoveAttachment}
             disabled={sending}
           >
@@ -243,7 +320,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       {/* Input row */}
       <div className="flex items-center gap-2">
         <button
-          className="btn btn-ghost px-2"
+          className="btn btn-ghost px-2 transition-fast"
           title="Attach file"
           onClick={handleAttachClick}
           disabled={sending}
@@ -252,7 +329,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         </button>
         <input
           ref={fileInputRef}
-          className="input flex-1"
+          className="input flex-1 transition-fast"
           placeholder={attachment ? "Add a message (optional)..." : "Type a message..."}
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
@@ -266,7 +343,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         />
         {attachment ? (
           <button
-            className="btn btn-primary px-3"
+            className="btn btn-primary px-3 transition-fast"
             onClick={handleSendAttachment}
             disabled={sending}
           >
@@ -274,7 +351,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
           </button>
         ) : (
           <button
-            className="btn btn-primary px-3"
+            className="btn btn-primary px-3 transition-fast"
             onClick={handleSendText}
             disabled={sending || !inputText.trim()}
           >

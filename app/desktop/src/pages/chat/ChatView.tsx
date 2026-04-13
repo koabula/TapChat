@@ -83,16 +83,14 @@ export default function ChatView() {
   };
 
   const isMyMessage = (msg: Message) => {
-    // If sender_device_id matches our device, it's our message
-    // For now, use a simple check - backend should provide this
     return msg.message_type === "sent" || msg.sender_device_id === "me";
   };
 
   if (!conversationId) {
     return (
       <div className="flex-1 flex items-center justify-center bg-base">
-        <div className="text-center">
-          <div className="w-16 h-16 rounded-full bg-surface-elevated mb-4 flex items-center justify-center">
+        <div className="text-center animate-fade-in">
+          <div className="w-16 h-16 rounded-full bg-surface-elevated mb-4 flex items-center justify-center animate-scale-in">
             <span className="text-2xl text-muted-color">💬</span>
           </div>
           <h2 className="text-xl text-muted-color mb-2">Select a conversation</h2>
@@ -104,29 +102,28 @@ export default function ChatView() {
 
   // Get display messages - show placeholder if loading or empty
   const displayMessages = loading ? [] : messages.length > 0 ? messages : [
-    // Placeholder for new conversations
     { message_id: "placeholder", sender_device_id: "", recipient_device_id: "", message_type: "placeholder", created_at: Date.now(), plaintext: "No messages yet. Say hello!", has_attachment: false },
   ];
 
   return (
     <div className="flex-1 flex flex-col bg-base">
       {/* Header */}
-      <header className="flex items-center gap-3 p-3 border-b border-default bg-surface">
-        <div className="avatar">
-          <span className="text-lg">{peerName[0]?.toUpperCase() || "?"}</span>
+      <header className="flex items-center gap-3 p-3 border-b border-default bg-surface animate-fade-in-down">
+        <div className="avatar animate-scale-in">
+          <span className="text-lg font-medium">{peerName[0]?.toUpperCase() || "?"}</span>
         </div>
         <div className="flex-1">
           <h2 className="text-primary-color font-medium">{peerName}</h2>
           <span className="text-muted-color text-xs flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full status-success" />
+            <span className="w-1.5 h-1.5 rounded-full status-success animate-pulse" />
             End-to-end encrypted
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <button className="btn btn-ghost px-2" title="Search messages">
+          <button className="btn btn-ghost px-2 transition-fast" title="Search messages">
             🔍
           </button>
-          <button className="btn btn-ghost px-2" title="More options">
+          <button className="btn btn-ghost px-2 transition-fast" title="More options">
             ⋮
           </button>
         </div>
@@ -135,22 +132,35 @@ export default function ChatView() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {loading && (
-          <div className="text-center text-muted-color">Loading messages...</div>
+          <div className="text-center py-8">
+            <div className="inline-block animate-spin text-2xl text-muted-color">⏳</div>
+            <p className="text-muted-color mt-2 animate-pulse">Loading messages...</p>
+          </div>
         )}
 
-        {displayMessages.map((msg) => (
+        {!loading && messages.length === 0 && (
+          <div className="text-center py-8 animate-fade-in">
+            <div className="text-muted-color">
+              <p className="mb-2">Start the conversation</p>
+              <p className="text-sm">Send a message below</p>
+            </div>
+          </div>
+        )}
+
+        {displayMessages.map((msg, index) => (
           <div
             key={msg.message_id}
             className={`flex ${
               isMyMessage(msg) ? "justify-end" : "justify-start"
             }`}
+            style={{ animationDelay: `${index * 30}ms` }}
           >
             {msg.has_attachment ? (
-              <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"}`}>
+              <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
                 <AttachmentPreview
                   messageId={msg.message_id}
                   conversationId={conversationId}
-                  reference={msg.message_id} // TODO: proper reference from message
+                  reference={msg.message_id}
                   mimeType="application/octet-stream"
                   fileName={undefined}
                 />
@@ -163,7 +173,7 @@ export default function ChatView() {
                 </span>
               </div>
             ) : (
-              <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"}`}>
+              <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
                 <span>{msg.plaintext}</span>
                 <span className="block text-xs text-right mt-1 opacity-60">
                   {formatTime(msg.created_at)}

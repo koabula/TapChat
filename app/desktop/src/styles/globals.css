@@ -78,10 +78,90 @@
   }
 }
 
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    opacity: 0;
+    transform: translateX(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes slideInLeft {
+  from {
+    opacity: 0;
+    transform: translateX(-20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
 @layer components {
   /* Button variants */
   .btn {
-    @apply inline-flex items-center justify-center px-4 py-2 rounded-lg font-medium transition-colors;
+    @apply inline-flex items-center justify-center px-4 py-2 rounded-lg font-medium;
+    transition: all 0.2s ease;
+  }
+  .btn:active {
+    transform: scale(0.98);
   }
 
   .btn-primary {
@@ -110,6 +190,7 @@
     background-color: var(--bg-surface-elevated);
     border: 1px solid var(--border-default);
     color: var(--text-primary);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
   }
   .input::placeholder {
     color: var(--text-muted);
@@ -124,11 +205,16 @@
     @apply rounded-lg p-4;
     background-color: var(--bg-surface);
     border: 1px solid var(--border-subtle);
+    transition: background-color 0.2s ease, box-shadow 0.2s ease;
+  }
+  .card:hover {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
   }
 
   /* Message bubble */
   .bubble {
     @apply px-4 py-2 rounded-bubble max-w-[70%];
+    animation: fadeInUp 0.2s ease;
   }
 
   .bubble-sent {
@@ -147,6 +233,10 @@
     @apply w-10 h-10 rounded-full flex items-center justify-center;
     background-color: var(--bg-surface-elevated);
     color: var(--text-muted);
+    transition: transform 0.2s ease;
+  }
+  .avatar:hover {
+    transform: scale(1.05);
   }
 
   /* Sidebar panel */
@@ -184,6 +274,65 @@
     background-color: var(--warning);
     color: var(--text-primary);
   }
+
+  /* Conversation list item */
+  .conv-item {
+    transition: background-color 0.15s ease, transform 0.15s ease;
+  }
+  .conv-item:hover {
+    background-color: var(--bg-surface-elevated);
+  }
+  .conv-item:active {
+    transform: scale(0.99);
+  }
+  .conv-item.active {
+    background-color: var(--bg-surface-elevated);
+    border-left: 3px solid var(--accent-primary);
+  }
+
+  /* Page transitions */
+  .page-enter {
+    animation: fadeIn 0.25s ease;
+  }
+
+  /* Modal */
+  .modal-overlay {
+    animation: fadeIn 0.2s ease;
+  }
+  .modal-content {
+    animation: scaleIn 0.25s ease;
+  }
+
+  /* Loading spinner */
+  .spinner {
+    animation: spin 1s linear infinite;
+  }
+
+  /* Drag overlay */
+  .drag-overlay {
+    animation: fadeIn 0.15s ease;
+    background-color: rgba(var(--accent-primary), 0.1);
+    border: 2px dashed var(--accent-primary);
+  }
+
+  /* Toast notification */
+  .toast {
+    animation: slideInRight 0.3s ease;
+  }
+  .toast-exit {
+    animation: slideInRight 0.3s ease reverse;
+  }
+
+  /* Progress bar animation */
+  .progress-bar {
+    transition: width 0.3s ease;
+  }
+
+  /* Skeleton loading */
+  .skeleton {
+    animation: pulse 2s ease-in-out infinite;
+    background-color: var(--bg-surface-elevated);
+  }
 }
 
 @layer utilities {
@@ -215,5 +364,45 @@
   }
   .border-subtle {
     border-color: var(--border-subtle);
+  }
+
+  /* Animation utilities */
+  .animate-fade-in {
+    animation: fadeIn 0.3s ease;
+  }
+  .animate-fade-in-up {
+    animation: fadeInUp 0.3s ease;
+  }
+  .animate-fade-in-down {
+    animation: fadeInDown 0.3s ease;
+  }
+  .animate-slide-in-right {
+    animation: slideInRight 0.3s ease;
+  }
+  .animate-slide-in-left {
+    animation: slideInLeft 0.3s ease;
+  }
+  .animate-scale-in {
+    animation: scaleIn 0.3s ease;
+  }
+  .animate-pulse {
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .animate-spin {
+    animation: spin 1s linear infinite;
+  }
+  .animate-bounce {
+    animation: bounce 1s ease infinite;
+  }
+
+  /* Transition utilities */
+  .transition-fast {
+    transition: all 0.15s ease;
+  }
+  .transition-medium {
+    transition: all 0.3s ease;
+  }
+  .transition-slow {
+    transition: all 0.5s ease;
   }
 }
