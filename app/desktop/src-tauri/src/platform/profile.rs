@@ -1,0 +1,257 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+use tapchat_core::cli::profile::{Profile, ProfileRegistry, ProfileMetadata, RuntimeMetadata};
+use tapchat_core::persistence::CorePersistenceSnapshot;
+
+/// Desktop profile manager - wraps CLI ProfileRegistry and provides
+/// async access for the Tauri app.
+pub struct ProfileManager {
+    pub inner: Arc<RwLock<ProfileManagerInner>>,
+}
+
+pub struct ProfileManagerInner {
+    pub registry: ProfileRegistry,
+    pub active_profile: Option<Profile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_bound: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStartupCheck {
+    pub has_active_profile: bool,
+    pub has_identity: bool,
+    pub has_runtime_binding: bool,
+    pub needs_onboarding: bool,
+    pub profile_path: Option<PathBuf>,
+}
+
+impl ProfileManager {
+    pub fn new() -> Self {
+        let registry = ProfileRegistry::load().unwrap_or_default();
+        let active_profile = registry
+            .active_profile
+            .as_ref()
+            .and_then(|path| Profile::open(path).ok());
+
+        Self {
+            inner: Arc::new(RwLock::new(ProfileManagerInner {
+                registry,
+                active_profile,
+            })),
+        }
+    }
+
+    /// Get the inner Arc for sharing with platform ports.
+    pub fn inner_arc(&self) -> Arc<RwLock<ProfileManagerInner>> {
+        self.inner.clone()
+    }
+
+    /// Create ProfileManager from an existing inner Arc.
+    pub fn from_inner(inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
+        Self { inner }
+    }
+
+    /// Check if we need onboarding or can go directly to active session.
+    pub async fn check_session_startup(&self) -> SessionStartupCheck {
+        let inner = self.inner.read().await;
+
+        let has_active_profile = inner.active_profile.is_some();
+        let profile = inner.active_profile.as_ref();
+
+        let has_identity = profile
+            .map(|p| p.metadata().user_id.is_some() && p.metadata().device_id.is_some())
+            .unwrap_or(false);
+
+        let has_runtime_binding = profile
+            .map(|p| {
+                // Check if runtime metadata exists and has base_url
+                p.load_runtime_metadata()
+                    .map(|r| r.base_url.is_some())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+        let needs_onboarding = !has_active_profile || !has_identity;
+
+        SessionStartupCheck {
+            has_active_profile,
+            has_identity,
+            has_runtime_binding,
+            needs_onboarding,
+            profile_path: profile.map(|p| p.root().to_path_buf()),
+        }
+    }
+
+    /// List all registered profiles.
+    pub async fn list_profiles(&self) -> Vec<ProfileSummary> {
+        let inner = self.inner.read().await;
+        let active_path = inner.registry.active_profile.as_ref();
+
+        inner
+            .registry
+            .profiles
+            .iter()
+            .map(|entry| {
+                let is_active = active_path
+                    .as_ref()
+                    .is_some_and(|active| active == &&entry.root_dir);
+
+                let runtime_bound = if is_active {
+                    inner
+                        .active_profile
+                        .as_ref()
+                        .and_then(|p| p.load_runtime_metadata().ok())
+                        .map(|r| r.base_url.is_some())
+                } else {
+                    Profile::open(&entry.root_dir)
+                        .ok()
+                        .and_then(|p| p.load_runtime_metadata().ok())
+                        .map(|r| r.base_url.is_some())
+                };
+
+                ProfileSummary {
+                    name: entry.name.clone(),
+                    path: entry.root_dir.clone(),
+                    is_active,
+                    user_id: entry.user_id.clone(),
+                    device_id: entry.device_id.clone(),
+                    runtime_bound,
+                }
+            })
+            .collect()
+    }
+
+    /// Create a new profile.
+    pub async fn create_profile(&self, name: &str, root: PathBuf) -> Result<ProfileSummary> {
+        let mut inner = self.inner.write().await;
+
+        let profile = Profile::init(name, &root)?;
+        let entry = profile.metadata().clone();
+
+        inner.registry.upsert(tapchat_core::cli::profile::ProfileRegistryEntry {
+            name: entry.name.clone(),
+            root_dir: entry.root_dir.clone(),
+            user_id: entry.user_id.clone(),
+            device_id: entry.device_id.clone(),
+        });
+
+        let is_active = if inner.registry.active_profile.is_none() {
+            inner.registry.active_profile = Some(root.clone());
+            inner.active_profile = Some(profile);
+            true
+        } else {
+            inner.registry.active_profile.as_ref() == Some(&root)
+        };
+
+        inner.registry.save()?;
+
+        Ok(ProfileSummary {
+            name: entry.name.clone(),
+            path: entry.root_dir.clone(),
+            is_active,
+            user_id: entry.user_id.clone(),
+            device_id: entry.device_id.clone(),
+            runtime_bound: None,
+        })
+    }
+
+    /// Activate an existing profile.
+    pub async fn activate_profile(&self, path: &PathBuf) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        inner.registry.set_active(path)?;
+        inner.active_profile = Some(Profile::open(path)?);
+        inner.registry.save()?;
+        Ok(())
+    }
+
+    /// Get the active profile's metadata.
+    pub async fn get_active_metadata(&self) -> Option<ProfileMetadata> {
+        let inner = self.inner.read().await;
+        inner.active_profile.as_ref().map(|p| p.metadata().clone())
+    }
+
+    /// Get the active profile's runtime metadata.
+    pub async fn get_runtime_metadata(&self) -> Option<RuntimeMetadata> {
+        let inner = self.inner.read().await;
+        inner
+            .active_profile
+            .as_ref()
+            .and_then(|p| p.load_runtime_metadata().ok())
+    }
+
+    /// Update identity in active profile.
+    pub async fn update_identity(
+        &self,
+        user_id: Option<String>,
+        device_id: Option<String>,
+    ) -> Result<()> {
+        let mut inner = self.inner.write().await;
+        if let Some(ref mut profile) = inner.active_profile {
+            profile.update_identity(user_id, device_id)?;
+        }
+        Ok(())
+    }
+
+    /// Save runtime metadata to active profile.
+    pub async fn save_runtime_metadata(&self, runtime: &RuntimeMetadata) -> Result<()> {
+        let inner = self.inner.read().await;
+        if let Some(ref profile) = inner.active_profile {
+            profile.save_runtime_metadata(runtime)?;
+        }
+        Ok(())
+    }
+
+    /// Load snapshot from active profile.
+    pub async fn load_snapshot(&self) -> Result<CorePersistenceSnapshot> {
+        let inner = self.inner.read().await;
+        match &inner.active_profile {
+            Some(profile) => profile.load_snapshot(),
+            None => Ok(CorePersistenceSnapshot::default()),
+        }
+    }
+
+    /// Save snapshot to active profile.
+    pub async fn save_snapshot(&self, snapshot: &CorePersistenceSnapshot) -> Result<()> {
+        let inner = self.inner.read().await;
+        if let Some(ref profile) = inner.active_profile {
+            profile.save_snapshot(snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Get the base URL for API calls from runtime metadata.
+    pub async fn get_base_url(&self) -> Option<String> {
+        self.get_runtime_metadata()
+            .await
+            .and_then(|r| r.base_url)
+    }
+
+    /// Get WebSocket URL from runtime metadata.
+    pub async fn get_websocket_url(&self) -> Option<String> {
+        self.get_runtime_metadata()
+            .await
+            .and_then(|r| r.websocket_base_url)
+    }
+}
+
+impl Default for ProfileManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
