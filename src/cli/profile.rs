@@ -265,9 +265,15 @@ impl ProfileRegistry {
         if !path.exists() {
             return Ok(Self::default());
         }
-        Ok(serde_json::from_slice(
-            &fs::read(path).context("read profile registry")?,
-        )?)
+
+        let content = fs::read(path).context("read profile registry")?;
+
+        // Handle empty file case
+        if content.is_empty() || content.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(Self::default());
+        }
+
+        Ok(serde_json::from_slice(&content)?)
     }
 
     pub fn save(&self) -> Result<()> {

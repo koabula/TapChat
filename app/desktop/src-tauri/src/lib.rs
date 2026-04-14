@@ -74,6 +74,7 @@ pub fn run() {
         .on_window_event(lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             // Identity
+            commands::identity::init_onboarding_profile,
             commands::identity::create_or_load_identity,
             commands::identity::get_identity_info,
             commands::identity::get_share_link,

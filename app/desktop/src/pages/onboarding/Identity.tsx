@@ -2,6 +2,14 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
+interface ProfileSummary {
+  name: string;
+  path: string;
+  is_active: boolean;
+  user_id?: string;
+  device_id?: string;
+}
+
 interface CreateIdentityResult {
   user_id: string;
   device_id: string;
@@ -13,12 +21,42 @@ export default function Identity() {
   const [searchParams] = useSearchParams();
   const isRecover = searchParams.get("mode") === "recover";
 
+  const [profileName, setProfileName] = useState("default");
   const [deviceName, setDeviceName] = useState("My Laptop");
   const [mnemonic, setMnemonic] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [step, setStep] = useState<"profile" | "identity">(isRecover ? "identity" : "profile");
 
-  const handleSubmit = async () => {
+  const handleInitProfile = async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      console.log("Calling init_onboarding_profile with profileName:", profileName);
+
+      // Initialize profile first
+      const result = await invoke<ProfileSummary>("init_onboarding_profile", {
+        profileName,
+      });
+
+      console.log("Profile created successfully:", result);
+
+      // Move to identity step
+      setStep("identity");
+    } catch (err) {
+      console.error("Failed to create profile:", err);
+      // Handle different error formats
+      const errorMsg = typeof err === 'string' ? err :
+        (err instanceof Error ? err.message :
+          JSON.stringify(err));
+      setError(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmitIdentity = async () => {
     setLoading(true);
     setError(null);
 
@@ -49,7 +87,7 @@ export default function Identity() {
       <div className="flex items-center mb-8">
         <button
           className="btn btn-ghost px-2"
-          onClick={() => navigate("/onboarding")}
+          onClick={() => step === "identity" && !isRecover ? setStep("profile") : navigate("/onboarding")}
         >
           ← Back
         </button>
@@ -58,54 +96,93 @@ export default function Identity() {
 
       {/* Content */}
       <div className="flex flex-col items-center justify-center flex-1">
-        <h2 className="text-xl font-semibold text-primary-color mb-2">
-          {isRecover ? "Recover Your Identity" : "Name Your Device"}
-        </h2>
+        {step === "profile" && !isRecover && (
+          <>
+            <h2 className="text-xl font-semibold text-primary-color mb-2">
+              Create Your Profile
+            </h2>
+            <p className="text-secondary-color text-center mb-6 max-w-md">
+              Your profile stores all your messages and contacts locally. Choose a name for your profile.
+            </p>
 
-        {!isRecover && (
-          <p className="text-secondary-color text-center mb-6 max-w-md">
-            This name helps you identify this device when managing multiple devices.
-          </p>
+            <div className="w-full max-w-sm space-y-4">
+              <div>
+                <label className="text-sm text-muted-color mb-1 block">Profile name</label>
+                <input
+                  className="input"
+                  placeholder="default"
+                  value={profileName}
+                  onChange={(e) => setProfileName(e.target.value)}
+                />
+              </div>
+
+              {error && (
+                <div className="status-error text-sm">{error}</div>
+              )}
+
+              <button
+                className="btn btn-primary w-full"
+                onClick={handleInitProfile}
+                disabled={loading || !profileName.trim()}
+              >
+                {loading ? "Creating..." : "Continue"}
+              </button>
+            </div>
+          </>
         )}
 
-        {isRecover && (
-          <p className="text-secondary-color text-center mb-4 max-w-md">
-            Enter your 12-word recovery phrase:
-          </p>
+        {step === "identity" && (
+          <>
+            <h2 className="text-xl font-semibold text-primary-color mb-2">
+              {isRecover ? "Recover Your Identity" : "Name Your Device"}
+            </h2>
+
+            {!isRecover && (
+              <p className="text-secondary-color text-center mb-6 max-w-md">
+                This name helps you identify this device when managing multiple devices.
+              </p>
+            )}
+
+            {isRecover && (
+              <p className="text-secondary-color text-center mb-4 max-w-md">
+                Enter your 12-word recovery phrase:
+              </p>
+            )}
+
+            <div className="w-full max-w-sm space-y-4">
+              {isRecover && (
+                <textarea
+                  className="input min-h-[100px] resize-none"
+                  placeholder="word1 word2 word3 word4 ..."
+                  value={mnemonic}
+                  onChange={(e) => setMnemonic(e.target.value)}
+                />
+              )}
+
+              <div>
+                <label className="text-sm text-muted-color mb-1 block">Device name</label>
+                <input
+                  className="input"
+                  placeholder="My Laptop"
+                  value={deviceName}
+                  onChange={(e) => setDeviceName(e.target.value)}
+                />
+              </div>
+
+              {error && (
+                <div className="status-error text-sm">{error}</div>
+              )}
+
+              <button
+                className="btn btn-primary w-full"
+                onClick={handleSubmitIdentity}
+                disabled={loading || (isRecover && !mnemonic.trim())}
+              >
+                {loading ? "Loading..." : isRecover ? "Recover" : "Continue"}
+              </button>
+            </div>
+          </>
         )}
-
-        <div className="w-full max-w-sm space-y-4">
-          {isRecover && (
-            <textarea
-              className="input min-h-[100px] resize-none"
-              placeholder="word1 word2 word3 word4 ..."
-              value={mnemonic}
-              onChange={(e) => setMnemonic(e.target.value)}
-            />
-          )}
-
-          <div>
-            <label className="text-sm text-muted-color mb-1 block">Device name</label>
-            <input
-              className="input"
-              placeholder="My Laptop"
-              value={deviceName}
-              onChange={(e) => setDeviceName(e.target.value)}
-            />
-          </div>
-
-          {error && (
-            <div className="status-error text-sm">{error}</div>
-          )}
-
-          <button
-            className="btn btn-primary w-full"
-            onClick={handleSubmit}
-            disabled={loading || (isRecover && !mnemonic.trim())}
-          >
-            {loading ? "Loading..." : isRecover ? "Recover" : "Continue"}
-          </button>
-        </div>
       </div>
     </div>
   );

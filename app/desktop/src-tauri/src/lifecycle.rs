@@ -193,7 +193,7 @@ pub async fn drive_core_with_handle(
 pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
 
-    // Get device_id from profile
+    // Get device_id from profile and persist session state
     let device_id = {
         let inner = state.inner.read().await;
         inner.profile_manager.get_active_metadata().await
@@ -205,6 +205,12 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     {
         let mut inner = state.inner.write().await;
         inner.session = SessionState::Active { device_id };
+
+        // Persist the current snapshot to profile
+        let snapshot = inner.engine.refresh_snapshot();
+        if let Err(e) = inner.profile_manager.save_snapshot(&snapshot).await {
+            log::error!("Failed to save snapshot: {}", e);
+        }
     }
 
     // Close onboarding window
@@ -215,6 +221,9 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     // Show main window
     if let Some(main_window) = app.get_webview_window("main") {
         main_window.show().map_err(|e| e.to_string())?;
+        if let Err(e) = main_window.set_focus() {
+            log::error!("Failed to focus main window: {}", e);
+        }
     }
 
     // Start session with AppStarted event

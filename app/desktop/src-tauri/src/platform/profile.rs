@@ -20,6 +20,7 @@ pub struct ProfileManagerInner {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ProfileSummary {
     pub name: String,
     pub path: PathBuf,
