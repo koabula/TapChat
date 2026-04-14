@@ -56,6 +56,7 @@ pub async fn list_contacts(
         .map(|persisted| {
             ContactSummary {
                 user_id: persisted.user_id.clone(),
+                display_name: persisted.display_name.clone().or(persisted.original_name.clone()),
                 device_count: persisted.bundle.devices.len(),
             }
         })
@@ -72,6 +73,23 @@ pub async fn refresh_contact(
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RefreshIdentityState { user_id }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_contact_display_name(
+    app: tauri::AppHandle,
+    user_id: String,
+    display_name: Option<String>,
+) -> Result<CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::SetContactDisplayName {
+            user_id,
+            display_name,
+        }),
     )
     .await
     .map_err(|e| e.to_string())

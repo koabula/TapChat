@@ -67,8 +67,17 @@ impl DesktopPersistence {
     /// Save a full snapshot to the profile.
     pub async fn save_snapshot(&self, snapshot: &CorePersistenceSnapshot) -> Result<()> {
         let pm = self.profile_inner.read().await;
+        log::info!(
+            "save_snapshot called: active_profile={}, local_identity={}, contacts={}",
+            pm.active_profile.is_some(),
+            snapshot.local_identity.is_some(),
+            snapshot.contacts.len()
+        );
         if let Some(ref profile) = pm.active_profile {
             profile.save_snapshot(snapshot)?;
+            log::info!("Snapshot saved successfully to profile");
+        } else {
+            log::warn!("save_snapshot called but no active_profile set!");
         }
         Ok(())
     }

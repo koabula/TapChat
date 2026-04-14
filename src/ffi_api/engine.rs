@@ -1,19 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use ed25519_dalek::Signer;
 use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
-use crate::identity::IdentityManager;
+use crate::identity::{IdentityManager, encode_hex, generate_bundle_share_id, identity_bundle_payload};
 use crate::mls_adapter::{
     CreateConversationArtifacts, IngestResult, MlsAdapter, PeerDeviceKeyPackage,
     RemoveMembersArtifacts,
 };
 use crate::model::{
     Ack, ConversationKind, ConversationState, DeliveryClass, Envelope, IdentityBundle, InboxRecord,
-    MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
+    MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, StorageProfile, Validate,
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
@@ -77,8 +78,19 @@ impl CoreEngine {
         self.state.local_identity.as_ref()
     }
 
+    pub fn local_display_name(&self) -> Option<String> {
+        self.state.local_display_name.clone()
+            .or_else(|| self.state.local_bundle.as_ref()?.display_name.clone())
+    }
+
     pub fn contact_bundle(&self, user_id: &str) -> Option<&IdentityBundle> {
-        self.state.contacts.get(user_id)
+        self.state.contacts.get(user_id).map(|c| &c.bundle)
+    }
+
+    pub fn contact_display_name(&self, user_id: &str) -> Option<&str> {
+        self.state.contacts.get(user_id).and_then(|c| {
+            c.display_name.as_deref().or(c.original_name.as_deref())
+        })
     }
 
     pub fn conversation_state(&self, conversation_id: &str) -> Option<&LocalConversationState> {
@@ -175,7 +187,13 @@ impl CoreEngine {
         .unwrap_or_default();
         let mut contacts = BTreeMap::new();
         for contact in snapshot.contacts {
-            contacts.insert(contact.user_id, contact.bundle);
+            contacts.insert(contact.user_id.clone(), PersistedContact {
+                user_id: contact.user_id,
+                bundle: contact.bundle,
+                display_name: contact.display_name,
+                original_name: contact.original_name,
+                added_at: contact.added_at,
+            });
         }
 
         let mut conversations = BTreeMap::new();
@@ -359,6 +377,10 @@ impl CoreEngine {
 
         let local_identity = snapshot.local_identity.map(|identity| identity.state);
         let persisted_deployment = snapshot.deployment.clone();
+        let local_display_name = persisted_deployment
+            .as_ref()
+            .and_then(|deployment| deployment.local_bundle.as_ref())
+            .and_then(|bundle| bundle.display_name.clone());
         let mut engine = Self {
             state: CoreState {
                 local_identity,
@@ -386,6 +408,7 @@ impl CoreEngine {
                 message_nonce: snapshot.message_nonce,
                 recovery_contexts,
                 pending_allowlist_mutation: None,
+                local_display_name,
             },
         };
 
@@ -443,7 +466,8 @@ impl CoreEngine {
             CoreCommand::CreateOrLoadIdentity {
                 mnemonic,
                 device_name,
-            } => self.create_or_load_identity(mnemonic, device_name),
+                display_name,
+            } => self.create_or_load_identity(mnemonic, device_name, display_name),
             CoreCommand::ImportDeploymentBundle { bundle } => self.import_deployment_bundle(bundle),
             CoreCommand::ImportIdentityBundle { bundle } => self.import_identity_bundle(bundle),
             CoreCommand::ApplyIdentityBundleUpdate { bundle } => {
@@ -494,6 +518,12 @@ impl CoreEngine {
             CoreCommand::RotateContactShareLink => self.rotate_contact_share_link(),
             CoreCommand::RebuildConversation { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
+            }
+            CoreCommand::SetLocalDisplayName { display_name } => {
+                self.set_local_display_name(display_name)
+            }
+            CoreCommand::SetContactDisplayName { user_id, display_name } => {
+                self.set_contact_display_name(user_id, display_name)
             }
         }
     }
@@ -681,7 +711,22 @@ impl CoreEngine {
     fn import_identity_bundle(&mut self, bundle: IdentityBundle) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
         let user_id = bundle.user_id.clone();
-        self.state.contacts.insert(user_id.clone(), bundle);
+        let original_name = bundle.display_name.clone();
+        let now = current_timestamp_hint(self.state.outbox.len());
+
+        // Check if contact already exists to preserve user's display_name
+        let existing_display_name = self.state.contacts.get(&user_id)
+            .and_then(|c| c.display_name.clone());
+
+        let persisted_contact = PersistedContact {
+            user_id: user_id.clone(),
+            bundle,
+            display_name: existing_display_name,
+            original_name,
+            added_at: now,
+        };
+
+        self.state.contacts.insert(user_id.clone(), persisted_contact);
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
@@ -705,7 +750,26 @@ impl CoreEngine {
         IdentityManager::verify_identity_bundle(&bundle)?;
         let user_id = bundle.user_id.clone();
         let affected_conversations = self.affected_conversations_for_peer(&user_id);
-        self.state.contacts.insert(user_id.clone(), bundle);
+
+        // Preserve existing display_name, update original_name if bundle has display_name
+        let existing = self.state.contacts.get(&user_id);
+        let display_name = existing.and_then(|c| c.display_name.clone());
+        let original_name = bundle.display_name.clone().or(
+            existing.and_then(|c| c.original_name.clone())
+        );
+        let added_at = existing.map(|c| c.added_at).unwrap_or_else(|| {
+            current_timestamp_hint(self.state.outbox.len())
+        });
+
+        let persisted_contact = PersistedContact {
+            user_id: user_id.clone(),
+            bundle,
+            display_name,
+            original_name,
+            added_at,
+        };
+
+        self.state.contacts.insert(user_id.clone(), persisted_contact);
 
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
@@ -746,7 +810,13 @@ impl CoreEngine {
         &mut self,
         mnemonic: Option<String>,
         device_name: Option<String>,
+        display_name: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        // Validate display_name if provided
+        if let Some(ref name) = display_name {
+            crate::model::validate_display_name(name)?;
+        }
+
         let identity = if let Some(existing) = self.state.local_identity.clone() {
             if let Some(provided_mnemonic) = mnemonic.as_deref() {
                 let recovered = IdentityManager::recover_user_root(provided_mnemonic)?;
@@ -766,6 +836,7 @@ impl CoreEngine {
         self.state.local_identity = Some(identity);
         self.state.mls_adapter = Some(adapter);
         self.state.published_key_package = Some(package);
+        self.state.local_display_name = display_name.clone();
         self.state
             .sync_states
             .insert(device_id.clone(), SyncEngine::new_device_state(&device_id));
@@ -783,6 +854,7 @@ impl CoreEngine {
             view_model: Some(CoreViewModel {
                 contacts: vec![ContactSummary {
                     user_id,
+                    display_name,
                     device_count: 1,
                 }],
                 banners: vec![SystemBanner {
@@ -835,6 +907,7 @@ impl CoreEngine {
             view_model: Some(CoreViewModel {
                 contacts: vec![ContactSummary {
                     user_id,
+                    display_name: None,
                     device_count: 1,
                 }],
                 banners: vec![SystemBanner {
@@ -1475,11 +1548,17 @@ impl CoreEngine {
         if device_id.trim().is_empty() {
             return Err(CoreError::invalid_input("device_id must not be empty"));
         }
-        let deployment = self
-            .state
-            .deployment_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+
+        // Check if deployment_bundle exists - if not, skip sync gracefully
+        let deployment = match self.state.deployment_bundle.as_ref() {
+            Some(d) => d,
+            None => {
+                // No deployment configured - return empty output without error
+                // This happens when profile hasn't been deployed to Cloudflare yet
+                return Ok(CoreOutput::default());
+            }
+        };
+
         let inbox_websocket_endpoint = deployment.inbox_websocket_endpoint.clone();
         let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
         let headers = self.device_runtime_headers()?;
@@ -1761,7 +1840,7 @@ impl CoreEngine {
             .contacts
             .get(&user_id)
             .ok_or_else(|| CoreError::invalid_input("contact does not exist"))?;
-        let reference = bundle.identity_bundle_ref.clone().ok_or_else(|| {
+        let reference = bundle.bundle.identity_bundle_ref.clone().ok_or_else(|| {
             CoreError::invalid_state("contact identity bundle reference is missing")
         })?;
         Ok(CoreOutput {
@@ -2274,12 +2353,13 @@ impl CoreEngine {
             .contacts
             .get(peer_user_id)
             .ok_or_else(|| CoreError::invalid_input("peer contact is missing"))?;
-        if bundle.identity_bundle_ref.is_none() {
+        if bundle.bundle.identity_bundle_ref.is_none() {
             return Err(CoreError::invalid_input(
                 "peer identity bundle reference is missing",
             ));
         }
         if !bundle
+            .bundle
             .devices
             .iter()
             .any(|device| matches!(device.status, crate::model::DeviceStatusKind::Active))
@@ -2288,7 +2368,7 @@ impl CoreEngine {
                 "peer identity bundle does not contain any active devices",
             ));
         }
-        Ok(bundle)
+        Ok(&bundle.bundle)
     }
 
     fn enqueue_envelopes(&mut self, peer_user_id: String, envelopes: Vec<Envelope>) {
@@ -2474,6 +2554,141 @@ impl CoreEngine {
             },
             last_message_type: conversation.last_message_type,
             recovery: self.recovery_snapshot_for_conversation(conversation_id),
+        })
+    }
+
+    fn set_local_display_name(&mut self, display_name: Option<String>) -> CoreResult<CoreOutput> {
+        // Validate display_name if provided
+        if let Some(ref name) = display_name {
+            crate::model::validate_display_name(name)?;
+        }
+
+        self.state.local_display_name = display_name.clone();
+
+        // Re-generate and sign the identity bundle with new display_name
+        let publish_effects = if self.state.local_identity.is_some() && self.state.deployment_bundle.is_some() {
+            // Build devices list from existing bundle
+            let devices: Vec<crate::model::DeviceContactProfile> = self.state.local_bundle
+                .as_ref()
+                .map(|b| b.devices.clone())
+                .unwrap_or_default();
+
+            // Get existing bundle_share_id
+            let bundle_share_id = self.state.local_bundle
+                .as_ref()
+                .and_then(|b| b.bundle_share_id.clone());
+
+            // Re-export identity bundle with new display_name
+            let local_identity = self.state.local_identity.as_ref().unwrap();
+            let deployment = self.state.deployment_bundle.as_ref().unwrap();
+
+            let encoded_user_id = urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
+            let unsigned = crate::model::IdentityBundle {
+                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                user_id: local_identity.user_identity.user_id.clone(),
+                user_public_key: local_identity.user_identity.user_public_key.clone(),
+                devices,
+                bundle_share_id: Some(bundle_share_id.unwrap_or_else(|| crate::identity::generate_bundle_share_id())),
+                identity_bundle_ref: deployment.runtime_config.identity_bundle_ref.clone()
+                    .map(|reference| reference.replace("{userId}", &encoded_user_id)),
+                device_status_ref: deployment.runtime_config.device_status_ref.clone()
+                    .map(|reference| reference.replace("{userId}", &encoded_user_id)),
+                storage_profile: Some(crate::model::StorageProfile {
+                    base_url: deployment.storage_base_info.base_url.clone(),
+                    profile_ref: None,
+                }),
+                display_name: display_name.clone(),
+                updated_at: local_identity.device_status.updated_at,
+                signature: String::new(),
+            };
+
+            // Sign the bundle
+            let signature = local_identity.user_root_signing_key()
+                .sign(crate::identity::identity_bundle_payload(&unsigned).as_bytes());
+            let signed_bundle = crate::model::IdentityBundle {
+                signature: crate::identity::encode_hex(&signature.to_bytes()),
+                ..unsigned
+            };
+
+            // Update the local bundle
+            self.state.local_bundle = Some(signed_bundle.clone());
+
+            // Generate publish effects
+            self.local_shared_state_publish_effects()?
+        } else {
+            // Just update the bundle display_name if we can't re-sign
+            if let Some(ref mut bundle) = self.state.local_bundle {
+                bundle.display_name = display_name.clone();
+            }
+            vec![]
+        };
+
+        let persist_effect = persist_effect(
+            &self.state,
+            vec![PersistOp::SaveDeployment],
+        );
+
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: {
+                let mut effects = publish_effects;
+                effects.push(persist_effect);
+                effects
+            },
+            view_model: Some(CoreViewModel {
+                contacts: vec![ContactSummary {
+                    user_id: self.state.local_identity
+                        .as_ref()
+                        .map(|i| i.user_identity.user_id.clone())
+                        .unwrap_or_default(),
+                    display_name,
+                    device_count: 1,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn set_contact_display_name(
+        &mut self,
+        user_id: String,
+        display_name: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        // Validate display_name if provided
+        if let Some(ref name) = display_name {
+            crate::model::validate_display_name(name)?;
+        }
+
+        // Check if contact exists
+        if !self.state.contacts.contains_key(&user_id) {
+            return Err(CoreError::invalid_input("contact does not exist"));
+        }
+
+        // Update display_name
+        if let Some(contact) = self.state.contacts.get_mut(&user_id) {
+            contact.display_name = display_name.clone();
+        }
+
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveContact { user_id }],
+            )],
+            view_model: Some(CoreViewModel {
+                contacts: self.state.contacts.iter().map(|(uid, c)| ContactSummary {
+                    user_id: uid.clone(),
+                    display_name: c.display_name.clone().or(c.original_name.clone()),
+                    device_count: c.bundle.devices.len(),
+                }).collect(),
+                ..CoreViewModel::default()
+            }),
         })
     }
 
@@ -4177,10 +4392,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
         contacts: state
             .contacts
             .iter()
-            .map(|(user_id, bundle)| PersistedContact {
-                user_id: user_id.clone(),
-                bundle: bundle.clone(),
-            })
+            .map(|(_user_id, contact)| contact.clone())
             .collect(),
         conversations: state
             .conversations

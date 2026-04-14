@@ -288,6 +288,7 @@ impl IdentityManager {
                 base_url: deployment.storage_base_info.base_url.clone(),
                 profile_ref: None,
             }),
+            display_name: None,
             updated_at: local_identity.device_status.updated_at,
             signature: String::new(),
         };
@@ -382,7 +383,7 @@ fn derive_slip10_ed25519_key(seed: &[u8], path: &[u32]) -> CoreResult<[u8; 32]> 
     Ok(secret)
 }
 
-fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
+pub fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
     let mut parts = vec![
         bundle.version.clone(),
         bundle.user_id.clone(),
@@ -413,7 +414,7 @@ fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
     parts.join("|")
 }
 
-fn generate_bundle_share_id() -> String {
+pub fn generate_bundle_share_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     encode_hex(&bytes)

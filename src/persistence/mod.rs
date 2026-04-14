@@ -28,6 +28,12 @@ pub struct PersistedDeployment {
 pub struct PersistedContact {
     pub user_id: String,
     pub bundle: IdentityBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
+    #[serde(default)]
+    pub added_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

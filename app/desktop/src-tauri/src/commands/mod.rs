@@ -7,3 +7,4 @@ pub mod cloudflare;
 pub mod cloudflare_rest;
 pub mod session;
 pub mod utility;
+pub mod profile;

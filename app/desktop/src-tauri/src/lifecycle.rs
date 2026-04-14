@@ -8,6 +8,7 @@ use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
 
+use crate::commands::session::SessionStatus;
 use crate::state::{AppState, SessionState};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
@@ -231,7 +232,7 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     // Update session state
     {
         let mut inner = state.inner.write().await;
-        inner.session = SessionState::Active { device_id };
+        inner.session = SessionState::Active { device_id: device_id.clone() };
 
         // Persist the current snapshot to profile
         let snapshot = inner.engine.refresh_snapshot();
@@ -240,7 +241,14 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
         }
     }
 
-    // Close onboarding window
+    // Emit session-status event to notify frontend - this triggers route change
+    let _ = app.emit("session-status", SessionStatus {
+        state: "active".to_string(),
+        device_id: Some(device_id),
+        ws_connected: false,
+    });
+
+    // Close onboarding window if exists
     if let Some(onboarding_window) = app.get_webview_window("onboarding") {
         onboarding_window.close().map_err(|e| e.to_string())?;
     }

@@ -10,7 +10,7 @@ use crate::model::{
     Ack, ConversationKind, DeploymentBundle, Envelope, IdentityBundle, InboxRecord, MessageType,
     MlsStateStatus, MlsStateSummary,
 };
-use crate::persistence::{CorePersistenceSnapshot, PersistOp};
+use crate::persistence::{CorePersistenceSnapshot, PersistOp, PersistedContact};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
     AllowlistDocument, AppendDeliveryDisposition, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
@@ -36,6 +36,7 @@ pub enum CoreCommand {
     CreateOrLoadIdentity {
         mnemonic: Option<String>,
         device_name: Option<String>,
+        display_name: Option<String>,
     },
     ImportDeploymentBundle {
         bundle: DeploymentBundle,
@@ -101,6 +102,13 @@ pub enum CoreCommand {
     RotateContactShareLink,
     RebuildConversation {
         conversation_id: String,
+    },
+    SetLocalDisplayName {
+        display_name: Option<String>,
+    },
+    SetContactDisplayName {
+        user_id: String,
+        display_name: Option<String>,
     },
 }
 
@@ -405,6 +413,8 @@ pub struct MessageSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactSummary {
     pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub device_count: usize,
 }
 
@@ -528,7 +538,7 @@ pub(crate) struct CoreState {
     pub(crate) local_identity: Option<LocalIdentityState>,
     pub(crate) local_bundle: Option<IdentityBundle>,
     pub(crate) deployment_bundle: Option<DeploymentBundle>,
-    pub(crate) contacts: BTreeMap<String, IdentityBundle>,
+    pub(crate) contacts: BTreeMap<String, PersistedContact>,
     pub(crate) conversations: BTreeMap<String, LocalConversationState>,
     pub(crate) sync_states: BTreeMap<String, DeviceSyncState>,
     pub(crate) outbox: Vec<Envelope>,
@@ -545,6 +555,7 @@ pub(crate) struct CoreState {
     pub(crate) message_nonce: u64,
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
     pub(crate) pending_allowlist_mutation: Option<PendingAllowlistMutation>,
+    pub(crate) local_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,6 +659,7 @@ impl Default for CoreState {
             message_nonce: 0,
             recovery_contexts: BTreeMap::new(),
             pending_allowlist_mutation: None,
+            local_display_name: None,
         }
     }
 }

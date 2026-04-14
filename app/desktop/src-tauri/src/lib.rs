@@ -80,6 +80,7 @@ pub fn run() {
             commands::identity::get_share_link,
             commands::identity::rotate_share_link,
             commands::identity::update_device_status,
+            commands::identity::set_local_display_name,
             // Conversations
             commands::conversation::list_conversations,
             commands::conversation::create_conversation,
@@ -93,6 +94,14 @@ pub fn run() {
             commands::contact::import_contact_by_link,
             commands::contact::list_contacts,
             commands::contact::refresh_contact,
+            commands::contact::set_contact_display_name,
+            // Profile
+            commands::profile::list_profiles,
+            commands::profile::create_profile,
+            commands::profile::start_new_profile_onboarding,
+            commands::profile::activate_profile,
+            commands::profile::delete_profile,
+            commands::profile::reload_engine,
             // Message Requests
             commands::request::list_message_requests,
             commands::request::act_on_message_request,

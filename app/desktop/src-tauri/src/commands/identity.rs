@@ -15,6 +15,8 @@ pub struct IdentityInfo {
     pub user_id: String,
     pub device_id: String,
     pub mnemonic: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// Result of identity creation/recovery
@@ -105,6 +107,7 @@ pub async fn create_or_load_identity(
         CoreInput::Command(CoreCommand::CreateOrLoadIdentity {
             mnemonic,
             device_name,
+            display_name: None,
         }),
     )
     .await
@@ -156,17 +159,20 @@ pub async fn get_identity_info(
 
     let identity = inner.engine.local_identity();
     let bundle = inner.engine.local_bundle();
+    let local_display_name = inner.engine.local_display_name();
 
     match (identity, bundle) {
         (Some(id), Some(b)) => Ok(Some(IdentityInfo {
             user_id: b.user_id.clone(),
             device_id: id.device_identity.device_id.clone(),
             mnemonic: id.mnemonic.clone(),
+            display_name: b.display_name.clone().or(local_display_name),
         })),
         (Some(id), None) => Ok(Some(IdentityInfo {
             user_id: id.user_identity.user_id.clone(),
             device_id: id.device_identity.device_id.clone(),
             mnemonic: id.mnemonic.clone(),
+            display_name: local_display_name,
         })),
         _ => Ok(None),
     }
@@ -225,6 +231,21 @@ pub async fn update_device_status(
         CoreInput::Command(CoreCommand::UpdateLocalDeviceStatus {
             target_device_id,
             status: device_status,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_local_display_name(
+    app: AppHandle,
+    display_name: Option<String>,
+) -> Result<CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::SetLocalDisplayName {
+            display_name,
         }),
     )
     .await

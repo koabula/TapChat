@@ -7,6 +7,7 @@ interface IdentityInfo {
   user_id: string;
   device_id: string;
   mnemonic: string;
+  display_name?: string | null;
 }
 
 interface RuntimeStatus {
@@ -14,32 +15,78 @@ interface RuntimeStatus {
   endpoint: string | null;
 }
 
+interface ProfileSummary {
+  name: string;
+  path: string;
+  is_active: boolean;
+  user_id: string | null;
+  device_id: string | null;
+  runtime_bound: boolean | null;
+}
+
 export default function Settings() {
   const navigate = useNavigate();
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [showMnemonic, setShowMnemonic] = useState(false);
   const [newAllowlistUser, setNewAllowlistUser] = useState("");
   const [allowlist, setAllowlist] = useState<string[]>([]);
   const [darkMode, setDarkMode] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [switchingProfile, setSwitchingProfile] = useState<string | null>(null);
+
+  // Display name editing state
+  const [editingDisplayName, setEditingDisplayName] = useState(false);
+  const [displayNameInput, setDisplayNameInput] = useState("");
+  const [savingDisplayName, setSavingDisplayName] = useState(false);
+
+  // New profile creation state - just show confirmation dialog
+  const [showCreateConfirm, setShowCreateConfirm] = useState(false);
+  const [startingOnboarding, setStartingOnboarding] = useState(false);
+
+  // Delete profile state
+  const [deletingProfile, setDeletingProfile] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState<{ path: string; name: string } | null>(null);
 
   useEffect(() => {
-    invoke<IdentityInfo | null>("get_identity_info")
-      .then(setIdentity)
-      .catch((err) => console.error("Failed to get identity:", err));
-
-    invoke<RuntimeStatus>("cloudflare_status")
-      .then(setRuntimeStatus)
-      .catch((err) => console.error("Failed to get runtime status:", err));
-
-    // Load allowlist
+    loadIdentity();
+    loadRuntimeStatus();
     loadAllowlist();
+    loadProfiles();
 
     // Check system preference for dark mode
     const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     setDarkMode(isDark);
   }, []);
+
+  const loadIdentity = async () => {
+    try {
+      const result = await invoke<IdentityInfo | null>("get_identity_info");
+      setIdentity(result);
+      setDisplayNameInput(result?.display_name || "");
+    } catch (err) {
+      console.error("Failed to get identity:", err);
+    }
+  };
+
+  const loadRuntimeStatus = async () => {
+    try {
+      const result = await invoke<RuntimeStatus>("cloudflare_status");
+      setRuntimeStatus(result);
+    } catch (err) {
+      console.error("Failed to get runtime status:", err);
+    }
+  };
+
+  const loadProfiles = async () => {
+    try {
+      const result = await invoke<ProfileSummary[]>("list_profiles");
+      setProfiles(result);
+    } catch (err) {
+      console.error("Failed to load profiles:", err);
+    }
+  };
 
   const loadAllowlist = async () => {
     try {
@@ -99,6 +146,78 @@ export default function Settings() {
     }
   };
 
+  const handleSaveDisplayName = async () => {
+    setSavingDisplayName(true);
+    try {
+      const nameToSave = displayNameInput.trim() || null;
+      await invoke("set_local_display_name", { displayName: nameToSave });
+      setEditingDisplayName(false);
+      loadIdentity();
+    } catch (err) {
+      console.error("Failed to save display name:", err);
+      alert(String(err));
+    } finally {
+      setSavingDisplayName(false);
+    }
+  };
+
+  const handleSwitchProfile = async (path: string) => {
+    setSwitchingProfile(path);
+    try {
+      await invoke("activate_profile", { path });
+      // Reload all data to reflect the new active profile
+      loadProfiles();
+      loadIdentity();
+      loadRuntimeStatus();
+      loadAllowlist();
+    } catch (err) {
+      console.error("Failed to switch profile:", err);
+      // Don't show popup for transient errors like websocket connect
+      const errorMsg = String(err);
+      if (!errorMsg.includes("websocket") && !errorMsg.includes("connect")) {
+        alert(errorMsg);
+      }
+    } finally {
+      setSwitchingProfile(null);
+    }
+  };
+
+  const handleStartNewProfileOnboarding = async () => {
+    setStartingOnboarding(true);
+    try {
+      // Start onboarding - does NOT create profile yet, will be created during onboarding
+      await invoke("start_new_profile_onboarding");
+      setShowCreateConfirm(false);
+      // The backend will emit session-status event which triggers frontend navigation
+    } catch (err) {
+      console.error("Failed to start onboarding:", err);
+      alert(String(err));
+    } finally {
+      setStartingOnboarding(false);
+    }
+  };
+
+  const handleDeleteProfile = async (path: string, name: string) => {
+    // Show confirmation dialog
+    setShowDeleteConfirm({ path, name });
+  };
+
+  const confirmDeleteProfile = async () => {
+    if (!showDeleteConfirm) return;
+    const { path } = showDeleteConfirm;
+    setDeletingProfile(path);
+    setShowDeleteConfirm(null);
+    try {
+      await invoke("delete_profile", { path });
+      loadProfiles();
+    } catch (err) {
+      console.error("Failed to delete profile:", err);
+      alert(String(err));
+    } finally {
+      setDeletingProfile(null);
+    }
+  };
+
   return (
     <div className="flex h-screen bg-base">
       <div className="flex-1 flex flex-col max-w-2xl mx-auto">
@@ -138,11 +257,175 @@ export default function Settings() {
             </div>
           </section>
 
-          {/* Profile section */}
+          {/* Profiles section */}
           <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Profile</h2>
+            <h2 className="text-lg font-medium text-primary-color mb-3">Profiles</h2>
 
             <div className="card space-y-2">
+              {profiles.length === 0 && (
+                <p className="text-muted-color text-sm">
+                  No profiles found. Create a profile during onboarding.
+                </p>
+              )}
+
+              {profiles.map((profile) => (
+                <div
+                  key={profile.path}
+                  className={`flex items-center justify-between p-2 rounded ${
+                    profile.is_active ? "bg-surface-elevated" : ""
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full ${
+                      profile.is_active ? "status-success" : "bg-surface-elevated"
+                    }`} />
+                    <div>
+                      <span className="text-primary-color font-medium">{profile.name}</span>
+                      {profile.user_id && (
+                        <span className="text-muted-color text-xs ml-2">
+                          ({profile.user_id.slice(0, 8)}...)
+                        </span>
+                      )}
+                      {profile.runtime_bound && (
+                        <span className="status-success text-xs ml-1">Connected</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {profile.is_active ? (
+                      <span className="text-xs text-muted-color">(Active)</span>
+                    ) : (
+                      <>
+                        <button
+                          className="btn btn-ghost text-sm"
+                          onClick={() => handleSwitchProfile(profile.path)}
+                          disabled={switchingProfile === profile.path}
+                        >
+                          {switchingProfile === profile.path ? "Switching..." : "Switch"}
+                        </button>
+                        <button
+                          className="btn btn-ghost text-xs status-error"
+                          onClick={() => handleDeleteProfile(profile.path, profile.name)}
+                          disabled={deletingProfile === profile.path}
+                        >
+                          {deletingProfile === profile.path ? "..." : "✕"}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {/* Delete confirmation dialog */}
+              {showDeleteConfirm && (
+                <div className="card mt-2 pt-2 border-t border-default">
+                  <p className="status-error mb-3">
+                    Delete profile "{showDeleteConfirm.name}"?
+                  </p>
+                  <p className="text-muted-color text-sm mb-3">
+                    This action cannot be undone. All data in this profile will be permanently deleted.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="btn btn-ghost status-error"
+                      onClick={confirmDeleteProfile}
+                      disabled={deletingProfile === showDeleteConfirm.path}
+                    >
+                      {deletingProfile === showDeleteConfirm.path ? "Deleting..." : "Yes, Delete"}
+                    </button>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => setShowDeleteConfirm(null)}
+                      disabled={deletingProfile !== null}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Create new profile - confirmation dialog */}
+              {showCreateConfirm ? (
+                <div className="card mt-2 pt-2 border-t border-default">
+                  <p className="text-primary-color mb-3">
+                    Create a new profile? You will be guided through the setup process.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleStartNewProfileOnboarding}
+                      disabled={startingOnboarding}
+                    >
+                      {startingOnboarding ? "Starting..." : "Yes, Start Setup"}
+                    </button>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => setShowCreateConfirm(false)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  className="btn btn-secondary w-full mt-2"
+                  onClick={() => setShowCreateConfirm(true)}
+                >
+                  + Create New Profile
+                </button>
+              )}
+            </div>
+          </section>
+
+          {/* Profile section - User info */}
+          <section className="mb-6">
+            <h2 className="text-lg font-medium text-primary-color mb-3">Account</h2>
+
+            <div className="card space-y-3">
+              {/* Display Name */}
+              <div>
+                <label className="text-muted-color text-xs block mb-1">Display Name</label>
+                {editingDisplayName ? (
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="input flex-1"
+                      value={displayNameInput}
+                      onChange={(e) => setDisplayNameInput(e.target.value)}
+                      placeholder="Enter your display name"
+                      maxLength={64}
+                    />
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleSaveDisplayName}
+                      disabled={savingDisplayName}
+                    >
+                      {savingDisplayName ? "Saving..." : "Save"}
+                    </button>
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        setEditingDisplayName(false);
+                        setDisplayNameInput(identity?.display_name || "");
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-primary-color">
+                      {identity?.display_name || "Not set"}
+                    </span>
+                    <button
+                      className="btn btn-ghost text-sm"
+                      onClick={() => setEditingDisplayName(true)}
+                    >
+                      Edit
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <div>
                 <label className="text-muted-color text-xs block mb-1">User ID</label>
                 <span className="text-primary-color truncate">

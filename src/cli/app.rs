@@ -953,6 +953,7 @@ impl CliApp {
             CoreCommand::CreateOrLoadIdentity {
                 mnemonic,
                 device_name: Some(device_name),
+                display_name: None,
             }
         };
         driver.run_command_until_idle(command).await?;

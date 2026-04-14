@@ -152,6 +152,19 @@ impl RealtimeManager {
         }])
     }
 
+    /// Close all realtime connections silently (no notifications).
+    /// Used when switching profiles to avoid triggering disconnect notifications.
+    pub async fn close_all_silent(&self) -> Result<()> {
+        let mut sessions = self.sessions.write().await;
+
+        // Close all sessions without emitting events
+        for (_, session) in sessions.drain() {
+            let _ = session.stop_tx.send(()).await;
+        }
+
+        Ok(())
+    }
+
     /// Check if a session is connected.
     pub async fn is_connected(&self, device_id: &str) -> bool {
         let sessions = self.sessions.read().await;

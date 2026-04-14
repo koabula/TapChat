@@ -2019,6 +2019,7 @@ async fn run_identity_command(
         CoreCommand::CreateOrLoadIdentity {
             mnemonic,
             device_name: Some(device_name.to_string()),
+            display_name: None,
         }
     };
     driver.run_command_until_idle(command).await?;

@@ -142,25 +142,26 @@ impl ProfileManager {
     pub async fn create_profile(&self, name: &str, root: PathBuf) -> Result<ProfileSummary> {
         let mut inner = self.inner.write().await;
 
+        // Profile::init calls sync_registry_entry which saves registry to disk.
+        // We need to reload the registry from disk to sync our in-memory state.
         let profile = Profile::init(name, &root)?;
-        let entry = profile.metadata().clone();
 
-        inner.registry.upsert(tapchat_core::cli::profile::ProfileRegistryEntry {
-            name: entry.name.clone(),
-            root_dir: entry.root_dir.clone(),
-            user_id: entry.user_id.clone(),
-            device_id: entry.device_id.clone(),
-        });
+        // Reload registry to get the entry that was just saved by sync_registry_entry
+        inner.registry = tapchat_core::cli::profile::ProfileRegistry::load()
+            .map_err(|e| anyhow!("Failed to reload registry after profile init: {}", e))?;
 
+        // Set this profile as active if no active profile exists
         let is_active = if inner.registry.active_profile.is_none() {
             inner.registry.active_profile = Some(root.clone());
             inner.active_profile = Some(profile);
+            inner.registry.save()?;
             true
         } else {
+            inner.active_profile = Some(profile);
             inner.registry.active_profile.as_ref() == Some(&root)
         };
 
-        inner.registry.save()?;
+        let entry = inner.active_profile.as_ref().unwrap().metadata();
 
         Ok(ProfileSummary {
             name: entry.name.clone(),
@@ -181,6 +182,34 @@ impl ProfileManager {
         Ok(())
     }
 
+    /// Delete a profile (removes registry entry and directory).
+    /// Cannot delete the active profile.
+    pub async fn delete_profile(&self, path: &PathBuf) -> Result<()> {
+        let mut inner = self.inner.write().await;
+
+        // Cannot delete active profile
+        if inner.registry.active_profile.as_ref() == Some(path) {
+            return Err(anyhow!("Cannot delete the active profile"));
+        }
+
+        // Check if profile exists in registry
+        if !inner.registry.profiles.iter().any(|entry| entry.root_dir == *path) {
+            return Err(anyhow!("Profile not found in registry"));
+        }
+
+        // Remove from registry
+        inner.registry.remove(path);
+        inner.registry.save()?;
+
+        // Delete the directory
+        if path.exists() {
+            std::fs::remove_dir_all(path)
+                .map_err(|e| anyhow!("Failed to delete profile directory: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     /// Get the active profile's metadata.
     pub async fn get_active_metadata(&self) -> Option<ProfileMetadata> {
         let inner = self.inner.read().await;
@@ -197,6 +226,7 @@ impl ProfileManager {
     }
 
     /// Update identity in active profile.
+    /// This updates the profile metadata and syncs the registry entry.
     pub async fn update_identity(
         &self,
         user_id: Option<String>,
@@ -205,6 +235,10 @@ impl ProfileManager {
         let mut inner = self.inner.write().await;
         if let Some(ref mut profile) = inner.active_profile {
             profile.update_identity(user_id, device_id)?;
+            // Reload registry from disk to sync in-memory state
+            // (profile.update_identity saves to disk but we need to update our in-memory copy)
+            inner.registry = tapchat_core::cli::profile::ProfileRegistry::load()
+                .map_err(|e| anyhow!("Failed to reload registry: {}", e))?;
         }
         Ok(())
     }

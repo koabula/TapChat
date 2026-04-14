@@ -34,11 +34,16 @@ impl Validate for UserIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceBinding {
     pub version: String,
+    #[serde(alias = "user_id")]
     pub user_id: String,
+    #[serde(alias = "device_id")]
     pub device_id: String,
+    #[serde(alias = "device_public_key")]
     pub device_public_key: String,
+    #[serde(alias = "created_at")]
     pub created_at: u64,
     pub signature: String,
 }
@@ -114,10 +119,11 @@ impl Validate for DeviceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct CapabilityConstraints {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "max_bytes", skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "max_ops_per_minute", skip_serializing_if = "Option::is_none")]
     pub max_ops_per_minute: Option<u32>,
 }
 
@@ -134,15 +140,19 @@ pub enum CapabilityOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InboxAppendCapability {
     pub version: String,
     pub service: CapabilityService,
+    #[serde(alias = "user_id")]
     pub user_id: String,
+    #[serde(alias = "target_device_id")]
     pub target_device_id: String,
     pub endpoint: String,
     pub operations: Vec<CapabilityOperation>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, alias = "conversation_scope", skip_serializing_if = "Vec::is_empty")]
     pub conversation_scope: Vec<String>,
+    #[serde(alias = "expires_at")]
     pub expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub constraints: Option<CapabilityConstraints>,
@@ -180,12 +190,16 @@ impl Validate for InboxAppendCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KeyPackageRef {
     pub version: String,
+    #[serde(alias = "user_id")]
     pub user_id: String,
+    #[serde(alias = "device_id")]
     pub device_id: String,
-    #[serde(rename = "ref")]
+    #[serde(rename = "ref", alias = "object_ref")]
     pub object_ref: String,
+    #[serde(alias = "expires_at")]
     pub expires_at: u64,
 }
 
@@ -199,13 +213,16 @@ impl Validate for KeyPackageRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageRef {
     pub kind: String,
-    #[serde(rename = "ref")]
+    #[serde(rename = "ref", alias = "object_ref")]
     pub object_ref: String,
+    #[serde(alias = "size_bytes")]
     pub size_bytes: u64,
+    #[serde(alias = "mime_type")]
     pub mime_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "expires_at", skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 }
 
@@ -236,13 +253,18 @@ impl Validate for WakeHint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceContactProfile {
     pub version: String,
+    #[serde(alias = "device_id")]
     pub device_id: String,
+    #[serde(alias = "device_public_key")]
     pub device_public_key: String,
     pub binding: DeviceBinding,
     pub status: DeviceStatusKind,
+    #[serde(alias = "inbox_append_capability")]
     pub inbox_append_capability: InboxAppendCapability,
+    #[serde(alias = "keypackage_ref")]
     pub keypackage_ref: KeyPackageRef,
 }
 
@@ -273,14 +295,15 @@ impl Validate for DeviceContactProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageProfile {
     // Optional shared storage access hint for platform adapters. It is metadata only and
     // must not be treated as an implicit locator for identity or device-state refresh.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "base_url", skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     // Optional profile object reference for storage metadata. This is not an identity bundle
     // reference and must not be used as a fallback for shared-state discovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "profile_ref", skip_serializing_if = "Option::is_none")]
     pub profile_ref: Option<String>,
 }
 
@@ -293,21 +316,27 @@ pub enum RealtimeKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdentityBundle {
     pub version: String,
+    #[serde(alias = "user_id")]
     pub user_id: String,
+    #[serde(alias = "user_public_key")]
     pub user_public_key: String,
     pub devices: Vec<DeviceContactProfile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "bundle_share_id", skip_serializing_if = "Option::is_none")]
     pub bundle_share_id: Option<String>,
     // Canonical shared-state reference for this identity bundle. Contact refresh must only
     // use this explicit reference and must not infer object locations from storage hints.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "identity_bundle_ref", skip_serializing_if = "Option::is_none")]
     pub identity_bundle_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "device_status_ref", skip_serializing_if = "Option::is_none")]
     pub device_status_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "storage_profile", skip_serializing_if = "Option::is_none")]
     pub storage_profile: Option<StorageProfile>,
+    #[serde(default, alias = "display_name", skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(alias = "updated_at")]
     pub updated_at: u64,
     pub signature: String,
 }
@@ -323,6 +352,9 @@ impl Validate for IdentityBundle {
         }
         if let Some(identity_bundle_ref) = &self.identity_bundle_ref {
             validate_required("identity_bundle_ref", identity_bundle_ref)?;
+        }
+        if let Some(display_name) = &self.display_name {
+            validate_display_name(display_name)?;
         }
         if self.devices.is_empty() {
             return Err(CoreError::invalid_input(
@@ -711,6 +743,55 @@ fn validate_version(value: &str) -> CoreResult<()> {
             "unsupported version {value}, expected {CURRENT_MODEL_VERSION}"
         )));
     }
+    Ok(())
+}
+
+/// Validate display_name for security.
+/// - Max length: 64 characters
+/// - No control characters (newline, tab, etc.)
+/// - No HTML/script injection patterns
+/// - No URL schemes that could be used for phishing
+pub fn validate_display_name(name: &str) -> CoreResult<()> {
+    if name.is_empty() {
+        return Ok(()); // Empty is valid (means no display name)
+    }
+
+    // Length check
+    if name.len() > 64 {
+        return Err(CoreError::invalid_input(
+            "display_name must not exceed 64 characters"
+        ));
+    }
+
+    // No control characters
+    if name.chars().any(|c| c.is_control()) {
+        return Err(CoreError::invalid_input(
+            "display_name must not contain control characters"
+        ));
+    }
+
+    // No HTML/script injection patterns
+    let lower = name.to_lowercase();
+    if lower.contains("<") || lower.contains(">") || lower.contains("&")
+        || lower.contains("javascript:") || lower.contains("data:")
+        || lower.contains("vbscript:") || lower.contains("onload")
+        || lower.contains("onclick") || lower.contains("onerror")
+    {
+        return Err(CoreError::invalid_input(
+            "display_name contains potentially dangerous content"
+        ));
+    }
+
+    // No URL schemes (phishing prevention)
+    if lower.contains("http://") || lower.contains("https://")
+        || lower.contains("ftp://") || lower.contains("mailto:")
+        || lower.contains("tel:") || lower.contains("file://")
+    {
+        return Err(CoreError::invalid_input(
+            "display_name must not contain URL schemes"
+        ));
+    }
+
     Ok(())
 }
 

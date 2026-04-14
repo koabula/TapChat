@@ -1,21 +1,67 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate, useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
+
+interface ContactSummary {
+  user_id: string;
+  display_name: string | null;
+  device_count: number;
+}
 
 export default function ContactDetail() {
   const navigate = useNavigate();
   const { id: userId } = useParams();
   const [refreshing, setRefreshing] = useState(false);
+  const [contact, setContact] = useState<ContactSummary | null>(null);
+  const [editingDisplayName, setEditingDisplayName] = useState(false);
+  const [displayName, setDisplayName] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    // Load contact info
+    loadContact();
+  }, [userId]);
+
+  const loadContact = async () => {
+    if (!userId) return;
+    try {
+      const contacts = await invoke<ContactSummary[]>("list_contacts");
+      const found = contacts.find(c => c.user_id === userId);
+      setContact(found || null);
+      setDisplayName(found?.display_name || "");
+    } catch (err) {
+      console.error("Failed to load contact:", err);
+    }
+  };
 
   const handleRefresh = async () => {
     if (!userId) return;
     setRefreshing(true);
     try {
       await invoke("refresh_contact", { userId });
+      loadContact();
     } catch (err) {
       console.error("Failed to refresh:", err);
     } finally {
       setRefreshing(false);
+    }
+  };
+
+  const handleSaveDisplayName = async () => {
+    if (!userId) return;
+    setSaving(true);
+    try {
+      await invoke("set_contact_display_name", {
+        userId,
+        displayName: displayName.trim() || null,
+      });
+      setEditingDisplayName(false);
+      loadContact();
+    } catch (err) {
+      console.error("Failed to save display name:", err);
+      alert(String(err));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -59,8 +105,58 @@ export default function ContactDetail() {
           {/* Avatar */}
           <div className="flex items-center justify-center mb-4">
             <div className="w-20 h-20 rounded-full bg-surface-elevated flex items-center justify-center">
-              <span className="text-3xl">{userId?.[0] || "?"}</span>
+              <span className="text-3xl">
+                {contact?.display_name?.[0] || userId?.[0] || "?"}
+              </span>
             </div>
+          </div>
+
+          {/* Display Name (备注) */}
+          <div className="text-center mb-4">
+            {editingDisplayName ? (
+              <div className="flex items-center gap-2 justify-center">
+                <input
+                  className="input text-center"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                  placeholder="Enter display name"
+                  maxLength={64}
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={handleSaveDisplayName}
+                  disabled={saving}
+                >
+                  {saving ? "Saving..." : "Save"}
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    setEditingDisplayName(false);
+                    setDisplayName(contact?.display_name || "");
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center gap-2">
+                <h2 className="text-xl font-semibold text-primary-color">
+                  {contact?.display_name || "No display name"}
+                </h2>
+                <button
+                  className="btn btn-ghost text-sm"
+                  onClick={() => setEditingDisplayName(true)}
+                >
+                  Edit
+                </button>
+              </div>
+            )}
+            {contact?.display_name && (
+              <p className="text-muted-color text-sm mt-1">
+                (备注 - local nickname)
+              </p>
+            )}
           </div>
 
           {/* Info */}
@@ -72,12 +168,7 @@ export default function ContactDetail() {
 
             <div className="card">
               <label className="text-muted-color text-xs block mb-1">Devices</label>
-              <span className="text-primary-color">1 device</span>
-            </div>
-
-            <div className="card">
-              <label className="text-muted-color text-xs block mb-1">Last refreshed</label>
-              <span className="text-primary-color">Just now</span>
+              <span className="text-primary-color">{contact?.device_count || 1} device(s)</span>
             </div>
           </div>
 
