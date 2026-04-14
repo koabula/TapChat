@@ -22,6 +22,7 @@ pub async fn list_conversations(
         .map(|persisted| {
             ConversationSummary {
                 conversation_id: persisted.conversation_id.clone(),
+                peer_user_id: persisted.state.peer_user_id.clone(),
                 state: format!("{:?}", persisted.state.conversation.state).to_lowercase(),
                 last_message_type: persisted.state.last_message_type,
                 recovery: None, // TODO: add recovery diagnostics if needed

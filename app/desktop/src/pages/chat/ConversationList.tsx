@@ -14,11 +14,8 @@ export default function ConversationList() {
   const { id: activeId } = useParams();
   const { conversations } = useConversationsStore();
 
-  // Placeholder data if no conversations loaded yet
-  const items: ConversationItem[] = conversations.length > 0 ? conversations : [
-    { conversation_id: "demo-1", peer_user_id: "Alice", last_message: "Hey there!", last_message_time: Date.now() - 3600000, unread_count: 0 },
-    { conversation_id: "demo-2", peer_user_id: "Bob", last_message: "Photo attachment", last_message_time: Date.now() - 7200000, unread_count: 2 },
-  ];
+  // Use actual conversations from store, show empty state if none
+  const items: ConversationItem[] = conversations;
 
   const formatTime = (timestamp: number | null | undefined) => {
     if (!timestamp) return "";

@@ -188,8 +188,8 @@ pub async fn get_share_link(
         (Some(b), Some(d)) => {
             // Get HTTP endpoint from deployment bundle
             let http_endpoint = d.deployment_bundle.inbox_http_endpoint;
-            // Construct share link: {endpoint}/v1/users/{user_id}/bundle
-            Ok(Some(format!("{}/v1/users/{}/bundle", http_endpoint.trim_end_matches('/'), b.user_id)))
+            // Construct share link: {endpoint}/v1/shared-state/{user_id}/identity-bundle
+            Ok(Some(format!("{}/v1/shared-state/{}/identity-bundle", http_endpoint.trim_end_matches('/'), b.user_id)))
         }
         _ => Ok(None),
     }

@@ -8,7 +8,8 @@
     "shell:allow-open",
     "dialog:default",
     "notification:default",
-    "clipboard-manager:default",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-read-text",
     "updater:default",
     "process:default",
     {

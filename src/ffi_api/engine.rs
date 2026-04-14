@@ -984,6 +984,7 @@ impl CoreEngine {
                 view_model: Some(CoreViewModel {
                     conversations: vec![ConversationSummary {
                         conversation_id,
+                        peer_user_id: peer_user_id.clone(),
                         state: format!("{:?}", existing.conversation.state).to_lowercase(),
                         last_message_type: existing_last_message_type,
                         recovery,
@@ -1039,7 +1040,7 @@ impl CoreEngine {
                 welcome.payload_b64.clone(),
             )?);
         }
-        self.enqueue_envelopes(peer_user_id, generated.clone());
+        self.enqueue_envelopes(peer_user_id.clone(), generated.clone());
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
@@ -1060,6 +1061,7 @@ impl CoreEngine {
             view_model: Some(CoreViewModel {
                 conversations: vec![ConversationSummary {
                     conversation_id,
+                    peer_user_id,
                     state: "active".into(),
                     last_message_type: Some(MessageType::MlsCommit),
                     recovery: None,
@@ -1779,7 +1781,7 @@ impl CoreEngine {
     }
 
     fn rebuild_conversation(&mut self, conversation_id: String) -> CoreResult<CoreOutput> {
-        let (member_device_ids, last_message_type) = {
+        let (member_device_ids, last_message_type, peer_user_id) = {
             let conversation_state = self
                 .state
                 .conversations
@@ -1795,6 +1797,7 @@ impl CoreEngine {
                     .map(|member| member.device_id.clone())
                     .collect::<Vec<_>>(),
                 conversation_state.last_message_type,
+                conversation_state.peer_user_id.clone(),
             )
         };
         if let Some(adapter) = self.state.mls_adapter.as_mut() {
@@ -1838,6 +1841,7 @@ impl CoreEngine {
             view_model: Some(CoreViewModel {
                 conversations: vec![ConversationSummary {
                     conversation_id: conversation_id.clone(),
+                    peer_user_id,
                     state: "needs_rebuild".into(),
                     last_message_type,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
@@ -2462,6 +2466,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         Ok(ConversationSummary {
             conversation_id: conversation_id.to_string(),
+            peer_user_id: conversation.peer_user_id.clone(),
             state: match conversation.recovery_status {
                 RecoveryStatus::Healthy => "active".into(),
                 RecoveryStatus::NeedsRecovery => "needs_recovery".into(),

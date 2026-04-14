@@ -40,9 +40,6 @@ export default function ChatLayout() {
           onClick={() => navigate("/requests")}
         >
           <span className="text-secondary-color">Message Requests</span>
-          <span className="ml-auto badge badge-warning">
-            2
-          </span>
         </button>
 
         {/* Bottom nav */}

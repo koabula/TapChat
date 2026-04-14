@@ -1,19 +1,61 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
-import type { CoreUpdateEvent } from "../lib/types";
+import type { CoreUpdateEvent, ConversationSummary, ContactSummary } from "../lib/types";
 
 /**
  * Hook that listens to core-update events and dispatches them to the appropriate stores.
+ * Also fetches initial data on mount when the session is active.
  */
 export function useCoreUpdate() {
   const setConversations = useConversationsStore((s) => s.setConversations);
   const setContacts = useContactsStore((s) => s.setContacts);
-  const setUserId = useSessionStore((s) => s.setUserId);
+  const sessionState = useSessionStore((s) => s.sessionState);
 
   useEffect(() => {
+    // Fetch initial data if session is active
+    if (sessionState === "active") {
+      fetchInitialData();
+    }
+
+    async function fetchInitialData() {
+      try {
+        console.log("[useCoreUpdate] Fetching initial data...");
+
+        // Fetch conversations
+        const conversations = await invoke<ConversationSummary[]>("list_conversations");
+        console.log("[useCoreUpdate] Loaded conversations:", conversations.length);
+
+        const mappedConversations = conversations.map((c) => ({
+          conversation_id: c.conversation_id,
+          peer_user_id: c.peer_user_id,
+          state: c.state,
+          last_message: c.last_message_type ? formatMessageType(c.last_message_type) : null,
+          last_message_time: null,
+          unread_count: 0,
+        }));
+        setConversations(mappedConversations);
+
+        // Fetch contacts
+        const contacts = await invoke<ContactSummary[]>("list_contacts");
+        console.log("[useCoreUpdate] Loaded contacts:", contacts.length);
+
+        const mappedContacts = contacts.map((c) => ({
+          user_id: c.user_id,
+          display_name: null,
+          device_count: c.device_count,
+          last_refresh: null,
+        }));
+        setContacts(mappedContacts);
+      } catch (err) {
+        console.error("[useCoreUpdate] Failed to fetch initial data:", err);
+      }
+    }
+
+    // Listen for core-update events
     const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
       const { state_update, view_model } = event.payload;
 
@@ -29,7 +71,7 @@ export function useCoreUpdate() {
       if (state_update.conversations_changed && view_model.conversations) {
         const conversations = view_model.conversations.map((c) => ({
           conversation_id: c.conversation_id,
-          peer_user_id: "", // We need to fetch this separately or add to view model
+          peer_user_id: c.peer_user_id,
           state: c.state,
           last_message: c.last_message_type ? formatMessageType(c.last_message_type) : null,
           last_message_time: null,
@@ -66,7 +108,7 @@ export function useCoreUpdate() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [setConversations, setContacts, setUserId]);
+  }, [setConversations, setContacts, sessionState]);
 }
 
 function formatMessageType(type: string): string {

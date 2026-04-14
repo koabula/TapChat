@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
+
+import { useContactsStore } from "@/store/contacts";
 
 interface Contact {
   user_id: string;
@@ -10,16 +12,25 @@ interface Contact {
 
 export default function ContactList() {
   const navigate = useNavigate();
-  const [contacts] = useState<Contact[]>([]);
+  const { contacts: storeContacts } = useContactsStore();
   const [shareLinkInput, setShareLinkInput] = useState("");
   const [adding, setAdding] = useState(false);
 
-  // Placeholder contacts
-  const displayContacts = contacts.length > 0 ? contacts : [
-    { user_id: "user:alice", display_name: "Alice", device_count: 2 },
-    { user_id: "user:bob", display_name: "Bob", device_count: 1 },
-    { user_id: "user:carol", display_name: "Carol", device_count: 1 },
-  ];
+  // Fetch contacts from backend on mount
+  useEffect(() => {
+    async function fetchContacts() {
+      try {
+        const contacts = await invoke<Contact[]>("list_contacts");
+        console.log("[ContactList] Loaded contacts:", contacts.length);
+      } catch (err) {
+        console.error("[ContactList] Failed to load contacts:", err);
+      }
+    }
+    fetchContacts();
+  }, []);
+
+  // Use contacts from store, show empty state if none
+  const displayContacts: Contact[] = storeContacts.length > 0 ? storeContacts : [];
 
   const handleAddByLink = async () => {
     if (!shareLinkInput.trim()) return;

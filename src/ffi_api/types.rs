@@ -388,6 +388,7 @@ pub struct CoreStateUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationSummary {
     pub conversation_id: String,
+    pub peer_user_id: String,
     pub state: String,
     pub last_message_type: Option<MessageType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

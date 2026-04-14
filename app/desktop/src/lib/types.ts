@@ -34,6 +34,7 @@ export interface IdentityInfo {
 // Conversations
 export interface ConversationSummary {
   conversation_id: string;
+  peer_user_id: string;
   state: string;
   last_message_type?: string;
   recovery?: RecoveryDiagnostics;

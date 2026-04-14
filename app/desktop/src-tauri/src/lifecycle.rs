@@ -4,7 +4,8 @@ use anyhow::Result;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
 use tauri::webview::WebviewWindowBuilder;
 
-use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, CoreStateUpdate};
+use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
+use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
 
 use crate::state::{AppState, SessionState};
@@ -26,12 +27,16 @@ pub async fn on_app_ready(app: &AppHandle) {
         inner.profile_manager.check_session_startup().await
     };
 
+    log::info!("Session startup check: {:?}", startup_check);
+
     // Update state based on startup check
     let needs_onboarding = startup_check.needs_onboarding;
 
     if needs_onboarding {
         // Determine onboarding step based on what's missing
         let step = determine_onboarding_step(&startup_check);
+
+        log::info!("Needs onboarding, step: {:?}", step);
 
         let mut inner = state.inner.write().await;
         inner.session = SessionState::Onboarding { step };
@@ -51,25 +56,47 @@ pub async fn on_app_ready(app: &AppHandle) {
         .build()
         .expect("failed to create onboarding window");
     } else {
+        log::info!("Session ready, loading snapshot and showing main window");
+
+        // Load snapshot from profile and initialize engine
+        let (snapshot, device_id) = {
+            let inner = state.inner.read().await;
+
+            // Load snapshot from active profile
+            let snapshot = inner.profile_manager.load_snapshot().await
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to load snapshot: {}", e);
+                    CorePersistenceSnapshot::default()
+                });
+
+            // Get device_id from profile metadata
+            let device_id = inner.profile_manager.get_active_metadata().await
+                .and_then(|m| m.device_id)
+                .unwrap_or_else(|| "unknown-device".to_string());
+
+            (snapshot, device_id)
+        };
+
+        log::info!("Loaded snapshot with {} contacts, {} conversations, deployment: {:?}",
+            snapshot.contacts.len(),
+            snapshot.conversations.len(),
+            snapshot.deployment.as_ref().map(|d| d.deployment_bundle.inbox_http_endpoint.clone()));
+
+        // Initialize engine from snapshot
+        {
+            let mut inner = state.inner.write().await;
+
+            // Create engine from restored state
+            inner.engine = CoreEngine::from_restored_state(snapshot);
+
+            inner.session = SessionState::Active { device_id };
+            inner.profile_path = startup_check.profile_path;
+        }
+
         // Show main window (created hidden in tauri.conf.json)
         if let Some(main_window) = app.get_webview_window("main") {
             main_window.show().expect("failed to show main window");
         }
-
-        // Update session state to Active
-        let device_id = startup_check.profile_path
-            .clone()
-            .and_then(|_p| {
-                // Get device_id from profile metadata
-                // This is a simplified approach; real implementation would read from profile
-                None // TODO: read device_id from profile
-            })
-            .unwrap_or_else(|| "unknown-device".to_string());
-
-        let mut inner = state.inner.write().await;
-        inner.session = SessionState::Active { device_id };
-        inner.profile_path = startup_check.profile_path;
-        drop(inner);
 
         // Start session
         let state_clone = state.inner.clone();

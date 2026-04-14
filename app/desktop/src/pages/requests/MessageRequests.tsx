@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -10,16 +10,35 @@ interface MessageRequest {
   first_seen_at: number;
 }
 
+interface CoreOutput {
+  view_model?: {
+    message_requests?: MessageRequest[];
+  };
+}
+
 export default function MessageRequests() {
   const navigate = useNavigate();
   const [requests, setRequests] = useState<MessageRequest[]>([]);
+  const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
 
-  // Placeholder requests
-  const displayRequests = requests.length > 0 ? requests : [
-    { request_id: "r1", sender_user_id: "user:unknown1", sender_display_name: null, message_count: 3, first_seen_at: Date.now() - 7200000 },
-    { request_id: "r2", sender_user_id: "user:unknown2", sender_display_name: null, message_count: 1, first_seen_at: Date.now() - 300000 },
-  ];
+  useEffect(() => {
+    loadRequests();
+  }, []);
+
+  const loadRequests = async () => {
+    setLoading(true);
+    try {
+      const result = await invoke<CoreOutput>("list_message_requests");
+      if (result.view_model?.message_requests) {
+        setRequests(result.view_model.message_requests);
+      }
+    } catch (err) {
+      console.error("Failed to load message requests:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   const formatTime = (timestamp: number) => {
     const diff = Date.now() - timestamp;
@@ -54,13 +73,23 @@ export default function MessageRequests() {
             ←
           </button>
           <h1 className="font-semibold text-primary-color ml-2">
-            Message Requests ({displayRequests.length})
+            Message Requests ({requests.length})
           </h1>
         </header>
 
         {/* Request list */}
         <div className="flex-1 overflow-y-auto p-4">
-          {displayRequests.map((req) => (
+          {loading && (
+            <div className="text-center text-muted-color">Loading...</div>
+          )}
+
+          {!loading && requests.length === 0 && (
+            <div className="text-center text-muted-color">
+              <p>No pending message requests</p>
+            </div>
+          )}
+
+          {!loading && requests.map((req) => (
             <div
               key={req.request_id}
               className="card mb-4"
