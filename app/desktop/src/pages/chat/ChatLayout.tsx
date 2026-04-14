@@ -1,9 +1,11 @@
+import { useState } from "react";
 import { Outlet, useNavigate } from "react-router";
 import ConversationList from "./ConversationList";
 import { NetworkIndicator } from "@/components/SystemBanner";
 
 export default function ChatLayout() {
   const navigate = useNavigate();
+  const [searchQuery, setSearchQuery] = useState("");
 
   return (
     <div className="flex h-screen bg-base">
@@ -26,12 +28,14 @@ export default function ChatLayout() {
           <input
             className="input text-sm"
             placeholder="Search conversations..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
           />
         </div>
 
         {/* Conversation list */}
         <div className="flex-1 overflow-y-auto">
-          <ConversationList />
+          <ConversationList searchQuery={searchQuery} />
         </div>
 
         {/* Message requests badge */}

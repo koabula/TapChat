@@ -1,21 +1,21 @@
 import { useNavigate, useParams } from "react-router";
 import { useConversationsStore } from "@/store/conversations";
 
-interface ConversationItem {
-  conversation_id: string;
-  peer_user_id: string;
-  last_message?: string | null;
-  last_message_time?: number | null;
-  unread_count?: number;
+interface ConversationListProps {
+  searchQuery?: string;
 }
 
-export default function ConversationList() {
+export default function ConversationList({ searchQuery = "" }: ConversationListProps) {
   const navigate = useNavigate();
   const { id: activeId } = useParams();
   const { conversations } = useConversationsStore();
 
-  // Use actual conversations from store, show empty state if none
-  const items: ConversationItem[] = conversations;
+  // Filter conversations based on search query
+  const filteredConversations = conversations.filter((conv) => {
+    if (!searchQuery.trim()) return true;
+    const query = searchQuery.toLowerCase();
+    return conv.peer_user_id.toLowerCase().includes(query);
+  });
 
   const formatTime = (timestamp: number | null | undefined) => {
     if (!timestamp) return "";
@@ -33,7 +33,13 @@ export default function ConversationList() {
 
   return (
     <div className="space-y-1 p-2">
-      {items.length === 0 && (
+      {filteredConversations.length === 0 && searchQuery.trim() && (
+        <div className="text-center py-8 animate-fade-in">
+          <div className="text-muted-color">No conversations match "{searchQuery}"</div>
+        </div>
+      )}
+
+      {filteredConversations.length === 0 && !searchQuery.trim() && (
         <div className="text-center py-8 animate-fade-in">
           <div className="text-muted-color">No conversations yet</div>
           <button
@@ -45,7 +51,7 @@ export default function ConversationList() {
         </div>
       )}
 
-      {items.map((conv, index) => (
+      {filteredConversations.map((conv, index) => (
         <button
           key={conv.conversation_id}
           className={`conv-item w-full flex items-center gap-3 p-2 rounded-lg ${

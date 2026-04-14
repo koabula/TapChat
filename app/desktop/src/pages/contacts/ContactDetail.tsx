@@ -17,6 +17,10 @@ export default function ContactDetail() {
   const [displayName, setDisplayName] = useState("");
   const [saving, setSaving] = useState(false);
 
+  // Delete contact state
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
   useEffect(() => {
     // Load contact info
     loadContact();
@@ -74,6 +78,32 @@ export default function ContactDetail() {
       navigate(`/chat/${result.conversation_id}`);
     } catch (err) {
       console.error("Failed to create conversation:", err);
+      const errorMsg = String(err);
+      if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("request")) {
+        alert("Network error: Unable to connect to the peer's inbox. Both profiles need to have Cloudflare deployed to communicate.");
+      } else {
+        alert(errorMsg);
+      }
+    }
+  };
+
+  const handleDeleteContact = async () => {
+    setShowDeleteConfirm(true);
+  };
+
+  const confirmDeleteContact = async () => {
+    if (!userId) return;
+    setDeleting(true);
+    try {
+      await invoke("delete_contact", { userId });
+      setShowDeleteConfirm(false);
+      // Navigate back to contacts list
+      navigate("/contacts");
+    } catch (err) {
+      console.error("Failed to delete contact:", err);
+      alert(String(err));
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -152,12 +182,7 @@ export default function ContactDetail() {
                 </button>
               </div>
             )}
-            {contact?.display_name && (
-              <p className="text-muted-color text-sm mt-1">
-                (备注 - local nickname)
-              </p>
-            )}
-          </div>
+                      </div>
 
           {/* Info */}
           <div className="space-y-4">
@@ -178,9 +203,45 @@ export default function ContactDetail() {
               className="btn btn-primary w-full"
               onClick={handleStartChat}
             >
-              Start Conversation
+              Chat
+            </button>
+
+            {/* Delete contact button */}
+            <button
+              className="btn btn-ghost w-full status-error"
+              onClick={handleDeleteContact}
+            >
+              Delete Contact
             </button>
           </div>
+
+          {/* Delete confirmation dialog */}
+          {showDeleteConfirm && (
+            <div className="card mt-4 border-t border-default">
+              <p className="status-error mb-3">
+                Delete this contact?
+              </p>
+              <p className="text-muted-color text-sm mb-3">
+                This will also delete any conversations with this contact. This action cannot be undone.
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn btn-ghost status-error"
+                  onClick={confirmDeleteContact}
+                  disabled={deleting}
+                >
+                  {deleting ? "Deleting..." : "Yes, Delete"}
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => setShowDeleteConfirm(false)}
+                  disabled={deleting}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>

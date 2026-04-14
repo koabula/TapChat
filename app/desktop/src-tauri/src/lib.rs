@@ -95,6 +95,7 @@ pub fn run() {
             commands::contact::list_contacts,
             commands::contact::refresh_contact,
             commands::contact::set_contact_display_name,
+            commands::contact::delete_contact,
             // Profile
             commands::profile::list_profiles,
             commands::profile::create_profile,

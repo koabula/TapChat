@@ -94,3 +94,16 @@ pub async fn set_contact_display_name(
     .await
     .map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn delete_contact(
+    app: tauri::AppHandle,
+    user_id: String,
+) -> Result<CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::DeleteContact { user_id }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}

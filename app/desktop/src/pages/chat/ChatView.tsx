@@ -1,50 +1,47 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 import MessageInput from "@/components/MessageInput";
 import AttachmentPreview from "@/components/AttachmentPreview";
-
-interface Message {
-  message_id: string;
-  sender_device_id: string;
-  recipient_device_id: string;
-  message_type: string;
-  created_at: number;
-  plaintext: string | null;
-  has_attachment: boolean;
-}
-
-interface CoreUpdateEvent {
-  state_update: {
-    conversations_changed: boolean;
-    messages_changed: boolean;
-    contacts_changed: boolean;
-    checkpoints_changed: boolean;
-    system_statuses_changed: string[];
-  };
-  effects: unknown[];
-  view_model?: {
-    conversations: unknown[];
-    messages: unknown[];
-    contacts: unknown[];
-    banners: unknown[];
-    message_requests: unknown[];
-    allowlist?: unknown;
-  };
-}
+import { useContactsStore } from "@/store/contacts";
+import { useConversationsStore } from "@/store/conversations";
+import { useSessionStore } from "@/store/session";
+import type { Message, CoreUpdateEvent } from "@/lib/types";
 
 export default function ChatView() {
   const { id: conversationId } = useParams();
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
-  const [peerName] = useState("Contact");
+
+  // Get stores for peer name resolution
+  const { contacts } = useContactsStore();
+  const { conversations } = useConversationsStore();
+  const { deviceId } = useSessionStore();
+
+  // Resolve peer name from contacts store
+  const peerName = useMemo(() => {
+    if (!conversationId) return "Contact";
+
+    // Find the conversation to get peer_user_id
+    const conversation = conversations.find(c => c.conversation_id === conversationId);
+    if (!conversation) return "Contact";
+
+    // Find contact by user_id
+    const contact = contacts.find(c => c.user_id === conversation.peer_user_id);
+    if (contact?.display_name) return contact.display_name;
+
+    // Fallback to truncated user_id
+    return conversation.peer_user_id.slice(0, 12) + "...";
+  }, [conversationId, conversations, contacts]);
 
   // Subscribe to core-update events to refresh messages
   useEffect(() => {
+    if (!conversationId) return;
+
     const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
-      if (event.payload.state_update.messages_changed && conversationId) {
+      if (event.payload.state_update.messages_changed) {
         loadMessages();
       }
     });
@@ -66,9 +63,7 @@ export default function ChatView() {
 
     setLoading(true);
     try {
-      const result = await invoke<Message[]>("get_messages", {
-        conversationId,
-      });
+      const result = await invoke<Message[]>("get_messages", { conversationId });
       setMessages(result);
     } catch (err) {
       console.error("Failed to load messages:", err);
@@ -82,10 +77,15 @@ export default function ChatView() {
     return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   };
 
+  // Determine if message was sent by me (my device)
   const isMyMessage = (msg: Message) => {
-    return msg.message_type === "sent" || msg.sender_device_id === "me";
+    // "sent" type means outgoing message
+    if (msg.message_type === "sent") return true;
+    // Compare sender_device_id with my device_id
+    return deviceId && msg.sender_device_id === deviceId;
   };
 
+  // No conversation selected - show empty state
   if (!conversationId) {
     return (
       <div className="flex-1 flex items-center justify-center bg-base">
@@ -99,11 +99,6 @@ export default function ChatView() {
       </div>
     );
   }
-
-  // Get display messages - show placeholder if loading or empty
-  const displayMessages = loading ? [] : messages.length > 0 ? messages : [
-    { message_id: "placeholder", sender_device_id: "", recipient_device_id: "", message_type: "placeholder", created_at: Date.now(), plaintext: "No messages yet. Say hello!", has_attachment: false },
-  ];
 
   return (
     <div className="flex-1 flex flex-col bg-base">
@@ -147,20 +142,18 @@ export default function ChatView() {
           </div>
         )}
 
-        {displayMessages.map((msg, index) => (
+        {!loading && messages.map((msg, index) => (
           <div
             key={msg.message_id}
-            className={`flex ${
-              isMyMessage(msg) ? "justify-end" : "justify-start"
-            }`}
+            className={`flex ${isMyMessage(msg) ? "justify-end" : "justify-start"}`}
             style={{ animationDelay: `${index * 30}ms` }}
           >
-            {msg.has_attachment ? (
+            {msg.has_attachment && msg.storage_refs && msg.storage_refs.length > 0 ? (
               <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
                 <AttachmentPreview
                   messageId={msg.message_id}
                   conversationId={conversationId}
-                  reference={msg.message_id}
+                  reference={msg.storage_refs[0]}
                   mimeType="application/octet-stream"
                   fileName={undefined}
                 />
@@ -174,7 +167,7 @@ export default function ChatView() {
               </div>
             ) : (
               <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
-                <span>{msg.plaintext}</span>
+                <span>{msg.plaintext || "[empty message]"}</span>
                 <span className="block text-xs text-right mt-1 opacity-60">
                   {formatTime(msg.created_at)}
                   {isMyMessage(msg) && " ✓✓"}

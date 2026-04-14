@@ -1,18 +1,13 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
 
 import { useContactsStore } from "@/store/contacts";
-
-interface Contact {
-  user_id: string;
-  display_name: string | null;
-  device_count: number;
-}
+import { listContacts, importContactByLink } from "@/lib/tauri";
+import type { ContactSummary } from "@/lib/types";
 
 export default function ContactList() {
   const navigate = useNavigate();
-  const { contacts: storeContacts } = useContactsStore();
+  const { contacts: storeContacts, setContacts } = useContactsStore();
   const [shareLinkInput, setShareLinkInput] = useState("");
   const [adding, setAdding] = useState(false);
 
@@ -20,28 +15,45 @@ export default function ContactList() {
   useEffect(() => {
     async function fetchContacts() {
       try {
-        const contacts = await invoke<Contact[]>("list_contacts");
+        const contacts = await listContacts();
         console.log("[ContactList] Loaded contacts:", contacts.length);
+        // Map to store format with display_name placeholder
+        const mappedContacts = contacts.map((c: ContactSummary) => ({
+          user_id: c.user_id,
+          display_name: null, // Backend doesn't provide display_name yet
+          device_count: c.device_count,
+          last_refresh: null,
+        }));
+        setContacts(mappedContacts);
       } catch (err) {
         console.error("[ContactList] Failed to load contacts:", err);
       }
     }
     fetchContacts();
-  }, []);
+  }, [setContacts]);
 
   // Use contacts from store, show empty state if none
-  const displayContacts: Contact[] = storeContacts.length > 0 ? storeContacts : [];
+  const displayContacts = storeContacts;
 
   const handleAddByLink = async () => {
     if (!shareLinkInput.trim()) return;
 
     setAdding(true);
     try {
-      await invoke("import_contact_by_link", { shareLink: shareLinkInput });
+      await importContactByLink(shareLinkInput);
       setShareLinkInput("");
-      // TODO: Refresh contact list
+      // Refresh contact list after adding
+      const contacts = await listContacts();
+      const mappedContacts = contacts.map((c: ContactSummary) => ({
+        user_id: c.user_id,
+        display_name: null,
+        device_count: c.device_count,
+        last_refresh: null,
+      }));
+      setContacts(mappedContacts);
     } catch (err) {
       console.error("Failed to add contact:", err);
+      alert(String(err));
     } finally {
       setAdding(false);
     }

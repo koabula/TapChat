@@ -11,6 +11,7 @@ import type {
   SessionStatus,
   CoreUpdateEvent,
   CloudflareProgressEvent,
+  ProfileSummary,
 } from "./types";
 
 // Re-export Tauri primitives
@@ -32,6 +33,35 @@ export async function getIdentityInfo(): Promise<IdentityInfo | null> {
 
 export async function getShareLink(): Promise<string | null> {
   return invoke("get_share_link");
+}
+
+export async function rotateShareLink(): Promise<void> {
+  return invoke("rotate_share_link");
+}
+
+export async function setLocalDisplayName(displayName: string | null): Promise<void> {
+  return invoke("set_local_display_name", { displayName });
+}
+
+// Profiles
+export async function listProfiles(): Promise<ProfileSummary[]> {
+  return invoke("list_profiles");
+}
+
+export async function activateProfile(path: string): Promise<void> {
+  return invoke("activate_profile", { path });
+}
+
+export async function deleteProfile(path: string): Promise<void> {
+  return invoke("delete_profile", { path });
+}
+
+export async function startNewProfileOnboarding(): Promise<void> {
+  return invoke("start_new_profile_onboarding");
+}
+
+export async function initOnboardingProfile(profileName: string): Promise<ProfileSummary> {
+  return invoke("init_onboarding_profile", { profileName });
 }
 
 // Conversations
@@ -96,6 +126,10 @@ export async function listContacts(): Promise<ContactSummary[]> {
 
 export async function refreshContact(userId: string): Promise<void> {
   return invoke("refresh_contact", { userId });
+}
+
+export async function deleteContact(userId: string): Promise<CoreOutput> {
+  return invoke("delete_contact", { userId });
 }
 
 // Message Requests

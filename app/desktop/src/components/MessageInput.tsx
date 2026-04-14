@@ -113,6 +113,12 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       onSent?.();
     } catch (err) {
       console.error("Failed to send:", err);
+      const errorMsg = String(err);
+      if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("request") || errorMsg.includes("connect")) {
+        alert("Network error: Unable to deliver message. Check if your peer has Cloudflare deployed and accessible.");
+      } else {
+        alert(errorMsg);
+      }
     } finally {
       setSending(false);
     }

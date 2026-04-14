@@ -9,54 +9,75 @@ import type { CoreUpdateEvent, ConversationSummary, ContactSummary } from "../li
 /**
  * Hook that listens to core-update events and dispatches them to the appropriate stores.
  * Also fetches initial data on mount when the session is active.
+ *
+ * Handles profile switching by clearing stores and reloading data on engine-reloaded event.
  */
 export function useCoreUpdate() {
   const setConversations = useConversationsStore((s) => s.setConversations);
   const setContacts = useContactsStore((s) => s.setContacts);
   const sessionState = useSessionStore((s) => s.sessionState);
+  const setDeviceId = useSessionStore((s) => s.setDeviceId);
+
+  // Function to fetch and set all data
+  const fetchAndSetData = async () => {
+    try {
+      console.log("[useCoreUpdate] Fetching data...");
+
+      // Fetch conversations
+      const conversations = await invoke<ConversationSummary[]>("list_conversations");
+      console.log("[useCoreUpdate] Loaded conversations:", conversations.length);
+
+      const mappedConversations = conversations.map((c) => ({
+        conversation_id: c.conversation_id,
+        peer_user_id: c.peer_user_id,
+        state: c.state,
+        last_message: c.last_message_type ? formatMessageType(c.last_message_type) : null,
+        last_message_time: null,
+        unread_count: 0,
+      }));
+      setConversations(mappedConversations);
+
+      // Fetch contacts
+      const contacts = await invoke<ContactSummary[]>("list_contacts");
+      console.log("[useCoreUpdate] Loaded contacts:", contacts.length);
+
+      const mappedContacts = contacts.map((c) => ({
+        user_id: c.user_id,
+        display_name: null,
+        device_count: c.device_count,
+        last_refresh: null,
+      }));
+      setContacts(mappedContacts);
+
+      // Fetch identity info to get device_id
+      try {
+        const identity = await invoke<{ device_id?: string } | null>("get_identity_info");
+        if (identity?.device_id) {
+          setDeviceId(identity.device_id);
+        }
+      } catch (err) {
+        console.error("[useCoreUpdate] Failed to get identity info:", err);
+      }
+    } catch (err) {
+      console.error("[useCoreUpdate] Failed to fetch data:", err);
+    }
+  };
+
+  // Clear all stores
+  const clearStores = () => {
+    console.log("[useCoreUpdate] Clearing stores...");
+    setConversations([]);
+    setContacts([]);
+  };
 
   useEffect(() => {
     // Fetch initial data if session is active
     if (sessionState === "active") {
-      fetchInitialData();
-    }
-
-    async function fetchInitialData() {
-      try {
-        console.log("[useCoreUpdate] Fetching initial data...");
-
-        // Fetch conversations
-        const conversations = await invoke<ConversationSummary[]>("list_conversations");
-        console.log("[useCoreUpdate] Loaded conversations:", conversations.length);
-
-        const mappedConversations = conversations.map((c) => ({
-          conversation_id: c.conversation_id,
-          peer_user_id: c.peer_user_id,
-          state: c.state,
-          last_message: c.last_message_type ? formatMessageType(c.last_message_type) : null,
-          last_message_time: null,
-          unread_count: 0,
-        }));
-        setConversations(mappedConversations);
-
-        // Fetch contacts
-        const contacts = await invoke<ContactSummary[]>("list_contacts");
-        console.log("[useCoreUpdate] Loaded contacts:", contacts.length);
-
-        const mappedContacts = contacts.map((c) => ({
-          user_id: c.user_id,
-          display_name: null,
-          device_count: c.device_count,
-          last_refresh: null,
-        }));
-        setContacts(mappedContacts);
-      } catch (err) {
-        console.error("[useCoreUpdate] Failed to fetch initial data:", err);
-      }
+      fetchAndSetData();
     }
 
     // Listen for core-update events
-    const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
+    const unlistenCoreUpdate = listen<CoreUpdateEvent>("core-update", (event) => {
       const { state_update, view_model } = event.payload;
 
       // Log for debugging
@@ -105,10 +126,20 @@ export function useCoreUpdate() {
       }
     });
 
+    // Listen for engine-reloaded event (profile switch)
+    const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {
+      console.log("[useCoreUpdate] Engine reloaded (profile switched)");
+      // Clear stores first to remove old profile's data
+      clearStores();
+      // Then fetch new profile's data
+      fetchAndSetData();
+    });
+
     return () => {
-      unlisten.then((fn) => fn());
+      unlistenCoreUpdate.then((fn) => fn());
+      unlistenEngineReloaded.then((fn) => fn());
     };
-  }, [setConversations, setContacts, sessionState]);
+  }, [setConversations, setContacts, setDeviceId, sessionState]);
 }
 
 function formatMessageType(type: string): string {

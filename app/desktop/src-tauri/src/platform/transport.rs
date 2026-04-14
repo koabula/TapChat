@@ -60,7 +60,9 @@ impl DesktopTransport {
             HttpMethod::Delete => reqwest::Method::DELETE,
         };
 
-        let mut builder = self.client.request(method, &request.url);
+        log::info!("HTTP request: {} {}", method, request.url);
+
+        let mut builder = self.client.request(method.clone(), &request.url);
         for (key, value) in &request.headers {
             builder = builder.header(key, value);
         }
@@ -71,6 +73,7 @@ impl DesktopTransport {
         match builder.send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
+                log::info!("HTTP response: {} {} - status {}", method, request.url, status);
                 let body = response.text().await.ok();
                 Ok(vec![CoreEvent::HttpResponseReceived {
                     request_id: request.request_id,
@@ -80,6 +83,13 @@ impl DesktopTransport {
             }
             Err(e) => {
                 let retryable = e.is_timeout() || e.is_connect();
+                log::warn!(
+                    "HTTP request failed: {} {} - error: {} (retryable: {})",
+                    method,
+                    request.url,
+                    e,
+                    retryable
+                );
                 Ok(vec![CoreEvent::HttpRequestFailed {
                     request_id: request.request_id,
                     retryable,

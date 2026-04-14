@@ -2,23 +2,11 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
-interface MessageRequest {
-  request_id: string;
-  sender_user_id: string;
-  sender_display_name: string | null;
-  message_count: number;
-  first_seen_at: number;
-}
-
-interface CoreOutput {
-  view_model?: {
-    message_requests?: MessageRequest[];
-  };
-}
+import type { MessageRequestItem, CoreOutput } from "@/lib/types";
 
 export default function MessageRequests() {
   const navigate = useNavigate();
-  const [requests, setRequests] = useState<MessageRequest[]>([]);
+  const [requests, setRequests] = useState<MessageRequestItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
 
@@ -96,7 +84,7 @@ export default function MessageRequests() {
             >
               <div className="flex items-center gap-3 mb-2">
                 <div className="avatar">
-                  <span>?</span>
+                  <span>{req.sender_display_name?.[0] || "?"}</span>
                 </div>
                 <div>
                   <span className="text-primary-color">

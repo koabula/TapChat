@@ -469,6 +469,18 @@ impl MlsAdapter {
         self.export_serializable_state()
     }
 
+    /// Delete a MLS group for a conversation.
+    /// This removes the group state from memory and should be followed by
+    /// persistence deletion of the serialized state.
+    pub fn delete_group(&mut self, conversation_id: &str) -> CoreResult<()> {
+        if !self.groups.contains_key(conversation_id) {
+            // Group doesn't exist, nothing to delete
+            return Ok(());
+        }
+        self.groups.remove(conversation_id);
+        Ok(())
+    }
+
     pub fn restore_from_bootstrap_state(serialized_state: &str) -> CoreResult<Self> {
         let provider = OpenMlsRustCrypto::default();
         let parsed: PersistedGroupState =

@@ -93,7 +93,7 @@ function AppInner() {
 }
 
 function App() {
-  const { setSessionState, setWsConnected } = useSessionStore();
+  const { setSessionState, setWsConnected, setDeviceId } = useSessionStore();
   const [loading, setLoading] = useState(true);
 
   // Subscribe to Tauri events on mount (these don't need Router context)
@@ -103,6 +103,9 @@ function App() {
       console.log("[App] session-status:", event.payload);
       setSessionState(event.payload.state);
       setWsConnected(event.payload.ws_connected);
+      if (event.payload.device_id) {
+        setDeviceId(event.payload.device_id);
+      }
     });
 
     // Subscribe to realtime WebSocket events

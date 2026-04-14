@@ -1,33 +1,27 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
-interface IdentityInfo {
-  user_id: string;
-  device_id: string;
-  mnemonic: string;
-  display_name?: string | null;
-}
-
-interface RuntimeStatus {
-  bound: boolean;
-  endpoint: string | null;
-}
-
-interface ProfileSummary {
-  name: string;
-  path: string;
-  is_active: boolean;
-  user_id: string | null;
-  device_id: string | null;
-  runtime_bound: boolean | null;
-}
+import {
+  getIdentityInfo,
+  getShareLink,
+  rotateShareLink,
+  setLocalDisplayName,
+  listProfiles,
+  activateProfile,
+  deleteProfile,
+  startNewProfileOnboarding,
+  cloudflareStatus,
+  addToAllowlist,
+  removeFromAllowlist,
+  getAllowlist,
+} from "@/lib/tauri";
+import type { IdentityInfo, ProfileSummary, CloudflareStatus } from "@/lib/types";
 
 export default function Settings() {
   const navigate = useNavigate();
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [showMnemonic, setShowMnemonic] = useState(false);
   const [newAllowlistUser, setNewAllowlistUser] = useState("");
@@ -62,7 +56,7 @@ export default function Settings() {
 
   const loadIdentity = async () => {
     try {
-      const result = await invoke<IdentityInfo | null>("get_identity_info");
+      const result = await getIdentityInfo();
       setIdentity(result);
       setDisplayNameInput(result?.display_name || "");
     } catch (err) {
@@ -72,7 +66,7 @@ export default function Settings() {
 
   const loadRuntimeStatus = async () => {
     try {
-      const result = await invoke<RuntimeStatus>("cloudflare_status");
+      const result = await cloudflareStatus();
       setRuntimeStatus(result);
     } catch (err) {
       console.error("Failed to get runtime status:", err);
@@ -81,7 +75,7 @@ export default function Settings() {
 
   const loadProfiles = async () => {
     try {
-      const result = await invoke<ProfileSummary[]>("list_profiles");
+      const result = await listProfiles();
       setProfiles(result);
     } catch (err) {
       console.error("Failed to load profiles:", err);
@@ -90,8 +84,10 @@ export default function Settings() {
 
   const loadAllowlist = async () => {
     try {
-      const result = await invoke<{ allowlist?: { allowed_sender_user_ids: string[] } }>("get_allowlist");
-      setAllowlist(result.allowlist?.allowed_sender_user_ids || []);
+      const result = await getAllowlist();
+      if (result.view_model?.allowlist) {
+        setAllowlist(result.view_model.allowlist.allowed_sender_user_ids || []);
+      }
     } catch (err) {
       console.error("Failed to load allowlist:", err);
     }
@@ -105,7 +101,7 @@ export default function Settings() {
 
   const handleCopyShareLink = async () => {
     try {
-      const link = await invoke<string | null>("get_share_link");
+      const link = await getShareLink();
       if (link) {
         await writeText(link);
         setCopied(true);
@@ -119,7 +115,7 @@ export default function Settings() {
   const handleAddAllowlist = async () => {
     if (!newAllowlistUser.trim()) return;
     try {
-      await invoke("add_to_allowlist", { userId: newAllowlistUser });
+      await addToAllowlist(newAllowlistUser);
       setNewAllowlistUser("");
       loadAllowlist();
     } catch (err) {
@@ -129,7 +125,7 @@ export default function Settings() {
 
   const handleRemoveAllowlist = async (userId: string) => {
     try {
-      await invoke("remove_from_allowlist", { userId });
+      await removeFromAllowlist(userId);
       loadAllowlist();
     } catch (err) {
       console.error("Failed to remove from allowlist:", err);
@@ -138,7 +134,7 @@ export default function Settings() {
 
   const handleRotateLink = async () => {
     try {
-      await invoke("rotate_share_link");
+      await rotateShareLink();
       alert("Share link rotated. Share the new link with your contacts.");
     } catch (err) {
       console.error("Failed to rotate link:", err);
@@ -150,7 +146,7 @@ export default function Settings() {
     setSavingDisplayName(true);
     try {
       const nameToSave = displayNameInput.trim() || null;
-      await invoke("set_local_display_name", { displayName: nameToSave });
+      await setLocalDisplayName(nameToSave);
       setEditingDisplayName(false);
       loadIdentity();
     } catch (err) {
@@ -164,20 +160,21 @@ export default function Settings() {
   const handleSwitchProfile = async (path: string) => {
     setSwitchingProfile(path);
     try {
-      await invoke("activate_profile", { path });
-      // Reload all data to reflect the new active profile
+      await activateProfile(path);
+    } catch (err) {
+      console.error("Profile switch error:", err);
+      // Don't show popup for transient errors like websocket connect
+      const errorMsg = String(err);
+      if (!errorMsg.includes("websocket") && !errorMsg.includes("connect") && errorMsg !== "") {
+        alert(errorMsg);
+      }
+    } finally {
+      // Always reload all data - profile switch may have succeeded even if websocket failed
+      // The engine-reloaded event will also trigger store refresh via useCoreUpdate
       loadProfiles();
       loadIdentity();
       loadRuntimeStatus();
       loadAllowlist();
-    } catch (err) {
-      console.error("Failed to switch profile:", err);
-      // Don't show popup for transient errors like websocket connect
-      const errorMsg = String(err);
-      if (!errorMsg.includes("websocket") && !errorMsg.includes("connect")) {
-        alert(errorMsg);
-      }
-    } finally {
       setSwitchingProfile(null);
     }
   };
@@ -186,7 +183,7 @@ export default function Settings() {
     setStartingOnboarding(true);
     try {
       // Start onboarding - does NOT create profile yet, will be created during onboarding
-      await invoke("start_new_profile_onboarding");
+      await startNewProfileOnboarding();
       setShowCreateConfirm(false);
       // The backend will emit session-status event which triggers frontend navigation
     } catch (err) {
@@ -208,7 +205,7 @@ export default function Settings() {
     setDeletingProfile(path);
     setShowDeleteConfirm(null);
     try {
-      await invoke("delete_profile", { path });
+      await deleteProfile(path);
       loadProfiles();
     } catch (err) {
       console.error("Failed to delete profile:", err);
@@ -585,9 +582,16 @@ export default function Settings() {
             <h2 className="text-lg font-medium status-error mb-3">Danger Zone</h2>
 
             <div className="card">
-              <button className="btn btn-ghost w-full status-error">
-                Delete Identity
+              <button
+                className="btn btn-ghost w-full status-error opacity-50 cursor-not-allowed"
+                disabled
+                title="Feature not yet implemented"
+              >
+                Delete Identity (Not Yet Implemented)
               </button>
+              <p className="text-muted-color text-xs mt-2 text-center">
+                This feature will be available in a future update
+              </p>
             </div>
           </section>
         </div>

@@ -525,6 +525,7 @@ impl CoreEngine {
             CoreCommand::SetContactDisplayName { user_id, display_name } => {
                 self.set_contact_display_name(user_id, display_name)
             }
+            CoreCommand::DeleteContact { user_id } => self.delete_contact(user_id),
         }
     }
 
@@ -2681,6 +2682,62 @@ impl CoreEngine {
                 &self.state,
                 vec![PersistOp::SaveContact { user_id }],
             )],
+            view_model: Some(CoreViewModel {
+                contacts: self.state.contacts.iter().map(|(uid, c)| ContactSummary {
+                    user_id: uid.clone(),
+                    display_name: c.display_name.clone().or(c.original_name.clone()),
+                    device_count: c.bundle.devices.len(),
+                }).collect(),
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn delete_contact(&mut self, user_id: String) -> CoreResult<CoreOutput> {
+        // Check if contact exists
+        if !self.state.contacts.contains_key(&user_id) {
+            return Err(CoreError::invalid_input("contact does not exist"));
+        }
+
+        // Remove contact from state
+        self.state.contacts.remove(&user_id);
+
+        // Remove any conversations with this peer
+        let conversation_ids_to_remove: Vec<String> = self
+            .state
+            .conversations
+            .iter()
+            .filter(|(_, conv)| conv.peer_user_id == user_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // Collect persistence operations
+        let mut persist_ops: Vec<PersistOp> = vec![PersistOp::DeleteContact { user_id: user_id.clone() }];
+
+        for conv_id in &conversation_ids_to_remove {
+            // Remove from state
+            self.state.conversations.remove(conv_id);
+            self.state.mls_summaries.remove(conv_id);
+            self.state.recovery_contexts.remove(conv_id);
+
+            // Remove MLS group from adapter
+            if let Some(ref mut mls_adapter) = self.state.mls_adapter {
+                mls_adapter.delete_group(conv_id)?;
+            }
+
+            // Add persistence operations
+            persist_ops.push(PersistOp::DeleteConversation { conversation_id: conv_id.clone() });
+            persist_ops.push(PersistOp::DeleteMlsState { conversation_id: conv_id.clone() });
+            persist_ops.push(PersistOp::DeleteRecoveryContext { conversation_id: conv_id.clone() });
+        }
+
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                conversations_changed: !conversation_ids_to_remove.is_empty(),
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(&self.state, persist_ops)],
             view_model: Some(CoreViewModel {
                 contacts: self.state.contacts.iter().map(|(uid, c)| ContactSummary {
                     user_id: uid.clone(),

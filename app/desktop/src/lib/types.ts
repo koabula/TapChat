@@ -24,11 +24,22 @@ export interface CoreViewModel {
   allowlist?: AllowlistDocument;
 }
 
-// Identity
+// Identity - matches backend IdentityInfo struct
 export interface IdentityInfo {
   user_id: string;
   device_id: string;
   mnemonic: string;
+  display_name?: string;
+}
+
+// Profiles - matches backend ProfileSummary struct
+export interface ProfileSummary {
+  name: string;
+  path: string;
+  is_active: boolean;
+  user_id: string | null;
+  device_id: string | null;
+  runtime_bound: boolean | null;
 }
 
 // Conversations
@@ -46,16 +57,19 @@ export interface MessageSummary {
   message_type: string;
 }
 
-// Messages
+// Messages - matches backend get_messages response
 export interface Message {
   message_id: string;
-  sender_user_id: string;
-  content: string | null;
-  has_attachment: boolean;
+  sender_device_id: string;
+  recipient_device_id: string;
+  message_type: string; // "sent" | "received" | "control"
   created_at: number;
+  plaintext: string | null;
+  has_attachment: boolean;
+  storage_refs?: string[]; // attachment references
 }
 
-// Contacts
+// Contacts - matches backend ContactSummary
 export interface ContactSummary {
   user_id: string;
   device_count: number;

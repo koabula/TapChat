@@ -159,20 +159,23 @@ async fn reload_engine_from_profile(
         inner.session = SessionState::Active { device_id: device_id.clone() };
     }
 
-    // Emit session-status event
+    // Emit session-status event - this happens BEFORE websocket connect
     let _ = app.emit("session-status", SessionStatus {
         state: "active".to_string(),
-        device_id: Some(device_id),
+        device_id: Some(device_id.clone()),
         ws_connected: false,
     });
 
-    // Notify frontend of the reload
+    // Notify frontend of the reload (for clearing stores)
     let _ = app.emit("engine-reloaded", {});
 
-    // Start session with AppStarted event
-    drive_core_with_handle(app, CoreInput::Event(tapchat_core::CoreEvent::AppStarted))
-        .await
-        .map_err(|e| e.to_string())?;
+    // Start session with AppStarted event - this may fail on websocket connect
+    // but profile switch is already successful, so we don't propagate this error
+    if let Err(e) = drive_core_with_handle(app, CoreInput::Event(tapchat_core::CoreEvent::AppStarted)).await {
+        // Log the error but don't fail the profile switch
+        log::warn!("Failed to start realtime session after profile switch: {}", e);
+        // Return success anyway - profile switch is complete, just realtime failed
+    }
 
     Ok(())
 }

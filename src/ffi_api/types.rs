@@ -110,6 +110,9 @@ pub enum CoreCommand {
         user_id: String,
         display_name: Option<String>,
     },
+    DeleteContact {
+        user_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
