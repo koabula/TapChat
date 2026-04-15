@@ -1,4 +1,4 @@
-use tauri::{Manager, State};
+use tauri::Manager;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use tapchat_core::{CoreCommand, CoreOutput};

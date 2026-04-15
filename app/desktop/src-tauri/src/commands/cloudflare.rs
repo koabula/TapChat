@@ -3,11 +3,9 @@
 //! Uses embedded minimal wrangler for OAuth login and REST API for deployment.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::RwLock;
+use tauri::{AppHandle, Emitter, State};
 
 use tapchat_core::cli::profile::RuntimeMetadata;
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
@@ -422,7 +420,6 @@ pub async fn cloudflare_deploy(
 /// Load OAuth token from wrangler config file
 fn load_oauth_token() -> Result<String, String> {
     use std::fs;
-    use std::io::BufRead;
 
     let config_file = dirs::home_dir()
         .ok_or_else(|| "Cannot determine home directory".to_string())?

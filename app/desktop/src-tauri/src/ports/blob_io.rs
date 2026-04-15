@@ -149,6 +149,7 @@ pub async fn upload_blob_with_progress(
 }
 
 /// Upload blob without progress tracking (for cases where app handle isn't available).
+#[allow(dead_code)]
 pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
     upload_blob_with_progress(upload, None, String::new()).await
 }

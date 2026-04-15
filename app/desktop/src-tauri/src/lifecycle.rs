@@ -100,7 +100,6 @@ pub async fn on_app_ready(app: &AppHandle) {
         }
 
         // Start session
-        let state_clone = state.inner.clone();
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             // Fire AppStarted to kick off sync

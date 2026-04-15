@@ -1,7 +1,7 @@
 use tauri::State;
 
 use tapchat_core::{CoreCommand, CoreOutput};
-use tapchat_core::ffi_api::{ContactSummary, ConversationSummary};
+use tapchat_core::ffi_api::ConversationSummary;
 use tapchat_core::model::ConversationKind;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};

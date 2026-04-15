@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tokio::sync::RwLock;
 
 use tapchat_core::ffi_api::PersistStateEffect;
@@ -14,14 +14,12 @@ use crate::platform::profile::ProfileManagerInner;
 #[derive(Clone)]
 pub struct DesktopPersistence {
     profile_inner: Arc<RwLock<ProfileManagerInner>>,
-    attachment_dir: Option<PathBuf>,
 }
 
 impl DesktopPersistence {
     pub fn new(profile_inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
         Self {
             profile_inner,
-            attachment_dir: None,
         }
     }
 
@@ -94,6 +92,7 @@ impl DesktopPersistence {
 
 /// Synchronous persistence for use in non-async contexts.
 /// Writes directly to disk without going through ProfileManager.
+#[allow(dead_code)]
 pub fn persist_state_sync(effect: &PersistStateEffect, profile_path: Option<&PathBuf>) {
     if let Some(path) = profile_path {
         let snapshot_path = path.join("snapshot.json");

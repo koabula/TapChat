@@ -26,6 +26,7 @@ pub fn schedule_timer(timer_id: String, delay_ms: u64) {
 
 /// Timer manager that holds app handle for proper event emission.
 /// This is set up during app initialization.
+#[allow(dead_code)]
 pub struct TimerManager {
     app_handle: Option<Arc<RwLock<Option<tauri::AppHandle>>>>,
 }
@@ -36,12 +37,14 @@ impl TimerManager {
     }
 
     /// Set the app handle for timer callbacks.
-    pub fn set_app_handle(&mut self, handle: tauri::AppHandle) {
+    #[allow(dead_code)]
+    pub fn set_app_handle(&mut self, _handle: tauri::AppHandle) {
         // Store handle for timer callbacks to use
         // This requires global state management
     }
 
     /// Schedule a timer with proper event emission.
+    #[allow(dead_code)]
     pub fn schedule_with_handle(&self, timer_id: String, delay_ms: u64, app: tauri::AppHandle) {
         tokio::spawn(async move {
             sleep(Duration::from_millis(delay_ms)).await;

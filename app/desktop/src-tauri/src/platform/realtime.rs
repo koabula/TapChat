@@ -17,10 +17,12 @@ use crate::platform::profile::ProfileManagerInner;
 /// Realtime connection manager for WebSocket subscriptions.
 pub struct RealtimeManager {
     sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
+    #[allow(dead_code)]
     profile_inner: Arc<RwLock<ProfileManagerInner>>,
     app_handle: Option<Arc<AppHandle>>,
 }
 
+#[allow(dead_code)]
 struct RealtimeSession {
     device_id: String,
     endpoint: String,
@@ -31,6 +33,7 @@ struct RealtimeSession {
 /// Events received from WebSocket.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum WsServerEvent {
     HeadUpdated { seq: u64 },
     InboxRecordAvailable { seq: u64, record: Option<serde_json::Value> },
@@ -171,7 +174,7 @@ impl RealtimeManager {
         sessions.get(device_id).map(|s| s.connected).unwrap_or(false)
     }
 
-    fn build_ws_url(&self, endpoint: &str, device_id: &str, last_acked_seq: u64) -> Result<String> {
+    fn build_ws_url(&self, endpoint: &str, _device_id: &str, last_acked_seq: u64) -> Result<String> {
         // Convert HTTP endpoint to WebSocket URL
         let ws_base = if endpoint.starts_with("https://") {
             endpoint.replace("https://", "wss://")
@@ -182,7 +185,7 @@ impl RealtimeManager {
         };
 
         // Append subscription path
-        let encoded_device = urlencoding::encode(device_id);
+        // Note: device_id is already included in the endpoint path
         Ok(format!(
             "{}?last_acked_seq={}",
             ws_base,

@@ -7,14 +7,14 @@ use crate::conversation::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
-use crate::identity::{IdentityManager, encode_hex, generate_bundle_share_id, identity_bundle_payload};
+use crate::identity::IdentityManager;
 use crate::mls_adapter::{
     CreateConversationArtifacts, IngestResult, MlsAdapter, PeerDeviceKeyPackage,
     RemoveMembersArtifacts,
 };
 use crate::model::{
     Ack, ConversationKind, ConversationState, DeliveryClass, Envelope, IdentityBundle, InboxRecord,
-    MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, StorageProfile, Validate,
+    MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,

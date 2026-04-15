@@ -9,15 +9,9 @@ use tapchat_core::model::{Ack, IdentityBundle, InboxRecord};
 use tapchat_core::transport_contract::{
     AckRequest, AckResult,
     AppendEnvelopeRequest, AppendEnvelopeResult,
-    FetchAllowlistRequest,
     FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest,
     GetHeadResult,
-    MessageRequestActionRequest, MessageRequestActionResult,
     PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    PublishSharedStateRequest,
-    ReplaceAllowlistRequest,
-    RealtimeSubscriptionRequest,
 };
 
 use crate::platform::profile::ProfileManagerInner;

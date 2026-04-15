@@ -1,10 +1,7 @@
-use tauri::State;
-
 use tapchat_core::{CoreCommand, CoreOutput};
-use tapchat_core::transport_contract::{AllowlistDocument, MessageRequestAction, MessageRequestItem};
+use tapchat_core::transport_contract::MessageRequestAction;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
-use crate::state::AppState;
 
 #[tauri::command]
 pub async fn list_message_requests(

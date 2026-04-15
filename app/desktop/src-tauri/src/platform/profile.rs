@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 

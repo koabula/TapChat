@@ -90,6 +90,7 @@ pub struct DeployProgress {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub enum DeployPhase {
     Preflight,
     CreatingBuckets,
@@ -109,6 +110,7 @@ struct CloudflareError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct CloudflareErrorDetail {
     #[serde(default)]
     code: Option<i64>,
@@ -621,6 +623,7 @@ pub fn load_embedded_worker_script(runtime_root: &Path) -> Result<String, String
 }
 
 /// Get accounts using OAuth token
+#[allow(dead_code)]
 pub async fn get_accounts(api_token: &str) -> Result<Vec<AccountInfo>, String> {
     let client = Client::builder()
         .build()

@@ -494,6 +494,7 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
+    #[allow(unused_assignments)]
     let mut last_error = String::new();
     let mut attempt = 0u32;
     loop {

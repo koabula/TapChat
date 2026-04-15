@@ -1,12 +1,12 @@
-use std::path::PathBuf;
 use std::io::Write;
 
-use tauri::{Manager, AppHandle};
+use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_notification::NotificationExt;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 #[tauri::command]
+#[allow(deprecated)] // TODO: migrate to tauri-plugin-opener
 pub fn open_file(
     app: tauri::AppHandle,
     path: String,
