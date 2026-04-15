@@ -61,4 +61,19 @@ impl AppState {
             })),
         }
     }
+
+    /// Create AppState with a specific profile name (for multi-instance mode).
+    pub fn with_profile_name(name: &str) -> Self {
+        let profile_manager = ProfileManager::with_profile_name(name);
+        let inner_arc = profile_manager.inner_arc();
+        Self {
+            inner: Arc::new(RwLock::new(AppStateInner {
+                engine: CoreEngine::new(),
+                ports: DesktopPlatformPorts::new(inner_arc),
+                profile_manager,
+                session: SessionState::Uninitialized,
+                profile_path: None,
+            })),
+        }
+    }
 }

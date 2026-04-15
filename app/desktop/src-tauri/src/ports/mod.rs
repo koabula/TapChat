@@ -8,16 +8,20 @@ pub mod notification;
 use std::sync::Arc;
 
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tapchat_core::ffi_api::{
-    CoreEvent, HttpRequestEffect, PersistStateEffect, ReadAttachmentBytesEffect,
+    CoreEvent, HttpRequestEffect, HttpMethod, PersistStateEffect, ReadAttachmentBytesEffect,
     UserNotificationEffect, WriteDownloadedAttachmentEffect,
 };
+use tapchat_core::model::CURRENT_MODEL_VERSION;
 use tapchat_core::platform_ports::{
     BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
     TransportPort,
 };
 use tapchat_core::transport_contract::{
-    BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest, FetchIdentityBundleRequest,
+    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest, FetchIdentityBundleRequest,
     FetchMessageRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
     PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
 };
@@ -69,6 +73,77 @@ impl DesktopPlatformPorts {
     pub fn set_conversation_context(&mut self, conversation_id: String) {
         self.current_conversation_id = Some(conversation_id);
     }
+
+    /// Build contact share URL for sender identification in message requests.
+    /// This generates a signed URL that allows recipients to fetch the sender's identity bundle.
+    async fn build_contact_share_url(&self) -> Result<Option<String>> {
+        let pm = self.transport.profile_inner.read().await;
+
+        // Get active profile
+        let Some(profile) = pm.active_profile.as_ref() else {
+            log::warn!("No active profile found for contact share URL");
+            return Ok(None);
+        };
+
+        // Load runtime metadata
+        let runtime = match profile.load_runtime_metadata() {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("Failed to load runtime metadata: {}", e);
+                return Ok(None);
+            }
+        };
+
+        // Get base URL
+        let base_url = runtime.public_base_url.clone()
+            .or(runtime.base_url.clone());
+
+        let Some(base_url) = base_url else {
+            log::warn!("No base URL in runtime metadata");
+            return Ok(None);
+        };
+
+        // Get sharing secret
+        let Some(sharing_secret) = runtime.sharing_secret.clone() else {
+            log::warn!("No sharing secret in runtime metadata");
+            return Ok(None);
+        };
+
+        // Get local bundle from persistence
+        let snapshot = match profile.load_snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Failed to load snapshot: {}", e);
+                return Ok(None);
+            }
+        };
+
+        let Some(deployment) = snapshot.deployment.as_ref() else {
+            log::warn!("No deployment in snapshot");
+            return Ok(None);
+        };
+
+        let Some(local_bundle) = deployment.local_bundle.as_ref() else {
+            log::warn!("No local bundle in deployment");
+            return Ok(None);
+        };
+
+        // Get bundle_share_id
+        let Some(share_id) = local_bundle.bundle_share_id.clone() else {
+            log::warn!("No bundle_share_id in local bundle");
+            return Ok(None);
+        };
+
+        // Build signed token
+        let user_id = local_bundle.user_id.clone();
+        let token = sign_contact_share_token(&sharing_secret, &user_id, &share_id)?;
+
+        Ok(Some(format!(
+            "{}/v1/contact-share/{}",
+            base_url.trim_end_matches('/'),
+            token
+        )))
+    }
 }
 
 // --- TransportPort ---
@@ -80,6 +155,52 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         request: HttpRequestEffect,
     ) -> Result<Vec<CoreEvent>> {
+        // Intercept append envelope requests to inject correct sender_bundle_share_url
+        if request.method == HttpMethod::Post && request.url.contains("/messages") {
+            log::info!("[TransportPort] Intercepting /messages POST request");
+            if let Some(body) = &request.body {
+                log::debug!("[TransportPort] Request body: {}", body);
+                // Try to parse as AppendEnvelopeRequest
+                if let Ok(mut append_request) = serde_json::from_str::<AppendEnvelopeRequest>(body) {
+                    log::info!("[TransportPort] Parsed AppendEnvelopeRequest successfully");
+                    log::info!("[TransportPort] Current sender_bundle_share_url: {:?}", append_request.sender_bundle_share_url);
+
+                    // Check if sender_bundle_share_url needs to be replaced
+                    // It should be a contact-share URL, not identity_bundle_ref
+                    let needs_contact_share_url = append_request.sender_bundle_share_url.is_none()
+                        || append_request.sender_bundle_share_url.as_ref().map(|url| !url.contains("/v1/contact-share/")).unwrap_or(true);
+
+                    log::info!("[TransportPort] needs_contact_share_url: {}", needs_contact_share_url);
+
+                    if needs_contact_share_url {
+                        // Generate correct contact share URL from runtime metadata
+                        let contact_share_url = self.build_contact_share_url().await?;
+                        log::info!("[TransportPort] Generated contact_share_url: {:?}", contact_share_url);
+
+                        if let Some(url) = contact_share_url {
+                            log::info!("[TransportPort] Injecting sender_bundle_share_url: {}", url);
+                            append_request.sender_bundle_share_url = Some(url);
+                            // Rebuild the request with modified body
+                            let modified_body = serde_json::to_string(&append_request)?;
+                            log::debug!("[TransportPort] Modified body: {}", modified_body);
+                            let modified_request = HttpRequestEffect {
+                                request_id: request.request_id.clone(),
+                                method: request.method.clone(),
+                                url: request.url.clone(),
+                                headers: request.headers.clone(),
+                                body: Some(modified_body),
+                            };
+                            return self.transport.execute_http_request(modified_request).await;
+                        } else {
+                            log::warn!("[TransportPort] Failed to generate contact_share_url, sending original request");
+                        }
+                    }
+                } else {
+                    log::warn!("[TransportPort] Failed to parse body as AppendEnvelopeRequest");
+                }
+            }
+        }
+
         self.transport.execute_http_request(request).await
     }
 
@@ -274,3 +395,24 @@ impl NotificationPort for DesktopPlatformPorts {
 
 // --- SecureStoragePort (skeleton) ---
 impl SecureStoragePort for DesktopPlatformPorts {}
+
+/// Sign a contact share token using HMAC-SHA256.
+/// Format: base64url(payload).base64url(signature)
+fn sign_contact_share_token(secret: &str, user_id: &str, share_id: &str) -> Result<String> {
+    let payload = serde_json::json!({
+        "version": CURRENT_MODEL_VERSION,
+        "service": "contact_share",
+        "userId": user_id,
+        "shareId": share_id,
+    });
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Failed to initialize HMAC: {}", e))?;
+    mac.update(&payload_bytes);
+    let signature = mac.finalize().into_bytes();
+    Ok(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(payload_bytes),
+        URL_SAFE_NO_PAD.encode(signature)
+    ))
+}

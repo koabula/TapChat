@@ -1,11 +1,18 @@
+use serde::Serialize;
 use tauri::State;
 
-use tapchat_core::{CoreCommand, CoreOutput};
+use tapchat_core::CoreCommand;
 use tapchat_core::ffi_api::ConversationSummary;
 use tapchat_core::model::ConversationKind;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::AppState;
+
+/// Simplified result for create_conversation command
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateConversationResult {
+    pub conversation_id: String,
+}
 
 #[tauri::command]
 pub async fn list_conversations(
@@ -37,8 +44,8 @@ pub async fn list_conversations(
 pub async fn create_conversation(
     app: tauri::AppHandle,
     peer_user_id: String,
-) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+) -> Result<CreateConversationResult, String> {
+    let output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::CreateConversation {
             peer_user_id,
@@ -46,7 +53,15 @@ pub async fn create_conversation(
         }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // Extract conversation_id from CoreOutput view_model
+    let conversation_id = output
+        .view_model
+        .and_then(|vm| vm.conversations.first().map(|c| c.conversation_id.clone()))
+        .ok_or_else(|| "Failed to get conversation_id from response".to_string())?;
+
+    Ok(CreateConversationResult { conversation_id })
 }
 
 #[tauri::command]

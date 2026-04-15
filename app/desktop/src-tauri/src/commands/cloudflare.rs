@@ -355,6 +355,15 @@ pub async fn cloudflare_deploy(
         .await
         .map_err(|e| format!("Deployment not ready: {}", e))?;
 
+    // Wait for secrets to propagate in Worker environment
+    // Cloudflare Workers secrets need additional time to become available
+    let _ = app.emit("cloudflare-progress", DeployProgress {
+        phase: DeployPhase::VerifyingDeployment,
+        message: "Waiting for secrets to propagate...".into(),
+        progress_percent: 88,
+    });
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
     // Bootstrap device bundle
     let _ = app.emit("cloudflare-progress", DeployProgress {
         phase: DeployPhase::VerifyingDeployment,

@@ -58,6 +58,34 @@ impl ProfileManager {
         }
     }
 
+    /// Create ProfileManager with a specific profile name (for multi-instance mode).
+    /// This loads the named profile instead of the registry's active_profile.
+    pub fn with_profile_name(name: &str) -> Self {
+        let registry = ProfileRegistry::load().unwrap_or_default();
+
+        // Find profile by name in registry
+        let profile = registry
+            .profiles
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| Profile::open(&entry.root_dir).ok());
+
+        if profile.is_none() {
+            log::warn!(
+                "Profile '{}' not found in registry. Available profiles: {}",
+                name,
+                registry.profiles.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
+            );
+        }
+
+        Self {
+            inner: Arc::new(RwLock::new(ProfileManagerInner {
+                registry,
+                active_profile: profile,
+            })),
+        }
+    }
+
     /// Get the inner Arc for sharing with platform ports.
     pub fn inner_arc(&self) -> Arc<RwLock<ProfileManagerInner>> {
         self.inner.clone()

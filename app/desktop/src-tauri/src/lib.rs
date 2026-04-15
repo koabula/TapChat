@@ -10,19 +10,81 @@ use tauri::Manager;
 
 pub use state::{AppState, SessionState};
 
+/// Startup configuration parsed from command line arguments.
+struct StartupConfig {
+    /// Specific profile name to load (enables multi-instance mode).
+    profile_name: Option<String>,
+    /// Force multi-instance mode even without --profile.
+    multi_instance: bool,
+}
+
+/// Parse command line arguments to determine startup mode.
+fn parse_startup_args() -> StartupConfig {
+    let args: Vec<String> = std::env::args().collect();
+    let mut profile_name = None;
+    let mut multi_instance = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" | "-p" => {
+                if i + 1 < args.len() {
+                    profile_name = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--multi-instance" | "-m" => {
+                multi_instance = true;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+
+    // If a profile is specified, implicitly enable multi-instance mode
+    if profile_name.is_some() {
+        multi_instance = true;
+    }
+
+    StartupConfig { profile_name, multi_instance }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Parse startup arguments
+    let config = parse_startup_args();
+
     // Updater public key for signature verification
     let updater_pubkey = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExOTAyMUI4NTBDM0U1QjAKUldTdzVjTlF1Q0dRb1VPeGZYQ3M1dC9kcEJ5S1hidHNFVFQrZVRzWks2RGQ3NEZWSGI0YkpTQVQK";
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // Create AppState based on startup config
+    let app_state = if let Some(name) = &config.profile_name {
+        AppState::with_profile_name(name)
+    } else {
+        AppState::new()
+    };
+
+    // Build Tauri app
+    let builder = tauri::Builder::default();
+
+    // Only load single-instance plugin when NOT in multi-instance mode
+    let builder = if !config.multi_instance {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // When a second instance tries to start, focus the main window instead
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
         }))
+    } else {
+        // In multi-instance mode, skip single-instance plugin
+        // Each instance runs independently
+        builder
+    };
+
+    builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
@@ -33,9 +95,17 @@ pub fn run() {
                 .build()
         )
         .plugin(tauri_plugin_process::init())
-        .manage(AppState::new())
-        .setup(|app| {
+        .manage(app_state)
+        .setup(move |app| {
             let handle = app.handle().clone();
+
+            // Log startup mode for debugging
+            if config.multi_instance {
+                log::info!("TapChat started in multi-instance mode");
+                if let Some(name) = &config.profile_name {
+                    log::info!("Loading profile: {}", name);
+                }
+            }
 
             // Create tray menu
             let show_item = MenuItem::with_id(app, "show", "Show TapChat", true, None::<&str>)?;

@@ -13,15 +13,21 @@ use tapchat_core::transport_contract::{
     GetHeadResult,
     PrepareBlobUploadRequest, PrepareBlobUploadResult,
 };
+use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 
 use crate::platform::profile::ProfileManagerInner;
+
+/// Helper to check if a string looks like JSON
+fn looks_like_json(s: &str) -> bool {
+    s.trim().starts_with('{') || s.trim().starts_with('[')
+}
 
 /// HTTP transport implementation for desktop app.
 /// Executes HTTP requests to the Cloudflare backend.
 #[derive(Clone)]
 pub struct DesktopTransport {
     client: Client,
-    profile_inner: Arc<RwLock<ProfileManagerInner>>,
+    pub profile_inner: Arc<RwLock<ProfileManagerInner>>,
 }
 
 impl DesktopTransport {
@@ -43,6 +49,8 @@ impl DesktopTransport {
     }
 
     /// Execute a generic HTTP request.
+    /// Converts snake_case JSON (from CoreEngine) to camelCase (for server),
+    /// and converts camelCase response back to snake_case.
     pub async fn execute_http_request(
         &self,
         request: HttpRequestEffect,
@@ -58,17 +66,50 @@ impl DesktopTransport {
 
         let mut builder = self.client.request(method.clone(), &request.url);
         for (key, value) in &request.headers {
-            builder = builder.header(key, value);
+            // Convert X-Tapchat-Capability header value to camelCase
+            let header_value = if key.eq_ignore_ascii_case("X-Tapchat-Capability") {
+                to_camel_case_json_string(value).unwrap_or_else(|_| value.clone())
+            } else {
+                value.clone()
+            };
+            builder = builder.header(key, header_value);
         }
         if let Some(body) = &request.body {
-            builder = builder.body(body.clone());
+            // Convert JSON body to camelCase for server
+            let converted = if looks_like_json(body) {
+                to_camel_case_json_string(body).unwrap_or_else(|_| body.clone())
+            } else {
+                body.clone()
+            };
+            log::debug!("HTTP body converted: {} -> {}", body, converted);
+            builder = builder.body(converted);
         }
 
         match builder.send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
                 log::info!("HTTP response: {} {} - status {}", method, request.url, status);
-                let body = response.text().await.ok();
+
+                let body = response
+                    .text()
+                    .await
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| {
+                        // Convert camelCase response back to snake_case for CoreEngine
+                        if content_type.contains("application/json") {
+                            to_snake_case_json_string(&value).unwrap_or(value)
+                        } else {
+                            value
+                        }
+                    });
+
                 Ok(vec![CoreEvent::HttpResponseReceived {
                     request_id: request.request_id,
                     status,

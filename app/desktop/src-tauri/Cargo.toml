@@ -35,3 +35,5 @@ log = "0.4"
 tapchat_core = { path = "../../../", package = "TapChat" }
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+hmac = "0.12"
+sha2 = "0.10"
