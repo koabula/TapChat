@@ -94,6 +94,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
         let device_id = engine
@@ -237,7 +238,7 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .devices[0]
+            .bundle.devices[0]
             .device_id
             .clone();
         let mut conversation_users = [local_user_id.clone(), peer_user_id.clone()];
@@ -382,6 +383,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
         let device_id = engine
@@ -418,6 +420,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
         let device_id = engine
@@ -771,7 +774,7 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .devices[0]
+            .bundle.devices[0]
             .device_id
             .clone();
 
@@ -1011,7 +1014,7 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .devices[0]
+            .bundle.devices[0]
             .device_id
             .clone();
         let record = sample_control_record(
@@ -1085,7 +1088,7 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .devices[0]
+            .bundle.devices[0]
             .device_id
             .clone();
 
@@ -1234,7 +1237,7 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .devices[0]
+            .bundle.devices[0]
             .device_id
             .clone();
         let record = sample_control_record_with_type(
@@ -1430,6 +1433,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
         engine.state.conversations.insert(
@@ -1758,9 +1762,10 @@ mod tests {
             .contacts
             .get(&merged.user_id)
             .expect("updated contact");
-        assert_eq!(updated.devices.len(), 2);
+        assert_eq!(updated.bundle.devices.len(), 2);
         assert!(
             updated
+                .bundle
                 .devices
                 .iter()
                 .any(|device| device.device_id == bob_laptop_profile.device_id)
@@ -2063,6 +2068,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
 
@@ -2095,6 +2101,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
         let device_id = engine
@@ -2128,6 +2135,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
 
@@ -2154,6 +2162,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
 
@@ -2201,6 +2210,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("phone".into()),
+                display_name: None,
             })
             .expect("identity");
 
@@ -2236,6 +2246,7 @@ mod tests {
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: Some(mnemonic.into()),
                 device_name: Some(device_name.into()),
+                display_name: None,
             })
             .expect("identity");
         engine

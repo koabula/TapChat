@@ -1124,6 +1124,7 @@ mod tests {
             version: CURRENT_MODEL_VERSION.to_string(),
             user_id: "user:alice".into(),
             user_public_key: "alice-pub".into(),
+            display_name: None,
             bundle_share_id: Some("share-alice".into()),
             devices: vec![DeviceContactProfile {
                 version: CURRENT_MODEL_VERSION.to_string(),

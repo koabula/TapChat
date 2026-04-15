@@ -564,6 +564,7 @@ mod tests {
             version: CURRENT_MODEL_VERSION.to_string(),
             user_id: identity.user_identity.user_id.clone(),
             user_public_key: identity.user_identity.user_public_key.clone(),
+            display_name: None,
             devices: vec![DeviceContactProfile {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 device_id: identity.device_identity.device_id.clone(),
