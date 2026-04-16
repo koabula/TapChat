@@ -25,11 +25,13 @@ import SystemBanner from "./components/SystemBanner";
 import { UpdateNotification } from "./hooks/useAutoUpdate";
 
 import { useSessionStore } from "./store/session";
+import { useMessageRequestsStore } from "./store/requests";
 import { useCoreUpdate } from "./hooks/useCoreUpdate";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
 
 import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
+import type { MessageRequestItem } from "./store/requests";
 
 /**
  * Inner app component that has Router context.
@@ -94,6 +96,7 @@ function AppInner() {
 
 function App() {
   const { setSessionState, setWsConnected, setDeviceId } = useSessionStore();
+  const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [loading, setLoading] = useState(true);
 
   // Subscribe to Tauri events on mount (these don't need Router context)
@@ -119,10 +122,26 @@ function App() {
           break;
         case "disconnected":
           setWsConnected(false);
+          // Trigger reconnection via sync
+          console.log("[App] WebSocket disconnected, triggering sync for reconnection...");
+          invoke("sync_now").catch((err) => {
+            console.error("[App] Failed to trigger sync for reconnection:", err);
+          });
+          break;
+        case "message_request_changed":
+          // Refresh message requests from backend
+          invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests")
+            .then((result) => {
+              if (result.view_model?.message_requests) {
+                setRequests(result.view_model.message_requests);
+              }
+            })
+            .catch((err) => {
+              console.error("[App] Failed to refresh message requests:", err);
+            });
           break;
         case "head_updated":
         case "inbox_record_available":
-        case "message_request_changed":
           // These events should trigger a sync or refresh
           // The core-update event will handle the actual data refresh
           break;
@@ -158,7 +177,7 @@ function App() {
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected]);
+  }, [setSessionState, setWsConnected, setRequests]);
 
   if (loading) {
     return (

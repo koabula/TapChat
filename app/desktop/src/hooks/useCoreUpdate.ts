@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
+import { useMessageRequestsStore } from "../store/requests";
 import type { CoreUpdateEvent, ConversationSummary, ContactSummary } from "../lib/types";
 
 /**
@@ -17,6 +18,7 @@ export function useCoreUpdate() {
   const setContacts = useContactsStore((s) => s.setContacts);
   const sessionState = useSessionStore((s) => s.sessionState);
   const setDeviceId = useSessionStore((s) => s.setDeviceId);
+  const setRequests = useMessageRequestsStore((s) => s.setRequests);
 
   // Function to fetch and set all data
   const fetchAndSetData = async () => {
@@ -121,7 +123,7 @@ export function useCoreUpdate() {
 
       // Process message requests
       if (view_model.message_requests) {
-        // Could dispatch to a separate message requests store
+        setRequests(view_model.message_requests);
         console.log("[useCoreUpdate] Message requests:", view_model.message_requests.length);
       }
     });

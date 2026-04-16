@@ -2,10 +2,12 @@ import { useState } from "react";
 import { Outlet, useNavigate } from "react-router";
 import ConversationList from "./ConversationList";
 import { NetworkIndicator } from "@/components/SystemBanner";
+import { useMessageRequestsStore } from "@/store/requests";
 
 export default function ChatLayout() {
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
+  const requests = useMessageRequestsStore((s) => s.requests);
 
   return (
     <div className="flex h-screen bg-base">
@@ -44,6 +46,9 @@ export default function ChatLayout() {
           onClick={() => navigate("/requests")}
         >
           <span className="text-secondary-color">Message Requests</span>
+          {requests.length > 0 && (
+            <span className="badge badge-primary">{requests.length}</span>
+          )}
         </button>
 
         {/* Bottom nav */}
