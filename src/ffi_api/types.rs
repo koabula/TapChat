@@ -484,6 +484,8 @@ pub(crate) struct PendingOutboxItem {
     pub(crate) peer_user_id: String,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plaintext_cache: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

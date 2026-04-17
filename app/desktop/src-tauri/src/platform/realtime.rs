@@ -174,18 +174,22 @@ impl RealtimeManager {
         sessions.get(device_id).map(|s| s.connected).unwrap_or(false)
     }
 
-    fn build_ws_url(&self, endpoint: &str, _device_id: &str, last_acked_seq: u64) -> Result<String> {
-        // Convert HTTP endpoint to WebSocket URL
-        let ws_base = if endpoint.starts_with("https://") {
-            endpoint.replace("https://", "wss://")
-        } else if endpoint.starts_with("http://") {
-            endpoint.replace("http://", "ws://")
+    fn build_ws_url(&self, endpoint: &str, device_id: &str, last_acked_seq: u64) -> Result<String> {
+        // Replace {deviceId} placeholder with actual device_id
+        // The endpoint format from deployment bundle is:
+        // wss://worker-url/v1/inbox/{deviceId}/subscribe
+        let url_with_device = endpoint.replace("{deviceId}", &urlencoding::encode(device_id));
+
+        // Convert HTTP endpoint to WebSocket URL if needed
+        let ws_base = if url_with_device.starts_with("https://") {
+            url_with_device.replace("https://", "wss://")
+        } else if url_with_device.starts_with("http://") {
+            url_with_device.replace("http://", "ws://")
         } else {
-            endpoint.to_string()
+            url_with_device
         };
 
-        // Append subscription path
-        // Note: device_id is already included in the endpoint path
+        // Append query parameter
         Ok(format!(
             "{}?last_acked_seq={}",
             ws_base,

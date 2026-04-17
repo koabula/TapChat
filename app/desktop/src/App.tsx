@@ -142,8 +142,11 @@ function App() {
           break;
         case "head_updated":
         case "inbox_record_available":
-          // These events should trigger a sync or refresh
-          // The core-update event will handle the actual data refresh
+          // These events indicate new messages - trigger sync to fetch them
+          console.log("[App] Realtime event received, triggering sync...");
+          invoke("sync_now").catch((err) => {
+            console.error("[App] Failed to sync:", err);
+          });
           break;
       }
     });

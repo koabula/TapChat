@@ -61,6 +61,8 @@ pub struct PersistedOutgoingEnvelope {
     pub envelope: Envelope,
     pub peer_user_id: String,
     pub retries: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_cache: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

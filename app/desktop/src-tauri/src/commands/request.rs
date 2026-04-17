@@ -1,5 +1,5 @@
 use tauri::{AppHandle, Emitter, State};
-use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
+use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate, CoreEngine};
 use tapchat_core::transport_contract::MessageRequestAction;
 use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
 
@@ -61,6 +61,25 @@ pub async fn act_on_message_request(
             )
             .await
             .map_err(|e| e.to_string())?;
+
+            // Reload engine from profile to sync memory state with disk
+            {
+                let mut inner = state.inner.write().await;
+
+                // Load fresh snapshot from disk via ProfileManager
+                let snapshot = inner.profile_manager.load_snapshot()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // Reinitialize engine from updated snapshot
+                inner.engine = CoreEngine::from_restored_state(snapshot);
+
+                log::info!(
+                    "[act_on_message_request] Reloaded engine: {} conversations, {} contacts",
+                    inner.engine.refresh_snapshot().conversations.len(),
+                    inner.engine.refresh_snapshot().contacts.len()
+                );
+            }
 
             // Emit core-update to refresh frontend state
             let _ = app.emit("core-update", CoreOutput {

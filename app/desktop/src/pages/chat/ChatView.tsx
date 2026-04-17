@@ -10,6 +10,15 @@ import { useConversationsStore } from "@/store/conversations";
 import { useSessionStore } from "@/store/session";
 import type { Message, CoreUpdateEvent } from "@/lib/types";
 
+// Interface for send_text result
+interface SendMessageResult {
+  message_id: string;
+  conversation_id: string;
+  sender_device_id: string;
+  plaintext: string;
+  created_at: number;
+}
+
 export default function ChatView() {
   const { id: conversationId } = useParams();
   const [messages, setMessages] = useState<Message[]>([]);
@@ -42,7 +51,8 @@ export default function ChatView() {
 
     const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
       if (event.payload.state_update.messages_changed) {
-        loadMessages();
+        // Refresh messages without showing loading state (avoid UI flicker)
+        refreshMessages();
       }
     });
 
@@ -51,7 +61,7 @@ export default function ChatView() {
     };
   }, [conversationId]);
 
-  // Load messages when conversation changes
+  // Load messages when conversation changes (show loading only on initial load)
   useEffect(() => {
     if (conversationId) {
       loadMessages();
@@ -73,16 +83,51 @@ export default function ChatView() {
     }
   };
 
+  // Refresh messages without loading state (for updates)
+  const refreshMessages = async () => {
+    if (!conversationId) return;
+
+    try {
+      const result = await invoke<Message[]>("get_messages", { conversationId });
+      setMessages(result);
+    } catch (err) {
+      console.error("Failed to refresh messages:", err);
+    }
+  };
+
+  // Handle sent message - add immediately to local display
+  const handleSentMessage = (sentMsg?: SendMessageResult) => {
+    if (!sentMsg || !conversationId) return;
+
+    // Create a temporary message for immediate display
+    const tempMessage: Message = {
+      message_id: sentMsg.message_id,
+      sender_device_id: sentMsg.sender_device_id,
+      recipient_device_id: deviceId || "",
+      message_type: "sent",
+      created_at: sentMsg.created_at,
+      plaintext: sentMsg.plaintext,
+      has_attachment: false,
+      storage_refs: [],
+    };
+
+    // Add to messages list if not already present
+    setMessages(prev => {
+      if (prev.some(m => m.message_id === sentMsg.message_id)) {
+        return prev;
+      }
+      return [...prev, tempMessage];
+    });
+  };
+
   const formatTime = (timestamp: number) => {
     return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   };
 
-  // Determine if message was sent by me (my device)
+  // Determine if message was sent by me
+  // Backend returns "sent" for outgoing, "received" for incoming
   const isMyMessage = (msg: Message) => {
-    // "sent" type means outgoing message
-    if (msg.message_type === "sent") return true;
-    // Compare sender_device_id with my device_id
-    return deviceId && msg.sender_device_id === deviceId;
+    return msg.message_type === "sent";
   };
 
   // No conversation selected - show empty state
@@ -181,7 +226,7 @@ export default function ChatView() {
       {/* Input */}
       <MessageInput
         conversationId={conversationId}
-        onSent={loadMessages}
+        onSent={handleSentMessage}
       />
     </div>
   );

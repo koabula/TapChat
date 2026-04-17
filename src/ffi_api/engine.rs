@@ -216,6 +216,7 @@ impl CoreEngine {
                 peer_user_id: item.peer_user_id,
                 retries: item.retries,
                 in_flight: false,
+                plaintext_cache: item.plaintext_cache,
             })
             .collect();
         let outbox = pending_outbox
@@ -1181,7 +1182,12 @@ impl CoreEngine {
                 )
             })
             .collect::<CoreResult<Vec<_>>>()?;
-        self.enqueue_envelopes(peer_user_id, envelopes.clone());
+        // Cache plaintext for display until message is synced
+        self.enqueue_envelopes_with_plaintext(
+            peer_user_id,
+            envelopes.clone(),
+            plaintext.clone(),
+        );
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -2380,6 +2386,26 @@ impl CoreEngine {
                 peer_user_id: peer_user_id.clone(),
                 retries: 0,
                 in_flight: false,
+                plaintext_cache: None,
+            });
+        }
+    }
+
+    /// Enqueue envelopes with plaintext cache for sent messages
+    fn enqueue_envelopes_with_plaintext(
+        &mut self,
+        peer_user_id: String,
+        envelopes: Vec<Envelope>,
+        plaintext: String,
+    ) {
+        for envelope in envelopes {
+            self.state.outbox.push(envelope.clone());
+            self.state.pending_outbox.push(PendingOutboxItem {
+                envelope,
+                peer_user_id: peer_user_id.clone(),
+                retries: 0,
+                in_flight: false,
+                plaintext_cache: Some(plaintext.clone()),
             });
         }
     }
@@ -4476,6 +4502,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 envelope: item.envelope.clone(),
                 peer_user_id: item.peer_user_id.clone(),
                 retries: item.retries,
+                plaintext_cache: item.plaintext_cache.clone(),
             })
             .collect(),
         pending_acks: state

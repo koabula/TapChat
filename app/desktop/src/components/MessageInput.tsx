@@ -35,6 +35,18 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Interface for send_text result
+  interface SendMessageResult {
+    message_id: string;
+    conversation_id: string;
+    sender_device_id: string;
+    plaintext: string;
+    created_at: number;
+  }
+
+  // Extended onSent callback with message info for immediate display
+  const onSentWithMessage = onSent as ((msg?: SendMessageResult) => void) | undefined;
+
   // Listen for upload progress events
   useEffect(() => {
     const unlisten = listen<UploadProgressEvent>("upload-progress", (event) => {
@@ -103,14 +115,16 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   const handleSendText = async () => {
     if (!inputText.trim()) return;
 
+    const textToSend = inputText;
     setSending(true);
     try {
-      await invoke("send_text", {
+      const result = await invoke<SendMessageResult>("send_text", {
         conversationId,
-        plaintext: inputText,
+        plaintext: textToSend,
       });
       setInputText("");
-      onSent?.();
+      // Pass the sent message info for immediate display
+      onSentWithMessage?.(result);
     } catch (err) {
       console.error("Failed to send:", err);
       const errorMsg = String(err);
