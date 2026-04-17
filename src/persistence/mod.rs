@@ -627,6 +627,7 @@ mod tests {
                 },
                 peer_user_id: "user:bob".into(),
                 retries: 0,
+                plaintext_cache: Some("test plaintext".into()),
             }],
             pending_acks: vec![PersistedPendingAck {
                 device_id: identity.device_identity.device_id.clone(),

@@ -6,7 +6,7 @@ use tapchat_core::ffi_api::ConversationSummary;
 use tapchat_core::model::ConversationKind;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
-use crate::state::AppState;
+use crate::state::{AppState, SessionState};
 
 /// Simplified result for create_conversation command
 #[derive(Debug, Clone, Serialize)]
@@ -75,9 +75,29 @@ pub async fn get_messages(
     let snapshot = inner.engine.refresh_snapshot();
 
     // Get local device_id to determine message direction
+    // Primary source: local_identity from snapshot
+    // Fallback: device_id from session state (set during profile switch/startup)
     let local_device_id = snapshot.local_identity
         .as_ref()
-        .map(|li| li.state.device_identity.device_id.clone());
+        .map(|li| li.state.device_identity.device_id.clone())
+        .or_else(|| {
+            // Fallback to session state device_id
+            match &inner.session {
+                SessionState::Active { device_id } => Some(device_id.clone()),
+                _ => None,
+            }
+        });
+
+    // Log for debugging
+    log::info!(
+        "get_messages: conversation_id={}, local_device_id={}, messages_count={}",
+        conversation_id,
+        local_device_id.as_deref().unwrap_or("NONE"),
+        snapshot.conversations.iter()
+            .find(|c| c.conversation_id == conversation_id)
+            .map(|p| p.state.messages.len())
+            .unwrap_or(0)
+    );
 
     // Find the conversation and extract messages
     let conversation_messages: Vec<serde_json::Value> = snapshot.conversations

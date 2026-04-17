@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::Signer;
+use log;
 use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
@@ -2437,19 +2438,24 @@ impl CoreEngine {
         }
 
         // Check if conversation is still recovering
-        // If recovery_status is NeedsRecovery but there's no active recovery context,
-        // the recovery may have completed during a previous session - clear it
         if recovery_status == RecoveryStatus::NeedsRecovery {
-            // Check if there's an active recovery context for this conversation
-            if self.state.recovery_contexts.contains_key(conversation_id) {
+            // Check the actual MLS group state to determine if recovery is complete
+            // The MLS summary reflects the true cryptographic state of the group
+            let mls_status = self.state.mls_summaries
+                .get(conversation_id)
+                .map(|s| s.status);
+
+            // If MLS group is Active, recovery has completed - clear recovery state
+            if mls_status == Some(MlsStateStatus::Active) {
+                self.state.recovery_contexts.remove(conversation_id);
+                if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                    state.recovery_status = RecoveryStatus::Healthy;
+                }
+            } else {
+                // MLS group is still recovering or status unknown
                 return Err(CoreError::temporary_failure(
                     "conversation membership is still recovering",
                 ));
-            }
-            // No active recovery context - recovery may have completed
-            // Clear the recovery status to allow sending
-            if let Some(state) = self.state.conversations.get_mut(conversation_id) {
-                state.recovery_status = RecoveryStatus::Healthy;
             }
         }
         self.direct_peer_contact_bundle(&peer_user_id)?;
@@ -2566,6 +2572,10 @@ impl CoreEngine {
         let sender_device_id = identity.device_identity.device_id.clone();
         let sender_proof = identity.sign_sender_proof(payload_b64.as_bytes());
         let message_nonce = self.next_message_nonce();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(message_nonce);
         Ok(Envelope {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             message_id: self.next_message_id(conversation_id, recipient_device_id, message_nonce),
@@ -2573,7 +2583,7 @@ impl CoreEngine {
             sender_user_id,
             sender_device_id,
             recipient_device_id: recipient_device_id.to_string(),
-            created_at: message_nonce,
+            created_at,
             message_type,
             inline_ciphertext: Some(payload_b64.clone()),
             storage_refs: vec![],
@@ -3793,6 +3803,11 @@ impl CoreEngine {
                                     .unwrap_or_default(),
                             )? {
                             IngestResult::AppliedApplication(application) => {
+                                log::info!(
+                                    "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
+                                    record.message_id,
+                                    application.plaintext.len()
+                                );
                                 if let Some(state) =
                                     self.state.conversations.get_mut(&conversation_id)
                                 {
@@ -3803,7 +3818,24 @@ impl CoreEngine {
                                     {
                                         message.plaintext =
                                             String::from_utf8(application.plaintext).ok();
+                                        log::info!(
+                                            "handle_inbox_records: Set plaintext for message {} to {:?}",
+                                            record.message_id,
+                                            message.plaintext.as_deref().map(|s| if s.len() > 50 { &s[..50] } else { s })
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "handle_inbox_records: Could not find message {} in conversation {} to set plaintext",
+                                            record.message_id,
+                                            conversation_id
+                                        );
                                     }
+                                } else {
+                                    log::warn!(
+                                        "handle_inbox_records: Conversation {} not found for message {}",
+                                        conversation_id,
+                                        record.message_id
+                                    );
                                 }
                                 if let Ok(summary) = self
                                     .state
@@ -3860,6 +3892,11 @@ impl CoreEngine {
                                 ackable = true;
                             }
                             IngestResult::PendingRetry => {
+                                log::warn!(
+                                    "handle_inbox_records: PendingRetry for message {} in conversation {}",
+                                    record.message_id,
+                                    conversation_id
+                                );
                                 let reason = self.recovery_reason_for_record(&conversation_id);
                                 {
                                     let sync_state = self
@@ -3879,6 +3916,11 @@ impl CoreEngine {
                                 pending_recovery_conversations.insert(conversation_id.clone());
                             }
                             IngestResult::NeedsRebuild => {
+                                log::warn!(
+                                    "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
+                                    record.message_id,
+                                    conversation_id
+                                );
                                 output = merge_outputs(
                                     output,
                                     self.escalate_conversation_to_rebuild(
@@ -4186,17 +4228,27 @@ impl CoreEngine {
     }
 
     fn handle_append_delivery_result(
-        &self,
+        &mut self,
         message_id: &str,
         result: &AppendEnvelopeResult,
     ) -> CoreOutput {
-        let peer_user_id = self
+        // Find the pending outbox item to get plaintext and conversation info
+        let pending_item = self
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_id == message_id)
+            .find(|item| item.envelope.message_id == message_id);
+
+        let peer_user_id = pending_item
             .map(|item| item.peer_user_id.clone())
             .unwrap_or_else(|| "peer".into());
+
+        let plaintext_cache = pending_item
+            .and_then(|item| item.plaintext_cache.clone());
+
+        let envelope = pending_item
+            .map(|item| item.envelope.clone());
+
         let append_result = AppendResultSummary {
             accepted: result.accepted,
             delivered_to: result.delivered_to.clone(),
@@ -4204,10 +4256,54 @@ impl CoreEngine {
             request_id: result.request_id.clone(),
             seq: Some(result.seq),
         };
+
+        // When message is delivered to inbox, store it in conversation.messages
+        // This ensures the message is preserved even after pending_outbox is cleared
+        let messages_changed = if result.delivered_to == AppendDeliveryDisposition::Inbox {
+            if let Some(env) = &envelope {
+                let conversation_id = env.conversation_id.clone();
+                if let Some(conv) = self.state.conversations.get_mut(&conversation_id) {
+                    // Check if message already exists (avoid duplicates)
+                    if !conv.messages.iter().any(|m| m.message_id == message_id) {
+                        conv.messages.push(crate::conversation::StoredMessage {
+                            message_id: message_id.to_string(),
+                            sender_device_id: env.sender_device_id.clone(),
+                            recipient_device_id: env.recipient_device_id.clone(),
+                            message_type: env.message_type,
+                            created_at: env.created_at,
+                            plaintext: plaintext_cache.clone(),
+                            storage_refs: env.storage_refs.clone(),
+                            downloaded_blob_b64: None,
+                        });
+                        conv.last_message_type = Some(env.message_type);
+                        log::info!(
+                            "handle_append_delivery_result: stored message {} in conversation {} with plaintext={}",
+                            message_id,
+                            conversation_id,
+                            plaintext_cache.is_some()
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let (status, message, banner) = match result.delivered_to {
             AppendDeliveryDisposition::Inbox => {
                 return CoreOutput {
-                    state_update: CoreStateUpdate::default(),
+                    state_update: CoreStateUpdate {
+                        messages_changed,
+                        conversations_changed: messages_changed,
+                        ..CoreStateUpdate::default()
+                    },
                     effects: vec![],
                     view_model: Some(CoreViewModel {
                         append_result: Some(append_result),

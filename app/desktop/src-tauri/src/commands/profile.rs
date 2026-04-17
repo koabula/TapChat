@@ -14,7 +14,19 @@ pub async fn list_profiles(
     state: State<'_, AppState>,
 ) -> Result<Vec<ProfileSummary>, String> {
     let pm = &state.inner.read().await.profile_manager;
-    Ok(pm.list_profiles().await)
+    let profiles = pm.list_profiles().await;
+    log::info!("list_profiles: returning {} profiles", profiles.len());
+    for p in &profiles {
+        log::info!(
+            "list_profiles: profile '{}' at {}, is_active={}, user_id={}, device_id={}",
+            p.name,
+            p.path.display(),
+            p.is_active,
+            p.user_id.as_deref().unwrap_or("None"),
+            p.device_id.as_deref().unwrap_or("None")
+        );
+    }
+    Ok(profiles)
 }
 
 #[tauri::command]
@@ -74,6 +86,8 @@ pub async fn activate_profile(
     state: State<'_, AppState>,
     path: PathBuf,
 ) -> Result<(), String> {
+    log::info!("activate_profile: activating profile at {}", path.display());
+
     // Activate the profile
     {
         let pm = &state.inner.read().await.profile_manager;
@@ -85,6 +99,7 @@ pub async fn activate_profile(
     // Reload the engine from the new profile
     reload_engine_from_profile(&app, &state).await?;
 
+    log::info!("activate_profile: completed successfully");
     Ok(())
 }
 
@@ -97,7 +112,12 @@ pub async fn delete_profile(
     // Check if this is the active profile
     let is_active = {
         let inner = state.inner.read().await;
-        inner.profile_manager.inner.read().await.registry.active_profile.as_ref() == Some(&path)
+        let pm_inner = inner.profile_manager.inner.read().await;
+        let result = pm_inner.registry.active_profile.as_ref() == Some(&path);
+        // Explicitly drop to avoid borrow issues
+        drop(pm_inner);
+        drop(inner);
+        result
     };
 
     if is_active {
@@ -129,7 +149,10 @@ async fn reload_engine_from_profile(
     app: &AppHandle,
     state: &State<'_, AppState>,
 ) -> Result<(), String> {
-    // First, close all existing realtime connections silently to avoid disconnect notifications
+    // Emit profile-switch-start to notify frontend that we're beginning a switch
+    let _ = app.emit("profile-switch-start", {});
+
+    // Step 1: Close all existing realtime connections silently
     {
         let inner = state.inner.read().await;
         if let Err(e) = inner.ports.realtime.close_all_silent().await {
@@ -137,14 +160,39 @@ async fn reload_engine_from_profile(
         }
     }
 
-    // Load snapshot from active profile
+    // Step 2: Wait for old connections to fully close
+    // This prevents race conditions where old websocket events might
+    // arrive during the new profile initialization
+    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Step 3: Load snapshot from active profile
     let snapshot = {
         let inner = state.inner.read().await;
+        log::info!(
+            "reload_engine_from_profile: loading snapshot, active_profile={}",
+            inner.profile_manager.inner.read().await.active_profile.is_some()
+        );
         inner.profile_manager.load_snapshot().await
             .map_err(|e| format!("Failed to load snapshot: {}", e))?
     };
 
-    // Get device_id from profile metadata
+    log::info!(
+        "reload_engine_from_profile: snapshot loaded, local_identity={}, deployment={}, contacts={}, conversations={}",
+        snapshot.local_identity.is_some(),
+        snapshot.deployment.is_some(),
+        snapshot.contacts.len(),
+        snapshot.conversations.len()
+    );
+
+    if let Some(deployment) = &snapshot.deployment {
+        log::info!(
+            "reload_engine_from_profile: deployment_bundle has inbox_websocket_endpoint={}, inbox_http_endpoint={}",
+            deployment.deployment_bundle.inbox_websocket_endpoint,
+            deployment.deployment_bundle.inbox_http_endpoint
+        );
+    }
+
+    // Step 4: Get device_id from profile metadata
     let device_id = {
         let inner = state.inner.read().await;
         inner.profile_manager.get_active_metadata().await
@@ -152,30 +200,39 @@ async fn reload_engine_from_profile(
             .unwrap_or_else(|| "unknown-device".to_string())
     };
 
-    // Reinitialize engine from snapshot
+    log::info!("reload_engine_from_profile: device_id={}", device_id);
+
+    // Step 5: Reinitialize engine from snapshot
     {
         let mut inner = state.inner.write().await;
         inner.engine = CoreEngine::from_restored_state(snapshot);
         inner.session = SessionState::Active { device_id: device_id.clone() };
     }
 
-    // Emit session-status event - this happens BEFORE websocket connect
+    // Step 6: Emit session-status event - this happens BEFORE websocket connect
     let _ = app.emit("session-status", SessionStatus {
         state: "active".to_string(),
         device_id: Some(device_id.clone()),
         ws_connected: false,
     });
 
-    // Notify frontend of the reload (for clearing stores)
+    // Step 7: Notify frontend of the reload (for clearing stores)
+    // This triggers the frontend to clear its state and prepare for new data
     let _ = app.emit("engine-reloaded", {});
 
-    // Start session with AppStarted event - this may fail on websocket connect
-    // but profile switch is already successful, so we don't propagate this error
+    log::info!("reload_engine_from_profile: events emitted, starting AppStarted");
+
+    // Step 8: Start session with AppStarted event - this will establish new websocket
+    // If websocket connect fails, profile switch still succeeded, just realtime failed
     if let Err(e) = drive_core_with_handle(app, CoreInput::Event(tapchat_core::CoreEvent::AppStarted)).await {
-        // Log the error but don't fail the profile switch
         log::warn!("Failed to start realtime session after profile switch: {}", e);
         // Return success anyway - profile switch is complete, just realtime failed
     }
+
+    // Step 9: Emit profile-switch-complete to notify frontend that switch is done
+    let _ = app.emit("profile-switch-complete", {});
+
+    log::info!("reload_engine_from_profile: completed successfully");
 
     Ok(())
 }

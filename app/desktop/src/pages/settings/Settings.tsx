@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { listen } from "@tauri-apps/api/event";
 
 import {
   getIdentityInfo,
@@ -52,6 +53,19 @@ export default function Settings() {
     // Check system preference for dark mode
     const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
     setDarkMode(isDark);
+
+    // Listen for engine-reloaded event (profile switch) to reload all data
+    const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {
+      console.log("[Settings] Engine reloaded, refreshing data...");
+      loadIdentity();
+      loadRuntimeStatus();
+      loadAllowlist();
+      loadProfiles();
+    });
+
+    return () => {
+      unlistenEngineReloaded.then((fn) => fn());
+    };
   }, []);
 
   const loadIdentity = async () => {
@@ -161,6 +175,9 @@ export default function Settings() {
     setSwitchingProfile(path);
     try {
       await activateProfile(path);
+      // Do NOT reload data here - wait for engine-reloaded event
+      // which will trigger useCoreUpdate to fetch new data
+      // The profile-switch-complete event signals that the switch is done
     } catch (err) {
       console.error("Profile switch error:", err);
       // Don't show popup for transient errors like websocket connect
@@ -169,12 +186,9 @@ export default function Settings() {
         alert(errorMsg);
       }
     } finally {
-      // Always reload all data - profile switch may have succeeded even if websocket failed
-      // The engine-reloaded event will also trigger store refresh via useCoreUpdate
+      // Just update the profiles list and clear switching state
+      // Identity/runtime/allowlist data will be refreshed via engine-reloaded event
       loadProfiles();
-      loadIdentity();
-      loadRuntimeStatus();
-      loadAllowlist();
       setSwitchingProfile(null);
     }
   };

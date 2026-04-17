@@ -5,7 +5,7 @@ resolver = "2"
 [package]
 name = "TapChat"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 name = "tapchat_core"
@@ -37,6 +37,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 urlencoding = "2"
+log = "0.4"
 
 [dev-dependencies]
 tapchat_transport_adapter = { path = "crates/tapchat_transport_adapter" }

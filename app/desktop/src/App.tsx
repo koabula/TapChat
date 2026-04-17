@@ -98,6 +98,8 @@ function App() {
   const { setSessionState, setWsConnected, setDeviceId } = useSessionStore();
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [loading, setLoading] = useState(true);
+  // Track if we're in a profile switch to avoid triggering reconnect
+  const [isProfileSwitching, setIsProfileSwitching] = useState(false);
 
   // Subscribe to Tauri events on mount (these don't need Router context)
   useEffect(() => {
@@ -111,6 +113,18 @@ function App() {
       }
     });
 
+    // Subscribe to profile switch events to track state
+    const unlistenProfileSwitchStart = listen<void>("profile-switch-start", () => {
+      console.log("[App] profile-switch-start: entering profile switch mode");
+      setIsProfileSwitching(true);
+      setWsConnected(false);
+    });
+
+    const unlistenProfileSwitchComplete = listen<void>("profile-switch-complete", () => {
+      console.log("[App] profile-switch-complete: exiting profile switch mode");
+      setIsProfileSwitching(false);
+    });
+
     // Subscribe to realtime WebSocket events
     const unlistenRealtime = listen<RealtimeEventPayload>("realtime-event", (event) => {
       console.log("[App] realtime-event:", event.payload);
@@ -122,18 +136,44 @@ function App() {
           break;
         case "disconnected":
           setWsConnected(false);
-          // Trigger reconnection via sync
-          console.log("[App] WebSocket disconnected, triggering sync for reconnection...");
-          invoke("sync_now").catch((err) => {
-            console.error("[App] Failed to trigger sync for reconnection:", err);
-          });
+          // Only attempt reconnect if not in profile switch mode
+          if (!isProfileSwitching) {
+            console.log("[App] WebSocket disconnected, scheduling reconnect...");
+            // Schedule a reconnect attempt after a short delay
+            setTimeout(() => {
+              if (!isProfileSwitching) {
+                console.log("[App] Attempting reconnect...");
+                invoke("sync_now").catch((err) => {
+                  console.error("[App] Reconnect attempt failed:", err);
+                });
+              }
+            }, 2000);
+          } else {
+            console.log("[App] WebSocket disconnected during profile switch, skipping reconnect");
+          }
+          break;
+        case "error":
+          setWsConnected(false);
+          console.log("[App] WebSocket error:", event.payload.data);
+          // Also attempt reconnect on error if not switching
+          if (!isProfileSwitching) {
+            setTimeout(() => {
+              if (!isProfileSwitching) {
+                invoke("sync_now").catch((err) => {
+                  console.error("[App] Reconnect after error failed:", err);
+                });
+              }
+            }, 3000);
+          }
           break;
         case "message_request_changed":
           // Refresh message requests from backend
+          console.log("[App] Message request changed, refreshing...");
           invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests")
             .then((result) => {
               if (result.view_model?.message_requests) {
                 setRequests(result.view_model.message_requests);
+                console.log("[App] Message requests updated:", result.view_model.message_requests.length);
               }
             })
             .catch((err) => {
@@ -176,11 +216,13 @@ function App() {
 
     return () => {
       unlistenSessionStatus.then((fn) => fn());
+      unlistenProfileSwitchStart.then((fn) => fn());
+      unlistenProfileSwitchComplete.then((fn) => fn());
       unlistenRealtime.then((fn) => fn());
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected, setRequests]);
+  }, [setSessionState, setWsConnected, setRequests, isProfileSwitching]);
 
   if (loading) {
     return (
