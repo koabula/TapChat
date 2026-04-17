@@ -146,7 +146,7 @@ export default function ChatView() {
   }
 
   return (
-    <div className="flex-1 flex flex-col bg-base">
+    <div className="flex-1 flex flex-col bg-base min-h-0">
       {/* Header */}
       <header className="flex items-center gap-3 p-3 border-b border-default bg-surface animate-fade-in-down">
         <div className="avatar animate-scale-in">
@@ -170,7 +170,7 @@ export default function ChatView() {
       </header>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
         {loading && (
           <div className="text-center py-8">
             <div className="inline-block animate-spin text-2xl text-muted-color">⏳</div>

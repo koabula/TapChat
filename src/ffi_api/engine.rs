@@ -2410,28 +2410,49 @@ impl CoreEngine {
         }
     }
 
-    fn ensure_conversation_ready_for_send(&self, conversation_id: &str) -> CoreResult<()> {
+    fn ensure_conversation_ready_for_send(&mut self, conversation_id: &str) -> CoreResult<()> {
         if conversation_id.trim().is_empty() {
             return Err(CoreError::invalid_input(
                 "conversation_id must not be empty",
             ));
         }
-        let conversation = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-        if conversation.conversation.state == ConversationState::NeedsRebuild {
+        // Get conversation state info first (immutable borrow)
+        let (conv_state, recovery_status, peer_user_id) = {
+            let conversation = self
+                .state
+                .conversations
+                .get(conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+            (
+                conversation.conversation.state,
+                conversation.recovery_status,
+                conversation.peer_user_id.clone(),
+            )
+        };
+
+        if conv_state == ConversationState::NeedsRebuild {
             return Err(CoreError::invalid_state(
                 "conversation needs rebuild before sending new messages",
             ));
         }
-        if conversation.recovery_status != RecoveryStatus::Healthy {
-            return Err(CoreError::temporary_failure(
-                "conversation membership is still recovering",
-            ));
+
+        // Check if conversation is still recovering
+        // If recovery_status is NeedsRecovery but there's no active recovery context,
+        // the recovery may have completed during a previous session - clear it
+        if recovery_status == RecoveryStatus::NeedsRecovery {
+            // Check if there's an active recovery context for this conversation
+            if self.state.recovery_contexts.contains_key(conversation_id) {
+                return Err(CoreError::temporary_failure(
+                    "conversation membership is still recovering",
+                ));
+            }
+            // No active recovery context - recovery may have completed
+            // Clear the recovery status to allow sending
+            if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                state.recovery_status = RecoveryStatus::Healthy;
+            }
         }
-        self.direct_peer_contact_bundle(&conversation.peer_user_id)?;
+        self.direct_peer_contact_bundle(&peer_user_id)?;
         Ok(())
     }
 

@@ -12,7 +12,7 @@ export default function ChatLayout() {
   return (
     <div className="flex h-screen bg-base">
       {/* Sidebar */}
-      <aside className="w-72 sidebar flex flex-col">
+      <aside className="w-72 sidebar flex flex-col h-full">
         {/* Header */}
         <div className="flex items-center p-3 border-b border-default">
           <h1 className="font-semibold text-primary-color">TapChat</h1>
@@ -78,7 +78,7 @@ export default function ChatLayout() {
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 flex flex-col">
+      <main className="flex-1 flex flex-col overflow-hidden">
         <Outlet />
       </main>
     </div>
