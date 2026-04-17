@@ -1,25 +1,33 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
-import type { MessageRequestItem, CoreOutput } from "@/lib/types";
+import { useMessageRequestsStore } from "@/store/requests";
+import { useConversationsStore } from "@/store/conversations";
+import { useContactsStore } from "@/store/contacts";
+
+import type { MessageRequestActionOutput } from "@/lib/types";
 
 export default function MessageRequests() {
   const navigate = useNavigate();
-  const [requests, setRequests] = useState<MessageRequestItem[]>([]);
+  const requests = useMessageRequestsStore((s) => s.requests);
+  const removeRequest = useMessageRequestsStore((s) => s.removeRequest);
+  const setConversations = useConversationsStore((s) => s.setConversations);
+  const setContacts = useContactsStore((s) => s.setContacts);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
 
+  // Sync from backend on mount
   useEffect(() => {
-    loadRequests();
+    loadFromBackend();
   }, []);
 
-  const loadRequests = async () => {
+  const loadFromBackend = async () => {
     setLoading(true);
     try {
-      const result = await invoke<CoreOutput>("list_message_requests");
+      const result = await invoke<{ view_model?: { message_requests?: typeof requests } }>("list_message_requests");
       if (result.view_model?.message_requests) {
-        setRequests(result.view_model.message_requests);
+        useMessageRequestsStore.getState().setRequests(result.view_model.message_requests);
       }
     } catch (err) {
       console.error("Failed to load message requests:", err);
@@ -39,11 +47,53 @@ export default function MessageRequests() {
   const handleAction = async (requestId: string, action: "accept" | "reject") => {
     setActing(requestId);
     try {
-      await invoke("act_on_message_request", { requestId, action });
-      // Remove from list
-      setRequests((prev) => prev.filter((r) => r.request_id !== requestId));
+      const result = await invoke<MessageRequestActionOutput>("act_on_message_request", { requestId, action });
+
+      // Remove from local store immediately
+      removeRequest(requestId);
+
+      // If accepted and conversation was created, refresh conversations and contacts
+      if (action === "accept" && result.accepted) {
+        console.log("[MessageRequests] Accept result:", result);
+
+        // Refresh conversations to show the newly created conversation
+        try {
+          const conversations = await invoke<{ conversation_id: string; peer_user_id: string; state: string }[]>("list_conversations");
+          setConversations(conversations.map(c => ({
+            conversation_id: c.conversation_id,
+            peer_user_id: c.peer_user_id,
+            state: c.state,
+            last_message: null,
+            last_message_time: null,
+            unread_count: 0,
+          })));
+          console.log("[MessageRequests] Refreshed conversations:", conversations.length);
+
+          // Refresh contacts
+          const contacts = await invoke<{ user_id: string; device_count: number }[]>("list_contacts");
+          setContacts(contacts.map(c => ({
+            user_id: c.user_id,
+            display_name: null,
+            device_count: c.device_count,
+            last_refresh: null,
+          })));
+          console.log("[MessageRequests] Refreshed contacts:", contacts.length);
+
+          // Navigate to the new conversation if one was created
+          if (result.conversation_id) {
+            navigate(`/chat/${result.conversation_id}`);
+          } else {
+            navigate("/");
+          }
+        } catch (err) {
+          console.error("[MessageRequests] Failed to refresh after accept:", err);
+          navigate("/");
+        }
+      }
     } catch (err) {
       console.error("Failed to action request:", err);
+      // Reload from backend on error to restore state
+      loadFromBackend();
     } finally {
       setActing(null);
     }

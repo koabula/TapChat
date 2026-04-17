@@ -3,6 +3,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { stdin, stdout, stderr } from "node:process";
+import fs from "node:fs/promises";
+import os from "node:os";
+import https from "node:https";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SERVICE_DIR = path.resolve(SCRIPT_DIR, "..");
@@ -10,6 +13,7 @@ const WRANGLER_ENTRY = path.join(SERVICE_DIR, "node_modules", "wrangler", "bin",
 const NODE_COMMAND = process.execPath;
 const PREFIX = "tapchat-";
 const YES_MODE = process.argv.includes("--yes");
+const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 
 function wranglerArgs(...args) {
   return [WRANGLER_ENTRY, ...args];
@@ -125,11 +129,163 @@ async function deleteWorker(name) {
   });
 }
 
-async function deleteBucket(name) {
-  await runCommand(NODE_COMMAND, wranglerArgs("r2", "bucket", "delete", name), {
-    capture: true,
-    input: "y\n"
+// Parse wrangler config to get OAuth token
+async function getWranglerConfig() {
+  const configPath = path.join(os.homedir(), ".wrangler", "config", "default.toml");
+  try {
+    const content = await fs.readFile(configPath, "utf-8");
+    const config = {};
+    // Simple TOML parsing for key = "value" format
+    for (const line of content.split(/\r?\n/)) {
+      const match = line.match(/^\s*(\w+)\s*=\s*"([^"]*)"\s*$/);
+      if (match) {
+        config[match[1]] = match[2];
+      }
+    }
+    return config;
+  } catch {
+    return null;
+  }
+}
+
+// HTTP request helper using native https module
+async function httpGet(url, headers) {
+  return await new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: "GET",
+      headers,
+    }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => body += chunk);
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+    });
+    req.on("error", reject);
+    req.end();
   });
+}
+
+async function httpDelete(url, headers) {
+  return await new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: "DELETE",
+      headers,
+    }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => body += chunk);
+      res.on("end", () => resolve({ status: res.statusCode, body }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function listBucketObjects(accountId, bucketName, apiToken) {
+  // Use Cloudflare R2 REST API to list objects
+  // API endpoint: GET https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket_name}/objects
+  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${bucketName}/objects`;
+
+  try {
+    const response = await httpGet(url, {
+      "Authorization": `Bearer ${apiToken}`,
+    });
+
+    if (response.status !== 200) {
+      // Bucket might be empty or not exist
+      return [];
+    }
+
+    const parsed = JSON.parse(response.body);
+    // Response format: { result: [...] }
+    const objects = parsed.result || [];
+    return objects.map(obj => obj.key || obj.name || obj);
+  } catch {
+    return [];
+  }
+}
+
+async function deleteBucketObjectViaApi(accountId, bucketName, objectKey, apiToken) {
+  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${bucketName}/objects/${encodeURIComponent(objectKey)}`;
+
+  const response = await httpDelete(url, {
+    "Authorization": `Bearer ${apiToken}`,
+  });
+
+  return response.status === 200 || response.status === 204;
+}
+
+async function deleteBucketObject(accountId, bucketName, objectKey, apiToken) {
+  // Prefer REST API for efficiency, fallback to wrangler CLI if API fails
+  try {
+    const success = await deleteBucketObjectViaApi(accountId, bucketName, objectKey, apiToken);
+    if (success) return;
+  } catch {
+    // Fallback to wrangler
+  }
+
+  // Fallback: Use wrangler r2 object delete command
+  await runCommand(
+    NODE_COMMAND,
+    wranglerArgs("r2", "object", "delete", `${bucketName}/${objectKey}`),
+    { capture: true, allowFailure: true }
+  );
+}
+
+async function emptyBucket(accountId, bucketName, apiToken) {
+  stdout.write(`Emptying bucket ${bucketName}...\n`);
+
+  let deletedCount = 0;
+  let iteration = 0;
+  const maxIterations = 100; // Safety limit
+
+  // R2 list API is paginated, so we need to loop until empty
+  while (iteration < maxIterations) {
+    iteration++;
+    const objects = await listBucketObjects(accountId, bucketName, apiToken);
+
+    if (objects.length === 0) {
+      stdout.write(`  Bucket ${bucketName} is now empty (deleted ${deletedCount} objects in ${iteration} iterations)\n`);
+      return;
+    }
+
+    stdout.write(`  Deleting ${objects.length} objects from ${bucketName} (iteration ${iteration})...\n`);
+
+    // Delete objects in parallel batches for efficiency
+    const batchSize = 20;
+    for (let i = 0; i < objects.length; i += batchSize) {
+      const batch = objects.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        batch.map(objectKey => deleteBucketObjectViaApi(accountId, bucketName, objectKey, apiToken))
+      );
+      for (const result of results) {
+        if (result.status === "fulfilled" && result.value) {
+          deletedCount++;
+        } else if (result.status === "rejected") {
+          stderr.write(`  Warning: ${result.reason?.message || result.reason}\n`);
+        }
+      }
+    }
+  }
+
+  stdout.write(`  Emptied ${deletedCount} objects from ${bucketName} (max iterations reached)\n`);
+}
+
+async function deleteBucket(name, accountId, apiToken) {
+  // First empty the bucket
+  await emptyBucket(accountId, name, apiToken);
+
+  // Now delete the empty bucket via REST API
+  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${name}`;
+  const response = await httpDelete(url, {
+    "Authorization": `Bearer ${apiToken}`,
+  });
+
+  if (response.status !== 200 && response.status !== 204) {
+    // Fallback to wrangler CLI
+    await runCommand(NODE_COMMAND, wranglerArgs("r2", "bucket", "delete", name), {
+      capture: true,
+      input: "y\n"
+    });
+  }
 }
 
 async function confirmDeletion(workers, buckets) {
@@ -150,7 +306,17 @@ async function confirmDeletion(workers, buckets) {
 async function main() {
   logStep("Checking Wrangler login...");
   const whoami = await runWranglerWhoAmI();
-  logStep(`Using Cloudflare account: ${whoami.accounts?.[0]?.name ?? "unknown"} (${whoami.accounts?.[0]?.id ?? "unknown"})`);
+  const accountId = whoami.accounts?.[0]?.id;
+  logStep(`Using Cloudflare account: ${whoami.accounts?.[0]?.name ?? "unknown"} (${accountId ?? "unknown"})`);
+
+  // Get wrangler config for direct API access
+  const wranglerConfig = await getWranglerConfig();
+  const apiToken = wranglerConfig?.oauth_token;
+
+  if (!apiToken) {
+    stderr.write("Warning: Could not get OAuth token from wrangler config. Bucket emptying may be slower.\n");
+  }
+
   logStep("Listing TapChat R2 buckets...");
   const buckets = await listBuckets();
   const workers = deriveWorkersFromBuckets(buckets);
@@ -182,7 +348,15 @@ async function main() {
   for (const bucket of buckets) {
     try {
       stdout.write(`Deleting bucket ${bucket}\n`);
-      await deleteBucket(bucket);
+      if (apiToken && accountId) {
+        await deleteBucket(bucket, accountId, apiToken);
+      } else {
+        // Fallback: try wrangler CLI (will fail if bucket has objects)
+        await runCommand(NODE_COMMAND, wranglerArgs("r2", "bucket", "delete", bucket), {
+          capture: true,
+          input: "y\n"
+        });
+      }
     } catch (error) {
       bucketFailures.push({ bucket, error: error instanceof Error ? error.message : String(error) });
     }

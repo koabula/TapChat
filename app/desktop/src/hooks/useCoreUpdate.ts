@@ -5,7 +5,7 @@ import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
 import { useMessageRequestsStore } from "../store/requests";
-import type { CoreUpdateEvent, ConversationSummary, ContactSummary } from "../lib/types";
+import type { CoreUpdateEvent, ConversationSummary, ContactSummary, MessageRequestItem } from "../lib/types";
 
 /**
  * Hook that listens to core-update events and dispatches them to the appropriate stores.
@@ -50,6 +50,13 @@ export function useCoreUpdate() {
         last_refresh: null,
       }));
       setContacts(mappedContacts);
+
+      // Fetch message requests
+      const requestsResult = await invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests");
+      if (requestsResult.view_model?.message_requests) {
+        setRequests(requestsResult.view_model.message_requests);
+        console.log("[useCoreUpdate] Loaded message requests:", requestsResult.view_model.message_requests.length);
+      }
 
       // Fetch identity info to get device_id
       try {
@@ -141,7 +148,7 @@ export function useCoreUpdate() {
       unlistenCoreUpdate.then((fn) => fn());
       unlistenEngineReloaded.then((fn) => fn());
     };
-  }, [setConversations, setContacts, setDeviceId, sessionState]);
+  }, [setConversations, setContacts, setDeviceId, setRequests, sessionState]);
 }
 
 function formatMessageType(type: string): string {

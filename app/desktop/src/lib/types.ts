@@ -90,6 +90,18 @@ export interface MessageRequestItem {
   last_conversation_id: string;
 }
 
+// Message Request Action Output (matches Rust MessageRequestActionOutput)
+export interface MessageRequestActionOutput {
+  accepted: boolean;
+  request_id: string;
+  sender_user_id: string;
+  action: string;
+  contact_available: boolean;
+  conversation_available: boolean;
+  auto_created_conversation: boolean;
+  conversation_id?: string;
+}
+
 // Allowlist
 export interface AllowlistDocument {
   allowed_sender_user_ids: string[];
