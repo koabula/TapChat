@@ -94,7 +94,7 @@ export default function Devices() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-base">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-base">
       {/* Header */}
       <header className="flex items-center p-3 border-b border-default">
         <button className="btn btn-ghost px-2" onClick={() => navigate("/settings")}>
@@ -104,7 +104,7 @@ export default function Devices() {
       </header>
 
       {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto overscroll-contain p-4">
         {loading && (
           <div className="text-center text-muted-color">Loading...</div>
         )}

@@ -10,9 +10,9 @@ export default function ChatLayout() {
   const requests = useMessageRequestsStore((s) => s.requests);
 
   return (
-    <div className="flex h-screen bg-base">
+    <div className="flex h-full min-h-0 overflow-hidden bg-base">
       {/* Sidebar */}
-      <aside className="w-72 sidebar flex flex-col h-full">
+      <aside className="sidebar flex h-full w-72 min-h-0 flex-col">
         {/* Header */}
         <div className="flex items-center p-3 border-b border-default">
           <h1 className="font-semibold text-primary-color">TapChat</h1>
@@ -36,7 +36,7 @@ export default function ChatLayout() {
         </div>
 
         {/* Conversation list */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto overscroll-contain">
           <ConversationList searchQuery={searchQuery} />
         </div>
 

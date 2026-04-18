@@ -14,7 +14,7 @@ interface SessionState {
 }
 
 export const useSessionStore = create<SessionState>((set) => ({
-  sessionState: "uninitialized",
+  sessionState: "bootstrapping",
   wsConnected: false,
   syncInFlight: false,
   deviceId: null,

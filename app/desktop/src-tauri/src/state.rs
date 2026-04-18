@@ -14,6 +14,7 @@ use crate::ports::DesktopPlatformPorts;
 pub struct AppState {
     pub inner: Arc<RwLock<AppStateInner>>,
     pub sync_gate: Arc<Mutex<SyncGateState>>,
+    pub ws_status: Arc<RwLock<WsStatusSnapshot>>,
 }
 
 pub struct AppStateInner {
@@ -54,6 +55,12 @@ pub struct SyncGateState {
     pub pending: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WsStatusSnapshot {
+    pub ws_connected: bool,
+    pub last_known_device_id: Option<String>,
+}
+
 impl AppState {
     pub fn new() -> Self {
         let profile_manager = ProfileManager::new();
@@ -67,6 +74,7 @@ impl AppState {
                 profile_path: None,
             })),
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
+            ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
         }
     }
 
@@ -83,6 +91,7 @@ impl AppState {
                 profile_path: None,
             })),
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
+            ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
         }
     }
 }

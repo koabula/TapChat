@@ -45,6 +45,14 @@
     scroll-behavior: smooth;
   }
 
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
   /* Base background and text using CSS variables */
   body {
     background-color: var(--bg-base);
