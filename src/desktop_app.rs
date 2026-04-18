@@ -1050,18 +1050,7 @@ pub async fn message_request_accept(
     let result =
         accept_message_request_with_bundle_import(&mut profile, &mut driver, request_id).await?;
     let sender_user_id = result.sender_user_id.clone();
-
-    let mut driver = load_driver(&profile)?;
-    let contact_bundle = driver.contact_bundle(&sender_user_id).ok_or_else(|| {
-        anyhow!("accepted request for {sender_user_id}, but the contact was not persisted")
-    })?;
-    if contact_bundle.identity_bundle_ref.is_none() {
-        return Err(anyhow!(
-            "accepted request for {sender_user_id}, but the identity bundle reference was not persisted"
-        ));
-    }
-
-    let conversation_exists = driver
+    let had_conversation_before = driver
         .latest_snapshot()
         .as_ref()
         .map(|snapshot| {
@@ -1071,23 +1060,30 @@ pub async fn message_request_accept(
                 .any(|conversation| conversation.state.peer_user_id == sender_user_id)
         })
         .unwrap_or(false);
-    let auto_created_conversation = !conversation_exists;
-    if auto_created_conversation {
-        driver
-            .run_command_until_idle(CoreCommand::CreateConversation {
-                peer_user_id: sender_user_id.clone(),
-                conversation_kind: crate::model::ConversationKind::Direct,
-            })
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "accepted request for {sender_user_id}, but automatic direct conversation creation failed: {error}"
-                )
-            })?;
-        persist_driver(&mut profile, &driver)?;
+
+    let contact_bundle = driver.contact_bundle(&sender_user_id).ok_or_else(|| {
+        anyhow!("accepted request for {sender_user_id}, but the contact was not persisted")
+    })?;
+    if contact_bundle.identity_bundle_ref.is_none() {
+        return Err(anyhow!(
+            "accepted request for {sender_user_id}, but the identity bundle reference was not persisted"
+        ));
     }
 
-    let driver = load_driver(&profile)?;
+    let device_id = local_device_id(&driver)?;
+    driver
+        .run_command_until_idle_without_realtime(CoreCommand::SyncInbox {
+            device_id,
+            reason: Some("desktop_message_request_accept".into()),
+        })
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "accepted request for {sender_user_id}, but inbox sync after acceptance failed: {error}"
+            )
+        })?;
+    persist_driver(&mut profile, &driver)?;
+
     let conversation_id = driver
         .latest_snapshot()
         .as_ref()
@@ -1097,12 +1093,9 @@ pub async fn message_request_accept(
                 .iter()
                 .find(|conversation| conversation.state.peer_user_id == sender_user_id)
                 .map(|conversation| conversation.conversation_id.clone())
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "accepted request for {sender_user_id}, but the direct conversation was not persisted"
-            )
-        })?;
+        });
+    let conversation_available = conversation_id.is_some();
+    let auto_created_conversation = !had_conversation_before && conversation_available;
 
     Ok(MessageRequestActionView {
         accepted: result.accepted,
@@ -1111,9 +1104,9 @@ pub async fn message_request_accept(
         promoted_count: result.promoted_count,
         action: format!("{:?}", result.action).to_lowercase(),
         contact_available: true,
-        conversation_available: true,
+        conversation_available,
         auto_created_conversation,
-        conversation_id: Some(conversation_id),
+        conversation_id,
         sender_bundle_share_url: None,
     })
 }
