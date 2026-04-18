@@ -4,7 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use tapchat_core::CoreEngine;
 
-use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
+use crate::commands::session::SessionStatus;
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::platform::profile::ProfileSummary;
 use crate::state::{AppState, SessionState};
@@ -69,8 +69,6 @@ pub async fn start_new_profile_onboarding(
         // Reset engine to fresh state
         inner.engine = CoreEngine::default();
     }
-
-    set_ws_connection_snapshot(&state, None, false).await;
 
     // Emit session-status event to notify frontend - this triggers route change
     let _ = app.emit("session-status", SessionStatus {
@@ -210,8 +208,6 @@ async fn reload_engine_from_profile(
         inner.engine = CoreEngine::from_restored_state(snapshot);
         inner.session = SessionState::Active { device_id: device_id.clone() };
     }
-
-    set_ws_connection_snapshot(&state, Some(device_id.clone()), false).await;
 
     // Step 6: Emit session-status event - this happens BEFORE websocket connect
     let _ = app.emit("session-status", SessionStatus {

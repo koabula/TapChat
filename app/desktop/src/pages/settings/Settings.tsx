@@ -230,8 +230,8 @@ export default function Settings() {
   };
 
   return (
-    <div className="flex h-full min-h-0 overflow-hidden bg-base">
-      <div className="mx-auto flex min-h-0 max-w-2xl flex-1 flex-col">
+    <div className="flex h-screen bg-base">
+      <div className="flex-1 flex flex-col max-w-2xl mx-auto">
         {/* Header */}
         <header className="flex items-center p-3 border-b border-default">
           <button
@@ -244,7 +244,7 @@ export default function Settings() {
         </header>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto overscroll-contain p-4">
+        <div className="flex-1 overflow-y-auto p-4">
           {/* Appearance section */}
           <section className="mb-6">
             <h2 className="text-lg font-medium text-primary-color mb-3">Appearance</h2>

@@ -3,13 +3,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
 use tauri::webview::WebviewWindowBuilder;
-use std::time::Instant;
 
 use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
 
-use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
+use crate::commands::session::SessionStatus;
 use crate::state::{AppState, SessionState};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
@@ -22,18 +21,12 @@ pub enum CoreInput {
 /// onboarding or the main window based on ProfileManager session check.
 pub async fn on_app_ready(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let startup_started_at = Instant::now();
 
     // Check session startup using ProfileManager
-    let startup_check_started_at = Instant::now();
     let startup_check = {
         let inner = state.inner.read().await;
         inner.profile_manager.check_session_startup().await
     };
-    log::info!(
-        "on_app_ready: check_session_startup completed in {}ms",
-        startup_check_started_at.elapsed().as_millis()
-    );
 
     log::info!("Session startup check: {:?}", startup_check);
 
@@ -50,7 +43,6 @@ pub async fn on_app_ready(app: &AppHandle) {
         inner.session = SessionState::Onboarding { step };
         inner.profile_path = startup_check.profile_path;
         drop(inner);
-        set_ws_connection_snapshot(&state, None, false).await;
 
         // Open onboarding window
         let _onboarding = WebviewWindowBuilder::new(
@@ -68,7 +60,6 @@ pub async fn on_app_ready(app: &AppHandle) {
         log::info!("Session ready, loading snapshot and showing main window");
 
         // Load snapshot from profile and initialize engine
-        let load_snapshot_started_at = Instant::now();
         let (snapshot, device_id) = {
             let inner = state.inner.read().await;
 
@@ -86,10 +77,6 @@ pub async fn on_app_ready(app: &AppHandle) {
 
             (snapshot, device_id)
         };
-        log::info!(
-            "on_app_ready: load_snapshot completed in {}ms",
-            load_snapshot_started_at.elapsed().as_millis()
-        );
 
         log::info!("Loaded snapshot with {} contacts, {} conversations, deployment: {:?}",
             snapshot.contacts.len(),
@@ -97,7 +84,6 @@ pub async fn on_app_ready(app: &AppHandle) {
             snapshot.deployment.as_ref().map(|d| d.deployment_bundle.inbox_http_endpoint.clone()));
 
         // Initialize engine from snapshot
-        let restore_engine_started_at = Instant::now();
         {
             let mut inner = state.inner.write().await;
 
@@ -107,49 +93,21 @@ pub async fn on_app_ready(app: &AppHandle) {
             inner.session = SessionState::Active { device_id };
             inner.profile_path = startup_check.profile_path;
         }
-        log::info!(
-            "on_app_ready: CoreEngine::from_restored_state completed in {}ms",
-            restore_engine_started_at.elapsed().as_millis()
-        );
-
-        let active_device_id = {
-            let inner = state.inner.read().await;
-            match &inner.session {
-                SessionState::Active { device_id } => Some(device_id.clone()),
-                _ => None,
-            }
-        };
-        set_ws_connection_snapshot(&state, active_device_id, false).await;
 
         // Show main window (created hidden in tauri.conf.json)
-        let show_window_started_at = Instant::now();
         if let Some(main_window) = app.get_webview_window("main") {
             main_window.show().expect("failed to show main window");
         }
-        log::info!(
-            "on_app_ready: main_window.show completed in {}ms",
-            show_window_started_at.elapsed().as_millis()
-        );
 
         // Start session
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
-            let app_started_at = Instant::now();
             // Fire AppStarted to kick off sync
             if let Err(e) = drive_core_with_handle(&app_clone, CoreInput::Event(CoreEvent::AppStarted)).await {
                 log::error!("Failed to start session: {}", e);
             }
-            log::info!(
-                "on_app_ready: AppStarted finished in {}ms",
-                app_started_at.elapsed().as_millis()
-            );
         });
     }
-
-    log::info!(
-        "on_app_ready: total startup path completed in {}ms",
-        startup_started_at.elapsed().as_millis()
-    );
 }
 
 /// Determine the appropriate onboarding step based on startup check.
@@ -281,8 +239,6 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
             log::error!("Failed to save snapshot: {}", e);
         }
     }
-
-    set_ws_connection_snapshot(&state, Some(device_id.clone()), false).await;
 
     // Emit session-status event to notify frontend - this triggers route change
     let _ = app.emit("session-status", SessionStatus {

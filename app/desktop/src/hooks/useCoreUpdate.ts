@@ -13,6 +13,7 @@ import type {
   ContactSummary,
   MessageRequestItem,
 } from "../lib/types";
+import type { Conversation } from "../store/conversations";
 
 function mapContacts(contacts: ContactSummary[]) {
   return contacts.map((contact) => ({
@@ -20,6 +21,81 @@ function mapContacts(contacts: ContactSummary[]) {
     display_name: contact.display_name ?? null,
     device_count: contact.device_count,
     last_refresh: null,
+  }));
+}
+
+function displayMessagePreview(conversation: ConversationSummary): string {
+  const preview = conversation.last_message_preview?.trim();
+  if (preview) {
+    return preview;
+  }
+  return conversation.peer_user_id;
+}
+
+function activityKeyForConversation(conversation: ConversationSummary): string {
+  return [
+    conversation.conversation_id,
+    String(conversation.message_count ?? 0),
+    conversation.last_message_preview?.trim() ?? "",
+  ].join("|");
+}
+
+function buildConversations(
+  conversations: ConversationSummary[],
+  contacts: Array<{ user_id: string; display_name: string | null }>,
+  previous: Conversation[],
+  activeConversationId: string | null,
+  markUnread: boolean,
+): Conversation[] {
+  const previousById = new Map(
+    previous.map((conversation) => [conversation.conversation_id, conversation]),
+  );
+  const displayNameByUserId = new Map(
+    contacts.map((contact) => [contact.user_id, contact.display_name]),
+  );
+
+  return conversations.map((conversation) => {
+    const prior = previousById.get(conversation.conversation_id);
+    const displayName = displayNameByUserId.get(conversation.peer_user_id) ?? null;
+    const messageCount = conversation.message_count ?? prior?.message_count ?? 0;
+    const nextActivityKey = activityKeyForConversation(conversation);
+    const hasNewMessages =
+      prior !== undefined &&
+      prior.last_activity_key !== nextActivityKey &&
+      (messageCount > prior.message_count || (conversation.last_message_preview?.trim() ?? "") !== (prior.last_message ?? ""));
+    const shouldMarkUnread =
+      markUnread &&
+      hasNewMessages &&
+      conversation.conversation_id !== activeConversationId;
+
+    return {
+      conversation_id: conversation.conversation_id,
+      peer_user_id: conversation.peer_user_id,
+      state: conversation.state,
+      display_name: displayName,
+      last_message: displayMessagePreview(conversation),
+      last_message_time: prior?.last_message_time ?? null,
+      message_count: messageCount,
+      last_activity_key: nextActivityKey,
+      unread_count: shouldMarkUnread ? 1 : prior?.unread_count ?? 0,
+      has_unread:
+        conversation.conversation_id === activeConversationId
+          ? false
+          : shouldMarkUnread || prior?.has_unread || false,
+    };
+  });
+}
+
+function refreshConversationDisplayNames(
+  conversations: Conversation[],
+  contacts: Array<{ user_id: string; display_name: string | null }>,
+): Conversation[] {
+  const displayNameByUserId = new Map(
+    contacts.map((contact) => [contact.user_id, contact.display_name]),
+  );
+  return conversations.map((conversation) => ({
+    ...conversation,
+    display_name: displayNameByUserId.get(conversation.peer_user_id) ?? null,
   }));
 }
 
@@ -35,9 +111,6 @@ async function fetchConversationSnapshot(): Promise<ConversationSummary[]> {
  */
 export function useCoreUpdate() {
   const setConversations = useConversationsStore((s) => s.setConversations);
-  const mergeConversationSnapshot = useConversationsStore(
-    (s) => s.mergeConversationSnapshot,
-  );
   const setContacts = useContactsStore((s) => s.setContacts);
   const sessionState = useSessionStore((s) => s.sessionState);
   const setDeviceId = useSessionStore((s) => s.setDeviceId);
@@ -49,17 +122,28 @@ export function useCoreUpdate() {
     requestId: number,
     conversations: ConversationSummary[],
     contacts: Array<{ user_id: string; display_name: string | null }>,
+    previousConversations: Conversation[],
+    activeConversationId: string | null,
     markUnread: boolean,
   ) => {
     if (requestId < latestAppliedConversationRequestIdRef.current) {
       return;
     }
     latestAppliedConversationRequestIdRef.current = requestId;
-    mergeConversationSnapshot(conversations, contacts, { markUnread });
+    const mappedConversations = buildConversations(
+      conversations,
+      contacts,
+      previousConversations,
+      activeConversationId,
+      markUnread,
+    );
+    setConversations(mappedConversations);
   };
 
   const refreshConversationsFromBackend = async (
     contacts: Array<{ user_id: string; display_name: string | null }>,
+    previousConversations: Conversation[],
+    activeConversationId: string | null,
     markUnread: boolean,
   ) => {
     const requestId = ++latestConversationRequestIdRef.current;
@@ -67,7 +151,14 @@ export function useCoreUpdate() {
     if (requestId < latestConversationRequestIdRef.current) {
       return;
     }
-    applyConversationSnapshot(requestId, conversations, contacts, markUnread);
+    applyConversationSnapshot(
+      requestId,
+      conversations,
+      contacts,
+      previousConversations,
+      activeConversationId,
+      markUnread,
+    );
   };
 
   const fetchAndSetData = async () => {
@@ -83,7 +174,14 @@ export function useCoreUpdate() {
       const conversations = await fetchConversationSnapshot();
       console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
       const requestId = ++latestConversationRequestIdRef.current;
-      applyConversationSnapshot(requestId, conversations, mappedContacts, false);
+      applyConversationSnapshot(
+        requestId,
+        conversations,
+        mappedContacts,
+        [],
+        useConversationsStore.getState().activeConversationId,
+        false,
+      );
 
       const requestsResult = await invoke<{
         view_model?: { message_requests?: MessageRequestItem[] };
@@ -127,6 +225,8 @@ export function useCoreUpdate() {
         `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
       );
 
+      const previousConversations = useConversationsStore.getState().conversations;
+      const activeConversationId = useConversationsStore.getState().activeConversationId;
       let nextContacts = useContactsStore.getState().contacts;
 
       if (state_update.contacts_changed && view_model?.contacts) {
@@ -141,11 +241,15 @@ export function useCoreUpdate() {
             requestId,
             view_model.conversations,
             nextContacts,
+            previousConversations,
+            activeConversationId,
             state_update.messages_changed,
           );
         } else {
           void refreshConversationsFromBackend(
             nextContacts,
+            previousConversations,
+            activeConversationId,
             state_update.messages_changed,
           ).catch((err) => {
             console.error(
@@ -154,9 +258,9 @@ export function useCoreUpdate() {
           });
         }
       } else if (state_update.contacts_changed) {
-        setConversations(useConversationsStore.getState().conversations, {
-          markUnread: false,
-        });
+        setConversations(
+          refreshConversationDisplayNames(previousConversations, nextContacts),
+        );
       }
 
       if (view_model?.banners && view_model.banners.length > 0) {
@@ -183,12 +287,5 @@ export function useCoreUpdate() {
       unlistenCoreUpdate.then((fn) => fn());
       unlistenEngineReloaded.then((fn) => fn());
     };
-  }, [
-    mergeConversationSnapshot,
-    setConversations,
-    setContacts,
-    setDeviceId,
-    setRequests,
-    sessionState,
-  ]);
+  }, [setConversations, setContacts, setDeviceId, setRequests, sessionState]);
 }

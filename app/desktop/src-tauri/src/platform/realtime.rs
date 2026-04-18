@@ -8,14 +8,12 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::transport_contract::RealtimeSubscriptionRequest;
 
-use crate::commands::session::set_ws_connection_snapshot;
 use crate::platform::profile::ProfileManagerInner;
-use crate::state::AppState;
 
 /// Unique identifier for each WebSocket connection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,11 +203,6 @@ impl RealtimeManager {
 
         // Step 8: Emit WebSocketConnected to frontend
         if let Some(app) = &self.app_handle {
-            set_ws_connection_snapshot(
-                app.state::<AppState>().inner(),
-                Some(device_id.clone()),
-                true,
-            ).await;
             let _ = app.emit("realtime-event", RealtimeEventPayload {
                 device_id: device_id.clone(),
                 event_type: "connected".to_string(),
@@ -262,11 +255,6 @@ impl RealtimeManager {
 
         // Emit WebSocketDisconnected to frontend
         if let Some(app) = &self.app_handle {
-            set_ws_connection_snapshot(
-                app.state::<AppState>().inner(),
-                Some(device_id.to_string()),
-                false,
-            ).await;
             let _ = app.emit("realtime-event", RealtimeEventPayload {
                 device_id: device_id.to_string(),
                 event_type: "disconnected".to_string(),
@@ -420,11 +408,6 @@ impl RealtimeManager {
                     };
                     if should_emit {
                         if let Some(app) = &app_handle {
-                            set_ws_connection_snapshot(
-                                app.state::<AppState>().inner(),
-                                Some(device_id.clone()),
-                                false,
-                            ).await;
                             let _ = app.emit("realtime-event", RealtimeEventPayload {
                                 device_id: device_id.clone(),
                                 event_type: "disconnected".to_string(),
@@ -500,11 +483,6 @@ impl RealtimeManager {
 
                             if should_emit {
                                 if let Some(app) = &app_handle {
-                                    set_ws_connection_snapshot(
-                                        app.state::<AppState>().inner(),
-                                        Some(device_id.clone()),
-                                        false,
-                                    ).await;
                                     let _ = app.emit("realtime-event", RealtimeEventPayload {
                                         device_id: device_id.clone(),
                                         event_type: "disconnected".to_string(),
@@ -531,11 +509,6 @@ impl RealtimeManager {
 
                             if should_emit {
                                 if let Some(app) = &app_handle {
-                                    set_ws_connection_snapshot(
-                                        app.state::<AppState>().inner(),
-                                        Some(device_id.clone()),
-                                        false,
-                                    ).await;
                                     let _ = app.emit("realtime-event", RealtimeEventPayload {
                                         device_id: device_id.clone(),
                                         event_type: "error".to_string(),
