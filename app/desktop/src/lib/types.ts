@@ -47,7 +47,9 @@ export interface ConversationSummary {
   conversation_id: string;
   peer_user_id: string;
   state: string;
+  last_message_preview?: string | null;
   last_message_type?: string;
+  message_count?: number;
   recovery?: RecoveryDiagnostics;
 }
 
@@ -73,6 +75,7 @@ export interface Message {
 export interface ContactSummary {
   user_id: string;
   device_count: number;
+  display_name?: string | null;
 }
 
 // Message Requests

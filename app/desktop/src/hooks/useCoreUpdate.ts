@@ -6,6 +6,72 @@ import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
 import { useMessageRequestsStore } from "../store/requests";
 import type { CoreUpdateEvent, ConversationSummary, ContactSummary, MessageRequestItem } from "../lib/types";
+import type { Conversation } from "../store/conversations";
+
+function mapContacts(contacts: ContactSummary[]) {
+  return contacts.map((contact) => ({
+    user_id: contact.user_id,
+    display_name: contact.display_name ?? null,
+    device_count: contact.device_count,
+    last_refresh: null,
+  }));
+}
+
+function displayMessagePreview(conversation: ConversationSummary): string {
+  const preview = conversation.last_message_preview?.trim();
+  if (preview) {
+    return preview;
+  }
+  return conversation.peer_user_id;
+}
+
+function buildConversations(
+  conversations: ConversationSummary[],
+  contacts: Array<{ user_id: string; display_name: string | null }>,
+  previous: Conversation[],
+  activeConversationId: string | null,
+  markUnread: boolean,
+): Conversation[] {
+  const previousById = new Map(previous.map((conversation) => [conversation.conversation_id, conversation]));
+  const displayNameByUserId = new Map(contacts.map((contact) => [contact.user_id, contact.display_name]));
+
+  return conversations.map((conversation) => {
+    const prior = previousById.get(conversation.conversation_id);
+    const displayName = displayNameByUserId.get(conversation.peer_user_id) ?? null;
+    const messageCount = conversation.message_count ?? prior?.message_count ?? 0;
+    const hasNewMessages = prior !== undefined && messageCount > prior.message_count;
+    const shouldMarkUnread =
+      markUnread &&
+      hasNewMessages &&
+      conversation.conversation_id !== activeConversationId;
+
+    return {
+      conversation_id: conversation.conversation_id,
+      peer_user_id: conversation.peer_user_id,
+      state: conversation.state,
+      display_name: displayName,
+      last_message: displayMessagePreview(conversation),
+      last_message_time: prior?.last_message_time ?? null,
+      message_count: messageCount,
+      unread_count: shouldMarkUnread ? 1 : prior?.unread_count ?? 0,
+      has_unread:
+        conversation.conversation_id === activeConversationId
+          ? false
+          : shouldMarkUnread || prior?.has_unread || false,
+    };
+  });
+}
+
+function refreshConversationDisplayNames(
+  conversations: Conversation[],
+  contacts: Array<{ user_id: string; display_name: string | null }>,
+): Conversation[] {
+  const displayNameByUserId = new Map(contacts.map((contact) => [contact.user_id, contact.display_name]));
+  return conversations.map((conversation) => ({
+    ...conversation,
+    display_name: displayNameByUserId.get(conversation.peer_user_id) ?? null,
+  }));
+}
 
 /**
  * Hook that listens to core-update events and dispatches them to the appropriate stores.
@@ -25,31 +91,24 @@ export function useCoreUpdate() {
     try {
       console.debug("[useCoreUpdate] fetching initial data");
 
-      // Fetch conversations
-      const conversations = await invoke<ConversationSummary[]>("list_conversations");
-      console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
-
-      const mappedConversations = conversations.map((c) => ({
-        conversation_id: c.conversation_id,
-        peer_user_id: c.peer_user_id,
-        state: c.state,
-        last_message: c.last_message_type ? formatMessageType(c.last_message_type) : null,
-        last_message_time: null,
-        unread_count: 0,
-      }));
-      setConversations(mappedConversations);
-
       // Fetch contacts
       const contacts = await invoke<ContactSummary[]>("list_contacts");
       console.debug(`[useCoreUpdate] loaded contacts=${contacts.length}`);
 
-      const mappedContacts = contacts.map((c) => ({
-        user_id: c.user_id,
-        display_name: null,
-        device_count: c.device_count,
-        last_refresh: null,
-      }));
+      const mappedContacts = mapContacts(contacts);
       setContacts(mappedContacts);
+
+      // Fetch conversations
+      const conversations = await invoke<ConversationSummary[]>("list_conversations");
+      console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
+      const mappedConversations = buildConversations(
+        conversations,
+        mappedContacts,
+        [],
+        useConversationsStore.getState().activeConversationId,
+        false,
+      );
+      setConversations(mappedConversations);
 
       // Fetch message requests
       const requestsResult = await invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests");
@@ -77,6 +136,7 @@ export function useCoreUpdate() {
     console.debug("[useCoreUpdate] clearing stores");
     setConversations([]);
     setContacts([]);
+    useConversationsStore.getState().setActiveConversation(null);
   };
 
   useEffect(() => {
@@ -96,27 +156,27 @@ export function useCoreUpdate() {
       if (!view_model) return;
 
       // Update conversations if changed
-      if (state_update.conversations_changed && view_model.conversations) {
-        const conversations = view_model.conversations.map((c) => ({
-          conversation_id: c.conversation_id,
-          peer_user_id: c.peer_user_id,
-          state: c.state,
-          last_message: c.last_message_type ? formatMessageType(c.last_message_type) : null,
-          last_message_time: null,
-          unread_count: 0,
-        }));
-        setConversations(conversations);
-      }
+      const previousConversations = useConversationsStore.getState().conversations;
+      const activeConversationId = useConversationsStore.getState().activeConversationId;
+      let nextContacts = useContactsStore.getState().contacts;
 
       // Update contacts if changed
       if (state_update.contacts_changed && view_model.contacts) {
-        const contacts = view_model.contacts.map((c) => ({
-          user_id: c.user_id,
-          display_name: null,
-          device_count: c.device_count,
-          last_refresh: null,
-        }));
-        setContacts(contacts);
+        nextContacts = mapContacts(view_model.contacts);
+        setContacts(nextContacts);
+      }
+
+      if (view_model.conversations && (state_update.conversations_changed || state_update.messages_changed)) {
+        const conversations = buildConversations(
+          view_model.conversations,
+          nextContacts,
+          previousConversations,
+          activeConversationId,
+          state_update.messages_changed,
+        );
+        setConversations(conversations);
+      } else if (state_update.contacts_changed) {
+        setConversations(refreshConversationDisplayNames(previousConversations, nextContacts));
       }
 
       // Process banners for system status notifications
@@ -147,17 +207,4 @@ export function useCoreUpdate() {
       unlistenEngineReloaded.then((fn) => fn());
     };
   }, [setConversations, setContacts, setDeviceId, setRequests, sessionState]);
-}
-
-function formatMessageType(type: string): string {
-  switch (type) {
-    case "text":
-      return "Message";
-    case "attachment":
-      return "Attachment";
-    case "control":
-      return "Control message";
-    default:
-      return type;
-  }
 }

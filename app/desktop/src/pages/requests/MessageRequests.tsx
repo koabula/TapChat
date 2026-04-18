@@ -6,7 +6,7 @@ import { useMessageRequestsStore } from "@/store/requests";
 import { useConversationsStore } from "@/store/conversations";
 import { useContactsStore } from "@/store/contacts";
 
-import type { MessageRequestActionOutput } from "@/lib/types";
+import type { ContactSummary, ConversationSummary, MessageRequestActionOutput } from "@/lib/types";
 
 export default function MessageRequests() {
   const navigate = useNavigate();
@@ -60,22 +60,28 @@ export default function MessageRequests() {
 
         // Refresh conversations to show the newly created conversation
         try {
-          const conversations = await invoke<{ conversation_id: string; peer_user_id: string; state: string }[]>("list_conversations");
+          const contacts = await invoke<ContactSummary[]>("list_contacts");
+          const contactsByUserId = new Map(
+            contacts.map((contact) => [contact.user_id, contact.display_name ?? null]),
+          );
+          const conversations = await invoke<ConversationSummary[]>("list_conversations");
           setConversations(conversations.map(c => ({
             conversation_id: c.conversation_id,
             peer_user_id: c.peer_user_id,
             state: c.state,
-            last_message: null,
+            display_name: contactsByUserId.get(c.peer_user_id) ?? null,
+            last_message: c.last_message_preview?.trim() || c.peer_user_id,
             last_message_time: null,
+            message_count: c.message_count ?? 0,
             unread_count: 0,
+            has_unread: false,
           })));
           console.debug(`[MessageRequests] Refreshed conversations count=${conversations.length}`);
 
           // Refresh contacts
-          const contacts = await invoke<{ user_id: string; device_count: number }[]>("list_contacts");
           setContacts(contacts.map(c => ({
             user_id: c.user_id,
-            display_name: null,
+            display_name: c.display_name ?? null,
             device_count: c.device_count,
             last_refresh: null,
           })));

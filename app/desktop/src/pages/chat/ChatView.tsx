@@ -26,24 +26,29 @@ export default function ChatView() {
 
   // Get stores for peer name resolution
   const { contacts } = useContactsStore();
-  const { conversations } = useConversationsStore();
+  const { conversations, setActiveConversation } = useConversationsStore();
   const { deviceId } = useSessionStore();
+
+  const activeConversation = useMemo(
+    () => conversations.find((conversation) => conversation.conversation_id === conversationId),
+    [conversationId, conversations],
+  );
 
   // Resolve peer name from contacts store
   const peerName = useMemo(() => {
     if (!conversationId) return "Contact";
+    if (!activeConversation) return "Contact";
 
-    // Find the conversation to get peer_user_id
-    const conversation = conversations.find(c => c.conversation_id === conversationId);
-    if (!conversation) return "Contact";
+    const contact = contacts.find((item) => item.user_id === activeConversation.peer_user_id);
+    return contact?.display_name || activeConversation.display_name || activeConversation.peer_user_id;
+  }, [conversationId, activeConversation, contacts]);
 
-    // Find contact by user_id
-    const contact = contacts.find(c => c.user_id === conversation.peer_user_id);
-    if (contact?.display_name) return contact.display_name;
-
-    // Fallback to truncated user_id
-    return conversation.peer_user_id.slice(0, 12) + "...";
-  }, [conversationId, conversations, contacts]);
+  useEffect(() => {
+    setActiveConversation(conversationId ?? null);
+    return () => {
+      setActiveConversation(null);
+    };
+  }, [conversationId, setActiveConversation]);
 
   // Subscribe to core-update events to refresh messages
   useEffect(() => {

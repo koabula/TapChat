@@ -16,11 +16,10 @@ export default function ContactList() {
     async function fetchContacts() {
       try {
         const contacts = await listContacts();
-        console.log("[ContactList] Loaded contacts:", contacts.length);
-        // Map to store format with display_name placeholder
+        console.debug(`[ContactList] Loaded contacts count=${contacts.length}`);
         const mappedContacts = contacts.map((c: ContactSummary) => ({
           user_id: c.user_id,
-          display_name: null, // Backend doesn't provide display_name yet
+          display_name: c.display_name ?? null,
           device_count: c.device_count,
           last_refresh: null,
         }));
@@ -46,7 +45,7 @@ export default function ContactList() {
       const contacts = await listContacts();
       const mappedContacts = contacts.map((c: ContactSummary) => ({
         user_id: c.user_id,
-        display_name: null,
+        display_name: c.display_name ?? null,
         device_count: c.device_count,
         last_refresh: null,
       }));

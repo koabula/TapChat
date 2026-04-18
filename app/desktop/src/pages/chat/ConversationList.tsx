@@ -14,7 +14,10 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
   const filteredConversations = conversations.filter((conv) => {
     if (!searchQuery.trim()) return true;
     const query = searchQuery.toLowerCase();
-    return conv.peer_user_id.toLowerCase().includes(query);
+    return (
+      conv.peer_user_id.toLowerCase().includes(query) ||
+      conv.display_name?.toLowerCase().includes(query) === true
+    );
   });
 
   const formatTime = (timestamp: number | null | undefined) => {
@@ -62,14 +65,16 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         >
           {/* Avatar */}
           <div className="avatar transition-medium">
-            <span className="text-lg font-medium">{conv.peer_user_id[0]?.toUpperCase() || "?"}</span>
+            <span className="text-lg font-medium">
+              {(conv.display_name || conv.peer_user_id)[0]?.toUpperCase() || "?"}
+            </span>
           </div>
 
           {/* Content */}
           <div className="flex-1 min-w-0">
             <div className="flex items-center justify-between">
               <span className="text-primary-color truncate font-medium">
-                {conv.peer_user_id}
+                {conv.display_name || conv.peer_user_id}
               </span>
               <span className="text-muted-color text-xs">
                 {formatTime(conv.last_message_time)}
@@ -77,12 +82,13 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
             </div>
             <div className="flex items-center justify-between mt-1">
               <span className="text-secondary-color truncate text-sm">
-                {conv.last_message || "No messages"}
+                {conv.last_message || conv.peer_user_id}
               </span>
-              {conv.unread_count && conv.unread_count > 0 && (
-                <span className="badge badge-primary animate-scale-in">
-                  {conv.unread_count}
-                </span>
+              {conv.has_unread && (
+                <span
+                  className="w-2.5 h-2.5 rounded-full bg-primary animate-scale-in shrink-0"
+                  aria-label="Unread messages"
+                />
               )}
             </div>
           </div>
