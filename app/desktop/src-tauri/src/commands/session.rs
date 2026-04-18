@@ -13,6 +13,53 @@ pub struct SessionStatus {
     pub ws_connected: bool,
 }
 
+pub async fn set_ws_connection_snapshot(
+    state: &AppState,
+    device_id: Option<String>,
+    ws_connected: bool,
+) {
+    let mut snapshot = state.ws_status.write().await;
+    snapshot.ws_connected = ws_connected;
+    if device_id.is_some() {
+        snapshot.last_known_device_id = device_id;
+    } else if !ws_connected {
+        snapshot.last_known_device_id = None;
+    }
+}
+
+pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
+    let (session, ws_snapshot) = {
+        let inner = state.inner.read().await;
+        let session = inner.session.clone();
+        drop(inner);
+        let ws_snapshot = state.ws_status.read().await.clone();
+        (session, ws_snapshot)
+    };
+
+    match session {
+        SessionState::Active { device_id } => SessionStatus {
+            state: "active".into(),
+            device_id: Some(device_id),
+            ws_connected: ws_snapshot.ws_connected,
+        },
+        SessionState::Onboarding { step } => SessionStatus {
+            state: format!("onboarding:{:?}", step).to_lowercase(),
+            device_id: None,
+            ws_connected: ws_snapshot.ws_connected,
+        },
+        SessionState::Uninitialized => SessionStatus {
+            state: "uninitialized".into(),
+            device_id: ws_snapshot.last_known_device_id,
+            ws_connected: ws_snapshot.ws_connected,
+        },
+        SessionState::Quitting => SessionStatus {
+            state: "quitting".into(),
+            device_id: ws_snapshot.last_known_device_id,
+            ws_connected: ws_snapshot.ws_connected,
+        },
+    }
+}
+
 async fn run_gated_sync(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -90,6 +137,8 @@ pub async fn stop_realtime_session(
 
     drop(inner);
 
+    set_ws_connection_snapshot(&state, Some(device_id.clone()), false).await;
+
     // Close WebSocket through ports
     // Note: This would be better as an effect, but for now we emit a disconnect event
     let _ = app.emit("session-status", SessionStatus {
@@ -113,38 +162,7 @@ pub async fn sync_now(
 pub async fn get_session_status(
     state: State<'_, AppState>,
 ) -> Result<SessionStatus, String> {
-    let inner = state.inner.read().await;
-
-    // Check WebSocket connection status from realtime manager
-    let ws_connected = match &inner.session {
-        SessionState::Active { device_id } => {
-            inner.ports.realtime.is_connected(device_id).await
-        }
-        _ => false,
-    };
-
-    match &inner.session {
-        SessionState::Active { device_id } => Ok(SessionStatus {
-            state: "active".into(),
-            device_id: Some(device_id.clone()),
-            ws_connected,
-        }),
-        SessionState::Onboarding { step } => Ok(SessionStatus {
-            state: format!("onboarding:{:?}", step).to_lowercase(),
-            device_id: None,
-            ws_connected,
-        }),
-        SessionState::Uninitialized => Ok(SessionStatus {
-            state: "uninitialized".into(),
-            device_id: None,
-            ws_connected,
-        }),
-        SessionState::Quitting => Ok(SessionStatus {
-            state: "quitting".into(),
-            device_id: None,
-            ws_connected,
-        }),
-    }
+    Ok(read_session_status_snapshot(&state).await)
 }
 
 #[cfg(test)]

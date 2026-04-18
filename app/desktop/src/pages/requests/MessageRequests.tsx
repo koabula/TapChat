@@ -12,7 +12,9 @@ export default function MessageRequests() {
   const navigate = useNavigate();
   const requests = useMessageRequestsStore((s) => s.requests);
   const removeRequest = useMessageRequestsStore((s) => s.removeRequest);
-  const setConversations = useConversationsStore((s) => s.setConversations);
+  const mergeConversationSnapshot = useConversationsStore(
+    (s) => s.mergeConversationSnapshot,
+  );
   const setContacts = useContactsStore((s) => s.setContacts);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
@@ -65,22 +67,20 @@ export default function MessageRequests() {
             contacts.map((contact) => [contact.user_id, contact.display_name ?? null]),
           );
           const conversations = await invoke<ConversationSummary[]>("list_conversations");
-          setConversations(conversations.map(c => ({
-            conversation_id: c.conversation_id,
-            peer_user_id: c.peer_user_id,
-            state: c.state,
-            display_name: contactsByUserId.get(c.peer_user_id) ?? null,
-            last_message: c.last_message_preview?.trim() || c.peer_user_id,
-            last_message_time: null,
-            message_count: c.message_count ?? 0,
-            last_activity_key: [
-              c.conversation_id,
-              String(c.message_count ?? 0),
-              c.last_message_preview?.trim() ?? "",
-            ].join("|"),
-            unread_count: 0,
-            has_unread: false,
-          })));
+          mergeConversationSnapshot(
+            conversations.map((conversation) => ({
+              ...conversation,
+              last_message_preview:
+                conversation.last_message_preview?.trim() ||
+                contactsByUserId.get(conversation.peer_user_id) ||
+                conversation.peer_user_id,
+            })),
+            contacts.map((contact) => ({
+              user_id: contact.user_id,
+              display_name: contact.display_name ?? null,
+            })),
+            { markUnread: false },
+          );
           console.debug(`[MessageRequests] Refreshed conversations count=${conversations.length}`);
 
           // Refresh contacts
@@ -113,8 +113,8 @@ export default function MessageRequests() {
   };
 
   return (
-    <div className="flex h-screen bg-base">
-      <div className="flex-1 flex flex-col">
+    <div className="flex h-full min-h-0 overflow-hidden bg-base">
+      <div className="flex-1 flex min-h-0 flex-col">
         {/* Header */}
         <header className="flex items-center p-3 border-b border-default">
           <button
@@ -129,7 +129,7 @@ export default function MessageRequests() {
         </header>
 
         {/* Request list */}
-        <div className="flex-1 overflow-y-auto p-4">
+        <div className="flex-1 overflow-y-auto overscroll-contain p-4">
           {loading && (
             <div className="text-center text-muted-color">Loading...</div>
           )}

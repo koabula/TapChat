@@ -67,6 +67,27 @@ function AppInner() {
   useNotifications();
 
   // Route based on session state
+  if (sessionState === "bootstrapping") {
+    return (
+      <div className="flex h-full min-h-0 bg-base">
+        <div className="sidebar flex w-72 flex-col border-r border-default">
+          <div className="flex items-center p-3 border-b border-default">
+            <h1 className="font-semibold text-primary-color">TapChat</h1>
+          </div>
+          <div className="p-3 text-sm text-muted-color">Starting session...</div>
+        </div>
+        <div className="flex min-h-0 flex-1 items-center justify-center bg-base">
+          <div className="text-center">
+            <div className="text-primary-color font-medium">TapChat</div>
+            <div className="mt-2 text-sm text-muted-color">
+              Preparing your workspace
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const isOnboarding = sessionState.startsWith("onboarding") || sessionState === "uninitialized";
 
   return (
@@ -114,13 +135,15 @@ function AppInner() {
 function App() {
   const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight } = useSessionStore();
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
-  const [loading, setLoading] = useState(true);
+  const [statusResolved, setStatusResolved] = useState(false);
   const isProfileSwitchingRef = useRef(false);
   const syncInFlightRef = useRef(false);
   const syncPendingRef = useRef(false);
 
   // Subscribe to Tauri events on mount (these don't need Router context)
   useEffect(() => {
+    const mountedAt = performance.now();
+
     const refreshMessageRequests = async () => {
       const result = await invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests");
       if (result.view_model?.message_requests) {
@@ -261,14 +284,22 @@ function App() {
     // Fetch initial session status
     invoke<SessionStatus>("get_session_status")
       .then((status) => {
+        const elapsedMs = Math.round(performance.now() - mountedAt);
+        console.debug(
+          `[App] get_session_status resolved in ${elapsedMs}ms ${summarizeSessionStatus(status)}`,
+        );
         console.debug(`[App] initial session-status ${summarizeSessionStatus(status)}`);
         setSessionState(status.state);
         setWsConnected(status.ws_connected);
-        setLoading(false);
+        if (status.device_id) {
+          setDeviceId(status.device_id);
+        }
+        setStatusResolved(true);
       })
       .catch((err) => {
         console.error(`[App] failed to get session status: ${String(err)}`);
-        setLoading(false);
+        setSessionState("uninitialized");
+        setStatusResolved(true);
       });
 
     return () => {
@@ -281,17 +312,9 @@ function App() {
     };
   }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight]);
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-base">
-        <div className="text-muted-color">Loading...</div>
-      </div>
-    );
-  }
-
   return (
     <BrowserRouter>
-      <AppInner />
+      <AppInner key={statusResolved ? "resolved" : "bootstrapping"} />
     </BrowserRouter>
   );
 }

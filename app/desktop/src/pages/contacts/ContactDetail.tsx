@@ -108,8 +108,8 @@ export default function ContactDetail() {
   };
 
   return (
-    <div className="flex h-screen bg-base">
-      <div className="flex-1 flex flex-col">
+    <div className="flex h-full min-h-0 overflow-hidden bg-base">
+      <div className="flex-1 flex min-h-0 flex-col">
         {/* Header */}
         <header className="flex items-center p-3 border-b border-default">
           <button
@@ -131,7 +131,7 @@ export default function ContactDetail() {
         </header>
 
         {/* Content */}
-        <div className="p-6">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-6">
           {/* Avatar */}
           <div className="flex items-center justify-center mb-4">
             <div className="w-20 h-20 rounded-full bg-surface-elevated flex items-center justify-center">
