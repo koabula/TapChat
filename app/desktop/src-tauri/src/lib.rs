@@ -89,6 +89,18 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_log::Builder::new()
+            .level(log::LevelFilter::Info)
+            .targets([
+                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                    path: dirs::data_local_dir()
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join("TapChat")
+                        .join("logs"),
+                    file_name: None,
+                }),
+            ])
+            .build())
         .plugin(
             tauri_plugin_updater::Builder::new()
                 .pubkey(updater_pubkey)

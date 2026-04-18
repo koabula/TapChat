@@ -52,7 +52,8 @@ pub async fn act_on_message_request(
 
     match action_enum {
         MessageRequestAction::Accept => {
-            // For accept, use the desktop_app function that auto-imports contact
+            // Accept through the desktop helper so we import the sender bundle
+            // and sync promoted inbox records before the UI navigates.
             let profile_path = profile_path.ok_or("Profile path not set")?;
 
             let result = tapchat_core::desktop_app::message_request_accept(
@@ -85,7 +86,7 @@ pub async fn act_on_message_request(
             let _ = app.emit("core-update", CoreOutput {
                 state_update: CoreStateUpdate {
                     contacts_changed: true,
-                    conversations_changed: result.auto_created_conversation,
+                    conversations_changed: result.conversation_available,
                     ..CoreStateUpdate::default()
                 },
                 effects: vec![],

@@ -59,14 +59,29 @@ struct RealtimeSession {
 }
 
 /// Events received from WebSocket.
+/// Note: Cloudflare uses camelCase for field names (deviceId, senderUserId, requestId)
+/// but snake_case for event types (head_updated, inbox_record_available, message_request_changed)
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum WsServerEvent {
-    HeadUpdated { seq: u64 },
-    InboxRecordAvailable { seq: u64, record: Option<serde_json::Value> },
+    HeadUpdated {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        seq: u64,
+    },
+    InboxRecordAvailable {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        seq: u64,
+        record: Option<serde_json::Value>,
+    },
     MessageRequestChanged {
+        #[serde(rename = "deviceId")]
+        device_id: String,
+        #[serde(rename = "senderUserId")]
         sender_user_id: String,
+        #[serde(rename = "requestId")]
         request_id: String,
         change: String,
     },

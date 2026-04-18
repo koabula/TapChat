@@ -3853,7 +3853,13 @@ impl CoreEngine {
                                 self.clear_recovery_context_as_healthy(&conversation_id);
                                 ackable = true;
                             }
-                            IngestResult::AppliedCommit { .. } => {
+                            IngestResult::AppliedCommit { epoch } => {
+                                log::info!(
+                                    "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
+                                    record.message_id,
+                                    conversation_id,
+                                    epoch
+                                );
                                 if let Ok(summary) = self
                                     .state
                                     .mls_adapter
@@ -3870,7 +3876,13 @@ impl CoreEngine {
                                 self.clear_recovery_context_as_healthy(&conversation_id);
                                 ackable = true;
                             }
-                            IngestResult::AppliedWelcome { .. } => {
+                            IngestResult::AppliedWelcome { epoch } => {
+                                log::info!(
+                                    "handle_inbox_records: AppliedWelcome for message {} in conversation {}, epoch={}",
+                                    record.message_id,
+                                    conversation_id,
+                                    epoch
+                                );
                                 self.clear_pending_records_for_conversation(
                                     &device_id,
                                     &conversation_id,

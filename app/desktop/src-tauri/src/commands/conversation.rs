@@ -100,12 +100,25 @@ pub async fn get_messages(
     );
 
     // Find the conversation and extract messages
+    // Filter out MLS protocol messages (Welcome, Commit) - they have no plaintext and shouldn't be displayed
     let conversation_messages: Vec<serde_json::Value> = snapshot.conversations
         .iter()
         .find(|c| c.conversation_id == conversation_id)
         .map(|persisted| {
             persisted.state.messages.iter()
+                .filter(|msg| {
+                    // Only show application messages, not protocol messages
+                    // MlsWelcome and MlsCommit are MLS handshake messages with no plaintext
+                    matches!(msg.message_type, tapchat_core::model::MessageType::MlsApplication)
+                })
                 .map(|msg| {
+                    // Log plaintext status for debugging
+                    log::info!(
+                        "get_messages: message_id={}, message_type={:?}, plaintext={:?}",
+                        msg.message_id,
+                        msg.message_type,
+                        msg.plaintext.as_deref().map(|s| if s.len() > 50 { &s[..50] } else { s })
+                    );
                     // Determine if this is a sent or received message
                     let direction = if local_device_id.as_ref() == Some(&msg.sender_device_id) {
                         "sent"
@@ -117,6 +130,7 @@ pub async fn get_messages(
                         "sender_device_id": msg.sender_device_id,
                         "recipient_device_id": msg.recipient_device_id,
                         "message_type": direction,
+                        "raw_message_type": format!("{:?}", msg.message_type).to_lowercase(),
                         "created_at": msg.created_at,
                         "plaintext": msg.plaintext,
                         "has_attachment": !msg.storage_refs.is_empty(),
@@ -129,6 +143,7 @@ pub async fn get_messages(
 
     // Merge pending outbox messages (sent but not yet acked)
     // These are outgoing messages that haven't been confirmed yet
+    // All pending outbox messages are MlsApplication type (actual user messages)
     let outbox_messages: Vec<serde_json::Value> = snapshot.pending_outbox
         .iter()
         .filter(|env| env.envelope.conversation_id == conversation_id)
@@ -145,6 +160,7 @@ pub async fn get_messages(
                 "sender_device_id": env.envelope.sender_device_id,
                 "recipient_device_id": env.envelope.recipient_device_id,
                 "message_type": "sent",
+                "raw_message_type": "mls_application",
                 "created_at": env.envelope.created_at,
                 "plaintext": env.plaintext_cache, // Use cached plaintext if available
                 "has_attachment": !env.envelope.storage_refs.is_empty(),
