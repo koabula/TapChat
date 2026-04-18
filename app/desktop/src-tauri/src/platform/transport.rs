@@ -22,6 +22,32 @@ fn looks_like_json(s: &str) -> bool {
     s.trim().starts_with('{') || s.trim().starts_with('[')
 }
 
+fn sanitize_url_for_log(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return raw.split('?').next().unwrap_or(raw).to_string();
+    };
+
+    let mut path = url.path().to_string();
+    if let Some(prefix) = path.strip_prefix("/v1/contact-share/") {
+        if !prefix.is_empty() {
+            path = "/v1/contact-share/<redacted>".into();
+        }
+    }
+
+    let mut sanitized = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        sanitized.push(':');
+        sanitized.push_str(&port.to_string());
+    }
+    sanitized.push_str(&path);
+
+    if url.query().is_some() {
+        sanitized.push_str("?<redacted>");
+    }
+
+    sanitized
+}
+
 /// HTTP transport implementation for desktop app.
 /// Executes HTTP requests to the Cloudflare backend.
 #[derive(Clone)]
@@ -62,7 +88,7 @@ impl DesktopTransport {
             HttpMethod::Delete => reqwest::Method::DELETE,
         };
 
-        log::info!("HTTP request: {} {}", method, request.url);
+        log::info!("HTTP request: {} {}", method, sanitize_url_for_log(&request.url));
 
         let mut builder = self.client.request(method.clone(), &request.url);
         for (key, value) in &request.headers {
@@ -81,7 +107,6 @@ impl DesktopTransport {
             } else {
                 body.clone()
             };
-            log::debug!("HTTP body converted: {} -> {}", body, converted);
             builder = builder.body(converted);
         }
 
@@ -94,7 +119,12 @@ impl DesktopTransport {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
-                log::info!("HTTP response: {} {} - status {}", method, request.url, status);
+                log::info!(
+                    "HTTP response: {} {} - status {}",
+                    method,
+                    sanitize_url_for_log(&request.url),
+                    status
+                );
 
                 let body = response
                     .text()
@@ -121,7 +151,7 @@ impl DesktopTransport {
                 log::warn!(
                     "HTTP request failed: {} {} - error: {} (retryable: {})",
                     method,
-                    request.url,
+                    sanitize_url_for_log(&request.url),
                     e,
                     retryable
                 );
@@ -310,4 +340,23 @@ impl DesktopTransport {
 struct FetchMessagesResult {
     to_seq: u64,
     records: Vec<InboxRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_url_for_log_redacts_tokens_and_queries() {
+        let sanitized = sanitize_url_for_log(
+            "https://example.com/v1/contact-share/secret-token?last_acked_seq=3",
+        );
+
+        assert_eq!(
+            sanitized,
+            "https://example.com/v1/contact-share/<redacted>?<redacted>"
+        );
+        assert!(!sanitized.contains("secret-token"));
+        assert!(!sanitized.contains("last_acked_seq=3"));
+    }
 }

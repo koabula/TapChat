@@ -126,7 +126,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       // Pass the sent message info for immediate display
       onSentWithMessage?.(result);
     } catch (err) {
-      console.error("Failed to send:", err);
+      console.error(`[MessageInput] Failed to send message: ${String(err)}`);
       const errorMsg = String(err);
       if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("request") || errorMsg.includes("connect")) {
         alert("Network error: Unable to deliver message. Check if your peer has Cloudflare deployed and accessible.");
@@ -155,7 +155,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       });
       // Progress events will handle the rest
     } catch (err) {
-      console.error("Failed to send attachment:", err);
+      console.error(`[MessageInput] Failed to send attachment: ${String(err)}`);
       setUploadProgress(null);
       setUploadStatus(null);
       setSending(false);
@@ -173,7 +173,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         handleFileFromPath(selected as string);
       }
     } catch (err) {
-      console.error("File selection failed:", err);
+      console.error(`[MessageInput] File selection failed: ${String(err)}`);
     }
   };
 
@@ -234,7 +234,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
 
       handleFileFromPath(tempPath);
     } catch (err) {
-      console.error("Failed to handle dropped file:", err);
+      console.error(`[MessageInput] Failed to handle dropped file: ${String(err)}`);
       // Fallback: show alert to use picker
       alert("Please use the attachment button to select files");
     }

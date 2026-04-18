@@ -26,7 +26,7 @@ export default function ContactList() {
         }));
         setContacts(mappedContacts);
       } catch (err) {
-        console.error("[ContactList] Failed to load contacts:", err);
+        console.error(`[ContactList] Failed to load contacts: ${String(err)}`);
       }
     }
     fetchContacts();
@@ -52,7 +52,7 @@ export default function ContactList() {
       }));
       setContacts(mappedContacts);
     } catch (err) {
-      console.error("Failed to add contact:", err);
+      console.error(`[ContactList] Failed to add contact: ${String(err)}`);
       alert(String(err));
     } finally {
       setAdding(false);

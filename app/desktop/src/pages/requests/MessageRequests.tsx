@@ -30,7 +30,7 @@ export default function MessageRequests() {
         useMessageRequestsStore.getState().setRequests(result.view_model.message_requests);
       }
     } catch (err) {
-      console.error("Failed to load message requests:", err);
+      console.error(`[MessageRequests] Failed to load message requests: ${String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -54,7 +54,9 @@ export default function MessageRequests() {
 
       // If accepted and conversation was created, refresh conversations and contacts
       if (action === "accept" && result.accepted) {
-        console.log("[MessageRequests] Accept result:", result);
+        console.debug(
+          `[MessageRequests] Accepted request requestId=${requestId} conversationAvailable=${Boolean(result.conversation_id)}`,
+        );
 
         // Refresh conversations to show the newly created conversation
         try {
@@ -67,7 +69,7 @@ export default function MessageRequests() {
             last_message_time: null,
             unread_count: 0,
           })));
-          console.log("[MessageRequests] Refreshed conversations:", conversations.length);
+          console.debug(`[MessageRequests] Refreshed conversations count=${conversations.length}`);
 
           // Refresh contacts
           const contacts = await invoke<{ user_id: string; device_count: number }[]>("list_contacts");
@@ -77,7 +79,7 @@ export default function MessageRequests() {
             device_count: c.device_count,
             last_refresh: null,
           })));
-          console.log("[MessageRequests] Refreshed contacts:", contacts.length);
+          console.debug(`[MessageRequests] Refreshed contacts count=${contacts.length}`);
 
           // Navigate to the new conversation if one was created
           if (result.conversation_id) {
@@ -86,12 +88,12 @@ export default function MessageRequests() {
             navigate("/");
           }
         } catch (err) {
-          console.error("[MessageRequests] Failed to refresh after accept:", err);
+          console.error(`[MessageRequests] Failed to refresh after accept: ${String(err)}`);
           navigate("/");
         }
       }
     } catch (err) {
-      console.error("Failed to action request:", err);
+      console.error(`[MessageRequests] Failed to ${action} request ${requestId}: ${String(err)}`);
       // Reload from backend on error to restore state
       loadFromBackend();
     } finally {

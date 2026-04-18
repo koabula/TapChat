@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tapchat_core::CoreEngine;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;
@@ -13,6 +13,7 @@ use crate::ports::DesktopPlatformPorts;
 /// async runtime.
 pub struct AppState {
     pub inner: Arc<RwLock<AppStateInner>>,
+    pub sync_gate: Arc<Mutex<SyncGateState>>,
 }
 
 pub struct AppStateInner {
@@ -47,6 +48,12 @@ pub enum OnboardingStep {
     Complete,
 }
 
+#[derive(Debug, Default)]
+pub struct SyncGateState {
+    pub in_flight: bool,
+    pub pending: bool,
+}
+
 impl AppState {
     pub fn new() -> Self {
         let profile_manager = ProfileManager::new();
@@ -59,6 +66,7 @@ impl AppState {
                 session: SessionState::Uninitialized,
                 profile_path: None,
             })),
+            sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
         }
     }
 
@@ -74,6 +82,7 @@ impl AppState {
                 session: SessionState::Uninitialized,
                 profile_path: None,
             })),
+            sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
         }
     }
 }

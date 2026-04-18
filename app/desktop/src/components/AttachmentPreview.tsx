@@ -48,7 +48,7 @@ export default function AttachmentPreview({
       }
     } catch (err) {
       // Preview failed, fall back to icon display
-      console.error("Failed to load image preview:", err);
+      console.error(`[AttachmentPreview] Failed to load image preview: ${String(err)}`);
     } finally {
       setLoadingPreview(false);
     }
@@ -101,7 +101,7 @@ export default function AttachmentPreview({
     try {
       await invoke("open_file", { path: downloadedPath });
     } catch (err) {
-      console.error("Failed to open file:", err);
+      console.error(`[AttachmentPreview] Failed to open file: ${String(err)}`);
     }
   };
 

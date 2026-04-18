@@ -17,7 +17,7 @@ export default function Complete() {
   useEffect(() => {
     invoke<string | null>("get_share_link")
       .then(setShareLink)
-      .catch((err) => console.error("Failed to get share link:", err));
+      .catch((err) => console.error(`[OnboardingComplete] Failed to get share link: ${String(err)}`));
   }, []);
 
   const handleCopyShareLink = async () => {
@@ -27,7 +27,7 @@ export default function Complete() {
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
       } catch (err) {
-        console.error("Failed to copy:", err);
+        console.error(`[OnboardingComplete] Failed to copy share link: ${String(err)}`);
       }
     }
   };

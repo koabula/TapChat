@@ -50,12 +50,22 @@ struct RealtimeSession {
     device_id: String,
     endpoint: String,
     connection_id: ConnectionId,
+    connecting: bool,
     connected: bool,
     /// If true, this session is stale and should not process messages
     stale: bool,
     stop_tx: mpsc::Sender<()>,
     /// Time when connection was established
     connected_at: Option<Instant>,
+}
+
+enum ConnectionReservation {
+    Existing,
+    Reserved {
+        connection_id: ConnectionId,
+        stop_rx: mpsc::Receiver<()>,
+        stale_stop_tx: Option<mpsc::Sender<()>>,
+    },
 }
 
 /// Events received from WebSocket.
@@ -124,38 +134,31 @@ impl RealtimeManager {
             endpoint,
             subscription.last_acked_seq
         );
-
-        // Step 1: Mark any existing connection as stale and close it
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(existing) = sessions.get_mut(&device_id) {
-                if existing.connected && !existing.stale {
-                    log::info!(
-                        "RealtimeManager: marking existing connection {} as stale for device_id={}",
-                        existing.connection_id.as_str(),
-                        device_id
-                    );
-                    existing.stale = true;
-                    existing.connected = false;
-                    // Send stop signal to old connection's read_loop
-                    let _ = existing.stop_tx.send(()).await;
-                }
+        let reservation = self.reserve_connection(&device_id, &endpoint).await;
+        let (connection_id, stop_rx, stale_stop_tx) = match reservation {
+            ConnectionReservation::Existing => {
+                log::debug!(
+                    "RealtimeManager: reusing active or connecting session for device_id={}",
+                    device_id
+                );
+                return Ok(Vec::new());
             }
-        }
+            ConnectionReservation::Reserved {
+                connection_id,
+                stop_rx,
+                stale_stop_tx,
+            } => (connection_id, stop_rx, stale_stop_tx),
+        };
 
-        // Step 2: Wait a brief moment for old connection to stop processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if let Some(tx) = stale_stop_tx {
+            let _ = tx.send(()).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
 
         // Step 3: Build WebSocket URL
         let ws_url = self.build_ws_url(&endpoint, &device_id, subscription.last_acked_seq)?;
 
         log::info!("RealtimeManager: built ws_url={}", ws_url);
-
-        // Step 4: Create stop channel for new connection
-        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
-
-        // Step 5: Generate unique connection ID
-        let connection_id = self.next_connection_id().await;
 
         // Step 6: Create request with headers
         let mut request = Request::builder()
@@ -178,9 +181,19 @@ impl RealtimeManager {
         }
 
         // Step 7: Connect
-        let (ws_stream, _) = connect_async_tls_with_config(request, None, false, None)
-            .await
-            .context("websocket connect")?;
+        let (ws_stream, _) = match connect_async_tls_with_config(request, None, false, None).await {
+            Ok(result) => result,
+            Err(error) => {
+                let mut sessions = self.sessions.write().await;
+                if sessions
+                    .get(&device_id)
+                    .is_some_and(|session| session.connection_id == connection_id)
+                {
+                    sessions.remove(&device_id);
+                }
+                return Err(error).context("websocket connect");
+            }
+        };
 
         log::info!(
             "RealtimeManager: WebSocket connected for device_id={}, connection_id={}",
@@ -200,18 +213,14 @@ impl RealtimeManager {
         // Step 9: Store new session (replace any stale entry)
         {
             let mut sessions = self.sessions.write().await;
-            sessions.insert(
-                device_id.clone(),
-                RealtimeSession {
-                    device_id: device_id.clone(),
-                    endpoint: endpoint.clone(),
-                    connection_id: connection_id.clone(),
-                    connected: true,
-                    stale: false,
-                    stop_tx,
-                    connected_at: Some(Instant::now()),
-                },
-            );
+            if let Some(session) = sessions.get_mut(&device_id) {
+                if session.connection_id == connection_id {
+                    session.connecting = false;
+                    session.connected = true;
+                    session.stale = false;
+                    session.connected_at = Some(Instant::now());
+                }
+            }
         }
 
         // Step 10: Spawn background task to read messages
@@ -268,6 +277,7 @@ impl RealtimeManager {
         // Mark all as stale and close
         for (_, session) in sessions.iter_mut() {
             session.stale = true;
+            session.connecting = false;
             session.connected = false;
             let _ = session.stop_tx.send(()).await;
         }
@@ -292,6 +302,55 @@ impl RealtimeManager {
         sessions.get(device_id).map(|s| {
             (s.connection_id.as_str().to_string(), s.connected, s.stale)
         })
+    }
+
+    async fn reserve_connection(
+        &self,
+        device_id: &str,
+        endpoint: &str,
+    ) -> ConnectionReservation {
+        let connection_id = self.next_connection_id().await;
+        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+        let mut sessions = self.sessions.write().await;
+        let mut stale_stop_tx = None;
+
+        if let Some(existing) = sessions.get_mut(device_id) {
+            if !existing.stale && (existing.connecting || existing.connected) {
+                return ConnectionReservation::Existing;
+            }
+
+            if !existing.stale {
+                log::info!(
+                    "RealtimeManager: marking existing connection {} as stale for device_id={}",
+                    existing.connection_id.as_str(),
+                    device_id
+                );
+                existing.stale = true;
+                existing.connecting = false;
+                existing.connected = false;
+                stale_stop_tx = Some(existing.stop_tx.clone());
+            }
+        }
+
+        sessions.insert(
+            device_id.to_string(),
+            RealtimeSession {
+                device_id: device_id.to_string(),
+                endpoint: endpoint.to_string(),
+                connection_id: connection_id.clone(),
+                connecting: true,
+                connected: false,
+                stale: false,
+                stop_tx: stop_tx.clone(),
+                connected_at: None,
+            },
+        );
+
+        ConnectionReservation::Reserved {
+            connection_id,
+            stop_rx,
+            stale_stop_tx,
+        }
     }
 
     fn build_ws_url(&self, endpoint: &str, device_id: &str, last_acked_seq: u64) -> Result<String> {
@@ -363,7 +422,6 @@ impl RealtimeManager {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            log::info!("RealtimeManager: received WS text for {}: {}", device_id, &text);
                             // Check if this connection is still active (not stale)
                             let is_active = {
                                 let sessions_guard = sessions.read().await;
@@ -383,7 +441,7 @@ impl RealtimeManager {
 
                             // Parse and emit as realtime event to frontend
                             if let Ok(event) = serde_json::from_str::<WsServerEvent>(&text) {
-                                log::info!("WS event parsed successfully for {}: {:?}", device_id, event);
+                                log::info!("RealtimeManager: {}", summarize_ws_event(&device_id, &event));
 
                                 // Emit to frontend
                                 if let Some(app) = &app_handle {
@@ -492,5 +550,77 @@ impl WsServerEvent {
             WsServerEvent::InboxRecordAvailable { .. } => "inbox_record_available",
             WsServerEvent::MessageRequestChanged { .. } => "message_request_changed",
         }.to_string()
+    }
+}
+
+fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
+    match event {
+        WsServerEvent::HeadUpdated { seq, .. } => {
+            format!("device_id={device_id} type=head_updated seq={seq}")
+        }
+        WsServerEvent::InboxRecordAvailable { seq, .. } => {
+            format!("device_id={device_id} type=inbox_record_available seq={seq}")
+        }
+        WsServerEvent::MessageRequestChanged {
+            sender_user_id,
+            request_id,
+            change,
+            ..
+        } => format!(
+            "device_id={device_id} type=message_request_changed sender_user_id={sender_user_id} request_id={request_id} change={change}"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tapchat_core::cli::profile::ProfileRegistry;
+
+    #[tokio::test]
+    async fn reserve_connection_skips_second_active_or_connecting_session() {
+        let manager = RealtimeManager::new(Arc::new(RwLock::new(ProfileManagerInner {
+            registry: ProfileRegistry::default(),
+            active_profile: None,
+        })));
+
+        let first = manager
+            .reserve_connection("device:test", "wss://example.com/ws")
+            .await;
+        assert!(matches!(first, ConnectionReservation::Reserved { .. }));
+
+        let second = manager
+            .reserve_connection("device:test", "wss://example.com/ws")
+            .await;
+        assert!(matches!(second, ConnectionReservation::Existing));
+
+        let sessions = manager.sessions.read().await;
+        let session = sessions.get("device:test").expect("session");
+        assert!(session.connecting);
+        assert!(!session.connected);
+        assert!(!session.stale);
+    }
+
+    #[test]
+    fn summarize_ws_event_omits_payload_contents() {
+        let summary = summarize_ws_event(
+            "device:test",
+            &WsServerEvent::InboxRecordAvailable {
+                device_id: "device:test".into(),
+                seq: 9,
+                record: Some(serde_json::json!({
+                    "envelope": {
+                        "inlineCiphertext": "secret",
+                        "senderProof": { "value": "proof" }
+                    }
+                })),
+            },
+        );
+
+        assert!(summary.contains("type=inbox_record_available"));
+        assert!(summary.contains("seq=9"));
+        assert!(!summary.contains("inlineCiphertext"));
+        assert!(!summary.contains("senderProof"));
+        assert!(!summary.contains("secret"));
     }
 }

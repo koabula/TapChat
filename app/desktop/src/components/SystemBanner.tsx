@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -111,18 +111,21 @@ export function NetworkIndicator() {
   const [syncing, setSyncing] = useState(false);
   const [isProfileSwitching, setIsProfileSwitching] = useState(false);
   const [lastDisconnectTime, setLastDisconnectTime] = useState<number | null>(null);
+  const isProfileSwitchingRef = useRef(false);
 
   useEffect(() => {
     // Listen to profile-switch events to track when we're switching profiles
     const unlistenProfileSwitchStart = listen<void>("profile-switch-start", () => {
-      console.log("[NetworkIndicator] profile-switch-start");
+      console.debug("[NetworkIndicator] profile-switch-start");
+      isProfileSwitchingRef.current = true;
       setIsProfileSwitching(true);
       setConnected(null); // Reset to unknown during switch
       setLastDisconnectTime(null);
     });
 
     const unlistenProfileSwitchComplete = listen<void>("profile-switch-complete", () => {
-      console.log("[NetworkIndicator] profile-switch-complete");
+      console.debug("[NetworkIndicator] profile-switch-complete");
+      isProfileSwitchingRef.current = false;
       setIsProfileSwitching(false);
       setLastDisconnectTime(null);
     });
@@ -130,11 +133,10 @@ export function NetworkIndicator() {
     // Listen to realtime-event for connection status
     const unlistenRealtime = listen<RealtimeEventPayload>("realtime-event", (event) => {
       const { event_type } = event.payload;
-      console.log("[NetworkIndicator] realtime-event:", event_type);
+      console.debug(`[NetworkIndicator] realtime-event type=${event_type}`);
 
       // Skip handling during profile switch
-      if (isProfileSwitching) {
-        console.log("[NetworkIndicator] skipping event during profile switch");
+      if (isProfileSwitchingRef.current) {
         return;
       }
 
@@ -166,12 +168,12 @@ export function NetworkIndicator() {
     // Check initial connection status
     invoke<{ ws_connected: boolean }>("get_session_status")
       .then((status) => {
-        if (!isProfileSwitching) {
+        if (!isProfileSwitchingRef.current) {
           setConnected(status.ws_connected);
         }
       })
       .catch((err) => {
-        console.error("[NetworkIndicator] Failed to get session status:", err);
+        console.error(`[NetworkIndicator] failed to get session status: ${String(err)}`);
       });
 
     return () => {
@@ -180,19 +182,19 @@ export function NetworkIndicator() {
       unlistenRealtime.then((fn) => fn());
       unlistenSync.then((fn) => fn());
     };
-  }, [isProfileSwitching]);
+  }, []);
 
   // Check if we've been disconnected for more than 5 seconds (not just brief flicker)
   const isLongDisconnect = lastDisconnectTime !== null &&
     (Date.now() - lastDisconnectTime) > 5000;
 
   const handleReconnect = async () => {
-    console.log("[NetworkIndicator] Manual reconnect triggered");
+    console.debug("[NetworkIndicator] manual reconnect triggered");
     setSyncing(true);
     try {
       await invoke("sync_now");
     } catch (err) {
-      console.error("[NetworkIndicator] Reconnect failed:", err);
+      console.error(`[NetworkIndicator] reconnect failed: ${String(err)}`);
     }
     // Sync status will be updated via core-update event
   };

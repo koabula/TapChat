@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -32,6 +32,23 @@ import { useNotifications } from "./hooks/useNotifications";
 
 import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
 import type { MessageRequestItem } from "./store/requests";
+
+function summarizeSessionStatus(status: SessionStatus): string {
+  return `state=${status.state} ws_connected=${status.ws_connected} device_id=${status.device_id ?? "none"}`;
+}
+
+function summarizeRealtimeEvent(event: RealtimeEventPayload): string {
+  return `type=${event.event_type} device_id=${event.device_id}`;
+}
+
+function isBenignMessageRequestSyncError(error: unknown): boolean {
+  const message = String(error);
+  return (
+    message.includes("unknown request_id") ||
+    message.includes("message request not found") ||
+    message.includes("not_found")
+  );
+}
 
 /**
  * Inner app component that has Router context.
@@ -98,14 +115,66 @@ function App() {
   const { setSessionState, setWsConnected, setDeviceId } = useSessionStore();
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [loading, setLoading] = useState(true);
-  // Track if we're in a profile switch to avoid triggering reconnect
-  const [isProfileSwitching, setIsProfileSwitching] = useState(false);
+  const isProfileSwitchingRef = useRef(false);
+  const syncInFlightRef = useRef(false);
+  const syncPendingRef = useRef(false);
 
   // Subscribe to Tauri events on mount (these don't need Router context)
   useEffect(() => {
+    const refreshMessageRequests = async () => {
+      const result = await invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests");
+      if (result.view_model?.message_requests) {
+        setRequests(result.view_model.message_requests);
+        console.debug(`[App] message requests refreshed count=${result.view_model.message_requests.length}`);
+      }
+    };
+
+    const scheduleSync = () => {
+      if (isProfileSwitchingRef.current) {
+        console.debug("[App] skipping sync during profile switch");
+        return;
+      }
+
+      if (syncInFlightRef.current) {
+        syncPendingRef.current = true;
+        console.debug("[App] sync already in flight; marked trailing sync");
+        return;
+      }
+
+      syncInFlightRef.current = true;
+
+      const runSync = async () => {
+        try {
+          await invoke("sync_now");
+          console.debug("[App] sync completed");
+        } catch (err) {
+          if (isBenignMessageRequestSyncError(err)) {
+            console.warn(`[App] benign sync race ignored: ${String(err)}`);
+            try {
+              await refreshMessageRequests();
+            } catch (refreshErr) {
+              console.warn(`[App] message request refresh after benign sync race failed: ${String(refreshErr)}`);
+            }
+          } else {
+            console.error(`[App] sync failed: ${String(err)}`);
+          }
+        } finally {
+          if (syncPendingRef.current) {
+            syncPendingRef.current = false;
+            console.debug("[App] running trailing sync");
+            void runSync();
+            return;
+          }
+          syncInFlightRef.current = false;
+        }
+      };
+
+      void runSync();
+    };
+
     // Subscribe to session-status events
     const unlistenSessionStatus = listen<SessionStatus>("session-status", (event) => {
-      console.log("[App] session-status:", event.payload);
+      console.debug(`[App] session-status ${summarizeSessionStatus(event.payload)}`);
       setSessionState(event.payload.state);
       setWsConnected(event.payload.ws_connected);
       if (event.payload.device_id) {
@@ -115,19 +184,19 @@ function App() {
 
     // Subscribe to profile switch events to track state
     const unlistenProfileSwitchStart = listen<void>("profile-switch-start", () => {
-      console.log("[App] profile-switch-start: entering profile switch mode");
-      setIsProfileSwitching(true);
+      console.debug("[App] profile-switch-start");
+      isProfileSwitchingRef.current = true;
       setWsConnected(false);
     });
 
     const unlistenProfileSwitchComplete = listen<void>("profile-switch-complete", () => {
-      console.log("[App] profile-switch-complete: exiting profile switch mode");
-      setIsProfileSwitching(false);
+      console.debug("[App] profile-switch-complete");
+      isProfileSwitchingRef.current = false;
     });
 
     // Subscribe to realtime WebSocket events
     const unlistenRealtime = listen<RealtimeEventPayload>("realtime-event", (event) => {
-      console.log("[App] realtime-event:", event.payload);
+      console.debug(`[App] realtime-event ${summarizeRealtimeEvent(event.payload)}`);
       const { event_type } = event.payload;
 
       switch (event_type) {
@@ -137,80 +206,66 @@ function App() {
         case "disconnected":
           setWsConnected(false);
           // Only attempt reconnect if not in profile switch mode
-          if (!isProfileSwitching) {
-            console.log("[App] WebSocket disconnected, scheduling reconnect...");
+          if (!isProfileSwitchingRef.current) {
+            console.debug("[App] websocket disconnected; scheduling reconnect");
             // Schedule a reconnect attempt after a short delay
             setTimeout(() => {
-              if (!isProfileSwitching) {
-                console.log("[App] Attempting reconnect...");
-                invoke("sync_now").catch((err) => {
-                  console.error("[App] Reconnect attempt failed:", err);
-                });
+              if (!isProfileSwitchingRef.current) {
+                scheduleSync();
               }
             }, 2000);
           } else {
-            console.log("[App] WebSocket disconnected during profile switch, skipping reconnect");
+            console.debug("[App] websocket disconnected during profile switch");
           }
           break;
         case "error":
           setWsConnected(false);
-          console.log("[App] WebSocket error:", event.payload.data);
+          console.warn(`[App] websocket error ${event.payload.device_id}: ${event.payload.data ?? "unknown"}`);
           // Also attempt reconnect on error if not switching
-          if (!isProfileSwitching) {
+          if (!isProfileSwitchingRef.current) {
             setTimeout(() => {
-              if (!isProfileSwitching) {
-                invoke("sync_now").catch((err) => {
-                  console.error("[App] Reconnect after error failed:", err);
-                });
+              if (!isProfileSwitchingRef.current) {
+                scheduleSync();
               }
             }, 3000);
           }
           break;
         case "message_request_changed":
           // Refresh message requests from backend
-          console.log("[App] Message request changed, refreshing...");
-          invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests")
-            .then((result) => {
-              if (result.view_model?.message_requests) {
-                setRequests(result.view_model.message_requests);
-                console.log("[App] Message requests updated:", result.view_model.message_requests.length);
-              }
-            })
+          refreshMessageRequests()
             .catch((err) => {
-              console.error("[App] Failed to refresh message requests:", err);
+              console.error(`[App] failed to refresh message requests: ${String(err)}`);
             });
           break;
-        case "head_updated":
         case "inbox_record_available":
-          // These events indicate new messages - trigger sync to fetch them
-          console.log("[App] Realtime event received, triggering sync...");
-          invoke("sync_now").catch((err) => {
-            console.error("[App] Failed to sync:", err);
-          });
+          scheduleSync();
+          break;
+        case "head_updated":
           break;
       }
     });
 
     // Subscribe to websocket connection events (legacy)
     const unlistenWsConnect = listen<{ device_id: string }>("websocket-connected", (event) => {
-      console.log("[App] WebSocket connected:", event.payload);
+      console.debug(`[App] websocket-connected device_id=${event.payload.device_id}`);
       setWsConnected(true);
     });
 
     const unlistenWsDisconnect = listen<{ device_id: string; reason?: string }>("websocket-disconnected", (event) => {
-      console.log("[App] WebSocket disconnected:", event.payload);
+      console.debug(`[App] websocket-disconnected device_id=${event.payload.device_id} reason=${event.payload.reason ?? "none"}`);
       setWsConnected(false);
     });
 
     // Fetch initial session status
     invoke<SessionStatus>("get_session_status")
       .then((status) => {
+        console.debug(`[App] initial session-status ${summarizeSessionStatus(status)}`);
         setSessionState(status.state);
         setWsConnected(status.ws_connected);
         setLoading(false);
       })
       .catch((err) => {
-        console.error("[App] Failed to get session status:", err);
+        console.error(`[App] failed to get session status: ${String(err)}`);
         setLoading(false);
       });
 
@@ -222,7 +277,7 @@ function App() {
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected, setRequests, isProfileSwitching]);
+  }, [setSessionState, setWsConnected, setRequests, setDeviceId]);
 
   if (loading) {
     return (

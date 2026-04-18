@@ -23,7 +23,7 @@ export default function BackupMnemonic() {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
-      console.error("Failed to copy:", err);
+      console.error(`[BackupMnemonic] Failed to copy mnemonic: ${String(err)}`);
     }
   };
 

@@ -33,19 +33,21 @@ export default function Identity() {
     setError(null);
 
     try {
-      console.log("Calling init_onboarding_profile with profileName:", profileName);
+      console.debug(`[OnboardingIdentity] Initializing profile profileName=${profileName}`);
 
       // Initialize profile first
       const result = await invoke<ProfileSummary>("init_onboarding_profile", {
         profileName,
       });
 
-      console.log("Profile created successfully:", result);
+      console.debug(
+        `[OnboardingIdentity] Profile initialized name=${result.name} active=${result.is_active}`,
+      );
 
       // Move to identity step
       setStep("identity");
     } catch (err) {
-      console.error("Failed to create profile:", err);
+      console.error(`[OnboardingIdentity] Failed to create profile: ${String(err)}`);
       // Handle different error formats
       const errorMsg = typeof err === 'string' ? err :
         (err instanceof Error ? err.message :

@@ -34,7 +34,7 @@ export default function ContactDetail() {
       setContact(found || null);
       setDisplayName(found?.display_name || "");
     } catch (err) {
-      console.error("Failed to load contact:", err);
+      console.error(`[ContactDetail] Failed to load contact: ${String(err)}`);
     }
   };
 
@@ -45,7 +45,7 @@ export default function ContactDetail() {
       await invoke("refresh_contact", { userId });
       loadContact();
     } catch (err) {
-      console.error("Failed to refresh:", err);
+      console.error(`[ContactDetail] Failed to refresh contact: ${String(err)}`);
     } finally {
       setRefreshing(false);
     }
@@ -62,7 +62,7 @@ export default function ContactDetail() {
       setEditingDisplayName(false);
       loadContact();
     } catch (err) {
-      console.error("Failed to save display name:", err);
+      console.error(`[ContactDetail] Failed to save display name: ${String(err)}`);
       alert(String(err));
     } finally {
       setSaving(false);
@@ -77,7 +77,7 @@ export default function ContactDetail() {
       });
       navigate(`/chat/${result.conversation_id}`);
     } catch (err) {
-      console.error("Failed to create conversation:", err);
+      console.error(`[ContactDetail] Failed to create conversation: ${String(err)}`);
       const errorMsg = String(err);
       if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("request")) {
         alert("Network error: Unable to connect to the peer's inbox. Both profiles need to have Cloudflare deployed to communicate.");
@@ -100,7 +100,7 @@ export default function ContactDetail() {
       // Navigate back to contacts list
       navigate("/contacts");
     } catch (err) {
-      console.error("Failed to delete contact:", err);
+      console.error(`[ContactDetail] Failed to delete contact: ${String(err)}`);
       alert(String(err));
     } finally {
       setDeleting(false);

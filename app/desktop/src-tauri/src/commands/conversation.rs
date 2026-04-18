@@ -8,6 +8,13 @@ use tapchat_core::model::ConversationKind;
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::{AppState, SessionState};
 
+fn summarize_plaintext(plaintext: Option<&str>) -> String {
+    match plaintext {
+        Some(value) => format!("has_plaintext=true plaintext_len={}", value.len()),
+        None => "has_plaintext=false plaintext_len=0".into(),
+    }
+}
+
 /// Simplified result for create_conversation command
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateConversationResult {
@@ -114,10 +121,10 @@ pub async fn get_messages(
                 .map(|msg| {
                     // Log plaintext status for debugging
                     log::info!(
-                        "get_messages: message_id={}, message_type={:?}, plaintext={:?}",
+                        "get_messages: message_id={}, message_type={:?}, {}",
                         msg.message_id,
                         msg.message_type,
-                        msg.plaintext.as_deref().map(|s| if s.len() > 50 { &s[..50] } else { s })
+                        summarize_plaintext(msg.plaintext.as_deref())
                     );
                     // Determine if this is a sent or received message
                     let direction = if local_device_id.as_ref() == Some(&msg.sender_device_id) {
@@ -175,4 +182,17 @@ pub async fn get_messages(
     all_messages.sort_by_key(|msg| msg["created_at"].as_u64().unwrap_or(0));
 
     Ok(all_messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_plaintext_never_includes_plaintext_contents() {
+        let summary = summarize_plaintext(Some("hello secret world"));
+        assert_eq!(summary, "has_plaintext=true plaintext_len=18");
+        assert!(!summary.contains("hello"));
+        assert!(!summary.contains("secret"));
+    }
 }

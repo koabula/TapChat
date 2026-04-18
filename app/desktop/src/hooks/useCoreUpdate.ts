@@ -23,11 +23,11 @@ export function useCoreUpdate() {
   // Function to fetch and set all data
   const fetchAndSetData = async () => {
     try {
-      console.log("[useCoreUpdate] Fetching data...");
+      console.debug("[useCoreUpdate] fetching initial data");
 
       // Fetch conversations
       const conversations = await invoke<ConversationSummary[]>("list_conversations");
-      console.log("[useCoreUpdate] Loaded conversations:", conversations.length);
+      console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
 
       const mappedConversations = conversations.map((c) => ({
         conversation_id: c.conversation_id,
@@ -41,7 +41,7 @@ export function useCoreUpdate() {
 
       // Fetch contacts
       const contacts = await invoke<ContactSummary[]>("list_contacts");
-      console.log("[useCoreUpdate] Loaded contacts:", contacts.length);
+      console.debug(`[useCoreUpdate] loaded contacts=${contacts.length}`);
 
       const mappedContacts = contacts.map((c) => ({
         user_id: c.user_id,
@@ -55,7 +55,7 @@ export function useCoreUpdate() {
       const requestsResult = await invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests");
       if (requestsResult.view_model?.message_requests) {
         setRequests(requestsResult.view_model.message_requests);
-        console.log("[useCoreUpdate] Loaded message requests:", requestsResult.view_model.message_requests.length);
+        console.debug(`[useCoreUpdate] loaded message_requests=${requestsResult.view_model.message_requests.length}`);
       }
 
       // Fetch identity info to get device_id
@@ -65,16 +65,16 @@ export function useCoreUpdate() {
           setDeviceId(identity.device_id);
         }
       } catch (err) {
-        console.error("[useCoreUpdate] Failed to get identity info:", err);
+        console.error(`[useCoreUpdate] failed to get identity info: ${String(err)}`);
       }
     } catch (err) {
-      console.error("[useCoreUpdate] Failed to fetch data:", err);
+      console.error(`[useCoreUpdate] failed to fetch data: ${String(err)}`);
     }
   };
 
   // Clear all stores
   const clearStores = () => {
-    console.log("[useCoreUpdate] Clearing stores...");
+    console.debug("[useCoreUpdate] clearing stores");
     setConversations([]);
     setContacts([]);
   };
@@ -89,11 +89,9 @@ export function useCoreUpdate() {
     const unlistenCoreUpdate = listen<CoreUpdateEvent>("core-update", (event) => {
       const { state_update, view_model } = event.payload;
 
-      // Log for debugging
-      console.log("[useCoreUpdate] Received core-update:", {
-        state_update,
-        view_model,
-      });
+      console.debug(
+        `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`
+      );
 
       if (!view_model) return;
 
@@ -131,13 +129,13 @@ export function useCoreUpdate() {
       // Process message requests
       if (view_model.message_requests) {
         setRequests(view_model.message_requests);
-        console.log("[useCoreUpdate] Message requests:", view_model.message_requests.length);
+        console.debug(`[useCoreUpdate] message_requests=${view_model.message_requests.length}`);
       }
     });
 
     // Listen for engine-reloaded event (profile switch)
     const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {
-      console.log("[useCoreUpdate] Engine reloaded (profile switched)");
+      console.debug("[useCoreUpdate] engine reloaded");
       // Clear stores first to remove old profile's data
       clearStores();
       // Then fetch new profile's data

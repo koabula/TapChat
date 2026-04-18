@@ -2,7 +2,6 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use tapchat_core::{CoreCommand, CoreOutput};
-use tapchat_core::transport_contract::RealtimeSubscriptionRequest;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::{AppState, SessionState};
@@ -14,55 +13,66 @@ pub struct SessionStatus {
     pub ws_connected: bool,
 }
 
+async fn run_gated_sync(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    reason: &str,
+) -> Result<CoreOutput, String> {
+    let device_id = {
+        let inner = state.inner.read().await;
+        match &inner.session {
+            SessionState::Active { device_id } => device_id.clone(),
+            _ => return Err("No active session".into()),
+        }
+    };
+
+    {
+        let mut gate = state.sync_gate.lock().await;
+        if gate.in_flight {
+            gate.pending = true;
+            log::debug!("[session] sync already in flight; coalescing request ({reason})");
+            return Ok(CoreOutput::default());
+        }
+        gate.in_flight = true;
+        gate.pending = false;
+    }
+
+    loop {
+        let result = drive_core_with_handle(
+            app,
+            CoreInput::Command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some(reason.to_string()),
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string());
+
+        let should_rerun = {
+            let mut gate = state.sync_gate.lock().await;
+            if gate.pending {
+                gate.pending = false;
+                true
+            } else {
+                gate.in_flight = false;
+                false
+            }
+        };
+
+        if !should_rerun {
+            return result;
+        }
+
+        log::debug!("[session] running trailing sync after coalesced request ({reason})");
+    }
+}
+
 #[tauri::command]
 pub async fn start_realtime_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let inner = state.inner.read().await;
-
-    // Get device_id and endpoint from active session
-    let (device_id, endpoint) = match &inner.session {
-        SessionState::Active { device_id } => {
-            // Get runtime metadata to find WebSocket endpoint
-            let runtime = inner.profile_manager.get_runtime_metadata().await;
-            let ws_endpoint = runtime.and_then(|r| r.websocket_base_url);
-            (device_id.clone(), ws_endpoint)
-        }
-        _ => return Err("No active session".into()),
-    };
-
-    let endpoint = endpoint.ok_or("No WebSocket endpoint configured")?;
-
-    // Get last acked seq from sync state
-    let snapshot = inner.engine.refresh_snapshot();
-    let last_acked_seq = snapshot.sync_states
-        .iter()
-        .find(|s| s.device_id == device_id)
-        .map(|s| s.state.checkpoint.last_acked_seq)
-        .unwrap_or(0);
-
-    drop(inner);
-
-    // Create realtime subscription request
-    let subscription = RealtimeSubscriptionRequest {
-        device_id,
-        endpoint,
-        last_acked_seq,
-        headers: Default::default(),
-    };
-
-    // Open WebSocket through drive_core
-    drive_core_with_handle(
-        &app,
-        CoreInput::Command(CoreCommand::SyncInbox {
-            device_id: subscription.device_id.clone(),
-            reason: Some("realtime start".into()),
-        }),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
+    run_gated_sync(&app, &state, "realtime start").await?;
     Ok(())
 }
 
@@ -96,24 +106,7 @@ pub async fn sync_now(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreOutput, String> {
-    let inner = state.inner.read().await;
-
-    let device_id = match &inner.session {
-        SessionState::Active { device_id } => device_id.clone(),
-        _ => return Err("No active session".into()),
-    };
-
-    drop(inner);
-
-    drive_core_with_handle(
-        &app,
-        CoreInput::Command(CoreCommand::SyncInbox {
-            device_id,
-            reason: Some("manual".into()),
-        }),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    run_gated_sync(&app, &state, "manual").await
 }
 
 #[tauri::command]
@@ -151,5 +144,29 @@ pub async fn get_session_status(
             device_id: None,
             ws_connected,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::state::SyncGateState;
+
+    #[tokio::test]
+    async fn coalesced_sync_requests_set_pending_without_starting_second_run() {
+        let gate = tokio::sync::Mutex::new(SyncGateState {
+            in_flight: true,
+            pending: false,
+        });
+
+        {
+            let mut state = gate.lock().await;
+            assert!(state.in_flight);
+            assert!(!state.pending);
+            state.pending = true;
+        }
+
+        let state = gate.lock().await;
+        assert!(state.in_flight);
+        assert!(state.pending);
     }
 }

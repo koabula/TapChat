@@ -146,6 +146,21 @@ impl DesktopPlatformPorts {
     }
 }
 
+fn summarize_share_url(url: Option<&str>) -> String {
+    let Some(url) = url else {
+        return "none".into();
+    };
+    let Ok(parsed) = url::Url::parse(url) else {
+        return "<invalid-url>".into();
+    };
+    let host = parsed.host_str().unwrap_or_default();
+    let path = parsed.path();
+    if path.starts_with("/v1/contact-share/") {
+        return format!("{host}/v1/contact-share/<redacted>");
+    }
+    format!("{host}{path}")
+}
+
 // --- TransportPort ---
 // Note: TransportPort trait requires `&mut self` but our implementations use `&self`
 // We implement by delegating to the platform modules
@@ -159,11 +174,13 @@ impl TransportPort for DesktopPlatformPorts {
         if request.method == HttpMethod::Post && request.url.contains("/messages") {
             log::info!("[TransportPort] Intercepting /messages POST request");
             if let Some(body) = &request.body {
-                log::debug!("[TransportPort] Request body: {}", body);
                 // Try to parse as AppendEnvelopeRequest
                 if let Ok(mut append_request) = serde_json::from_str::<AppendEnvelopeRequest>(body) {
                     log::info!("[TransportPort] Parsed AppendEnvelopeRequest successfully");
-                    log::info!("[TransportPort] Current sender_bundle_share_url: {:?}", append_request.sender_bundle_share_url);
+                    log::info!(
+                        "[TransportPort] sender_bundle_share_url={}",
+                        summarize_share_url(append_request.sender_bundle_share_url.as_deref())
+                    );
 
                     // Check if sender_bundle_share_url needs to be replaced
                     // It should be a contact-share URL, not identity_bundle_ref
@@ -175,14 +192,18 @@ impl TransportPort for DesktopPlatformPorts {
                     if needs_contact_share_url {
                         // Generate correct contact share URL from runtime metadata
                         let contact_share_url = self.build_contact_share_url().await?;
-                        log::info!("[TransportPort] Generated contact_share_url: {:?}", contact_share_url);
+                        log::info!(
+                            "[TransportPort] generated_contact_share_url={}",
+                            summarize_share_url(contact_share_url.as_deref())
+                        );
 
                         if let Some(url) = contact_share_url {
-                            log::info!("[TransportPort] Injecting sender_bundle_share_url: {}", url);
+                            log::info!(
+                                "[TransportPort] Injecting contact-share URL for outbound request"
+                            );
                             append_request.sender_bundle_share_url = Some(url);
                             // Rebuild the request with modified body
                             let modified_body = serde_json::to_string(&append_request)?;
-                            log::debug!("[TransportPort] Modified body: {}", modified_body);
                             let modified_request = HttpRequestEffect {
                                 request_id: request.request_id.clone(),
                                 method: request.method.clone(),
@@ -415,4 +436,18 @@ fn sign_contact_share_token(secret: &str, user_id: &str, share_id: &str) -> Resu
         URL_SAFE_NO_PAD.encode(payload_bytes),
         URL_SAFE_NO_PAD.encode(signature)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_share_url_redacts_contact_share_token() {
+        let summary = summarize_share_url(Some(
+            "https://example.com/v1/contact-share/secret-token-value",
+        ));
+        assert_eq!(summary, "example.com/v1/contact-share/<redacted>");
+        assert!(!summary.contains("secret-token-value"));
+    }
 }

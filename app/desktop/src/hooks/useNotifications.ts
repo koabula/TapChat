@@ -103,7 +103,7 @@ export async function ensureNotificationPermission(): Promise<boolean> {
     }
     return granted;
   } catch (err) {
-    console.error("Failed to check notification permission:", err);
+      console.error(`[Notifications] Failed to check notification permission: ${String(err)}`);
     return false;
   }
 }

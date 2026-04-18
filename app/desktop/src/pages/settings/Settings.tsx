@@ -56,7 +56,7 @@ export default function Settings() {
 
     // Listen for engine-reloaded event (profile switch) to reload all data
     const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {
-      console.log("[Settings] Engine reloaded, refreshing data...");
+      console.debug("[Settings] Engine reloaded, refreshing settings data");
       loadIdentity();
       loadRuntimeStatus();
       loadAllowlist();
@@ -74,7 +74,7 @@ export default function Settings() {
       setIdentity(result);
       setDisplayNameInput(result?.display_name || "");
     } catch (err) {
-      console.error("Failed to get identity:", err);
+      console.error(`[Settings] Failed to get identity: ${String(err)}`);
     }
   };
 
@@ -83,7 +83,7 @@ export default function Settings() {
       const result = await cloudflareStatus();
       setRuntimeStatus(result);
     } catch (err) {
-      console.error("Failed to get runtime status:", err);
+      console.error(`[Settings] Failed to get runtime status: ${String(err)}`);
     }
   };
 
@@ -92,7 +92,7 @@ export default function Settings() {
       const result = await listProfiles();
       setProfiles(result);
     } catch (err) {
-      console.error("Failed to load profiles:", err);
+      console.error(`[Settings] Failed to load profiles: ${String(err)}`);
     }
   };
 
@@ -103,7 +103,7 @@ export default function Settings() {
         setAllowlist(result.view_model.allowlist.allowed_sender_user_ids || []);
       }
     } catch (err) {
-      console.error("Failed to load allowlist:", err);
+      console.error(`[Settings] Failed to load allowlist: ${String(err)}`);
     }
   };
 
@@ -122,7 +122,7 @@ export default function Settings() {
         setTimeout(() => setCopied(false), 2000);
       }
     } catch (err) {
-      console.error("Failed to copy:", err);
+      console.error(`[Settings] Failed to copy share link: ${String(err)}`);
     }
   };
 
@@ -133,7 +133,7 @@ export default function Settings() {
       setNewAllowlistUser("");
       loadAllowlist();
     } catch (err) {
-      console.error("Failed to add to allowlist:", err);
+      console.error(`[Settings] Failed to add allowlist entry: ${String(err)}`);
     }
   };
 
@@ -142,7 +142,7 @@ export default function Settings() {
       await removeFromAllowlist(userId);
       loadAllowlist();
     } catch (err) {
-      console.error("Failed to remove from allowlist:", err);
+      console.error(`[Settings] Failed to remove allowlist entry: ${String(err)}`);
     }
   };
 
@@ -151,7 +151,7 @@ export default function Settings() {
       await rotateShareLink();
       alert("Share link rotated. Share the new link with your contacts.");
     } catch (err) {
-      console.error("Failed to rotate link:", err);
+      console.error(`[Settings] Failed to rotate share link: ${String(err)}`);
       alert(String(err));
     }
   };
@@ -164,7 +164,7 @@ export default function Settings() {
       setEditingDisplayName(false);
       loadIdentity();
     } catch (err) {
-      console.error("Failed to save display name:", err);
+      console.error(`[Settings] Failed to save display name: ${String(err)}`);
       alert(String(err));
     } finally {
       setSavingDisplayName(false);
@@ -179,7 +179,7 @@ export default function Settings() {
       // which will trigger useCoreUpdate to fetch new data
       // The profile-switch-complete event signals that the switch is done
     } catch (err) {
-      console.error("Profile switch error:", err);
+      console.error(`[Settings] Profile switch error: ${String(err)}`);
       // Don't show popup for transient errors like websocket connect
       const errorMsg = String(err);
       if (!errorMsg.includes("websocket") && !errorMsg.includes("connect") && errorMsg !== "") {
@@ -201,7 +201,7 @@ export default function Settings() {
       setShowCreateConfirm(false);
       // The backend will emit session-status event which triggers frontend navigation
     } catch (err) {
-      console.error("Failed to start onboarding:", err);
+      console.error(`[Settings] Failed to start onboarding: ${String(err)}`);
       alert(String(err));
     } finally {
       setStartingOnboarding(false);
@@ -222,7 +222,7 @@ export default function Settings() {
       await deleteProfile(path);
       loadProfiles();
     } catch (err) {
-      console.error("Failed to delete profile:", err);
+      console.error(`[Settings] Failed to delete profile: ${String(err)}`);
       alert(String(err));
     } finally {
       setDeletingProfile(null);

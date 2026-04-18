@@ -49,7 +49,7 @@ export default function Devices() {
         ]);
       }
     } catch (err) {
-      console.error("Failed to load devices:", err);
+      console.error(`[DeviceSettings] Failed to load devices: ${String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -69,7 +69,7 @@ export default function Devices() {
       });
       loadDevices();
     } catch (err) {
-      console.error("Failed to revoke device:", err);
+      console.error(`[DeviceSettings] Failed to revoke device: ${String(err)}`);
       alert(String(err));
     } finally {
       setRevokingDevice(null);

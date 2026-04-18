@@ -76,7 +76,7 @@ export default function ChatView() {
       const result = await invoke<Message[]>("get_messages", { conversationId });
       setMessages(result);
     } catch (err) {
-      console.error("Failed to load messages:", err);
+      console.error(`[ChatView] Failed to load messages: ${String(err)}`);
       setMessages([]);
     } finally {
       setLoading(false);
@@ -91,7 +91,7 @@ export default function ChatView() {
       const result = await invoke<Message[]>("get_messages", { conversationId });
       setMessages(result);
     } catch (err) {
-      console.error("Failed to refresh messages:", err);
+      console.error(`[ChatView] Failed to refresh messages: ${String(err)}`);
     }
   };
 

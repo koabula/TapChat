@@ -82,7 +82,7 @@ export default function Runtime() {
       const result = await invoke<RuntimeStatus>("cloudflare_status");
       setStatus(result);
     } catch (err) {
-      console.error("Failed to load runtime status:", err);
+      console.error(`[RuntimeSettings] Failed to load runtime status: ${String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -93,7 +93,7 @@ export default function Runtime() {
       const result = await invoke<PreflightResult>("cloudflare_preflight");
       setPreflight(result);
     } catch (err) {
-      console.error("Preflight check failed:", err);
+      console.error(`[RuntimeSettings] Preflight check failed: ${String(err)}`);
       setError(String(err));
     }
   };
