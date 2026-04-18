@@ -8,6 +8,7 @@ export interface Conversation {
   last_message: string | null;
   last_message_time: number | null;
   message_count: number;
+  last_activity_key: string;
   unread_count: number;
   has_unread: boolean;
 }

@@ -112,7 +112,7 @@ function AppInner() {
 }
 
 function App() {
-  const { setSessionState, setWsConnected, setDeviceId } = useSessionStore();
+  const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight } = useSessionStore();
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [loading, setLoading] = useState(true);
   const isProfileSwitchingRef = useRef(false);
@@ -142,6 +142,7 @@ function App() {
       }
 
       syncInFlightRef.current = true;
+      setSyncInFlight(true);
 
       const runSync = async () => {
         try {
@@ -166,6 +167,7 @@ function App() {
             return;
           }
           syncInFlightRef.current = false;
+          setSyncInFlight(false);
         }
       };
 
@@ -277,7 +279,7 @@ function App() {
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected, setRequests, setDeviceId]);
+  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight]);
 
   if (loading) {
     return (

@@ -1,35 +1,25 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
-interface BannerData {
-  status: "sync_in_progress" | "identity_refresh_needed" | "conversation_needs_rebuild" | "attachment_upload_failed" | "temporary_network_failure" | "message_queued_for_approval" | "message_rejected_by_policy";
-  message: string;
-}
+import type {
+  CoreUpdateEvent,
+  RealtimeEventPayload,
+  SystemBanner as SystemBannerItem,
+} from "@/lib/types";
+import { useSessionStore } from "@/store/session";
 
-interface CoreUpdateEvent {
-  state_update: {
-    system_statuses_changed: BannerData[];
-  };
-}
-
-interface RealtimeEventPayload {
-  device_id: string;
-  event_type: string;
-  data?: string;
-}
-
-const statusIcons: Record<BannerData["status"], string> = {
-  sync_in_progress: "⏳",
-  identity_refresh_needed: "🔐",
-  conversation_needs_rebuild: "🔧",
-  attachment_upload_failed: "📎",
-  temporary_network_failure: "📶",
-  message_queued_for_approval: "📬",
-  message_rejected_by_policy: "🚫",
+const statusIcons: Record<SystemBannerItem["status"], string> = {
+  sync_in_progress: "?",
+  identity_refresh_needed: "??",
+  conversation_needs_rebuild: "??",
+  attachment_upload_failed: "??",
+  temporary_network_failure: "??",
+  message_queued_for_approval: "??",
+  message_rejected_by_policy: "??",
 };
 
-const statusColors: Record<BannerData["status"], string> = {
+const statusColors: Record<SystemBannerItem["status"], string> = {
   sync_in_progress: "bg-frost.3 text-polar.1",
   identity_refresh_needed: "bg-aurora.orange text-polar.1",
   conversation_needs_rebuild: "bg-aurora.yellow text-polar.1",
@@ -39,28 +29,28 @@ const statusColors: Record<BannerData["status"], string> = {
   message_rejected_by_policy: "bg-aurora.red text-polar.1",
 };
 
+function bannerKey(banner: SystemBannerItem): string {
+  return `${banner.status}:${banner.message}`;
+}
+
+function visibleBanners(banners: SystemBannerItem[] | undefined): SystemBannerItem[] {
+  return (banners ?? []).filter((banner) => banner.message.trim().length > 0);
+}
+
 /**
  * System banner component for displaying sync status, errors, and warnings.
- * Appears at the top of the main chat layout when there are system statuses.
+ * Appears at the top of the main chat layout when there are user-visible banners.
  */
 export default function SystemBanner() {
-  const [banners, setBanners] = useState<BannerData[]>([]);
+  const [banners, setBanners] = useState<SystemBannerItem[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    // Listen for core-update events to show/hide banners
     const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
-      const { state_update } = event.payload;
-      if (state_update.system_statuses_changed && state_update.system_statuses_changed.length > 0) {
-        // Add new banners, filter out dismissed ones
-        const newBanners = state_update.system_statuses_changed.filter(
-          (b) => !dismissed.has(b.status)
-        );
-        setBanners(newBanners);
-      } else {
-        // Clear banners if no statuses
-        setBanners([]);
-      }
+      const nextBanners = visibleBanners(event.payload.view_model?.banners).filter(
+        (banner) => !dismissed.has(bannerKey(banner)),
+      );
+      setBanners(nextBanners);
     });
 
     return () => {
@@ -68,9 +58,10 @@ export default function SystemBanner() {
     };
   }, [dismissed]);
 
-  const handleDismiss = (status: BannerData["status"]) => {
-    setDismissed((prev) => new Set([...prev, status]));
-    setBanners((prev) => prev.filter((b) => b.status !== status));
+  const handleDismiss = (banner: SystemBannerItem) => {
+    const key = bannerKey(banner);
+    setDismissed((prev) => new Set([...prev, key]));
+    setBanners((prev) => prev.filter((item) => bannerKey(item) !== key));
   };
 
   if (banners.length === 0) {
@@ -81,7 +72,7 @@ export default function SystemBanner() {
     <div className="fixed top-0 left-0 right-0 z-50 flex flex-col gap-1 p-2">
       {banners.map((banner) => (
         <div
-          key={banner.status}
+          key={bannerKey(banner)}
           className={`flex items-center justify-between px-3 py-2 rounded-lg shadow-lg ${statusColors[banner.status]}`}
         >
           <div className="flex items-center gap-2">
@@ -90,9 +81,9 @@ export default function SystemBanner() {
           </div>
           <button
             className="text-sm px-2 hover:opacity-70"
-            onClick={() => handleDismiss(banner.status)}
+            onClick={() => handleDismiss(banner)}
           >
-            ✕
+            ?
           </button>
         </div>
       ))}
@@ -107,19 +98,18 @@ export default function SystemBanner() {
  * Handles profile switch gracefully without showing disconnect during switch.
  */
 export function NetworkIndicator() {
-  const [connected, setConnected] = useState<boolean | null>(null); // null = unknown
-  const [syncing, setSyncing] = useState(false);
+  const [connected, setConnected] = useState<boolean | null>(null);
   const [isProfileSwitching, setIsProfileSwitching] = useState(false);
   const [lastDisconnectTime, setLastDisconnectTime] = useState<number | null>(null);
   const isProfileSwitchingRef = useRef(false);
+  const syncing = useSessionStore((state) => state.syncInFlight);
 
   useEffect(() => {
-    // Listen to profile-switch events to track when we're switching profiles
     const unlistenProfileSwitchStart = listen<void>("profile-switch-start", () => {
       console.debug("[NetworkIndicator] profile-switch-start");
       isProfileSwitchingRef.current = true;
       setIsProfileSwitching(true);
-      setConnected(null); // Reset to unknown during switch
+      setConnected(null);
       setLastDisconnectTime(null);
     });
 
@@ -130,12 +120,10 @@ export function NetworkIndicator() {
       setLastDisconnectTime(null);
     });
 
-    // Listen to realtime-event for connection status
     const unlistenRealtime = listen<RealtimeEventPayload>("realtime-event", (event) => {
       const { event_type } = event.payload;
       console.debug(`[NetworkIndicator] realtime-event type=${event_type}`);
 
-      // Skip handling during profile switch
       if (isProfileSwitchingRef.current) {
         return;
       }
@@ -146,9 +134,6 @@ export function NetworkIndicator() {
           setLastDisconnectTime(null);
           break;
         case "disconnected":
-          setConnected(false);
-          setLastDisconnectTime(Date.now());
-          break;
         case "error":
           setConnected(false);
           setLastDisconnectTime(Date.now());
@@ -156,16 +141,6 @@ export function NetworkIndicator() {
       }
     });
 
-    // Listen for sync status
-    const unlistenSync = listen<CoreUpdateEvent>("core-update", (event) => {
-      const { state_update } = event.payload;
-      const hasSyncStatus = state_update.system_statuses_changed?.some(
-        (s) => s.status === "sync_in_progress"
-      );
-      setSyncing(hasSyncStatus);
-    });
-
-    // Check initial connection status
     invoke<{ ws_connected: boolean }>("get_session_status")
       .then((status) => {
         if (!isProfileSwitchingRef.current) {
@@ -180,23 +155,19 @@ export function NetworkIndicator() {
       unlistenProfileSwitchStart.then((fn) => fn());
       unlistenProfileSwitchComplete.then((fn) => fn());
       unlistenRealtime.then((fn) => fn());
-      unlistenSync.then((fn) => fn());
     };
   }, []);
 
-  // Check if we've been disconnected for more than 5 seconds (not just brief flicker)
-  const isLongDisconnect = lastDisconnectTime !== null &&
-    (Date.now() - lastDisconnectTime) > 5000;
+  const isLongDisconnect =
+    lastDisconnectTime !== null && (Date.now() - lastDisconnectTime) > 5000;
 
   const handleReconnect = async () => {
     console.debug("[NetworkIndicator] manual reconnect triggered");
-    setSyncing(true);
     try {
       await invoke("sync_now");
     } catch (err) {
       console.error(`[NetworkIndicator] reconnect failed: ${String(err)}`);
     }
-    // Sync status will be updated via core-update event
   };
 
   return (
@@ -213,7 +184,9 @@ export function NetworkIndicator() {
         </>
       ) : connected === false ? (
         <>
-          <span className={`w-2 h-2 rounded-full ${isLongDisconnect ? "status-error" : "bg-frost.3"} animate-pulse`} />
+          <span
+            className={`w-2 h-2 rounded-full ${isLongDisconnect ? "status-error" : "bg-frost.3"} animate-pulse`}
+          />
           {isLongDisconnect ? (
             <button
               className="text-error hover:underline"

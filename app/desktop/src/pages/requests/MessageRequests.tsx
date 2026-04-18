@@ -73,6 +73,11 @@ export default function MessageRequests() {
             last_message: c.last_message_preview?.trim() || c.peer_user_id,
             last_message_time: null,
             message_count: c.message_count ?? 0,
+            last_activity_key: [
+              c.conversation_id,
+              String(c.message_count ?? 0),
+              c.last_message_preview?.trim() ?? "",
+            ].join("|"),
             unread_count: 0,
             has_unread: false,
           })));
