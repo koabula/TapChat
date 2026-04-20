@@ -1,4 +1,5 @@
 # TapChat
+ENG | [中文](./README_CN.md)
 
 A decentralized instant messaging app built for censorship resistance and metadata privacy.
 
