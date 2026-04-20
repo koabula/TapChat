@@ -145,6 +145,9 @@ export function NetworkIndicator() {
       .then((status) => {
         if (!isProfileSwitchingRef.current) {
           setConnected(status.ws_connected);
+          if (!status.ws_connected) {
+            setLastDisconnectTime(Date.now());
+          }
         }
       })
       .catch((err) => {

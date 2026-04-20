@@ -50,6 +50,17 @@ function isBenignMessageRequestSyncError(error: unknown): boolean {
   );
 }
 
+function isRuntimeAuthError(detail: string | undefined | null): boolean {
+  const value = (detail ?? "").toLowerCase();
+  return (
+    value.includes("403") ||
+    value.includes("forbidden") ||
+    value.includes("capability_expired") ||
+    value.includes("invalid_capability") ||
+    value.includes("device runtime")
+  );
+}
+
 /**
  * Inner app component that has Router context.
  * Hooks that use useNavigate() must be called here, inside BrowserRouter.
@@ -246,13 +257,15 @@ function App() {
         case "error":
           setWsConnected(false);
           console.warn(`[App] websocket error ${event.payload.device_id}: ${event.payload.data ?? "unknown"}`);
-          // Also attempt reconnect on error if not switching
-          if (!isProfileSwitchingRef.current) {
+          // Avoid tight reconnect loops when runtime auth is invalid or expired.
+          if (!isProfileSwitchingRef.current && !isRuntimeAuthError(event.payload.data)) {
             setTimeout(() => {
               if (!isProfileSwitchingRef.current) {
                 scheduleSync();
               }
             }, 3000);
+          } else if (isRuntimeAuthError(event.payload.data)) {
+            console.warn("[App] websocket auth error detected; waiting for explicit refresh instead of auto-retrying");
           }
           break;
         case "message_request_changed":

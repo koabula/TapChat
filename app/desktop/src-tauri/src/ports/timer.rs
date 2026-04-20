@@ -1,26 +1,29 @@
 use std::sync::Arc;
 
-use tauri::Emitter;
-use tokio::sync::RwLock;
+use tauri::AppHandle;
+use tapchat_core::CoreEvent;
 use tokio::time::{sleep, Duration};
+
+use crate::lifecycle::{CoreInput, drive_core_with_handle};
 
 /// Schedule a timer that will fire after the given delay.
 /// The timer triggers a CoreEvent::TimerTriggered that gets fed back into the core engine.
-pub fn schedule_timer(timer_id: String, delay_ms: u64) {
-    // Get app handle from global state (set during setup)
-    // For now, we'll spawn a task that logs the timer event
-    // The actual integration needs the app handle to emit events
-
+pub fn schedule_timer(app_handle: Option<Arc<AppHandle>>, timer_id: String, delay_ms: u64) {
     tokio::spawn(async move {
         sleep(Duration::from_millis(delay_ms)).await;
 
-        // TODO: Get app handle and call drive_core_with_handle
-        // For now, just log
         log::info!("Timer triggered: {}", timer_id);
 
-        // In production, this would emit:
-        // CoreEvent::TimerTriggered { timer_id }
-        // which would be fed back into drive_core
+        if let Some(app) = app_handle {
+            if let Err(error) = drive_core_with_handle(
+                &app,
+                CoreInput::Event(CoreEvent::TimerTriggered { timer_id: timer_id.clone() }),
+            ).await {
+                log::error!("Timer {} failed to drive core: {}", timer_id, error);
+            }
+        } else {
+            log::warn!("Timer {} fired without app handle; dropping event", timer_id);
+        }
     });
 }
 
@@ -28,7 +31,7 @@ pub fn schedule_timer(timer_id: String, delay_ms: u64) {
 /// This is set up during app initialization.
 #[allow(dead_code)]
 pub struct TimerManager {
-    app_handle: Option<Arc<RwLock<Option<tauri::AppHandle>>>>,
+    app_handle: Option<Arc<AppHandle>>,
 }
 
 impl TimerManager {
@@ -37,24 +40,13 @@ impl TimerManager {
     }
 
     /// Set the app handle for timer callbacks.
-    #[allow(dead_code)]
-    pub fn set_app_handle(&mut self, _handle: tauri::AppHandle) {
-        // Store handle for timer callbacks to use
-        // This requires global state management
+    pub fn set_app_handle(&mut self, handle: tauri::AppHandle) {
+        self.app_handle = Some(Arc::new(handle));
     }
 
     /// Schedule a timer with proper event emission.
-    #[allow(dead_code)]
-    pub fn schedule_with_handle(&self, timer_id: String, delay_ms: u64, app: tauri::AppHandle) {
-        tokio::spawn(async move {
-            sleep(Duration::from_millis(delay_ms)).await;
-
-            // Emit timer event to frontend
-            let _ = app.emit("timer-triggered", &timer_id);
-
-            // The frontend or lifecycle handler will feed this into drive_core
-            log::info!("Timer {} triggered after {}ms", timer_id, delay_ms);
-        });
+    pub fn schedule_with_handle(&self, timer_id: String, delay_ms: u64) {
+        schedule_timer(self.app_handle.clone(), timer_id, delay_ms);
     }
 }
 

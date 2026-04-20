@@ -4,6 +4,7 @@ use tapchat_core::transport_contract::MessageRequestAction;
 use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::AppState;
 
 /// View model for message request action returned to frontend.
@@ -22,7 +23,11 @@ pub struct MessageRequestActionOutput {
 #[tauri::command]
 pub async fn list_message_requests(
     app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<CoreOutput, String> {
+    ensure_fresh_device_runtime_auth_for_state(state.inner())
+        .await
+        .map_err(|error| error.to_string())?;
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ListMessageRequests),
@@ -52,6 +57,9 @@ pub async fn act_on_message_request(
 
     match action_enum {
         MessageRequestAction::Accept => {
+            ensure_fresh_device_runtime_auth_for_state(state.inner())
+                .await
+                .map_err(|error| error.to_string())?;
             // Accept through the desktop helper so we import the sender bundle
             // and sync promoted inbox records before the UI navigates.
             let profile_path = profile_path.ok_or("Profile path not set")?;
@@ -114,6 +122,9 @@ pub async fn act_on_message_request(
             })
         }
         MessageRequestAction::Reject => {
+            ensure_fresh_device_runtime_auth_for_state(state.inner())
+                .await
+                .map_err(|error| error.to_string())?;
             // For reject, use the normal CoreCommand flow
             let output = drive_core_with_handle(
                 &app,
@@ -147,7 +158,11 @@ pub async fn act_on_message_request(
 #[tauri::command]
 pub async fn get_allowlist(
     app: AppHandle,
+    state: State<'_, AppState>,
 ) -> Result<CoreOutput, String> {
+    ensure_fresh_device_runtime_auth_for_state(state.inner())
+        .await
+        .map_err(|error| error.to_string())?;
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ListAllowlist),
@@ -159,8 +174,12 @@ pub async fn get_allowlist(
 #[tauri::command]
 pub async fn add_to_allowlist(
     app: AppHandle,
+    state: State<'_, AppState>,
     user_id: String,
 ) -> Result<CoreOutput, String> {
+    ensure_fresh_device_runtime_auth_for_state(state.inner())
+        .await
+        .map_err(|error| error.to_string())?;
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::AddAllowlistUser { user_id }),
@@ -172,8 +191,12 @@ pub async fn add_to_allowlist(
 #[tauri::command]
 pub async fn remove_from_allowlist(
     app: AppHandle,
+    state: State<'_, AppState>,
     user_id: String,
 ) -> Result<CoreOutput, String> {
+    ensure_fresh_device_runtime_auth_for_state(state.inner())
+        .await
+        .map_err(|error| error.to_string())?;
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RemoveAllowlistUser { user_id }),

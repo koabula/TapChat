@@ -7,6 +7,7 @@ use tapchat_core::CoreEngine;
 use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::platform::profile::ProfileSummary;
+use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, SessionState};
 
 #[tauri::command]
@@ -115,7 +116,13 @@ pub async fn delete_profile(
     let is_active = {
         let inner = state.inner.read().await;
         let pm_inner = inner.profile_manager.inner.read().await;
-        let result = pm_inner.registry.active_profile.as_ref() == Some(&path);
+        let result = pm_inner
+            .active_profile
+            .as_ref()
+            .map(|profile| profile.root().to_path_buf())
+            .or_else(|| pm_inner.registry.active_profile.clone())
+            .as_ref()
+            == Some(&path);
         // Explicitly drop to avoid borrow issues
         drop(pm_inner);
         drop(inner);
@@ -166,6 +173,14 @@ async fn reload_engine_from_profile(
     // This prevents race conditions where old websocket events might
     // arrive during the new profile initialization
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+    // Step 2.5: Refresh device runtime auth on disk before loading snapshot.
+    {
+        let inner = state.inner.read().await;
+        ensure_fresh_device_runtime_auth(&inner.profile_manager)
+            .await
+            .map_err(|e| format!("Failed to refresh device runtime auth: {}", e))?;
+    }
 
     // Step 3: Load snapshot from active profile
     let snapshot = {

@@ -4,6 +4,7 @@ use tauri::{AppHandle, Emitter, State};
 use tapchat_core::{CoreCommand, CoreOutput};
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::{AppState, SessionState};
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +120,9 @@ pub async fn start_realtime_session(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    ensure_fresh_device_runtime_auth_for_state(state.inner())
+        .await
+        .map_err(|error| error.to_string())?;
     run_gated_sync(&app, &state, "realtime start").await?;
     Ok(())
 }
@@ -155,6 +159,9 @@ pub async fn sync_now(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreOutput, String> {
+    ensure_fresh_device_runtime_auth_for_state(state.inner())
+        .await
+        .map_err(|error| error.to_string())?;
     run_gated_sync(&app, &state, "manual").await
 }
 

@@ -40,6 +40,7 @@ pub struct DesktopPlatformPorts {
     pub realtime: RealtimeManager,
     pub persistence: DesktopPersistence,
     pub notification: notification::NotificationManager,
+    pub timer: timer::TimerManager,
     /// HTTP client for transport operations
     client: reqwest::Client,
     /// AppHandle for emitting progress events
@@ -56,6 +57,7 @@ impl DesktopPlatformPorts {
             realtime: RealtimeManager::new(profile_inner.clone()),
             persistence: DesktopPersistence::new(profile_inner),
             notification: notification::NotificationManager::new(),
+            timer: timer::TimerManager::new(),
             client: reqwest::Client::new(),
             app_handle: None,
             current_conversation_id: None,
@@ -67,6 +69,9 @@ impl DesktopPlatformPorts {
         self.app_handle = Some(handle.clone());
         self.realtime.set_app_handle(handle.clone());
         self.notification.set_app_handle(handle);
+        if let Some(app_handle) = &self.app_handle {
+            self.timer.set_app_handle((**app_handle).clone());
+        }
     }
 
     /// Set the current conversation ID for upload progress context
@@ -395,8 +400,7 @@ impl PersistencePort for DesktopPlatformPorts {
 // --- TimerPort ---
 impl TimerPort for DesktopPlatformPorts {
     fn schedule_timer(&mut self, timer_id: String, delay_ms: u64) -> Result<Vec<CoreEvent>> {
-        // Spawn background task that will emit TimerTriggered after delay
-        timer::schedule_timer(timer_id, delay_ms);
+        self.timer.schedule_with_handle(timer_id, delay_ms);
         Ok(Vec::new())
     }
 }

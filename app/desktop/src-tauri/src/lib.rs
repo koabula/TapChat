@@ -2,6 +2,7 @@ mod commands;
 mod lifecycle;
 mod platform;
 mod ports;
+mod runtime_auth;
 mod state;
 
 use tauri::menu::{Menu, MenuItem};

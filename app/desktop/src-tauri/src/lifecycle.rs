@@ -10,6 +10,7 @@ use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
 
 use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
+use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, SessionState};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
@@ -66,6 +67,32 @@ pub async fn on_app_ready(app: &AppHandle) {
         .expect("failed to create onboarding window");
     } else {
         log::info!("Session ready, loading snapshot and showing main window");
+
+        let refresh_started_at = Instant::now();
+        {
+            let inner = state.inner.read().await;
+            match ensure_fresh_device_runtime_auth(&inner.profile_manager).await {
+                Ok(Some(_)) => {
+                    log::info!(
+                        "on_app_ready: refreshed device runtime auth in {}ms",
+                        refresh_started_at.elapsed().as_millis()
+                    );
+                }
+                Ok(None) => {
+                    log::info!(
+                        "on_app_ready: device runtime auth refresh not needed ({}ms)",
+                        refresh_started_at.elapsed().as_millis()
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "on_app_ready: device runtime auth refresh failed in {}ms: {}",
+                        refresh_started_at.elapsed().as_millis(),
+                        error
+                    );
+                }
+            }
+        }
 
         // Load snapshot from profile and initialize engine
         let load_snapshot_started_at = Instant::now();

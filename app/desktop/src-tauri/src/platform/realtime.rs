@@ -133,7 +133,7 @@ impl RealtimeManager {
         log::info!(
             "RealtimeManager::open_connection: device_id={}, endpoint={}, last_acked_seq={}",
             device_id,
-            endpoint,
+            summarize_endpoint(&endpoint),
             subscription.last_acked_seq
         );
         let reservation = self.reserve_connection(&device_id, &endpoint).await;
@@ -193,7 +193,29 @@ impl RealtimeManager {
                 {
                     sessions.remove(&device_id);
                 }
-                return Err(error).context("websocket connect");
+                let detail = format!("websocket connect: {}", error);
+                log::warn!(
+                    "RealtimeManager: websocket connect failed device_id={} endpoint={} error={}",
+                    device_id,
+                    summarize_endpoint(&endpoint),
+                    detail
+                );
+                if let Some(app) = &self.app_handle {
+                    set_ws_connection_snapshot(
+                        app.state::<AppState>().inner(),
+                        Some(device_id.clone()),
+                        false,
+                    ).await;
+                    let _ = app.emit("realtime-event", RealtimeEventPayload {
+                        device_id: device_id.clone(),
+                        event_type: "error".to_string(),
+                        data: Some(detail.clone()),
+                    });
+                }
+                return Ok(vec![CoreEvent::WebSocketDisconnected {
+                    device_id,
+                    reason: Some(detail),
+                }]);
             }
         };
 
@@ -560,6 +582,14 @@ impl RealtimeManager {
             }
         }
     }
+}
+
+fn summarize_endpoint(endpoint: &str) -> String {
+    let Ok(parsed) = url::Url::parse(endpoint) else {
+        return "<invalid-endpoint>".into();
+    };
+    let host = parsed.host_str().unwrap_or_default();
+    format!("{host}{}", parsed.path())
 }
 
 /// Event payload sent to frontend via Tauri event.

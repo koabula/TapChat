@@ -130,7 +130,11 @@ impl ProfileManager {
     /// List all registered profiles.
     pub async fn list_profiles(&self) -> Vec<ProfileSummary> {
         let inner = self.inner.read().await;
-        let active_path = inner.registry.active_profile.as_ref();
+        let active_path = inner
+            .active_profile
+            .as_ref()
+            .map(|profile| profile.root().to_path_buf())
+            .or_else(|| inner.registry.active_profile.clone());
 
         inner
             .registry
@@ -139,7 +143,7 @@ impl ProfileManager {
             .map(|entry| {
                 let is_active = active_path
                     .as_ref()
-                    .is_some_and(|active| active == &&entry.root_dir);
+                    .is_some_and(|active| active == &entry.root_dir);
 
                 let runtime_bound = if is_active {
                     inner
