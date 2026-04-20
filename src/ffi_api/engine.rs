@@ -1062,7 +1062,9 @@ impl CoreEngine {
                         conversation_id,
                         peer_user_id: peer_user_id.clone(),
                         state: format!("{:?}", existing.conversation.state).to_lowercase(),
+                        last_message_preview: None,
                         last_message_type: existing_last_message_type,
+                        message_count: None,
                         recovery,
                     }],
                     ..CoreViewModel::default()
@@ -1139,7 +1141,9 @@ impl CoreEngine {
                     conversation_id,
                     peer_user_id,
                     state: "active".into(),
+                    last_message_preview: None,
                     last_message_type: Some(MessageType::MlsCommit),
+                    message_count: None,
                     recovery: None,
                 }],
                 messages: generated
@@ -1930,7 +1934,9 @@ impl CoreEngine {
                     conversation_id: conversation_id.clone(),
                     peer_user_id,
                     state: "needs_rebuild".into(),
+                    last_message_preview: None,
                     last_message_type,
+                    message_count: None,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
                 }],
                 ..CoreViewModel::default()
@@ -2610,7 +2616,9 @@ impl CoreEngine {
                 RecoveryStatus::NeedsRecovery => "needs_recovery".into(),
                 RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
             },
+            last_message_preview: None,
             last_message_type: conversation.last_message_type,
+            message_count: None,
             recovery: self.recovery_snapshot_for_conversation(conversation_id),
         })
     }
