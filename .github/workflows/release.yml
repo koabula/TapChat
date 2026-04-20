@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -40,7 +43,31 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf icns-utils
+
+      - name: Generate Linux icon.icns from PNG
+        if: matrix.platform == 'linux'
+        run: |
+          cd app/desktop/src-tauri/icons
+          png2icns icon.icns icon.png
+
+      - name: Generate macOS icon.icns from PNG
+        if: matrix.platform == 'macos-intel' || matrix.platform == 'macos-arm'
+        run: |
+          cd app/desktop/src-tauri/icons
+          mkdir -p icon.iconset
+          sips -z 16 16 icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32 icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32 icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64 icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128 icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256 icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256 icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512 icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512 icon.png --out icon.iconset/icon_512x512.png
+          sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o icon.icns
+          rm -rf icon.iconset
 
       - name: Add Rust target for macOS
         if: matrix.target != ''
