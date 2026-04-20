@@ -21,6 +21,11 @@ node_modules/
 *.key
 *.key.pub
 
+# Cloudflare build outputs
+/services/cloudflare/bundled/
+/services/cloudflare/.test-runtime/
+/services/cloudflare/.test-runtime-debug/
+
 # Test and debug files
 *.log
 *.trace
