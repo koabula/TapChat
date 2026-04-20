@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -24,6 +24,11 @@ export default function ChatView() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(false);
 
+  // Refs for auto-scrolling
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
+
   // Get stores for peer name resolution
   const { contacts } = useContactsStore();
   const { conversations, setActiveConversation } = useConversationsStore();
@@ -42,6 +47,34 @@ export default function ChatView() {
     const contact = contacts.find((item) => item.user_id === activeConversation.peer_user_id);
     return contact?.display_name || activeConversation.display_name || activeConversation.peer_user_id;
   }, [conversationId, activeConversation, contacts]);
+
+  // Scroll to bottom function
+  const scrollToBottom = (behavior: "smooth" | "instant" = "smooth") => {
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({
+        behavior: behavior === "smooth" ? "smooth" : "auto",
+        block: "end",
+      });
+    }
+  };
+
+  // Track if user is near bottom (for auto-scroll decisions)
+  const handleScroll = () => {
+    if (messagesContainerRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
+      const isNearBottom = scrollHeight - scrollTop - clientHeight < 100;
+      shouldAutoScrollRef.current = isNearBottom;
+    }
+  };
+
+  // Auto-scroll when messages change
+  useEffect(() => {
+    if (!loading && messages.length > 0) {
+      // On initial load, scroll to bottom instantly
+      // On message updates, only scroll if user is near bottom
+      scrollToBottom(shouldAutoScrollRef.current ? "smooth" : "instant");
+    }
+  }, [messages, loading]);
 
   useEffect(() => {
     setActiveConversation(conversationId ?? null);
@@ -129,6 +162,96 @@ export default function ChatView() {
     return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   };
 
+  // Format date separator
+  const formatDateSeparator = (timestamp: number, now: Date): string | null => {
+    const date = new Date(timestamp);
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+    // Same day - no separator
+    if (messageDate.getTime() === today.getTime()) {
+      return null;
+    }
+
+    // Format options
+    const monthNames = ["Jan.", "Feb.", "Mar.", "Apr.", "May.", "Jun.", "Jul.", "Aug.", "Sep.", "Oct.", "Nov.", "Dec."];
+    const dayNames = ["Sun.", "Mon.", "Tue.", "Wed.", "Thu.", "Fri.", "Sat."];
+
+    const month = monthNames[date.getMonth()];
+    const day = date.getDate();
+    const weekday = dayNames[date.getDay()];
+
+    // Different year - include year
+    if (date.getFullYear() !== now.getFullYear()) {
+      return `${date.getFullYear()} ${month} ${day} ${weekday}`;
+    }
+
+    // Same year but different day
+    return `${month} ${day} ${weekday}`;
+  };
+
+  // Build message list with date separators
+  const buildMessageListWithSeparators = () => {
+    if (loading || messages.length === 0) return null;
+
+    const now = new Date();
+    const result: React.ReactNode[] = [];
+    let lastDateKey: string | null = null;
+
+    messages.forEach((msg, index) => {
+      const dateStr = formatDateSeparator(msg.created_at, now);
+      const dateKey = dateStr || "today";
+
+      // Add date separator if this is a new day
+      if (dateKey !== lastDateKey && dateStr) {
+        result.push(
+          <div key={`date-${msg.created_at}`} className="date-separator">
+            <span>{dateStr}</span>
+          </div>
+        );
+      }
+      lastDateKey = dateKey;
+
+      // Add message
+      result.push(
+        <div
+          key={msg.message_id}
+          className={`flex ${isMyMessage(msg) ? "justify-end" : "justify-start"}`}
+          style={{ animationDelay: `${index * 30}ms` }}
+        >
+          {msg.has_attachment && msg.storage_refs && msg.storage_refs.length > 0 ? (
+            <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
+              <AttachmentPreview
+                messageId={msg.message_id}
+                conversationId={conversationId!}
+                reference={msg.storage_refs[0]}
+                mimeType="application/octet-stream"
+                fileName={undefined}
+              />
+              {msg.plaintext && (
+                <span className="block mt-2">{msg.plaintext}</span>
+              )}
+              <span className="block text-xs text-right mt-1 opacity-60">
+                {formatTime(msg.created_at)}
+                {isMyMessage(msg) && " ✓✓"}
+              </span>
+            </div>
+          ) : (
+            <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
+              <span>{msg.plaintext || "[empty message]"}</span>
+              <span className="block text-xs text-right mt-1 opacity-60">
+                {formatTime(msg.created_at)}
+                {isMyMessage(msg) && " ✓✓"}
+              </span>
+            </div>
+          )}
+        </div>
+      );
+    });
+
+    return result;
+  };
+
   // Determine if message was sent by me
   // Backend returns "sent" for outgoing, "received" for incoming
   const isMyMessage = (msg: Message) => {
@@ -175,7 +298,11 @@ export default function ChatView() {
       </header>
 
       {/* Messages */}
-      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3">
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3"
+      >
         {loading && (
           <div className="text-center py-8">
             <div className="inline-block animate-spin text-2xl text-muted-color">⏳</div>
@@ -192,40 +319,10 @@ export default function ChatView() {
           </div>
         )}
 
-        {!loading && messages.map((msg, index) => (
-          <div
-            key={msg.message_id}
-            className={`flex ${isMyMessage(msg) ? "justify-end" : "justify-start"}`}
-            style={{ animationDelay: `${index * 30}ms` }}
-          >
-            {msg.has_attachment && msg.storage_refs && msg.storage_refs.length > 0 ? (
-              <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
-                <AttachmentPreview
-                  messageId={msg.message_id}
-                  conversationId={conversationId}
-                  reference={msg.storage_refs[0]}
-                  mimeType="application/octet-stream"
-                  fileName={undefined}
-                />
-                {msg.plaintext && (
-                  <span className="block mt-2">{msg.plaintext}</span>
-                )}
-                <span className="block text-xs text-right mt-1 opacity-60">
-                  {formatTime(msg.created_at)}
-                  {isMyMessage(msg) && " ✓✓"}
-                </span>
-              </div>
-            ) : (
-              <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
-                <span>{msg.plaintext || "[empty message]"}</span>
-                <span className="block text-xs text-right mt-1 opacity-60">
-                  {formatTime(msg.created_at)}
-                  {isMyMessage(msg) && " ✓✓"}
-                </span>
-              </div>
-            )}
-          </div>
-        ))}
+        {buildMessageListWithSeparators()}
+
+        {/* Scroll anchor */}
+        <div ref={messagesEndRef} />
       </div>
 
       {/* Input */}

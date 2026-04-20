@@ -236,6 +236,18 @@
     color: var(--text-primary);
   }
 
+  /* Date separator */
+  .date-separator {
+    @apply flex items-center justify-center py-2 my-4;
+    animation: fadeIn 0.2s ease;
+  }
+
+  .date-separator span {
+    @apply px-3 py-1 rounded-full text-xs font-medium;
+    background-color: var(--bg-surface-elevated);
+    color: var(--text-muted);
+  }
+
   /* Avatar */
   .avatar {
     @apply w-10 h-10 rounded-full flex items-center justify-center;

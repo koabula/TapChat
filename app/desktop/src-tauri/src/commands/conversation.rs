@@ -1,9 +1,10 @@
 use serde::Serialize;
 use tauri::State;
 
-use tapchat_core::CoreCommand;
+use tapchat_core::conversation::StoredMessage;
 use tapchat_core::ffi_api::ConversationSummary;
-use tapchat_core::model::ConversationKind;
+use tapchat_core::model::{ConversationKind, MessageType};
+use tapchat_core::CoreCommand;
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::{AppState, SessionState};
@@ -13,6 +14,27 @@ fn summarize_plaintext(plaintext: Option<&str>) -> String {
         Some(value) => format!("has_plaintext=true plaintext_len={}", value.len()),
         None => "has_plaintext=false plaintext_len=0".into(),
     }
+}
+
+/// Generate a preview string for the last message in a conversation.
+/// Returns None if there are no messages or the last message has no plaintext.
+fn generate_last_message_preview(messages: &[StoredMessage]) -> Option<String> {
+    // Find the last application message (not protocol messages like Welcome/Commit)
+    let last_app_message = messages
+        .iter()
+        .rev()
+        .find(|msg| matches!(msg.message_type, MessageType::MlsApplication));
+
+    last_app_message.and_then(|msg| {
+        msg.plaintext.as_ref().map(|p| {
+            // Truncate to 50 characters for preview
+            if p.len() > 50 {
+                format!("{}...", &p[..50])
+            } else {
+                p.clone()
+            }
+        })
+    })
 }
 
 /// Simplified result for create_conversation command
@@ -34,11 +56,19 @@ pub async fn list_conversations(
     let summaries: Vec<ConversationSummary> = snapshot.conversations
         .iter()
         .map(|persisted| {
+            // Filter to only application messages for count
+            let app_message_count = persisted.state.messages
+                .iter()
+                .filter(|msg| matches!(msg.message_type, MessageType::MlsApplication))
+                .count();
+
             ConversationSummary {
                 conversation_id: persisted.conversation_id.clone(),
                 peer_user_id: persisted.state.peer_user_id.clone(),
                 state: format!("{:?}", persisted.state.conversation.state).to_lowercase(),
+                last_message_preview: generate_last_message_preview(&persisted.state.messages),
                 last_message_type: persisted.state.last_message_type,
+                message_count: Some(app_message_count),
                 recovery: None, // TODO: add recovery diagnostics if needed
             }
         })
