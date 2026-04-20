@@ -14,16 +14,16 @@ jobs:
         include:
           - platform: linux
             runner: ubuntu-latest
-            target: x86_64
+            target: ''
           - platform: windows
             runner: windows-latest
-            target: x86_64
-          - platform: macos
+            target: ''
+          - platform: macos-intel
             runner: macos-latest
-            target: x86_64
-          - platform: macos
+            target: x86_64-apple-darwin
+          - platform: macos-arm
             runner: macos-latest
-            target: aarch64
+            target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.runner }}
 
@@ -31,8 +31,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
       - uses: actions/setup-node@v4
         with:
@@ -43,6 +41,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Add Rust target for macOS
+        if: matrix.target != ''
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -60,5 +62,6 @@ jobs:
           releaseBody: 'See assets below for platform-specific installers.'
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
