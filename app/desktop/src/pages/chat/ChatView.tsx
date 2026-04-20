@@ -168,9 +168,9 @@ export default function ChatView() {
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
 
-    // Same day - no separator
+    // Same day - show "Today"
     if (messageDate.getTime() === today.getTime()) {
-      return null;
+      return "Today";
     }
 
     // Format options
@@ -233,7 +233,8 @@ export default function ChatView() {
               )}
               <span className="block text-xs text-right mt-1 opacity-60">
                 {formatTime(msg.created_at)}
-                {isMyMessage(msg) && " ✓✓"}
+                {/* TODO: implement delivery/read receipt status */}
+                {/* {isMyMessage(msg) && " ✓✓"} */}
               </span>
             </div>
           ) : (
@@ -241,7 +242,8 @@ export default function ChatView() {
               <span>{msg.plaintext || "[empty message]"}</span>
               <span className="block text-xs text-right mt-1 opacity-60">
                 {formatTime(msg.created_at)}
-                {isMyMessage(msg) && " ✓✓"}
+                {/* TODO: implement delivery/read receipt status */}
+                {/* {isMyMessage(msg) && " ✓✓"} */}
               </span>
             </div>
           )}
