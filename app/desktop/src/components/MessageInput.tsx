@@ -3,9 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 
+const MAX_TEXTAREA_ROWS = 5;
+const TEXTAREA_LINE_HEIGHT_PX = 24;
+
 interface MessageInputProps {
   conversationId: string;
-  onSent?: () => void;
+  onSent?: (msg?: { message_id: string; conversation_id: string; sender_device_id: string; plaintext: string; created_at: number }) => void;
 }
 
 interface AttachmentInfo {
@@ -33,8 +36,12 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const uploadFallbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Stabilize onSent callback to avoid useEffect listener churn
+  const onSentRef = useRef(onSent);
+  onSentRef.current = onSent;
 
   // Interface for send_text result
   interface SendMessageResult {
@@ -48,6 +55,18 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   // Extended onSent callback with message info for immediate display
   const onSentWithMessage = onSent as ((msg?: SendMessageResult) => void) | undefined;
 
+  // Reset attachment upload UI state (called on success, failure, or timeout)
+  const resetUploadState = useCallback(() => {
+    setUploadProgress(null);
+    setUploadStatus(null);
+    setAttachment(null);
+    setSending(false);
+    if (uploadFallbackTimeoutRef.current) {
+      clearTimeout(uploadFallbackTimeoutRef.current);
+      uploadFallbackTimeoutRef.current = null;
+    }
+  }, []);
+
   // Listen for upload progress events
   useEffect(() => {
     const unlisten = listen<UploadProgressEvent>("upload-progress", (event) => {
@@ -60,7 +79,6 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
 
         // Reset on complete or failed
         if (status === "complete" || status === "failed") {
-          // Clear fallback timeout
           if (uploadFallbackTimeoutRef.current) {
             clearTimeout(uploadFallbackTimeoutRef.current);
             uploadFallbackTimeoutRef.current = null;
@@ -70,7 +88,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
             setUploadStatus(null);
             if (status === "complete") {
               setAttachment(null);
-              onSent?.();
+              onSentRef.current?.();
             }
             setSending(false);
           }, 500);
@@ -101,12 +119,32 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       unlistenDragDrop.then((fn) => fn());
       unlistenDragEnter.then((fn) => fn());
       unlistenDragLeave.then((fn) => fn());
-      // Clear fallback timeout on unmount
-      if (uploadFallbackTimeoutRef.current) {
-        clearTimeout(uploadFallbackTimeoutRef.current);
-      }
     };
-  }, [conversationId, onSent]);
+    // onSent intentionally omitted from deps — stabilized via onSentRef
+  }, [conversationId]);
+
+  // Auto-resize textarea based on content (up to MAX_TEXTAREA_ROWS)
+  const adjustTextareaHeight = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+
+    // Reset to single row to measure scroll height correctly
+    ta.style.height = "auto";
+    const scrollHeight = ta.scrollHeight;
+    const maxHeight = MAX_TEXTAREA_ROWS * TEXTAREA_LINE_HEIGHT_PX;
+
+    if (scrollHeight > maxHeight) {
+      ta.style.height = `${maxHeight}px`;
+      ta.style.overflowY = "auto";
+    } else {
+      ta.style.height = `${scrollHeight}px`;
+      ta.style.overflowY = "hidden";
+    }
+  }, []);
+
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [inputText, adjustTextareaHeight]);
 
   // Handle file from path (from drag-drop or file picker)
   const handleFileFromPath = async (filePath: string) => {
@@ -171,14 +209,10 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     setUploadProgress(0);
     setUploadStatus("reading");
 
-    // Set a fallback timeout to reset state if events fail (e.g., app reload during async)
+    // Set a fallback timeout to reset state if the invoke itself hangs (network stall, etc.)
     uploadFallbackTimeoutRef.current = setTimeout(() => {
-      console.warn("[MessageInput] Upload timeout - resetting state");
-      setUploadProgress(null);
-      setUploadStatus(null);
-      setAttachment(null);
-      setSending(false);
-      uploadFallbackTimeoutRef.current = null;
+      console.warn("[MessageInput] Upload fallback timeout — resetting state");
+      resetUploadState();
     }, 30000);
 
     try {
@@ -189,7 +223,19 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         sizeBytes: attachment.size,
         fileName: attachment.name,
       });
-      // Progress events will handle the rest, but fallback timeout ensures recovery
+      // Invoke completed: upload succeeded. The upload-progress event may have
+      // already cleaned up via its 500ms deferred reset, but if the event was
+      // dropped (e.g. listener re-registration gap), we clean up here defensively.
+      // Use a short delay so the progress event's cleanup takes precedence if it fires.
+      setTimeout(() => {
+        // Only reset if still in sending state (progress event handler may have beaten us)
+        if (uploadFallbackTimeoutRef.current) {
+          clearTimeout(uploadFallbackTimeoutRef.current);
+          uploadFallbackTimeoutRef.current = null;
+          resetUploadState();
+          onSentRef.current?.();
+        }
+      }, 600);
     } catch (err) {
       if (uploadFallbackTimeoutRef.current) {
         clearTimeout(uploadFallbackTimeoutRef.current);
@@ -343,24 +389,25 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
 
       {/* Attachment preview */}
       {attachment && (
-        <div className="mb-2 p-2 card flex items-center gap-2 animate-fade-in-up">
-          <span className="text-lg">
+        <div className="mb-2 p-3 bg-surface/50 rounded-lg border border-subtle flex items-center gap-3 animate-fade-in-up">
+          <div className="w-10 h-10 rounded-lg bg-surface-elevated flex items-center justify-center text-xl flex-shrink-0 shadow-sm">
             {attachment.mimeType.startsWith("image/") ? "🖼️" :
              attachment.mimeType.startsWith("audio/") ? "🎵" :
-             attachment.mimeType.startsWith("video/") ? "🎬" : "📎"}
-          </span>
+             attachment.mimeType.startsWith("video/") ? "🎬" :
+             attachment.mimeType === "application/pdf" ? "📄" : "📎"}
+          </div>
           <div className="flex-1 min-w-0">
-            <span className="text-primary-color truncate block">{attachment.name}</span>
-            <span className="text-muted-color text-xs">{formatFileSize(attachment.size)}</span>
+            <span className="text-sm text-primary-color truncate block">{attachment.name}</span>
+            <span className="text-xs text-muted-color">{formatFileSize(attachment.size)}</span>
           </div>
           {uploadProgress !== null && (
-            <div className="w-24">
+            <div className="w-24 flex-shrink-0">
               <div className="text-xs text-muted-color mb-1">{formatStatus(uploadStatus || "")}</div>
-              <div className="w-full bg-surface rounded-full h-1.5 progress-bar">
+              <div className="w-full bg-surface-elevated rounded-full h-1.5 overflow-hidden">
                 <div
-                  className={`rounded-full h-1.5 transition-all ${
+                  className={`h-1.5 transition-all duration-300 rounded-full ${
                     uploadStatus === "failed" ? "bg-error" :
-                    uploadStatus === "complete" ? "status-success" : "bg-primary"
+                    uploadStatus === "complete" ? "bg-success" : "bg-primary"
                   }`}
                   style={{ width: `${uploadProgress}%` }}
                 />
@@ -368,9 +415,10 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
             </div>
           )}
           <button
-            className="btn btn-ghost px-1 text-sm transition-fast hover:bg-error/20"
+            className="w-6 h-6 flex items-center justify-center rounded-full text-xs text-muted-color hover:text-error hover:bg-error/10 transition-colors flex-shrink-0"
             onClick={handleRemoveAttachment}
             disabled={sending}
+            title="Remove attachment"
           >
             ✕
           </button>
@@ -378,7 +426,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       )}
 
       {/* Input row */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-end gap-2">
         <button
           className="btn btn-ghost px-2 transition-fast"
           title="Attach file"
@@ -387,9 +435,17 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         >
           📎
         </button>
-        <input
-          ref={fileInputRef}
-          className="input flex-1 transition-fast"
+        <textarea
+          ref={textareaRef}
+          className="input flex-1 transition-fast resize-none"
+          style={{
+            lineHeight: `${TEXTAREA_LINE_HEIGHT_PX}px`,
+            minHeight: `${TEXTAREA_LINE_HEIGHT_PX + 24}px`,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            overflowWrap: "break-word",
+          }}
+          rows={1}
           placeholder={attachment ? "Add a message (optional)..." : "Type a message..."}
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}

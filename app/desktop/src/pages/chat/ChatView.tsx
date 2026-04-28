@@ -227,6 +227,7 @@ export default function ChatView() {
                 reference={msg.storage_refs[0]?.ref || ""}
                 mimeType={msg.storage_refs[0]?.mime_type}
                 fileName={msg.storage_refs[0]?.file_name}
+                sizeBytes={msg.storage_refs[0]?.size_bytes}
               />
               {/* Don't show plaintext for attachment messages - it contains encrypted metadata */}
               <span className="block text-xs text-right mt-1 opacity-60">
@@ -235,11 +236,9 @@ export default function ChatView() {
             </div>
           ) : (
             <div className={`bubble ${isMyMessage(msg) ? "bubble-sent" : "bubble-received"} animate-fade-in-up`}>
-              <span>{msg.plaintext || "[empty message]"}</span>
+              <span className="block whitespace-pre-wrap break-words overflow-hidden">{msg.plaintext || "[empty message]"}</span>
               <span className="block text-xs text-right mt-1 opacity-60">
                 {formatTime(msg.created_at)}
-                {/* TODO: implement delivery/read receipt status */}
-                {/* {isMyMessage(msg) && " ✓✓"} */}
               </span>
             </div>
           )}
