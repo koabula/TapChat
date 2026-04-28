@@ -34,6 +34,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const uploadFallbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Interface for send_text result
   interface SendMessageResult {
@@ -59,6 +60,11 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
 
         // Reset on complete or failed
         if (status === "complete" || status === "failed") {
+          // Clear fallback timeout
+          if (uploadFallbackTimeoutRef.current) {
+            clearTimeout(uploadFallbackTimeoutRef.current);
+            uploadFallbackTimeoutRef.current = null;
+          }
           setTimeout(() => {
             setUploadProgress(null);
             setUploadStatus(null);
@@ -95,21 +101,41 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       unlistenDragDrop.then((fn) => fn());
       unlistenDragEnter.then((fn) => fn());
       unlistenDragLeave.then((fn) => fn());
+      // Clear fallback timeout on unmount
+      if (uploadFallbackTimeoutRef.current) {
+        clearTimeout(uploadFallbackTimeoutRef.current);
+      }
     };
   }, [conversationId, onSent]);
 
   // Handle file from path (from drag-drop or file picker)
-  const handleFileFromPath = (filePath: string) => {
+  const handleFileFromPath = async (filePath: string) => {
     const name = filePath.split(/[/\\]/).pop() || "file";
-    const ext = name.split(".").pop()?.toLowerCase() || "";
-    const mimeType = getMimeType(ext);
 
-    setAttachment({
-      path: filePath,
-      name,
-      size: 0, // Backend will determine
-      mimeType,
-    });
+    // Get file metadata from backend (size and mime type)
+    try {
+      const metadata = await invoke<{ size: number; mime_type: string }>("get_file_metadata", {
+        path: filePath,
+      });
+
+      setAttachment({
+        path: filePath,
+        name,
+        size: metadata.size,
+        mimeType: metadata.mime_type,
+      });
+    } catch (err) {
+      console.error(`[MessageInput] Failed to get file metadata: ${String(err)}`);
+      // Fallback: set with unknown size and octet-stream
+      const ext = name.split(".").pop()?.toLowerCase() || "";
+      const mimeType = getMimeType(ext);
+      setAttachment({
+        path: filePath,
+        name,
+        size: 0,
+        mimeType,
+      });
+    }
   };
 
   const handleSendText = async () => {
@@ -145,6 +171,16 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     setUploadProgress(0);
     setUploadStatus("reading");
 
+    // Set a fallback timeout to reset state if events fail (e.g., app reload during async)
+    uploadFallbackTimeoutRef.current = setTimeout(() => {
+      console.warn("[MessageInput] Upload timeout - resetting state");
+      setUploadProgress(null);
+      setUploadStatus(null);
+      setAttachment(null);
+      setSending(false);
+      uploadFallbackTimeoutRef.current = null;
+    }, 30000);
+
     try {
       await invoke("send_attachment", {
         conversationId,
@@ -153,8 +189,12 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         sizeBytes: attachment.size,
         fileName: attachment.name,
       });
-      // Progress events will handle the rest
+      // Progress events will handle the rest, but fallback timeout ensures recovery
     } catch (err) {
+      if (uploadFallbackTimeoutRef.current) {
+        clearTimeout(uploadFallbackTimeoutRef.current);
+        uploadFallbackTimeoutRef.current = null;
+      }
       console.error(`[MessageInput] Failed to send attachment: ${String(err)}`);
       setUploadProgress(null);
       setUploadStatus(null);

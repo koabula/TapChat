@@ -212,6 +212,7 @@ pub fn run() {
             commands::utility::request_notification_permission,
             commands::utility::show_notification,
             commands::utility::write_temp_file,
+            commands::utility::get_file_metadata,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TapChat");

@@ -11,7 +11,7 @@ use tapchat_core::platform_ports::execute_platform_effect;
 
 use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
-use crate::state::{AppState, SessionState};
+use crate::state::{AppState, SessionState, StartupPhase};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
 pub enum CoreInput {
@@ -24,6 +24,12 @@ pub enum CoreInput {
 pub async fn on_app_ready(app: &AppHandle) {
     let state = app.state::<AppState>();
     let startup_started_at = Instant::now();
+
+    // Set startup phase to LoadingProfile before reading files
+    {
+        let mut inner = state.inner.write().await;
+        inner.startup_phase = StartupPhase::LoadingProfile;
+    }
 
     // Check session startup using ProfileManager
     let startup_check_started_at = Instant::now();
@@ -50,6 +56,7 @@ pub async fn on_app_ready(app: &AppHandle) {
         let mut inner = state.inner.write().await;
         inner.session = SessionState::Onboarding { step };
         inner.profile_path = startup_check.profile_path;
+        inner.startup_phase = StartupPhase::Ready;  // Backend is ready, just needs onboarding
         drop(inner);
         set_ws_connection_snapshot(&state, None, false).await;
 
@@ -133,6 +140,7 @@ pub async fn on_app_ready(app: &AppHandle) {
 
             inner.session = SessionState::Active { device_id };
             inner.profile_path = startup_check.profile_path;
+            inner.startup_phase = StartupPhase::Ready;  // Backend is fully ready
         }
         log::info!(
             "on_app_ready: CoreEngine::from_restored_state completed in {}ms",
@@ -301,6 +309,7 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     {
         let mut inner = state.inner.write().await;
         inner.session = SessionState::Active { device_id: device_id.clone() };
+        inner.startup_phase = StartupPhase::Ready;  // Ensure startup phase is ready
 
         // Persist the current snapshot to profile
         let snapshot = inner.engine.refresh_snapshot();

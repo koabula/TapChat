@@ -59,6 +59,16 @@ export interface MessageSummary {
   message_type: string;
 }
 
+// Storage reference for attachments - matches Rust StorageRef
+export interface StorageRef {
+  kind: string;
+  ref: string;        // object_ref in Rust, renamed for JSON compatibility
+  size_bytes: number;
+  mime_type: string;
+  file_name?: string; // original file name
+  expires_at?: number;
+}
+
 // Messages - matches backend get_messages response
 export interface Message {
   message_id: string;
@@ -68,7 +78,7 @@ export interface Message {
   created_at: number;
   plaintext: string | null;
   has_attachment: boolean;
-  storage_refs?: string[]; // attachment references
+  storage_refs?: StorageRef[]; // attachment references with full metadata
 }
 
 // Contacts - matches backend ContactSummary

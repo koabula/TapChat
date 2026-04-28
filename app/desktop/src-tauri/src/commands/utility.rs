@@ -1,9 +1,79 @@
 use std::io::Write;
 
+use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_notification::NotificationExt;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+/// File metadata for attachment preview
+#[derive(Debug, Serialize)]
+pub struct FileMetadata {
+    pub size: u64,
+    pub mime_type: String,
+}
+
+/// Get file metadata (size and mime type from extension).
+#[tauri::command]
+pub fn get_file_metadata(
+    path: String,
+) -> Result<FileMetadata, String> {
+    let metadata = std::fs::metadata(&path)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+
+    let size = metadata.len();
+
+    // Infer mime type from extension
+    let mime_type = infer_mime_type(&path);
+
+    Ok(FileMetadata {
+        size,
+        mime_type,
+    })
+}
+
+fn infer_mime_type(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+
+    match ext.as_deref() {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("ogg") => "audio/ogg",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mov") => "video/quicktime",
+        Some("avi") => "video/x-msvideo",
+        Some("zip") => "application/zip",
+        Some("tar") => "application/x-tar",
+        Some("gz") => "application/gzip",
+        Some("rar") => "application/vnd.rar",
+        Some("7z") => "application/x-7z-compressed",
+        Some("txt") => "text/plain",
+        Some("html") | Some("htm") => "text/html",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("csv") => "text/csv",
+        _ => "application/octet-stream",
+    }.to_string()
+}
 
 #[tauri::command]
 #[allow(deprecated)] // TODO: migrate to tauri-plugin-opener

@@ -224,17 +224,13 @@ export default function ChatView() {
               <AttachmentPreview
                 messageId={msg.message_id}
                 conversationId={conversationId!}
-                reference={msg.storage_refs[0]}
-                mimeType="application/octet-stream"
-                fileName={undefined}
+                reference={msg.storage_refs[0]?.ref || ""}
+                mimeType={msg.storage_refs[0]?.mime_type}
+                fileName={msg.storage_refs[0]?.file_name}
               />
-              {msg.plaintext && (
-                <span className="block mt-2">{msg.plaintext}</span>
-              )}
+              {/* Don't show plaintext for attachment messages - it contains encrypted metadata */}
               <span className="block text-xs text-right mt-1 opacity-60">
                 {formatTime(msg.created_at)}
-                {/* TODO: implement delivery/read receipt status */}
-                {/* {isMyMessage(msg) && " ✓✓"} */}
               </span>
             </div>
           ) : (

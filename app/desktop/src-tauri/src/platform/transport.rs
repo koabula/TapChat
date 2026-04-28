@@ -315,12 +315,23 @@ impl DesktopTransport {
         let base_url = self.get_base_url().await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
-        let url = format!("{}/v1/storage/prepare", base_url);
-        let body = serde_json::to_string(&request)?;
+        let url = format!("{}/v1/storage/prepare-upload", base_url);
 
-        let response = self.client
+        // Serialize to snake_case JSON, then convert to camelCase for server
+        let snake_case_body = serde_json::to_string(&request)?;
+        let body = to_camel_case_json_string(&snake_case_body)
+            .context("convert prepare upload request to camelCase")?;
+
+        let mut builder = self.client
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        // Add authorization headers from the request
+        for (key, value) in &request.headers {
+            builder = builder.header(key, value);
+        }
+
+        let response = builder
             .body(body)
             .send()
             .await
@@ -332,7 +343,14 @@ impl DesktopTransport {
             anyhow::bail!("prepare upload failed: {} - {}", status, error_body);
         }
 
-        response.json().await.context("parse prepare result")
+        // Convert camelCase response back to snake_case for Rust
+        let response_text = response.text().await.context("read prepare result")?;
+        let snake_case_response = to_snake_case_json_string(&response_text)
+            .context("convert prepare result to snake_case")?;
+        let result: PrepareBlobUploadResult = serde_json::from_str(&snake_case_response)
+            .context("parse prepare result")?;
+
+        Ok(result)
     }
 }
 

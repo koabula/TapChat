@@ -6,7 +6,7 @@ interface AttachmentPreviewProps {
   messageId: string;
   conversationId: string;
   reference: string;
-  mimeType: string;
+  mimeType?: string;
   fileName?: string;
   downloaded?: boolean;
   showInline?: boolean;
@@ -16,7 +16,7 @@ export default function AttachmentPreview({
   messageId,
   conversationId,
   reference,
-  mimeType,
+  mimeType = "application/octet-stream",
   fileName,
   downloaded = false,
   showInline = true,
@@ -68,10 +68,13 @@ export default function AttachmentPreview({
     setError(null);
 
     try {
+      // Generate a reasonable default file name
+      const defaultFileName = fileName || `attachment${getExtensionFromMimeType(mimeType)}`;
+
       // Prompt user for save location
       const savePath = await save({
         title: "Save attachment",
-        defaultPath: fileName || `attachment-${messageId}`,
+        defaultPath: defaultFileName,
       });
 
       if (!savePath) {
@@ -92,6 +95,23 @@ export default function AttachmentPreview({
     } finally {
       setDownloading(false);
     }
+  };
+
+  // Get a reasonable extension from mime type
+  const getExtensionFromMimeType = (mime: string): string => {
+    const mimeToExt: Record<string, string> = {
+      "image/jpeg": ".jpg",
+      "image/png": ".png",
+      "image/gif": ".gif",
+      "image/webp": ".webp",
+      "application/pdf": ".pdf",
+      "audio/mpeg": ".mp3",
+      "audio/wav": ".wav",
+      "video/mp4": ".mp4",
+      "application/zip": ".zip",
+      "text/plain": ".txt",
+    };
+    return mimeToExt[mime] || "";
   };
 
   const handleOpen = async () => {

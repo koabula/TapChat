@@ -8,6 +8,16 @@ use tokio::sync::{Mutex, RwLock};
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;
 
+/// Startup phase to track initialization progress.
+/// Prevents race conditions where frontend queries session status before backend is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StartupPhase {
+    #[default]
+    NotStarted,
+    LoadingProfile,
+    Ready,
+}
+
 /// Central application state, shared across all Tauri commands via `tauri::State`.
 /// Uses `tokio::sync::RwLock` — never `std::sync::Mutex` — to avoid blocking the
 /// async runtime.
@@ -23,6 +33,7 @@ pub struct AppStateInner {
     pub profile_manager: ProfileManager,
     pub session: SessionState,
     pub profile_path: Option<PathBuf>,
+    pub startup_phase: StartupPhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +83,7 @@ impl AppState {
                 profile_manager,
                 session: SessionState::Uninitialized,
                 profile_path: None,
+                startup_phase: StartupPhase::NotStarted,
             })),
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
@@ -89,9 +101,15 @@ impl AppState {
                 profile_manager,
                 session: SessionState::Uninitialized,
                 profile_path: None,
+                startup_phase: StartupPhase::NotStarted,
             })),
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
         }
+    }
+
+    /// Get the inner Arc for use with helper functions.
+    pub fn inner(&self) -> &Arc<RwLock<AppStateInner>> {
+        &self.inner
     }
 }

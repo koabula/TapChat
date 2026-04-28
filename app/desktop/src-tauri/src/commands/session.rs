@@ -5,7 +5,7 @@ use tapchat_core::{CoreCommand, CoreOutput};
 
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
-use crate::state::{AppState, SessionState};
+use crate::state::{AppState, SessionState, StartupPhase};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatus {
@@ -29,13 +29,24 @@ pub async fn set_ws_connection_snapshot(
 }
 
 pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
-    let (session, ws_snapshot) = {
+    let (session, ws_snapshot, startup_phase) = {
         let inner = state.inner.read().await;
         let session = inner.session.clone();
+        let startup_phase = inner.startup_phase;
         drop(inner);
         let ws_snapshot = state.ws_status.read().await.clone();
-        (session, ws_snapshot)
+        (session, ws_snapshot, startup_phase)
     };
+
+    // If backend is not ready, return bootstrapping instead of uninitialized
+    // This prevents frontend from showing onboarding before profile is loaded
+    if startup_phase != StartupPhase::Ready {
+        return SessionStatus {
+            state: "bootstrapping".into(),
+            device_id: None,
+            ws_connected: false,
+        };
+    }
 
     match session {
         SessionState::Active { device_id } => SessionStatus {
