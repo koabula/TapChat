@@ -3508,7 +3508,16 @@ impl CoreEngine {
                             .map(|metadata| metadata.size_bytes)
                     })
                     .unwrap_or(task.descriptor.size_bytes),
-                mime_type: "application/octet-stream".into(),
+                mime_type: task
+                    .payload_metadata
+                    .as_ref()
+                    .map(|m| m.mime_type.clone())
+                    .unwrap_or_else(|| task.descriptor.mime_type.clone()),
+                file_name: task
+                    .payload_metadata
+                    .as_ref()
+                    .and_then(|m| m.file_name.clone())
+                    .or_else(|| task.descriptor.file_name.clone()),
                 expires_at: prepared.expires_at,
             });
             envelopes.push(envelope);

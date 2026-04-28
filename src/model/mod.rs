@@ -213,16 +213,17 @@ impl Validate for KeyPackageRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StorageRef {
     pub kind: String,
     #[serde(rename = "ref", alias = "object_ref")]
     pub object_ref: String,
-    #[serde(alias = "size_bytes")]
+    #[serde(alias = "sizeBytes")]
     pub size_bytes: u64,
-    #[serde(alias = "mime_type")]
+    #[serde(alias = "mimeType")]
     pub mime_type: String,
-    #[serde(alias = "expires_at", skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(alias = "expiresAt", skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 }
 

@@ -295,6 +295,7 @@ mod tests {
                     object_ref: "blob:1".into(),
                     size_bytes: 1,
                     mime_type: "application/octet-stream".into(),
+                    file_name: None,
                     expires_at: Some(10),
                 }],
                 delivery_class: DeliveryClass::Normal,
