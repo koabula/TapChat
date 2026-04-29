@@ -6,6 +6,7 @@ use tapchat_core::{CoreCommand, CoreOutput};
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::{AppState, SessionState, StartupPhase};
+use crate::timetest;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStatus {
@@ -96,6 +97,10 @@ async fn run_gated_sync(
         gate.pending = false;
     }
 
+    let sync_start = std::time::Instant::now();
+    let abs_start = crate::ts_ms();
+    timetest!("sync_begin device_id={} reason={} ts={}", device_id, reason, abs_start);
+
     loop {
         let result = drive_core_with_handle(
             app,
@@ -119,6 +124,8 @@ async fn run_gated_sync(
         };
 
         if !should_rerun {
+            let elapsed_ms = sync_start.elapsed().as_millis();
+            timetest!("sync_done device_id={} elapsed_ms={} ts={}", device_id, elapsed_ms, abs_start + elapsed_ms as u128);
             return result;
         }
 

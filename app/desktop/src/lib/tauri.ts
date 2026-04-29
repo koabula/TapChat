@@ -229,3 +229,12 @@ export async function setAttachmentSettings(settings: AttachmentSettings): Promi
 export async function getAttachmentCacheDir(): Promise<string> {
   return invoke("get_attachment_cache_dir");
 }
+
+// Debug mode for performance timing tests
+export async function setDebugMode(enabled: boolean): Promise<void> {
+  return invoke("set_debug_mode", { enabled });
+}
+
+export async function getDebugMode(): Promise<boolean> {
+  return invoke("get_debug_mode");
+}

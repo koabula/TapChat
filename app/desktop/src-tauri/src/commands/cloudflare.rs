@@ -16,6 +16,7 @@ use crate::commands::cloudflare_rest::{
 };
 use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::AppState;
+use crate::timetest;
 
 /// Preflight check result
 #[derive(Debug, Clone, Serialize)]
@@ -248,6 +249,10 @@ pub async fn cloudflare_deploy(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DeployResult, String> {
+    let deploy_start = std::time::Instant::now();
+    let abs_start = crate::ts_ms();
+    timetest!("deploy_begin ts={}", abs_start);
+
     let inner = state.inner.read().await;
 
     // Get identity info - identity must exist, but bundle is optional for first deployment
@@ -341,6 +346,8 @@ pub async fn cloudflare_deploy(
     ).await?;
 
     if !result.success {
+        let elapsed_ms = deploy_start.elapsed().as_millis();
+        timetest!("deploy_done success=false elapsed_ms={} ts={}", elapsed_ms, abs_start + elapsed_ms as u128);
         return Ok(result);
     }
 
@@ -422,6 +429,10 @@ pub async fn cloudflare_deploy(
         message: "Deployment complete!".into(),
         progress_percent: 100,
     });
+
+    let elapsed_secs = deploy_start.elapsed().as_secs_f64();
+    timetest!("deploy_done success=true worker_url={} elapsed_secs={:.1} ts={}",
+        result.worker_url, elapsed_secs, abs_start + ((elapsed_secs * 1000.0) as u128));
 
     Ok(result)
 }

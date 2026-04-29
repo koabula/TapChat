@@ -14,6 +14,7 @@ use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::transport_contract::RealtimeSubscriptionRequest;
 
 use crate::commands::session::set_ws_connection_snapshot;
+use crate::timetest;
 use crate::platform::profile::ProfileManagerInner;
 use crate::state::AppState;
 
@@ -224,6 +225,7 @@ impl RealtimeManager {
             device_id,
             connection_id.as_str()
         );
+        timetest!("ws_connected device_id={} ts={}", device_id, crate::ts_ms());
 
         // Step 8: Emit WebSocketConnected to frontend
         if let Some(app) = &self.app_handle {
@@ -482,6 +484,24 @@ impl RealtimeManager {
                             if let Ok(event) = serde_json::from_str::<WsServerEvent>(&text) {
                                 log::info!("RealtimeManager: {}", summarize_ws_event(&device_id, &event));
 
+                                // Emit [TIMETEST] for key realtime events
+                                match &event {
+                                    WsServerEvent::InboxRecordAvailable { seq, record, .. } => {
+                                        let msg_id = record
+                                            .as_ref()
+                                            .and_then(|r| r.get("messageId"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("?");
+                                        timetest!("ws_recv device_id={} seq={} msg_id={} event=inbox_record_available ts={}",
+                                            device_id, seq, msg_id, crate::ts_ms());
+                                    }
+                                    WsServerEvent::HeadUpdated { seq, .. } => {
+                                        timetest!("ws_recv device_id={} seq={} event=head_updated ts={}",
+                                            device_id, seq, crate::ts_ms());
+                                    }
+                                    WsServerEvent::MessageRequestChanged { .. } => {}
+                                }
+
                                 // Emit to frontend
                                 if let Some(app) = &app_handle {
                                     let _ = app.emit("realtime-event", RealtimeEventPayload {
@@ -538,6 +558,7 @@ impl RealtimeManager {
                         }
                         Some(Err(e)) => {
                             log::error!("WS error for {}: {:?}", device_id, e);
+                            timetest!("ws_error device_id={} error={:?} ts={}", device_id, e, crate::ts_ms());
 
                             // Only emit error if this connection is still active
                             let should_emit = {

@@ -18,6 +18,8 @@ import {
   addToAllowlist,
   removeFromAllowlist,
   getAllowlist,
+  setDebugMode,
+  getDebugMode,
 } from "@/lib/tauri";
 import type { IdentityInfo, ProfileSummary, CloudflareStatus } from "@/lib/types";
 
@@ -30,6 +32,7 @@ export default function Settings() {
   const [newAllowlistUser, setNewAllowlistUser] = useState("");
   const [allowlist, setAllowlist] = useState<string[]>([]);
   const [darkMode, setDarkMode] = useState(false);
+  const [debugMode, setDebugModeState] = useState(false);
   const [copied, setCopied] = useState(false);
   const [switchingProfile, setSwitchingProfile] = useState<string | null>(null);
 
@@ -51,6 +54,7 @@ export default function Settings() {
     loadRuntimeStatus();
     loadAllowlist();
     loadProfiles();
+    loadDebugMode();
 
     // Check system preference for dark mode
     const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -106,6 +110,26 @@ export default function Settings() {
       }
     } catch (err) {
       console.error(`[Settings] Failed to load allowlist: ${String(err)}`);
+    }
+  };
+
+  const loadDebugMode = async () => {
+    try {
+      const result = await getDebugMode();
+      setDebugModeState(result);
+    } catch {
+      // debug mode toggle is best-effort
+    }
+  };
+
+  // Toggle debug mode for [TIMETEST] instrumentation
+  const handleToggleDebugMode = async () => {
+    const next = !debugMode;
+    setDebugModeState(next);
+    try {
+      await setDebugMode(next);
+    } catch {
+      setDebugModeState(!next); // revert
     }
   };
 
@@ -596,6 +620,34 @@ export default function Settings() {
                   Show Recovery Phrase
                 </button>
               )}
+            </div>
+          </section>
+
+          {/* Performance Testing — Debug Mode */}
+          <section className="mb-6">
+            <h2 className="text-lg font-medium text-primary-color mb-3">Performance Testing</h2>
+
+            <div className="card">
+              <label className="flex items-center justify-between cursor-pointer">
+                <div className="flex-1">
+                  <span className="text-primary-color">Debug Mode</span>
+                  <p className="text-muted-color text-xs mt-0.5">
+                    When enabled, [TIMETEST] tagged log entries are emitted for measuring end-to-end latency, recovery, and deploy timing. Log entries are prefixed with "[TIMETEST]" for easy filtering.
+                  </p>
+                </div>
+                <button
+                  className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
+                    debugMode ? "bg-primary" : "bg-surface-elevated"
+                  }`}
+                  onClick={handleToggleDebugMode}
+                >
+                  <span
+                    className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+                      debugMode ? "translate-x-5" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </label>
             </div>
           </section>
 

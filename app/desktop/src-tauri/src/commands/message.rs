@@ -8,6 +8,7 @@ use tapchat_core::{CoreCommand, CoreOutput};
 
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
+use crate::timetest;
 
 /// Result of sending a message, including plaintext for local display
 #[derive(Debug, Clone, serde::Serialize)]
@@ -25,6 +26,10 @@ pub async fn send_text(
     conversation_id: String,
     plaintext: String,
 ) -> Result<SendMessageResult, String> {
+    let send_start = std::time::Instant::now();
+    let abs_start = crate::ts_ms();
+    timetest!("send_begin conversation_id={} len={} ts={}", conversation_id, plaintext.len(), abs_start);
+
     let output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::SendTextMessage {
@@ -50,6 +55,9 @@ pub async fn send_text(
         .as_ref()
         .map(|li| li.state.device_identity.device_id.clone())
         .unwrap_or_default();
+
+    let elapsed_ms = send_start.elapsed().as_millis();
+    timetest!("send_done msg_id={} elapsed_ms={} ts={}", message_id, elapsed_ms, abs_start + elapsed_ms as u128);
 
     Ok(SendMessageResult {
         message_id,

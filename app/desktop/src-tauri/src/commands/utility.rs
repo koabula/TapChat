@@ -146,6 +146,25 @@ pub fn write_temp_file(
     Ok(file_path.to_string_lossy().to_string())
 }
 
+/// Toggle debug mode for performance timing tests.
+/// When enabled, [TIMETEST] tagged log entries are emitted at key instrumentation points.
+#[tauri::command]
+pub fn set_debug_mode(enabled: bool) {
+    let was_enabled = crate::DEBUG_MODE.swap(enabled, std::sync::atomic::Ordering::Relaxed);
+    if was_enabled != enabled {
+        log::info!(
+            "[TIMETEST] Debug mode {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+    }
+}
+
+/// Get current debug mode state.
+#[tauri::command]
+pub fn get_debug_mode() -> bool {
+    crate::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn sanitize_filename(name: &str) -> String {
     // Remove potentially dangerous characters
     name.chars()

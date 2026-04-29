@@ -43,3 +43,5 @@ Thumbs.db
 # Profile data (user-specific runtime data)
 /profiles/
 /app/desktop/src-tauri/profiles/
+
+/TIMETEST

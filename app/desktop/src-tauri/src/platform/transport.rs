@@ -16,6 +16,7 @@ use tapchat_core::transport_contract::{
 use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 
 use crate::platform::profile::ProfileManagerInner;
+use crate::timetest;
 
 /// Helper to check if a string looks like JSON
 fn looks_like_json(s: &str) -> bool {
@@ -90,6 +91,9 @@ impl DesktopTransport {
 
         log::info!("HTTP request: {} {}", method, sanitize_url_for_log(&request.url));
 
+        let start = std::time::Instant::now();
+        let url_snapshot = request.url.clone();
+
         let mut builder = self.client.request(method.clone(), &request.url);
         for (key, value) in &request.headers {
             // Convert X-Tapchat-Capability header value to camelCase
@@ -119,12 +123,16 @@ impl DesktopTransport {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_string();
+                let elapsed_ms = start.elapsed().as_millis();
                 log::info!(
                     "HTTP response: {} {} - status {}",
                     method,
-                    sanitize_url_for_log(&request.url),
+                    sanitize_url_for_log(&url_snapshot),
                     status
                 );
+
+                timetest!("http_req method={} url={} status={} elapsed_ms={} ts={}",
+                    method, sanitize_url_for_log(&url_snapshot), status, elapsed_ms, crate::ts_ms());
 
                 let body = response
                     .text()
@@ -148,13 +156,16 @@ impl DesktopTransport {
             }
             Err(e) => {
                 let retryable = e.is_timeout() || e.is_connect();
+                let elapsed_ms = start.elapsed().as_millis();
                 log::warn!(
                     "HTTP request failed: {} {} - error: {} (retryable: {})",
                     method,
-                    sanitize_url_for_log(&request.url),
+                    sanitize_url_for_log(&url_snapshot),
                     e,
                     retryable
                 );
+                timetest!("http_req method={} url={} error=1 retryable={} elapsed_ms={} ts={}",
+                    method, sanitize_url_for_log(&url_snapshot), retryable, elapsed_ms, crate::ts_ms());
                 Ok(vec![CoreEvent::HttpRequestFailed {
                     request_id: request.request_id,
                     retryable,
@@ -169,6 +180,8 @@ impl DesktopTransport {
         &self,
         request: AppendEnvelopeRequest,
     ) -> Result<AppendEnvelopeResult> {
+        let start = std::time::Instant::now();
+        let msg_id = request.envelope.message_id.clone();
         let base_url = self.get_base_url().await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
@@ -177,6 +190,8 @@ impl DesktopTransport {
             base_url,
             urlencoding::encode(&request.recipient_device_id)
         );
+
+        timetest!("append_begin msg_id={} ts={}", msg_id, crate::ts_ms());
 
         let body = serde_json::to_string(&request)?;
         let response = self.client
@@ -188,12 +203,17 @@ impl DesktopTransport {
             .context("append envelope request")?;
 
         let status = response.status();
+        let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            timetest!("append_done msg_id={} status={} error=1 elapsed_ms={} ts={}", msg_id, status, elapsed_ms, crate::ts_ms());
             anyhow::bail!("append failed: {} - {}", status, error_body);
         }
 
-        response.json().await.context("parse append result")
+        let result: AppendEnvelopeResult = response.json().await.context("parse append result")?;
+        timetest!("append_done msg_id={} seq={} status={} elapsed_ms={} ts={}",
+            msg_id, result.seq, status, elapsed_ms, crate::ts_ms());
+        Ok(result)
     }
 
     /// Fetch messages from inbox.
@@ -203,6 +223,7 @@ impl DesktopTransport {
         from_seq: u64,
         limit: u64,
     ) -> Result<(u64, Vec<InboxRecord>)> {
+        let start = std::time::Instant::now();
         let base_url = self.get_base_url().await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
@@ -214,6 +235,8 @@ impl DesktopTransport {
             limit
         );
 
+        timetest!("fetch_begin device_id={} from_seq={} limit={} ts={}", device_id, from_seq, limit, crate::ts_ms());
+
         let response = self.client
             .get(&url)
             .send()
@@ -221,12 +244,17 @@ impl DesktopTransport {
             .context("fetch messages request")?;
 
         let status = response.status();
+        let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            timetest!("fetch_done device_id={} status={} error=1 elapsed_ms={} ts={}", device_id, status, elapsed_ms, crate::ts_ms());
             anyhow::bail!("fetch failed: {} - {}", status, error_body);
         }
 
         let result: FetchMessagesResult = response.json().await.context("parse fetch result")?;
+        let record_count = result.records.len();
+        timetest!("fetch_done device_id={} from_seq={} to_seq={} records={} elapsed_ms={} ts={}",
+            device_id, from_seq, result.to_seq, record_count, elapsed_ms, crate::ts_ms());
         Ok((result.to_seq, result.records))
     }
 
@@ -261,6 +289,7 @@ impl DesktopTransport {
 
     /// Get inbox head sequence.
     pub async fn get_head(&self, device_id: &str) -> Result<u64> {
+        let start = std::time::Instant::now();
         let base_url = self.get_base_url().await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
@@ -270,6 +299,8 @@ impl DesktopTransport {
             urlencoding::encode(device_id)
         );
 
+        timetest!("get_head_begin device_id={} ts={}", device_id, crate::ts_ms());
+
         let response = self.client
             .get(&url)
             .send()
@@ -277,12 +308,16 @@ impl DesktopTransport {
             .context("get head request")?;
 
         let status = response.status();
+        let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
+            timetest!("get_head_done device_id={} status={} error=1 elapsed_ms={} ts={}", device_id, status, elapsed_ms, crate::ts_ms());
             anyhow::bail!("get head failed: {} - {}", status, error_body);
         }
 
         let result: GetHeadResult = response.json().await.context("parse head result")?;
+        timetest!("get_head_done device_id={} head_seq={} elapsed_ms={} ts={}",
+            device_id, result.head_seq, elapsed_ms, crate::ts_ms());
         Ok(result.head_seq)
     }
 

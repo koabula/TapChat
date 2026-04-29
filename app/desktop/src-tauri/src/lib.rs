@@ -5,11 +5,41 @@ mod ports;
 mod runtime_auth;
 mod state;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 
 pub use state::{AppState, SessionState};
+
+/// Debug mode flag — when enabled, [TIMETEST] instrumentation is logged.
+pub static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Log a timing-test event when debug mode is active.
+#[doc(hidden)]
+pub fn timetest_log(msg: std::fmt::Arguments<'_>) {
+    if DEBUG_MODE.load(Ordering::Relaxed) {
+        log::info!("[TIMETEST] {}", msg);
+    }
+}
+
+/// Return current UNIX time in milliseconds, for cross-process correlation.
+#[doc(hidden)]
+pub fn ts_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// Emit a `[TIMETEST]` log line. No-op when debug mode is off.
+#[macro_export]
+macro_rules! timetest {
+    ($($arg:tt)*) => {
+        $crate::timetest_log(format_args!($($arg)*));
+    };
+}
 
 /// Startup configuration parsed from command line arguments.
 struct StartupConfig {
@@ -88,6 +118,9 @@ pub fn run() {
         builder
     };
 
+    // Determine log file name based on profile (multi-instance mode)
+    let log_file_name = config.profile_name.as_ref().map(|n| format!("{}.log", n));
+
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -96,13 +129,14 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
+                .max_file_size(100_000_000) // ~100 MB — effectively disable rotation
                 .targets([tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::Folder {
                         path: dirs::data_local_dir()
                             .unwrap_or_else(|| std::path::PathBuf::from("."))
                             .join("TapChat")
                             .join("logs"),
-                        file_name: None,
+                        file_name: log_file_name,
                     },
                 )])
                 .build(),
@@ -221,6 +255,8 @@ pub fn run() {
             commands::utility::show_notification,
             commands::utility::write_temp_file,
             commands::utility::get_file_metadata,
+            commands::utility::set_debug_mode,
+            commands::utility::get_debug_mode,
             // Attachment settings
             commands::attachment_settings::get_attachment_settings,
             commands::attachment_settings::set_attachment_settings,
