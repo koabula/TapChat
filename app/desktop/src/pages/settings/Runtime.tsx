@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useNavigate } from "react-router";
+import { Check, Circle, Loader, X } from "lucide-react";
 
 interface RuntimeStatus {
   bound: boolean;
@@ -185,8 +186,8 @@ export default function Runtime() {
                     progress.phase === "Failed" ? "bg-error text-white" :
                     "bg-primary animate-pulse text-white"
                   }`}>
-                    {progress.phase === "Complete" ? "✓" :
-                     progress.phase === "Failed" ? "✗" : "⏳"}
+                    {progress.phase === "Complete" ? <Check size={14} /> :
+                     progress.phase === "Failed" ? <X size={14} /> : <Loader size={14} className="animate-spin" />}
                   </span>
                   <span className="text-primary-color">
                     {PHASE_LABELS[progress.phase] || progress.message}
@@ -216,7 +217,7 @@ export default function Runtime() {
                 {deployResult.success ? (
                   <div className="space-y-2">
                     <div className="flex items-center gap-2">
-                      <span className="w-5 h-5 rounded-full bg-frost.1 text-white flex items-center justify-center text-sm">✓</span>
+                      <span className="w-5 h-5 rounded-full bg-frost.1 text-white flex items-center justify-center text-sm"><Check size={14} /></span>
                       <span className="text-primary-color font-medium">Successfully deployed</span>
                     </div>
                     <div className="text-sm text-muted-color">
@@ -248,7 +249,7 @@ export default function Runtime() {
                   {/* Embedded runtime */}
                   <div className="flex items-center gap-3">
                     <span className={`w-5 h-5 rounded-full flex items-center justify-center text-sm ${preflight.embedded_available ? "bg-frost.1 text-white" : "bg-surface-elevated text-muted-color"}`}>
-                      {preflight.embedded_available ? "✓" : "○"}
+                      {preflight.embedded_available ? <Check size={14} /> : <Circle size={14} />}
                     </span>
                     <span className="text-primary-color">Embedded runtime</span>
                   </div>
@@ -256,7 +257,7 @@ export default function Runtime() {
                   {/* Authentication */}
                   <div className="flex items-center gap-3">
                     <span className={`w-5 h-5 rounded-full flex items-center justify-center text-sm ${preflight.authenticated ? "bg-frost.1 text-white" : "bg-surface-elevated text-muted-color"}`}>
-                      {preflight.authenticated ? "✓" : "○"}
+                      {preflight.authenticated ? <Check size={14} /> : <Circle size={14} />}
                     </span>
                     <div className="flex-1">
                       <span className="text-primary-color">Cloudflare connected</span>

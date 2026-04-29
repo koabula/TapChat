@@ -5,7 +5,7 @@ use anyhow::Result;
 use tokio::sync::RwLock;
 
 use tapchat_core::ffi_api::PersistStateEffect;
-use tapchat_core::persistence::{CorePersistenceSnapshot, PersistOp, encode_snapshot};
+use tapchat_core::persistence::{encode_snapshot, CorePersistenceSnapshot, PersistOp};
 
 use crate::platform::profile::ProfileManagerInner;
 
@@ -18,25 +18,25 @@ pub struct DesktopPersistence {
 
 impl DesktopPersistence {
     pub fn new(profile_inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
-        Self {
-            profile_inner,
-        }
+        Self { profile_inner }
     }
 
-    /// Get the inbox attachments directory.
+    /// Get the attachments directory.
+    pub async fn attachments_dir(&self) -> Option<PathBuf> {
+        let pm = self.profile_inner.read().await;
+        pm.active_profile
+            .as_ref()
+            .map(|p| p.metadata().attachments_dir.clone())
+    }
+
+    /// Get the inbox attachments directory (deprecated alias for attachments_dir).
     pub async fn inbox_attachments_dir(&self) -> Option<PathBuf> {
-        let pm = self.profile_inner.read().await;
-        pm.active_profile
-            .as_ref()
-            .map(|p| p.metadata().inbox_attachments_dir.clone())
+        self.attachments_dir().await
     }
 
-    /// Get the outbox attachments directory.
+    /// Get the outbox attachments directory (deprecated alias for attachments_dir).
     pub async fn outbox_attachments_dir(&self) -> Option<PathBuf> {
-        let pm = self.profile_inner.read().await;
-        pm.active_profile
-            .as_ref()
-            .map(|p| p.metadata().outbox_attachments_dir.clone())
+        self.attachments_dir().await
     }
 
     /// Handle PersistState effect from CoreEngine.

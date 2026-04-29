@@ -1,18 +1,18 @@
-pub mod transport;
-pub mod realtime;
 pub mod blob_io;
-pub mod persistence;
-pub mod timer;
 pub mod notification;
+pub mod persistence;
+pub mod realtime;
+pub mod timer;
+pub mod transport;
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tapchat_core::ffi_api::{
-    CoreEvent, HttpRequestEffect, HttpMethod, PersistStateEffect, ReadAttachmentBytesEffect,
+    CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect, ReadAttachmentBytesEffect,
     UserNotificationEffect, WriteDownloadedAttachmentEffect,
 };
 use tapchat_core::model::CURRENT_MODEL_VERSION;
@@ -21,17 +21,18 @@ use tapchat_core::platform_ports::{
     TransportPort,
 };
 use tapchat_core::transport_contract::{
-    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
-    PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
+    PrepareBlobUploadRequest, PublishSharedStateRequest, RealtimeSubscriptionRequest,
+    ReplaceAllowlistRequest,
 };
-use tokio::sync::RwLock;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::RwLock;
 
-use crate::platform::profile::ProfileManagerInner;
-use crate::platform::transport::DesktopTransport;
-use crate::platform::realtime::RealtimeManager;
 use crate::platform::persistence::DesktopPersistence;
+use crate::platform::profile::ProfileManagerInner;
+use crate::platform::realtime::RealtimeManager;
+use crate::platform::transport::DesktopTransport;
 
 /// Desktop-specific implementation of all platform port traits.
 /// This is the bridge between CoreEngine effects and actual platform operations.
@@ -100,8 +101,7 @@ impl DesktopPlatformPorts {
         };
 
         // Get base URL
-        let base_url = runtime.public_base_url.clone()
-            .or(runtime.base_url.clone());
+        let base_url = runtime.public_base_url.clone().or(runtime.base_url.clone());
 
         let Some(base_url) = base_url else {
             log::warn!("No base URL in runtime metadata");
@@ -171,16 +171,14 @@ fn summarize_share_url(url: Option<&str>) -> String {
 // We implement by delegating to the platform modules
 
 impl TransportPort for DesktopPlatformPorts {
-    async fn execute_http_request(
-        &mut self,
-        request: HttpRequestEffect,
-    ) -> Result<Vec<CoreEvent>> {
+    async fn execute_http_request(&mut self, request: HttpRequestEffect) -> Result<Vec<CoreEvent>> {
         // Intercept append envelope requests to inject correct sender_bundle_share_url
         if request.method == HttpMethod::Post && request.url.contains("/messages") {
             log::info!("[TransportPort] Intercepting /messages POST request");
             if let Some(body) = &request.body {
                 // Try to parse as AppendEnvelopeRequest
-                if let Ok(mut append_request) = serde_json::from_str::<AppendEnvelopeRequest>(body) {
+                if let Ok(mut append_request) = serde_json::from_str::<AppendEnvelopeRequest>(body)
+                {
                     log::info!("[TransportPort] Parsed AppendEnvelopeRequest successfully");
                     log::info!(
                         "[TransportPort] sender_bundle_share_url={}",
@@ -190,9 +188,16 @@ impl TransportPort for DesktopPlatformPorts {
                     // Check if sender_bundle_share_url needs to be replaced
                     // It should be a contact-share URL, not identity_bundle_ref
                     let needs_contact_share_url = append_request.sender_bundle_share_url.is_none()
-                        || append_request.sender_bundle_share_url.as_ref().map(|url| !url.contains("/v1/contact-share/")).unwrap_or(true);
+                        || append_request
+                            .sender_bundle_share_url
+                            .as_ref()
+                            .map(|url| !url.contains("/v1/contact-share/"))
+                            .unwrap_or(true);
 
-                    log::info!("[TransportPort] needs_contact_share_url: {}", needs_contact_share_url);
+                    log::info!(
+                        "[TransportPort] needs_contact_share_url: {}",
+                        needs_contact_share_url
+                    );
 
                     if needs_contact_share_url {
                         // Generate correct contact share URL from runtime metadata
@@ -256,10 +261,7 @@ impl TransportPort for DesktopPlatformPorts {
         transport::act_on_message_request(&self.client, action).await
     }
 
-    async fn fetch_allowlist(
-        &mut self,
-        fetch: FetchAllowlistRequest,
-    ) -> Result<Vec<CoreEvent>> {
+    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
         transport::fetch_allowlist(&self.client, fetch).await
     }
 
@@ -299,16 +301,19 @@ impl BlobIoPort for DesktopPlatformPorts {
         read: ReadAttachmentBytesEffect,
     ) -> Result<Vec<CoreEvent>> {
         // Read from inbox/outbox attachments dir via persistence
-        let dir = self.persistence.inbox_attachments_dir().await;
+        let dir = self.persistence.attachments_dir().await;
 
         // Emit progress event if we have app handle
         if let Some(app) = &self.app_handle {
-            let _ = app.emit("upload-progress", blob_io::UploadProgressEvent {
-                task_id: read.task_id.clone(),
-                conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
-                progress: 5,
-                status: "reading".to_string(),
-            });
+            let _ = app.emit(
+                "upload-progress",
+                blob_io::UploadProgressEvent {
+                    task_id: read.task_id.clone(),
+                    conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
+                    progress: 5,
+                    status: "reading".to_string(),
+                },
+            );
         }
 
         blob_io::read_attachment_bytes(read, dir).await
@@ -323,12 +328,15 @@ impl BlobIoPort for DesktopPlatformPorts {
 
         // Emit progress event
         if let Some(app) = &self.app_handle {
-            let _ = app.emit("upload-progress", blob_io::UploadProgressEvent {
-                task_id: upload.task_id.clone(),
-                conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
-                progress: 10,
-                status: "preparing".to_string(),
-            });
+            let _ = app.emit(
+                "upload-progress",
+                blob_io::UploadProgressEvent {
+                    task_id: upload.task_id.clone(),
+                    conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
+                    progress: 10,
+                    status: "preparing".to_string(),
+                },
+            );
         }
 
         Ok(vec![CoreEvent::BlobUploadPrepared {
@@ -350,24 +358,30 @@ impl BlobIoPort for DesktopPlatformPorts {
 
         // Emit download progress
         if let Some(app) = &self.app_handle {
-            let _ = app.emit("download-progress", blob_io::UploadProgressEvent {
-                task_id: task_id.clone(),
-                conversation_id: conversation_id.clone(),
-                progress: 50,
-                status: "downloading".to_string(),
-            });
+            let _ = app.emit(
+                "download-progress",
+                blob_io::UploadProgressEvent {
+                    task_id: task_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    progress: 50,
+                    status: "downloading".to_string(),
+                },
+            );
         }
 
         let result = blob_io::download_blob(download).await;
 
         // Emit complete
         if let Some(app) = &self.app_handle {
-            let _ = app.emit("download-progress", blob_io::UploadProgressEvent {
-                task_id,
-                conversation_id,
-                progress: 100,
-                status: "complete".to_string(),
-            });
+            let _ = app.emit(
+                "download-progress",
+                blob_io::UploadProgressEvent {
+                    task_id,
+                    conversation_id,
+                    progress: 100,
+                    status: "complete".to_string(),
+                },
+            );
         }
 
         result

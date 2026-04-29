@@ -1,10 +1,11 @@
-pub mod identity;
-pub mod conversation;
-pub mod message;
-pub mod contact;
-pub mod request;
+pub mod attachment_settings;
 pub mod cloudflare;
 pub mod cloudflare_rest;
+pub mod contact;
+pub mod conversation;
+pub mod identity;
+pub mod message;
+pub mod profile;
+pub mod request;
 pub mod session;
 pub mod utility;
-pub mod profile;

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Outlet, useNavigate } from "react-router";
+import { Plus, Users, Settings } from "lucide-react";
 import ConversationList from "./ConversationList";
 import { NetworkIndicator } from "@/components/SystemBanner";
 import { useMessageRequestsStore } from "@/store/requests";
@@ -58,21 +59,21 @@ export default function ChatLayout() {
             title="New conversation (Ctrl+N)"
             onClick={() => navigate("/contacts")}
           >
-            +
+            <Plus size={20} />
           </button>
           <button
             className="btn btn-ghost px-2"
             title="Contacts (Ctrl+2)"
             onClick={() => navigate("/contacts")}
           >
-            👥
+            <Users size={20} />
           </button>
           <button
             className="btn btn-ghost px-2"
             title="Settings (Ctrl+S)"
             onClick={() => navigate("/settings")}
           >
-            ⚙
+            <Settings size={20} />
           </button>
         </div>
       </aside>

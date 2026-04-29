@@ -2,11 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tokio::fs;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tauri::{AppHandle, Emitter};
+use tokio::fs;
 
-use tapchat_core::ffi_api::{CoreEvent, ReadAttachmentBytesEffect, WriteDownloadedAttachmentEffect};
+use tapchat_core::ffi_api::{
+    CoreEvent, ReadAttachmentBytesEffect, WriteDownloadedAttachmentEffect,
+};
 use tapchat_core::transport_contract::{BlobDownloadRequest, BlobUploadRequest};
 
 /// Progress event payload sent to frontend during uploads
@@ -56,16 +58,20 @@ pub async fn upload_blob_with_progress(
 
     // Emit progress: starting upload
     if let Some(app_ref) = &app {
-        let _ = app_ref.emit("upload-progress", UploadProgressEvent {
-            task_id: task_id.clone(),
-            conversation_id: conversation_id.clone(),
-            progress: 0,
-            status: "uploading".to_string(),
-        });
+        let _ = app_ref.emit(
+            "upload-progress",
+            UploadProgressEvent {
+                task_id: task_id.clone(),
+                conversation_id: conversation_id.clone(),
+                progress: 0,
+                status: "uploading".to_string(),
+            },
+        );
     }
 
     // Decode base64 content
-    let bytes = BASE64.decode(&upload.blob_ciphertext_b64)
+    let bytes = BASE64
+        .decode(&upload.blob_ciphertext_b64)
         .context("decode base64 blob content")?;
 
     let mut request = client.put(&upload.upload_target);
@@ -78,12 +84,15 @@ pub async fn upload_blob_with_progress(
     // Note: reqwest doesn't have built-in progress, so we chunk it manually
     // For now, emit progress at start and completion
     if let Some(app_ref) = &app {
-        let _ = app_ref.emit("upload-progress", UploadProgressEvent {
-            task_id: task_id.clone(),
-            conversation_id: conversation_id.clone(),
-            progress: 10,
-            status: "uploading".to_string(),
-        });
+        let _ = app_ref.emit(
+            "upload-progress",
+            UploadProgressEvent {
+                task_id: task_id.clone(),
+                conversation_id: conversation_id.clone(),
+                progress: 10,
+                status: "uploading".to_string(),
+            },
+        );
     }
 
     request = request.body(bytes);
@@ -94,12 +103,15 @@ pub async fn upload_blob_with_progress(
             if status >= 200 && status < 300 {
                 // Emit progress: complete
                 if let Some(app_ref) = &app {
-                    let _ = app_ref.emit("upload-progress", UploadProgressEvent {
-                        task_id: task_id.clone(),
-                        conversation_id: conversation_id.clone(),
-                        progress: 100,
-                        status: "complete".to_string(),
-                    });
+                    let _ = app_ref.emit(
+                        "upload-progress",
+                        UploadProgressEvent {
+                            task_id: task_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            progress: 100,
+                            status: "complete".to_string(),
+                        },
+                    );
                 }
                 Ok(vec![CoreEvent::BlobUploaded {
                     task_id: upload.task_id,
@@ -110,12 +122,15 @@ pub async fn upload_blob_with_progress(
 
                 // Emit progress: failed
                 if let Some(app_ref) = &app {
-                    let _ = app_ref.emit("upload-progress", UploadProgressEvent {
-                        task_id: task_id.clone(),
-                        conversation_id: conversation_id.clone(),
-                        progress: 0,
-                        status: "failed".to_string(),
-                    });
+                    let _ = app_ref.emit(
+                        "upload-progress",
+                        UploadProgressEvent {
+                            task_id: task_id.clone(),
+                            conversation_id: conversation_id.clone(),
+                            progress: 0,
+                            status: "failed".to_string(),
+                        },
+                    );
                 }
 
                 Ok(vec![CoreEvent::BlobTransferFailed {
@@ -131,12 +146,15 @@ pub async fn upload_blob_with_progress(
 
             // Emit progress: failed
             if let Some(app_ref) = &app {
-                let _ = app_ref.emit("upload-progress", UploadProgressEvent {
-                    task_id: task_id.clone(),
-                    conversation_id,
-                    progress: 0,
-                    status: "failed".to_string(),
-                });
+                let _ = app_ref.emit(
+                    "upload-progress",
+                    UploadProgressEvent {
+                        task_id: task_id.clone(),
+                        conversation_id,
+                        progress: 0,
+                        status: "failed".to_string(),
+                    },
+                );
             }
 
             Ok(vec![CoreEvent::BlobTransferFailed {
@@ -176,7 +194,11 @@ pub async fn download_blob(download: BlobDownloadRequest) -> Result<Vec<CoreEven
                 }])
             } else {
                 let error_body = response.text().await.unwrap_or_default();
-                log::error!("Blob download failed: {} - {}", status, error_body);
+                if status == 403 && error_body.contains("capability_expired") {
+                    log::warn!("Blob download link expired: {} - {}", status, error_body);
+                } else {
+                    log::error!("Blob download failed: {} - {}", status, error_body);
+                }
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
                     retryable: false,
@@ -204,19 +226,32 @@ pub async fn write_downloaded_attachment(
     let dir = attachments_dir.context("no attachments directory configured")?;
 
     // Ensure directory exists
-    fs::create_dir_all(&dir).await.context("create attachments dir")?;
+    fs::create_dir_all(&dir)
+        .await
+        .context("create attachments dir")?;
 
     // Decode base64 content
-    let bytes = BASE64.decode(&write.plaintext_b64)
+    let bytes = BASE64
+        .decode(&write.plaintext_b64)
         .context("decode base64 attachment content")?;
 
-    // Use destination_id as the file path/id
+    // Use destination_id as an opaque platform destination. Absolute paths are
+    // user-selected save paths; relative ids are written under attachments_dir.
     let file_path = dir.join(&write.destination_id);
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .context("create attachment destination parent")?;
+    }
 
     // Write atomically using temp file
     let tmp_path = file_path.with_extension("tmp");
-    fs::write(&tmp_path, &bytes).await.context("write attachment temp file")?;
-    fs::rename(&tmp_path, &file_path).await.context("rename attachment file")?;
+    fs::write(&tmp_path, &bytes)
+        .await
+        .context("write attachment temp file")?;
+    fs::rename(&tmp_path, &file_path)
+        .await
+        .context("rename attachment file")?;
 
     // Return a successful result - the destination_id is opaque, so we just confirm success
     // Core doesn't have a specific "AttachmentWritten" event, we'll use BlobTransferFailed with success

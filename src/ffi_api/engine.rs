@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ed25519_dalek::Signer;
-use log;
-use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
+use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
@@ -35,7 +33,10 @@ use crate::transport_contract::{
     PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
     SharedStateDocumentKind,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::Signer;
+use log;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
@@ -80,7 +81,9 @@ impl CoreEngine {
     }
 
     pub fn local_display_name(&self) -> Option<String> {
-        self.state.local_display_name.clone()
+        self.state
+            .local_display_name
+            .clone()
             .or_else(|| self.state.local_bundle.as_ref()?.display_name.clone())
     }
 
@@ -89,9 +92,10 @@ impl CoreEngine {
     }
 
     pub fn contact_display_name(&self, user_id: &str) -> Option<&str> {
-        self.state.contacts.get(user_id).and_then(|c| {
-            c.display_name.as_deref().or(c.original_name.as_deref())
-        })
+        self.state
+            .contacts
+            .get(user_id)
+            .and_then(|c| c.display_name.as_deref().or(c.original_name.as_deref()))
     }
 
     pub fn conversation_state(&self, conversation_id: &str) -> Option<&LocalConversationState> {
@@ -188,13 +192,16 @@ impl CoreEngine {
         .unwrap_or_default();
         let mut contacts = BTreeMap::new();
         for contact in snapshot.contacts {
-            contacts.insert(contact.user_id.clone(), PersistedContact {
-                user_id: contact.user_id,
-                bundle: contact.bundle,
-                display_name: contact.display_name,
-                original_name: contact.original_name,
-                added_at: contact.added_at,
-            });
+            contacts.insert(
+                contact.user_id.clone(),
+                PersistedContact {
+                    user_id: contact.user_id,
+                    bundle: contact.bundle,
+                    display_name: contact.display_name,
+                    original_name: contact.original_name,
+                    added_at: contact.added_at,
+                },
+            );
         }
 
         let mut conversations = BTreeMap::new();
@@ -524,9 +531,10 @@ impl CoreEngine {
             CoreCommand::SetLocalDisplayName { display_name } => {
                 self.set_local_display_name(display_name)
             }
-            CoreCommand::SetContactDisplayName { user_id, display_name } => {
-                self.set_contact_display_name(user_id, display_name)
-            }
+            CoreCommand::SetContactDisplayName {
+                user_id,
+                display_name,
+            } => self.set_contact_display_name(user_id, display_name),
             CoreCommand::DeleteContact { user_id } => self.delete_contact(user_id),
         }
     }
@@ -579,7 +587,10 @@ impl CoreEngine {
             CoreEvent::MessageRequestsFetched { requests } => {
                 Ok(self.message_requests_output(requests))
             }
-            CoreEvent::MessageRequestsFetchFailed { retryable: _, detail } => Ok(CoreOutput {
+            CoreEvent::MessageRequestsFetchFailed {
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -616,7 +627,10 @@ impl CoreEngine {
                 view_model: None,
             }),
             CoreEvent::AllowlistFetched { document } => self.handle_allowlist_fetched(document),
-            CoreEvent::AllowlistFetchFailed { retryable: _, detail } => Ok(CoreOutput {
+            CoreEvent::AllowlistFetchFailed {
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -630,7 +644,10 @@ impl CoreEngine {
                 view_model: None,
             }),
             CoreEvent::AllowlistReplaced { document } => Ok(self.allowlist_output(document, true)),
-            CoreEvent::AllowlistReplaceFailed { retryable: _, detail } => Ok(CoreOutput {
+            CoreEvent::AllowlistReplaceFailed {
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -707,7 +724,9 @@ impl CoreEngine {
             )],
             view_model: None,
         };
-        output.effects.extend(self.local_shared_state_publish_effects()?);
+        output
+            .effects
+            .extend(self.local_shared_state_publish_effects()?);
         Ok(output)
     }
 
@@ -718,7 +737,10 @@ impl CoreEngine {
         let now = current_timestamp_hint(self.state.outbox.len());
 
         // Check if contact already exists to preserve user's display_name
-        let existing_display_name = self.state.contacts.get(&user_id)
+        let existing_display_name = self
+            .state
+            .contacts
+            .get(&user_id)
             .and_then(|c| c.display_name.clone());
 
         let persisted_contact = PersistedContact {
@@ -729,7 +751,9 @@ impl CoreEngine {
             added_at: now,
         };
 
-        self.state.contacts.insert(user_id.clone(), persisted_contact);
+        self.state
+            .contacts
+            .insert(user_id.clone(), persisted_contact);
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
@@ -757,12 +781,13 @@ impl CoreEngine {
         // Preserve existing display_name, update original_name if bundle has display_name
         let existing = self.state.contacts.get(&user_id);
         let display_name = existing.and_then(|c| c.display_name.clone());
-        let original_name = bundle.display_name.clone().or(
-            existing.and_then(|c| c.original_name.clone())
-        );
-        let added_at = existing.map(|c| c.added_at).unwrap_or_else(|| {
-            current_timestamp_hint(self.state.outbox.len())
-        });
+        let original_name = bundle
+            .display_name
+            .clone()
+            .or(existing.and_then(|c| c.original_name.clone()));
+        let added_at = existing
+            .map(|c| c.added_at)
+            .unwrap_or_else(|| current_timestamp_hint(self.state.outbox.len()));
 
         let persisted_contact = PersistedContact {
             user_id: user_id.clone(),
@@ -772,7 +797,9 @@ impl CoreEngine {
             added_at,
         };
 
-        self.state.contacts.insert(user_id.clone(), persisted_contact);
+        self.state
+            .contacts
+            .insert(user_id.clone(), persisted_contact);
 
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
@@ -1008,7 +1035,9 @@ impl CoreEngine {
             )],
             view_model: None,
         };
-        output.effects.extend(self.local_shared_state_publish_effects()?);
+        output
+            .effects
+            .extend(self.local_shared_state_publish_effects()?);
         Ok(output)
     }
 
@@ -1188,11 +1217,7 @@ impl CoreEngine {
             })
             .collect::<CoreResult<Vec<_>>>()?;
         // Cache plaintext for display until message is synced
-        self.enqueue_envelopes_with_plaintext(
-            peer_user_id,
-            envelopes.clone(),
-            plaintext.clone(),
-        );
+        self.enqueue_envelopes_with_plaintext(peer_user_id, envelopes.clone(), plaintext.clone());
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -1279,26 +1304,15 @@ impl CoreEngine {
         reference: String,
         destination: String,
     ) -> CoreResult<CoreOutput> {
-        let payload_metadata = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .and_then(|state| {
-                state
-                    .messages
-                    .iter()
-                    .find(|message| message.message_id == message_id)
-            })
-            .and_then(|message| message.plaintext.as_deref())
-            .ok_or_else(|| CoreError::invalid_input("attachment metadata is missing"))?
-            .to_string();
+        let payload_metadata =
+            self.attachment_payload_metadata_json(&conversation_id, &message_id)?;
         let payload_metadata: AttachmentPayloadMetadata = serde_json::from_str(&payload_metadata)
             .map_err(|error| {
             CoreError::invalid_input(format!(
                 "failed to decode attachment payload metadata: {error}"
             ))
         })?;
-        let task_id = format!("blob-download:{message_id}");
+        let task_id = attachment_download_task_id(&message_id, &reference, &destination);
         self.state.pending_blob_downloads.insert(
             task_id.clone(),
             PendingBlobDownload {
@@ -1326,6 +1340,35 @@ impl CoreEngine {
             },
             self.flush_pending_transport()?,
         ))
+    }
+
+    fn attachment_payload_metadata_json(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> CoreResult<String> {
+        self.state
+            .conversations
+            .get(conversation_id)
+            .and_then(|state| {
+                state
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == message_id)
+            })
+            .and_then(|message| message.plaintext.as_deref())
+            .or_else(|| {
+                self.state
+                    .pending_outbox
+                    .iter()
+                    .find(|item| {
+                        item.envelope.conversation_id == conversation_id
+                            && item.envelope.message_id == message_id
+                    })
+                    .and_then(|item| item.plaintext_cache.as_deref())
+            })
+            .ok_or_else(|| CoreError::invalid_input("attachment metadata is missing"))
+            .map(str::to_string)
     }
 
     fn reconcile_conversation_membership(
@@ -2217,10 +2260,7 @@ impl CoreEngine {
                 contacts_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![PersistOp::SaveDeployment],
-            )],
+            effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
             view_model: Some(CoreViewModel {
                 banners: vec![SystemBanner {
                     status: SystemStatus::SyncInProgress,
@@ -2447,7 +2487,9 @@ impl CoreEngine {
         if recovery_status == RecoveryStatus::NeedsRecovery {
             // Check the actual MLS group state to determine if recovery is complete
             // The MLS summary reflects the true cryptographic state of the group
-            let mls_status = self.state.mls_summaries
+            let mls_status = self
+                .state
+                .mls_summaries
                 .get(conversation_id)
                 .map(|s| s.status);
 
@@ -2632,15 +2674,21 @@ impl CoreEngine {
         self.state.local_display_name = display_name.clone();
 
         // Re-generate and sign the identity bundle with new display_name
-        let publish_effects = if self.state.local_identity.is_some() && self.state.deployment_bundle.is_some() {
+        let publish_effects = if self.state.local_identity.is_some()
+            && self.state.deployment_bundle.is_some()
+        {
             // Build devices list from existing bundle
-            let devices: Vec<crate::model::DeviceContactProfile> = self.state.local_bundle
+            let devices: Vec<crate::model::DeviceContactProfile> = self
+                .state
+                .local_bundle
                 .as_ref()
                 .map(|b| b.devices.clone())
                 .unwrap_or_default();
 
             // Get existing bundle_share_id
-            let bundle_share_id = self.state.local_bundle
+            let bundle_share_id = self
+                .state
+                .local_bundle
                 .as_ref()
                 .and_then(|b| b.bundle_share_id.clone());
 
@@ -2648,16 +2696,25 @@ impl CoreEngine {
             let local_identity = self.state.local_identity.as_ref().unwrap();
             let deployment = self.state.deployment_bundle.as_ref().unwrap();
 
-            let encoded_user_id = urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
+            let encoded_user_id =
+                urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
             let unsigned = crate::model::IdentityBundle {
                 version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                 user_id: local_identity.user_identity.user_id.clone(),
                 user_public_key: local_identity.user_identity.user_public_key.clone(),
                 devices,
-                bundle_share_id: Some(bundle_share_id.unwrap_or_else(|| crate::identity::generate_bundle_share_id())),
-                identity_bundle_ref: deployment.runtime_config.identity_bundle_ref.clone()
+                bundle_share_id: Some(
+                    bundle_share_id.unwrap_or_else(|| crate::identity::generate_bundle_share_id()),
+                ),
+                identity_bundle_ref: deployment
+                    .runtime_config
+                    .identity_bundle_ref
+                    .clone()
                     .map(|reference| reference.replace("{userId}", &encoded_user_id)),
-                device_status_ref: deployment.runtime_config.device_status_ref.clone()
+                device_status_ref: deployment
+                    .runtime_config
+                    .device_status_ref
+                    .clone()
                     .map(|reference| reference.replace("{userId}", &encoded_user_id)),
                 storage_profile: Some(crate::model::StorageProfile {
                     base_url: deployment.storage_base_info.base_url.clone(),
@@ -2669,7 +2726,8 @@ impl CoreEngine {
             };
 
             // Sign the bundle
-            let signature = local_identity.user_root_signing_key()
+            let signature = local_identity
+                .user_root_signing_key()
                 .sign(crate::identity::identity_bundle_payload(&unsigned).as_bytes());
             let signed_bundle = crate::model::IdentityBundle {
                 signature: crate::identity::encode_hex(&signature.to_bytes()),
@@ -2689,10 +2747,7 @@ impl CoreEngine {
             vec![]
         };
 
-        let persist_effect = persist_effect(
-            &self.state,
-            vec![PersistOp::SaveDeployment],
-        );
+        let persist_effect = persist_effect(&self.state, vec![PersistOp::SaveDeployment]);
 
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
@@ -2706,7 +2761,9 @@ impl CoreEngine {
             },
             view_model: Some(CoreViewModel {
                 contacts: vec![ContactSummary {
-                    user_id: self.state.local_identity
+                    user_id: self
+                        .state
+                        .local_identity
                         .as_ref()
                         .map(|i| i.user_identity.user_id.clone())
                         .unwrap_or_default(),
@@ -2748,11 +2805,16 @@ impl CoreEngine {
                 vec![PersistOp::SaveContact { user_id }],
             )],
             view_model: Some(CoreViewModel {
-                contacts: self.state.contacts.iter().map(|(uid, c)| ContactSummary {
-                    user_id: uid.clone(),
-                    display_name: c.display_name.clone().or(c.original_name.clone()),
-                    device_count: c.bundle.devices.len(),
-                }).collect(),
+                contacts: self
+                    .state
+                    .contacts
+                    .iter()
+                    .map(|(uid, c)| ContactSummary {
+                        user_id: uid.clone(),
+                        display_name: c.display_name.clone().or(c.original_name.clone()),
+                        device_count: c.bundle.devices.len(),
+                    })
+                    .collect(),
                 ..CoreViewModel::default()
             }),
         })
@@ -2777,7 +2839,9 @@ impl CoreEngine {
             .collect();
 
         // Collect persistence operations
-        let mut persist_ops: Vec<PersistOp> = vec![PersistOp::DeleteContact { user_id: user_id.clone() }];
+        let mut persist_ops: Vec<PersistOp> = vec![PersistOp::DeleteContact {
+            user_id: user_id.clone(),
+        }];
 
         for conv_id in &conversation_ids_to_remove {
             // Remove from state
@@ -2791,9 +2855,15 @@ impl CoreEngine {
             }
 
             // Add persistence operations
-            persist_ops.push(PersistOp::DeleteConversation { conversation_id: conv_id.clone() });
-            persist_ops.push(PersistOp::DeleteMlsState { conversation_id: conv_id.clone() });
-            persist_ops.push(PersistOp::DeleteRecoveryContext { conversation_id: conv_id.clone() });
+            persist_ops.push(PersistOp::DeleteConversation {
+                conversation_id: conv_id.clone(),
+            });
+            persist_ops.push(PersistOp::DeleteMlsState {
+                conversation_id: conv_id.clone(),
+            });
+            persist_ops.push(PersistOp::DeleteRecoveryContext {
+                conversation_id: conv_id.clone(),
+            });
         }
 
         Ok(CoreOutput {
@@ -2804,11 +2874,16 @@ impl CoreEngine {
             },
             effects: vec![persist_effect(&self.state, persist_ops)],
             view_model: Some(CoreViewModel {
-                contacts: self.state.contacts.iter().map(|(uid, c)| ContactSummary {
-                    user_id: uid.clone(),
-                    display_name: c.display_name.clone().or(c.original_name.clone()),
-                    device_count: c.bundle.devices.len(),
-                }).collect(),
+                contacts: self
+                    .state
+                    .contacts
+                    .iter()
+                    .map(|(uid, c)| ContactSummary {
+                        user_id: uid.clone(),
+                        display_name: c.display_name.clone().or(c.original_name.clone()),
+                        device_count: c.bundle.devices.len(),
+                    })
+                    .collect(),
                 ..CoreViewModel::default()
             }),
         })
@@ -3300,7 +3375,10 @@ impl CoreEngine {
                 self.state
                     .pending_outbox
                     .retain(|item| item.envelope.message_id != message_id);
-                Ok(merge_outputs(request_output, self.flush_pending_transport()?))
+                Ok(merge_outputs(
+                    request_output,
+                    self.flush_pending_transport()?,
+                ))
             }
             PendingRequest::Ack { device_id, .. } => {
                 let result: AckResult = serde_json::from_str(
@@ -3482,6 +3560,14 @@ impl CoreEngine {
             .download_target
             .clone()
             .unwrap_or(prepared.blob_ref.clone());
+        let payload_metadata = task.payload_metadata.clone().ok_or_else(|| {
+            CoreError::invalid_state("blob upload completed before payload metadata was prepared")
+        })?;
+        let payload_metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
+            CoreError::invalid_input(format!(
+                "failed to encode attachment payload metadata: {error}"
+            ))
+        })?;
         let mut envelopes = Vec::new();
         for recipient in recipients {
             let mut envelope = self.build_envelope(
@@ -3502,27 +3588,18 @@ impl CoreEngine {
                     .as_ref()
                     .and_then(|value| STANDARD.decode(value).ok())
                     .map(|bytes| bytes.len() as u64)
-                    .or_else(|| {
-                        task.payload_metadata
-                            .as_ref()
-                            .map(|metadata| metadata.size_bytes)
-                    })
+                    .or(Some(payload_metadata.size_bytes))
                     .unwrap_or(task.descriptor.size_bytes),
-                mime_type: task
-                    .payload_metadata
-                    .as_ref()
-                    .map(|m| m.mime_type.clone())
-                    .unwrap_or_else(|| task.descriptor.mime_type.clone()),
-                file_name: task
-                    .payload_metadata
-                    .as_ref()
-                    .and_then(|m| m.file_name.clone())
+                mime_type: payload_metadata.mime_type.clone(),
+                file_name: payload_metadata
+                    .file_name
+                    .clone()
                     .or_else(|| task.descriptor.file_name.clone()),
                 expires_at: prepared.expires_at,
             });
             envelopes.push(envelope);
         }
-        self.enqueue_envelopes(peer_user_id, envelopes);
+        self.enqueue_envelopes_with_plaintext(peer_user_id, envelopes, payload_metadata_json);
         Ok(merge_outputs(
             CoreOutput {
                 state_update: CoreStateUpdate::default(),
@@ -3695,7 +3772,6 @@ impl CoreEngine {
             if retryable && task.retries < MAX_TRANSPORT_RETRIES {
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate {
-                        messages_changed: true,
                         system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                         ..CoreStateUpdate::default()
                     },
@@ -3708,8 +3784,18 @@ impl CoreEngine {
                     view_model: None,
                 });
             }
+            if let Some(detail) = detail {
+                log::warn!("attachment download failed: {detail}");
+            } else {
+                log::warn!("attachment download failed");
+            }
+            self.state.pending_blob_downloads.remove(&task_id);
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![],
+                view_model: None,
+            });
         }
-        self.state.pending_blob_downloads.remove(&task_id);
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -4272,11 +4358,9 @@ impl CoreEngine {
             .map(|item| item.peer_user_id.clone())
             .unwrap_or_else(|| "peer".into());
 
-        let plaintext_cache = pending_item
-            .and_then(|item| item.plaintext_cache.clone());
+        let plaintext_cache = pending_item.and_then(|item| item.plaintext_cache.clone());
 
-        let envelope = pending_item
-            .map(|item| item.envelope.clone());
+        let envelope = pending_item.map(|item| item.envelope.clone());
 
         let append_result = AppendResultSummary {
             accepted: result.accepted,
@@ -4439,13 +4523,20 @@ impl CoreEngine {
         }
     }
 
-    fn handle_allowlist_fetched(&mut self, mut document: AllowlistDocument) -> CoreResult<CoreOutput> {
+    fn handle_allowlist_fetched(
+        &mut self,
+        mut document: AllowlistDocument,
+    ) -> CoreResult<CoreOutput> {
         let Some(mutation) = self.state.pending_allowlist_mutation.take() else {
             return Ok(self.allowlist_output(document, false));
         };
         match mutation {
             PendingAllowlistMutation::Add { user_id } => {
-                if !document.allowed_sender_user_ids.iter().any(|existing| existing == &user_id) {
+                if !document
+                    .allowed_sender_user_ids
+                    .iter()
+                    .any(|existing| existing == &user_id)
+                {
                     document.allowed_sender_user_ids.push(user_id.clone());
                     document.allowed_sender_user_ids.sort();
                     document.allowed_sender_user_ids.dedup();
@@ -4745,6 +4836,16 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
     }
 }
 
+fn attachment_download_task_id(message_id: &str, reference: &str, destination: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(reference.as_bytes());
+    hasher.update([0]);
+    hasher.update(destination.as_bytes());
+    let digest = hasher.finalize();
+    let hash: String = format!("{digest:x}").chars().take(12).collect();
+    format!("blob-download:{message_id}:{hash}")
+}
+
 fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
     base.state_update.conversations_changed |= next.state_update.conversations_changed;
     base.state_update.messages_changed |= next.state_update.messages_changed;
@@ -4760,7 +4861,9 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
             base_view.messages.append(&mut next_view.messages);
             base_view.contacts.append(&mut next_view.contacts);
             base_view.banners.append(&mut next_view.banners);
-            base_view.message_requests.append(&mut next_view.message_requests);
+            base_view
+                .message_requests
+                .append(&mut next_view.message_requests);
             if next_view.allowlist.is_some() {
                 base_view.allowlist = next_view.allowlist.take();
             }

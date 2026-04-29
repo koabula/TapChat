@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Check, Circle, Loader, X } from "lucide-react";
 
 interface AccountInfo {
   account_id: string;
@@ -166,7 +167,7 @@ export default function CloudflareSetup() {
               {/* Embedded runtime */}
               <div className="flex items-center gap-3">
                 <span className={`w-6 h-6 rounded-full flex items-center justify-center text-sm ${preflight.embedded_available ? "bg-frost.1 text-white" : "bg-surface-elevated text-muted-color"}`}>
-                  {preflight.embedded_available ? "✓" : "○"}
+                  {preflight.embedded_available ? <Check size={14} /> : <Circle size={14} />}
                 </span>
                 <div className="flex-1">
                   <span className="text-primary-color">Embedded runtime</span>
@@ -179,7 +180,7 @@ export default function CloudflareSetup() {
               {/* Authentication */}
               <div className="flex items-center gap-3">
                 <span className={`w-6 h-6 rounded-full flex items-center justify-center text-sm ${preflight.authenticated ? "bg-frost.1 text-white" : "bg-surface-elevated text-muted-color"}`}>
-                  {preflight.authenticated ? "✓" : "○"}
+                  {preflight.authenticated ? <Check size={14} /> : <Circle size={14} />}
                 </span>
                 <div className="flex-1">
                   <span className="text-primary-color">Cloudflare connected</span>
@@ -208,8 +209,8 @@ export default function CloudflareSetup() {
                   progress.phase === "Failed" ? "bg-error text-white" :
                   "bg-primary animate-pulse text-white"
                 }`}>
-                  {progress.phase === "Complete" ? "✓" :
-                   progress.phase === "Failed" ? "✗" : "⏳"}
+                  {progress.phase === "Complete" ? <Check size={14} /> :
+                   progress.phase === "Failed" ? <X size={14} /> : <Loader size={14} className="animate-spin" />}
                 </span>
                 <div className="flex-1">
                   <span className="text-primary-color">
@@ -239,7 +240,7 @@ export default function CloudflareSetup() {
             <div className="space-y-3 animate-fade-in">
               <div className="flex items-center gap-3">
                 <span className="w-6 h-6 rounded-full bg-frost.1 text-white flex items-center justify-center text-sm">
-                  ✓
+                  <Check size={14} />
                 </span>
                 <span className="text-primary-color font-medium">Infrastructure deployed!</span>
               </div>

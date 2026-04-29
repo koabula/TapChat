@@ -1,7 +1,9 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
+import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
+import { Monitor, X } from "lucide-react";
 
 import {
   getIdentityInfo,
@@ -319,7 +321,7 @@ export default function Settings() {
                           onClick={() => handleDeleteProfile(profile.path, profile.name)}
                           disabled={deletingProfile === profile.path}
                         >
-                          {deletingProfile === profile.path ? "..." : "✕"}
+                          {deletingProfile === profile.path ? "..." : <X size={14} />}
                         </button>
                       </>
                     )}
@@ -467,7 +469,7 @@ export default function Settings() {
             <div className="card">
               <div className="flex items-center justify-between mb-2">
                 <div className="flex items-center gap-2">
-                  <span className="text-lg">💻</span>
+                  <Monitor size={20} className="text-muted-color" />
                   <span className="text-primary-color">This Device</span>
                   <span className="status-success text-xs">Active</span>
                 </div>
@@ -505,7 +507,7 @@ export default function Settings() {
                     className="btn btn-ghost text-xs status-error"
                     onClick={() => handleRemoveAllowlist(userId)}
                   >
-                    ✕
+                    <X size={14} />
                   </button>
                 </div>
               ))}
@@ -555,6 +557,12 @@ export default function Settings() {
                 Manage Runtime
               </button>
             </div>
+          </section>
+
+          {/* Attachments section */}
+          <section className="mb-6">
+            <h2 className="text-lg font-medium text-primary-color mb-3">Attachments</h2>
+            <AttachmentsSettings />
           </section>
 
           {/* Recovery section */}
@@ -610,6 +618,128 @@ export default function Settings() {
           </section>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Inline component for attachment settings, co-located with Settings page. */
+function AttachmentsSettings() {
+  const [settings, setLocalSettings] = useState<{ auto_download_media: boolean; always_ask_save_path: boolean } | null>(null);
+  const [cacheDir, setCacheDir] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    loadSettings();
+    loadCacheDir();
+  }, []);
+
+  const loadSettings = async () => {
+    try {
+      const s = await invoke<{ auto_download_media: boolean; always_ask_save_path: boolean }>("get_attachment_settings");
+      setLocalSettings(s);
+    } catch (err) {
+      console.error("[Settings] Failed to load attachment settings:", err);
+    }
+  };
+
+  const loadCacheDir = async () => {
+    try {
+      const dir = await invoke<string>("get_attachment_cache_dir");
+      setCacheDir(dir);
+    } catch {
+      // not critical
+    }
+  };
+
+  const toggleAutoDownload = async () => {
+    if (!settings) return;
+    const next = { ...settings, auto_download_media: !settings.auto_download_media };
+    setLocalSettings(next);
+    setSaving(true);
+    try {
+      await invoke("set_attachment_settings", { settings: next });
+    } catch (err) {
+      console.error("[Settings] Failed to save attachment settings:", err);
+      setLocalSettings(settings); // revert
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const toggleAlwaysAsk = async () => {
+    if (!settings) return;
+    const next = { ...settings, always_ask_save_path: !settings.always_ask_save_path };
+    setLocalSettings(next);
+    setSaving(true);
+    try {
+      await invoke("set_attachment_settings", { settings: next });
+    } catch (err) {
+      console.error("[Settings] Failed to save attachment settings:", err);
+      setLocalSettings(settings); // revert
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!settings) {
+    return <div className="card"><span className="text-muted-color text-sm">Loading...</span></div>;
+  }
+
+  return (
+    <div className="card space-y-4">
+      {/* Auto-download toggle */}
+      <label className="flex items-center justify-between cursor-pointer">
+        <div className="flex-1">
+          <span className="text-primary-color">Auto-download media</span>
+          <p className="text-muted-color text-xs mt-0.5">
+            Automatically download image, audio, and video attachments (≤10 MB) from trusted contacts
+          </p>
+        </div>
+        <button
+          className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
+            settings.auto_download_media ? "bg-primary" : "bg-surface-elevated"
+          }`}
+          onClick={toggleAutoDownload}
+          disabled={saving}
+        >
+          <span
+            className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+              settings.auto_download_media ? "translate-x-5" : "translate-x-1"
+            }`}
+          />
+        </button>
+      </label>
+
+      {/* Always ask save path toggle */}
+      <label className="flex items-center justify-between cursor-pointer">
+        <div className="flex-1">
+          <span className="text-primary-color">Always ask save path</span>
+          <p className="text-muted-color text-xs mt-0.5">
+            When enabled, you will be asked where to save each downloaded file
+          </p>
+        </div>
+        <button
+          className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
+            settings.always_ask_save_path ? "bg-primary" : "bg-surface-elevated"
+          }`}
+          onClick={toggleAlwaysAsk}
+          disabled={saving}
+        >
+          <span
+            className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+              settings.always_ask_save_path ? "translate-x-5" : "translate-x-1"
+            }`}
+          />
+        </button>
+      </label>
+
+      {/* Cache directory (read-only) */}
+      {cacheDir && (
+        <div className="pt-3 border-t border-subtle">
+          <label className="text-muted-color text-xs block mb-1">Cache directory</label>
+          <span className="text-primary-color text-sm truncate block">{cacheDir}</span>
+        </div>
+      )}
     </div>
   );
 }

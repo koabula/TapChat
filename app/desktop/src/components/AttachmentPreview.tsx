@@ -1,8 +1,21 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
+import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
+import {
+  Image,
+  Music,
+  Clapperboard,
+  FileText,
+  FileEdit,
+  Sheet,
+  Presentation,
+  Archive,
+  File,
+} from "lucide-react";
+import AttachmentCard from "./AttachmentCard";
 
-interface AttachmentPreviewProps {
+export interface AttachmentPreviewProps {
   messageId: string;
   conversationId: string;
   reference: string;
@@ -21,50 +34,40 @@ export default function AttachmentPreview({
   fileName,
   sizeBytes,
   downloaded = false,
-  showInline = true,
 }: AttachmentPreviewProps) {
   const [downloading, setDownloading] = useState(false);
   const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [imageData, setImageData] = useState<string | null>(null);
-  const [loadingPreview, setLoadingPreview] = useState(false);
 
-  // Load inline preview for images
-  useEffect(() => {
-    if (showInline && mimeType.startsWith("image/") && !imageData) {
-      loadImagePreview();
+  const formatAttachmentError = (err: unknown): string => {
+    const text = String(err);
+    const lower = text.toLowerCase();
+    if (
+      lower.includes("capability_expired") ||
+      lower.includes("sharing token expired") ||
+      lower.includes("http 403") ||
+      lower.includes("link may have expired")
+    ) {
+      return "Attachment link expired";
     }
-  }, [mimeType, showInline, reference]);
-
-  const loadImagePreview = async () => {
-    setLoadingPreview(true);
-    try {
-      const result = await invoke<string | null>("get_attachment_preview", {
-        conversationId,
-        messageId,
-        reference,
-      });
-      if (result) {
-        setImageData(result);
-      }
-    } catch (err) {
-      console.error(`[AttachmentPreview] Failed to load image preview: ${String(err)}`);
-    } finally {
-      setLoadingPreview(false);
+    if (lower.includes("metadata is missing") || lower.includes("attachment metadata missing")) {
+      return "Attachment metadata missing";
     }
+    return text;
   };
 
-  const getFileIcon = (): string => {
-    if (mimeType.startsWith("image/")) return "🖼️";
-    if (mimeType.startsWith("audio/")) return "🎵";
-    if (mimeType.startsWith("video/")) return "🎬";
-    if (mimeType === "application/pdf") return "📄";
-    if (mimeType.includes("word") || mimeType.includes("document")) return "📝";
-    if (mimeType.includes("spreadsheet") || mimeType.includes("excel")) return "📊";
-    if (mimeType.includes("presentation") || mimeType.includes("powerpoint")) return "📽️";
-    if (mimeType === "application/zip" || mimeType.includes("compressed")) return "📦";
-    if (mimeType.startsWith("text/")) return "📃";
-    return "📎";
+  const getFileIcon = (): ReactNode => {
+    const cls = (color: string) => `w-6 h-6 ${color}`;
+    if (mimeType.startsWith("image/")) return <Image className={cls("text-file-icon-image")} />;
+    if (mimeType.startsWith("audio/")) return <Music className={cls("text-file-icon-audio")} />;
+    if (mimeType.startsWith("video/")) return <Clapperboard className={cls("text-file-icon-video")} />;
+    if (mimeType === "application/pdf") return <FileText className={cls("text-file-icon-pdf")} />;
+    if (mimeType.includes("word") || mimeType.includes("document")) return <FileEdit className={cls("text-file-icon-document")} />;
+    if (mimeType.includes("spreadsheet") || mimeType.includes("excel")) return <Sheet className={cls("text-file-icon-spreadsheet")} />;
+    if (mimeType.includes("presentation") || mimeType.includes("powerpoint")) return <Presentation className={cls("text-file-icon-presentation")} />;
+    if (mimeType === "application/zip" || mimeType.includes("compressed")) return <Archive className={cls("text-file-icon-archive")} />;
+    if (mimeType.startsWith("text/")) return <File className={cls("text-file-icon-text")} />;
+    return <File className={cls("text-file-icon-text")} />;
   };
 
   const getFileTypeLabel = (): string => {
@@ -86,27 +89,43 @@ export default function AttachmentPreview({
 
     try {
       const defaultFileName = fileName || `attachment${getExtensionFromMimeType(mimeType)}`;
+      const settings = await invoke<{ always_ask_save_path: boolean }>("get_attachment_settings");
 
-      const savePath = await save({
-        title: "Save attachment",
-        defaultPath: defaultFileName,
-      });
+      if (settings.always_ask_save_path) {
+        const savePath = await save({
+          title: "Save attachment",
+          defaultPath: defaultFileName,
+        });
 
-      if (!savePath) {
-        setDownloading(false);
-        return;
+        if (!savePath) {
+          setDownloading(false);
+          return null;
+        }
+
+        await invoke("download_attachment", {
+          conversationId,
+          messageId,
+          reference,
+          destination: savePath,
+        });
+
+        setDownloadedPath(savePath);
+        return savePath;
       }
 
-      await invoke("download_attachment", {
+      const defaultPath = await invoke<string>("download_attachment_to_default_path", {
         conversationId,
         messageId,
         reference,
-        destination: savePath,
+        fileName: defaultFileName,
+        mimeType,
       });
 
-      setDownloadedPath(savePath);
+      setDownloadedPath(defaultPath);
+      return defaultPath;
     } catch (err) {
-      setError(String(err));
+      setError(formatAttachmentError(err));
+      return null;
     } finally {
       setDownloading(false);
     }
@@ -129,17 +148,29 @@ export default function AttachmentPreview({
   };
 
   const handleOpen = async () => {
-    if (!downloadedPath) return;
+    if (!downloadedPath) {
+      await handleDownload();
+      return;
+    }
     try {
+      const exists = await invoke<boolean>("path_exists", { path: downloadedPath });
+      if (!exists) {
+        setDownloadedPath(null);
+        const redownloadedPath = await handleDownload();
+        if (redownloadedPath) {
+          await invoke("open_file", { path: redownloadedPath });
+        }
+        return;
+      }
       await invoke("open_file", { path: downloadedPath });
     } catch (err) {
-      console.error(`[AttachmentPreview] Failed to open file: ${String(err)}`);
+      setError(formatAttachmentError(err));
     }
   };
 
   const formatFileName = (): string => {
     if (!fileName) return "Attachment";
-    return fileName.length > 35 ? fileName.slice(0, 32) + "..." : fileName;
+    return fileName.length > 35 ? `${fileName.slice(0, 32)}...` : fileName;
   };
 
   const formatFileSize = (bytes?: number): string | null => {
@@ -149,152 +180,17 @@ export default function AttachmentPreview({
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const sizeStr = formatFileSize(sizeBytes);
-
-  // Image attachment with inline preview
-  if (showInline && mimeType.startsWith("image/")) {
-    return (
-      <div className="flex flex-col gap-2">
-        {/* Loading placeholder */}
-        {loadingPreview && (
-          <div className="w-full h-40 bg-surface-elevated rounded-lg flex items-center justify-center">
-            <div className="flex flex-col items-center gap-2">
-              <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-              <span className="text-xs text-muted-color">Loading preview...</span>
-            </div>
-          </div>
-        )}
-
-        {/* Image thumbnail */}
-        {imageData && (
-          <div className="relative group">
-            <img
-              src={`data:${mimeType};base64,${imageData}`}
-              alt={fileName || "Image attachment"}
-              className="max-w-full max-h-64 rounded-lg object-cover cursor-pointer shadow-sm"
-              onClick={handleDownload}
-              onError={() => setImageData(null)}
-            />
-            {/* Hover overlay */}
-            <div
-              className="absolute inset-0 bg-black/0 group-hover:bg-black/20 rounded-lg transition-colors flex items-center justify-center cursor-pointer"
-              onClick={handleDownload}
-            >
-              <span className="text-white text-sm font-medium opacity-0 group-hover:opacity-100 transition-opacity bg-black/50 px-3 py-1.5 rounded-full">
-                {downloaded || downloadedPath ? "Open" : "Download"}
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* Fallback when image can't be previewed */}
-        {!imageData && !loadingPreview && (
-          <FileCard
-            icon={getFileIcon()}
-            name={formatFileName()}
-            typeLabel={getFileTypeLabel()}
-            sizeStr={sizeStr}
-            downloaded={downloaded || !!downloadedPath}
-            downloading={downloading}
-            error={error}
-            onDownload={handleDownload}
-            onOpen={handleOpen}
-          />
-        )}
-      </div>
-    );
-  }
-
-  // Non-image file attachment
   return (
-    <FileCard
+    <AttachmentCard
       icon={getFileIcon()}
       name={formatFileName()}
       typeLabel={getFileTypeLabel()}
-      sizeStr={sizeStr}
+      sizeStr={formatFileSize(sizeBytes)}
       downloaded={downloaded || !!downloadedPath}
       downloading={downloading}
       error={error}
       onDownload={handleDownload}
       onOpen={handleOpen}
     />
-  );
-}
-
-/** Polished file card for non-image attachments */
-function FileCard({
-  icon,
-  name,
-  typeLabel,
-  sizeStr,
-  downloaded,
-  downloading,
-  error,
-  onDownload,
-  onOpen,
-}: {
-  icon: string;
-  name: string;
-  typeLabel: string;
-  sizeStr: string | null;
-  downloaded: boolean;
-  downloading: boolean;
-  error: string | null;
-  onDownload: () => void;
-  onOpen: () => void;
-}) {
-  return (
-    <div className="flex items-center gap-3 p-3 bg-surface/50 rounded-lg border border-subtle hover:border-default transition-colors group/file">
-      {/* Icon */}
-      <div className="w-10 h-10 rounded-lg bg-surface-elevated flex items-center justify-center text-xl flex-shrink-0 shadow-sm">
-        {icon}
-      </div>
-
-      {/* File info */}
-      <div className="flex-1 min-w-0">
-        <div className="text-sm text-primary-color font-medium truncate" title={name}>
-          {name}
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted-color">
-          <span>{typeLabel}</span>
-          {sizeStr && (
-            <>
-              <span className="opacity-40">·</span>
-              <span>{sizeStr}</span>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* Action button */}
-      {downloaded ? (
-        <button
-          className="text-xs text-primary hover:underline flex-shrink-0 transition-colors"
-          onClick={onOpen}
-        >
-          Open
-        </button>
-      ) : (
-        <button
-          className="text-xs text-primary hover:underline flex-shrink-0 transition-colors disabled:opacity-50"
-          onClick={onDownload}
-          disabled={downloading}
-        >
-          {downloading ? (
-            <span className="flex items-center gap-1">
-              <span className="w-3 h-3 border border-primary border-t-transparent rounded-full animate-spin" />
-              Saving...
-            </span>
-          ) : (
-            "Download"
-          )}
-        </button>
-      )}
-
-      {/* Error */}
-      {error && (
-        <span className="text-xs text-error flex-shrink-0">{error}</span>
-      )}
-    </div>
   );
 }

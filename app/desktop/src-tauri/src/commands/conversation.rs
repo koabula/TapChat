@@ -6,7 +6,7 @@ use tapchat_core::ffi_api::ConversationSummary;
 use tapchat_core::model::{ConversationKind, MessageType};
 use tapchat_core::CoreCommand;
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::{AppState, SessionState};
 
 fn summarize_plaintext(plaintext: Option<&str>) -> String {
@@ -53,11 +53,14 @@ pub async fn list_conversations(
     let snapshot = inner.engine.refresh_snapshot();
 
     // Build conversation summaries from snapshot
-    let summaries: Vec<ConversationSummary> = snapshot.conversations
+    let summaries: Vec<ConversationSummary> = snapshot
+        .conversations
         .iter()
         .map(|persisted| {
             // Filter to only application messages for count
-            let app_message_count = persisted.state.messages
+            let app_message_count = persisted
+                .state
+                .messages
                 .iter()
                 .filter(|msg| matches!(msg.message_type, MessageType::MlsApplication))
                 .count();
@@ -114,7 +117,8 @@ pub async fn get_messages(
     // Get local device_id to determine message direction
     // Primary source: local_identity from snapshot
     // Fallback: device_id from session state (set during profile switch/startup)
-    let local_device_id = snapshot.local_identity
+    let local_device_id = snapshot
+        .local_identity
         .as_ref()
         .map(|li| li.state.device_identity.device_id.clone())
         .or_else(|| {
@@ -126,11 +130,13 @@ pub async fn get_messages(
         });
 
     // Log for debugging
-    log::info!(
+    log::debug!(
         "get_messages: conversation_id={}, local_device_id={}, messages_count={}",
         conversation_id,
         local_device_id.as_deref().unwrap_or("NONE"),
-        snapshot.conversations.iter()
+        snapshot
+            .conversations
+            .iter()
             .find(|c| c.conversation_id == conversation_id)
             .map(|p| p.state.messages.len())
             .unwrap_or(0)
@@ -138,19 +144,26 @@ pub async fn get_messages(
 
     // Find the conversation and extract messages
     // Filter out MLS protocol messages (Welcome, Commit) - they have no plaintext and shouldn't be displayed
-    let conversation_messages: Vec<serde_json::Value> = snapshot.conversations
+    let conversation_messages: Vec<serde_json::Value> = snapshot
+        .conversations
         .iter()
         .find(|c| c.conversation_id == conversation_id)
         .map(|persisted| {
-            persisted.state.messages.iter()
+            persisted
+                .state
+                .messages
+                .iter()
                 .filter(|msg| {
                     // Only show application messages, not protocol messages
                     // MlsWelcome and MlsCommit are MLS handshake messages with no plaintext
-                    matches!(msg.message_type, tapchat_core::model::MessageType::MlsApplication)
+                    matches!(
+                        msg.message_type,
+                        tapchat_core::model::MessageType::MlsApplication
+                    )
                 })
                 .map(|msg| {
                     // Log plaintext status for debugging
-                    log::info!(
+                    log::debug!(
                         "get_messages: message_id={}, message_type={:?}, {}",
                         msg.message_id,
                         msg.message_type,
@@ -181,12 +194,14 @@ pub async fn get_messages(
     // Merge pending outbox messages (sent but not yet acked)
     // These are outgoing messages that haven't been confirmed yet
     // All pending outbox messages are MlsApplication type (actual user messages)
-    let outbox_messages: Vec<serde_json::Value> = snapshot.pending_outbox
+    let outbox_messages: Vec<serde_json::Value> = snapshot
+        .pending_outbox
         .iter()
         .filter(|env| env.envelope.conversation_id == conversation_id)
         .filter_map(|env| {
             // Only include if not already in conversation messages
-            let already_exists = conversation_messages.iter()
+            let already_exists = conversation_messages
+                .iter()
                 .any(|msg| msg["message_id"] == env.envelope.message_id);
             if already_exists {
                 return None;

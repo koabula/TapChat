@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::attachment_crypto::{
-        ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata, AttachmentPayloadMetadata,
+        AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
     };
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
     use crate::ffi_api::{
@@ -11,12 +11,12 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        CURRENT_MODEL_VERSION, ConversationKind, DeliveryClass, DeploymentBundle,
-        DeviceRuntimeAuth, Envelope, IdentityBundle, InboxRecord, InboxRecordState, MessageType,
-        SenderProof, StorageBaseInfo, WakeHint,
+        ConversationKind, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth, Envelope,
+        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
+        WakeHint, CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{CorePersistenceSnapshot, PersistOp};
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
@@ -141,7 +141,7 @@ mod tests {
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         let upload = alice
             .handle_command(CoreCommand::SendAttachmentMessage {
-                conversation_id,
+                conversation_id: conversation_id.clone(),
                 attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
@@ -199,10 +199,130 @@ mod tests {
                 .object_ref,
             "blob-download:attachment-1"
         );
+        let outbox_item = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| !item.envelope.storage_refs.is_empty())
+            .expect("attachment outbox");
+        let message_id = outbox_item.envelope.message_id.clone();
+        let plaintext_cache = outbox_item
+            .plaintext_cache
+            .as_deref()
+            .expect("attachment metadata cache");
+        let metadata: AttachmentPayloadMetadata =
+            serde_json::from_str(plaintext_cache).expect("attachment metadata json");
+        assert_eq!(metadata.mime_type, "application/octet-stream");
+        assert_eq!(metadata.file_name.as_deref(), Some("file.bin"));
+        assert_eq!(metadata.size_bytes, 4);
+
+        let download = alice
+            .handle_command(CoreCommand::DownloadAttachment {
+                conversation_id: conversation_id.clone(),
+                message_id: message_id.clone(),
+                reference: "blob-download:attachment-1".into(),
+                destination: "cached/file.bin".into(),
+            })
+            .expect("download attachment from pending outbox metadata");
+        assert!(download.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::DownloadBlob { download }
+                if download.blob_ref == "blob-download:attachment-1"
+        )));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
         )));
+
+        let request_id = find_http_request_id(&output, "/messages");
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":3,"delivered_to":"inbox"}"#.into()),
+            })
+            .expect("append inbox response");
+        let stored = alice
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.message_id == message_id)
+            .expect("stored sent attachment");
+        let stored_metadata: AttachmentPayloadMetadata = serde_json::from_str(
+            stored
+                .plaintext
+                .as_deref()
+                .expect("stored attachment metadata"),
+        )
+        .expect("stored attachment metadata json");
+        assert_eq!(
+            stored_metadata.encryption.algorithm,
+            ATTACHMENT_CIPHER_ALGORITHM
+        );
+    }
+
+    #[test]
+    fn download_attachment_uses_unique_task_ids_for_distinct_destinations() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let conversation_id = "conv:test".to_string();
+        engine.state.conversations.insert(
+            conversation_id.clone(),
+            crate::conversation::LocalConversationState {
+                conversation: crate::model::Conversation {
+                    conversation_id: conversation_id.clone(),
+                    kind: ConversationKind::Direct,
+                    member_users: vec!["user:alice".into(), "user:bob".into()],
+                    member_devices: vec![],
+                    state: crate::model::ConversationState::Active,
+                    updated_at: 0,
+                },
+                messages: vec![crate::conversation::StoredMessage {
+                    message_id: "msg:download".into(),
+                    sender_device_id: "device:sender".into(),
+                    recipient_device_id: "device:recipient".into(),
+                    message_type: MessageType::MlsApplication,
+                    created_at: 0,
+                    plaintext: Some(
+                        serde_json::to_string(&sample_attachment_payload_metadata())
+                            .expect("attachment metadata"),
+                    ),
+                    storage_refs: vec![],
+                    downloaded_blob_b64: None,
+                }],
+                last_message_type: Some(MessageType::MlsApplication),
+                peer_user_id: "user:bob".into(),
+                last_known_peer_active_devices: Default::default(),
+                recovery_status: crate::conversation::RecoveryStatus::Healthy,
+            },
+        );
+
+        engine
+            .handle_command(CoreCommand::DownloadAttachment {
+                conversation_id: conversation_id.clone(),
+                message_id: "msg:download".into(),
+                reference: "cid:download".into(),
+                destination: "cache/a.bin".into(),
+            })
+            .expect("first download");
+        engine
+            .handle_command(CoreCommand::DownloadAttachment {
+                conversation_id,
+                message_id: "msg:download".into(),
+                reference: "cid:download".into(),
+                destination: "downloads/a.bin".into(),
+            })
+            .expect("second download");
+
+        let task_ids: Vec<_> = engine.state.pending_blob_downloads.keys().cloned().collect();
+        assert_eq!(task_ids.len(), 2);
+        assert!(task_ids.iter().all(|task_id| {
+            task_id.starts_with("blob-download:msg:download:") && task_id.len() > 32
+        }));
+        assert_ne!(task_ids[0], task_ids[1]);
     }
 
     #[test]
@@ -238,7 +358,8 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .bundle.devices[0]
+            .bundle
+            .devices[0]
             .device_id
             .clone();
         let mut conversation_users = [local_user_id.clone(), peer_user_id.clone()];
@@ -283,12 +404,10 @@ mod tests {
             .expect("fetch response");
 
         assert!(output.state_update.conversations_changed);
-        assert!(
-            engine
-                .state
-                .conversations
-                .contains_key(&expected_conversation_id)
-        );
+        assert!(engine
+            .state
+            .conversations
+            .contains_key(&expected_conversation_id));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -506,12 +625,10 @@ mod tests {
         });
 
         let persist = persist.expect("persist effect");
-        assert!(
-            persist
-                .ops
-                .iter()
-                .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. }))
-        );
+        assert!(persist
+            .ops
+            .iter()
+            .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. })));
         assert!(persist.snapshot.is_some());
     }
 
@@ -553,12 +670,10 @@ mod tests {
         let snapshot = extract_snapshot(&output);
 
         assert!(!snapshot.mls_state_persistence_blocked);
-        assert!(
-            snapshot
-                .mls_states
-                .iter()
-                .all(|state| state.serialized_group_state.is_some())
-        );
+        assert!(snapshot
+            .mls_states
+            .iter()
+            .all(|state| state.serialized_group_state.is_some()));
     }
 
     #[test]
@@ -615,19 +730,15 @@ mod tests {
             })
             .expect("message request response");
 
-        assert!(
-            !alice
-                .state
-                .pending_outbox
-                .iter()
-                .any(|item| item.envelope.message_id == pending_message_id)
-        );
-        assert!(
-            output
-                .state_update
-                .system_statuses_changed
-                .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval)
-        );
+        assert!(!alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| item.envelope.message_id == pending_message_id));
+        assert!(output
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -644,7 +755,10 @@ mod tests {
             append_result.delivered_to,
             crate::transport_contract::AppendDeliveryDisposition::MessageRequest
         );
-        assert_eq!(append_result.request_id.as_deref(), Some("request:user:bob"));
+        assert_eq!(
+            append_result.request_id.as_deref(),
+            Some("request:user:bob")
+        );
     }
 
     #[test]
@@ -676,19 +790,15 @@ mod tests {
             })
             .expect("rejected response");
 
-        assert!(
-            !alice
-                .state
-                .pending_outbox
-                .iter()
-                .any(|item| item.envelope.message_id == pending_message_id)
-        );
-        assert!(
-            output
-                .state_update
-                .system_statuses_changed
-                .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy)
-        );
+        assert!(!alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| item.envelope.message_id == pending_message_id));
+        assert!(output
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -774,7 +884,8 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .bundle.devices[0]
+            .bundle
+            .devices[0]
             .device_id
             .clone();
 
@@ -862,12 +973,10 @@ mod tests {
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
 
-        assert!(
-            resumed
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. }))
-        );
+        assert!(resumed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. })));
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -1014,7 +1123,8 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .bundle.devices[0]
+            .bundle
+            .devices[0]
             .device_id
             .clone();
         let record = sample_control_record(
@@ -1088,7 +1198,8 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .bundle.devices[0]
+            .bundle
+            .devices[0]
             .device_id
             .clone();
 
@@ -1178,12 +1289,10 @@ mod tests {
                     if timer.timer_id == format!("refresh_identity:{}", bob_bundle.user_id)
                 )));
             } else {
-                assert!(
-                    output
-                        .state_update
-                        .system_statuses_changed
-                        .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild)
-                );
+                assert!(output
+                    .state_update
+                    .system_statuses_changed
+                    .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
             }
         }
 
@@ -1237,7 +1346,8 @@ mod tests {
             .values()
             .next()
             .expect("contact")
-            .bundle.devices[0]
+            .bundle
+            .devices[0]
             .device_id
             .clone();
         let record = sample_control_record_with_type(
@@ -1474,11 +1584,19 @@ mod tests {
                 destination: "download.bin".into(),
             })
             .expect("download attachment");
+        let task_id = engine
+            .state
+            .pending_blob_downloads
+            .keys()
+            .next()
+            .cloned()
+            .expect("pending download");
+        let retry_timer_id = format!("retry_blob_download:{task_id}");
 
         for attempt in 0..crate::ffi_api::MAX_TRANSPORT_RETRIES {
             let output = engine
                 .handle_event(CoreEvent::BlobTransferFailed {
-                    task_id: "blob-download:msg:download".into(),
+                    task_id: task_id.clone(),
                     retryable: true,
                     detail: Some("download failed".into()),
                 })
@@ -1487,29 +1605,25 @@ mod tests {
                 assert!(output.effects.iter().any(|effect| matches!(
                     effect,
                     CoreEffect::ScheduleTimer { timer }
-                    if timer.timer_id == "retry_blob_download:blob-download:msg:download"
+                    if timer.timer_id == retry_timer_id
                 )));
                 engine
                     .handle_event(CoreEvent::TimerTriggered {
-                        timer_id: "retry_blob_download:blob-download:msg:download".into(),
+                        timer_id: retry_timer_id.clone(),
                     })
                     .expect("retry timer");
             } else {
-                assert!(
-                    !output
-                        .effects
-                        .iter()
-                        .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. }))
-                );
+                assert!(!output
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
             }
         }
 
-        assert!(
-            !engine
-                .state
-                .pending_blob_downloads
-                .contains_key("blob-download:msg:download")
-        );
+        assert!(!engine
+            .state
+            .pending_blob_downloads
+            .contains_key(&task_id));
     }
 
     #[test]
@@ -1763,13 +1877,11 @@ mod tests {
             .get(&merged.user_id)
             .expect("updated contact");
         assert_eq!(updated.bundle.devices.len(), 2);
-        assert!(
-            updated
-                .bundle
-                .devices
-                .iter()
-                .any(|device| device.device_id == bob_laptop_profile.device_id)
-        );
+        assert!(updated
+            .bundle
+            .devices
+            .iter()
+            .any(|device| device.device_id == bob_laptop_profile.device_id));
     }
 
     #[test]
@@ -1885,16 +1997,12 @@ mod tests {
             })
             .collect();
         assert!(!remove_commits.is_empty());
-        assert!(
-            remove_commits
-                .iter()
-                .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id)
-        );
-        assert!(
-            remove_commits
-                .iter()
-                .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id)
-        );
+        assert!(remove_commits
+            .iter()
+            .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
+        assert!(remove_commits
+            .iter()
+            .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id));
     }
 
     #[test]
@@ -2019,22 +2127,18 @@ mod tests {
                     .iter()
                     .any(|message| message.message_type == MessageType::MlsWelcome)
         }));
-        assert!(
-            restored.state.pending_outbox[pending_before..]
-                .iter()
-                .any(|item| {
-                    item.envelope.conversation_id == conversation_id
-                        && item.envelope.message_type == MessageType::MlsCommit
-                })
-        );
-        assert!(
-            restored.state.pending_outbox[pending_before..]
-                .iter()
-                .any(|item| {
-                    item.envelope.conversation_id == conversation_id
-                        && item.envelope.message_type == MessageType::MlsWelcome
-                })
-        );
+        assert!(restored.state.pending_outbox[pending_before..]
+            .iter()
+            .any(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            }));
+        assert!(restored.state.pending_outbox[pending_before..]
+            .iter()
+            .any(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsWelcome
+            }));
         assert_eq!(
             restored
                 .state

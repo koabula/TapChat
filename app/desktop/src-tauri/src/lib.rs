@@ -49,7 +49,10 @@ fn parse_startup_args() -> StartupConfig {
         multi_instance = true;
     }
 
-    StartupConfig { profile_name, multi_instance }
+    StartupConfig {
+        profile_name,
+        multi_instance,
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -90,22 +93,24 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_log::Builder::new()
-            .level(log::LevelFilter::Info)
-            .targets([
-                tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
-                    path: dirs::data_local_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join("TapChat")
-                        .join("logs"),
-                    file_name: None,
-                }),
-            ])
-            .build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .targets([tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Folder {
+                        path: dirs::data_local_dir()
+                            .unwrap_or_else(|| std::path::PathBuf::from("."))
+                            .join("TapChat")
+                            .join("logs"),
+                        file_name: None,
+                    },
+                )])
+                .build(),
+        )
         .plugin(
             tauri_plugin_updater::Builder::new()
                 .pubkey(updater_pubkey)
-                .build()
+                .build(),
         )
         .plugin(tauri_plugin_process::init())
         .manage(app_state)
@@ -172,6 +177,8 @@ pub fn run() {
             commands::message::send_text,
             commands::message::send_attachment,
             commands::message::download_attachment,
+            commands::message::download_attachment_to_default_path,
+            commands::message::cache_attachment,
             commands::message::get_attachment_preview,
             // Contacts
             commands::contact::import_contact_by_link,
@@ -208,11 +215,16 @@ pub fn run() {
             lifecycle::set_onboarding_step,
             // Utility
             commands::utility::open_file,
+            commands::utility::path_exists,
             commands::utility::check_notification_permission,
             commands::utility::request_notification_permission,
             commands::utility::show_notification,
             commands::utility::write_temp_file,
             commands::utility::get_file_metadata,
+            // Attachment settings
+            commands::attachment_settings::get_attachment_settings,
+            commands::attachment_settings::set_attachment_settings,
+            commands::attachment_settings::get_attachment_cache_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TapChat");

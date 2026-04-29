@@ -2,11 +2,11 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{DeploymentBundle, IdentityBundle};
-use crate::persistence::{CorePersistenceSnapshot, decode_snapshot, encode_snapshot};
+use crate::persistence::{decode_snapshot, encode_snapshot, CorePersistenceSnapshot};
 
 use super::util::to_snake_case_json_string;
 
@@ -17,6 +17,8 @@ pub struct ProfileMetadata {
     pub bundles_dir: PathBuf,
     pub inbox_attachments_dir: PathBuf,
     pub outbox_attachments_dir: PathBuf,
+    #[serde(default)]
+    pub attachments_dir: PathBuf,
     pub runtime_dir: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
@@ -89,8 +91,9 @@ impl Profile {
         let meta = ProfileMetadata {
             name: name.to_string(),
             bundles_dir: root.join("bundles"),
-            inbox_attachments_dir: root.join("attachments").join("inbox"),
-            outbox_attachments_dir: root.join("attachments").join("outbox"),
+            inbox_attachments_dir: root.join("attachments"),
+            outbox_attachments_dir: root.join("attachments"),
+            attachments_dir: root.join("attachments"),
             runtime_dir: root.join("runtime"),
             root_dir: root.clone(),
             user_id: None,
@@ -113,9 +116,15 @@ impl Profile {
         if !meta_path.exists() {
             bail!("profile.json not found at {}", meta_path.display());
         }
-        let meta: ProfileMetadata =
+        let mut meta: ProfileMetadata =
             serde_json::from_slice(&fs::read(&meta_path).context("read profile metadata")?)
                 .context("decode profile metadata")?;
+        // Backward compat: old profiles don't have attachments_dir; derive from root
+        if meta.attachments_dir.as_os_str().is_empty() {
+            meta.attachments_dir = root.join("attachments");
+            meta.inbox_attachments_dir = meta.attachments_dir.clone();
+            meta.outbox_attachments_dir = meta.attachments_dir.clone();
+        }
         Ok(Self { root, meta })
     }
 
@@ -227,8 +236,7 @@ impl Profile {
 
     fn ensure_layout(&self) -> Result<()> {
         fs::create_dir_all(&self.meta.bundles_dir)?;
-        fs::create_dir_all(&self.meta.inbox_attachments_dir)?;
-        fs::create_dir_all(&self.meta.outbox_attachments_dir)?;
+        fs::create_dir_all(&self.meta.attachments_dir)?;
         fs::create_dir_all(&self.meta.runtime_dir)?;
         Ok(())
     }
@@ -277,10 +285,7 @@ impl ProfileRegistry {
     }
 
     pub fn save(&self) -> Result<()> {
-        write_atomic(
-            &profile_registry_path()?,
-            &serde_json::to_vec_pretty(self)?,
-        )
+        write_atomic(&profile_registry_path()?, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn upsert(&mut self, entry: ProfileRegistryEntry) {
@@ -293,8 +298,11 @@ impl ProfileRegistry {
             return;
         }
         self.profiles.push(entry);
-        self.profiles
-            .sort_by(|left, right| left.name.cmp(&right.name).then(left.root_dir.cmp(&right.root_dir)));
+        self.profiles.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.root_dir.cmp(&right.root_dir))
+        });
     }
 
     pub fn remove(&mut self, root_dir: &Path) {
@@ -310,7 +318,10 @@ impl ProfileRegistry {
 
     pub fn set_active(&mut self, root_dir: &Path) -> Result<()> {
         if !self.profiles.iter().any(|entry| entry.root_dir == root_dir) {
-            bail!("profile {} is not registered on this device", root_dir.display());
+            bail!(
+                "profile {} is not registered on this device",
+                root_dir.display()
+            );
         }
         self.active_profile = Some(root_dir.to_path_buf());
         Ok(())
@@ -328,7 +339,9 @@ impl ProfileRegistry {
                 self.active_profile = Some(entry.root_dir.clone());
                 Ok(entry.root_dir.clone())
             }
-            _ => bail!("multiple registered profiles share the name {name}; activate by path instead"),
+            _ => bail!(
+                "multiple registered profiles share the name {name}; activate by path instead"
+            ),
         }
     }
 
@@ -340,7 +353,12 @@ impl ProfileRegistry {
         self.profiles
             .iter()
             .find(|entry| &entry.root_dir == active)
-            .ok_or_else(|| anyhow!("active profile {} is no longer registered", active.display()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "active profile {} is no longer registered",
+                    active.display()
+                )
+            })
     }
 }
 
@@ -389,7 +407,9 @@ mod tests {
 
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
     }
 
     #[test]

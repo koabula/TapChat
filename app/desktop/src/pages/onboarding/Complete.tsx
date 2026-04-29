@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { Check, Clipboard } from "lucide-react";
 
 export default function Complete() {
   const navigate = useNavigate();
@@ -74,7 +75,7 @@ export default function Complete() {
       <div className="flex flex-col items-center justify-center flex-1">
         {/* Success icon */}
         <div className="w-16 h-16 rounded-full bg-frost.1 mb-6 flex items-center justify-center animate-scale-in">
-          <span className="text-2xl text-white">✓</span>
+          <Check size={28} className="text-white" />
         </div>
 
         <h2 className="text-xl font-semibold text-primary-color mb-2 animate-fade-in-up">
@@ -93,7 +94,7 @@ export default function Complete() {
               className="btn btn-ghost px-2 transition-fast"
               onClick={handleCopyShareLink}
             >
-              {copied ? "Copied!" : "📋"}
+              {copied ? "Copied!" : <Clipboard size={18} />}
             </button>
           </div>
         )}

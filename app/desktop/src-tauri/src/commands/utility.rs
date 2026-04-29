@@ -1,10 +1,10 @@
 use std::io::Write;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use tauri::Manager;
-use tauri_plugin_shell::ShellExt;
 use tauri_plugin_notification::NotificationExt;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use tauri_plugin_shell::ShellExt;
 
 /// File metadata for attachment preview
 #[derive(Debug, Serialize)]
@@ -15,21 +15,16 @@ pub struct FileMetadata {
 
 /// Get file metadata (size and mime type from extension).
 #[tauri::command]
-pub fn get_file_metadata(
-    path: String,
-) -> Result<FileMetadata, String> {
-    let metadata = std::fs::metadata(&path)
-        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
+    let metadata =
+        std::fs::metadata(&path).map_err(|e| format!("Failed to read file metadata: {}", e))?;
 
     let size = metadata.len();
 
     // Infer mime type from extension
     let mime_type = infer_mime_type(&path);
 
-    Ok(FileMetadata {
-        size,
-        mime_type,
-    })
+    Ok(FileMetadata { size, mime_type })
 }
 
 fn infer_mime_type(path: &str) -> String {
@@ -72,39 +67,34 @@ fn infer_mime_type(path: &str) -> String {
         Some("xml") => "application/xml",
         Some("csv") => "text/csv",
         _ => "application/octet-stream",
-    }.to_string()
+    }
+    .to_string()
 }
 
 #[tauri::command]
 #[allow(deprecated)] // TODO: migrate to tauri-plugin-opener
-pub fn open_file(
-    app: tauri::AppHandle,
-    path: String,
-) -> Result<(), String> {
+pub fn open_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let shell = app.shell();
 
-    shell
-        .open(&path, None)
-        .map_err(|e| e.to_string())?;
+    shell.open(&path, None).map_err(|e| e.to_string())?;
 
     Ok(())
 }
 
 #[tauri::command]
-pub fn check_notification_permission(
-    app: tauri::AppHandle,
-) -> Result<bool, String> {
+pub fn path_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+#[tauri::command]
+pub fn check_notification_permission(app: tauri::AppHandle) -> Result<bool, String> {
     let notification = app.notification();
-    let state = notification
-        .permission_state()
-        .map_err(|e| e.to_string())?;
+    let state = notification.permission_state().map_err(|e| e.to_string())?;
     Ok(state == tauri_plugin_notification::PermissionState::Granted)
 }
 
 #[tauri::command]
-pub fn request_notification_permission(
-    app: tauri::AppHandle,
-) -> Result<bool, String> {
+pub fn request_notification_permission(app: tauri::AppHandle) -> Result<bool, String> {
     let notification = app.notification();
     let state = notification
         .request_permission()
@@ -113,11 +103,7 @@ pub fn request_notification_permission(
 }
 
 #[tauri::command]
-pub fn show_notification(
-    app: tauri::AppHandle,
-    title: String,
-    body: String,
-) -> Result<(), String> {
+pub fn show_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
     let notification = app.notification();
     notification
         .builder()
@@ -137,29 +123,25 @@ pub fn write_temp_file(
     content_base64: String,
 ) -> Result<String, String> {
     // Get temp directory
-    let temp_dir = app.path().temp_dir()
-        .map_err(|e| e.to_string())?;
+    let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
 
     // Create tapchat temp subdir
     let tapchat_temp = temp_dir.join("tapchat");
-    std::fs::create_dir_all(&tapchat_temp)
-        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&tapchat_temp).map_err(|e| e.to_string())?;
 
     // Generate unique filename
-    let unique_name = format!("{}-{}",
+    let unique_name = format!(
+        "{}-{}",
         chrono::Utc::now().format("%Y%m%d%H%M%S"),
         sanitize_filename(&file_name)
     );
     let file_path = tapchat_temp.join(&unique_name);
 
     // Decode base64 and write
-    let bytes = BASE64.decode(&content_base64)
-        .map_err(|e| e.to_string())?;
+    let bytes = BASE64.decode(&content_base64).map_err(|e| e.to_string())?;
 
-    let mut file = std::fs::File::create(&file_path)
-        .map_err(|e| e.to_string())?;
-    file.write_all(&bytes)
-        .map_err(|e| e.to_string())?;
+    let mut file = std::fs::File::create(&file_path).map_err(|e| e.to_string())?;
+    file.write_all(&bytes).map_err(|e| e.to_string())?;
 
     Ok(file_path.to_string_lossy().to_string())
 }

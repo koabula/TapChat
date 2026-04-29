@@ -2,6 +2,15 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
+import {
+  Paperclip,
+  X,
+  Image,
+  Music,
+  Clapperboard,
+  FileText,
+  File,
+} from "lucide-react";
 
 const MAX_TEXTAREA_ROWS = 5;
 const TEXTAREA_LINE_HEIGHT_PX = 24;
@@ -32,12 +41,13 @@ interface DragDropPayload {
 export default function MessageInput({ conversationId, onSent }: MessageInputProps) {
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
-  const [attachment, setAttachment] = useState<AttachmentInfo | null>(null);
+  const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
+  const [uploadingIndex, setUploadingIndex] = useState<number | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const uploadFallbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const startedSendingRef = useRef(false);
 
   // Stabilize onSent callback to avoid useEffect listener churn
   const onSentRef = useRef(onSent);
@@ -55,11 +65,10 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   // Extended onSent callback with message info for immediate display
   const onSentWithMessage = onSent as ((msg?: SendMessageResult) => void) | undefined;
 
-  // Reset attachment upload UI state (called on success, failure, or timeout)
+  // Reset upload UI state
   const resetUploadState = useCallback(() => {
     setUploadProgress(null);
-    setUploadStatus(null);
-    setAttachment(null);
+    setUploadingIndex(null);
     setSending(false);
     if (uploadFallbackTimeoutRef.current) {
       clearTimeout(uploadFallbackTimeoutRef.current);
@@ -72,12 +81,9 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     const unlisten = listen<UploadProgressEvent>("upload-progress", (event) => {
       const { conversation_id, progress, status } = event.payload;
 
-      // Only handle progress for current conversation
       if (conversation_id === conversationId) {
         setUploadProgress(progress);
-        setUploadStatus(status);
 
-        // Reset on complete or failed
         if (status === "complete" || status === "failed") {
           if (uploadFallbackTimeoutRef.current) {
             clearTimeout(uploadFallbackTimeoutRef.current);
@@ -85,10 +91,12 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
           }
           setTimeout(() => {
             setUploadProgress(null);
-            setUploadStatus(null);
             if (status === "complete") {
-              setAttachment(null);
+              // Remove the completed attachment from the list
+              setAttachments(prev => prev.filter((_, i) => i !== uploadingIndex));
+              setUploadingIndex(null);
               onSentRef.current?.();
+              // If there are more attachments, continue sending
             }
             setSending(false);
           }, 500);
@@ -100,8 +108,9 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     const unlistenDragDrop = listen<DragDropPayload>("tauri://drag-drop", (event) => {
       const paths = event.payload.paths;
       if (paths.length > 0) {
-        const filePath = paths[0];
-        handleFileFromPath(filePath);
+        for (const filePath of paths) {
+          handleFileFromPath(filePath);
+        }
       }
       setIsDragging(false);
     });
@@ -120,15 +129,26 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       unlistenDragEnter.then((fn) => fn());
       unlistenDragLeave.then((fn) => fn());
     };
-    // onSent intentionally omitted from deps — stabilized via onSentRef
-  }, [conversationId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, uploadingIndex]);
+
+  // Effect to continue sending remaining attachments after one completes
+  useEffect(() => {
+    if (startedSendingRef.current && !sending && attachments.length > 0 && uploadingIndex === null) {
+      // Previous upload completed, start the next one
+      continueSendingAttachments();
+    }
+    if (attachments.length === 0) {
+      startedSendingRef.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sending, attachments.length, uploadingIndex]);
 
   // Auto-resize textarea based on content (up to MAX_TEXTAREA_ROWS)
   const adjustTextareaHeight = useCallback(() => {
     const ta = textareaRef.current;
     if (!ta) return;
 
-    // Reset to single row to measure scroll height correctly
     ta.style.height = "auto";
     const scrollHeight = ta.scrollHeight;
     const maxHeight = MAX_TEXTAREA_ROWS * TEXTAREA_LINE_HEIGHT_PX;
@@ -146,33 +166,31 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     adjustTextareaHeight();
   }, [inputText, adjustTextareaHeight]);
 
-  // Handle file from path (from drag-drop or file picker)
+  // Handle file from path (from drag-drop, file picker, or paste)
   const handleFileFromPath = async (filePath: string) => {
     const name = filePath.split(/[/\\]/).pop() || "file";
 
-    // Get file metadata from backend (size and mime type)
     try {
       const metadata = await invoke<{ size: number; mime_type: string }>("get_file_metadata", {
         path: filePath,
       });
 
-      setAttachment({
+      setAttachments(prev => [...prev, {
         path: filePath,
         name,
         size: metadata.size,
         mimeType: metadata.mime_type,
-      });
+      }]);
     } catch (err) {
       console.error(`[MessageInput] Failed to get file metadata: ${String(err)}`);
-      // Fallback: set with unknown size and octet-stream
       const ext = name.split(".").pop()?.toLowerCase() || "";
       const mimeType = getMimeType(ext);
-      setAttachment({
+      setAttachments(prev => [...prev, {
         path: filePath,
         name,
         size: 0,
         mimeType,
-      });
+      }]);
     }
   };
 
@@ -187,7 +205,6 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         plaintext: textToSend,
       });
       setInputText("");
-      // Pass the sent message info for immediate display
       onSentWithMessage?.(result);
     } catch (err) {
       console.error(`[MessageInput] Failed to send message: ${String(err)}`);
@@ -202,14 +219,11 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     }
   };
 
-  const handleSendAttachment = async () => {
-    if (!attachment) return;
-
-    setSending(true);
+  // Send a single attachment at the given index
+  const sendOneAttachment = async (info: AttachmentInfo, index: number) => {
+    setUploadingIndex(index);
     setUploadProgress(0);
-    setUploadStatus("reading");
 
-    // Set a fallback timeout to reset state if the invoke itself hangs (network stall, etc.)
     uploadFallbackTimeoutRef.current = setTimeout(() => {
       console.warn("[MessageInput] Upload fallback timeout — resetting state");
       resetUploadState();
@@ -218,21 +232,19 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     try {
       await invoke("send_attachment", {
         conversationId,
-        filePath: attachment.path,
-        mimeType: attachment.mimeType,
-        sizeBytes: attachment.size,
-        fileName: attachment.name,
+        filePath: info.path,
+        mimeType: info.mimeType,
+        sizeBytes: info.size,
+        fileName: info.name,
       });
-      // Invoke completed: upload succeeded. The upload-progress event may have
-      // already cleaned up via its 500ms deferred reset, but if the event was
-      // dropped (e.g. listener re-registration gap), we clean up here defensively.
-      // Use a short delay so the progress event's cleanup takes precedence if it fires.
+      // Upload completed — the upload-progress event will handle cleanup
+      // But set a defensive cleanup timer
       setTimeout(() => {
-        // Only reset if still in sending state (progress event handler may have beaten us)
         if (uploadFallbackTimeoutRef.current) {
           clearTimeout(uploadFallbackTimeoutRef.current);
           uploadFallbackTimeoutRef.current = null;
           resetUploadState();
+          setAttachments(prev => prev.filter((_, i) => i !== index));
           onSentRef.current?.();
         }
       }, 600);
@@ -242,21 +254,37 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         uploadFallbackTimeoutRef.current = null;
       }
       console.error(`[MessageInput] Failed to send attachment: ${String(err)}`);
-      setUploadProgress(null);
-      setUploadStatus(null);
       setSending(false);
+      setUploadProgress(null);
+      setUploadingIndex(null);
     }
+  };
+
+  // Start sending all attachments one by one
+  const continueSendingAttachments = async () => {
+    if (attachments.length === 0) return;
+    startedSendingRef.current = true;
+    setSending(true);
+    await sendOneAttachment(attachments[0], 0);
+  };
+
+  const handleSendAttachments = async () => {
+    if (attachments.length === 0) return;
+    await continueSendingAttachments();
   };
 
   const handleAttachClick = async () => {
     try {
       const selected = await open({
-        multiple: false,
-        title: "Select file to attach",
+        multiple: true,
+        title: "Select files to attach",
       });
 
       if (selected) {
-        handleFileFromPath(selected as string);
+        const paths = Array.isArray(selected) ? selected : [selected];
+        for (const filePath of paths) {
+          await handleFileFromPath(filePath as string);
+        }
       }
     } catch (err) {
       console.error(`[MessageInput] File selection failed: ${String(err)}`);
@@ -273,7 +301,6 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    // Only set false if leaving the container entirely
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX;
     const y = e.clientY;
@@ -287,22 +314,16 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     e.stopPropagation();
     setIsDragging(false);
 
-    // In Tauri, the tauri://drag-drop event handles this
-    // But we also handle DOM drop as fallback
     const files = e.dataTransfer.files;
     if (files.length > 0) {
-      // In browser/webview context, we can't get full paths from File objects
-      // We need to read the file content instead
-      const file = files[0];
-      handleFileObject(file);
+      for (let i = 0; i < files.length; i++) {
+        handleFileObject(files[i]);
+      }
     }
   }, []);
 
-  // Handle File object (from DOM drop in web context)
+  // Handle File object (from DOM drop or paste)
   const handleFileObject = async (file: File) => {
-    // Read file as ArrayBuffer and convert to base64
-    // Then we need to write it to a temp location for Tauri to access
-    // This is a workaround for browser-based drag-drop
     try {
       const arrayBuffer = await file.arrayBuffer();
       const base64 = btoa(
@@ -312,24 +333,54 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
         )
       );
 
-      // Write to temp file via backend
       const tempPath = await invoke<string>("write_temp_file", {
         fileName: file.name,
         contentBase64: base64,
       });
 
-      handleFileFromPath(tempPath);
+      await handleFileFromPath(tempPath);
     } catch (err) {
-      console.error(`[MessageInput] Failed to handle dropped file: ${String(err)}`);
-      // Fallback: show alert to use picker
+      console.error(`[MessageInput] Failed to handle file object: ${String(err)}`);
       alert("Please use the attachment button to select files");
     }
   };
 
-  const handleRemoveAttachment = () => {
-    setAttachment(null);
-    setUploadProgress(null);
-    setUploadStatus(null);
+  // Handle paste event — support pasting files from clipboard
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    const files: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].kind === "file") {
+        const file = items[i].getAsFile();
+        if (file) files.push(file);
+      }
+    }
+
+    if (files.length > 0) {
+      e.preventDefault(); // Prevent default paste (image URLs, etc.)
+      for (const file of files) {
+        handleFileObject(file);
+      }
+    }
+    // If clipboard has only text, don't prevent default — allow normal text paste
+  }, []);
+
+  const handleRemoveAttachment = (index: number) => {
+    setAttachments(prev => prev.filter((_, i) => i !== index));
+    // If we're currently uploading this index, reset
+    if (uploadingIndex === index) {
+      resetUploadState();
+    }
+  };
+
+  const getFileIcon = (mimeType: string) => {
+    if (mimeType.startsWith("image/")) return <Image className="w-5 h-5 text-file-icon-image" />;
+    if (mimeType.startsWith("audio/")) return <Music className="w-5 h-5 text-file-icon-audio" />;
+    if (mimeType.startsWith("video/")) return <Clapperboard className="w-5 h-5 text-file-icon-video" />;
+    if (mimeType === "application/pdf") return <FileText className="w-5 h-5 text-file-icon-pdf" />;
+    return <File className="w-5 h-5 text-file-icon-text" />;
   };
 
   const getMimeType = (ext: string): string => {
@@ -350,23 +401,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     return mimeMap[ext] || "application/octet-stream";
   };
 
-  const formatFileSize = (bytes: number): string => {
-    if (bytes === 0) return "Unknown size";
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  };
-
-  const formatStatus = (status: string): string => {
-    switch (status) {
-      case "reading": return "Reading file...";
-      case "preparing": return "Preparing upload...";
-      case "uploading": return "Uploading...";
-      case "complete": return "Complete!";
-      case "failed": return "Failed";
-      default: return status;
-    }
-  };
+  const hasAttachments = attachments.length > 0;
 
   return (
     <div
@@ -381,47 +416,72 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
       {isDragging && (
         <div className="absolute inset-0 drag-overlay flex items-center justify-center z-10">
           <div className="text-center">
-            <div className="text-4xl mb-2 animate-bounce">📎</div>
-            <p className="text-primary-color font-medium">Drop file to attach</p>
+            <Paperclip size={40} className="mb-2 animate-bounce text-primary-color" />
+            <p className="text-primary-color font-medium">Drop files to attach</p>
           </div>
         </div>
       )}
 
-      {/* Attachment preview */}
-      {attachment && (
-        <div className="mb-2 p-3 bg-surface/50 rounded-lg border border-subtle flex items-center gap-3 animate-fade-in-up">
-          <div className="w-10 h-10 rounded-lg bg-surface-elevated flex items-center justify-center text-xl flex-shrink-0 shadow-sm">
-            {attachment.mimeType.startsWith("image/") ? "🖼️" :
-             attachment.mimeType.startsWith("audio/") ? "🎵" :
-             attachment.mimeType.startsWith("video/") ? "🎬" :
-             attachment.mimeType === "application/pdf" ? "📄" : "📎"}
-          </div>
-          <div className="flex-1 min-w-0">
-            <span className="text-sm text-primary-color truncate block">{attachment.name}</span>
-            <span className="text-xs text-muted-color">{formatFileSize(attachment.size)}</span>
-          </div>
-          {uploadProgress !== null && (
-            <div className="w-24 flex-shrink-0">
-              <div className="text-xs text-muted-color mb-1">{formatStatus(uploadStatus || "")}</div>
-              <div className="w-full bg-surface-elevated rounded-full h-1.5 overflow-hidden">
-                <div
-                  className={`h-1.5 transition-all duration-300 rounded-full ${
-                    uploadStatus === "failed" ? "bg-error" :
-                    uploadStatus === "complete" ? "bg-success" : "bg-primary"
-                  }`}
-                  style={{ width: `${uploadProgress}%` }}
-                />
-              </div>
+      {/* Attachments preview — horizontal scrollable list */}
+      {hasAttachments && (
+        <div className="mb-2 flex gap-2 overflow-x-auto pb-1">
+          {attachments.map((att, index) => (
+            <div
+              key={`${att.path}-${index}`}
+              className={`relative flex-shrink-0 w-20 h-20 rounded-lg border flex flex-col items-center justify-center gap-1 transition-colors ${
+                uploadingIndex === index
+                  ? "border-primary bg-primary/5"
+                  : "border-subtle bg-surface/50 hover:border-default"
+              }`}
+            >
+              {/* Upload progress overlay */}
+              {uploadingIndex === index && uploadProgress !== null && (
+                <div className="absolute inset-0 bg-black/10 rounded-lg flex flex-col items-center justify-center">
+                  <div className="w-8 h-8 relative">
+                    <svg className="w-8 h-8 -rotate-90" viewBox="0 0 36 36">
+                      <circle
+                        className="text-surface-elevated"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        fill="none"
+                        cx="18" cy="18" r="15"
+                      />
+                      <circle
+                        className="text-primary"
+                        stroke="currentColor"
+                        strokeWidth="3"
+                        fill="none"
+                        cx="18" cy="18" r="15"
+                        strokeDasharray={`${uploadProgress * 0.94} 94`}
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                    <span className="absolute inset-0 flex items-center justify-center text-[8px] font-medium text-primary-color">
+                      {uploadProgress}%
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* File icon */}
+              {getFileIcon(att.mimeType)}
+
+              {/* File name */}
+              <span className="text-[10px] text-muted-color truncate w-16 text-center leading-tight" title={att.name}>
+                {att.name.length > 12 ? att.name.slice(0, 10) + ".." : att.name}
+              </span>
+
+              {/* Remove button */}
+              <button
+                className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-surface-elevated border border-default flex items-center justify-center hover:bg-error hover:text-white hover:border-error transition-colors"
+                onClick={() => handleRemoveAttachment(index)}
+                disabled={sending}
+                title="Remove attachment"
+              >
+                <X size={10} />
+              </button>
             </div>
-          )}
-          <button
-            className="w-6 h-6 flex items-center justify-center rounded-full text-xs text-muted-color hover:text-error hover:bg-error/10 transition-colors flex-shrink-0"
-            onClick={handleRemoveAttachment}
-            disabled={sending}
-            title="Remove attachment"
-          >
-            ✕
-          </button>
+          ))}
         </div>
       )}
 
@@ -433,7 +493,7 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
           onClick={handleAttachClick}
           disabled={sending}
         >
-          📎
+          <Paperclip size={20} />
         </button>
         <textarea
           ref={textareaRef}
@@ -446,24 +506,27 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
             overflowWrap: "break-word",
           }}
           rows={1}
-          placeholder={attachment ? "Add a message (optional)..." : "Type a message..."}
+          placeholder={hasAttachments ? "Add a message (optional)..." : "Type a message..."}
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !attachment) {
+            if (e.key === "Enter" && !e.shiftKey && !hasAttachments) {
               e.preventDefault();
               handleSendText();
             }
           }}
+          onPaste={handlePaste}
           disabled={sending}
         />
-        {attachment ? (
+        {hasAttachments ? (
           <button
-            className="btn btn-primary px-3 transition-fast"
-            onClick={handleSendAttachment}
+            className="btn btn-primary px-3 transition-fast whitespace-nowrap"
+            onClick={handleSendAttachments}
             disabled={sending}
           >
-            {sending ? "Uploading..." : "Send File"}
+            {sending
+              ? `Uploading ${(uploadingIndex ?? 0) + 1}/${attachments.length}...`
+              : `Send ${attachments.length} file${attachments.length > 1 ? "s" : ""}`}
           </button>
         ) : (
           <button

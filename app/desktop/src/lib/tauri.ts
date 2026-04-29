@@ -211,3 +211,21 @@ export function onSessionStatus(
 ): Promise<() => void> {
   return listen<SessionStatus>("session-status", (e) => callback(e.payload));
 }
+
+// Attachment settings
+export interface AttachmentSettings {
+  auto_download_media: boolean;
+  always_ask_save_path: boolean;
+}
+
+export async function getAttachmentSettings(): Promise<AttachmentSettings> {
+  return invoke("get_attachment_settings");
+}
+
+export async function setAttachmentSettings(settings: AttachmentSettings): Promise<void> {
+  return invoke("set_attachment_settings", { settings });
+}
+
+export async function getAttachmentCacheDir(): Promise<string> {
+  return invoke("get_attachment_cache_dir");
+}

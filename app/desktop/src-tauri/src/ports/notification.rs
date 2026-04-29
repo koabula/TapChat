@@ -19,9 +19,17 @@ impl NotificationManager {
     }
 
     /// Emit a user notification using the Tauri notification plugin.
-    pub fn emit_user_notification(&self, notification: UserNotificationEffect) -> anyhow::Result<()> {
+    pub fn emit_user_notification(
+        &self,
+        notification: UserNotificationEffect,
+    ) -> anyhow::Result<()> {
         let title = format_status_title(&notification.status);
         let body = &notification.message;
+
+        if should_suppress_notification(body) {
+            log::warn!("Suppressed desktop notification: {} - {}", title, body);
+            return Ok(());
+        }
 
         self.show_notification(&title, body)
     }
@@ -45,7 +53,12 @@ impl NotificationManager {
     }
 
     /// Show notification with custom icon.
-    pub fn show_notification_with_icon(&self, title: &str, body: &str, icon_path: &str) -> anyhow::Result<()> {
+    pub fn show_notification_with_icon(
+        &self,
+        title: &str,
+        body: &str,
+        icon_path: &str,
+    ) -> anyhow::Result<()> {
         if let Some(app) = &self.app_handle {
             use tauri_plugin_notification::NotificationExt;
 
@@ -67,6 +80,14 @@ impl Default for NotificationManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn should_suppress_notification(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("capability_expired")
+        || normalized.contains("sharing token expired")
+        || normalized.contains("http 403")
+        || normalized.contains("attachment link expired")
 }
 
 fn format_status_title(status: &tapchat_core::ffi_api::SystemStatus) -> String {

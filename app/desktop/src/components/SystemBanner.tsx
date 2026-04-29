@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  RefreshCw,
+  AlertTriangle,
+  AlertCircle,
+  FileWarning,
+  WifiOff,
+  Clock,
+  ShieldX,
+  X,
+} from "lucide-react";
 
 import type {
   CoreUpdateEvent,
@@ -9,14 +20,14 @@ import type {
 } from "@/lib/types";
 import { useSessionStore } from "@/store/session";
 
-const statusIcons: Record<SystemBannerItem["status"], string> = {
-  sync_in_progress: "?",
-  identity_refresh_needed: "??",
-  conversation_needs_rebuild: "??",
-  attachment_upload_failed: "??",
-  temporary_network_failure: "??",
-  message_queued_for_approval: "??",
-  message_rejected_by_policy: "??",
+const statusIcons: Record<SystemBannerItem["status"], ReactNode> = {
+  sync_in_progress: <RefreshCw size={18} className="animate-spin" />,
+  identity_refresh_needed: <AlertTriangle size={18} />,
+  conversation_needs_rebuild: <AlertCircle size={18} />,
+  attachment_upload_failed: <FileWarning size={18} />,
+  temporary_network_failure: <WifiOff size={18} />,
+  message_queued_for_approval: <Clock size={18} />,
+  message_rejected_by_policy: <ShieldX size={18} />,
 };
 
 const statusColors: Record<SystemBannerItem["status"], string> = {
@@ -83,7 +94,7 @@ export default function SystemBanner() {
             className="text-sm px-2 hover:opacity-70"
             onClick={() => handleDismiss(banner)}
           >
-            ?
+            <X size={16} />
           </button>
         </div>
       ))}

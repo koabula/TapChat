@@ -21,6 +21,15 @@
     --success: #A3BE8C; /* aurora.green */
     --warning: #EBCB8B; /* aurora.yellow */
     --error: #BF616A; /* aurora.red */
+    --file-icon-image: #5E81AC; /* frost.3 */
+    --file-icon-audio: #A3BE8C; /* aurora.green */
+    --file-icon-video: #B48EAD; /* aurora.purple */
+    --file-icon-pdf: #BF616A; /* aurora.red */
+    --file-icon-document: #EBCB8B; /* aurora.yellow */
+    --file-icon-spreadsheet: #81A1C1; /* frost.2 */
+    --file-icon-presentation: #D08770; /* aurora.orange */
+    --file-icon-archive: #8FBCBB; /* frost.4 */
+    --file-icon-text: #4C566A; /* polar.3 */
   }
 
   /* Dark mode */
@@ -38,6 +47,15 @@
     --success: #A3BE8C; /* aurora.green */
     --warning: #EBCB8B; /* aurora.yellow */
     --error: #BF616A; /* aurora.red */
+    --file-icon-image: #5E81AC; /* frost.3 */
+    --file-icon-audio: #A3BE8C; /* aurora.green */
+    --file-icon-video: #B48EAD; /* aurora.purple */
+    --file-icon-pdf: #BF616A; /* aurora.red */
+    --file-icon-document: #EBCB8B; /* aurora.yellow */
+    --file-icon-spreadsheet: #81A1C1; /* frost.2 */
+    --file-icon-presentation: #D08770; /* aurora.orange */
+    --file-icon-archive: #8FBCBB; /* frost.4 */
+    --file-icon-text: #4C566A; /* polar.3 */
   }
 
   /* Smooth scrolling */
@@ -388,6 +406,35 @@
   }
   .border-subtle {
     border-color: var(--border-subtle);
+  }
+
+  /* File icon color utilities */
+  .text-file-icon-image {
+    color: var(--file-icon-image);
+  }
+  .text-file-icon-audio {
+    color: var(--file-icon-audio);
+  }
+  .text-file-icon-video {
+    color: var(--file-icon-video);
+  }
+  .text-file-icon-pdf {
+    color: var(--file-icon-pdf);
+  }
+  .text-file-icon-document {
+    color: var(--file-icon-document);
+  }
+  .text-file-icon-spreadsheet {
+    color: var(--file-icon-spreadsheet);
+  }
+  .text-file-icon-presentation {
+    color: var(--file-icon-presentation);
+  }
+  .text-file-icon-archive {
+    color: var(--file-icon-archive);
+  }
+  .text-file-icon-text {
+    color: var(--file-icon-text);
   }
 
   /* Animation utilities */
