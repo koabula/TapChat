@@ -915,9 +915,25 @@ pub fn resolve_service_root(
 }
 
 pub fn resolve_embedded_runtime_root() -> Option<PathBuf> {
-    std::env::var_os(DESKTOP_EMBEDDED_RUNTIME_ROOT_ENV)
+    // 1. Environment variable override (highest priority)
+    if let Some(path) = std::env::var_os(DESKTOP_EMBEDDED_RUNTIME_ROOT_ENV)
         .map(PathBuf::from)
-        .filter(|path| path.exists())
+        .filter(|p| p.exists())
+    {
+        return Some(path);
+    }
+
+    // 2. Relative to executable (bundled mode — works on Windows, macOS .app, and typical Linux installs)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let embedded = exe_dir.join("embedded");
+            if embedded.exists() {
+                return Some(embedded);
+            }
+        }
+    }
+
+    None
 }
 
 pub fn resolve_embedded_workspace_root() -> Option<PathBuf> {
@@ -948,26 +964,17 @@ pub fn resolve_node_command(service_root: &Path) -> String {
     }
 
     if let Some(runtime_root) = resolve_embedded_runtime_root() {
-        let relative = if cfg!(windows) {
-            PathBuf::from("node").join("node.exe")
-        } else {
-            PathBuf::from("node").join("bin").join("node")
-        };
-        let candidate = runtime_root.join(relative);
+        let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+        let candidate = runtime_root.join("node").join(node_name);
         if candidate.exists() {
             return candidate.to_string_lossy().to_string();
         }
     }
 
-    let bundled_candidate = if cfg!(windows) {
-        service_root
-            .parent()
-            .map(|root| root.join("node").join("node.exe"))
-    } else {
-        service_root
-            .parent()
-            .map(|root| root.join("node").join("bin").join("node"))
-    };
+    let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+    let bundled_candidate = service_root
+        .parent()
+        .map(|root| root.join("node").join(node_name));
     if let Some(candidate) = bundled_candidate.filter(|path| path.exists()) {
         return candidate.to_string_lossy().to_string();
     }

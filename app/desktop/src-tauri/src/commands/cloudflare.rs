@@ -51,9 +51,15 @@ pub struct LoginResult {
     pub error: Option<String>,
 }
 
-/// Resolve embedded runtime root
-fn resolve_embedded_runtime_root() -> Option<PathBuf> {
-    // Check environment variable first
+/// Resolve embedded runtime root.
+///
+/// Resolution order (first match wins):
+/// 1. `TAPCHAT_DESKTOP_RUNTIME_ROOT` environment variable
+/// 2. Tauri resource directory (platform-correct for AppImage / .deb / .rpm / .app / .exe)
+/// 3. `embedded/` next to the current executable
+/// 4. `CARGO_MANIFEST_DIR/embedded` (development mode)
+fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    // 1. Environment variable override (highest priority)
     if let Ok(root) = std::env::var("TAPCHAT_DESKTOP_RUNTIME_ROOT") {
         let path = PathBuf::from(&root);
         if path.exists() {
@@ -61,17 +67,33 @@ fn resolve_embedded_runtime_root() -> Option<PathBuf> {
         }
     }
 
-    // In bundled mode, check relative to executable
-    let exe_path = std::env::current_exe().ok()?;
-    let exe_dir = exe_path.parent()?;
-
-    // Check for embedded directory
-    let embedded = exe_dir.join("embedded");
-    if embedded.exists() {
-        return Some(embedded);
+    // 2. Tauri resource directory — the canonical path for bundled resources on every platform.
+    //    On Linux this returns e.g. /usr/lib/tapchat-desktop for .deb/.rpm, or
+    //    $APPDIR/usr/lib/tapchat-desktop for AppImage.
+    if let Some(handle) = app_handle {
+        if let Ok(resource_dir) = handle.path().resource_dir() {
+            let embedded = resource_dir.join("embedded");
+            if embedded.exists() {
+                return Some(embedded);
+            }
+            // If resources were flattened, resource_dir itself may contain wrangler/
+            if resource_dir.join("wrangler").exists() {
+                return Some(resource_dir);
+            }
+        }
     }
 
-    // Development mode: check project structure
+    // 3. Relative to executable (works for portable / non-Tauri bundles)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let embedded = exe_dir.join("embedded");
+            if embedded.exists() {
+                return Some(embedded);
+            }
+        }
+    }
+
+    // 4. Development mode: check project source tree
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dev_embedded = manifest_dir.join("embedded");
     if dev_embedded.exists() {
@@ -81,31 +103,25 @@ fn resolve_embedded_runtime_root() -> Option<PathBuf> {
     None
 }
 
-/// Resolve embedded Node.js path
-fn resolve_embedded_node() -> Option<PathBuf> {
-    let runtime_root = resolve_embedded_runtime_root()?;
-
-    // Windows
-    if cfg!(windows) {
-        let node_exe = runtime_root.join("node").join("node.exe");
-        if node_exe.exists() {
-            return Some(node_exe);
-        }
+/// Resolve embedded Node.js binary.
+///
+/// Looks for `embedded/node/node` (macOS/Linux) or `embedded/node/node.exe` (Windows).
+fn resolve_embedded_node(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    let runtime_root = resolve_embedded_runtime_root(app_handle)?;
+    let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+    let node_path = runtime_root.join("node").join(node_name);
+    if node_path.exists() {
+        return Some(node_path);
     }
-
-    // macOS/Linux
-    let node_bin = runtime_root.join("node").join("bin").join("node");
-    if node_bin.exists() {
-        return Some(node_bin);
-    }
-
-    // Fallback to system node
     None
 }
 
 /// Run embedded wrangler script (login.mjs or whoami.mjs)
-async fn run_wrangler_script(script_name: &str) -> Result<String, String> {
-    let runtime_root = resolve_embedded_runtime_root()
+async fn run_wrangler_script(
+    app_handle: Option<&AppHandle>,
+    script_name: &str,
+) -> Result<String, String> {
+    let runtime_root = resolve_embedded_runtime_root(app_handle)
         .ok_or_else(|| "Embedded runtime not found. Please reinstall TapChat.")?;
 
     let script_path = runtime_root.join("wrangler").join(script_name);
@@ -114,9 +130,9 @@ async fn run_wrangler_script(script_name: &str) -> Result<String, String> {
         return Err(format!("Script {} not found in embedded runtime", script_name));
     }
 
-    // Get Node.js path
-    let node_path = resolve_embedded_node()
-        .unwrap_or_else(|| PathBuf::from("node")); // Fallback to system node
+    // Get Node.js path — prefer embedded, fall back to system "node"
+    let node_path = resolve_embedded_node(app_handle)
+        .unwrap_or_else(|| PathBuf::from("node"));
 
     // Run script
     let output = tokio::process::Command::new(&node_path)
@@ -153,12 +169,14 @@ fn parse_wrangler_output<T: serde::de::DeserializeOwned>(output: &str) -> Result
 
 /// Check preflight status
 #[tauri::command]
-pub async fn cloudflare_preflight() -> Result<PreflightResult, String> {
+pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, String> {
+    let app_ref = Some(&app);
+
     // Check if embedded runtime is available
-    let embedded_available = resolve_embedded_runtime_root().is_some();
+    let embedded_available = resolve_embedded_runtime_root(app_ref).is_some();
 
     // Run whoami to check authentication
-    let whoami_result = run_wrangler_script("whoami.mjs").await;
+    let whoami_result = run_wrangler_script(app_ref, "whoami.mjs").await;
 
     // Determine token_stored before matching
     let token_stored = whoami_result.is_ok();
@@ -207,6 +225,8 @@ pub async fn cloudflare_preflight() -> Result<PreflightResult, String> {
 /// Perform OAuth login
 #[tauri::command]
 pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
+    let app_ref = Some(&app);
+
     // Emit progress
     let _ = app.emit("cloudflare-progress", DeployProgress {
         phase: DeployPhase::Preflight,
@@ -215,7 +235,7 @@ pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
     });
 
     // Run login script
-    let login_output = run_wrangler_script("login.mjs").await?;
+    let login_output = run_wrangler_script(app_ref, "login.mjs").await?;
 
     // Parse result
     let login_result: OAuthTokens = parse_wrangler_output(&login_output)?;
@@ -288,7 +308,7 @@ pub async fn cloudflare_deploy(
         progress_percent: 5,
     });
 
-    let whoami_output = run_wrangler_script("whoami.mjs").await?;
+    let whoami_output = run_wrangler_script(Some(&app), "whoami.mjs").await?;
     let whoami: WhoamiResult = parse_wrangler_output(&whoami_output)?;
 
     if !whoami.authenticated {
@@ -312,7 +332,7 @@ pub async fn cloudflare_deploy(
     let api_token = load_oauth_token()?;
 
     // Load embedded Worker script
-    let runtime_root = resolve_embedded_runtime_root()
+    let runtime_root = resolve_embedded_runtime_root(Some(&app))
         .ok_or_else(|| "Embedded runtime not found".to_string())?;
 
     let worker_script = cloudflare_rest::load_embedded_worker_script(&runtime_root)?;
@@ -400,7 +420,7 @@ pub async fn cloudflare_deploy(
     // Save runtime metadata
     {
         let inner = state.inner.read().await;
-        let service_root = resolve_embedded_runtime_root();
+        let service_root = resolve_embedded_runtime_root(Some(&app));
 
         let runtime = RuntimeMetadata {
             pid: None,
