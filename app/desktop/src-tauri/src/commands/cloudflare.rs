@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use tapchat_core::cli::profile::RuntimeMetadata;
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
