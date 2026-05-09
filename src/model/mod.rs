@@ -151,7 +151,11 @@ pub struct InboxAppendCapability {
     pub target_device_id: String,
     pub endpoint: String,
     pub operations: Vec<CapabilityOperation>,
-    #[serde(default, alias = "conversation_scope", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        alias = "conversation_scope",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub conversation_scope: Vec<String>,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
@@ -305,7 +309,11 @@ pub struct StorageProfile {
     pub base_url: Option<String>,
     // Optional profile object reference for storage metadata. This is not an identity bundle
     // reference and must not be used as a fallback for shared-state discovery.
-    #[serde(default, alias = "profile_ref", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "profile_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub profile_ref: Option<String>,
 }
 
@@ -326,17 +334,37 @@ pub struct IdentityBundle {
     #[serde(alias = "user_public_key")]
     pub user_public_key: String,
     pub devices: Vec<DeviceContactProfile>,
-    #[serde(default, alias = "bundle_share_id", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "bundle_share_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bundle_share_id: Option<String>,
     // Canonical shared-state reference for this identity bundle. Contact refresh must only
     // use this explicit reference and must not infer object locations from storage hints.
-    #[serde(default, alias = "identity_bundle_ref", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "identity_bundle_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub identity_bundle_ref: Option<String>,
-    #[serde(default, alias = "device_status_ref", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "device_status_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub device_status_ref: Option<String>,
-    #[serde(default, alias = "storage_profile", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "storage_profile",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub storage_profile: Option<StorageProfile>,
-    #[serde(default, alias = "display_name", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "display_name",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub display_name: Option<String>,
     #[serde(alias = "updated_at")]
     pub updated_at: u64,
@@ -843,6 +871,115 @@ impl Validate for WelcomePickupDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInviteTokenPayload {
+    pub version: String,
+    pub service: String,
+    pub group_id: String,
+    pub invite_id: String,
+    pub inviter_user_id: String,
+    pub inviter_device_id: String,
+    pub join_policy: GroupJoinPolicy,
+    pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u64>,
+}
+
+impl Validate for GroupInviteTokenPayload {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        if self.service != "group_invite" {
+            return Err(CoreError::invalid_input(
+                "invite token service must be group_invite",
+            ));
+        }
+        validate_required("group_id", &self.group_id)?;
+        validate_required("invite_id", &self.invite_id)?;
+        validate_required("inviter_user_id", &self.inviter_user_id)?;
+        validate_required("inviter_device_id", &self.inviter_device_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInviteDocument {
+    pub version: String,
+    pub group_id: String,
+    pub title: String,
+    pub invite_id: String,
+    pub join_policy: GroupJoinPolicy,
+    pub inviter_user_id: String,
+    pub inviter_device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_contact_share_url: Option<String>,
+    pub owner_user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_contact_share_url: Option<String>,
+    pub join_request_endpoint: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u64>,
+    pub signature: String,
+}
+
+impl Validate for GroupInviteDocument {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("group_id", &self.group_id)?;
+        validate_required("title", &self.title)?;
+        validate_required("invite_id", &self.invite_id)?;
+        validate_required("inviter_user_id", &self.inviter_user_id)?;
+        validate_required("inviter_device_id", &self.inviter_device_id)?;
+        validate_required("owner_user_id", &self.owner_user_id)?;
+        validate_required("join_request_endpoint", &self.join_request_endpoint)?;
+        validate_required("signature", &self.signature)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupJoinRequestStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupJoinRequest {
+    pub version: String,
+    pub request_id: String,
+    pub group_id: String,
+    pub invite_id: String,
+    pub joiner_user_id: String,
+    pub joiner_device_id: String,
+    pub joiner_contact_share_url: String,
+    pub requested_at: u64,
+    pub request_capability: String,
+    pub signature: String,
+    pub status: GroupJoinRequestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
+}
+
+impl Validate for GroupJoinRequest {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("request_id", &self.request_id)?;
+        validate_required("group_id", &self.group_id)?;
+        validate_required("invite_id", &self.invite_id)?;
+        validate_required("joiner_user_id", &self.joiner_user_id)?;
+        validate_required("joiner_device_id", &self.joiner_device_id)?;
+        validate_required("joiner_contact_share_url", &self.joiner_contact_share_url)?;
+        validate_required("request_capability", &self.request_capability)?;
+        validate_required("signature", &self.signature)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ack {
     pub device_id: String,
     pub ack_seq: u64,
@@ -1092,36 +1229,44 @@ pub fn validate_display_name(name: &str) -> CoreResult<()> {
     // Length check
     if name.len() > 64 {
         return Err(CoreError::invalid_input(
-            "display_name must not exceed 64 characters"
+            "display_name must not exceed 64 characters",
         ));
     }
 
     // No control characters
     if name.chars().any(|c| c.is_control()) {
         return Err(CoreError::invalid_input(
-            "display_name must not contain control characters"
+            "display_name must not contain control characters",
         ));
     }
 
     // No HTML/script injection patterns
     let lower = name.to_lowercase();
-    if lower.contains("<") || lower.contains(">") || lower.contains("&")
-        || lower.contains("javascript:") || lower.contains("data:")
-        || lower.contains("vbscript:") || lower.contains("onload")
-        || lower.contains("onclick") || lower.contains("onerror")
+    if lower.contains("<")
+        || lower.contains(">")
+        || lower.contains("&")
+        || lower.contains("javascript:")
+        || lower.contains("data:")
+        || lower.contains("vbscript:")
+        || lower.contains("onload")
+        || lower.contains("onclick")
+        || lower.contains("onerror")
     {
         return Err(CoreError::invalid_input(
-            "display_name contains potentially dangerous content"
+            "display_name contains potentially dangerous content",
         ));
     }
 
     // No URL schemes (phishing prevention)
-    if lower.contains("http://") || lower.contains("https://")
-        || lower.contains("ftp://") || lower.contains("mailto:")
-        || lower.contains("tel:") || lower.contains("file://")
+    if lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("ftp://")
+        || lower.contains("mailto:")
+        || lower.contains("tel:")
+        || lower.contains("file://")
     {
         return Err(CoreError::invalid_input(
-            "display_name must not contain URL schemes"
+            "display_name must not contain URL schemes",
         ));
     }
 
@@ -1351,9 +1496,7 @@ mod tests {
     fn group_validation_rejects_empty_required_fields() {
         let mut manifest = sample_group_manifest();
         manifest.group_id.clear();
-        let error = manifest
-            .validate()
-            .expect_err("empty group_id should fail");
+        let error = manifest.validate().expect_err("empty group_id should fail");
         assert_eq!(error.code(), "invalid_input");
 
         let mut manifest = sample_group_manifest();

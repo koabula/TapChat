@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::attachment_crypto::{
-        AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
+        ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata, AttachmentPayloadMetadata,
     };
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
     use crate::ffi_api::{
@@ -11,12 +11,12 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        ConversationKind, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth, Envelope,
-        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
-        WakeHint, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, ConversationKind, DeliveryClass, DeploymentBundle,
+        DeviceRuntimeAuth, Envelope, IdentityBundle, InboxRecord, InboxRecordState, MessageType,
+        SenderProof, StorageBaseInfo, WakeHint,
     };
     use crate::persistence::{CorePersistenceSnapshot, PersistOp};
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
@@ -48,10 +48,6 @@ mod tests {
                 group_id: "group:project".into(),
                 invitee_user_ids: vec!["user:eve".into()],
             },
-            CoreCommand::ApproveGroupJoin {
-                group_id: "group:project".into(),
-                request_id: "request:1".into(),
-            },
             CoreCommand::LeaveGroup {
                 group_id: "group:project".into(),
             },
@@ -75,10 +71,6 @@ mod tests {
             CoreCommand::InviteToGroup {
                 group_id: "group:project".into(),
                 invitee_user_ids: vec!["user:eve".into()],
-            },
-            CoreCommand::ApproveGroupJoin {
-                group_id: "group:project".into(),
-                request_id: "request:1".into(),
             },
             CoreCommand::LeaveGroup {
                 group_id: "group:project".into(),
@@ -525,10 +517,12 @@ mod tests {
             .expect("fetch response");
 
         assert!(output.state_update.conversations_changed);
-        assert!(engine
-            .state
-            .conversations
-            .contains_key(&expected_conversation_id));
+        assert!(
+            engine
+                .state
+                .conversations
+                .contains_key(&expected_conversation_id)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -746,10 +740,12 @@ mod tests {
         });
 
         let persist = persist.expect("persist effect");
-        assert!(persist
-            .ops
-            .iter()
-            .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. })));
+        assert!(
+            persist
+                .ops
+                .iter()
+                .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. }))
+        );
         assert!(persist.snapshot.is_some());
     }
 
@@ -791,10 +787,12 @@ mod tests {
         let snapshot = extract_snapshot(&output);
 
         assert!(!snapshot.mls_state_persistence_blocked);
-        assert!(snapshot
-            .mls_states
-            .iter()
-            .all(|state| state.serialized_group_state.is_some()));
+        assert!(
+            snapshot
+                .mls_states
+                .iter()
+                .all(|state| state.serialized_group_state.is_some())
+        );
     }
 
     #[test]
@@ -851,15 +849,19 @@ mod tests {
             })
             .expect("message request response");
 
-        assert!(!alice
-            .state
-            .pending_outbox
-            .iter()
-            .any(|item| item.envelope.message_id == pending_message_id));
-        assert!(output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval));
+        assert!(
+            !alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| item.envelope.message_id == pending_message_id)
+        );
+        assert!(
+            output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -911,15 +913,19 @@ mod tests {
             })
             .expect("rejected response");
 
-        assert!(!alice
-            .state
-            .pending_outbox
-            .iter()
-            .any(|item| item.envelope.message_id == pending_message_id));
-        assert!(output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy));
+        assert!(
+            !alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| item.envelope.message_id == pending_message_id)
+        );
+        assert!(
+            output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -1094,10 +1100,12 @@ mod tests {
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
 
-        assert!(resumed
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. })));
+        assert!(
+            resumed
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. }))
+        );
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -1410,10 +1418,12 @@ mod tests {
                     if timer.timer_id == format!("refresh_identity:{}", bob_bundle.user_id)
                 )));
             } else {
-                assert!(output
-                    .state_update
-                    .system_statuses_changed
-                    .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
+                assert!(
+                    output
+                        .state_update
+                        .system_statuses_changed
+                        .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild)
+                );
             }
         }
 
@@ -1734,10 +1744,12 @@ mod tests {
                     })
                     .expect("retry timer");
             } else {
-                assert!(!output
-                    .effects
-                    .iter()
-                    .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
+                assert!(
+                    !output
+                        .effects
+                        .iter()
+                        .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. }))
+                );
             }
         }
 
@@ -1995,11 +2007,13 @@ mod tests {
             .get(&merged.user_id)
             .expect("updated contact");
         assert_eq!(updated.bundle.devices.len(), 2);
-        assert!(updated
-            .bundle
-            .devices
-            .iter()
-            .any(|device| device.device_id == bob_laptop_profile.device_id));
+        assert!(
+            updated
+                .bundle
+                .devices
+                .iter()
+                .any(|device| device.device_id == bob_laptop_profile.device_id)
+        );
     }
 
     #[test]
@@ -2115,12 +2129,16 @@ mod tests {
             })
             .collect();
         assert!(!remove_commits.is_empty());
-        assert!(remove_commits
-            .iter()
-            .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
-        assert!(remove_commits
-            .iter()
-            .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id));
+        assert!(
+            remove_commits
+                .iter()
+                .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id)
+        );
+        assert!(
+            remove_commits
+                .iter()
+                .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id)
+        );
     }
 
     #[test]
@@ -2245,18 +2263,22 @@ mod tests {
                     .iter()
                     .any(|message| message.message_type == MessageType::MlsWelcome)
         }));
-        assert!(restored.state.pending_outbox[pending_before..]
-            .iter()
-            .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            }));
-        assert!(restored.state.pending_outbox[pending_before..]
-            .iter()
-            .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsWelcome
-            }));
+        assert!(
+            restored.state.pending_outbox[pending_before..]
+                .iter()
+                .any(|item| {
+                    item.envelope.conversation_id == conversation_id
+                        && item.envelope.message_type == MessageType::MlsCommit
+                })
+        );
+        assert!(
+            restored.state.pending_outbox[pending_before..]
+                .iter()
+                .any(|item| {
+                    item.envelope.conversation_id == conversation_id
+                        && item.envelope.message_type == MessageType::MlsWelcome
+                })
+        );
         assert_eq!(
             restored
                 .state
@@ -2301,14 +2323,18 @@ mod tests {
             .expect("reimport deployment");
 
         assert_eq!(publish_shared_state_effects(&output).len(), 2);
-        assert!(publish_shared_state_effects(&output)
-            .iter()
-            .any(|publish| publish.document_kind
-                == crate::transport_contract::SharedStateDocumentKind::IdentityBundle));
-        assert!(publish_shared_state_effects(&output)
-            .iter()
-            .any(|publish| publish.document_kind
-                == crate::transport_contract::SharedStateDocumentKind::DeviceStatus));
+        assert!(
+            publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind
+                    == crate::transport_contract::SharedStateDocumentKind::IdentityBundle)
+        );
+        assert!(
+            publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind
+                    == crate::transport_contract::SharedStateDocumentKind::DeviceStatus)
+        );
     }
 
     #[test]

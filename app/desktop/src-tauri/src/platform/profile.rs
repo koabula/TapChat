@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use tapchat_core::cli::profile::{Profile, ProfileRegistry, ProfileMetadata, RuntimeMetadata};
+use tapchat_core::cli::profile::{Profile, ProfileMetadata, ProfileRegistry, RuntimeMetadata};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 
 /// Desktop profile manager - wraps CLI ProfileRegistry and provides
@@ -74,7 +74,12 @@ impl ProfileManager {
             log::warn!(
                 "Profile '{}' not found in registry. Available profiles: {}",
                 name,
-                registry.profiles.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
+                registry
+                    .profiles
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
 
@@ -225,7 +230,12 @@ impl ProfileManager {
         }
 
         // Check if profile exists in registry
-        if !inner.registry.profiles.iter().any(|entry| entry.root_dir == *path) {
+        if !inner
+            .registry
+            .profiles
+            .iter()
+            .any(|entry| entry.root_dir == *path)
+        {
             return Err(anyhow!("Profile not found in registry"));
         }
 
@@ -304,9 +314,7 @@ impl ProfileManager {
 
     /// Get the base URL for API calls from runtime metadata.
     pub async fn get_base_url(&self) -> Option<String> {
-        self.get_runtime_metadata()
-            .await
-            .and_then(|r| r.base_url)
+        self.get_runtime_metadata().await.and_then(|r| r.base_url)
     }
 
     /// Get WebSocket URL from runtime metadata.

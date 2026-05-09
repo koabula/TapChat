@@ -13,11 +13,11 @@ use tapchat_core::ffi_api::{
 use tapchat_core::model::{
     DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus,
 };
+use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::{
     BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
     TransportPort, execute_platform_effect,
 };
-use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
     FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
@@ -616,13 +616,19 @@ impl CoreDriver {
                 let normalized = to_snake_case_json_string(&body)?;
                 let value: serde_json::Value = serde_json::from_str(&normalized)?;
                 let requests = serde_json::from_value(
-                    value.get("requests").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    value
+                        .get("requests")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
                 )?;
                 Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
             }
             Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
                 retryable: false,
-                detail: Some(format!("list message requests failed with status {}", response.status())),
+                detail: Some(format!(
+                    "list message requests failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
                 retryable: true,
@@ -718,7 +724,10 @@ impl CoreDriver {
             }
             Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
                 retryable: false,
-                detail: Some(format!("get allowlist failed with status {}", response.status())),
+                detail: Some(format!(
+                    "get allowlist failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
                 retryable: true,
@@ -752,7 +761,10 @@ impl CoreDriver {
             }
             Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
                 retryable: false,
-                detail: Some(format!("put allowlist failed with status {}", response.status())),
+                detail: Some(format!(
+                    "put allowlist failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
                 retryable: true,
@@ -775,10 +787,12 @@ impl CoreDriver {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::SharedStatePublished {
-                document_kind: publish.document_kind,
-                reference: publish.reference,
-            }]),
+            Ok(response) if response.status().is_success() => {
+                Ok(vec![CoreEvent::SharedStatePublished {
+                    document_kind: publish.document_kind,
+                    reference: publish.reference,
+                }])
+            }
             Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
                 document_kind: publish.document_kind,
                 reference: publish.reference,
@@ -962,10 +976,7 @@ impl TransportPort for CoreDriver {
         CoreDriver::act_on_message_request(self, action).await
     }
 
-    async fn fetch_allowlist(
-        &mut self,
-        fetch: FetchAllowlistRequest,
-    ) -> Result<Vec<CoreEvent>> {
+    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
         CoreDriver::fetch_allowlist(self, fetch).await
     }
 
@@ -1113,11 +1124,15 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
     left.effects.extend(right.effects);
     match (&mut left.view_model, right.view_model) {
         (Some(left_view), Some(mut right_view)) => {
-            left_view.conversations.append(&mut right_view.conversations);
+            left_view
+                .conversations
+                .append(&mut right_view.conversations);
             left_view.messages.append(&mut right_view.messages);
             left_view.contacts.append(&mut right_view.contacts);
             left_view.banners.append(&mut right_view.banners);
-            left_view.message_requests.append(&mut right_view.message_requests);
+            left_view
+                .message_requests
+                .append(&mut right_view.message_requests);
             if right_view.allowlist.is_some() {
                 left_view.allowlist = right_view.allowlist.take();
             }

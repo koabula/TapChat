@@ -28,7 +28,12 @@ pub async fn send_text(
 ) -> Result<SendMessageResult, String> {
     let send_start = std::time::Instant::now();
     let abs_start = crate::ts_ms();
-    timetest!("send_begin conversation_id={} len={} ts={}", conversation_id, plaintext.len(), abs_start);
+    timetest!(
+        "send_begin conversation_id={} len={} ts={}",
+        conversation_id,
+        plaintext.len(),
+        abs_start
+    );
 
     let output = drive_core_with_handle(
         &app,
@@ -57,7 +62,12 @@ pub async fn send_text(
         .unwrap_or_default();
 
     let elapsed_ms = send_start.elapsed().as_millis();
-    timetest!("send_done msg_id={} elapsed_ms={} ts={}", message_id, elapsed_ms, abs_start + elapsed_ms as u128);
+    timetest!(
+        "send_done msg_id={} elapsed_ms={} ts={}",
+        message_id,
+        elapsed_ms,
+        abs_start + elapsed_ms as u128
+    );
 
     Ok(SendMessageResult {
         message_id,
@@ -193,16 +203,14 @@ pub async fn get_attachment_preview(
 ) -> Result<Option<String>, String> {
     let file_path = ensure_attachment_cached(&app, conversation_id, message_id, reference).await?;
 
-    let thumbnail = generate_thumbnail(&file_path)
-        .await
-        .map_err(|e| {
-            log::warn!(
-                "get_attachment_preview: thumbnail generation failed for {}: {}",
-                file_path.display(),
-                e
-            );
-            format!("Failed to generate thumbnail: {}", e)
-        })?;
+    let thumbnail = generate_thumbnail(&file_path).await.map_err(|e| {
+        log::warn!(
+            "get_attachment_preview: thumbnail generation failed for {}: {}",
+            file_path.display(),
+            e
+        );
+        format!("Failed to generate thumbnail: {}", e)
+    })?;
     if thumbnail.is_some() {
         log::debug!(
             "get_attachment_preview: thumbnail generated for {}",
@@ -518,10 +526,8 @@ mod tests {
             encryption: encrypted.metadata,
         };
         let downloaded_blob_b64 = BASE64.encode(encrypted.ciphertext);
-        let temp_dir = std::env::temp_dir().join(format!(
-            "tapchat-cache-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("tapchat-cache-test-{}", uuid::Uuid::new_v4()));
         let file_path = temp_dir.join("attachment-cache").join("cached");
 
         let materialized = materialize_cached_attachment_from_snapshot(

@@ -27,6 +27,10 @@ class DurableObjectStorageAdapter implements DurableObjectStorageLike {
     await this.storage.delete(key);
   }
 
+  async list<T>(options?: { prefix?: string }): Promise<Map<string, T>> {
+    return this.storage.list<T>(options);
+  }
+
   async setAlarm(epochMillis: number): Promise<void> {
     await this.storage.setAlarm(epochMillis);
   }

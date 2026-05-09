@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
+use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
@@ -14,34 +14,36 @@ use crate::mls_adapter::{
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCapabilityOperation,
-    GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest,
-    GroupMember, GroupMemberInvitePolicy, GroupMemberStatus, GroupMessageType,
-    GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle,
-    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
-    WelcomePickupDescriptor,
+    GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy,
+    GroupJoinRequest, GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberInvitePolicy,
+    GroupMemberStatus, GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord,
+    GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord, MessageType, MlsStateStatus,
+    MlsStateSummary, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
-    PersistedDeployment, PersistedGroupCursor, PersistedGroupState, PersistedLocalIdentity,
-    PersistedMlsState, PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope,
-    PersistedPendingAck, PersistedPendingBlobTransfer, PersistedRealtimeSession,
-    PersistedRecoveryContext, PersistedRecoveryEscalationReason, PersistedRecoveryPhase,
-    PersistedRecoveryReason, PersistedSyncState,
+    PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
+    PersistedGroupState, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
+    PersistedRealtimeSession, PersistedRecoveryContext, PersistedRecoveryEscalationReason,
+    PersistedRecoveryPhase, PersistedRecoveryReason, PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
     AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
     AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    BlobDownloadRequest, BlobUploadRequest, DeviceStatusDocument, DeviceStatusRecord,
-    FetchAllowlistRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
-    FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult, GetHeadResult,
-    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
-    MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, SharedStateDocumentKind,
+    BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest,
+    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult,
+    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetHeadResult, GroupJoinDecision,
+    ListGroupJoinRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
+    MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
+    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::Signer;
 use log;
 use sha2::{Digest, Sha256};
@@ -267,6 +269,21 @@ impl CoreEngine {
                 })
             })
             .collect::<Vec<_>>();
+        let group_invites = snapshot
+            .group_invites
+            .into_iter()
+            .map(|invite| (invite.invite_id.clone(), invite))
+            .collect::<BTreeMap<_, _>>();
+        let group_join_requests = snapshot
+            .group_join_requests
+            .into_iter()
+            .map(|request| (request.request_id.clone(), request))
+            .collect::<BTreeMap<_, _>>();
+        let pending_group_join_approvals = snapshot
+            .pending_group_join_approvals
+            .into_iter()
+            .map(|approval| (approval.request_id.clone(), approval))
+            .collect::<BTreeMap<_, _>>();
 
         let pending_acks = snapshot
             .pending_acks
@@ -443,6 +460,9 @@ impl CoreEngine {
                 group_states,
                 group_cursors,
                 pending_group_outbox,
+                group_invites,
+                group_join_requests,
+                pending_group_join_approvals,
                 pending_acks,
                 pending_blob_uploads,
                 pending_blob_downloads,
@@ -534,8 +554,32 @@ impl CoreEngine {
                 conversation_id,
                 plaintext,
             } => self.send_group_text_message(conversation_id, plaintext),
+            CoreCommand::CreateGroupInviteLink {
+                group_id,
+                expires_at,
+                max_uses,
+            } => self.create_group_invite_link(group_id, expires_at, max_uses),
+            CoreCommand::RevokeGroupInviteLink {
+                group_id,
+                invite_id,
+            } => self.revoke_group_invite_link(group_id, invite_id),
+            CoreCommand::FetchGroupInvite { invite_url } => self.fetch_group_invite(invite_url),
+            CoreCommand::SubmitGroupJoinRequest { invite_url } => {
+                self.submit_group_join_request(invite_url)
+            }
+            CoreCommand::ListGroupJoinRequests { group_id } => {
+                self.list_group_join_requests(group_id)
+            }
+            CoreCommand::ApproveGroupJoin {
+                group_id,
+                request_id,
+            } => self.approve_group_join(group_id, request_id),
+            CoreCommand::RejectGroupJoin {
+                group_id,
+                request_id,
+                reason,
+            } => self.reject_group_join(group_id, request_id, reason),
             CoreCommand::InviteToGroup { .. }
-            | CoreCommand::ApproveGroupJoin { .. }
             | CoreCommand::LeaveGroup { .. }
             | CoreCommand::RemoveGroupMember { .. } => Err(CoreError::unsupported(
                 "group membership workflow is not implemented",
@@ -834,6 +878,281 @@ impl CoreEngine {
                     },
                 }],
                 view_model: None,
+            }),
+            CoreEvent::GroupInviteCreated { invite_url, invite } => {
+                self.state.group_invites.insert(
+                    invite.invite_id.clone(),
+                    PersistedGroupInvite {
+                        group_id: invite.group_id.clone(),
+                        invite_id: invite.invite_id.clone(),
+                        invite_url: invite_url.clone(),
+                        document: invite.clone(),
+                    },
+                );
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveGroupInvite {
+                            invite_id: invite.invite_id.clone(),
+                        }],
+                    )],
+                    view_model: Some(CoreViewModel {
+                        group_invites: self.state.group_invites.values().cloned().collect(),
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupInviteFetched { invite_url, invite } => {
+                let local = self
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+                    .clone();
+                let joiner_user_id = local.user_identity.user_id.clone();
+                let joiner_device_id = local.device_identity.device_id.clone();
+                let contact_share = self
+                    .state
+                    .local_bundle
+                    .as_ref()
+                    .and_then(|bundle| bundle.identity_bundle_ref.clone())
+                    .ok_or_else(|| {
+                        CoreError::invalid_state(
+                            "local contact-share URL is required for group join",
+                        )
+                    })?;
+                let nonce = self.next_message_nonce();
+                let request_id = self.stable_scoped_id("group-join", &invite.invite_id, nonce);
+                let requested_at = current_unix_millis(self.state.message_nonce);
+                let request_capability = local.sign_sender_proof(
+                    format!(
+                        "group_join_request_capability:{}:{request_id}",
+                        invite.group_id
+                    )
+                    .as_bytes(),
+                );
+                let request = GroupJoinRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    request_id: request_id.clone(),
+                    group_id: invite.group_id.clone(),
+                    invite_id: invite.invite_id.clone(),
+                    joiner_user_id,
+                    joiner_device_id,
+                    joiner_contact_share_url: contact_share,
+                    requested_at,
+                    request_capability,
+                    signature: local.sign_sender_proof(
+                        format!("group_join_request:{}:{request_id}", invite.group_id).as_bytes(),
+                    ),
+                    status: GroupJoinRequestStatus::Pending,
+                    auto_approve: None,
+                };
+                request.validate()?;
+                self.state.group_join_requests.insert(
+                    request_id.clone(),
+                    PersistedGroupJoinRequest {
+                        group_id: invite.group_id.clone(),
+                        request_id: request_id.clone(),
+                        request: request.clone(),
+                        welcome_pickup: None,
+                        manifest: None,
+                        start_cursor: None,
+                    },
+                );
+                let invite_token = invite_url
+                    .rsplit('/')
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| CoreError::invalid_input("invite URL does not contain token"))?
+                    .to_string();
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![
+                        persist_effect(
+                            &self.state,
+                            vec![PersistOp::SaveGroupJoinRequest {
+                                request_id: request_id.clone(),
+                            }],
+                        ),
+                        CoreEffect::SubmitGroupJoinRequest {
+                            submit: SubmitGroupJoinRequest {
+                                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                                invite_token,
+                                request: request.clone(),
+                                headers: BTreeMap::new(),
+                            },
+                        },
+                    ],
+                    view_model: Some(CoreViewModel {
+                        group_join_requests: vec![request],
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupJoinRequestSubmitted { request } => {
+                self.state.group_join_requests.insert(
+                    request.request_id.clone(),
+                    PersistedGroupJoinRequest {
+                        group_id: request.group_id.clone(),
+                        request_id: request.request_id.clone(),
+                        request: request.clone(),
+                        welcome_pickup: None,
+                        manifest: None,
+                        start_cursor: None,
+                    },
+                );
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveGroupJoinRequest {
+                            request_id: request.request_id.clone(),
+                        }],
+                    )],
+                    view_model: Some(CoreViewModel {
+                        group_join_requests: vec![request],
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupJoinRequestsListed { group_id, requests } => {
+                let mut effects = Vec::new();
+                for request in &requests {
+                    self.state.group_join_requests.insert(
+                        request.request_id.clone(),
+                        PersistedGroupJoinRequest {
+                            group_id: request.group_id.clone(),
+                            request_id: request.request_id.clone(),
+                            request: request.clone(),
+                            welcome_pickup: None,
+                            manifest: None,
+                            start_cursor: None,
+                        },
+                    );
+                    effects.push(CoreEffect::FetchIdentityBundle {
+                        fetch: FetchIdentityBundleRequest {
+                            user_id: request.joiner_user_id.clone(),
+                            reference: Some(request.joiner_contact_share_url.clone()),
+                        },
+                    });
+                }
+                effects.push(persist_effect(
+                    &self.state,
+                    requests
+                        .iter()
+                        .map(|request| PersistOp::SaveGroupJoinRequest {
+                            request_id: request.request_id.clone(),
+                        })
+                        .collect(),
+                ));
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects,
+                    view_model: Some(CoreViewModel {
+                        group_join_requests: self
+                            .state
+                            .group_join_requests
+                            .values()
+                            .filter(|request| request.group_id == group_id)
+                            .map(|request| request.request.clone())
+                            .collect(),
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupJoinRequestStatusFetched {
+                request,
+                welcome_pickup,
+                manifest,
+                start_cursor,
+            } => {
+                self.state.group_join_requests.insert(
+                    request.request_id.clone(),
+                    PersistedGroupJoinRequest {
+                        group_id: request.group_id.clone(),
+                        request_id: request.request_id.clone(),
+                        request: request.clone(),
+                        welcome_pickup: welcome_pickup.clone(),
+                        manifest,
+                        start_cursor,
+                    },
+                );
+                let mut effects = vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveGroupJoinRequest {
+                        request_id: request.request_id.clone(),
+                    }],
+                )];
+                if let Some(descriptor) = welcome_pickup {
+                    effects.push(CoreEffect::FetchWelcomePickup {
+                        fetch: FetchWelcomePickupRequest {
+                            descriptor,
+                            headers: BTreeMap::new(),
+                        },
+                    });
+                }
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects,
+                    view_model: Some(CoreViewModel {
+                        group_join_requests: vec![request],
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupInviteCreateFailed { detail, .. }
+            | CoreEvent::GroupInviteFetchFailed { detail, .. }
+            | CoreEvent::GroupJoinRequestSubmitFailed { detail, .. }
+            | CoreEvent::GroupJoinDecisionFailed { detail, .. } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail
+                            .unwrap_or_else(|| "group invite/join request failed".into()),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::GroupInviteRevoked {
+                group_id: _,
+                invite_id,
+            } => {
+                self.state.group_invites.remove(&invite_id);
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::DeleteGroupInvite { invite_id }],
+                    )],
+                    view_model: None,
+                })
+            }
+            CoreEvent::GroupJoinDecisionApplied { request } => Ok(CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::SyncInProgress,
+                        message: format!("group join request {} decided", request.request_id),
+                    },
+                }],
+                view_model: Some(CoreViewModel {
+                    group_join_requests: vec![request],
+                    ..CoreViewModel::default()
+                }),
             }),
         }
     }
@@ -1724,6 +2043,386 @@ impl CoreEngine {
             effects: vec![CoreEffect::FetchWelcomePickup {
                 fetch: FetchWelcomePickupRequest {
                     descriptor,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn create_group_invite_link(
+        &mut self,
+        group_id: String,
+        expires_at: u64,
+        max_uses: Option<u64>,
+    ) -> CoreResult<CoreOutput> {
+        let state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let role = state.local_role.unwrap_or(GroupRole::Member);
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can create group invite links",
+            ));
+        }
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        let now = current_unix_millis(self.state.message_nonce);
+        if expires_at <= now {
+            return Err(CoreError::invalid_input(
+                "group invite expires_at is in the past",
+            ));
+        }
+        let nonce = self.next_message_nonce();
+        let state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let invite_id = self.stable_scoped_id("group-invite", &group_id, nonce);
+        let base = self.deployment_http_base()?;
+        let join_request_endpoint = format!("{}/v1/groups/{}/join-requests", base, group_id);
+        let local_contact_share_url = self
+            .state
+            .local_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.identity_bundle_ref.clone());
+        let document = GroupInviteDocument {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            group_id: group_id.clone(),
+            title: state.manifest.title.clone(),
+            invite_id: invite_id.clone(),
+            join_policy: state.manifest.join_policy,
+            inviter_user_id: identity.user_identity.user_id.clone(),
+            inviter_device_id: identity.device_identity.device_id.clone(),
+            inviter_contact_share_url: local_contact_share_url.clone(),
+            owner_user_id: state.manifest.owner_user_id.clone(),
+            owner_contact_share_url: local_contact_share_url,
+            join_request_endpoint,
+            created_at: now,
+            expires_at,
+            max_uses,
+            signature: identity.sign_sender_proof(
+                format!("group_invite:{group_id}:{invite_id}:{expires_at}").as_bytes(),
+            ),
+        };
+        document.validate()?;
+        let capability = self.group_capability(&group_id, role)?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::CreateGroupInvite {
+                create: CreateGroupInviteRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id,
+                    document,
+                    capability,
+                    max_uses,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn revoke_group_invite_link(
+        &mut self,
+        group_id: String,
+        invite_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can revoke group invite links",
+            ));
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::RevokeGroupInvite {
+                revoke: RevokeGroupInviteRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: group_id.clone(),
+                    invite_id,
+                    capability: self.group_capability(&group_id, role)?,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn fetch_group_invite(&mut self, invite_url: String) -> CoreResult<CoreOutput> {
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::FetchGroupInvite {
+                fetch: FetchGroupInviteRequest {
+                    invite_url,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn submit_group_join_request(&mut self, invite_url: String) -> CoreResult<CoreOutput> {
+        self.fetch_group_invite(invite_url)
+    }
+
+    fn list_group_join_requests(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can list group join requests",
+            ));
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::ListGroupJoinRequests {
+                list: ListGroupJoinRequestsRequest {
+                    group_id: group_id.clone(),
+                    capability: self.group_capability(&group_id, role)?,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: Some(CoreViewModel {
+                group_join_requests: self
+                    .state
+                    .group_join_requests
+                    .values()
+                    .filter(|request| request.group_id == group_id)
+                    .map(|request| request.request.clone())
+                    .collect(),
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn approve_group_join(
+        &mut self,
+        group_id: String,
+        request_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can approve group join requests",
+            ));
+        }
+        let join = self
+            .state
+            .group_join_requests
+            .get(&request_id)
+            .ok_or_else(|| CoreError::invalid_input("join request does not exist"))?
+            .request
+            .clone();
+        if join.group_id != group_id || join.status != GroupJoinRequestStatus::Pending {
+            return Err(CoreError::invalid_input(
+                "join request is not pending for this group",
+            ));
+        }
+        let contact = self
+            .state
+            .contacts
+            .get(&join.joiner_user_id)
+            .ok_or_else(|| {
+                CoreError::invalid_state("joiner identity bundle has not been imported")
+            })?
+            .bundle
+            .clone();
+        let peer_devices = active_peer_key_packages(&contact)?;
+        if peer_devices.is_empty() {
+            return Err(CoreError::invalid_state(
+                "joiner has no active key packages",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let adapter = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("MLS adapter is not initialized"))?;
+        let artifacts = adapter.add_members(&group_state.conversation_id, &peer_devices)?;
+        let summary = adapter.export_group_summary(&group_state.conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary);
+        let mut manifest = group_state.manifest.clone();
+        if !manifest
+            .members
+            .iter()
+            .any(|member| member.user_id == join.joiner_user_id)
+        {
+            manifest.members.push(GroupMember {
+                user_id: join.joiner_user_id.clone(),
+                role: GroupRole::Member,
+                status: GroupMemberStatus::Active,
+            });
+        }
+        manifest.roster_version = manifest.roster_version.saturating_add(1);
+        manifest.updated_at = current_unix_millis(self.state.message_nonce);
+        manifest.mls_epoch_hint = artifacts.epoch;
+        manifest.signer_user_id = group_state.manifest.signer_user_id.clone();
+        manifest.signer_device_id = group_state.manifest.signer_device_id.clone();
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+
+        let capability = self.group_capability(&group_id, role)?;
+        let commit = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.commit_b64,
+        )?;
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("MLS adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupEnvelopeVisibility::Protocol,
+            control_payload.payload_b64,
+        )?;
+        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: commit.message_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: control.message_id.clone(),
+                },
+            ],
+        )];
+        let mut first_welcome = None;
+        for welcome in artifacts.welcomes {
+            let descriptor =
+                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            first_welcome.get_or_insert_with(|| descriptor.clone());
+            effects.push(CoreEffect::PutWelcomePickup {
+                put: PutWelcomePickupRequest {
+                    descriptor,
+                    welcome_b64: welcome.payload_b64,
+                    manifest: Some(manifest.clone()),
+                    headers: BTreeMap::new(),
+                },
+            });
+        }
+        let start_cursor = GroupCursor {
+            group_id: group_id.clone(),
+            last_fetched_seq: 0,
+            updated_at: current_unix_millis(self.state.message_nonce),
+        };
+        effects.push(CoreEffect::DecideGroupJoinRequest {
+            decide: DecideGroupJoinRequest {
+                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                group_id: group_id.clone(),
+                request_id,
+                decision: GroupJoinDecision::Approve,
+                capability,
+                welcome_pickup: first_welcome,
+                manifest: Some(manifest),
+                start_cursor: Some(start_cursor),
+                reason: None,
+                headers: BTreeMap::new(),
+            },
+        });
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                messages: vec![
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id.clone(),
+                        message_id: commit.message_id,
+                        message_type: MessageType::MlsCommit,
+                    },
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id,
+                        message_id: control.message_id,
+                        message_type: MessageType::ControlDeviceMembershipChanged,
+                    },
+                ],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn reject_group_join(
+        &mut self,
+        group_id: String,
+        request_id: String,
+        reason: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can reject group join requests",
+            ));
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::DecideGroupJoinRequest {
+                decide: DecideGroupJoinRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: group_id.clone(),
+                    request_id,
+                    decision: GroupJoinDecision::Reject,
+                    capability: self.group_capability(&group_id, role)?,
+                    welcome_pickup: None,
+                    manifest: None,
+                    start_cursor: None,
+                    reason,
                     headers: BTreeMap::new(),
                 },
             }],
@@ -3258,6 +3957,55 @@ impl CoreEngine {
         ))
     }
 
+    fn deployment_http_base(&self) -> CoreResult<String> {
+        let deployment = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        Ok(deployment
+            .inbox_http_endpoint
+            .trim_end_matches('/')
+            .to_string())
+    }
+
+    fn stable_scoped_id(&self, prefix: &str, scope: &str, nonce: u64) -> String {
+        let local_user_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.user_identity.user_id.as_str())
+            .unwrap_or("user:local");
+        let mut hasher = Sha256::new();
+        hasher.update(prefix.as_bytes());
+        hasher.update(b":");
+        hasher.update(scope.as_bytes());
+        hasher.update(b":");
+        hasher.update(local_user_id.as_bytes());
+        hasher.update(b":");
+        hasher.update(nonce.to_le_bytes());
+        format!("{prefix}:{}", hex_lower(&hasher.finalize()[..16]))
+    }
+
+    fn sign_manifest(&self, manifest: &GroupManifest) -> CoreResult<String> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        Ok(identity.sign_sender_proof(
+            format!(
+                "group_manifest:{}:{}:{}:{}",
+                manifest.group_id,
+                manifest.conversation_id,
+                manifest.roster_version,
+                manifest.updated_at
+            )
+            .as_bytes(),
+        ))
+    }
+
     fn welcome_pickup_descriptor(
         &self,
         group_id: &str,
@@ -3305,6 +4053,8 @@ impl CoreEngine {
                 GroupCapabilityOperation::AppendApplication,
                 GroupCapabilityOperation::AppendControl,
                 GroupCapabilityOperation::AppendMembership,
+                GroupCapabilityOperation::ManageInvites,
+                GroupCapabilityOperation::ApproveJoin,
             ],
             GroupRole::Member => vec![
                 GroupCapabilityOperation::Read,
@@ -4290,6 +5040,25 @@ impl CoreEngine {
                     result.welcome_b64.len()
                 )))
             }
+            PendingRequest::CreateGroupInvite {
+                group_id,
+                invite_id,
+            } => Err(CoreError::invalid_state(format!(
+                "group invite HTTP response cannot be applied without typed transport event: {group_id}/{invite_id}"
+            ))),
+            PendingRequest::SubmitGroupJoinRequest {
+                group_id,
+                request_id,
+                ..
+            } => Err(CoreError::invalid_state(format!(
+                "group join HTTP response cannot be applied without typed transport event: {group_id}/{request_id}"
+            ))),
+            PendingRequest::DecideGroupJoinRequest {
+                group_id,
+                request_id,
+            } => Err(CoreError::invalid_state(format!(
+                "group join decision HTTP response cannot be applied without typed transport event: {group_id}/{request_id}"
+            ))),
         }
     }
 
@@ -4444,6 +5213,47 @@ impl CoreEngine {
                         status: SystemStatus::TemporaryNetworkFailure,
                         message: detail.unwrap_or_else(|| {
                             format!("welcome pickup request failed for {group_id}/{device_id}")
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            PendingRequest::CreateGroupInvite {
+                group_id,
+                invite_id,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("group invite create failed for {group_id}/{invite_id}")
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            PendingRequest::SubmitGroupJoinRequest {
+                group_id,
+                request_id,
+                ..
+            }
+            | PendingRequest::DecideGroupJoinRequest {
+                group_id,
+                request_id,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("group join request failed for {group_id}/{request_id}")
                         }),
                     },
                 }],
@@ -4858,7 +5668,11 @@ impl CoreEngine {
                                         log::info!(
                                             "handle_inbox_records: Set plaintext for message {} to {:?}",
                                             record.message_id,
-                                            message.plaintext.as_deref().map(|s| if s.len() > 50 { &s[..50] } else { s })
+                                            message.plaintext.as_deref().map(|s| if s.len() > 50 {
+                                                &s[..50]
+                                            } else {
+                                                s
+                                            })
                                         );
                                     } else {
                                         log::warn!(
@@ -5315,6 +6129,51 @@ impl CoreEngine {
                         message: body.unwrap_or_else(|| {
                             format!(
                                 "welcome pickup returned status {status} for {group_id}/{device_id}"
+                            )
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            PendingRequest::CreateGroupInvite {
+                group_id,
+                invite_id,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: body.unwrap_or_else(|| {
+                            format!(
+                                "group invite returned status {status} for {group_id}/{invite_id}"
+                            )
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            PendingRequest::SubmitGroupJoinRequest {
+                group_id,
+                request_id,
+                ..
+            }
+            | PendingRequest::DecideGroupJoinRequest {
+                group_id,
+                request_id,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: body.unwrap_or_else(|| {
+                            format!(
+                                "group join returned status {status} for {group_id}/{request_id}"
                             )
                         }),
                     },
@@ -6124,6 +6983,30 @@ fn group_message_type_to_direct(message_type: GroupMessageType) -> MessageType {
     }
 }
 
+fn active_peer_key_packages(bundle: &IdentityBundle) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
+    Ok(bundle
+        .devices
+        .iter()
+        .filter(|device| matches!(device.status, DeviceStatusKind::Active))
+        .map(|device| PeerDeviceKeyPackage {
+            user_id: bundle.user_id.clone(),
+            device_id: device.device_id.clone(),
+            device_public_key: device.device_public_key.clone(),
+            key_package_b64: device.keypackage_ref.object_ref.clone(),
+        })
+        .collect())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
     let mut unique = BTreeSet::new();
     unique.extend(ops);
@@ -6228,6 +7111,13 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 retries: item.retries,
                 plaintext_cache: item.plaintext_cache.clone(),
             })
+            .collect(),
+        group_invites: state.group_invites.values().cloned().collect(),
+        group_join_requests: state.group_join_requests.values().cloned().collect(),
+        pending_group_join_approvals: state
+            .pending_group_join_approvals
+            .values()
+            .cloned()
             .collect(),
         pending_acks: state
             .pending_acks

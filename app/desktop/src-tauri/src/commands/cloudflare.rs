@@ -9,12 +9,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use tapchat_core::cli::profile::RuntimeMetadata;
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
-use tapchat_core::{CoreCommand};
+use tapchat_core::CoreCommand;
 
 use crate::commands::cloudflare_rest::{
     self, DeployPhase, DeployProgress, DeployResult, OAuthTokens, WhoamiResult, WorkerDeployConfig,
 };
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
 use crate::timetest;
 
@@ -127,12 +127,14 @@ async fn run_wrangler_script(
     let script_path = runtime_root.join("wrangler").join(script_name);
 
     if !script_path.exists() {
-        return Err(format!("Script {} not found in embedded runtime", script_name));
+        return Err(format!(
+            "Script {} not found in embedded runtime",
+            script_name
+        ));
     }
 
     // Get Node.js path — prefer embedded, fall back to system "node"
-    let node_path = resolve_embedded_node(app_handle)
-        .unwrap_or_else(|| PathBuf::from("node"));
+    let node_path = resolve_embedded_node(app_handle).unwrap_or_else(|| PathBuf::from("node"));
 
     // Run script
     let output = tokio::process::Command::new(&node_path)
@@ -186,13 +188,11 @@ pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, Str
             let whoami: WhoamiResult = parse_wrangler_output(&output)?;
 
             if whoami.authenticated {
-                let account = whoami.accounts
-                    .first()
-                    .map(|a| AccountInfo {
-                        account_id: a.account_id.clone(),
-                        account_name: a.account_name.clone(),
-                        email: whoami.email.clone(),
-                    });
+                let account = whoami.accounts.first().map(|a| AccountInfo {
+                    account_id: a.account_id.clone(),
+                    account_name: a.account_name.clone(),
+                    email: whoami.email.clone(),
+                });
 
                 (true, account)
             } else {
@@ -228,11 +228,14 @@ pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
     let app_ref = Some(&app);
 
     // Emit progress
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::Preflight,
-        message: "Starting Cloudflare authorization...".into(),
-        progress_percent: 10,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::Preflight,
+            message: "Starting Cloudflare authorization...".into(),
+            progress_percent: 10,
+        },
+    );
 
     // Run login script
     let login_output = run_wrangler_script(app_ref, "login.mjs").await?;
@@ -249,11 +252,14 @@ pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
         });
     }
 
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::Complete,
-        message: "Authorization successful!".into(),
-        progress_percent: 100,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::Complete,
+            message: "Authorization successful!".into(),
+            progress_percent: 100,
+        },
+    );
 
     Ok(LoginResult {
         success: true,
@@ -295,18 +301,24 @@ pub async fn cloudflare_deploy(
     let device_id = identity_ref.device_identity.device_id.clone();
 
     // Get profile name
-    let profile_name = inner.profile_manager.get_active_metadata().await
+    let profile_name = inner
+        .profile_manager
+        .get_active_metadata()
+        .await
         .map(|m| m.name)
         .unwrap_or_else(|| "default".to_string());
 
     drop(inner);
 
     // Run whoami to get OAuth token
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::Preflight,
-        message: "Checking authentication...".into(),
-        progress_percent: 5,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::Preflight,
+            message: "Checking authentication...".into(),
+            progress_percent: 5,
+        },
+    );
 
     let whoami_output = run_wrangler_script(Some(&app), "whoami.mjs").await?;
     let whoami: WhoamiResult = parse_wrangler_output(&whoami_output)?;
@@ -324,7 +336,8 @@ pub async fn cloudflare_deploy(
     }
 
     // Get account_id and API token
-    let account_id = whoami.active_account_id
+    let account_id = whoami
+        .active_account_id
         .or_else(|| whoami.accounts.first().map(|a| a.account_id.clone()))
         .ok_or_else(|| "No Cloudflare account found".to_string())?;
 
@@ -363,20 +376,28 @@ pub async fn cloudflare_deploy(
         |progress| {
             let _ = app.emit("cloudflare-progress", progress);
         },
-    ).await?;
+    )
+    .await?;
 
     if !result.success {
         let elapsed_ms = deploy_start.elapsed().as_millis();
-        timetest!("deploy_done success=false elapsed_ms={} ts={}", elapsed_ms, abs_start + elapsed_ms as u128);
+        timetest!(
+            "deploy_done success=false elapsed_ms={} ts={}",
+            elapsed_ms,
+            abs_start + elapsed_ms as u128
+        );
         return Ok(result);
     }
 
     // Wait for deployment to be ready
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::VerifyingDeployment,
-        message: "Waiting for deployment to be ready...".into(),
-        progress_percent: 85,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::VerifyingDeployment,
+            message: "Waiting for deployment to be ready...".into(),
+            progress_percent: 85,
+        },
+    );
 
     tapchat_core::cli::runtime::wait_until_ready(&result.worker_url)
         .await
@@ -384,19 +405,25 @@ pub async fn cloudflare_deploy(
 
     // Wait for secrets to propagate in Worker environment
     // Cloudflare Workers secrets need additional time to become available
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::VerifyingDeployment,
-        message: "Waiting for secrets to propagate...".into(),
-        progress_percent: 88,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::VerifyingDeployment,
+            message: "Waiting for secrets to propagate...".into(),
+            progress_percent: 88,
+        },
+    );
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     // Bootstrap device bundle
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::VerifyingDeployment,
-        message: "Bootstrapping device...".into(),
-        progress_percent: 90,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::VerifyingDeployment,
+            message: "Bootstrapping device...".into(),
+            progress_percent: 90,
+        },
+    );
 
     let deployment_bundle = tapchat_core::cli::runtime::bootstrap_device_bundle(
         &result.worker_url,
@@ -425,7 +452,12 @@ pub async fn cloudflare_deploy(
         let runtime = RuntimeMetadata {
             pid: None,
             base_url: Some(result.worker_url.clone()),
-            websocket_base_url: Some(result.worker_url.replace("https://", "wss://").replace("http://", "ws://")),
+            websocket_base_url: Some(
+                result
+                    .worker_url
+                    .replace("https://", "wss://")
+                    .replace("http://", "ws://"),
+            ),
             bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
             sharing_secret: Some(config.sharing_token_secret.clone()),
             mode: Some("cloudflare".into()),
@@ -440,19 +472,29 @@ pub async fn cloudflare_deploy(
             last_deployed_at: None,
         };
 
-        inner.profile_manager.save_runtime_metadata(&runtime).await
+        inner
+            .profile_manager
+            .save_runtime_metadata(&runtime)
+            .await
             .map_err(|e| format!("Save runtime metadata failed: {}", e))?;
     }
 
-    let _ = app.emit("cloudflare-progress", DeployProgress {
-        phase: DeployPhase::Complete,
-        message: "Deployment complete!".into(),
-        progress_percent: 100,
-    });
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::Complete,
+            message: "Deployment complete!".into(),
+            progress_percent: 100,
+        },
+    );
 
     let elapsed_secs = deploy_start.elapsed().as_secs_f64();
-    timetest!("deploy_done success=true worker_url={} elapsed_secs={:.1} ts={}",
-        result.worker_url, elapsed_secs, abs_start + ((elapsed_secs * 1000.0) as u128));
+    timetest!(
+        "deploy_done success=true worker_url={} elapsed_secs={:.1} ts={}",
+        result.worker_url,
+        elapsed_secs,
+        abs_start + ((elapsed_secs * 1000.0) as u128)
+    );
 
     Ok(result)
 }
@@ -479,8 +521,12 @@ fn load_oauth_token() -> Result<String, String> {
         let trimmed = line.trim();
         if trimmed.starts_with("oauth_token") {
             // Extract value between quotes
-            let start = trimmed.find('"').ok_or_else(|| "Invalid token format".to_string())?;
-            let end = trimmed.rfind('"').ok_or_else(|| "Invalid token format".to_string())?;
+            let start = trimmed
+                .find('"')
+                .ok_or_else(|| "Invalid token format".to_string())?;
+            let end = trimmed
+                .rfind('"')
+                .ok_or_else(|| "Invalid token format".to_string())?;
 
             if start < end {
                 let token = trimmed[start + 1..end].to_string();
@@ -496,9 +542,7 @@ fn load_oauth_token() -> Result<String, String> {
 
 /// Check deployment status
 #[tauri::command]
-pub async fn cloudflare_status(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn cloudflare_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let inner = state.inner.read().await;
 
     let deployment = inner.engine.refresh_snapshot().deployment;

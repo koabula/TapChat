@@ -112,9 +112,29 @@ export function validateGroupReadAuthorization(
   capability: GroupCapability,
   now: number
 ): void {
+  if (!capability) {
+    throw new HttpError(401, "invalid_capability", "missing group capability");
+  }
   validateGroupCapabilityBase(request, groupId, capability, now);
   if (!capability.operations.includes("read")) {
     throw new HttpError(403, "invalid_capability", "group capability does not grant read");
+  }
+}
+
+export function validateGroupOperationAuthorization(
+  request: Request,
+  groupId: string,
+  capability: GroupCapability,
+  now: number,
+  operation: GroupCapabilityOperation,
+  allowedRoles: Array<GroupCapability["role"]> = ["owner", "admin"]
+): void {
+  validateGroupCapabilityBase(request, groupId, capability, now);
+  if (!capability.operations.includes(operation)) {
+    throw new HttpError(403, "invalid_capability", `group capability does not grant ${operation}`);
+  }
+  if (!allowedRoles.includes(capability.role)) {
+    throw new HttpError(403, "invalid_capability", `group role cannot use ${operation}`);
   }
 }
 

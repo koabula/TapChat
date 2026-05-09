@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, anyhow};
-use tapchat_core::CoreCommand;
+use anyhow::{anyhow, Context, Result};
 use tapchat_core::cli::runtime::bootstrap_device_bundle;
 use tapchat_core::model::DeploymentBundle;
 use tapchat_core::persistence::PersistedDeployment;
+use tapchat_core::CoreCommand;
 
 use crate::platform::profile::ProfileManager;
 use crate::state::AppState;
@@ -16,10 +16,7 @@ enum RefreshReason {
     ExpiringSoon,
 }
 
-fn refresh_reason(
-    expires_at: Option<u64>,
-    now_ms: u64,
-) -> Option<RefreshReason> {
+fn refresh_reason(expires_at: Option<u64>, now_ms: u64) -> Option<RefreshReason> {
     match expires_at {
         None => Some(RefreshReason::MissingAuth),
         Some(value) if value <= now_ms => Some(RefreshReason::Expired),
@@ -86,7 +83,9 @@ pub async fn ensure_fresh_device_runtime_auth(
                     .as_ref()
                     .map(|identity| identity.state.device_identity.device_id.clone())
             })
-            .ok_or_else(|| anyhow!("active profile missing device_id for device runtime refresh"))?;
+            .ok_or_else(|| {
+                anyhow!("active profile missing device_id for device runtime refresh")
+            })?;
         let expires_at = deployment
             .deployment_bundle
             .device_runtime_auth
@@ -106,19 +105,15 @@ pub async fn ensure_fresh_device_runtime_auth(
         device_id
     );
 
-    let refreshed_bundle = bootstrap_device_bundle(
-        &base_url,
-        &bootstrap_secret,
-        &user_id,
-        &device_id,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "refresh device runtime auth for user_id={} device_id={} via {}",
-            user_id, device_id, base_url
-        )
-    })?;
+    let refreshed_bundle =
+        bootstrap_device_bundle(&base_url, &bootstrap_secret, &user_id, &device_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "refresh device runtime auth for user_id={} device_id={} via {}",
+                    user_id, device_id, base_url
+                )
+            })?;
 
     {
         let mut inner = profile_manager.inner.write().await;
@@ -163,9 +158,7 @@ pub async fn ensure_fresh_device_runtime_auth(
     Ok(Some(refreshed_bundle))
 }
 
-pub async fn ensure_fresh_device_runtime_auth_for_state(
-    state: &AppState,
-) -> Result<bool> {
+pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Result<bool> {
     let refreshed = {
         let inner = state.inner.read().await;
         ensure_fresh_device_runtime_auth(&inner.profile_manager).await?
@@ -186,10 +179,9 @@ pub async fn ensure_fresh_device_runtime_auth_for_state(
     let snapshot = inner.engine.refresh_snapshot();
     {
         let mut pm_inner = inner.profile_manager.inner.write().await;
-        let profile = pm_inner
-            .active_profile
-            .as_mut()
-            .ok_or_else(|| anyhow!("active profile disappeared while updating engine runtime auth"))?;
+        let profile = pm_inner.active_profile.as_mut().ok_or_else(|| {
+            anyhow!("active profile disappeared while updating engine runtime auth")
+        })?;
         profile
             .save_snapshot(&snapshot)
             .context("persist refreshed engine snapshot")?;

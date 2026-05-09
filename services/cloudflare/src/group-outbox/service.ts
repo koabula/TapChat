@@ -2,11 +2,28 @@ import { HttpError } from "../auth/capability";
 import type {
   AppendGroupEnvelopeRequest,
   AppendGroupEnvelopeResult,
+  CreateGroupInviteRequest,
+  CreateGroupInviteResult,
+  DecideGroupJoinRequest,
+  DecideGroupJoinResult,
   FetchGroupOutboxRequest,
   FetchGroupOutboxResult,
+  FetchGroupInviteResult,
   GetGroupOutboxHeadResult,
+  GetGroupJoinRequestStatusResult,
   GroupEnvelope,
-  GroupOutboxRecord
+  GroupInviteDocument,
+  GroupInviteTokenPayload,
+  GroupJoinRequest,
+  GroupCursor,
+  GroupManifest,
+  GroupOutboxRecord,
+  ListGroupJoinRequestsResult,
+  RevokeGroupInviteRequest,
+  RevokeGroupInviteResult,
+  SubmitGroupJoinRequest,
+  SubmitGroupJoinResult,
+  WelcomePickupDescriptor
 } from "../types/contracts";
 import type { DurableObjectStorageLike, JsonBlobStore } from "../types/runtime";
 
@@ -30,6 +47,25 @@ interface StoredGroupRecordIndex {
 const META_KEY = "meta";
 const IDEMPOTENCY_PREFIX = "idempotency:";
 const RECORD_PREFIX = "record:";
+const INVITE_PREFIX = "invite:";
+const JOIN_REQUEST_PREFIX = "join-request:";
+
+interface StoredGroupInvite {
+  inviteUrl: string;
+  token: string;
+  document: GroupInviteDocument;
+  uses: number;
+  maxUses?: number;
+  revokedAt?: number;
+}
+
+interface StoredGroupJoinRequest {
+  request: GroupJoinRequest;
+  welcomePickup?: WelcomePickupDescriptor;
+  manifest?: GroupManifest;
+  startCursor?: GroupCursor;
+  reason?: string;
+}
 
 export class GroupOutboxService {
   private readonly groupId: string;
@@ -143,6 +179,162 @@ export class GroupOutboxService {
     return { headSeq: meta.headSeq };
   }
 
+  async createInvite(
+    input: CreateGroupInviteRequest,
+    inviteUrl: string,
+    token: string,
+    now: number
+  ): Promise<CreateGroupInviteResult> {
+    if (input.groupId !== this.groupId || input.document.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group invite route");
+    }
+    this.validateInviteDocument(input.document, now);
+    const key = `${INVITE_PREFIX}${input.document.inviteId}`;
+    const existing = await this.state.get<StoredGroupInvite>(key);
+    if (existing) {
+      if (existing.document.signature !== input.document.signature) {
+        throw new HttpError(409, "conflict", "invite id already exists with a different document");
+      }
+      return { inviteUrl: existing.inviteUrl, invite: existing.document };
+    }
+    const stored: StoredGroupInvite = {
+      inviteUrl,
+      token,
+      document: { ...input.document, signature: token },
+      uses: 0,
+      maxUses: input.maxUses ?? input.document.maxUses
+    };
+    await this.state.put(key, stored);
+    await this.state.setAlarm(input.document.expiresAt);
+    return { inviteUrl, invite: stored.document };
+  }
+
+  async fetchInvite(payload: GroupInviteTokenPayload, now: number): Promise<FetchGroupInviteResult> {
+    if (payload.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "invite token group does not match route");
+    }
+    const stored = await this.loadUsableInvite(payload.inviteId, now);
+    if (stored.token !== stored.document.signature) {
+      throw new HttpError(403, "invalid_capability", "invite signature is invalid");
+    }
+    return { invite: stored.document };
+  }
+
+  async revokeInvite(input: RevokeGroupInviteRequest, now: number): Promise<RevokeGroupInviteResult> {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group invite route");
+    }
+    const key = `${INVITE_PREFIX}${input.inviteId}`;
+    const stored = await this.state.get<StoredGroupInvite>(key);
+    if (!stored) {
+      throw new HttpError(404, "not_found", "invite not found");
+    }
+    await this.state.put(key, { ...stored, revokedAt: now });
+    return { accepted: true, inviteId: input.inviteId };
+  }
+
+  async submitJoinRequest(
+    input: SubmitGroupJoinRequest,
+    payload: GroupInviteTokenPayload,
+    now: number
+  ): Promise<SubmitGroupJoinResult> {
+    if (payload.groupId !== this.groupId || input.request.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "join request group does not match route");
+    }
+    if (payload.inviteId !== input.request.inviteId) {
+      throw new HttpError(403, "invalid_capability", "join request invite does not match bearer token");
+    }
+    const invite = await this.loadUsableInvite(payload.inviteId, now);
+    if (invite.document.joinPolicy === "closed") {
+      throw new HttpError(403, "invalid_invite", "invite does not allow link join requests");
+    }
+    this.validateJoinRequest(input.request, now);
+    const key = `${JOIN_REQUEST_PREFIX}${input.request.requestId}`;
+    const existing = await this.state.get<StoredGroupJoinRequest>(key);
+    if (existing) {
+      if (JSON.stringify(existing.request) !== JSON.stringify(input.request)) {
+        throw new HttpError(409, "conflict", "join request id already exists with different content");
+      }
+      return {
+        accepted: true,
+        request: existing.request,
+        autoApprove: existing.request.autoApprove
+      };
+    }
+    const request: GroupJoinRequest = {
+      ...input.request,
+      status: "pending",
+      autoApprove: invite.document.joinPolicy === "open_by_invite"
+    };
+    await this.state.put<StoredGroupJoinRequest>(key, { request });
+    await this.state.put<StoredGroupInvite>(`${INVITE_PREFIX}${payload.inviteId}`, {
+      ...invite,
+      uses: invite.uses + 1
+    });
+    return { accepted: true, request, autoApprove: request.autoApprove };
+  }
+
+  async listJoinRequests(): Promise<ListGroupJoinRequestsResult> {
+    const result = await this.state.list<StoredGroupJoinRequest>({ prefix: JOIN_REQUEST_PREFIX });
+    const requests = Array.from(result.values())
+      .map((stored) => stored.request)
+      .filter((request) => request.groupId === this.groupId && request.status === "pending")
+      .sort((a, b) => a.requestedAt - b.requestedAt || a.requestId.localeCompare(b.requestId));
+    return { requests };
+  }
+
+  async getJoinRequestStatus(
+    requestId: string,
+    requestCapability: string
+  ): Promise<GetGroupJoinRequestStatusResult> {
+    const stored = await this.state.get<StoredGroupJoinRequest>(`${JOIN_REQUEST_PREFIX}${requestId}`);
+    if (!stored || stored.request.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "join request not found");
+    }
+    if (stored.request.requestCapability !== requestCapability) {
+      throw new HttpError(403, "invalid_capability", "join request capability does not match bearer token");
+    }
+    if (stored.request.status !== "approved") {
+      return { request: stored.request };
+    }
+    return {
+      request: stored.request,
+      welcomePickup: stored.welcomePickup,
+      manifest: stored.manifest,
+      startCursor: stored.startCursor
+    };
+  }
+
+  async decideJoinRequest(input: DecideGroupJoinRequest): Promise<DecideGroupJoinResult> {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group join route");
+    }
+    const key = `${JOIN_REQUEST_PREFIX}${input.requestId}`;
+    const stored = await this.state.get<StoredGroupJoinRequest>(key);
+    if (!stored || stored.request.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "join request not found");
+    }
+    if (stored.request.status !== "pending") {
+      throw new HttpError(409, "conflict", "join request is already terminal");
+    }
+    if (input.decision === "approve" && (!input.welcomePickup || !input.manifest || !input.startCursor)) {
+      throw new HttpError(400, "invalid_input", "approved join request requires welcome pickup, manifest, and start cursor");
+    }
+    const request: GroupJoinRequest = {
+      ...stored.request,
+      status: input.decision === "approve" ? "approved" : "rejected"
+    };
+    const updated: StoredGroupJoinRequest = {
+      request,
+      welcomePickup: input.decision === "approve" ? input.welcomePickup : undefined,
+      manifest: input.decision === "approve" ? input.manifest : undefined,
+      startCursor: input.decision === "approve" ? input.startCursor : undefined,
+      reason: input.decision === "reject" ? input.reason : undefined
+    };
+    await this.state.put(key, updated);
+    return { accepted: true, request };
+  }
+
   private async getMeta(): Promise<GroupOutboxMeta> {
     return (await this.state.get<GroupOutboxMeta>(META_KEY)) ?? this.defaults;
   }
@@ -152,6 +344,59 @@ export class GroupOutboxService {
       throw new HttpError(400, "invalid_input", "group_id does not match group outbox route");
     }
     this.validateEnvelope(input.envelope);
+  }
+
+  private async loadUsableInvite(inviteId: string, now: number): Promise<StoredGroupInvite> {
+    const stored = await this.state.get<StoredGroupInvite>(`${INVITE_PREFIX}${inviteId}`);
+    if (!stored || stored.document.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "invite not found");
+    }
+    if (stored.revokedAt !== undefined) {
+      throw new HttpError(403, "invalid_invite", "invite is revoked");
+    }
+    if (stored.document.expiresAt <= now) {
+      throw new HttpError(403, "capability_expired", "invite is expired");
+    }
+    if (stored.maxUses !== undefined && stored.uses >= stored.maxUses) {
+      throw new HttpError(403, "invalid_invite", "invite max uses exceeded");
+    }
+    return stored;
+  }
+
+  private validateInviteDocument(document: GroupInviteDocument, now: number): void {
+    if (
+      !document.groupId ||
+      !document.inviteId ||
+      !document.title ||
+      !document.inviterUserId ||
+      !document.inviterDeviceId ||
+      !document.ownerUserId ||
+      !document.joinRequestEndpoint ||
+      !document.signature
+    ) {
+      throw new HttpError(400, "invalid_input", "invite document is missing required fields");
+    }
+    if (document.expiresAt <= now) {
+      throw new HttpError(400, "invalid_input", "invite must not already be expired");
+    }
+  }
+
+  private validateJoinRequest(request: GroupJoinRequest, now: number): void {
+    if (
+      !request.requestId ||
+      !request.groupId ||
+      !request.inviteId ||
+      !request.joinerUserId ||
+      !request.joinerDeviceId ||
+      !request.joinerContactShareUrl ||
+      !request.requestCapability ||
+      !request.signature
+    ) {
+      throw new HttpError(400, "invalid_input", "join request is missing required fields");
+    }
+    if (request.requestedAt > now + 5 * 60 * 1000) {
+      throw new HttpError(400, "invalid_input", "join request timestamp is too far in the future");
+    }
   }
 
   private validateEnvelope(envelope: GroupEnvelope): void {

@@ -4,16 +4,13 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tokio::sync::RwLock;
 
+use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 use tapchat_core::ffi_api::{CoreEvent, HttpMethod, HttpRequestEffect};
 use tapchat_core::model::{Ack, IdentityBundle, InboxRecord};
 use tapchat_core::transport_contract::{
-    AckRequest, AckResult,
-    AppendEnvelopeRequest, AppendEnvelopeResult,
-    FetchIdentityBundleRequest,
-    GetHeadResult,
-    PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, FetchIdentityBundleRequest,
+    GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
 };
-use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 
 use crate::platform::profile::ProfileManagerInner;
 use crate::timetest;
@@ -78,10 +75,7 @@ impl DesktopTransport {
     /// Execute a generic HTTP request.
     /// Converts snake_case JSON (from CoreEngine) to camelCase (for server),
     /// and converts camelCase response back to snake_case.
-    pub async fn execute_http_request(
-        &self,
-        request: HttpRequestEffect,
-    ) -> Result<Vec<CoreEvent>> {
+    pub async fn execute_http_request(&self, request: HttpRequestEffect) -> Result<Vec<CoreEvent>> {
         let method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
@@ -89,7 +83,11 @@ impl DesktopTransport {
             HttpMethod::Delete => reqwest::Method::DELETE,
         };
 
-        log::info!("HTTP request: {} {}", method, sanitize_url_for_log(&request.url));
+        log::info!(
+            "HTTP request: {} {}",
+            method,
+            sanitize_url_for_log(&request.url)
+        );
 
         let start = std::time::Instant::now();
         let url_snapshot = request.url.clone();
@@ -131,8 +129,14 @@ impl DesktopTransport {
                     status
                 );
 
-                timetest!("http_req method={} url={} status={} elapsed_ms={} ts={}",
-                    method, sanitize_url_for_log(&url_snapshot), status, elapsed_ms, crate::ts_ms());
+                timetest!(
+                    "http_req method={} url={} status={} elapsed_ms={} ts={}",
+                    method,
+                    sanitize_url_for_log(&url_snapshot),
+                    status,
+                    elapsed_ms,
+                    crate::ts_ms()
+                );
 
                 let body = response
                     .text()
@@ -164,8 +168,14 @@ impl DesktopTransport {
                     e,
                     retryable
                 );
-                timetest!("http_req method={} url={} error=1 retryable={} elapsed_ms={} ts={}",
-                    method, sanitize_url_for_log(&url_snapshot), retryable, elapsed_ms, crate::ts_ms());
+                timetest!(
+                    "http_req method={} url={} error=1 retryable={} elapsed_ms={} ts={}",
+                    method,
+                    sanitize_url_for_log(&url_snapshot),
+                    retryable,
+                    elapsed_ms,
+                    crate::ts_ms()
+                );
                 Ok(vec![CoreEvent::HttpRequestFailed {
                     request_id: request.request_id,
                     retryable,
@@ -182,7 +192,9 @@ impl DesktopTransport {
     ) -> Result<AppendEnvelopeResult> {
         let start = std::time::Instant::now();
         let msg_id = request.envelope.message_id.clone();
-        let base_url = self.get_base_url().await
+        let base_url = self
+            .get_base_url()
+            .await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
         let url = format!(
@@ -194,7 +206,8 @@ impl DesktopTransport {
         timetest!("append_begin msg_id={} ts={}", msg_id, crate::ts_ms());
 
         let body = serde_json::to_string(&request)?;
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body)
@@ -206,13 +219,25 @@ impl DesktopTransport {
         let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            timetest!("append_done msg_id={} status={} error=1 elapsed_ms={} ts={}", msg_id, status, elapsed_ms, crate::ts_ms());
+            timetest!(
+                "append_done msg_id={} status={} error=1 elapsed_ms={} ts={}",
+                msg_id,
+                status,
+                elapsed_ms,
+                crate::ts_ms()
+            );
             anyhow::bail!("append failed: {} - {}", status, error_body);
         }
 
         let result: AppendEnvelopeResult = response.json().await.context("parse append result")?;
-        timetest!("append_done msg_id={} seq={} status={} elapsed_ms={} ts={}",
-            msg_id, result.seq, status, elapsed_ms, crate::ts_ms());
+        timetest!(
+            "append_done msg_id={} seq={} status={} elapsed_ms={} ts={}",
+            msg_id,
+            result.seq,
+            status,
+            elapsed_ms,
+            crate::ts_ms()
+        );
         Ok(result)
     }
 
@@ -224,7 +249,9 @@ impl DesktopTransport {
         limit: u64,
     ) -> Result<(u64, Vec<InboxRecord>)> {
         let start = std::time::Instant::now();
-        let base_url = self.get_base_url().await
+        let base_url = self
+            .get_base_url()
+            .await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
         let url = format!(
@@ -235,9 +262,16 @@ impl DesktopTransport {
             limit
         );
 
-        timetest!("fetch_begin device_id={} from_seq={} limit={} ts={}", device_id, from_seq, limit, crate::ts_ms());
+        timetest!(
+            "fetch_begin device_id={} from_seq={} limit={} ts={}",
+            device_id,
+            from_seq,
+            limit,
+            crate::ts_ms()
+        );
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -247,20 +281,35 @@ impl DesktopTransport {
         let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            timetest!("fetch_done device_id={} status={} error=1 elapsed_ms={} ts={}", device_id, status, elapsed_ms, crate::ts_ms());
+            timetest!(
+                "fetch_done device_id={} status={} error=1 elapsed_ms={} ts={}",
+                device_id,
+                status,
+                elapsed_ms,
+                crate::ts_ms()
+            );
             anyhow::bail!("fetch failed: {} - {}", status, error_body);
         }
 
         let result: FetchMessagesResult = response.json().await.context("parse fetch result")?;
         let record_count = result.records.len();
-        timetest!("fetch_done device_id={} from_seq={} to_seq={} records={} elapsed_ms={} ts={}",
-            device_id, from_seq, result.to_seq, record_count, elapsed_ms, crate::ts_ms());
+        timetest!(
+            "fetch_done device_id={} from_seq={} to_seq={} records={} elapsed_ms={} ts={}",
+            device_id,
+            from_seq,
+            result.to_seq,
+            record_count,
+            elapsed_ms,
+            crate::ts_ms()
+        );
         Ok((result.to_seq, result.records))
     }
 
     /// Acknowledge messages.
     pub async fn ack(&self, device_id: &str, ack: Ack) -> Result<AckResult> {
-        let base_url = self.get_base_url().await
+        let base_url = self
+            .get_base_url()
+            .await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
         let url = format!(
@@ -270,7 +319,8 @@ impl DesktopTransport {
         );
 
         let body = serde_json::to_string(&AckRequest { ack })?;
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body)
@@ -290,7 +340,9 @@ impl DesktopTransport {
     /// Get inbox head sequence.
     pub async fn get_head(&self, device_id: &str) -> Result<u64> {
         let start = std::time::Instant::now();
-        let base_url = self.get_base_url().await
+        let base_url = self
+            .get_base_url()
+            .await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
         let url = format!(
@@ -299,9 +351,14 @@ impl DesktopTransport {
             urlencoding::encode(device_id)
         );
 
-        timetest!("get_head_begin device_id={} ts={}", device_id, crate::ts_ms());
+        timetest!(
+            "get_head_begin device_id={} ts={}",
+            device_id,
+            crate::ts_ms()
+        );
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
@@ -311,13 +368,24 @@ impl DesktopTransport {
         let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            timetest!("get_head_done device_id={} status={} error=1 elapsed_ms={} ts={}", device_id, status, elapsed_ms, crate::ts_ms());
+            timetest!(
+                "get_head_done device_id={} status={} error=1 elapsed_ms={} ts={}",
+                device_id,
+                status,
+                elapsed_ms,
+                crate::ts_ms()
+            );
             anyhow::bail!("get head failed: {} - {}", status, error_body);
         }
 
         let result: GetHeadResult = response.json().await.context("parse head result")?;
-        timetest!("get_head_done device_id={} head_seq={} elapsed_ms={} ts={}",
-            device_id, result.head_seq, elapsed_ms, crate::ts_ms());
+        timetest!(
+            "get_head_done device_id={} head_seq={} elapsed_ms={} ts={}",
+            device_id,
+            result.head_seq,
+            elapsed_ms,
+            crate::ts_ms()
+        );
         Ok(result.head_seq)
     }
 
@@ -327,7 +395,8 @@ impl DesktopTransport {
         request: FetchIdentityBundleRequest,
     ) -> Result<IdentityBundle> {
         // The share URL points to the bundle endpoint
-        let response = self.client
+        let response = self
+            .client
             .get(&request.user_id) // user_id is actually the share URL in this context
             .send()
             .await
@@ -347,7 +416,9 @@ impl DesktopTransport {
         &self,
         request: PrepareBlobUploadRequest,
     ) -> Result<PrepareBlobUploadResult> {
-        let base_url = self.get_base_url().await
+        let base_url = self
+            .get_base_url()
+            .await
             .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
 
         let url = format!("{}/v1/storage/prepare-upload", base_url);
@@ -357,7 +428,8 @@ impl DesktopTransport {
         let body = to_camel_case_json_string(&snake_case_body)
             .context("convert prepare upload request to camelCase")?;
 
-        let mut builder = self.client
+        let mut builder = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json");
 
@@ -382,8 +454,8 @@ impl DesktopTransport {
         let response_text = response.text().await.context("read prepare result")?;
         let snake_case_response = to_snake_case_json_string(&response_text)
             .context("convert prepare result to snake_case")?;
-        let result: PrepareBlobUploadResult = serde_json::from_str(&snake_case_response)
-            .context("parse prepare result")?;
+        let result: PrepareBlobUploadResult =
+            serde_json::from_str(&snake_case_response).context("parse prepare result")?;
 
         Ok(result)
     }

@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
-use tauri::webview::WebviewWindowBuilder;
 use std::time::Instant;
+use tauri::webview::WebviewWindowBuilder;
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
 
-use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
+use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
 
-use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
+use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, SessionState, StartupPhase};
 
@@ -56,22 +56,19 @@ pub async fn on_app_ready(app: &AppHandle) {
         let mut inner = state.inner.write().await;
         inner.session = SessionState::Onboarding { step };
         inner.profile_path = startup_check.profile_path;
-        inner.startup_phase = StartupPhase::Ready;  // Backend is ready, just needs onboarding
+        inner.startup_phase = StartupPhase::Ready; // Backend is ready, just needs onboarding
         drop(inner);
         set_ws_connection_snapshot(&state, None, false).await;
 
         // Open onboarding window
-        let _onboarding = WebviewWindowBuilder::new(
-            app,
-            "onboarding",
-            WebviewUrl::App("/onboarding".into()),
-        )
-        .title("TapChat Setup")
-        .inner_size(960.0, 640.0)
-        .resizable(false)
-        .center()
-        .build()
-        .expect("failed to create onboarding window");
+        let _onboarding =
+            WebviewWindowBuilder::new(app, "onboarding", WebviewUrl::App("/onboarding".into()))
+                .title("TapChat Setup")
+                .inner_size(960.0, 640.0)
+                .resizable(false)
+                .center()
+                .build()
+                .expect("failed to create onboarding window");
     } else {
         log::info!("Session ready, loading snapshot and showing main window");
 
@@ -107,14 +104,20 @@ pub async fn on_app_ready(app: &AppHandle) {
             let inner = state.inner.read().await;
 
             // Load snapshot from active profile
-            let snapshot = inner.profile_manager.load_snapshot().await
+            let snapshot = inner
+                .profile_manager
+                .load_snapshot()
+                .await
                 .unwrap_or_else(|e| {
                     log::error!("Failed to load snapshot: {}", e);
                     CorePersistenceSnapshot::default()
                 });
 
             // Get device_id from profile metadata
-            let device_id = inner.profile_manager.get_active_metadata().await
+            let device_id = inner
+                .profile_manager
+                .get_active_metadata()
+                .await
                 .and_then(|m| m.device_id)
                 .unwrap_or_else(|| "unknown-device".to_string());
 
@@ -125,10 +128,15 @@ pub async fn on_app_ready(app: &AppHandle) {
             load_snapshot_started_at.elapsed().as_millis()
         );
 
-        log::info!("Loaded snapshot with {} contacts, {} conversations, deployment: {:?}",
+        log::info!(
+            "Loaded snapshot with {} contacts, {} conversations, deployment: {:?}",
             snapshot.contacts.len(),
             snapshot.conversations.len(),
-            snapshot.deployment.as_ref().map(|d| d.deployment_bundle.inbox_http_endpoint.clone()));
+            snapshot
+                .deployment
+                .as_ref()
+                .map(|d| d.deployment_bundle.inbox_http_endpoint.clone())
+        );
 
         // Initialize engine from snapshot
         let restore_engine_started_at = Instant::now();
@@ -140,7 +148,7 @@ pub async fn on_app_ready(app: &AppHandle) {
 
             inner.session = SessionState::Active { device_id };
             inner.profile_path = startup_check.profile_path;
-            inner.startup_phase = StartupPhase::Ready;  // Backend is fully ready
+            inner.startup_phase = StartupPhase::Ready; // Backend is fully ready
         }
         log::info!(
             "on_app_ready: CoreEngine::from_restored_state completed in {}ms",
@@ -171,7 +179,9 @@ pub async fn on_app_ready(app: &AppHandle) {
         tauri::async_runtime::spawn(async move {
             let app_started_at = Instant::now();
             // Fire AppStarted to kick off sync
-            if let Err(e) = drive_core_with_handle(&app_clone, CoreInput::Event(CoreEvent::AppStarted)).await {
+            if let Err(e) =
+                drive_core_with_handle(&app_clone, CoreInput::Event(CoreEvent::AppStarted)).await
+            {
                 log::error!("Failed to start session: {}", e);
             }
             log::info!(
@@ -188,7 +198,9 @@ pub async fn on_app_ready(app: &AppHandle) {
 }
 
 /// Determine the appropriate onboarding step based on startup check.
-fn determine_onboarding_step(check: &crate::platform::profile::SessionStartupCheck) -> crate::state::OnboardingStep {
+fn determine_onboarding_step(
+    check: &crate::platform::profile::SessionStartupCheck,
+) -> crate::state::OnboardingStep {
     if !check.has_active_profile {
         // No profile at all - start fresh
         crate::state::OnboardingStep::Welcome
@@ -246,10 +258,7 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
 
 /// The single entry point for all core state changes. Processes a command or event
 /// through CoreEngine, executes resulting effects, and pushes UI updates to the frontend.
-pub async fn drive_core_with_handle(
-    app: &AppHandle,
-    input: CoreInput,
-) -> Result<CoreOutput> {
+pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result<CoreOutput> {
     let state = app.state::<AppState>();
     let app_arc = Arc::new(app.clone());
 
@@ -300,7 +309,10 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     // Get device_id from profile and persist session state
     let device_id = {
         let inner = state.inner.read().await;
-        inner.profile_manager.get_active_metadata().await
+        inner
+            .profile_manager
+            .get_active_metadata()
+            .await
             .and_then(|m| m.device_id)
             .unwrap_or_else(|| "unknown-device".to_string())
     };
@@ -308,8 +320,10 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     // Update session state
     {
         let mut inner = state.inner.write().await;
-        inner.session = SessionState::Active { device_id: device_id.clone() };
-        inner.startup_phase = StartupPhase::Ready;  // Ensure startup phase is ready
+        inner.session = SessionState::Active {
+            device_id: device_id.clone(),
+        };
+        inner.startup_phase = StartupPhase::Ready; // Ensure startup phase is ready
 
         // Persist the current snapshot to profile
         let snapshot = inner.engine.refresh_snapshot();
@@ -321,11 +335,14 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     set_ws_connection_snapshot(&state, Some(device_id.clone()), false).await;
 
     // Emit session-status event to notify frontend - this triggers route change
-    let _ = app.emit("session-status", SessionStatus {
-        state: "active".to_string(),
-        device_id: Some(device_id),
-        ws_connected: false,
-    });
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "active".to_string(),
+            device_id: Some(device_id),
+            ws_connected: false,
+        },
+    );
 
     // Close onboarding window if exists
     if let Some(onboarding_window) = app.get_webview_window("onboarding") {
@@ -367,7 +384,9 @@ pub async fn set_onboarding_step(app: AppHandle, step: String) -> Result<(), Str
     let mut inner = state.inner.write().await;
 
     if let SessionState::Onboarding { .. } = &inner.session {
-        inner.session = SessionState::Onboarding { step: onboarding_step };
+        inner.session = SessionState::Onboarding {
+            step: onboarding_step,
+        };
     }
 
     Ok(())

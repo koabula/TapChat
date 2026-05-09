@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;

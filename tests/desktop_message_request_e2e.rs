@@ -2,9 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use serde_json::Value;
 use tapchat_core::desktop_app;
 use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle, MessageType};
@@ -19,18 +19,17 @@ const BOB_MNEMONIC: &str =
 #[test]
 fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintext() -> Result<()> {
     let workspace_root = workspace_root();
-    let runtime = with_tokio(|| async {
-        CloudflareRuntimeHandle::start(&workspace_root).await
-    })?;
+    let runtime = with_tokio(|| async { CloudflareRuntimeHandle::start(&workspace_root).await })?;
     let temp_root = repo_temp_dir("desktop-message-request")?;
-    let registry_path = temp_root.path().join("desktop-message-request.profiles.json");
+    let registry_path = temp_root
+        .path()
+        .join("desktop-message-request.profiles.json");
     let alice_profile = temp_root.path().join("alice");
     let bob_profile = temp_root.path().join("bob");
 
     let alice_mnemonic =
         write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
-    let bob_mnemonic =
-        write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
+    let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
 
     run_cli_json(
         &registry_path,
@@ -88,10 +87,14 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
     let bob_device_id = required_str(&bob_identity, "device_id")?;
 
     let alice_bundle = with_tokio(|| async {
-        runtime.bootstrap_device_bundle(&alice_user_id, &alice_device_id).await
+        runtime
+            .bootstrap_device_bundle(&alice_user_id, &alice_device_id)
+            .await
     })?;
     let bob_bundle = with_tokio(|| async {
-        runtime.bootstrap_device_bundle(&bob_user_id, &bob_device_id).await
+        runtime
+            .bootstrap_device_bundle(&bob_user_id, &bob_device_id)
+            .await
     })?;
     let alice_bundle_path =
         write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
@@ -118,10 +121,18 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
         ],
     )?;
 
-    let alice_identity_path =
-        export_identity_bundle_to_path(&registry_path, temp_root.path(), &alice_profile, "alice-identity.json")?;
-    let bob_identity_path =
-        export_identity_bundle_to_path(&registry_path, temp_root.path(), &bob_profile, "bob-identity.json")?;
+    let alice_identity_path = export_identity_bundle_to_path(
+        &registry_path,
+        temp_root.path(),
+        &alice_profile,
+        "alice-identity.json",
+    )?;
+    let bob_identity_path = export_identity_bundle_to_path(
+        &registry_path,
+        temp_root.path(),
+        &bob_profile,
+        "bob-identity.json",
+    )?;
     let alice_identity_bundle: IdentityBundle = read_json_file(&alice_identity_path)?;
     let bob_identity_bundle: IdentityBundle = read_json_file(&bob_identity_path)?;
 
@@ -173,12 +184,10 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
             "hello before accept",
         ],
     )?;
-    assert!(
-        first_send["latest_notification"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("queued as a message request")
-    );
+    assert!(first_send["latest_notification"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("queued as a message request"));
 
     assert!(
         desktop_app::conversation_list(&bob_profile)?.is_empty(),
@@ -274,7 +283,10 @@ fn export_identity_bundle_to_path(
             &output.to_string_lossy(),
         ],
     )?;
-    assert_eq!(required_str(&exported, "written")?, output.to_string_lossy());
+    assert_eq!(
+        required_str(&exported, "written")?,
+        output.to_string_lossy()
+    );
     Ok(output)
 }
 

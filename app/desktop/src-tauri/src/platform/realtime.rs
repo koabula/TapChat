@@ -2,21 +2,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, RwLock};
-use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
-use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::{mpsc, RwLock};
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 
 use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::transport_contract::RealtimeSubscriptionRequest;
 
 use crate::commands::session::set_ws_connection_snapshot;
-use crate::timetest;
 use crate::platform::profile::ProfileManagerInner;
 use crate::state::AppState;
+use crate::timetest;
 
 /// Unique identifier for each WebSocket connection.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -119,7 +119,11 @@ impl RealtimeManager {
     async fn next_connection_id(&self) -> ConnectionId {
         let mut counter = self.connection_counter.write().await;
         *counter += 1;
-        ConnectionId(format!("conn:{}:{}", *counter, uuid::Uuid::new_v4().simple()))
+        ConnectionId(format!(
+            "conn:{}:{}",
+            *counter,
+            uuid::Uuid::new_v4().simple()
+        ))
     }
 
     /// Open a realtime WebSocket connection.
@@ -170,7 +174,10 @@ impl RealtimeManager {
             .header("Host", self.extract_host(&endpoint)?)
             .header("Upgrade", "websocket")
             .header("Connection", "Upgrade")
-            .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
             .header("Sec-WebSocket-Version", "13")
             .body(())
             .context("build websocket request")?;
@@ -206,12 +213,16 @@ impl RealtimeManager {
                         app.state::<AppState>().inner(),
                         Some(device_id.clone()),
                         false,
-                    ).await;
-                    let _ = app.emit("realtime-event", RealtimeEventPayload {
-                        device_id: device_id.clone(),
-                        event_type: "error".to_string(),
-                        data: Some(detail.clone()),
-                    });
+                    )
+                    .await;
+                    let _ = app.emit(
+                        "realtime-event",
+                        RealtimeEventPayload {
+                            device_id: device_id.clone(),
+                            event_type: "error".to_string(),
+                            data: Some(detail.clone()),
+                        },
+                    );
                 }
                 return Ok(vec![CoreEvent::WebSocketDisconnected {
                     device_id,
@@ -233,12 +244,16 @@ impl RealtimeManager {
                 app.state::<AppState>().inner(),
                 Some(device_id.clone()),
                 true,
-            ).await;
-            let _ = app.emit("realtime-event", RealtimeEventPayload {
-                device_id: device_id.clone(),
-                event_type: "connected".to_string(),
-                data: None,
-            });
+            )
+            .await;
+            let _ = app.emit(
+                "realtime-event",
+                RealtimeEventPayload {
+                    device_id: device_id.clone(),
+                    event_type: "connected".to_string(),
+                    data: None,
+                },
+            );
         }
 
         // Step 9: Store new session (replace any stale entry)
@@ -267,7 +282,8 @@ impl RealtimeManager {
                 connection_id_clone,
                 stop_rx,
                 app_handle_clone,
-            ).await;
+            )
+            .await;
         });
 
         Ok(vec![CoreEvent::WebSocketConnected { device_id }])
@@ -290,12 +306,16 @@ impl RealtimeManager {
                 app.state::<AppState>().inner(),
                 Some(device_id.to_string()),
                 false,
-            ).await;
-            let _ = app.emit("realtime-event", RealtimeEventPayload {
-                device_id: device_id.to_string(),
-                event_type: "disconnected".to_string(),
-                data: None,
-            });
+            )
+            .await;
+            let _ = app.emit(
+                "realtime-event",
+                RealtimeEventPayload {
+                    device_id: device_id.to_string(),
+                    event_type: "disconnected".to_string(),
+                    data: None,
+                },
+            );
         }
 
         Ok(vec![CoreEvent::WebSocketDisconnected {
@@ -327,7 +347,8 @@ impl RealtimeManager {
     /// Check if a session is connected and not stale.
     pub async fn is_connected(&self, device_id: &str) -> bool {
         let sessions = self.sessions.read().await;
-        sessions.get(device_id)
+        sessions
+            .get(device_id)
             .map(|s| s.connected && !s.stale)
             .unwrap_or(false)
     }
@@ -335,16 +356,12 @@ impl RealtimeManager {
     /// Get connection info for diagnostics.
     pub async fn get_connection_info(&self, device_id: &str) -> Option<(String, bool, bool)> {
         let sessions = self.sessions.read().await;
-        sessions.get(device_id).map(|s| {
-            (s.connection_id.as_str().to_string(), s.connected, s.stale)
-        })
+        sessions
+            .get(device_id)
+            .map(|s| (s.connection_id.as_str().to_string(), s.connected, s.stale))
     }
 
-    async fn reserve_connection(
-        &self,
-        device_id: &str,
-        endpoint: &str,
-    ) -> ConnectionReservation {
+    async fn reserve_connection(&self, device_id: &str, endpoint: &str) -> ConnectionReservation {
         let connection_id = self.next_connection_id().await;
         let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
         let mut sessions = self.sessions.write().await;
@@ -405,11 +422,7 @@ impl RealtimeManager {
         };
 
         // Append query parameter
-        Ok(format!(
-            "{}?last_acked_seq={}",
-            ws_base,
-            last_acked_seq
-        ))
+        Ok(format!("{}?last_acked_seq={}", ws_base, last_acked_seq))
     }
 
     fn extract_host(&self, endpoint: &str) -> Result<String> {
@@ -627,7 +640,8 @@ impl WsServerEvent {
             WsServerEvent::HeadUpdated { .. } => "head_updated",
             WsServerEvent::InboxRecordAvailable { .. } => "inbox_record_available",
             WsServerEvent::MessageRequestChanged { .. } => "message_request_changed",
-        }.to_string()
+        }
+        .to_string()
     }
 }
 

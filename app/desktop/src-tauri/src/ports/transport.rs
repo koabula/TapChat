@@ -8,8 +8,8 @@ use reqwest::Client;
 
 use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::transport_contract::{
-    FetchAllowlistRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
-    MessageRequestAction, PublishSharedStateRequest, ReplaceAllowlistRequest,
+    FetchAllowlistRequest, FetchMessageRequestsRequest, MessageRequestAction,
+    MessageRequestActionRequest, PublishSharedStateRequest, ReplaceAllowlistRequest,
 };
 
 /// Convert JSON keys from camelCase to snake_case for parsing
@@ -27,15 +27,20 @@ fn to_camel_case_json_string(input: &str) -> Result<String> {
 fn convert_json_keys_to_snake_case(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            let new_map = map.into_iter().map(|(k, v)| {
-                let new_key = camel_to_snake(&k);
-                (new_key, convert_json_keys_to_snake_case(v))
-            }).collect();
+            let new_map = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_key = camel_to_snake(&k);
+                    (new_key, convert_json_keys_to_snake_case(v))
+                })
+                .collect();
             serde_json::Value::Object(new_map)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(convert_json_keys_to_snake_case).collect())
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(convert_json_keys_to_snake_case)
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -43,15 +48,20 @@ fn convert_json_keys_to_snake_case(value: serde_json::Value) -> serde_json::Valu
 fn convert_json_keys_to_camel_case(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
-            let new_map = map.into_iter().map(|(k, v)| {
-                let new_key = snake_to_camel(&k);
-                (new_key, convert_json_keys_to_camel_case(v))
-            }).collect();
+            let new_map = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_key = snake_to_camel(&k);
+                    (new_key, convert_json_keys_to_camel_case(v))
+                })
+                .collect();
             serde_json::Value::Object(new_map)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(convert_json_keys_to_camel_case).collect())
-        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter()
+                .map(convert_json_keys_to_camel_case)
+                .collect(),
+        ),
         other => other,
     }
 }
@@ -103,13 +113,19 @@ pub async fn fetch_message_requests(
             let normalized = to_snake_case_json_string(&body)?;
             let value: serde_json::Value = serde_json::from_str(&normalized)?;
             let requests = serde_json::from_value(
-                value.get("requests").cloned().unwrap_or_else(|| serde_json::json!([])),
+                value
+                    .get("requests")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
             )?;
             Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
         }
         Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
             retryable: false,
-            detail: Some(format!("list message requests failed with status {}", response.status())),
+            detail: Some(format!(
+                "list message requests failed with status {}",
+                response.status()
+            )),
         }]),
         Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
             retryable: true,
@@ -215,7 +231,10 @@ pub async fn fetch_allowlist(
         }
         Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
             retryable: false,
-            detail: Some(format!("get allowlist failed with status {}", response.status())),
+            detail: Some(format!(
+                "get allowlist failed with status {}",
+                response.status()
+            )),
         }]),
         Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
             retryable: true,
@@ -252,7 +271,10 @@ pub async fn replace_allowlist(
         }
         Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
             retryable: false,
-            detail: Some(format!("put allowlist failed with status {}", response.status())),
+            detail: Some(format!(
+                "put allowlist failed with status {}",
+                response.status()
+            )),
         }]),
         Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
             retryable: true,
@@ -277,10 +299,12 @@ pub async fn publish_shared_state(
         .send()
         .await
     {
-        Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::SharedStatePublished {
-            document_kind: publish.document_kind,
-            reference: publish.reference,
-        }]),
+        Ok(response) if response.status().is_success() => {
+            Ok(vec![CoreEvent::SharedStatePublished {
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+            }])
+        }
         Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
             document_kind: publish.document_kind,
             reference: publish.reference,

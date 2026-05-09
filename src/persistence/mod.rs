@@ -7,8 +7,9 @@ use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::PublishedKeyPackage;
 use crate::model::{
-    Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupManifest,
-    GroupRole, IdentityBundle, MlsStateSummary, WelcomePickupDescriptor,
+    Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
+    GroupInviteDocument, GroupJoinRequest, GroupManifest, GroupRole, IdentityBundle,
+    MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::PrepareBlobUploadResult;
@@ -95,6 +96,34 @@ pub struct PersistedOutgoingGroupEnvelope {
     pub retries: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_cache: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGroupInvite {
+    pub group_id: String,
+    pub invite_id: String,
+    pub invite_url: String,
+    pub document: GroupInviteDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGroupJoinRequest {
+    pub group_id: String,
+    pub request_id: String,
+    pub request: GroupJoinRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_pickup: Option<WelcomePickupDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<GroupManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cursor: Option<GroupCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedPendingGroupJoinApproval {
+    pub group_id: String,
+    pub request_id: String,
+    pub join_request: GroupJoinRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +231,12 @@ pub struct CorePersistenceSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_group_outbox: Vec<PersistedOutgoingGroupEnvelope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_invites: Vec<PersistedGroupInvite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_join_requests: Vec<PersistedGroupJoinRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_group_join_approvals: Vec<PersistedPendingGroupJoinApproval>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_acks: Vec<PersistedPendingAck>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_blob_transfers: Vec<PersistedPendingBlobTransfer>,
@@ -242,6 +277,12 @@ pub enum PersistOp {
     DeleteGroupCursor { group_id: String },
     SaveOutgoingGroupEnvelope { message_id: String },
     DeleteOutgoingGroupEnvelope { message_id: String },
+    SaveGroupInvite { invite_id: String },
+    DeleteGroupInvite { invite_id: String },
+    SaveGroupJoinRequest { request_id: String },
+    DeleteGroupJoinRequest { request_id: String },
+    SavePendingGroupJoinApproval { request_id: String },
+    DeletePendingGroupJoinApproval { request_id: String },
     SavePendingAck { device_id: String },
     DeletePendingAck { device_id: String },
     SavePendingBlobTransfer { task_id: String },
@@ -314,6 +355,9 @@ pub struct InMemoryPersistence {
     group_states: BTreeMap<String, PersistedGroupState>,
     group_cursors: BTreeMap<String, PersistedGroupCursor>,
     pending_group_outbox: BTreeMap<String, PersistedOutgoingGroupEnvelope>,
+    group_invites: BTreeMap<String, PersistedGroupInvite>,
+    group_join_requests: BTreeMap<String, PersistedGroupJoinRequest>,
+    pending_group_join_approvals: BTreeMap<String, PersistedPendingGroupJoinApproval>,
     pending_acks: BTreeMap<String, PersistedPendingAck>,
     pending_blob_transfers: BTreeMap<String, PersistedPendingBlobTransfer>,
     recovery_contexts: BTreeMap<String, PersistedRecoveryContext>,
@@ -373,6 +417,24 @@ impl InMemoryPersistence {
             .cloned()
             .map(|item| (item.message_id.clone(), item))
             .collect();
+        self.group_invites = snapshot
+            .group_invites
+            .iter()
+            .cloned()
+            .map(|invite| (invite.invite_id.clone(), invite))
+            .collect();
+        self.group_join_requests = snapshot
+            .group_join_requests
+            .iter()
+            .cloned()
+            .map(|request| (request.request_id.clone(), request))
+            .collect();
+        self.pending_group_join_approvals = snapshot
+            .pending_group_join_approvals
+            .iter()
+            .cloned()
+            .map(|approval| (approval.request_id.clone(), approval))
+            .collect();
         self.pending_acks = snapshot
             .pending_acks
             .iter()
@@ -418,6 +480,13 @@ impl InMemoryPersistence {
             group_states: self.group_states.values().cloned().collect(),
             group_cursors: self.group_cursors.values().cloned().collect(),
             pending_group_outbox: self.pending_group_outbox.values().cloned().collect(),
+            group_invites: self.group_invites.values().cloned().collect(),
+            group_join_requests: self.group_join_requests.values().cloned().collect(),
+            pending_group_join_approvals: self
+                .pending_group_join_approvals
+                .values()
+                .cloned()
+                .collect(),
             pending_acks: self.pending_acks.values().cloned().collect(),
             pending_blob_transfers: self.pending_blob_transfers.values().cloned().collect(),
             recovery_contexts: self.recovery_contexts.values().cloned().collect(),
@@ -609,8 +678,8 @@ mod tests {
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
-        WakeHint, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
+        MessageType, SenderProof, WakeHint,
     };
     use base64::Engine as _;
 
@@ -700,6 +769,9 @@ mod tests {
             group_states: vec![],
             group_cursors: vec![],
             pending_group_outbox: vec![],
+            group_invites: vec![],
+            group_join_requests: vec![],
+            pending_group_join_approvals: vec![],
             pending_acks: vec![PersistedPendingAck {
                 device_id: identity.device_identity.device_id.clone(),
                 ack: Ack {
@@ -886,6 +958,9 @@ mod tests {
             group_states: vec![],
             group_cursors: vec![],
             pending_group_outbox: vec![],
+            group_invites: vec![],
+            group_join_requests: vec![],
+            pending_group_join_approvals: vec![],
             pending_acks: vec![],
             pending_blob_transfers: vec![],
             recovery_contexts: vec![],

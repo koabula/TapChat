@@ -6,6 +6,7 @@ import {
   validateBootstrapAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
   validateGroupAppendAuthorization,
+  validateGroupOperationAuthorization,
   validateGroupReadAuthorization,
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization,
@@ -24,6 +25,8 @@ import {
   type DeploymentBundle,
   type DeviceRuntimeAuth,
   type DeviceStatusDocument,
+  type GroupCapability,
+  type GroupInviteTokenPayload,
   type IdentityBundle,
   type KeyPackageRefsDocument,
   type PrepareBlobUploadRequest,
@@ -272,6 +275,80 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
 
       return stub.fetch(request);
+    }
+
+    const publicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)$/);
+    if (publicInviteMatch && request.method === "GET") {
+      let payload: GroupInviteTokenPayload;
+      try {
+        payload = await verifySharingPayload<GroupInviteTokenPayload>(
+          sharedStateSecret(env),
+          decodeURIComponent(publicInviteMatch[1]),
+          now
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "invalid group invite token";
+        throw new HttpError(message.includes("expired") ? 403 : 403, message.includes("expired") ? "capability_expired" : "invalid_capability", message);
+      }
+      if (payload.service !== "group_invite" || !payload.groupId || !payload.inviteId) {
+        throw new HttpError(403, "invalid_capability", "group invite token is malformed");
+      }
+      const objectId = env.GROUP_OUTBOX.idFromName(payload.groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+
+    const groupInviteMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/invites(?:\/([^/]+)\/revoke)?$/);
+    if (groupInviteMatch && request.method === "POST") {
+      const groupId = decodeURIComponent(groupInviteMatch[1]);
+      const body = await request.clone().json() as { capability?: GroupCapability };
+      validateGroupOperationAuthorization(request, groupId, body.capability as GroupCapability, now, "manage_invites");
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+
+    const joinCollectionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests$/);
+    if (joinCollectionMatch) {
+      const groupId = decodeURIComponent(joinCollectionMatch[1]);
+      if (request.method === "POST") {
+        const token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim();
+        if (!token) {
+          throw new HttpError(401, "invalid_capability", "missing group invite bearer token");
+        }
+        let payload: GroupInviteTokenPayload;
+        try {
+          payload = await verifySharingPayload<GroupInviteTokenPayload>(sharedStateSecret(env), token, now);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "invalid group invite token";
+          throw new HttpError(
+            message.includes("expired") ? 403 : 403,
+            message.includes("expired") ? "capability_expired" : "invalid_capability",
+            message
+          );
+        }
+        if (payload.service !== "group_invite" || payload.groupId !== groupId) {
+          throw new HttpError(403, "invalid_capability", "group invite token scope does not match request");
+        }
+      } else if (request.method === "GET") {
+        validateGroupOperationAuthorization(request, groupId, readGroupCapabilityHeader(request), now, "approve_join");
+      }
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+
+    const joinDecisionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/decision$/);
+    if (joinDecisionMatch && request.method === "POST") {
+      const groupId = decodeURIComponent(joinDecisionMatch[1]);
+      const body = await request.clone().json() as { capability?: GroupCapability };
+      validateGroupOperationAuthorization(request, groupId, body.capability as GroupCapability, now, "approve_join");
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+
+    const joinStatusMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)$/);
+    if (joinStatusMatch && request.method === "GET") {
+      const groupId = decodeURIComponent(joinStatusMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
 
     const welcomePickupMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/welcome-pickup\/([^/]+)$/);

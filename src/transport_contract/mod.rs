@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::model::{
-    Ack, Envelope, GroupCapability, GroupEnvelope, GroupManifest, GroupOutboxRecord,
-    IdentityBundle, InboxRecord, WelcomePickupDescriptor,
+    Ack, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupInviteDocument,
+    GroupJoinRequest, GroupManifest, GroupOutboxRecord, IdentityBundle, InboxRecord,
+    WelcomePickupDescriptor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +173,135 @@ pub struct PutWelcomePickupRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PutWelcomePickupResult {
     pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateGroupInviteRequest {
+    pub version: String,
+    pub group_id: String,
+    pub document: GroupInviteDocument,
+    pub capability: GroupCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateGroupInviteResult {
+    pub invite_url: String,
+    pub invite: GroupInviteDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeGroupInviteRequest {
+    pub version: String,
+    pub group_id: String,
+    pub invite_id: String,
+    pub capability: GroupCapability,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeGroupInviteResult {
+    pub accepted: bool,
+    pub invite_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchGroupInviteRequest {
+    pub invite_url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchGroupInviteResult {
+    pub invite: GroupInviteDocument,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitGroupJoinRequest {
+    pub version: String,
+    pub invite_token: String,
+    pub request: GroupJoinRequest,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitGroupJoinResult {
+    pub accepted: bool,
+    pub request: GroupJoinRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListGroupJoinRequestsRequest {
+    pub group_id: String,
+    pub capability: GroupCapability,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListGroupJoinRequestsResult {
+    pub requests: Vec<GroupJoinRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetGroupJoinRequestStatusRequest {
+    pub group_id: String,
+    pub request_id: String,
+    pub request_capability: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetGroupJoinRequestStatusResult {
+    pub request: GroupJoinRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_pickup: Option<WelcomePickupDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<GroupManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cursor: Option<GroupCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupJoinDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideGroupJoinRequest {
+    pub version: String,
+    pub group_id: String,
+    pub request_id: String,
+    pub decision: GroupJoinDecision,
+    pub capability: GroupCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_pickup: Option<WelcomePickupDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<GroupManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cursor: Option<GroupCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideGroupJoinResult {
+    pub accepted: bool,
+    pub request: GroupJoinRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,10 +483,10 @@ pub struct PublishSharedStateRequest {
 mod tests {
     use super::*;
     use crate::model::{
-        CapabilityService, DeliveryClass, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
-        GroupEnvelopeVisibility, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState,
-        GroupRole, MessageType, SenderProof, StorageRef, WelcomePickupDescriptor,
-        CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, CapabilityService, DeliveryClass, GroupCapability,
+        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType,
+        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, MessageType, SenderProof, StorageRef,
+        WelcomePickupDescriptor,
     };
 
     #[test]

@@ -7,6 +7,7 @@ declare class DurableObjectState {
     get<T>(key: string): Promise<T | undefined>;
     put<T>(key: string, value: T): Promise<void>;
     delete(key: string): Promise<void>;
+    list<T>(options?: { prefix?: string }): Promise<Map<string, T>>;
     setAlarm(epochMillis: number | Date): Promise<void>;
   };
 }

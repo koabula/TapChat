@@ -60,6 +60,16 @@ class MemoryState implements DurableObjectStorageLike {
     this.map.delete(key);
   }
 
+  async list<T>(options?: { prefix?: string }): Promise<Map<string, T>> {
+    const output = new Map<string, T>();
+    for (const [key, value] of this.map.entries()) {
+      if (!options?.prefix || key.startsWith(options.prefix)) {
+        output.set(key, value as T);
+      }
+    }
+    return output;
+  }
+
   async setAlarm(epochMillis: number): Promise<void> {
     this.alarmAt = epochMillis;
   }
@@ -201,6 +211,7 @@ class FakeGroupOutboxStub implements DurableObjectStub {
       spillStore: this.spillStore,
       maxInlineBytes: this.env.maxInlineBytes,
       retentionDays: this.env.retentionDays,
+      sharingSecret: this.env.sharingSecret,
       now: 1_000
     });
   }

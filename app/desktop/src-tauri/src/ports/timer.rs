@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use tauri::AppHandle;
 use tapchat_core::CoreEvent;
+use tauri::AppHandle;
 use tokio::time::{sleep, Duration};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 
 /// Schedule a timer that will fire after the given delay.
 /// The timer triggers a CoreEvent::TimerTriggered that gets fed back into the core engine.
@@ -17,12 +17,19 @@ pub fn schedule_timer(app_handle: Option<Arc<AppHandle>>, timer_id: String, dela
         if let Some(app) = app_handle {
             if let Err(error) = drive_core_with_handle(
                 &app,
-                CoreInput::Event(CoreEvent::TimerTriggered { timer_id: timer_id.clone() }),
-            ).await {
+                CoreInput::Event(CoreEvent::TimerTriggered {
+                    timer_id: timer_id.clone(),
+                }),
+            )
+            .await
+            {
                 log::error!("Timer {} failed to drive core: {}", timer_id, error);
             }
         } else {
-            log::warn!("Timer {} fired without app handle; dropping event", timer_id);
+            log::warn!(
+                "Timer {} fired without app handle; dropping event",
+                timer_id
+            );
         }
     });
 }

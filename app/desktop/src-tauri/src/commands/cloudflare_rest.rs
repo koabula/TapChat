@@ -125,7 +125,10 @@ pub async fn create_r2_bucket(
     account_id: &str,
     bucket_name: &str,
 ) -> Result<(), String> {
-    let url = format!("{}/accounts/{}/r2/buckets/{}", CF_API_BASE, account_id, bucket_name);
+    let url = format!(
+        "{}/accounts/{}/r2/buckets/{}",
+        CF_API_BASE, account_id, bucket_name
+    );
 
     let response = client
         .put(&url)
@@ -160,7 +163,10 @@ pub async fn create_r2_bucket(
         .and_then(|e| e.message.clone())
         .unwrap_or_else(|| format!("HTTP {}", status));
 
-    Err(format!("Failed to create bucket {}: {}", bucket_name, error_msg))
+    Err(format!(
+        "Failed to create bucket {}: {}",
+        bucket_name, error_msg
+    ))
 }
 
 /// Upload Worker script via REST API
@@ -226,16 +232,24 @@ pub async fn upload_worker_script(
     // Build multipart form data
     // Cloudflare expects: metadata (JSON) + script (JS file named 'worker.js')
     let form = reqwest::multipart::Form::new()
-        .part("metadata", reqwest::multipart::Part::text(metadata.to_string())
-            .mime_str("application/json")
-            .map_err(|e| format!("MIME type error: {}", e))?)
-        .part("worker.js", reqwest::multipart::Part::text(worker_script.to_string())
-            .file_name("worker.js")
-            .mime_str("application/javascript+module")
-            .map_err(|e| format!("MIME type error: {}", e))?);
+        .part(
+            "metadata",
+            reqwest::multipart::Part::text(metadata.to_string())
+                .mime_str("application/json")
+                .map_err(|e| format!("MIME type error: {}", e))?,
+        )
+        .part(
+            "worker.js",
+            reqwest::multipart::Part::text(worker_script.to_string())
+                .file_name("worker.js")
+                .mime_str("application/javascript+module")
+                .map_err(|e| format!("MIME type error: {}", e))?,
+        );
 
-    let url = format!("{}/accounts/{}/workers/scripts/{}",
-        CF_API_BASE, account_id, worker_name);
+    let url = format!(
+        "{}/accounts/{}/workers/scripts/{}",
+        CF_API_BASE, account_id, worker_name
+    );
 
     let response = client
         .put(&url)
@@ -253,8 +267,12 @@ pub async fn upload_worker_script(
             .await
             .map_err(|e| format!("Failed to read error response: {}", e))?;
 
-        let cf_error: CloudflareError = serde_json::from_str(&error_body)
-            .map_err(|e| format!("Failed to parse error response: {} (body: {})", e, error_body))?;
+        let cf_error: CloudflareError = serde_json::from_str(&error_body).map_err(|e| {
+            format!(
+                "Failed to parse error response: {} (body: {})",
+                e, error_body
+            )
+        })?;
 
         let error_msg = cf_error
             .errors
@@ -277,8 +295,10 @@ pub async fn write_worker_secret(
     secret_name: &str,
     secret_value: &str,
 ) -> Result<(), String> {
-    let url = format!("{}/accounts/{}/workers/scripts/{}/secrets",
-        CF_API_BASE, account_id, worker_name);
+    let url = format!(
+        "{}/accounts/{}/workers/scripts/{}/secrets",
+        CF_API_BASE, account_id, worker_name
+    );
 
     let response = client
         .put(&url)
@@ -309,7 +329,10 @@ pub async fn write_worker_secret(
             .and_then(|e| e.message.clone())
             .unwrap_or_else(|| format!("HTTP {}", status));
 
-        return Err(format!("Failed to write secret {}: {}", secret_name, error_msg));
+        return Err(format!(
+            "Failed to write secret {}: {}",
+            secret_name, error_msg
+        ));
     }
 
     Ok(())
@@ -329,8 +352,10 @@ pub async fn enable_workers_dev_routing(
 
     // POST to this endpoint enables workers.dev routing for the worker
     // The worker will be accessible at https://{worker_name}.{subdomain}.workers.dev
-    let url = format!("{}/accounts/{}/workers/scripts/{}/subdomain",
-        CF_API_BASE, account_id, worker_name);
+    let url = format!(
+        "{}/accounts/{}/workers/scripts/{}/subdomain",
+        CF_API_BASE, account_id, worker_name
+    );
 
     let response = client
         .post(&url)
@@ -350,11 +375,20 @@ pub async fn enable_workers_dev_routing(
 
     if !status.is_success() {
         // Log detailed error for debugging
-        eprintln!("Error enabling workers.dev routing: HTTP {} - {}", status, response_body);
-        return Err(format!("Failed to enable workers.dev routing: HTTP {} - {}", status, response_body));
+        eprintln!(
+            "Error enabling workers.dev routing: HTTP {} - {}",
+            status, response_body
+        );
+        return Err(format!(
+            "Failed to enable workers.dev routing: HTTP {} - {}",
+            status, response_body
+        ));
     }
 
-    eprintln!("Successfully enabled workers.dev routing for {}: {}", worker_name, response_body);
+    eprintln!(
+        "Successfully enabled workers.dev routing for {}: {}",
+        worker_name, response_body
+    );
     Ok(())
 }
 
@@ -365,8 +399,10 @@ pub async fn check_worker_exists(
     account_id: &str,
     worker_name: &str,
 ) -> Result<bool, String> {
-    let url = format!("{}/accounts/{}/workers/scripts/{}/",
-        CF_API_BASE, account_id, worker_name);
+    let url = format!(
+        "{}/accounts/{}/workers/scripts/{}/",
+        CF_API_BASE, account_id, worker_name
+    );
 
     let response = client
         .get(&url)
@@ -385,8 +421,7 @@ pub async fn get_worker_subdomain(
     account_id: &str,
 ) -> Result<String, String> {
     // Get the account's workers.dev subdomain
-    let url = format!("{}/accounts/{}/workers/subdomain",
-        CF_API_BASE, account_id);
+    let url = format!("{}/accounts/{}/workers/subdomain", CF_API_BASE, account_id);
 
     let response = client
         .get(&url)
@@ -403,7 +438,10 @@ pub async fn get_worker_subdomain(
             .await
             .map_err(|e| format!("Failed to read error response: {}", e))?;
 
-        return Err(format!("Failed to get worker subdomain: HTTP {} - {}", status, error_body));
+        return Err(format!(
+            "Failed to get worker subdomain: HTTP {} - {}",
+            status, error_body
+        ));
     }
 
     let body: serde_json::Value = response
@@ -445,13 +483,15 @@ pub async fn ensure_account_workers_dev_subdomain(
     // If no subdomain exists, try to set one
     // Use account_id prefix as a reasonable subdomain name
     // (most accounts already have a subdomain, so this is a fallback)
-    let url = format!("{}/accounts/{}/workers/subdomain",
-        CF_API_BASE, account_id);
+    let url = format!("{}/accounts/{}/workers/subdomain", CF_API_BASE, account_id);
 
     // Use a short identifier derived from account_id
     let subdomain_name = format!("tc-{}", &account_id[..8.min(account_id.len())]);
 
-    eprintln!("Attempting to create workers.dev subdomain: {}", subdomain_name);
+    eprintln!(
+        "Attempting to create workers.dev subdomain: {}",
+        subdomain_name
+    );
 
     let response = client
         .put(&url)
@@ -470,8 +510,14 @@ pub async fn ensure_account_workers_dev_subdomain(
             .text()
             .await
             .map_err(|e| format!("Failed to read error response: {}", e))?;
-        eprintln!("Failed to set workers.dev subdomain: HTTP {} - {}", status, error_body);
-        return Err(format!("Failed to set workers.dev subdomain: HTTP {} - {}", status, error_body));
+        eprintln!(
+            "Failed to set workers.dev subdomain: HTTP {} - {}",
+            status, error_body
+        );
+        return Err(format!(
+            "Failed to set workers.dev subdomain: HTTP {} - {}",
+            status, error_body
+        ));
     }
 
     let body: serde_json::Value = response
@@ -518,7 +564,15 @@ pub async fn deploy_via_rest_api(
         progress_percent: 40,
     });
 
-    upload_worker_script(&client, api_token, account_id, &config.worker_name, worker_script, config).await?;
+    upload_worker_script(
+        &client,
+        api_token,
+        account_id,
+        &config.worker_name,
+        worker_script,
+        config,
+    )
+    .await?;
 
     // Phase 2.5: Enable workers.dev subdomain routing
     progress_callback(DeployProgress {
@@ -536,10 +590,24 @@ pub async fn deploy_via_rest_api(
         progress_percent: 60,
     });
 
-    write_worker_secret(&client, api_token, account_id, &config.worker_name,
-        "SHARING_TOKEN_SECRET", &config.sharing_token_secret).await?;
-    write_worker_secret(&client, api_token, account_id, &config.worker_name,
-        "BOOTSTRAP_TOKEN_SECRET", &config.bootstrap_token_secret).await?;
+    write_worker_secret(
+        &client,
+        api_token,
+        account_id,
+        &config.worker_name,
+        "SHARING_TOKEN_SECRET",
+        &config.sharing_token_secret,
+    )
+    .await?;
+    write_worker_secret(
+        &client,
+        api_token,
+        account_id,
+        &config.worker_name,
+        "BOOTSTRAP_TOKEN_SECRET",
+        &config.bootstrap_token_secret,
+    )
+    .await?;
 
     // Phase 4: Get deployment URL
     progress_callback(DeployProgress {
@@ -555,7 +623,9 @@ pub async fn deploy_via_rest_api(
         } else {
             // Get the account's workers.dev subdomain and construct URL
             match get_worker_subdomain(&client, api_token, account_id).await {
-                Ok(subdomain) => format!("https://{}.{}.workers.dev", config.worker_name, subdomain),
+                Ok(subdomain) => {
+                    format!("https://{}.{}.workers.dev", config.worker_name, subdomain)
+                }
                 Err(_) => format!("https://{}.workers.dev", config.worker_name),
             }
         }
@@ -590,7 +660,8 @@ pub async fn deploy_via_rest_api(
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             if check_worker_exists(&client, api_token, account_id, &config.worker_name)
                 .await
-                .unwrap_or(false) {
+                .unwrap_or(false)
+            {
                 break;
             }
         }

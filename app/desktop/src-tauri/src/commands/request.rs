@@ -1,9 +1,9 @@
-use tauri::{AppHandle, Emitter, State};
-use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate, CoreEngine};
-use tapchat_core::transport_contract::MessageRequestAction;
 use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
+use tapchat_core::transport_contract::MessageRequestAction;
+use tapchat_core::{CoreCommand, CoreEngine, CoreOutput, CoreStateUpdate};
+use tauri::{AppHandle, Emitter, State};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::AppState;
 
@@ -28,12 +28,9 @@ pub async fn list_message_requests(
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    drive_core_with_handle(
-        &app,
-        CoreInput::Command(CoreCommand::ListMessageRequests),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListMessageRequests))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -64,19 +61,19 @@ pub async fn act_on_message_request(
             // and sync promoted inbox records before the UI navigates.
             let profile_path = profile_path.ok_or("Profile path not set")?;
 
-            let result = tapchat_core::desktop_app::message_request_accept(
-                profile_path,
-                &request_id,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let result =
+                tapchat_core::desktop_app::message_request_accept(profile_path, &request_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
 
             // Reload engine from profile to sync memory state with disk
             {
                 let mut inner = state.inner.write().await;
 
                 // Load fresh snapshot from disk via ProfileManager
-                let snapshot = inner.profile_manager.load_snapshot()
+                let snapshot = inner
+                    .profile_manager
+                    .load_snapshot()
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -91,24 +88,27 @@ pub async fn act_on_message_request(
             }
 
             // Emit core-update to refresh frontend state
-            let _ = app.emit("core-update", CoreOutput {
-                state_update: CoreStateUpdate {
-                    contacts_changed: true,
-                    conversations_changed: result.conversation_available,
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![],
-                view_model: Some(CoreViewModel {
-                    message_request_action: Some(MessageRequestActionSummary {
-                        accepted: result.accepted,
-                        request_id: result.request_id.clone(),
-                        sender_user_id: result.sender_user_id.clone(),
-                        promoted_count: result.promoted_count,
-                        action: MessageRequestAction::Accept,
+            let _ = app.emit(
+                "core-update",
+                CoreOutput {
+                    state_update: CoreStateUpdate {
+                        contacts_changed: true,
+                        conversations_changed: result.conversation_available,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![],
+                    view_model: Some(CoreViewModel {
+                        message_request_action: Some(MessageRequestActionSummary {
+                            accepted: result.accepted,
+                            request_id: result.request_id.clone(),
+                            sender_user_id: result.sender_user_id.clone(),
+                            promoted_count: result.promoted_count,
+                            action: MessageRequestAction::Accept,
+                        }),
+                        ..CoreViewModel::default()
                     }),
-                    ..CoreViewModel::default()
-                }),
-            });
+                },
+            );
 
             Ok(MessageRequestActionOutput {
                 accepted: result.accepted,
@@ -137,7 +137,8 @@ pub async fn act_on_message_request(
             .map_err(|e| e.to_string())?;
 
             // Extract result from output
-            let action_summary = output.view_model
+            let action_summary = output
+                .view_model
                 .and_then(|vm| vm.message_request_action)
                 .ok_or("Message request action result not returned")?;
 
@@ -163,12 +164,9 @@ pub async fn get_allowlist(
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    drive_core_with_handle(
-        &app,
-        CoreInput::Command(CoreCommand::ListAllowlist),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListAllowlist))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

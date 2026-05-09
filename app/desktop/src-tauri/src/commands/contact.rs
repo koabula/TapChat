@@ -3,7 +3,7 @@ use tauri::State;
 use tapchat_core::ffi_api::ContactSummary;
 use tapchat_core::{CoreCommand, CoreOutput};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -23,7 +23,10 @@ pub async fn import_contact_by_link(
         .map_err(|e| format!("Failed to fetch identity bundle: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Failed to fetch bundle: HTTP {}", response.status()));
+        return Err(format!(
+            "Failed to fetch bundle: HTTP {}",
+            response.status()
+        ));
     }
 
     // Parse the identity bundle
@@ -42,23 +45,23 @@ pub async fn import_contact_by_link(
 }
 
 #[tauri::command]
-pub async fn list_contacts(
-    state: State<'_, AppState>,
-) -> Result<Vec<ContactSummary>, String> {
+pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactSummary>, String> {
     let inner = state.inner.read().await;
 
     // Get snapshot from engine which contains all contacts
     let snapshot = inner.engine.refresh_snapshot();
 
     // Build contact summaries from snapshot
-    let summaries: Vec<ContactSummary> = snapshot.contacts
+    let summaries: Vec<ContactSummary> = snapshot
+        .contacts
         .iter()
-        .map(|persisted| {
-            ContactSummary {
-                user_id: persisted.user_id.clone(),
-                display_name: persisted.display_name.clone().or(persisted.original_name.clone()),
-                device_count: persisted.bundle.devices.len(),
-            }
+        .map(|persisted| ContactSummary {
+            user_id: persisted.user_id.clone(),
+            display_name: persisted
+                .display_name
+                .clone()
+                .or(persisted.original_name.clone()),
+            device_count: persisted.bundle.devices.len(),
         })
         .collect();
 
@@ -66,10 +69,7 @@ pub async fn list_contacts(
 }
 
 #[tauri::command]
-pub async fn refresh_contact(
-    app: tauri::AppHandle,
-    user_id: String,
-) -> Result<CoreOutput, String> {
+pub async fn refresh_contact(app: tauri::AppHandle, user_id: String) -> Result<CoreOutput, String> {
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RefreshIdentityState { user_id }),
@@ -96,10 +96,7 @@ pub async fn set_contact_display_name(
 }
 
 #[tauri::command]
-pub async fn delete_contact(
-    app: tauri::AppHandle,
-    user_id: String,
-) -> Result<CoreOutput, String> {
+pub async fn delete_contact(app: tauri::AppHandle, user_id: String) -> Result<CoreOutput, String> {
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::DeleteContact { user_id }),

@@ -231,6 +231,126 @@ export interface PutWelcomePickupResult {
   accepted: boolean;
 }
 
+export type GroupInviteService = "group_invite";
+
+export interface GroupInviteTokenPayload {
+  version: string;
+  service: GroupInviteService;
+  groupId: string;
+  inviteId: string;
+  inviterUserId: string;
+  inviterDeviceId: string;
+  joinPolicy: GroupJoinPolicy;
+  expiresAt: number;
+  maxUses?: number;
+}
+
+export interface GroupInviteDocument {
+  version: string;
+  groupId: string;
+  title: string;
+  inviteId: string;
+  joinPolicy: GroupJoinPolicy;
+  inviterUserId: string;
+  inviterDeviceId: string;
+  inviterContactShareUrl?: string;
+  ownerUserId: string;
+  ownerContactShareUrl?: string;
+  joinRequestEndpoint: string;
+  createdAt: number;
+  expiresAt: number;
+  maxUses?: number;
+  signature: string;
+}
+
+export type GroupJoinRequestStatus = "pending" | "approved" | "rejected" | "expired" | "revoked";
+
+export interface GroupJoinRequest {
+  version: string;
+  requestId: string;
+  groupId: string;
+  inviteId: string;
+  joinerUserId: string;
+  joinerDeviceId: string;
+  joinerContactShareUrl: string;
+  requestedAt: number;
+  requestCapability: string;
+  signature: string;
+  status: GroupJoinRequestStatus;
+  autoApprove?: boolean;
+}
+
+export interface CreateGroupInviteRequest {
+  version: string;
+  groupId: string;
+  document: GroupInviteDocument;
+  capability: GroupCapability;
+  maxUses?: number;
+}
+
+export interface CreateGroupInviteResult {
+  inviteUrl: string;
+  invite: GroupInviteDocument;
+}
+
+export interface RevokeGroupInviteRequest {
+  version: string;
+  groupId: string;
+  inviteId: string;
+  capability: GroupCapability;
+}
+
+export interface RevokeGroupInviteResult {
+  accepted: boolean;
+  inviteId: string;
+}
+
+export interface FetchGroupInviteResult {
+  invite: GroupInviteDocument;
+}
+
+export interface SubmitGroupJoinRequest {
+  version: string;
+  inviteToken: string;
+  request: GroupJoinRequest;
+}
+
+export interface SubmitGroupJoinResult {
+  accepted: boolean;
+  request: GroupJoinRequest;
+  autoApprove?: boolean;
+}
+
+export interface ListGroupJoinRequestsResult {
+  requests: GroupJoinRequest[];
+}
+
+export interface GetGroupJoinRequestStatusResult {
+  request: GroupJoinRequest;
+  welcomePickup?: WelcomePickupDescriptor;
+  manifest?: GroupManifest;
+  startCursor?: GroupCursor;
+}
+
+export type GroupJoinDecision = "approve" | "reject";
+
+export interface DecideGroupJoinRequest {
+  version: string;
+  groupId: string;
+  requestId: string;
+  decision: GroupJoinDecision;
+  capability: GroupCapability;
+  welcomePickup?: WelcomePickupDescriptor;
+  manifest?: GroupManifest;
+  startCursor?: GroupCursor;
+  reason?: string;
+}
+
+export interface DecideGroupJoinResult {
+  accepted: boolean;
+  request: GroupJoinRequest;
+}
+
 export interface Ack {
   deviceId: string;
   ackSeq: number;

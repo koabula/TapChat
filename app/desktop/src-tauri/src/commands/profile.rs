@@ -4,16 +4,14 @@ use tauri::{AppHandle, Emitter, State};
 
 use tapchat_core::CoreEngine;
 
-use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::profile::ProfileSummary;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, SessionState};
 
 #[tauri::command]
-pub async fn list_profiles(
-    state: State<'_, AppState>,
-) -> Result<Vec<ProfileSummary>, String> {
+pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileSummary>, String> {
     let pm = &state.inner.read().await.profile_manager;
     let profiles = pm.list_profiles().await;
     log::info!("list_profiles: returning {} profiles", profiles.len());
@@ -36,8 +34,8 @@ pub async fn create_profile(
     name: String,
 ) -> Result<ProfileSummary, String> {
     // Use default path: APPDATA/TapChat/profiles/{name}
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| "Could not determine app data directory".to_string())?;
+    let data_dir =
+        dirs::data_dir().ok_or_else(|| "Could not determine app data directory".to_string())?;
 
     let path = data_dir.join("TapChat").join("profiles").join(&name);
 
@@ -64,7 +62,9 @@ pub async fn start_new_profile_onboarding(
     // Set session state to Onboarding Welcome
     {
         let mut inner = state.inner.write().await;
-        inner.session = SessionState::Onboarding { step: crate::state::OnboardingStep::Welcome };
+        inner.session = SessionState::Onboarding {
+            step: crate::state::OnboardingStep::Welcome,
+        };
         inner.profile_path = None; // Clear profile path - will be set during onboarding
 
         // Reset engine to fresh state
@@ -74,11 +74,14 @@ pub async fn start_new_profile_onboarding(
     set_ws_connection_snapshot(&state, None, false).await;
 
     // Emit session-status event to notify frontend - this triggers route change
-    let _ = app.emit("session-status", SessionStatus {
-        state: "onboarding:welcome".to_string(),
-        device_id: None,
-        ws_connected: false,
-    });
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "onboarding:welcome".to_string(),
+            device_id: None,
+            ws_connected: false,
+        },
+    );
 
     Ok(())
 }
@@ -130,13 +133,13 @@ pub async fn delete_profile(
     };
 
     if is_active {
-        return Err("Cannot delete the active profile. Switch to another profile first.".to_string());
+        return Err(
+            "Cannot delete the active profile. Switch to another profile first.".to_string(),
+        );
     }
 
     let pm = &state.inner.read().await.profile_manager;
-    pm.delete_profile(&path)
-        .await
-        .map_err(|e| e.to_string())?;
+    pm.delete_profile(&path).await.map_err(|e| e.to_string())?;
 
     // Refresh profiles list
     let profiles: Vec<ProfileSummary> = pm.list_profiles().await;
@@ -146,10 +149,7 @@ pub async fn delete_profile(
 }
 
 #[tauri::command]
-pub async fn reload_engine(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn reload_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     reload_engine_from_profile(&app, &state).await
 }
 
@@ -187,9 +187,18 @@ async fn reload_engine_from_profile(
         let inner = state.inner.read().await;
         log::info!(
             "reload_engine_from_profile: loading snapshot, active_profile={}",
-            inner.profile_manager.inner.read().await.active_profile.is_some()
+            inner
+                .profile_manager
+                .inner
+                .read()
+                .await
+                .active_profile
+                .is_some()
         );
-        inner.profile_manager.load_snapshot().await
+        inner
+            .profile_manager
+            .load_snapshot()
+            .await
             .map_err(|e| format!("Failed to load snapshot: {}", e))?
     };
 
@@ -212,7 +221,10 @@ async fn reload_engine_from_profile(
     // Step 4: Get device_id from profile metadata
     let device_id = {
         let inner = state.inner.read().await;
-        inner.profile_manager.get_active_metadata().await
+        inner
+            .profile_manager
+            .get_active_metadata()
+            .await
             .and_then(|m| m.device_id)
             .unwrap_or_else(|| "unknown-device".to_string())
     };
@@ -223,17 +235,22 @@ async fn reload_engine_from_profile(
     {
         let mut inner = state.inner.write().await;
         inner.engine = CoreEngine::from_restored_state(snapshot);
-        inner.session = SessionState::Active { device_id: device_id.clone() };
+        inner.session = SessionState::Active {
+            device_id: device_id.clone(),
+        };
     }
 
     set_ws_connection_snapshot(&state, Some(device_id.clone()), false).await;
 
     // Step 6: Emit session-status event - this happens BEFORE websocket connect
-    let _ = app.emit("session-status", SessionStatus {
-        state: "active".to_string(),
-        device_id: Some(device_id.clone()),
-        ws_connected: false,
-    });
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "active".to_string(),
+            device_id: Some(device_id.clone()),
+            ws_connected: false,
+        },
+    );
 
     // Step 7: Notify frontend of the reload (for clearing stores)
     // This triggers the frontend to clear its state and prepare for new data
@@ -243,8 +260,13 @@ async fn reload_engine_from_profile(
 
     // Step 8: Start session with AppStarted event - this will establish new websocket
     // If websocket connect fails, profile switch still succeeded, just realtime failed
-    if let Err(e) = drive_core_with_handle(app, CoreInput::Event(tapchat_core::CoreEvent::AppStarted)).await {
-        log::warn!("Failed to start realtime session after profile switch: {}", e);
+    if let Err(e) =
+        drive_core_with_handle(app, CoreInput::Event(tapchat_core::CoreEvent::AppStarted)).await
+    {
+        log::warn!(
+            "Failed to start realtime session after profile switch: {}",
+            e
+        );
         // Return success anyway - profile switch is complete, just realtime failed
     }
 

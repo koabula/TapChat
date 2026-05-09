@@ -7,11 +7,14 @@ use crate::ffi_api::{
     WriteDownloadedAttachmentEffect,
 };
 use crate::transport_contract::{
-    AppendGroupEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    AppendGroupEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest,
+    DecideGroupJoinRequest, FetchAllowlistRequest, FetchGroupInviteRequest,
     FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    FetchWelcomePickupRequest, GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
-    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
-    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest, MessageRequestActionRequest,
+    PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    SubmitGroupJoinRequest,
 };
 
 pub trait TransportPort {
@@ -80,6 +83,55 @@ pub trait TransportPort {
         _put: PutWelcomePickupRequest,
     ) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("welcome pickup put transport is not implemented by this platform")
+    }
+
+    async fn create_group_invite(
+        &mut self,
+        _create: CreateGroupInviteRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group invite create transport is not implemented by this platform")
+    }
+
+    async fn revoke_group_invite(
+        &mut self,
+        _revoke: RevokeGroupInviteRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group invite revoke transport is not implemented by this platform")
+    }
+
+    async fn fetch_group_invite(
+        &mut self,
+        _fetch: FetchGroupInviteRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group invite fetch transport is not implemented by this platform")
+    }
+
+    async fn submit_group_join_request(
+        &mut self,
+        _submit: SubmitGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group join submit transport is not implemented by this platform")
+    }
+
+    async fn list_group_join_requests(
+        &mut self,
+        _list: ListGroupJoinRequestsRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group join list transport is not implemented by this platform")
+    }
+
+    async fn get_group_join_request_status(
+        &mut self,
+        _get: GetGroupJoinRequestStatusRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group join status transport is not implemented by this platform")
+    }
+
+    async fn decide_group_join_request(
+        &mut self,
+        _decide: DecideGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group join decision transport is not implemented by this platform")
     }
 }
 
@@ -162,6 +214,19 @@ where
         CoreEffect::GetGroupOutboxHead { get } => ports.get_group_outbox_head(get).await,
         CoreEffect::FetchWelcomePickup { fetch } => ports.fetch_welcome_pickup(fetch).await,
         CoreEffect::PutWelcomePickup { put } => ports.put_welcome_pickup(put).await,
+        CoreEffect::CreateGroupInvite { create } => ports.create_group_invite(create).await,
+        CoreEffect::RevokeGroupInvite { revoke } => ports.revoke_group_invite(revoke).await,
+        CoreEffect::FetchGroupInvite { fetch } => ports.fetch_group_invite(fetch).await,
+        CoreEffect::SubmitGroupJoinRequest { submit } => {
+            ports.submit_group_join_request(submit).await
+        }
+        CoreEffect::ListGroupJoinRequests { list } => ports.list_group_join_requests(list).await,
+        CoreEffect::GetGroupJoinRequestStatus { get } => {
+            ports.get_group_join_request_status(get).await
+        }
+        CoreEffect::DecideGroupJoinRequest { decide } => {
+            ports.decide_group_join_request(decide).await
+        }
         CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,
         CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
         CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,

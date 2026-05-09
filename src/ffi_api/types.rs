@@ -7,20 +7,26 @@ use crate::conversation::RecoveryStatus;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
-    Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope, GroupRole,
-    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary,
+    Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope,
+    GroupInviteDocument, GroupJoinRequest, GroupRole, IdentityBundle, InboxRecord, MessageType,
+    MlsStateStatus, MlsStateSummary, WelcomePickupDescriptor,
 };
-use crate::persistence::{CorePersistenceSnapshot, PersistOp, PersistedContact};
+use crate::persistence::{
+    CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedGroupInvite,
+    PersistedGroupJoinRequest, PersistedPendingGroupJoinApproval,
+};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
     AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest, BlobDownloadRequest,
-    BlobUploadRequest, FetchAllowlistRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupOutboxHeadRequest,
-    GroupRealtimeSubscriptionRequest, MessageRequestAction, MessageRequestActionRequest,
-    MessageRequestActionResult, MessageRequestItem, MessageRequestRealtimeChange,
-    PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
-    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    SharedStateDocumentKind,
+    BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
+    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest,
+    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest,
+    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
+    MessageRequestItem, MessageRequestRealtimeChange, PrepareBlobUploadRequest,
+    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -91,12 +97,35 @@ pub enum CoreCommand {
         group_id: String,
         invitee_user_ids: Vec<String>,
     },
+    CreateGroupInviteLink {
+        group_id: String,
+        expires_at: u64,
+        max_uses: Option<u64>,
+    },
+    RevokeGroupInviteLink {
+        group_id: String,
+        invite_id: String,
+    },
+    FetchGroupInvite {
+        invite_url: String,
+    },
+    SubmitGroupJoinRequest {
+        invite_url: String,
+    },
+    ListGroupJoinRequests {
+        group_id: String,
+    },
     RequestJoinGroup {
         invite_url: String,
     },
     ApproveGroupJoin {
         group_id: String,
         request_id: String,
+    },
+    RejectGroupJoin {
+        group_id: String,
+        request_id: String,
+        reason: Option<String>,
     },
     LeaveGroup {
         group_id: String,
@@ -297,6 +326,55 @@ pub enum CoreEvent {
         retryable: bool,
         detail: Option<String>,
     },
+    GroupInviteCreated {
+        invite_url: String,
+        invite: GroupInviteDocument,
+    },
+    GroupInviteCreateFailed {
+        group_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    GroupInviteFetched {
+        invite_url: String,
+        invite: GroupInviteDocument,
+    },
+    GroupInviteFetchFailed {
+        invite_url: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    GroupInviteRevoked {
+        group_id: String,
+        invite_id: String,
+    },
+    GroupJoinRequestSubmitted {
+        request: GroupJoinRequest,
+    },
+    GroupJoinRequestSubmitFailed {
+        invite_url: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    GroupJoinRequestsListed {
+        group_id: String,
+        requests: Vec<GroupJoinRequest>,
+    },
+    GroupJoinRequestStatusFetched {
+        request: GroupJoinRequest,
+        welcome_pickup: Option<WelcomePickupDescriptor>,
+        manifest: Option<crate::model::GroupManifest>,
+        start_cursor: Option<GroupCursor>,
+    },
+    GroupJoinDecisionApplied {
+        request: GroupJoinRequest,
+    },
+    GroupJoinDecisionFailed {
+        group_id: String,
+        request_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,6 +493,27 @@ pub enum CoreEffect {
     },
     PutWelcomePickup {
         put: PutWelcomePickupRequest,
+    },
+    CreateGroupInvite {
+        create: CreateGroupInviteRequest,
+    },
+    RevokeGroupInvite {
+        revoke: RevokeGroupInviteRequest,
+    },
+    FetchGroupInvite {
+        fetch: FetchGroupInviteRequest,
+    },
+    SubmitGroupJoinRequest {
+        submit: SubmitGroupJoinRequest,
+    },
+    ListGroupJoinRequests {
+        list: ListGroupJoinRequestsRequest,
+    },
+    GetGroupJoinRequestStatus {
+        get: GetGroupJoinRequestStatusRequest,
+    },
+    DecideGroupJoinRequest {
+        decide: DecideGroupJoinRequest,
     },
     FetchIdentityBundle {
         fetch: FetchIdentityBundleRequest,
@@ -573,6 +672,10 @@ pub struct CoreViewModel {
     pub message_request_action: Option<MessageRequestActionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub append_result: Option<AppendResultSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_invites: Vec<PersistedGroupInvite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_join_requests: Vec<GroupJoinRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -664,6 +767,9 @@ pub(crate) struct CoreState {
     pub(crate) group_states: BTreeMap<String, crate::persistence::PersistedGroupState>,
     pub(crate) group_cursors: BTreeMap<String, GroupCursor>,
     pub(crate) pending_group_outbox: Vec<PendingGroupOutboxItem>,
+    pub(crate) group_invites: BTreeMap<String, PersistedGroupInvite>,
+    pub(crate) group_join_requests: BTreeMap<String, PersistedGroupJoinRequest>,
+    pub(crate) pending_group_join_approvals: BTreeMap<String, PersistedPendingGroupJoinApproval>,
     pub(crate) pending_acks: BTreeMap<String, PendingAckState>,
     pub(crate) pending_blob_uploads: BTreeMap<String, PendingBlobUpload>,
     pub(crate) pending_blob_downloads: BTreeMap<String, PendingBlobDownload>,
@@ -710,6 +816,19 @@ pub(crate) enum PendingRequest {
     FetchWelcomePickup {
         group_id: String,
         device_id: String,
+    },
+    CreateGroupInvite {
+        group_id: String,
+        invite_id: String,
+    },
+    SubmitGroupJoinRequest {
+        group_id: String,
+        request_id: String,
+        invite_url: String,
+    },
+    DecideGroupJoinRequest {
+        group_id: String,
+        request_id: String,
     },
     Ack {
         device_id: String,
@@ -789,6 +908,9 @@ impl Default for CoreState {
             group_states: BTreeMap::new(),
             group_cursors: BTreeMap::new(),
             pending_group_outbox: Vec::new(),
+            group_invites: BTreeMap::new(),
+            group_join_requests: BTreeMap::new(),
+            pending_group_join_approvals: BTreeMap::new(),
             pending_acks: BTreeMap::new(),
             pending_blob_uploads: BTreeMap::new(),
             pending_blob_downloads: BTreeMap::new(),

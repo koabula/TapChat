@@ -3,7 +3,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use tapchat_core::{CoreCommand, CoreOutput};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::{AppState, SessionState, StartupPhase};
 use crate::timetest;
@@ -99,7 +99,12 @@ async fn run_gated_sync(
 
     let sync_start = std::time::Instant::now();
     let abs_start = crate::ts_ms();
-    timetest!("sync_begin device_id={} reason={} ts={}", device_id, reason, abs_start);
+    timetest!(
+        "sync_begin device_id={} reason={} ts={}",
+        device_id,
+        reason,
+        abs_start
+    );
 
     loop {
         let result = drive_core_with_handle(
@@ -125,7 +130,12 @@ async fn run_gated_sync(
 
         if !should_rerun {
             let elapsed_ms = sync_start.elapsed().as_millis();
-            timetest!("sync_done device_id={} elapsed_ms={} ts={}", device_id, elapsed_ms, abs_start + elapsed_ms as u128);
+            timetest!(
+                "sync_done device_id={} elapsed_ms={} ts={}",
+                device_id,
+                elapsed_ms,
+                abs_start + elapsed_ms as u128
+            );
             return result;
         }
 
@@ -163,20 +173,20 @@ pub async fn stop_realtime_session(
 
     // Close WebSocket through ports
     // Note: This would be better as an effect, but for now we emit a disconnect event
-    let _ = app.emit("session-status", SessionStatus {
-        state: "active".into(),
-        device_id: Some(device_id),
-        ws_connected: false,
-    });
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "active".into(),
+            device_id: Some(device_id),
+            ws_connected: false,
+        },
+    );
 
     Ok(())
 }
 
 #[tauri::command]
-pub async fn sync_now(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<CoreOutput, String> {
+pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<CoreOutput, String> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
@@ -184,9 +194,7 @@ pub async fn sync_now(
 }
 
 #[tauri::command]
-pub async fn get_session_status(
-    state: State<'_, AppState>,
-) -> Result<SessionStatus, String> {
+pub async fn get_session_status(state: State<'_, AppState>) -> Result<SessionStatus, String> {
     Ok(read_session_status_snapshot(&state).await)
 }
 

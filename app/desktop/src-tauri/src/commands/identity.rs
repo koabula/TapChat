@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{AppHandle, State};
 
-use tapchat_core::{CoreCommand, CoreOutput};
 use tapchat_core::model::DeviceStatusKind;
+use tapchat_core::{CoreCommand, CoreOutput};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::profile::ProfileSummary;
 use crate::state::AppState;
 
@@ -36,15 +36,18 @@ pub async fn init_onboarding_profile(
     profile_name: String,
 ) -> Result<ProfileSummary, String> {
     // Use default path: APPDATA/TapChat/profiles/{profile_name}
-    let data_dir = dirs::data_dir()
-        .ok_or_else(|| {
-            log::error!("Could not get data directory from dirs crate");
-            "Could not determine app data directory. Please ensure APPDATA environment variable is set.".to_string()
-        })?;
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        log::error!("Could not get data directory from dirs crate");
+        "Could not determine app data directory. Please ensure APPDATA environment variable is set."
+            .to_string()
+    })?;
 
     log::info!("Data dir: {:?}", data_dir);
 
-    let path = data_dir.join("TapChat").join("profiles").join(&profile_name);
+    let path = data_dir
+        .join("TapChat")
+        .join("profiles")
+        .join(&profile_name);
     log::info!("Creating profile '{}' at path: {:?}", profile_name, path);
 
     // Create profile
@@ -90,7 +93,10 @@ pub async fn create_or_load_identity(
                 .join("profiles")
                 .join("default");
 
-            state.inner.read().await
+            state
+                .inner
+                .read()
+                .await
                 .profile_manager
                 .create_profile("default", default_path.clone())
                 .await
@@ -125,7 +131,10 @@ pub async fn create_or_load_identity(
 
             // Update profile metadata with identity info
             drop(inner);
-            state.inner.read().await
+            state
+                .inner
+                .read()
+                .await
                 .profile_manager
                 .update_identity(Some(user_id.clone()), Some(device_id.clone()))
                 .await
@@ -135,7 +144,10 @@ pub async fn create_or_load_identity(
             {
                 let inner = state.inner.write().await;
                 let snapshot = inner.engine.refresh_snapshot();
-                inner.profile_manager.save_snapshot(&snapshot).await
+                inner
+                    .profile_manager
+                    .save_snapshot(&snapshot)
+                    .await
                     .map_err(|e| e.to_string())?;
             }
 
@@ -152,9 +164,7 @@ pub async fn create_or_load_identity(
 }
 
 #[tauri::command]
-pub async fn get_identity_info(
-    state: State<'_, AppState>,
-) -> Result<Option<IdentityInfo>, String> {
+pub async fn get_identity_info(state: State<'_, AppState>) -> Result<Option<IdentityInfo>, String> {
     let inner = state.inner.read().await;
 
     let identity = inner.engine.local_identity();
@@ -179,9 +189,7 @@ pub async fn get_identity_info(
 }
 
 #[tauri::command]
-pub async fn get_share_link(
-    state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
+pub async fn get_share_link(state: State<'_, AppState>) -> Result<Option<String>, String> {
     let inner = state.inner.read().await;
 
     // Get the share link from the deployment bundle
@@ -195,16 +203,18 @@ pub async fn get_share_link(
             // Get HTTP endpoint from deployment bundle
             let http_endpoint = d.deployment_bundle.inbox_http_endpoint;
             // Construct share link: {endpoint}/v1/shared-state/{user_id}/identity-bundle
-            Ok(Some(format!("{}/v1/shared-state/{}/identity-bundle", http_endpoint.trim_end_matches('/'), b.user_id)))
+            Ok(Some(format!(
+                "{}/v1/shared-state/{}/identity-bundle",
+                http_endpoint.trim_end_matches('/'),
+                b.user_id
+            )))
         }
         _ => Ok(None),
     }
 }
 
 #[tauri::command]
-pub async fn rotate_share_link(
-    app: AppHandle,
-) -> Result<CoreOutput, String> {
+pub async fn rotate_share_link(app: AppHandle) -> Result<CoreOutput, String> {
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RotateContactShareLink),
@@ -244,9 +254,7 @@ pub async fn set_local_display_name(
 ) -> Result<CoreOutput, String> {
     drive_core_with_handle(
         &app,
-        CoreInput::Command(CoreCommand::SetLocalDisplayName {
-            display_name,
-        }),
+        CoreInput::Command(CoreCommand::SetLocalDisplayName { display_name }),
     )
     .await
     .map_err(|e| e.to_string())
