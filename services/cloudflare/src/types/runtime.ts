@@ -22,6 +22,7 @@ export interface R2Bucket {
 
 export interface Env {
   INBOX: DurableObjectNamespace;
+  GROUP_OUTBOX: DurableObjectNamespace;
   TAPCHAT_STORAGE: R2Bucket;
   PUBLIC_BASE_URL?: string;
   DEPLOYMENT_REGION?: string;

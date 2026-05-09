@@ -51,7 +51,8 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       BOOTSTRAP_TOKEN_SECRET: "bootstrap-secret"
     },
     durableObjects: {
-      INBOX: "InboxDurableObject"
+      INBOX: "InboxDurableObject",
+      GROUP_OUTBOX: "GroupOutboxDurableObject"
     },
     r2Buckets: ["TAPCHAT_STORAGE"]
   });

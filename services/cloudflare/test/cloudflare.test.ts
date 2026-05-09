@@ -4,8 +4,12 @@ import {
   CURRENT_MODEL_VERSION,
   type AllowlistDocument,
   type AppendEnvelopeRequest,
+  type AppendGroupEnvelopeRequest,
   type BootstrapDeviceRequest,
   type DeploymentBundle,
+  type GroupCapability,
+  type GroupCapabilityOperation,
+  type GroupMessageType,
   type IdentityBundle,
   type MessageRequestListResult
 } from "../src/types/contracts";
@@ -37,6 +41,7 @@ class TestWebSocketPair {
 
 const { handleRequest } = await import("../src/routes/http");
 const { handleInboxDurableRequest } = await import("../src/inbox/durable");
+const { handleGroupOutboxDurableRequest } = await import("../src/group-outbox/durable");
 const { InboxService } = await import("../src/inbox/service");
 
 class MemoryState implements DurableObjectStorageLike {
@@ -170,6 +175,37 @@ class FakeInboxStub implements DurableObjectStub {
   }
 }
 
+class FakeGroupOutboxStub implements DurableObjectStub {
+  private readonly groupId: string;
+  private readonly state: MemoryState;
+  private readonly spillStore: MemoryR2Store;
+  private readonly env: { maxInlineBytes: number; retentionDays: number };
+
+  constructor(
+    groupId: string,
+    state: MemoryState,
+    spillStore: MemoryR2Store,
+    env: { maxInlineBytes: number; retentionDays: number }
+  ) {
+    this.groupId = groupId;
+    this.state = state;
+    this.spillStore = spillStore;
+    this.env = env;
+  }
+
+  async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const request = input instanceof Request ? input : new Request(input, init);
+    return handleGroupOutboxDurableRequest(request, {
+      groupId: this.groupId,
+      state: this.state,
+      spillStore: this.spillStore,
+      maxInlineBytes: this.env.maxInlineBytes,
+      retentionDays: this.env.retentionDays,
+      now: 1_000
+    });
+  }
+}
+
 function createEnv(options?: {
   rateLimitPerMinute?: string;
   rateLimitPerHour?: string;
@@ -180,6 +216,7 @@ function createEnv(options?: {
 }) {
   const bucket = new MemoryR2Store();
   const inboxes = new Map<string, FakeInboxStub>();
+  const groupOutboxes = new Map<string, FakeGroupOutboxStub>();
   const maxInlineBytes = Number(options?.maxInlineBytes ?? "128");
   const retentionDays = Number(options?.retentionDays ?? "30");
   const rateLimitPerMinute = Number(options?.rateLimitPerMinute ?? "60");
@@ -215,6 +252,24 @@ function createEnv(options?: {
           );
         }
         return inboxes.get(deviceId) as DurableObjectStub;
+      }
+    } satisfies DurableObjectNamespace,
+    GROUP_OUTBOX: {
+      idFromName(name: string) {
+        return name as DurableObjectId;
+      },
+      get(id: DurableObjectId) {
+        const groupId = id as unknown as string;
+        if (!groupOutboxes.has(groupId)) {
+          groupOutboxes.set(
+            groupId,
+            new FakeGroupOutboxStub(groupId, new MemoryState(), bucket, {
+              maxInlineBytes,
+              retentionDays
+            })
+          );
+        }
+        return groupOutboxes.get(groupId) as DurableObjectStub;
       }
     } satisfies DurableObjectNamespace
   };
@@ -258,6 +313,61 @@ function sampleCapability(deviceId = "device:bob:phone", conversationScope?: str
     expiresAt: Date.now() + 60_000,
     constraints: maxBytes === undefined ? undefined : { maxBytes },
     signature: "append-cap-sig"
+  };
+}
+
+function sampleGroupCapability(
+  groupId = "group:project",
+  operations: GroupCapabilityOperation[] = ["read", "append_application", "append_control", "append_membership"],
+  role: GroupCapability["role"] = "owner"
+): GroupCapability {
+  return {
+    version: CURRENT_MODEL_VERSION,
+    service: "group_outbox",
+    groupId,
+    userId: "user:alice",
+    deviceId: "device:alice:phone",
+    operations,
+    role,
+    expiresAt: Date.now() + 60_000,
+    signature: "group-cap-sig"
+  };
+}
+
+function sampleGroupAppend(
+  groupId = "group:project",
+  messageId = "msg:group:1",
+  messageType: GroupMessageType = "mls_application",
+  capability = sampleGroupCapability(groupId)
+): AppendGroupEnvelopeRequest {
+  return {
+    version: CURRENT_MODEL_VERSION,
+    groupId,
+    envelope: {
+      version: CURRENT_MODEL_VERSION,
+      messageId,
+      groupId,
+      conversationId: `conv:${groupId}`,
+      senderUserId: "user:alice",
+      senderDeviceId: "device:alice:phone",
+      createdAt: 1,
+      messageType,
+      visibility: "visible",
+      inlineCiphertext: "cipher",
+      storageRefs: [],
+      senderProof: {
+        type: "signature",
+        value: "sig"
+      }
+    },
+    capability
+  };
+}
+
+function groupHeaders(capability: GroupCapability): Record<string, string> {
+  return {
+    ...authHeaders(capability.signature),
+    "X-Tapchat-Group-Capability": JSON.stringify(capability)
   };
 }
 
@@ -712,6 +822,258 @@ test("shared-state writes accept device runtime auth", async () => {
   assert.equal(put.status, 200);
   const get = await handleRequest(new Request("https://example.com/v1/shared-state/user%3Aalice/identity-bundle"), env);
   assert.equal(get.status, 200);
+});
+
+test("group outbox appends fetches and returns head with authorized capability", async () => {
+  const { env } = createEnv();
+  const capability = sampleGroupCapability();
+
+  for (const [messageId, expectedSeq] of [["msg:group:1", 1], ["msg:group:2", 2]] as const) {
+    const response = await handleRequest(
+      new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+        method: "POST",
+        headers: {
+          ...groupHeaders(capability),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(sampleGroupAppend("group:project", messageId, "mls_application", capability))
+      }),
+      env
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { version: CURRENT_MODEL_VERSION, accepted: true, seq: expectedSeq });
+  }
+
+  const fetch = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=1&limit=10", {
+      headers: groupHeaders(capability)
+    }),
+    env
+  );
+  assert.equal(fetch.status, 200);
+  const body = await fetch.json() as { toSeq: number; records: Array<{ seq: number; messageId: string }> };
+  assert.equal(body.toSeq, 2);
+  assert.deepEqual(body.records.map((record) => [record.seq, record.messageId]), [
+    [1, "msg:group:1"],
+    [2, "msg:group:2"]
+  ]);
+
+  const head = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: groupHeaders(capability)
+    }),
+    env
+  );
+  assert.equal(head.status, 200);
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 2 });
+
+  const empty = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=99&limit=10", {
+      headers: groupHeaders(capability)
+    }),
+    env
+  );
+  assert.equal(empty.status, 200);
+  assert.deepEqual(await empty.json(), { version: CURRENT_MODEL_VERSION, toSeq: 2, records: [] });
+});
+
+test("group outbox append is idempotent by message id", async () => {
+  const { env } = createEnv();
+  const capability = sampleGroupCapability();
+  const request = sampleGroupAppend("group:project", "msg:group:idempotent", "mls_application", capability);
+
+  for (let i = 0; i < 2; i += 1) {
+    const response = await handleRequest(
+      new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+        method: "POST",
+        headers: {
+          ...groupHeaders(capability),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(request)
+      }),
+      env
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { version: CURRENT_MODEL_VERSION, accepted: true, seq: 1 });
+  }
+
+  const fetch = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=1&limit=10", {
+      headers: groupHeaders(capability)
+    }),
+    env
+  );
+  const body = await fetch.json() as { records: unknown[] };
+  assert.equal(body.records.length, 1);
+});
+
+test("group outbox rejects invalid capabilities and scope mismatches", async () => {
+  const { env } = createEnv();
+  const capability = sampleGroupCapability();
+
+  const missingAuth = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: {
+        "X-Tapchat-Group-Capability": JSON.stringify(capability)
+      }
+    }),
+    env
+  );
+  assert.equal(missingAuth.status, 401);
+
+  const invalidJson = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: {
+        ...authHeaders(capability.signature),
+        "X-Tapchat-Group-Capability": "{"
+      }
+    }),
+    env
+  );
+  assert.equal(invalidJson.status, 400);
+
+  const wrongSignature = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: {
+        ...authHeaders("wrong"),
+        "X-Tapchat-Group-Capability": JSON.stringify(capability)
+      }
+    }),
+    env
+  );
+  assert.equal(wrongSignature.status, 403);
+
+  const expired = sampleGroupCapability();
+  expired.expiresAt = 1;
+  const expiredResponse = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: groupHeaders(expired)
+    }),
+    env
+  );
+  assert.equal(expiredResponse.status, 403);
+
+  const wrongGroup = sampleGroupCapability("group:other");
+  const wrongGroupResponse = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: groupHeaders(wrongGroup)
+    }),
+    env
+  );
+  assert.equal(wrongGroupResponse.status, 403);
+
+  const bodyMismatch = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend("group:other", "msg:mismatch", "mls_application", capability))
+    }),
+    env
+  );
+  assert.equal(bodyMismatch.status, 403);
+});
+
+test("group outbox enforces operation and role permissions", async () => {
+  const { env } = createEnv();
+  const noRead = sampleGroupCapability("group:project", ["append_application"], "member");
+  const unreadable = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: groupHeaders(noRead)
+    }),
+    env
+  );
+  assert.equal(unreadable.status, 403);
+
+  const noApplication = sampleGroupCapability("group:project", ["read", "append_control"], "admin");
+  const appDenied = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(noApplication),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend("group:project", "msg:app-denied", "mls_application", noApplication))
+    }),
+    env
+  );
+  assert.equal(appDenied.status, 403);
+
+  const memberWithMembership = sampleGroupCapability(
+    "group:project",
+    ["read", "append_application", "append_control", "append_membership"],
+    "member"
+  );
+  const memberDenied = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(memberWithMembership),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend(
+        "group:project",
+        "msg:membership-denied",
+        "control_group_membership_changed",
+        memberWithMembership
+      ))
+    }),
+    env
+  );
+  assert.equal(memberDenied.status, 403);
+
+  const admin = sampleGroupCapability("group:project", ["read", "append_membership"], "admin");
+  const adminAllowed = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(admin),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend(
+        "group:project",
+        "msg:membership-allowed",
+        "control_group_membership_changed",
+        admin
+      ))
+    }),
+    env
+  );
+  assert.equal(adminAllowed.status, 200);
+});
+
+test("group outbox spills large records to R2 and fetches them back", async () => {
+  const { env, bucket } = createEnv({ maxInlineBytes: "1" });
+  const capability = sampleGroupCapability();
+  const append = sampleGroupAppend("group:project", "msg:large", "mls_application", capability);
+  append.envelope.inlineCiphertext = "large cipher payload";
+
+  const response = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(append)
+    }),
+    env
+  );
+  assert.equal(response.status, 200);
+  assert.equal(bucket.has("group-outbox-payload/group:project/1.json"), true);
+
+  const fetch = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=1&limit=10", {
+      headers: groupHeaders(capability)
+    }),
+    env
+  );
+  assert.equal(fetch.status, 200);
+  const body = await fetch.json() as { records: Array<{ messageId: string }> };
+  assert.deepEqual(body.records.map((record) => record.messageId), ["msg:large"]);
 });
 
 test("ack semantics reject backwards ack and cleanup only removes expired acked records", async () => {

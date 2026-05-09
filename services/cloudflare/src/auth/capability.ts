@@ -1,8 +1,12 @@
 import type {
   AppendEnvelopeRequest,
+  AppendGroupEnvelopeRequest,
   BootstrapToken,
   DeviceRuntimeScope,
   DeviceRuntimeToken,
+  GroupCapability,
+  GroupCapabilityOperation,
+  GroupMessageType,
   InboxAppendCapability,
   KeyPackageWriteToken,
   SharedStateWriteToken
@@ -87,6 +91,95 @@ export function validateAppendAuthorization(
   if (capability.constraints?.maxBytes !== undefined && size > capability.constraints.maxBytes) {
     throw new HttpError(413, "payload_too_large", "envelope exceeds capability size limit");
   }
+}
+
+export function readGroupCapabilityHeader(request: Request): GroupCapability {
+  const capabilityHeader = request.headers.get("X-Tapchat-Group-Capability");
+  if (!capabilityHeader) {
+    throw new HttpError(401, "invalid_capability", "missing X-Tapchat-Group-Capability header");
+  }
+  try {
+    return JSON.parse(capabilityHeader) as GroupCapability;
+  } catch {
+    throw new HttpError(400, "invalid_capability", "X-Tapchat-Group-Capability is not valid JSON");
+  }
+}
+
+export function validateGroupReadAuthorization(
+  request: Request,
+  groupId: string,
+  capability: GroupCapability,
+  now: number
+): void {
+  validateGroupCapabilityBase(request, groupId, capability, now);
+  if (!capability.operations.includes("read")) {
+    throw new HttpError(403, "invalid_capability", "group capability does not grant read");
+  }
+}
+
+export function validateGroupAppendAuthorization(
+  request: Request,
+  groupId: string,
+  body: AppendGroupEnvelopeRequest,
+  now: number
+): void {
+  const capability = body.capability;
+  validateGroupCapabilityBase(request, groupId, capability, now);
+  if (body.groupId !== groupId || body.envelope.groupId !== groupId) {
+    throw new HttpError(403, "invalid_capability", "group capability scope does not match request group");
+  }
+
+  const required = requiredGroupAppendOperation(body.envelope.messageType);
+  if (!capability.operations.includes(required)) {
+    throw new HttpError(403, "invalid_capability", `group capability does not grant ${required}`);
+  }
+  if (required === "append_membership" && capability.role === "member") {
+    throw new HttpError(403, "invalid_capability", "member role cannot append membership control messages");
+  }
+}
+
+function validateGroupCapabilityBase(
+  request: Request,
+  groupId: string,
+  capability: GroupCapability,
+  now: number
+): void {
+  const signature = getBearerToken(request);
+  if (capability.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "group capability version is not supported");
+  }
+  if (capability.signature !== signature) {
+    throw new HttpError(403, "invalid_capability", "group capability signature does not match bearer token");
+  }
+  if (capability.service !== "group_outbox") {
+    throw new HttpError(403, "invalid_capability", "group capability service must be group_outbox");
+  }
+  if (capability.groupId !== groupId) {
+    throw new HttpError(403, "invalid_capability", "group capability groupId does not match request path");
+  }
+  if (capability.expiresAt <= now) {
+    throw new HttpError(403, "capability_expired", "group capability is expired");
+  }
+}
+
+function requiredGroupAppendOperation(messageType: GroupMessageType): GroupCapabilityOperation {
+  if (messageType === "mls_application") {
+    return "append_application";
+  }
+  if (isMembershipControlMessage(messageType)) {
+    return "append_membership";
+  }
+  return "append_control";
+}
+
+function isMembershipControlMessage(messageType: GroupMessageType): boolean {
+  return (
+    messageType === "control_group_membership_changed" ||
+    messageType === "control_group_join_requested" ||
+    messageType === "control_group_join_approved" ||
+    messageType === "control_group_join_rejected" ||
+    messageType === "control_group_leave_requested"
+  );
 }
 
 async function verifySignedToken<T>(secret: string, request: Request, now: number): Promise<T> {

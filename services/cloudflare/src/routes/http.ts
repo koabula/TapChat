@@ -1,9 +1,12 @@
 import {
   HttpError,
+  readGroupCapabilityHeader,
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
   validateBootstrapAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
+  validateGroupAppendAuthorization,
+  validateGroupReadAuthorization,
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization
 } from "../auth/capability";
@@ -13,6 +16,7 @@ import { StorageService } from "../storage/service";
 import {
   CURRENT_MODEL_VERSION,
   type AllowlistDocument,
+  type AppendGroupEnvelopeRequest,
   type AppendEnvelopeRequest,
   type BootstrapDeviceRequest,
   type DeploymentBundle,
@@ -144,7 +148,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
       keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
-      features: ["generic_sync", "attachment_v1", "message_requests", "allowlist", "rate_limit"]
+      features: ["generic_sync", "attachment_v1", "message_requests", "allowlist", "rate_limit", "group_outbox_mvp"]
     }
   };
 }
@@ -243,6 +247,23 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         operation.startsWith("message-requests/")
       ) {
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_manage", now);
+      }
+
+      return stub.fetch(request);
+    }
+
+    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head)$/);
+    if (groupOutboxMatch) {
+      const groupId = decodeURIComponent(groupOutboxMatch[1]);
+      const operation = groupOutboxMatch[2];
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      const stub = env.GROUP_OUTBOX.get(objectId);
+
+      if (request.method === "POST" && operation === "messages") {
+        const body = (await request.clone().json()) as AppendGroupEnvelopeRequest;
+        validateGroupAppendAuthorization(request, groupId, body, now);
+      } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
+        validateGroupReadAuthorization(request, groupId, readGroupCapabilityHeader(request), now);
       }
 
       return stub.fetch(request);

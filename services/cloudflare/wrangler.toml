@@ -14,6 +14,10 @@ BOOTSTRAP_TOKEN_SECRET = "replace-me-bootstrap"
 name = "INBOX"
 class_name = "InboxDurableObject"
 
+[[durable_objects.bindings]]
+name = "GROUP_OUTBOX"
+class_name = "GroupOutboxDurableObject"
+
 [[r2_buckets]]
 binding = "TAPCHAT_STORAGE"
 bucket_name = "tapchat-storage"
@@ -22,3 +26,7 @@ preview_bucket_name = "tapchat-storage-preview"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["InboxDurableObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["GroupOutboxDurableObject"]
