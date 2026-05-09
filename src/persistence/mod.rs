@@ -6,7 +6,10 @@ use crate::attachment_crypto::AttachmentPayloadMetadata;
 use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::PublishedKeyPackage;
-use crate::model::{Ack, DeploymentBundle, Envelope, IdentityBundle, MlsStateSummary};
+use crate::model::{
+    Ack, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope, GroupManifest, GroupRole,
+    IdentityBundle, MlsStateSummary, WelcomePickupDescriptor,
+};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::PrepareBlobUploadResult;
 
@@ -60,6 +63,33 @@ pub struct PersistedOutgoingEnvelope {
     pub message_id: String,
     pub envelope: Envelope,
     pub peer_user_id: String,
+    pub retries: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaintext_cache: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGroupState {
+    pub group_id: String,
+    pub conversation_id: String,
+    pub manifest: GroupManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_role: Option<GroupRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_pickup: Option<WelcomePickupDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGroupCursor {
+    pub group_id: String,
+    pub cursor: GroupCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedOutgoingGroupEnvelope {
+    pub message_id: String,
+    pub group_id: String,
+    pub envelope: GroupEnvelope,
     pub retries: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_cache: Option<String>,
@@ -164,6 +194,12 @@ pub struct CorePersistenceSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_outbox: Vec<PersistedOutgoingEnvelope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_states: Vec<PersistedGroupState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_cursors: Vec<PersistedGroupCursor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_group_outbox: Vec<PersistedOutgoingGroupEnvelope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_acks: Vec<PersistedPendingAck>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_blob_transfers: Vec<PersistedPendingBlobTransfer>,
@@ -198,6 +234,12 @@ pub enum PersistOp {
     DeleteMlsState { conversation_id: String },
     SaveOutgoingEnvelope { message_id: String },
     DeleteOutgoingEnvelope { message_id: String },
+    SaveGroupState { group_id: String },
+    DeleteGroupState { group_id: String },
+    SaveGroupCursor { group_id: String },
+    DeleteGroupCursor { group_id: String },
+    SaveOutgoingGroupEnvelope { message_id: String },
+    DeleteOutgoingGroupEnvelope { message_id: String },
     SavePendingAck { device_id: String },
     DeletePendingAck { device_id: String },
     SavePendingBlobTransfer { task_id: String },
@@ -267,6 +309,9 @@ pub struct InMemoryPersistence {
     sync_states: BTreeMap<String, PersistedSyncState>,
     mls_states: BTreeMap<String, PersistedMlsState>,
     pending_outbox: BTreeMap<String, PersistedOutgoingEnvelope>,
+    group_states: BTreeMap<String, PersistedGroupState>,
+    group_cursors: BTreeMap<String, PersistedGroupCursor>,
+    pending_group_outbox: BTreeMap<String, PersistedOutgoingGroupEnvelope>,
     pending_acks: BTreeMap<String, PersistedPendingAck>,
     pending_blob_transfers: BTreeMap<String, PersistedPendingBlobTransfer>,
     recovery_contexts: BTreeMap<String, PersistedRecoveryContext>,
@@ -304,6 +349,24 @@ impl InMemoryPersistence {
             .collect();
         self.pending_outbox = snapshot
             .pending_outbox
+            .iter()
+            .cloned()
+            .map(|item| (item.message_id.clone(), item))
+            .collect();
+        self.group_states = snapshot
+            .group_states
+            .iter()
+            .cloned()
+            .map(|state| (state.group_id.clone(), state))
+            .collect();
+        self.group_cursors = snapshot
+            .group_cursors
+            .iter()
+            .cloned()
+            .map(|cursor| (cursor.group_id.clone(), cursor))
+            .collect();
+        self.pending_group_outbox = snapshot
+            .pending_group_outbox
             .iter()
             .cloned()
             .map(|item| (item.message_id.clone(), item))
@@ -350,6 +413,9 @@ impl InMemoryPersistence {
             sync_states: self.sync_states.values().cloned().collect(),
             mls_states: self.mls_states.values().cloned().collect(),
             pending_outbox: self.pending_outbox.values().cloned().collect(),
+            group_states: self.group_states.values().cloned().collect(),
+            group_cursors: self.group_cursors.values().cloned().collect(),
+            pending_group_outbox: self.pending_group_outbox.values().cloned().collect(),
             pending_acks: self.pending_acks.values().cloned().collect(),
             pending_blob_transfers: self.pending_blob_transfers.values().cloned().collect(),
             recovery_contexts: self.recovery_contexts.values().cloned().collect(),
@@ -629,6 +695,9 @@ mod tests {
                 retries: 0,
                 plaintext_cache: Some("test plaintext".into()),
             }],
+            group_states: vec![],
+            group_cursors: vec![],
+            pending_group_outbox: vec![],
             pending_acks: vec![PersistedPendingAck {
                 device_id: identity.device_identity.device_id.clone(),
                 ack: Ack {
@@ -812,6 +881,9 @@ mod tests {
             sync_states: vec![],
             mls_states: vec![],
             pending_outbox: vec![],
+            group_states: vec![],
+            group_cursors: vec![],
+            pending_group_outbox: vec![],
             pending_acks: vec![],
             pending_blob_transfers: vec![],
             recovery_contexts: vec![],
@@ -836,6 +908,34 @@ mod tests {
             loaded.contacts[0].bundle.identity_bundle_ref.as_deref(),
             Some("ref:identity-bob")
         );
+    }
+
+    #[test]
+    fn direct_only_snapshot_decodes_with_empty_group_defaults() {
+        let bytes = serde_json::json!({
+            "format_version": SNAPSHOT_FORMAT_VERSION,
+            "snapshot": {
+                "message_nonce": 3,
+                "contacts": [],
+                "conversations": [],
+                "sync_states": [],
+                "mls_states": [],
+                "pending_outbox": [],
+                "pending_acks": [],
+                "pending_blob_transfers": [],
+                "recovery_contexts": [],
+                "realtime_sessions": [],
+                "mls_state_persistence_blocked": false
+            }
+        })
+        .to_string();
+
+        let snapshot = decode_snapshot(bytes.as_bytes()).expect("decode direct-only snapshot");
+
+        assert_eq!(snapshot.message_nonce, 3);
+        assert!(snapshot.group_states.is_empty());
+        assert!(snapshot.group_cursors.is_empty());
+        assert!(snapshot.pending_group_outbox.is_empty());
     }
 
     #[test]

@@ -47,6 +47,12 @@ export interface ConversationSummary {
   conversation_id: string;
   peer_user_id: string;
   state: string;
+  kind?: "direct" | "group";
+  title?: string | null;
+  group_id?: string | null;
+  member_count?: number | null;
+  group_role?: GroupRole | null;
+  group_cursor?: GroupCursor | null;
   last_message_preview?: string | null;
   last_message_type?: string;
   message_count?: number;
@@ -67,6 +73,130 @@ export interface StorageRef {
   mime_type: string;
   file_name?: string; // original file name
   expires_at?: number;
+}
+
+export type GroupRole = "owner" | "admin" | "member";
+export type GroupMemberStatus = "active" | "pending" | "removed" | "left";
+export type GroupJoinPolicy = "closed" | "approval_required" | "open_by_invite";
+export type GroupMemberInvitePolicy = "owner_admin_only" | "request_owner_approval";
+
+export interface GroupMember {
+  user_id: string;
+  role: GroupRole;
+  status: GroupMemberStatus;
+}
+
+export interface GroupOutboxDescriptor {
+  endpoint: string;
+  subscribe_endpoint?: string;
+}
+
+export interface GroupManifest {
+  version: string;
+  group_id: string;
+  conversation_id: string;
+  title: string;
+  owner_user_id: string;
+  admins: string[];
+  members: GroupMember[];
+  join_policy: GroupJoinPolicy;
+  member_invite_policy: GroupMemberInvitePolicy;
+  roster_version: number;
+  mls_epoch_hint: number;
+  last_commit_message_id?: string;
+  outbox: GroupOutboxDescriptor;
+  updated_at: number;
+  signer_user_id: string;
+  signer_device_id: string;
+  signature: string;
+}
+
+export type GroupCapabilityOperation =
+  | "read"
+  | "subscribe"
+  | "append_application"
+  | "append_control"
+  | "append_membership"
+  | "manage_invites"
+  | "approve_join"
+  | "remove_member"
+  | "update_group_metadata";
+
+export interface GroupCapability {
+  version: string;
+  service: "group_outbox";
+  group_id: string;
+  user_id: string;
+  device_id: string;
+  operations: GroupCapabilityOperation[];
+  role: GroupRole;
+  expires_at: number;
+  signature: string;
+}
+
+export type GroupMessageType =
+  | "mls_application"
+  | "mls_commit"
+  | "control_group_membership_changed"
+  | "control_group_metadata_updated"
+  | "control_group_join_requested"
+  | "control_group_join_approved"
+  | "control_group_join_rejected"
+  | "control_group_leave_requested"
+  | "control_conversation_needs_rebuild";
+
+export type GroupEnvelopeVisibility = "visible" | "protocol";
+
+export interface GroupEnvelope {
+  version: string;
+  message_id: string;
+  group_id: string;
+  conversation_id: string;
+  sender_user_id: string;
+  sender_device_id: string;
+  created_at: number;
+  message_type: GroupMessageType;
+  visibility: GroupEnvelopeVisibility;
+  inline_ciphertext?: string;
+  storage_refs?: StorageRef[];
+  sender_proof: SenderProof;
+  membership_proof?: SenderProof;
+}
+
+export interface GroupOutboxRecord {
+  seq: number;
+  group_id: string;
+  message_id: string;
+  received_at: number;
+  expires_at?: number;
+  state: "available";
+  envelope: GroupEnvelope;
+}
+
+export interface GroupCursor {
+  group_id: string;
+  last_fetched_seq: number;
+  updated_at: number;
+}
+
+export interface WelcomePickupDescriptor {
+  group_id: string;
+  device_id: string;
+  endpoint: string;
+  capability: string;
+  expires_at: number;
+}
+
+export interface GroupCommandResultSummary {
+  group_id?: string;
+  conversation_id?: string;
+  accepted: boolean;
+  status: "unsupported" | "pending" | "accepted";
+}
+
+export interface SenderProof {
+  type: string;
+  value: string;
 }
 
 // Messages - matches backend get_messages response
@@ -216,7 +346,13 @@ export interface CoreUpdateEvent {
 export type CoreEffect =
   | { type: "execute_http_request"; request: HttpRequestEffect }
   | { type: "open_realtime_connection"; connection: RealtimeConnectionEffect }
+  | { type: "open_group_realtime_connection"; subscription: GroupRealtimeSubscriptionRequest }
   | { type: "close_realtime_connection"; device_id: string }
+  | { type: "append_group_envelope"; append: AppendGroupEnvelopeRequest }
+  | { type: "fetch_group_outbox"; fetch: FetchGroupOutboxRequest }
+  | { type: "get_group_outbox_head"; get: GetGroupOutboxHeadRequest }
+  | { type: "fetch_welcome_pickup"; fetch: FetchWelcomePickupRequest }
+  | { type: "put_welcome_pickup"; put: PutWelcomePickupRequest }
   | { type: "fetch_identity_bundle"; fetch: FetchIdentityBundleRequest }
   | { type: "fetch_message_requests"; fetch: FetchMessageRequestsRequest }
   | { type: "act_on_message_request"; action: MessageRequestActionRequest }
@@ -249,6 +385,44 @@ interface RealtimeSubscriptionRequest {
   device_id: string;
   endpoint: string;
   last_acked_seq: number;
+  headers: Record<string, string>;
+}
+
+interface GroupRealtimeSubscriptionRequest {
+  group_id: string;
+  endpoint: string;
+  last_seq: number;
+  capability: GroupCapability;
+  headers: Record<string, string>;
+}
+
+interface AppendGroupEnvelopeRequest {
+  version: string;
+  group_id: string;
+  envelope: GroupEnvelope;
+  capability: GroupCapability;
+}
+
+interface FetchGroupOutboxRequest {
+  group_id: string;
+  from_seq: number;
+  limit: number;
+  capability: GroupCapability;
+}
+
+interface GetGroupOutboxHeadRequest {
+  group_id: string;
+  capability: GroupCapability;
+}
+
+interface FetchWelcomePickupRequest {
+  descriptor: WelcomePickupDescriptor;
+  headers: Record<string, string>;
+}
+
+interface PutWelcomePickupRequest {
+  descriptor: WelcomePickupDescriptor;
+  welcome_b64: string;
   headers: Record<string, string>;
 }
 

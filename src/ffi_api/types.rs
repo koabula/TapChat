@@ -7,17 +7,20 @@ use crate::conversation::RecoveryStatus;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
-    Ack, ConversationKind, DeploymentBundle, Envelope, IdentityBundle, InboxRecord, MessageType,
-    MlsStateStatus, MlsStateSummary,
+    Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupRole, IdentityBundle,
+    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary,
 };
 use crate::persistence::{CorePersistenceSnapshot, PersistOp, PersistedContact};
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    AllowlistDocument, AppendDeliveryDisposition, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestAction,
-    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
-    MessageRequestRealtimeChange, PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, SharedStateDocumentKind,
+    AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest, BlobDownloadRequest,
+    BlobUploadRequest, FetchAllowlistRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupOutboxHeadRequest,
+    GroupRealtimeSubscriptionRequest, MessageRequestAction, MessageRequestActionRequest,
+    MessageRequestActionResult, MessageRequestItem, MessageRequestRealtimeChange,
+    PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
+    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    SharedStateDocumentKind,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -51,6 +54,10 @@ pub enum CoreCommand {
         peer_user_id: String,
         conversation_kind: ConversationKind,
     },
+    CreateGroupConversation {
+        title: String,
+        member_user_ids: Vec<String>,
+    },
     ReconcileConversationMembership {
         conversation_id: String,
     },
@@ -71,6 +78,32 @@ pub enum CoreCommand {
     SyncInbox {
         device_id: String,
         reason: Option<String>,
+    },
+    SyncGroupOutbox {
+        group_id: String,
+        reason: Option<String>,
+    },
+    SendGroupTextMessage {
+        conversation_id: String,
+        plaintext: String,
+    },
+    InviteToGroup {
+        group_id: String,
+        invitee_user_ids: Vec<String>,
+    },
+    RequestJoinGroup {
+        invite_url: String,
+    },
+    ApproveGroupJoin {
+        group_id: String,
+        request_id: String,
+    },
+    LeaveGroup {
+        group_id: String,
+    },
+    RemoveGroupMember {
+        group_id: String,
+        target_user_id: String,
     },
     RefreshIdentityState {
         user_id: String,
@@ -323,8 +356,26 @@ pub enum CoreEffect {
     OpenRealtimeConnection {
         connection: RealtimeConnectionEffect,
     },
+    OpenGroupRealtimeConnection {
+        subscription: GroupRealtimeSubscriptionRequest,
+    },
     CloseRealtimeConnection {
         device_id: String,
+    },
+    AppendGroupEnvelope {
+        append: AppendGroupEnvelopeRequest,
+    },
+    FetchGroupOutbox {
+        fetch: FetchGroupOutboxRequest,
+    },
+    GetGroupOutboxHead {
+        get: GetGroupOutboxHeadRequest,
+    },
+    FetchWelcomePickup {
+        fetch: FetchWelcomePickupRequest,
+    },
+    PutWelcomePickup {
+        put: PutWelcomePickupRequest,
     },
     FetchIdentityBundle {
         fetch: FetchIdentityBundleRequest,
@@ -401,6 +452,18 @@ pub struct ConversationSummary {
     pub conversation_id: String,
     pub peer_user_id: String,
     pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ConversationKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_role: Option<GroupRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_cursor: Option<GroupCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -57,6 +57,178 @@ export interface InboxRecord {
   envelope: Envelope;
 }
 
+export type GroupRole = "owner" | "admin" | "member";
+export type GroupMemberStatus = "active" | "pending" | "removed" | "left";
+export type GroupJoinPolicy = "closed" | "approval_required" | "open_by_invite";
+export type GroupMemberInvitePolicy = "owner_admin_only" | "request_owner_approval";
+
+export interface GroupMember {
+  userId: string;
+  role: GroupRole;
+  status: GroupMemberStatus;
+}
+
+export interface GroupOutboxDescriptor {
+  endpoint: string;
+  subscribeEndpoint?: string;
+}
+
+export interface GroupManifest {
+  version: string;
+  groupId: string;
+  conversationId: string;
+  title: string;
+  ownerUserId: string;
+  admins: string[];
+  members: GroupMember[];
+  joinPolicy: GroupJoinPolicy;
+  memberInvitePolicy: GroupMemberInvitePolicy;
+  rosterVersion: number;
+  mlsEpochHint: number;
+  lastCommitMessageId?: string;
+  outbox: GroupOutboxDescriptor;
+  updatedAt: number;
+  signerUserId: string;
+  signerDeviceId: string;
+  signature: string;
+}
+
+export type GroupCapabilityOperation =
+  | "read"
+  | "subscribe"
+  | "append_application"
+  | "append_control"
+  | "append_membership"
+  | "manage_invites"
+  | "approve_join"
+  | "remove_member"
+  | "update_group_metadata";
+
+export interface GroupCapability {
+  version: string;
+  service: "group_outbox";
+  groupId: string;
+  userId: string;
+  deviceId: string;
+  operations: GroupCapabilityOperation[];
+  role: GroupRole;
+  expiresAt: number;
+  signature: string;
+}
+
+export type GroupMessageType =
+  | "mls_application"
+  | "mls_commit"
+  | "control_group_membership_changed"
+  | "control_group_metadata_updated"
+  | "control_group_join_requested"
+  | "control_group_join_approved"
+  | "control_group_join_rejected"
+  | "control_group_leave_requested"
+  | "control_conversation_needs_rebuild";
+
+export type GroupEnvelopeVisibility = "visible" | "protocol";
+
+export interface GroupEnvelope {
+  version: string;
+  messageId: string;
+  groupId: string;
+  conversationId: string;
+  senderUserId: string;
+  senderDeviceId: string;
+  createdAt: number;
+  messageType: GroupMessageType;
+  visibility: GroupEnvelopeVisibility;
+  inlineCiphertext?: string;
+  storageRefs?: StorageRef[];
+  senderProof: SenderProof;
+  membershipProof?: SenderProof;
+}
+
+export interface GroupOutboxRecord {
+  seq: number;
+  groupId: string;
+  messageId: string;
+  receivedAt: number;
+  expiresAt?: number;
+  state: "available";
+  envelope: GroupEnvelope;
+}
+
+export interface GroupCursor {
+  groupId: string;
+  lastFetchedSeq: number;
+  updatedAt: number;
+}
+
+export interface WelcomePickupDescriptor {
+  groupId: string;
+  deviceId: string;
+  endpoint: string;
+  capability: string;
+  expiresAt: number;
+}
+
+export interface AppendGroupEnvelopeRequest {
+  version: string;
+  groupId: string;
+  envelope: GroupEnvelope;
+  capability: GroupCapability;
+}
+
+export interface AppendGroupEnvelopeResult {
+  accepted: boolean;
+  seq: number;
+}
+
+export interface FetchGroupOutboxRequest {
+  groupId: string;
+  fromSeq: number;
+  limit: number;
+  capability: GroupCapability;
+}
+
+export interface FetchGroupOutboxResult {
+  toSeq: number;
+  records: GroupOutboxRecord[];
+}
+
+export interface GetGroupOutboxHeadResult {
+  headSeq: number;
+}
+
+export interface GetGroupOutboxHeadRequest {
+  groupId: string;
+  capability: GroupCapability;
+}
+
+export interface GroupRealtimeSubscriptionRequest {
+  groupId: string;
+  endpoint: string;
+  lastSeq: number;
+  capability: GroupCapability;
+  headers?: Record<string, string>;
+}
+
+export interface FetchWelcomePickupRequest {
+  descriptor: WelcomePickupDescriptor;
+  headers?: Record<string, string>;
+}
+
+export interface FetchWelcomePickupResult {
+  welcomeB64: string;
+}
+
+export interface PutWelcomePickupRequest {
+  descriptor: WelcomePickupDescriptor;
+  welcomeB64: string;
+  headers?: Record<string, string>;
+}
+
+export interface PutWelcomePickupResult {
+  accepted: boolean;
+}
+
 export interface Ack {
   deviceId: string;
   ackSeq: number;

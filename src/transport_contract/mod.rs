@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::model::{Ack, Envelope, IdentityBundle, InboxRecord};
+use crate::model::{
+    Ack, Envelope, GroupCapability, GroupEnvelope, GroupOutboxRecord, IdentityBundle, InboxRecord,
+    WelcomePickupDescriptor,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEnvelopeRequest {
@@ -91,6 +94,80 @@ pub struct RealtimeSubscriptionRequest {
     pub last_acked_seq: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendGroupEnvelopeRequest {
+    pub version: String,
+    pub group_id: String,
+    pub envelope: GroupEnvelope,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendGroupEnvelopeResult {
+    pub accepted: bool,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchGroupOutboxRequest {
+    pub group_id: String,
+    pub from_seq: u64,
+    pub limit: u64,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchGroupOutboxResult {
+    pub to_seq: u64,
+    pub records: Vec<GroupOutboxRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetGroupOutboxHeadRequest {
+    pub group_id: String,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetGroupOutboxHeadResult {
+    pub head_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRealtimeSubscriptionRequest {
+    pub group_id: String,
+    pub endpoint: String,
+    pub last_seq: u64,
+    pub capability: GroupCapability,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchWelcomePickupRequest {
+    pub descriptor: WelcomePickupDescriptor,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchWelcomePickupResult {
+    pub welcome_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutWelcomePickupRequest {
+    pub descriptor: WelcomePickupDescriptor,
+    pub welcome_b64: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutWelcomePickupResult {
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,7 +349,10 @@ pub struct PublishSharedStateRequest {
 mod tests {
     use super::*;
     use crate::model::{
-        CURRENT_MODEL_VERSION, DeliveryClass, MessageType, SenderProof, StorageRef,
+        CapabilityService, CURRENT_MODEL_VERSION, DeliveryClass, GroupCapability,
+        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType,
+        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, MessageType, SenderProof,
+        StorageRef, WelcomePickupDescriptor,
     };
 
     #[test]
@@ -352,5 +432,94 @@ mod tests {
 
         let decoded: ReplaceAllowlistRequest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.document.allowed_sender_user_ids, vec!["user:alice"]);
+    }
+
+    #[test]
+    fn group_transport_contract_types_round_trip() {
+        let append = AppendGroupEnvelopeRequest {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            group_id: "group:project".into(),
+            envelope: sample_group_envelope(),
+            capability: sample_group_capability(),
+        };
+        let json = serde_json::to_string(&append).expect("serialize append");
+        let decoded: AppendGroupEnvelopeRequest =
+            serde_json::from_str(&json).expect("deserialize append");
+        assert_eq!(decoded, append);
+
+        let fetch = FetchGroupOutboxResult {
+            to_seq: 7,
+            records: vec![GroupOutboxRecord {
+                seq: 7,
+                group_id: "group:project".into(),
+                message_id: "msg:group:1".into(),
+                received_at: 10,
+                expires_at: None,
+                state: GroupOutboxRecordState::Available,
+                envelope: sample_group_envelope(),
+            }],
+        };
+        let json = serde_json::to_string(&fetch).expect("serialize fetch");
+        let decoded: FetchGroupOutboxResult =
+            serde_json::from_str(&json).expect("deserialize fetch");
+        assert_eq!(decoded, fetch);
+
+        let pickup = PutWelcomePickupRequest {
+            descriptor: WelcomePickupDescriptor {
+                group_id: "group:project".into(),
+                device_id: "device:bob:phone".into(),
+                endpoint: "https://example.com/welcome/group%3Aproject/device%3Abob%3Aphone"
+                    .into(),
+                capability: "cap:welcome:1".into(),
+                expires_at: 99,
+            },
+            welcome_b64: "d2VsY29tZQ==".into(),
+            headers: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&pickup).expect("serialize welcome");
+        let decoded: PutWelcomePickupRequest =
+            serde_json::from_str(&json).expect("deserialize welcome");
+        assert_eq!(decoded, pickup);
+    }
+
+    fn sample_group_capability() -> GroupCapability {
+        GroupCapability {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            service: CapabilityService::GroupOutbox,
+            group_id: "group:project".into(),
+            user_id: "user:alice".into(),
+            device_id: "device:alice:phone".into(),
+            operations: vec![
+                GroupCapabilityOperation::Read,
+                GroupCapabilityOperation::AppendApplication,
+            ],
+            role: GroupRole::Owner,
+            expires_at: 999,
+            signature: "cap-sig".into(),
+        }
+    }
+
+    fn sample_group_envelope() -> GroupEnvelope {
+        GroupEnvelope {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            message_id: "msg:group:1".into(),
+            group_id: "group:project".into(),
+            conversation_id: "conv:group:project".into(),
+            sender_user_id: "user:alice".into(),
+            sender_device_id: "device:alice:phone".into(),
+            created_at: 9,
+            message_type: GroupMessageType::MlsApplication,
+            visibility: GroupEnvelopeVisibility::Visible,
+            inline_ciphertext: Some("ciphertext".into()),
+            storage_refs: vec![],
+            sender_proof: SenderProof {
+                proof_type: "signature".into(),
+                value: "proof".into(),
+            },
+            membership_proof: Some(SenderProof {
+                proof_type: "membership".into(),
+                value: "member-proof".into(),
+            }),
+        }
     }
 }

@@ -131,6 +131,7 @@ pub struct CapabilityConstraints {
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityService {
     Inbox,
+    GroupOutbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,6 +508,337 @@ impl Validate for InboxRecord {
             InboxRecordState::Available => {}
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupMemberStatus {
+    Active,
+    Pending,
+    Removed,
+    Left,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupJoinPolicy {
+    Closed,
+    ApprovalRequired,
+    OpenByInvite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupMemberInvitePolicy {
+    OwnerAdminOnly,
+    RequestOwnerApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMember {
+    pub user_id: String,
+    pub role: GroupRole,
+    pub status: GroupMemberStatus,
+}
+
+impl Validate for GroupMember {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("user_id", &self.user_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupOutboxDescriptor {
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe_endpoint: Option<String>,
+}
+
+impl Validate for GroupOutboxDescriptor {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("endpoint", &self.endpoint)?;
+        if let Some(endpoint) = &self.subscribe_endpoint {
+            validate_required("subscribe_endpoint", endpoint)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupManifest {
+    pub version: String,
+    pub group_id: String,
+    pub conversation_id: String,
+    pub title: String,
+    pub owner_user_id: String,
+    pub admins: Vec<String>,
+    pub members: Vec<GroupMember>,
+    pub join_policy: GroupJoinPolicy,
+    pub member_invite_policy: GroupMemberInvitePolicy,
+    pub roster_version: u64,
+    pub mls_epoch_hint: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_message_id: Option<String>,
+    pub outbox: GroupOutboxDescriptor,
+    pub updated_at: u64,
+    pub signer_user_id: String,
+    pub signer_device_id: String,
+    pub signature: String,
+}
+
+impl Validate for GroupManifest {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("group_id", &self.group_id)?;
+        validate_required("conversation_id", &self.conversation_id)?;
+        validate_required("owner_user_id", &self.owner_user_id)?;
+        validate_required("signer_user_id", &self.signer_user_id)?;
+        validate_required("signer_device_id", &self.signer_device_id)?;
+        validate_required("signature", &self.signature)?;
+        if self.members.is_empty() {
+            return Err(CoreError::invalid_input(
+                "group manifest must contain at least one member",
+            ));
+        }
+        for member in &self.members {
+            member.validate()?;
+        }
+        let active_owner_count = self
+            .members
+            .iter()
+            .filter(|member| {
+                member.role == GroupRole::Owner && member.status == GroupMemberStatus::Active
+            })
+            .count();
+        if active_owner_count != 1 {
+            return Err(CoreError::invalid_input(
+                "group manifest must contain exactly one active owner",
+            ));
+        }
+        if !self.members.iter().any(|member| {
+            member.user_id == self.owner_user_id
+                && member.role == GroupRole::Owner
+                && member.status == GroupMemberStatus::Active
+        }) {
+            return Err(CoreError::invalid_input(
+                "owner_user_id must match the active owner member",
+            ));
+        }
+        self.outbox.validate()?;
+        if let Some(message_id) = &self.last_commit_message_id {
+            validate_required("last_commit_message_id", message_id)?;
+        }
+        for admin in &self.admins {
+            validate_required("admins", admin)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupCapabilityOperation {
+    Read,
+    Subscribe,
+    AppendApplication,
+    AppendControl,
+    AppendMembership,
+    ManageInvites,
+    ApproveJoin,
+    RemoveMember,
+    UpdateGroupMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCapability {
+    pub version: String,
+    pub service: CapabilityService,
+    pub group_id: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub operations: Vec<GroupCapabilityOperation>,
+    pub role: GroupRole,
+    pub expires_at: u64,
+    pub signature: String,
+}
+
+impl Validate for GroupCapability {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("group_id", &self.group_id)?;
+        validate_required("user_id", &self.user_id)?;
+        validate_required("device_id", &self.device_id)?;
+        validate_required("signature", &self.signature)?;
+        if self.service != CapabilityService::GroupOutbox {
+            return Err(CoreError::invalid_input(
+                "service must be group_outbox for group capability",
+            ));
+        }
+        if self.operations.is_empty() {
+            return Err(CoreError::invalid_input(
+                "operations must contain at least one group capability operation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupMessageType {
+    MlsApplication,
+    MlsCommit,
+    ControlGroupMembershipChanged,
+    ControlGroupMetadataUpdated,
+    ControlGroupJoinRequested,
+    ControlGroupJoinApproved,
+    ControlGroupJoinRejected,
+    ControlGroupLeaveRequested,
+    ControlConversationNeedsRebuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupEnvelopeVisibility {
+    Visible,
+    Protocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupEnvelope {
+    pub version: String,
+    pub message_id: String,
+    pub group_id: String,
+    pub conversation_id: String,
+    pub sender_user_id: String,
+    pub sender_device_id: String,
+    pub created_at: u64,
+    pub message_type: GroupMessageType,
+    pub visibility: GroupEnvelopeVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_ciphertext: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_refs: Vec<StorageRef>,
+    pub sender_proof: SenderProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_proof: Option<SenderProof>,
+}
+
+impl Validate for GroupEnvelope {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("message_id", &self.message_id)?;
+        validate_required("group_id", &self.group_id)?;
+        validate_required("conversation_id", &self.conversation_id)?;
+        validate_required("sender_user_id", &self.sender_user_id)?;
+        validate_required("sender_device_id", &self.sender_device_id)?;
+        self.sender_proof.validate()?;
+        if let Some(proof) = &self.membership_proof {
+            proof.validate()?;
+        }
+        if self.inline_ciphertext.is_none() && self.storage_refs.is_empty() {
+            return Err(CoreError::invalid_input(
+                "group envelope must include inline_ciphertext or at least one storage_ref",
+            ));
+        }
+        if self
+            .inline_ciphertext
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(CoreError::invalid_input(
+                "inline_ciphertext must not be empty when provided",
+            ));
+        }
+        for reference in &self.storage_refs {
+            reference.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupOutboxRecordState {
+    Available,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupOutboxRecord {
+    pub seq: u64,
+    pub group_id: String,
+    pub message_id: String,
+    pub received_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    pub state: GroupOutboxRecordState,
+    pub envelope: GroupEnvelope,
+}
+
+impl Validate for GroupOutboxRecord {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("group_id", &self.group_id)?;
+        validate_required("message_id", &self.message_id)?;
+        self.envelope.validate()?;
+        if self.message_id != self.envelope.message_id {
+            return Err(CoreError::invalid_input(
+                "group outbox record message_id must match envelope message_id",
+            ));
+        }
+        if self.group_id != self.envelope.group_id {
+            return Err(CoreError::invalid_input(
+                "group outbox record group_id must match envelope group_id",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupCursor {
+    pub group_id: String,
+    pub last_fetched_seq: u64,
+    pub updated_at: u64,
+}
+
+impl Validate for GroupCursor {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("group_id", &self.group_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WelcomePickupDescriptor {
+    pub group_id: String,
+    pub device_id: String,
+    pub endpoint: String,
+    pub capability: String,
+    pub expires_at: u64,
+}
+
+impl Validate for WelcomePickupDescriptor {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("group_id", &self.group_id)?;
+        validate_required("device_id", &self.device_id)?;
+        validate_required("endpoint", &self.endpoint)?;
+        validate_required("capability", &self.capability)
     }
 }
 
@@ -977,6 +1309,124 @@ mod tests {
     }
 
     #[test]
+    fn group_model_types_round_trip_json() {
+        let manifest = sample_group_manifest();
+        manifest.validate().expect("manifest should validate");
+        let manifest_json = serde_json::to_string(&manifest).expect("serialize manifest");
+        let decoded_manifest: GroupManifest =
+            serde_json::from_str(&manifest_json).expect("deserialize manifest");
+        assert_eq!(decoded_manifest, manifest);
+
+        let capability = sample_group_capability();
+        capability.validate().expect("capability should validate");
+        let capability_json = serde_json::to_string(&capability).expect("serialize capability");
+        let decoded_capability: GroupCapability =
+            serde_json::from_str(&capability_json).expect("deserialize capability");
+        assert_eq!(decoded_capability, capability);
+
+        let record = sample_group_record();
+        record.validate().expect("record should validate");
+        let record_json = serde_json::to_string(&record).expect("serialize record");
+        let decoded_record: GroupOutboxRecord =
+            serde_json::from_str(&record_json).expect("deserialize record");
+        assert_eq!(decoded_record, record);
+    }
+
+    #[test]
+    fn group_enums_serialize_as_snake_case() {
+        let json = serde_json::to_string(&GroupRole::Owner).expect("serialize role");
+        assert_eq!(json, "\"owner\"");
+        let json = serde_json::to_string(&GroupCapabilityOperation::AppendMembership)
+            .expect("serialize operation");
+        assert_eq!(json, "\"append_membership\"");
+        let json = serde_json::to_string(&GroupMessageType::ControlGroupJoinRequested)
+            .expect("serialize message type");
+        assert_eq!(json, "\"control_group_join_requested\"");
+        let json = serde_json::to_string(&GroupEnvelopeVisibility::Protocol)
+            .expect("serialize visibility");
+        assert_eq!(json, "\"protocol\"");
+    }
+
+    #[test]
+    fn group_validation_rejects_empty_required_fields() {
+        let mut manifest = sample_group_manifest();
+        manifest.group_id.clear();
+        let error = manifest
+            .validate()
+            .expect_err("empty group_id should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let mut manifest = sample_group_manifest();
+        manifest.outbox.endpoint.clear();
+        let error = manifest
+            .validate()
+            .expect_err("empty outbox endpoint should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let mut manifest = sample_group_manifest();
+        manifest.signature.clear();
+        let error = manifest
+            .validate()
+            .expect_err("empty signature should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let mut envelope = sample_group_record().envelope;
+        envelope.sender_proof.value.clear();
+        let error = envelope
+            .validate()
+            .expect_err("empty sender proof should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn group_manifest_rejects_owner_count_mismatch() {
+        let mut manifest = sample_group_manifest();
+        manifest.members[0].status = GroupMemberStatus::Removed;
+        let error = manifest
+            .validate()
+            .expect_err("manifest without active owner should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let mut manifest = sample_group_manifest();
+        manifest.members.push(GroupMember {
+            user_id: "user:eve".into(),
+            role: GroupRole::Owner,
+            status: GroupMemberStatus::Active,
+        });
+        let error = manifest
+            .validate()
+            .expect_err("manifest with multiple active owners should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn group_capability_rejects_empty_operations() {
+        let mut capability = sample_group_capability();
+        capability.operations = vec![];
+        let error = capability
+            .validate()
+            .expect_err("empty operations should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
+    fn group_record_validation_rejects_envelope_mismatch() {
+        let mut record = sample_group_record();
+        record.envelope.group_id = "group:other".into();
+        let error = record
+            .validate()
+            .expect_err("group_id mismatch should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let mut record = sample_group_record();
+        record.envelope.message_id = "msg:other".into();
+        let error = record
+            .validate()
+            .expect_err("message_id mismatch should fail");
+        assert_eq!(error.code(), "invalid_input");
+    }
+
+    #[test]
     fn sync_checkpoint_validation_rejects_acked_past_fetched() {
         let checkpoint = SyncCheckpoint {
             device_id: "device:bob:phone".into(),
@@ -1195,6 +1645,94 @@ mod tests {
             sender_proof: SenderProof {
                 proof_type: "signature".into(),
                 value: "proof".into(),
+            },
+        }
+    }
+
+    fn sample_group_manifest() -> GroupManifest {
+        GroupManifest {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            group_id: "group:project".into(),
+            conversation_id: "conv:group:project".into(),
+            title: "Project".into(),
+            owner_user_id: "user:alice".into(),
+            admins: vec!["user:alice".into()],
+            members: vec![
+                GroupMember {
+                    user_id: "user:alice".into(),
+                    role: GroupRole::Owner,
+                    status: GroupMemberStatus::Active,
+                },
+                GroupMember {
+                    user_id: "user:bob".into(),
+                    role: GroupRole::Member,
+                    status: GroupMemberStatus::Active,
+                },
+            ],
+            join_policy: GroupJoinPolicy::ApprovalRequired,
+            member_invite_policy: GroupMemberInvitePolicy::RequestOwnerApproval,
+            roster_version: 1,
+            mls_epoch_hint: 1,
+            last_commit_message_id: Some("msg:commit:1".into()),
+            outbox: GroupOutboxDescriptor {
+                endpoint: "https://example.com/v1/groups/group%3Aproject/outbox".into(),
+                subscribe_endpoint: Some(
+                    "wss://example.com/v1/groups/group%3Aproject/subscribe".into(),
+                ),
+            },
+            updated_at: 1,
+            signer_user_id: "user:alice".into(),
+            signer_device_id: "device:alice:phone".into(),
+            signature: "sig".into(),
+        }
+    }
+
+    fn sample_group_capability() -> GroupCapability {
+        GroupCapability {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            service: CapabilityService::GroupOutbox,
+            group_id: "group:project".into(),
+            user_id: "user:alice".into(),
+            device_id: "device:alice:phone".into(),
+            operations: vec![
+                GroupCapabilityOperation::Read,
+                GroupCapabilityOperation::AppendApplication,
+                GroupCapabilityOperation::AppendMembership,
+            ],
+            role: GroupRole::Owner,
+            expires_at: 999,
+            signature: "cap-sig".into(),
+        }
+    }
+
+    fn sample_group_record() -> GroupOutboxRecord {
+        GroupOutboxRecord {
+            seq: 7,
+            group_id: "group:project".into(),
+            message_id: "msg:group:1".into(),
+            received_at: 10,
+            expires_at: Some(100),
+            state: GroupOutboxRecordState::Available,
+            envelope: GroupEnvelope {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                message_id: "msg:group:1".into(),
+                group_id: "group:project".into(),
+                conversation_id: "conv:group:project".into(),
+                sender_user_id: "user:alice".into(),
+                sender_device_id: "device:alice:phone".into(),
+                created_at: 9,
+                message_type: GroupMessageType::MlsApplication,
+                visibility: GroupEnvelopeVisibility::Visible,
+                inline_ciphertext: Some("ciphertext".into()),
+                storage_refs: vec![],
+                sender_proof: SenderProof {
+                    proof_type: "signature".into(),
+                    value: "proof".into(),
+                },
+                membership_proof: Some(SenderProof {
+                    proof_type: "membership".into(),
+                    value: "member-proof".into(),
+                }),
             },
         }
     }

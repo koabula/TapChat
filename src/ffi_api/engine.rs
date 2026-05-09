@@ -486,6 +486,16 @@ impl CoreEngine {
                 peer_user_id,
                 conversation_kind,
             } => self.create_conversation(peer_user_id, conversation_kind),
+            CoreCommand::CreateGroupConversation { .. }
+            | CoreCommand::SyncGroupOutbox { .. }
+            | CoreCommand::SendGroupTextMessage { .. }
+            | CoreCommand::InviteToGroup { .. }
+            | CoreCommand::RequestJoinGroup { .. }
+            | CoreCommand::ApproveGroupJoin { .. }
+            | CoreCommand::LeaveGroup { .. }
+            | CoreCommand::RemoveGroupMember { .. } => {
+                Err(CoreError::unsupported("group phase not implemented"))
+            }
             CoreCommand::ReconcileConversationMembership { conversation_id } => {
                 self.reconcile_conversation_membership(conversation_id)
             }
@@ -1091,6 +1101,12 @@ impl CoreEngine {
                         conversation_id,
                         peer_user_id: peer_user_id.clone(),
                         state: format!("{:?}", existing.conversation.state).to_lowercase(),
+                        kind: Some(ConversationKind::Direct),
+                        title: None,
+                        group_id: None,
+                        member_count: None,
+                        group_role: None,
+                        group_cursor: None,
                         last_message_preview: None,
                         last_message_type: existing_last_message_type,
                         message_count: None,
@@ -1170,6 +1186,12 @@ impl CoreEngine {
                     conversation_id,
                     peer_user_id,
                     state: "active".into(),
+                    kind: Some(ConversationKind::Direct),
+                    title: None,
+                    group_id: None,
+                    member_count: None,
+                    group_role: None,
+                    group_cursor: None,
                     last_message_preview: None,
                     last_message_type: Some(MessageType::MlsCommit),
                     message_count: None,
@@ -1977,6 +1999,12 @@ impl CoreEngine {
                     conversation_id: conversation_id.clone(),
                     peer_user_id,
                     state: "needs_rebuild".into(),
+                    kind: Some(ConversationKind::Direct),
+                    title: None,
+                    group_id: None,
+                    member_count: None,
+                    group_role: None,
+                    group_cursor: None,
                     last_message_preview: None,
                     last_message_type,
                     message_count: None,
@@ -2658,6 +2686,12 @@ impl CoreEngine {
                 RecoveryStatus::NeedsRecovery => "needs_recovery".into(),
                 RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
             },
+            kind: Some(ConversationKind::Direct),
+            title: None,
+            group_id: None,
+            member_count: None,
+            group_role: None,
+            group_cursor: None,
             last_message_preview: None,
             last_message_type: conversation.last_message_type,
             message_count: None,
@@ -4742,6 +4776,9 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 plaintext_cache: item.plaintext_cache.clone(),
             })
             .collect(),
+        group_states: Vec::new(),
+        group_cursors: Vec::new(),
+        pending_group_outbox: Vec::new(),
         pending_acks: state
             .pending_acks
             .iter()

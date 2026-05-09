@@ -113,6 +113,14 @@ where
         CoreEffect::FetchAllowlist { fetch } => ports.fetch_allowlist(fetch).await,
         CoreEffect::ReplaceAllowlist { update } => ports.replace_allowlist(update).await,
         CoreEffect::PublishSharedState { publish } => ports.publish_shared_state(publish).await,
+        CoreEffect::OpenGroupRealtimeConnection { .. }
+        | CoreEffect::AppendGroupEnvelope { .. }
+        | CoreEffect::FetchGroupOutbox { .. }
+        | CoreEffect::GetGroupOutboxHead { .. }
+        | CoreEffect::FetchWelcomePickup { .. }
+        | CoreEffect::PutWelcomePickup { .. } => {
+            anyhow::bail!("group phase not implemented")
+        }
         CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,
         CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
         CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,

@@ -28,6 +28,94 @@ mod tests {
     }
 
     #[test]
+    fn group_core_commands_round_trip_json() {
+        let commands = vec![
+            CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec!["user:bob".into()],
+            },
+            CoreCommand::SyncGroupOutbox {
+                group_id: "group:project".into(),
+                reason: Some("manual".into()),
+            },
+            CoreCommand::SendGroupTextMessage {
+                conversation_id: "conv:group:project".into(),
+                plaintext: "hello group".into(),
+            },
+            CoreCommand::InviteToGroup {
+                group_id: "group:project".into(),
+                invitee_user_ids: vec!["user:eve".into()],
+            },
+            CoreCommand::RequestJoinGroup {
+                invite_url: "tapchat://join/group:project".into(),
+            },
+            CoreCommand::ApproveGroupJoin {
+                group_id: "group:project".into(),
+                request_id: "request:1".into(),
+            },
+            CoreCommand::LeaveGroup {
+                group_id: "group:project".into(),
+            },
+            CoreCommand::RemoveGroupMember {
+                group_id: "group:project".into(),
+                target_user_id: "user:eve".into(),
+            },
+        ];
+
+        for command in commands {
+            let json = serde_json::to_string(&command).expect("serialize command");
+            assert!(json.contains("group"));
+            let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize command");
+            assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn group_core_commands_return_stable_unsupported_error() {
+        let commands = vec![
+            CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec!["user:bob".into()],
+            },
+            CoreCommand::SyncGroupOutbox {
+                group_id: "group:project".into(),
+                reason: None,
+            },
+            CoreCommand::SendGroupTextMessage {
+                conversation_id: "conv:group:project".into(),
+                plaintext: "hello group".into(),
+            },
+            CoreCommand::InviteToGroup {
+                group_id: "group:project".into(),
+                invitee_user_ids: vec!["user:eve".into()],
+            },
+            CoreCommand::RequestJoinGroup {
+                invite_url: "tapchat://join/group:project".into(),
+            },
+            CoreCommand::ApproveGroupJoin {
+                group_id: "group:project".into(),
+                request_id: "request:1".into(),
+            },
+            CoreCommand::LeaveGroup {
+                group_id: "group:project".into(),
+            },
+            CoreCommand::RemoveGroupMember {
+                group_id: "group:project".into(),
+                target_user_id: "user:eve".into(),
+            },
+        ];
+
+        let mut engine = CoreEngine::new();
+        for command in commands {
+            let error = engine
+                .handle_command(command)
+                .expect_err("group command should be unsupported in phase 0");
+            assert_eq!(error.code(), "unsupported");
+            assert_eq!(error.message(), "group phase not implemented");
+        }
+    }
+
+    #[test]
     fn send_text_message_emits_append_request() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
