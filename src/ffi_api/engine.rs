@@ -12,12 +12,18 @@ use crate::mls_adapter::{
     RemoveMembersArtifacts,
 };
 use crate::model::{
-    Ack, ConversationKind, ConversationState, DeliveryClass, Envelope, IdentityBundle, InboxRecord,
-    MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
+    Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
+    DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCapabilityOperation,
+    GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest,
+    GroupMember, GroupMemberInvitePolicy, GroupMemberStatus, GroupMessageType,
+    GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle,
+    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
+    WelcomePickupDescriptor,
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
-    PersistedDeployment, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    PersistedDeployment, PersistedGroupCursor, PersistedGroupState, PersistedLocalIdentity,
+    PersistedMlsState, PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope,
     PersistedPendingAck, PersistedPendingBlobTransfer, PersistedRealtimeSession,
     PersistedRecoveryContext, PersistedRecoveryEscalationReason, PersistedRecoveryPhase,
     PersistedRecoveryReason, PersistedSyncState,
@@ -25,13 +31,15 @@ use crate::persistence::{
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
     AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
-    AppendEnvelopeResult, BlobDownloadRequest, BlobUploadRequest, DeviceStatusDocument,
-    DeviceStatusRecord, FetchAllowlistRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult, GetHeadResult,
+    AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
+    BlobDownloadRequest, BlobUploadRequest, DeviceStatusDocument, DeviceStatusRecord,
+    FetchAllowlistRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
+    FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult, GetHeadResult,
     MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
     MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    SharedStateDocumentKind,
+    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, SharedStateDocumentKind,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Signer;
@@ -231,6 +239,34 @@ impl CoreEngine {
             .iter()
             .map(|item| item.envelope.clone())
             .collect::<Vec<_>>();
+        let group_states = snapshot
+            .group_states
+            .into_iter()
+            .map(|state| (state.group_id.clone(), state))
+            .collect::<BTreeMap<_, _>>();
+        let group_cursors = snapshot
+            .group_cursors
+            .into_iter()
+            .map(|cursor| (cursor.group_id.clone(), cursor.cursor))
+            .collect::<BTreeMap<_, _>>();
+        let pending_group_outbox = snapshot
+            .pending_group_outbox
+            .into_iter()
+            .filter_map(|item| {
+                let capability = item.capability.or_else(|| {
+                    group_states.get(&item.group_id).map(|state| {
+                        group_capability_for_manifest(&state.manifest, GroupRole::Owner)
+                    })
+                })?;
+                Some(PendingGroupOutboxItem {
+                    envelope: item.envelope,
+                    capability,
+                    retries: item.retries,
+                    in_flight: false,
+                    plaintext_cache: item.plaintext_cache,
+                })
+            })
+            .collect::<Vec<_>>();
 
         let pending_acks = snapshot
             .pending_acks
@@ -404,6 +440,9 @@ impl CoreEngine {
                 sync_states,
                 outbox,
                 pending_outbox,
+                group_states,
+                group_cursors,
+                pending_group_outbox,
                 pending_acks,
                 pending_blob_uploads,
                 pending_blob_downloads,
@@ -486,16 +525,22 @@ impl CoreEngine {
                 peer_user_id,
                 conversation_kind,
             } => self.create_conversation(peer_user_id, conversation_kind),
-            CoreCommand::CreateGroupConversation { .. }
-            | CoreCommand::SyncGroupOutbox { .. }
-            | CoreCommand::SendGroupTextMessage { .. }
-            | CoreCommand::InviteToGroup { .. }
-            | CoreCommand::RequestJoinGroup { .. }
+            CoreCommand::CreateGroupConversation {
+                title,
+                member_user_ids,
+            } => self.create_group_conversation(title, member_user_ids),
+            CoreCommand::SyncGroupOutbox { group_id, .. } => self.sync_group_outbox(group_id),
+            CoreCommand::SendGroupTextMessage {
+                conversation_id,
+                plaintext,
+            } => self.send_group_text_message(conversation_id, plaintext),
+            CoreCommand::InviteToGroup { .. }
             | CoreCommand::ApproveGroupJoin { .. }
             | CoreCommand::LeaveGroup { .. }
-            | CoreCommand::RemoveGroupMember { .. } => {
-                Err(CoreError::unsupported("group phase not implemented"))
-            }
+            | CoreCommand::RemoveGroupMember { .. } => Err(CoreError::unsupported(
+                "group membership workflow is not implemented",
+            )),
+            CoreCommand::RequestJoinGroup { invite_url } => self.request_join_group(invite_url),
             CoreCommand::ReconcileConversationMembership { conversation_id } => {
                 self.reconcile_conversation_membership(conversation_id)
             }
@@ -712,6 +757,84 @@ impl CoreEngine {
             CoreEvent::UserConfirmedRebuild { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
             }
+            CoreEvent::GroupOutboxFetched {
+                group_id,
+                records,
+                to_seq,
+            } => self.handle_group_outbox_records(group_id, records, to_seq),
+            CoreEvent::GroupOutboxFetchFailed {
+                group_id,
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail
+                            .unwrap_or_else(|| format!("group outbox fetch failed for {group_id}")),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::GroupEnvelopeAppended {
+                group_id,
+                message_id,
+                seq,
+            } => self.handle_group_envelope_appended(group_id, message_id, seq),
+            CoreEvent::GroupEnvelopeAppendFailed {
+                group_id,
+                message_id,
+                retryable,
+                detail,
+            } => self.handle_group_append_failed(group_id, message_id, retryable, detail),
+            CoreEvent::WelcomePickupFetched {
+                descriptor,
+                welcome_b64,
+                manifest,
+            } => self.handle_welcome_pickup_fetched(descriptor, welcome_b64, manifest),
+            CoreEvent::WelcomePickupFetchFailed {
+                descriptor,
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("welcome pickup fetch failed for {}", descriptor.device_id)
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            CoreEvent::WelcomePickupPut { .. } => Ok(CoreOutput::default()),
+            CoreEvent::WelcomePickupPutFailed {
+                descriptor,
+                retryable: _,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("welcome pickup put failed for {}", descriptor.device_id)
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
         }
     }
 
@@ -1270,6 +1393,341 @@ impl CoreEngine {
                     .collect(),
                 ..CoreViewModel::default()
             }),
+        })
+    }
+
+    fn create_group_conversation(
+        &mut self,
+        title: String,
+        member_user_ids: Vec<String>,
+    ) -> CoreResult<CoreOutput> {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err(CoreError::invalid_input("group title must not be empty"));
+        }
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        let mut member_user_ids = member_user_ids
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        member_user_ids.sort();
+        member_user_ids.dedup();
+        if member_user_ids.is_empty() {
+            return Err(CoreError::invalid_input(
+                "group must include at least one invited member",
+            ));
+        }
+        if member_user_ids.contains(&local_identity.user_identity.user_id) {
+            return Err(CoreError::invalid_input(
+                "member_user_ids must not include the local owner",
+            ));
+        }
+
+        let mut peer_keypackages = Vec::new();
+        let mut member_devices = vec![ConversationMember {
+            user_id: local_identity.user_identity.user_id.clone(),
+            device_id: local_identity.device_identity.device_id.clone(),
+            status: DeviceStatusKind::Active,
+        }];
+        for user_id in &member_user_ids {
+            let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
+            for device in bundle
+                .devices
+                .iter()
+                .filter(|device| matches!(device.status, DeviceStatusKind::Active))
+            {
+                peer_keypackages.push(PeerDeviceKeyPackage {
+                    user_id: user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    device_public_key: device.device_public_key.clone(),
+                    key_package_b64: device.keypackage_ref.object_ref.clone(),
+                });
+                member_devices.push(ConversationMember {
+                    user_id: user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    status: DeviceStatusKind::Active,
+                });
+            }
+        }
+        if peer_keypackages.is_empty() {
+            return Err(CoreError::invalid_input(
+                "group must include at least one active invited device",
+            ));
+        }
+
+        let group_id = self.next_group_id(&title, &member_user_ids);
+        let conversation_id = format!("conv:{group_id}");
+        if self.state.group_states.contains_key(&group_id)
+            || self.state.conversations.contains_key(&conversation_id)
+        {
+            return Err(CoreError::invalid_state(
+                "group conversation already exists",
+            ));
+        }
+
+        let artifacts = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .create_conversation(&conversation_id, &peer_keypackages)?;
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter missing after create"))?
+            .export_group_summary(&conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(conversation_id.clone(), summary.clone());
+
+        let now = current_unix_millis(self.state.message_nonce);
+        let manifest = self.build_group_manifest(
+            &group_id,
+            &conversation_id,
+            &title,
+            &local_identity,
+            &member_user_ids,
+            summary.epoch,
+            now,
+        )?;
+        manifest.validate()?;
+        let group_state = PersistedGroupState {
+            group_id: group_id.clone(),
+            conversation_id: conversation_id.clone(),
+            manifest: manifest.clone(),
+            local_role: Some(GroupRole::Owner),
+            welcome_pickup: None,
+        };
+        self.state
+            .group_states
+            .insert(group_id.clone(), group_state);
+        self.state.group_cursors.insert(
+            group_id.clone(),
+            GroupCursor {
+                group_id: group_id.clone(),
+                last_fetched_seq: 0,
+                updated_at: now,
+            },
+        );
+        self.state.conversations.insert(
+            conversation_id.clone(),
+            LocalConversationState {
+                conversation: Conversation {
+                    conversation_id: conversation_id.clone(),
+                    kind: ConversationKind::Group,
+                    member_users: {
+                        let mut users = member_user_ids.clone();
+                        users.push(local_identity.user_identity.user_id.clone());
+                        users.sort();
+                        users.dedup();
+                        users
+                    },
+                    member_devices,
+                    state: ConversationState::Active,
+                    updated_at: now,
+                },
+                messages: Vec::new(),
+                last_message_type: None,
+                peer_user_id: group_id.clone(),
+                last_known_peer_active_devices: BTreeSet::new(),
+                recovery_status: RecoveryStatus::Healthy,
+            },
+        );
+
+        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
+        let commit_envelope = self.build_group_envelope(
+            &group_id,
+            &conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.commit_b64,
+        )?;
+        self.enqueue_group_envelope(commit_envelope.clone(), capability, None);
+
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveConversation {
+                    conversation_id: conversation_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: conversation_id.clone(),
+                },
+                PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveGroupCursor {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: commit_envelope.message_id.clone(),
+                },
+            ],
+        )];
+        for welcome in artifacts.welcomes {
+            let descriptor =
+                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            effects.push(CoreEffect::PutWelcomePickup {
+                put: PutWelcomePickupRequest {
+                    descriptor,
+                    welcome_b64: welcome.payload_b64,
+                    manifest: Some(manifest.clone()),
+                    headers: BTreeMap::new(),
+                },
+            });
+        }
+
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(&conversation_id)?],
+                messages: vec![MessageSummary {
+                    conversation_id,
+                    message_id: commit_envelope.message_id,
+                    message_type: MessageType::MlsCommit,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn send_group_text_message(
+        &mut self,
+        conversation_id: String,
+        plaintext: String,
+    ) -> CoreResult<CoreOutput> {
+        self.ensure_group_ready_for_send(&conversation_id)?;
+        if plaintext.trim().is_empty() {
+            return Err(CoreError::invalid_input("plaintext must not be empty"));
+        }
+        let payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&conversation_id, plaintext.as_bytes())?;
+        let group_id = self
+            .group_id_for_conversation(&conversation_id)?
+            .to_string();
+        let envelope = self.build_group_envelope(
+            &group_id,
+            &conversation_id,
+            GroupMessageType::MlsApplication,
+            GroupEnvelopeVisibility::Visible,
+            payload.payload_b64,
+        )?;
+        let capability = self.group_capability(&group_id, self.local_group_role(&group_id)?)?;
+        self.enqueue_group_envelope(envelope.clone(), capability, Some(plaintext));
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveMlsState {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveOutgoingGroupEnvelope {
+                        message_id: envelope.message_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id,
+                    message_id: envelope.message_id,
+                    message_type: MessageType::MlsApplication,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn sync_group_outbox(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let cursor = self
+            .state
+            .group_cursors
+            .get(&group_id)
+            .cloned()
+            .unwrap_or(GroupCursor {
+                group_id: group_id.clone(),
+                last_fetched_seq: 0,
+                updated_at: 0,
+            });
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::FetchGroupOutbox {
+                fetch: FetchGroupOutboxRequest {
+                    group_id,
+                    from_seq: cursor.last_fetched_seq.saturating_add(1).max(1),
+                    limit: 100,
+                    capability: self.group_capability_for_state(&state)?,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn request_join_group(&mut self, invite_url: String) -> CoreResult<CoreOutput> {
+        let descriptor_json = invite_url
+            .strip_prefix("tapchat://welcome-pickup/")
+            .map(|value| {
+                let bytes = STANDARD.decode(value).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "welcome pickup invite payload is not valid base64: {error}"
+                    ))
+                })?;
+                String::from_utf8(bytes).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "welcome pickup invite payload is not valid UTF-8: {error}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(invite_url);
+        let descriptor: WelcomePickupDescriptor =
+            serde_json::from_str(&descriptor_json).map_err(|error| {
+                CoreError::invalid_input(format!(
+                    "phase 2 request_join_group expects a welcome pickup descriptor JSON: {error}"
+                ))
+            })?;
+        descriptor.validate()?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::FetchWelcomePickup {
+                fetch: FetchWelcomePickupRequest {
+                    descriptor,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: None,
         })
     }
 
@@ -2180,6 +2638,17 @@ impl CoreEngine {
             }
             return self.flush_pending_transport();
         }
+        if let Some(message_id) = timer_id.strip_prefix("retry_group_append:") {
+            if let Some(item) = self
+                .state
+                .pending_group_outbox
+                .iter_mut()
+                .find(|item| item.envelope.message_id == message_id)
+            {
+                item.in_flight = false;
+            }
+            return self.flush_pending_transport();
+        }
         if let Some(device_id) = timer_id.strip_prefix("retry_ack:") {
             if let Some(ack) = self.state.pending_acks.get_mut(device_id) {
                 ack.in_flight = false;
@@ -2643,7 +3112,8 @@ impl CoreEngine {
             .state
             .local_identity
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
         let sender_user_id = identity.user_identity.user_id.clone();
         let sender_device_id = identity.device_identity.device_id.clone();
         let sender_proof = identity.sign_sender_proof(payload_b64.as_bytes());
@@ -2672,12 +3142,311 @@ impl CoreEngine {
         })
     }
 
+    fn build_group_manifest(
+        &self,
+        group_id: &str,
+        conversation_id: &str,
+        title: &str,
+        identity: &crate::identity::LocalIdentityState,
+        member_user_ids: &[String],
+        epoch: u64,
+        now: u64,
+    ) -> CoreResult<GroupManifest> {
+        let mut members = vec![GroupMember {
+            user_id: identity.user_identity.user_id.clone(),
+            role: GroupRole::Owner,
+            status: GroupMemberStatus::Active,
+        }];
+        members.extend(member_user_ids.iter().cloned().map(|user_id| GroupMember {
+            user_id,
+            role: GroupRole::Member,
+            status: GroupMemberStatus::Active,
+        }));
+        let outbox = GroupOutboxDescriptor {
+            endpoint: self.group_outbox_messages_endpoint(group_id)?,
+            subscribe_endpoint: None,
+        };
+        let signature_payload = format!(
+            "group_manifest:{group_id}:{conversation_id}:{title}:{}:{epoch}:{now}",
+            identity.user_identity.user_id
+        );
+        Ok(GroupManifest {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            group_id: group_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            title: title.to_string(),
+            owner_user_id: identity.user_identity.user_id.clone(),
+            admins: Vec::new(),
+            members,
+            join_policy: GroupJoinPolicy::Closed,
+            member_invite_policy: GroupMemberInvitePolicy::OwnerAdminOnly,
+            roster_version: 1,
+            mls_epoch_hint: epoch,
+            last_commit_message_id: None,
+            outbox,
+            updated_at: now,
+            signer_user_id: identity.user_identity.user_id.clone(),
+            signer_device_id: identity.device_identity.device_id.clone(),
+            signature: identity.sign_sender_proof(signature_payload.as_bytes()),
+        })
+    }
+
+    fn build_group_envelope(
+        &mut self,
+        group_id: &str,
+        conversation_id: &str,
+        message_type: GroupMessageType,
+        visibility: GroupEnvelopeVisibility,
+        payload_b64: String,
+    ) -> CoreResult<GroupEnvelope> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        let message_nonce = self.next_message_nonce();
+        let created_at = current_unix_millis(message_nonce);
+        let sender_proof = identity.sign_sender_proof(payload_b64.as_bytes());
+        Ok(GroupEnvelope {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            message_id: self.next_message_id(conversation_id, "group", message_nonce),
+            group_id: group_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender_user_id: identity.user_identity.user_id.clone(),
+            sender_device_id: identity.device_identity.device_id.clone(),
+            created_at,
+            message_type,
+            visibility,
+            inline_ciphertext: Some(payload_b64),
+            storage_refs: Vec::new(),
+            sender_proof: SenderProof {
+                proof_type: "device_signature".into(),
+                value: sender_proof,
+            },
+            membership_proof: None,
+        })
+    }
+
+    fn enqueue_group_envelope(
+        &mut self,
+        envelope: GroupEnvelope,
+        capability: GroupCapability,
+        plaintext: Option<String>,
+    ) {
+        self.state
+            .pending_group_outbox
+            .push(PendingGroupOutboxItem {
+                envelope,
+                capability,
+                retries: 0,
+                in_flight: false,
+                plaintext_cache: plaintext,
+            });
+    }
+
+    fn group_outbox_messages_endpoint(&self, group_id: &str) -> CoreResult<String> {
+        let deployment = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        Ok(format!(
+            "{}/v1/groups/{}/outbox/messages",
+            deployment.inbox_http_endpoint.trim_end_matches('/'),
+            group_id
+        ))
+    }
+
+    fn welcome_pickup_descriptor(
+        &self,
+        group_id: &str,
+        device_id: &str,
+    ) -> CoreResult<WelcomePickupDescriptor> {
+        let deployment = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let expires_at = current_unix_millis(self.state.message_nonce) + 24 * 60 * 60 * 1000;
+        let endpoint = format!(
+            "{}/v1/groups/{}/welcome-pickup/{}",
+            deployment.inbox_http_endpoint.trim_end_matches('/'),
+            group_id,
+            device_id
+        );
+        let capability = identity.sign_sender_proof(
+            format!("welcome_pickup:{group_id}:{device_id}:{expires_at}").as_bytes(),
+        );
+        Ok(WelcomePickupDescriptor {
+            group_id: group_id.to_string(),
+            device_id: device_id.to_string(),
+            endpoint,
+            capability,
+            expires_at,
+        })
+    }
+
+    fn group_capability(&self, group_id: &str, role: GroupRole) -> CoreResult<GroupCapability> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let expires_at = current_unix_millis(self.state.message_nonce) + 24 * 60 * 60 * 1000;
+        let operations = match role {
+            GroupRole::Owner | GroupRole::Admin => vec![
+                GroupCapabilityOperation::Read,
+                GroupCapabilityOperation::AppendApplication,
+                GroupCapabilityOperation::AppendControl,
+                GroupCapabilityOperation::AppendMembership,
+            ],
+            GroupRole::Member => vec![
+                GroupCapabilityOperation::Read,
+                GroupCapabilityOperation::AppendApplication,
+                GroupCapabilityOperation::AppendControl,
+            ],
+        };
+        let signature = identity.sign_sender_proof(
+            format!(
+                "group_capability:{group_id}:{}:{}:{expires_at}",
+                identity.user_identity.user_id, identity.device_identity.device_id
+            )
+            .as_bytes(),
+        );
+        Ok(GroupCapability {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            service: CapabilityService::GroupOutbox,
+            group_id: group_id.to_string(),
+            user_id: identity.user_identity.user_id.clone(),
+            device_id: identity.device_identity.device_id.clone(),
+            operations,
+            role,
+            expires_at,
+            signature,
+        })
+    }
+
+    fn group_capability_for_state(
+        &self,
+        state: &PersistedGroupState,
+    ) -> CoreResult<GroupCapability> {
+        self.group_capability(
+            &state.group_id,
+            state.local_role.unwrap_or(GroupRole::Member),
+        )
+    }
+
+    fn local_group_role(&self, group_id: &str) -> CoreResult<GroupRole> {
+        self.state
+            .group_states
+            .get(group_id)
+            .and_then(|state| state.local_role)
+            .ok_or_else(|| CoreError::invalid_input("local group role is missing"))
+    }
+
+    fn group_id_for_conversation(&self, conversation_id: &str) -> CoreResult<&str> {
+        self.state
+            .group_states
+            .values()
+            .find(|state| state.conversation_id == conversation_id)
+            .map(|state| state.group_id.as_str())
+            .ok_or_else(|| CoreError::invalid_input("group conversation does not exist"))
+    }
+
+    fn ensure_group_ready_for_send(&self, conversation_id: &str) -> CoreResult<()> {
+        let conversation = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        if conversation.conversation.kind != ConversationKind::Group {
+            return Err(CoreError::invalid_input("conversation is not a group"));
+        }
+        if conversation.conversation.state == ConversationState::NeedsRebuild
+            || conversation.recovery_status != RecoveryStatus::Healthy
+        {
+            return Err(CoreError::temporary_failure(
+                "group conversation is not ready for sending",
+            ));
+        }
+        let summary = self
+            .state
+            .mls_summaries
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_state("group MLS state is missing"))?;
+        if summary.status != MlsStateStatus::Active {
+            return Err(CoreError::temporary_failure(
+                "group MLS state is not active",
+            ));
+        }
+        Ok(())
+    }
+
+    fn next_group_id(&mut self, title: &str, members: &[String]) -> String {
+        let nonce = self.next_message_nonce();
+        let local_user_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.user_identity.user_id.as_str())
+            .unwrap_or("user:local");
+        let mut hasher = Sha256::new();
+        hasher.update(local_user_id.as_bytes());
+        hasher.update(title.as_bytes());
+        for member in members {
+            hasher.update(member.as_bytes());
+        }
+        hasher.update(nonce.to_be_bytes());
+        let digest = hasher.finalize();
+        format!("group:{}", hex_prefix(&digest, 16))
+    }
+
     fn conversation_summary(&self, conversation_id: &str) -> CoreResult<ConversationSummary> {
         let conversation = self
             .state
             .conversations
             .get(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        if conversation.conversation.kind == ConversationKind::Group {
+            let group_state = self
+                .state
+                .group_states
+                .values()
+                .find(|state| state.conversation_id == conversation_id);
+            return Ok(ConversationSummary {
+                conversation_id: conversation_id.to_string(),
+                peer_user_id: conversation.peer_user_id.clone(),
+                state: match conversation.recovery_status {
+                    RecoveryStatus::Healthy => "active".into(),
+                    RecoveryStatus::NeedsRecovery => "needs_recovery".into(),
+                    RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
+                },
+                kind: Some(ConversationKind::Group),
+                title: group_state.map(|state| state.manifest.title.clone()),
+                group_id: group_state.map(|state| state.group_id.clone()),
+                member_count: group_state.map(|state| {
+                    state
+                        .manifest
+                        .members
+                        .iter()
+                        .filter(|member| member.status == GroupMemberStatus::Active)
+                        .count()
+                }),
+                group_role: group_state.and_then(|state| state.local_role),
+                group_cursor: group_state
+                    .and_then(|state| self.state.group_cursors.get(&state.group_id).cloned()),
+                last_message_preview: None,
+                last_message_type: conversation.last_message_type,
+                message_count: Some(conversation.messages.len()),
+                recovery: self.recovery_snapshot_for_conversation(conversation_id),
+            });
+        }
         Ok(ConversationSummary {
             conversation_id: conversation_id.to_string(),
             peer_user_id: conversation.peer_user_id.clone(),
@@ -3062,6 +3831,7 @@ impl CoreEngine {
     fn flush_pending_transport(&mut self) -> CoreResult<CoreOutput> {
         let mut output = CoreOutput::default();
         output = merge_outputs(output, self.flush_outbox()?);
+        output = merge_outputs(output, self.flush_group_outbox()?);
         output = merge_outputs(output, self.flush_pending_acks()?);
         output = merge_outputs(output, self.flush_blob_uploads()?);
         output = merge_outputs(output, self.flush_blob_downloads()?);
@@ -3080,6 +3850,35 @@ impl CoreEngine {
             let request = self.build_append_request(&item)?;
             self.state.pending_outbox[index].in_flight = true;
             effects.push(CoreEffect::ExecuteHttpRequest { request });
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                messages_changed: !effects.is_empty(),
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: None,
+        })
+    }
+
+    fn flush_group_outbox(&mut self) -> CoreResult<CoreOutput> {
+        let mut effects = Vec::new();
+        for index in 0..self.state.pending_group_outbox.len() {
+            if self.state.pending_group_outbox[index].in_flight
+                || self.state.pending_group_outbox[index].retries >= MAX_TRANSPORT_RETRIES
+            {
+                continue;
+            }
+            let item = self.state.pending_group_outbox[index].clone();
+            self.state.pending_group_outbox[index].in_flight = true;
+            effects.push(CoreEffect::AppendGroupEnvelope {
+                append: AppendGroupEnvelopeRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: item.envelope.group_id.clone(),
+                    envelope: item.envelope,
+                    capability: item.capability,
+                },
+            });
         }
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
@@ -3430,6 +4229,67 @@ impl CoreEngine {
                 self.state.pending_acks.remove(&device_id);
                 self.flush_pending_transport()
             }
+            PendingRequest::AppendGroupEnvelope {
+                group_id,
+                message_id,
+            } => {
+                let result: AppendGroupEnvelopeResult = serde_json::from_str(
+                    body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"),
+                )
+                .map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "failed to decode group append response: {error}"
+                    ))
+                })?;
+                if !result.accepted {
+                    return Err(CoreError::temporary_failure(
+                        "group append response was not accepted",
+                    ));
+                }
+                self.handle_group_envelope_appended(group_id, message_id, result.seq)
+            }
+            PendingRequest::FetchGroupOutbox { group_id, .. } => {
+                let response: FetchGroupOutboxResult = serde_json::from_str(
+                    body.as_deref().unwrap_or("{\"to_seq\":0,\"records\":[]}"),
+                )
+                .map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "failed to decode group fetch response: {error}"
+                    ))
+                })?;
+                self.handle_group_outbox_records(group_id, response.records, response.to_seq)
+            }
+            PendingRequest::PutWelcomePickup { .. } => {
+                let result: PutWelcomePickupResult =
+                    serde_json::from_str(body.as_deref().unwrap_or("{\"accepted\":false}"))
+                        .map_err(|error| {
+                            CoreError::invalid_input(format!(
+                                "failed to decode welcome pickup put response: {error}"
+                            ))
+                        })?;
+                if !result.accepted {
+                    return Err(CoreError::temporary_failure(
+                        "welcome pickup put response was not accepted",
+                    ));
+                }
+                Ok(CoreOutput::default())
+            }
+            PendingRequest::FetchWelcomePickup {
+                group_id: _,
+                device_id: _,
+            } => {
+                let result: FetchWelcomePickupResult =
+                    serde_json::from_str(body.as_deref().unwrap_or("{\"welcome_b64\":\"\"}"))
+                        .map_err(|error| {
+                            CoreError::invalid_input(format!(
+                                "failed to decode welcome pickup response: {error}"
+                            ))
+                        })?;
+                Err(CoreError::invalid_state(format!(
+                    "welcome pickup HTTP response cannot be applied without descriptor: {}",
+                    result.welcome_b64.len()
+                )))
+            }
         }
     }
 
@@ -3547,6 +4407,46 @@ impl CoreEngine {
                         },
                     }]
                 },
+                view_model: None,
+            }),
+            PendingRequest::AppendGroupEnvelope {
+                group_id,
+                message_id,
+            } => self.handle_group_append_failed(group_id, message_id, retryable, detail),
+            PendingRequest::FetchGroupOutbox { group_id, .. } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail
+                            .unwrap_or_else(|| format!("group outbox fetch failed for {group_id}")),
+                    },
+                }],
+                view_model: None,
+            }),
+            PendingRequest::PutWelcomePickup {
+                group_id,
+                device_id,
+            }
+            | PendingRequest::FetchWelcomePickup {
+                group_id,
+                device_id,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("welcome pickup request failed for {group_id}/{device_id}")
+                        }),
+                    },
+                }],
                 view_model: None,
             }),
         }
@@ -4373,6 +5273,54 @@ impl CoreEngine {
                 }],
                 view_model: None,
             }),
+            PendingRequest::AppendGroupEnvelope {
+                group_id,
+                message_id,
+            } => self.handle_group_append_failed(
+                group_id,
+                message_id,
+                status >= 500,
+                body.or_else(|| Some(format!("group append returned status {status}"))),
+            ),
+            PendingRequest::FetchGroupOutbox { group_id, .. } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: body.unwrap_or_else(|| {
+                            format!("group fetch returned status {status} for {group_id}")
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
+            PendingRequest::PutWelcomePickup {
+                group_id,
+                device_id,
+            }
+            | PendingRequest::FetchWelcomePickup {
+                group_id,
+                device_id,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: body.unwrap_or_else(|| {
+                            format!(
+                                "welcome pickup returned status {status} for {group_id}/{device_id}"
+                            )
+                        }),
+                    },
+                }],
+                view_model: None,
+            }),
         }
     }
 
@@ -4650,6 +5598,428 @@ impl CoreEngine {
         }
     }
 
+    fn handle_group_outbox_records(
+        &mut self,
+        group_id: String,
+        mut records: Vec<GroupOutboxRecord>,
+        to_seq: u64,
+    ) -> CoreResult<CoreOutput> {
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let conversation_id = group_state.conversation_id.clone();
+        records.sort_by_key(|record| record.seq);
+        let mut messages = Vec::new();
+        for record in records {
+            record.validate()?;
+            if record.group_id != group_id || record.envelope.conversation_id != conversation_id {
+                return Err(CoreError::invalid_input(
+                    "group outbox record does not match local group",
+                ));
+            }
+            if self
+                .state
+                .conversations
+                .get(&conversation_id)
+                .map(|state| {
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message.message_id == record.message_id)
+                })
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let message_type = group_message_type_to_direct(record.envelope.message_type);
+            if matches!(
+                record.envelope.message_type,
+                GroupMessageType::MlsApplication | GroupMessageType::MlsCommit
+            ) {
+                let result = self
+                    .state
+                    .mls_adapter
+                    .as_mut()
+                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                    .ingest_message(
+                        &conversation_id,
+                        &record.envelope.sender_device_id,
+                        message_type,
+                        record
+                            .envelope
+                            .inline_ciphertext
+                            .as_deref()
+                            .unwrap_or_default(),
+                    )?;
+                match result {
+                    IngestResult::AppliedApplication(application) => self
+                        .store_group_record_message(
+                            &conversation_id,
+                            &record,
+                            message_type,
+                            String::from_utf8(application.plaintext).ok(),
+                        )?,
+                    IngestResult::AppliedCommit { .. } => self.store_group_record_message(
+                        &conversation_id,
+                        &record,
+                        message_type,
+                        None,
+                    )?,
+                    IngestResult::PendingRetry => {
+                        self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
+                        continue;
+                    }
+                    IngestResult::NeedsRebuild => {
+                        return self.escalate_conversation_to_rebuild(
+                            &conversation_id,
+                            RecoveryEscalationReason::MlsMarkedUnrecoverable,
+                            "group MLS marked conversation unrecoverable",
+                        );
+                    }
+                    IngestResult::AppliedWelcome { .. } => {}
+                }
+                if let Ok(summary) = self
+                    .state
+                    .mls_adapter
+                    .as_ref()
+                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                    .export_group_summary(&conversation_id)
+                {
+                    self.state
+                        .mls_summaries
+                        .insert(conversation_id.clone(), summary);
+                }
+            } else {
+                self.store_group_record_message(&conversation_id, &record, message_type, None)?;
+            }
+            messages.push(MessageSummary {
+                conversation_id: conversation_id.clone(),
+                message_id: record.message_id,
+                message_type,
+            });
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        self.state.group_cursors.insert(
+            group_id.clone(),
+            GroupCursor {
+                group_id: group_id.clone(),
+                last_fetched_seq: to_seq,
+                updated_at: now,
+            },
+        );
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: !messages.is_empty(),
+                messages_changed: !messages.is_empty(),
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveConversation {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveGroupCursor { group_id },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(&conversation_id)?],
+                messages,
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn store_group_record_message(
+        &mut self,
+        conversation_id: &str,
+        record: &GroupOutboxRecord,
+        message_type: MessageType,
+        plaintext: Option<String>,
+    ) -> CoreResult<()> {
+        let state = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        state.messages.push(crate::conversation::StoredMessage {
+            message_id: record.message_id.clone(),
+            sender_device_id: record.envelope.sender_device_id.clone(),
+            recipient_device_id: String::new(),
+            message_type,
+            created_at: record.envelope.created_at,
+            plaintext,
+            storage_refs: record.envelope.storage_refs.clone(),
+            downloaded_blob_b64: None,
+        });
+        state.last_message_type = Some(message_type);
+        state.conversation.updated_at = record.envelope.created_at;
+        Ok(())
+    }
+
+    fn handle_group_envelope_appended(
+        &mut self,
+        group_id: String,
+        message_id: String,
+        seq: u64,
+    ) -> CoreResult<CoreOutput> {
+        let pending_item = self
+            .state
+            .pending_group_outbox
+            .iter()
+            .find(|item| item.envelope.message_id == message_id)
+            .cloned();
+        self.state
+            .pending_group_outbox
+            .retain(|item| item.envelope.message_id != message_id);
+        let mut messages = Vec::new();
+        if let Some(item) = pending_item {
+            let group_state = self
+                .state
+                .group_states
+                .get(&group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                .clone();
+            let already_stored = self
+                .state
+                .conversations
+                .get(&group_state.conversation_id)
+                .map(|state| {
+                    state
+                        .messages
+                        .iter()
+                        .any(|message| message.message_id == message_id)
+                })
+                .unwrap_or(false);
+            if !already_stored {
+                let message_type = group_message_type_to_direct(item.envelope.message_type);
+                let record = GroupOutboxRecord {
+                    seq,
+                    group_id: group_id.clone(),
+                    message_id: message_id.clone(),
+                    received_at: current_unix_millis(self.state.message_nonce),
+                    expires_at: None,
+                    state: GroupOutboxRecordState::Available,
+                    envelope: item.envelope,
+                };
+                self.store_group_record_message(
+                    &group_state.conversation_id,
+                    &record,
+                    message_type,
+                    item.plaintext_cache,
+                )?;
+                messages.push(MessageSummary {
+                    conversation_id: group_state.conversation_id,
+                    message_id: message_id.clone(),
+                    message_type,
+                });
+            }
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                conversations_changed: !messages.is_empty(),
+                messages_changed: !messages.is_empty(),
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::DeleteOutgoingGroupEnvelope { message_id }],
+            )],
+            view_model: Some(CoreViewModel {
+                messages,
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn handle_group_append_failed(
+        &mut self,
+        group_id: String,
+        message_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        if let Some(item) = self
+            .state
+            .pending_group_outbox
+            .iter_mut()
+            .find(|item| item.envelope.message_id == message_id)
+        {
+            item.in_flight = false;
+            item.retries = item.retries.saturating_add(1);
+            if retryable && item.retries < MAX_TRANSPORT_RETRIES {
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![CoreEffect::ScheduleTimer {
+                        timer: TimerEffect {
+                            timer_id: format!("retry_group_append:{message_id}"),
+                            delay_ms: 0,
+                        },
+                    }],
+                    view_model: None,
+                });
+            }
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::EmitUserNotification {
+                notification: UserNotificationEffect {
+                    status: SystemStatus::TemporaryNetworkFailure,
+                    message: detail.unwrap_or_else(|| {
+                        format!("group append failed for {group_id}/{message_id}")
+                    }),
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn handle_welcome_pickup_fetched(
+        &mut self,
+        descriptor: WelcomePickupDescriptor,
+        welcome_b64: String,
+        manifest: Option<GroupManifest>,
+    ) -> CoreResult<CoreOutput> {
+        if !self.state.group_states.contains_key(&descriptor.group_id) {
+            let manifest = manifest.ok_or_else(|| {
+                CoreError::invalid_input("welcome pickup result is missing group manifest")
+            })?;
+            manifest.validate()?;
+            let local_identity = self
+                .state
+                .local_identity
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            let local_role = manifest
+                .members
+                .iter()
+                .find(|member| {
+                    member.user_id == local_identity.user_identity.user_id
+                        && member.status == GroupMemberStatus::Active
+                })
+                .map(|member| member.role);
+            if local_role.is_none() {
+                return Err(CoreError::invalid_input(
+                    "local user is not an active member of the group manifest",
+                ));
+            }
+            self.state.conversations.insert(
+                manifest.conversation_id.clone(),
+                LocalConversationState {
+                    conversation: Conversation {
+                        conversation_id: manifest.conversation_id.clone(),
+                        kind: ConversationKind::Group,
+                        member_users: manifest
+                            .members
+                            .iter()
+                            .map(|member| member.user_id.clone())
+                            .collect(),
+                        member_devices: vec![ConversationMember {
+                            user_id: local_identity.user_identity.user_id.clone(),
+                            device_id: local_identity.device_identity.device_id.clone(),
+                            status: DeviceStatusKind::Active,
+                        }],
+                        state: ConversationState::Active,
+                        updated_at: manifest.updated_at,
+                    },
+                    messages: Vec::new(),
+                    last_message_type: None,
+                    peer_user_id: manifest.group_id.clone(),
+                    last_known_peer_active_devices: BTreeSet::new(),
+                    recovery_status: RecoveryStatus::Healthy,
+                },
+            );
+            self.state.group_cursors.insert(
+                manifest.group_id.clone(),
+                GroupCursor {
+                    group_id: manifest.group_id.clone(),
+                    last_fetched_seq: 0,
+                    updated_at: manifest.updated_at,
+                },
+            );
+            self.state.group_states.insert(
+                manifest.group_id.clone(),
+                PersistedGroupState {
+                    group_id: manifest.group_id.clone(),
+                    conversation_id: manifest.conversation_id.clone(),
+                    manifest,
+                    local_role,
+                    welcome_pickup: Some(descriptor.clone()),
+                },
+            );
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&descriptor.group_id)
+            .ok_or_else(|| CoreError::invalid_input("group state does not exist for welcome"))?
+            .clone();
+        let result = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .ingest_message(
+                &group_state.conversation_id,
+                &group_state.manifest.signer_device_id,
+                MessageType::MlsWelcome,
+                &welcome_b64,
+            )?;
+        if !matches!(result, IngestResult::AppliedWelcome { .. }) {
+            return Err(CoreError::invalid_state("welcome pickup did not apply"));
+        }
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .export_group_summary(&group_state.conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary);
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveConversation {
+                        conversation_id: group_state.conversation_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: group_state.conversation_id.clone(),
+                    },
+                    PersistOp::SaveGroupState {
+                        group_id: group_state.group_id.clone(),
+                    },
+                    PersistOp::SaveGroupCursor {
+                        group_id: group_state.group_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(&group_state.conversation_id)?],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
     fn replay_pending_records_for_device(&mut self, device_id: String) -> CoreResult<CoreOutput> {
         let records = {
             let Some(sync_state) = self.state.sync_states.get_mut(&device_id) else {
@@ -4690,6 +6060,68 @@ impl CoreEngine {
 
 fn current_timestamp_hint(outbox_len: usize) -> u64 {
     outbox_len as u64 + 1
+}
+
+fn current_unix_millis(fallback: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(fallback)
+}
+
+fn hex_prefix(bytes: &[u8], len: usize) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            let hi = byte >> 4;
+            let lo = byte & 0x0f;
+            [hex_nibble(hi), hex_nibble(lo)]
+        })
+        .take(len)
+        .collect()
+}
+
+fn hex_nibble(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        _ => (b'a' + (value - 10)) as char,
+    }
+}
+
+fn group_capability_for_manifest(manifest: &GroupManifest, role: GroupRole) -> GroupCapability {
+    GroupCapability {
+        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+        service: CapabilityService::GroupOutbox,
+        group_id: manifest.group_id.clone(),
+        user_id: manifest.signer_user_id.clone(),
+        device_id: manifest.signer_device_id.clone(),
+        operations: vec![
+            GroupCapabilityOperation::Read,
+            GroupCapabilityOperation::AppendApplication,
+            GroupCapabilityOperation::AppendControl,
+        ],
+        role,
+        expires_at: current_unix_millis(0) + 60 * 60 * 1000,
+        signature: manifest.signature.clone(),
+    }
+}
+
+fn group_message_type_to_direct(message_type: GroupMessageType) -> MessageType {
+    match message_type {
+        GroupMessageType::MlsApplication => MessageType::MlsApplication,
+        GroupMessageType::MlsCommit => MessageType::MlsCommit,
+        GroupMessageType::ControlConversationNeedsRebuild => {
+            MessageType::ControlConversationNeedsRebuild
+        }
+        GroupMessageType::ControlGroupMembershipChanged
+        | GroupMessageType::ControlGroupJoinRequested
+        | GroupMessageType::ControlGroupJoinApproved
+        | GroupMessageType::ControlGroupJoinRejected
+        | GroupMessageType::ControlGroupLeaveRequested => {
+            MessageType::ControlDeviceMembershipChanged
+        }
+        GroupMessageType::ControlGroupMetadataUpdated => MessageType::ControlIdentityStateUpdated,
+    }
 }
 
 fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
@@ -4776,9 +6208,27 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 plaintext_cache: item.plaintext_cache.clone(),
             })
             .collect(),
-        group_states: Vec::new(),
-        group_cursors: Vec::new(),
-        pending_group_outbox: Vec::new(),
+        group_states: state.group_states.values().cloned().collect(),
+        group_cursors: state
+            .group_cursors
+            .iter()
+            .map(|(group_id, cursor)| PersistedGroupCursor {
+                group_id: group_id.clone(),
+                cursor: cursor.clone(),
+            })
+            .collect(),
+        pending_group_outbox: state
+            .pending_group_outbox
+            .iter()
+            .map(|item| PersistedOutgoingGroupEnvelope {
+                message_id: item.envelope.message_id.clone(),
+                group_id: item.envelope.group_id.clone(),
+                envelope: item.envelope.clone(),
+                capability: Some(item.capability.clone()),
+                retries: item.retries,
+                plaintext_cache: item.plaintext_cache.clone(),
+            })
+            .collect(),
         pending_acks: state
             .pending_acks
             .iter()

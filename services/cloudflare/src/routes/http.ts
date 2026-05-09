@@ -8,11 +8,13 @@ import {
   validateGroupAppendAuthorization,
   validateGroupReadAuthorization,
   validateKeyPackageWriteAuthorization,
-  validateSharedStateWriteAuthorization
+  validateSharedStateWriteAuthorization,
+  validateWelcomePickupAuthorization
 } from "../auth/capability";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
 import { SharedStateService } from "../storage/shared-state";
 import { StorageService } from "../storage/service";
+import { WelcomePickupService } from "../welcome-pickup/service";
 import {
   CURRENT_MODEL_VERSION,
   type AllowlistDocument,
@@ -24,7 +26,9 @@ import {
   type DeviceStatusDocument,
   type IdentityBundle,
   type KeyPackageRefsDocument,
-  type PrepareBlobUploadRequest
+  type PrepareBlobUploadRequest,
+  type PutWelcomePickupRequest,
+  type WelcomePickupDescriptor
 } from "../types/contracts";
 import type { Env } from "../types/runtime";
 
@@ -148,7 +152,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
       keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
-      features: ["generic_sync", "attachment_v1", "message_requests", "allowlist", "rate_limit", "group_outbox_mvp"]
+      features: ["generic_sync", "attachment_v1", "message_requests", "allowlist", "rate_limit", "group_outbox_mvp", "welcome_pickup_mvp"]
     }
   };
 }
@@ -182,6 +186,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     sharedStateSecret(env)
   );
   const sharedState = new SharedStateService(new R2JsonBlobStore(env.TAPCHAT_STORAGE), baseUrl(request, env));
+  const welcomePickup = new WelcomePickupService(new R2JsonBlobStore(env.TAPCHAT_STORAGE));
   const now = Date.now();
 
   try {
@@ -267,6 +272,31 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
 
       return stub.fetch(request);
+    }
+
+    const welcomePickupMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/welcome-pickup\/([^/]+)$/);
+    if (welcomePickupMatch) {
+      const groupId = decodeURIComponent(welcomePickupMatch[1]);
+      const deviceId = decodeURIComponent(welcomePickupMatch[2]);
+      if (request.method === "PUT") {
+        const body = (await request.json()) as PutWelcomePickupRequest;
+        validateWelcomePickupAuthorization(request, groupId, deviceId, body.descriptor, now);
+        return jsonResponse(await welcomePickup.put(body, now));
+      }
+      if (request.method === "GET") {
+        const encoded = request.headers.get("X-Tapchat-Welcome-Pickup");
+        if (!encoded) {
+          throw new HttpError(401, "invalid_capability", "missing X-Tapchat-Welcome-Pickup header");
+        }
+        let descriptor: WelcomePickupDescriptor;
+        try {
+          descriptor = JSON.parse(encoded) as WelcomePickupDescriptor;
+        } catch {
+          throw new HttpError(400, "invalid_capability", "X-Tapchat-Welcome-Pickup is not valid JSON");
+        }
+        validateWelcomePickupAuthorization(request, groupId, deviceId, descriptor, now);
+        return jsonResponse(await welcomePickup.fetch(descriptor, now));
+      }
     }
 
     const identityBundleMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/identity-bundle$/);

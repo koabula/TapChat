@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{timeout, Duration, Instant};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 use crate::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
@@ -17,16 +17,19 @@ use crate::ffi_api::{
     SyncCheckpointSnapshot,
 };
 use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
-use crate::platform_ports::{
-    BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
-    TransportPort, execute_platform_effect,
-};
 use crate::persistence::CorePersistenceSnapshot;
+use crate::platform_ports::{
+    execute_platform_effect, BlobIoPort, NotificationPort, PersistencePort, RealtimePort,
+    SecureStoragePort, TimerPort, TransportPort,
+};
 use crate::transport_contract::{
-    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
-    PrepareBlobUploadRequest, PublishSharedStateRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest,
+    AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
+    BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest, FetchGroupOutboxRequest,
+    FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupOutboxHeadRequest,
+    GetGroupOutboxHeadResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
+    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
 };
 
 use super::util::{to_camel_case_json_string, to_snake_case_json_string};
@@ -444,7 +447,8 @@ impl CoreDriver {
     async fn execute_effect(&mut self, effect: CoreEffect) -> Result<Vec<CoreEvent>> {
         if self.suppress_realtime {
             match effect {
-                CoreEffect::OpenRealtimeConnection { .. } | CoreEffect::CloseRealtimeConnection { .. } => {
+                CoreEffect::OpenRealtimeConnection { .. }
+                | CoreEffect::CloseRealtimeConnection { .. } => {
                     return Ok(Vec::new());
                 }
                 _ => {}
@@ -476,8 +480,7 @@ impl CoreDriver {
             if request.url.contains("/messages") {
                 let mut append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
                 if append_request.sender_bundle_share_url.is_none() {
-                    append_request.sender_bundle_share_url =
-                        self.runtime.contact_share_url.clone();
+                    append_request.sender_bundle_share_url = self.runtime.contact_share_url.clone();
                 }
                 if append_request.sender_bundle_hash.is_none() {
                     append_request.sender_bundle_hash = self
@@ -488,7 +491,8 @@ impl CoreDriver {
                 self.runtime
                     .recent_appends
                     .push(append_request.envelope.clone());
-                let converted = to_camel_case_json_string(&serde_json::to_string(&append_request)?)?;
+                let converted =
+                    to_camel_case_json_string(&serde_json::to_string(&append_request)?)?;
                 builder = builder.body(converted);
                 return match builder.send().await {
                     Ok(response) => {
@@ -661,13 +665,19 @@ impl CoreDriver {
                 let normalized = to_snake_case_json_string(&body)?;
                 let value: serde_json::Value = serde_json::from_str(&normalized)?;
                 let requests = serde_json::from_value(
-                    value.get("requests").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    value
+                        .get("requests")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
                 )?;
                 Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
             }
             Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
                 retryable: false,
-                detail: Some(format!("list message requests failed with status {}", response.status())),
+                detail: Some(format!(
+                    "list message requests failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
                 retryable: true,
@@ -763,7 +773,10 @@ impl CoreDriver {
             }
             Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
                 retryable: false,
-                detail: Some(format!("get allowlist failed with status {}", response.status())),
+                detail: Some(format!(
+                    "get allowlist failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
                 retryable: true,
@@ -797,7 +810,10 @@ impl CoreDriver {
             }
             Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
                 retryable: false,
-                detail: Some(format!("put allowlist failed with status {}", response.status())),
+                detail: Some(format!(
+                    "put allowlist failed with status {}",
+                    response.status()
+                )),
             }]),
             Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
                 retryable: true,
@@ -820,10 +836,12 @@ impl CoreDriver {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::SharedStatePublished {
-                document_kind: publish.document_kind,
-                reference: publish.reference,
-            }]),
+            Ok(response) if response.status().is_success() => {
+                Ok(vec![CoreEvent::SharedStatePublished {
+                    document_kind: publish.document_kind,
+                    reference: publish.reference,
+                }])
+            }
             Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
                 document_kind: publish.document_kind,
                 reference: publish.reference,
@@ -1043,10 +1061,7 @@ impl TransportPort for CoreDriver {
         CoreDriver::act_on_message_request(self, action).await
     }
 
-    async fn fetch_allowlist(
-        &mut self,
-        fetch: FetchAllowlistRequest,
-    ) -> Result<Vec<CoreEvent>> {
+    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
         CoreDriver::fetch_allowlist(self, fetch).await
     }
 
@@ -1062,6 +1077,233 @@ impl TransportPort for CoreDriver {
         publish: PublishSharedStateRequest,
     ) -> Result<Vec<CoreEvent>> {
         CoreDriver::publish_shared_state(self, publish).await
+    }
+
+    async fn append_group_envelope(
+        &mut self,
+        append: AppendGroupEnvelopeRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let endpoint = self
+            .engine
+            .refresh_snapshot()
+            .group_states
+            .iter()
+            .find(|state| state.group_id == append.group_id)
+            .map(|state| state.manifest.outbox.endpoint.clone())
+            .ok_or_else(|| anyhow!("group outbox endpoint is missing"))?;
+        let request = self
+            .runtime
+            .client
+            .post(endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", append.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&append.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&append)?)?);
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
+                        group_id: append.group_id,
+                        message_id: append.envelope.message_id,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: AppendGroupEnvelopeResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupEnvelopeAppended {
+                    group_id: append.group_id,
+                    message_id: append.envelope.message_id,
+                    seq: result.seq,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
+                group_id: append.group_id,
+                message_id: append.envelope.message_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn fetch_group_outbox(
+        &mut self,
+        fetch: FetchGroupOutboxRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let url = format!(
+            "{}/v1/groups/{}/outbox/messages?fromSeq={}&limit={}",
+            base.trim_end_matches('/'),
+            fetch.group_id,
+            fetch.from_seq,
+            fetch.limit
+        );
+        let request = self
+            .runtime
+            .client
+            .get(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", fetch.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&fetch.capability)?)?,
+            );
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
+                        group_id: fetch.group_id,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: FetchGroupOutboxResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupOutboxFetched {
+                    group_id: fetch.group_id,
+                    records: result.records,
+                    to_seq: result.to_seq,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
+                group_id: fetch.group_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn get_group_outbox_head(
+        &mut self,
+        get: GetGroupOutboxHeadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let url = format!(
+            "{}/v1/groups/{}/outbox/head",
+            base.trim_end_matches('/'),
+            get.group_id
+        );
+        let response = self
+            .runtime
+            .client
+            .get(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", get.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&get.capability)?)?,
+            )
+            .send()
+            .await?;
+        let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
+        let _result: GetGroupOutboxHeadResult = serde_json::from_str(&body)?;
+        Ok(Vec::new())
+    }
+
+    async fn put_welcome_pickup(&mut self, put: PutWelcomePickupRequest) -> Result<Vec<CoreEvent>> {
+        let response = self
+            .runtime
+            .client
+            .put(&put.descriptor.endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", put.descriptor.capability),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&put)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::WelcomePickupPutFailed {
+                        descriptor: put.descriptor,
+                        retryable: status >= 500,
+                        detail: response.text().await.ok(),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
+                let _result: PutWelcomePickupResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::WelcomePickupPut {
+                    descriptor: put.descriptor,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::WelcomePickupPutFailed {
+                descriptor: put.descriptor,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn fetch_welcome_pickup(
+        &mut self,
+        fetch: FetchWelcomePickupRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let response = self
+            .runtime
+            .client
+            .get(&fetch.descriptor.endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", fetch.descriptor.capability),
+            )
+            .header(
+                "X-Tapchat-Welcome-Pickup",
+                to_camel_case_json_string(&serde_json::to_string(&fetch.descriptor)?)?,
+            )
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::WelcomePickupFetchFailed {
+                        descriptor: fetch.descriptor,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: FetchWelcomePickupResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::WelcomePickupFetched {
+                    descriptor: fetch.descriptor,
+                    welcome_b64: result.welcome_b64,
+                    manifest: result.manifest,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::WelcomePickupFetchFailed {
+                descriptor: fetch.descriptor,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
     }
 }
 
@@ -1207,11 +1449,15 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
     left.effects.extend(right.effects);
     match (&mut left.view_model, right.view_model) {
         (Some(left_view), Some(mut right_view)) => {
-            left_view.conversations.append(&mut right_view.conversations);
+            left_view
+                .conversations
+                .append(&mut right_view.conversations);
             left_view.messages.append(&mut right_view.messages);
             left_view.contacts.append(&mut right_view.contacts);
             left_view.banners.append(&mut right_view.banners);
-            left_view.message_requests.append(&mut right_view.message_requests);
+            left_view
+                .message_requests
+                .append(&mut right_view.message_requests);
             if right_view.allowlist.is_some() {
                 left_view.allowlist = right_view.allowlist.take();
             }
@@ -1232,7 +1478,7 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduledTimer, parse_realtime_event};
+    use super::{parse_realtime_event, ScheduledTimer};
     use tokio::time::{Duration, Instant};
 
     #[test]

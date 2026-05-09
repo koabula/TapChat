@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::model::{
-    Ack, Envelope, GroupCapability, GroupEnvelope, GroupOutboxRecord, IdentityBundle, InboxRecord,
-    WelcomePickupDescriptor,
+    Ack, Envelope, GroupCapability, GroupEnvelope, GroupManifest, GroupOutboxRecord,
+    IdentityBundle, InboxRecord, WelcomePickupDescriptor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,12 +155,16 @@ pub struct FetchWelcomePickupRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchWelcomePickupResult {
     pub welcome_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<GroupManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PutWelcomePickupRequest {
     pub descriptor: WelcomePickupDescriptor,
     pub welcome_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<GroupManifest>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
 }
@@ -349,10 +353,10 @@ pub struct PublishSharedStateRequest {
 mod tests {
     use super::*;
     use crate::model::{
-        CapabilityService, CURRENT_MODEL_VERSION, DeliveryClass, GroupCapability,
-        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType,
-        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, MessageType, SenderProof,
-        StorageRef, WelcomePickupDescriptor,
+        CapabilityService, DeliveryClass, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        GroupEnvelopeVisibility, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState,
+        GroupRole, MessageType, SenderProof, StorageRef, WelcomePickupDescriptor,
+        CURRENT_MODEL_VERSION,
     };
 
     #[test]
@@ -409,7 +413,10 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serialize");
         let decoded: AppendEnvelopeResult = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(decoded.delivered_to, AppendDeliveryDisposition::MessageRequest);
+        assert_eq!(
+            decoded.delivered_to,
+            AppendDeliveryDisposition::MessageRequest
+        );
         assert_eq!(decoded.queued_as_request, Some(true));
         assert_eq!(decoded.request_id.as_deref(), Some("request:user:alice"));
     }
@@ -468,12 +475,12 @@ mod tests {
             descriptor: WelcomePickupDescriptor {
                 group_id: "group:project".into(),
                 device_id: "device:bob:phone".into(),
-                endpoint: "https://example.com/welcome/group%3Aproject/device%3Abob%3Aphone"
-                    .into(),
+                endpoint: "https://example.com/welcome/group%3Aproject/device%3Abob%3Aphone".into(),
                 capability: "cap:welcome:1".into(),
                 expires_at: 99,
             },
             welcome_b64: "d2VsY29tZQ==".into(),
+            manifest: None,
             headers: BTreeMap::new(),
         };
         let json = serde_json::to_string(&pickup).expect("serialize welcome");

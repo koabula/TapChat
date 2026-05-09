@@ -9,7 +9,8 @@ import type {
   GroupMessageType,
   InboxAppendCapability,
   KeyPackageWriteToken,
-  SharedStateWriteToken
+  SharedStateWriteToken,
+  WelcomePickupDescriptor
 } from "../types/contracts";
 import { CURRENT_MODEL_VERSION } from "../types/contracts";
 import { verifySharingPayload } from "../storage/sharing";
@@ -124,17 +125,44 @@ export function validateGroupAppendAuthorization(
   now: number
 ): void {
   const capability = body.capability;
+  if (!capability) {
+    throw new HttpError(401, "invalid_capability", "missing group capability");
+  }
   validateGroupCapabilityBase(request, groupId, capability, now);
   if (body.groupId !== groupId || body.envelope.groupId !== groupId) {
     throw new HttpError(403, "invalid_capability", "group capability scope does not match request group");
   }
 
-  const required = requiredGroupAppendOperation(body.envelope.messageType);
-  if (!capability.operations.includes(required)) {
-    throw new HttpError(403, "invalid_capability", `group capability does not grant ${required}`);
+  for (const required of requiredGroupAppendOperations(body.envelope.messageType)) {
+    if (!capability.operations.includes(required)) {
+      throw new HttpError(403, "invalid_capability", `group capability does not grant ${required}`);
+    }
   }
-  if (required === "append_membership" && capability.role === "member") {
+  if (isMembershipControlMessage(body.envelope.messageType) && capability.role === "member") {
     throw new HttpError(403, "invalid_capability", "member role cannot append membership control messages");
+  }
+}
+
+export function validateWelcomePickupAuthorization(
+  request: Request,
+  groupId: string,
+  deviceId: string,
+  descriptor: WelcomePickupDescriptor,
+  now: number
+): void {
+  const token = getBearerToken(request);
+  if (descriptor.groupId !== groupId || descriptor.deviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "welcome pickup descriptor scope does not match request path");
+  }
+  const requestUrl = new URL(request.url);
+  if (descriptor.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
+    throw new HttpError(403, "invalid_capability", "welcome pickup endpoint does not match request path");
+  }
+  if (descriptor.expiresAt <= now) {
+    throw new HttpError(403, "capability_expired", "welcome pickup capability is expired");
+  }
+  if (descriptor.capability !== token) {
+    throw new HttpError(403, "invalid_capability", "welcome pickup capability does not match bearer token");
   }
 }
 
@@ -162,14 +190,14 @@ function validateGroupCapabilityBase(
   }
 }
 
-function requiredGroupAppendOperation(messageType: GroupMessageType): GroupCapabilityOperation {
+function requiredGroupAppendOperations(messageType: GroupMessageType): GroupCapabilityOperation[] {
   if (messageType === "mls_application") {
-    return "append_application";
+    return ["append_application"];
   }
   if (isMembershipControlMessage(messageType)) {
-    return "append_membership";
+    return ["append_control", "append_membership"];
   }
-  return "append_control";
+  return ["append_control"];
 }
 
 function isMembershipControlMessage(messageType: GroupMessageType): boolean {

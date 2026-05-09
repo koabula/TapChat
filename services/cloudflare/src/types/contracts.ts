@@ -217,11 +217,13 @@ export interface FetchWelcomePickupRequest {
 
 export interface FetchWelcomePickupResult {
   welcomeB64: string;
+  manifest?: GroupManifest;
 }
 
 export interface PutWelcomePickupRequest {
   descriptor: WelcomePickupDescriptor;
   welcomeB64: string;
+  manifest?: GroupManifest;
   headers?: Record<string, string>;
 }
 

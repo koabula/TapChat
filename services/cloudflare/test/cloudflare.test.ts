@@ -975,6 +975,21 @@ test("group outbox rejects invalid capabilities and scope mismatches", async () 
     env
   );
   assert.equal(bodyMismatch.status, 403);
+
+  const missingBodyCapability = sampleGroupAppend("group:project", "msg:missing-capability");
+  delete (missingBodyCapability as Partial<AppendGroupEnvelopeRequest>).capability;
+  const missingBodyCapabilityResponse = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...authHeaders(capability.signature),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(missingBodyCapability)
+    }),
+    env
+  );
+  assert.equal(missingBodyCapabilityResponse.status, 401);
 });
 
 test("group outbox enforces operation and role permissions", async () => {
@@ -1025,7 +1040,26 @@ test("group outbox enforces operation and role permissions", async () => {
   );
   assert.equal(memberDenied.status, 403);
 
-  const admin = sampleGroupCapability("group:project", ["read", "append_membership"], "admin");
+  const adminWithoutControl = sampleGroupCapability("group:project", ["read", "append_membership"], "admin");
+  const adminWithoutControlDenied = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(adminWithoutControl),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend(
+        "group:project",
+        "msg:membership-no-control",
+        "control_group_membership_changed",
+        adminWithoutControl
+      ))
+    }),
+    env
+  );
+  assert.equal(adminWithoutControlDenied.status, 403);
+
+  const admin = sampleGroupCapability("group:project", ["read", "append_control", "append_membership"], "admin");
   const adminAllowed = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
       method: "POST",
@@ -1074,6 +1108,59 @@ test("group outbox spills large records to R2 and fetches them back", async () =
   assert.equal(fetch.status, 200);
   const body = await fetch.json() as { records: Array<{ messageId: string }> };
   assert.deepEqual(body.records.map((record) => record.messageId), ["msg:large"]);
+});
+
+test("welcome pickup stores and fetches a device-scoped welcome", async () => {
+  const { env } = createEnv();
+  const descriptor = {
+    groupId: "group:project",
+    deviceId: "device:bob:phone",
+    endpoint: "https://example.com/v1/groups/group:project/welcome-pickup/device:bob:phone",
+    capability: "welcome-cap-1",
+    expiresAt: Date.now() + 60_000
+  };
+
+  const put = await handleRequest(
+    new Request(descriptor.endpoint, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(descriptor.capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        descriptor,
+        welcomeB64: "d2VsY29tZQ=="
+      })
+    }),
+    env
+  );
+  assert.equal(put.status, 200);
+  assert.equal(((await put.json()) as { accepted: boolean }).accepted, true);
+
+  const fetched = await handleRequest(
+    new Request(descriptor.endpoint, {
+      method: "GET",
+      headers: {
+        ...authHeaders(descriptor.capability),
+        "X-Tapchat-Welcome-Pickup": JSON.stringify(descriptor)
+      }
+    }),
+    env
+  );
+  assert.equal(fetched.status, 200);
+  assert.equal(((await fetched.json()) as { welcomeB64: string }).welcomeB64, "d2VsY29tZQ==");
+
+  const rejected = await handleRequest(
+    new Request(descriptor.endpoint, {
+      method: "GET",
+      headers: {
+        ...authHeaders("wrong"),
+        "X-Tapchat-Welcome-Pickup": JSON.stringify(descriptor)
+      }
+    }),
+    env
+  );
+  assert.equal(rejected.status, 403);
 });
 
 test("ack semantics reject backwards ack and cleanup only removes expired acked records", async () => {

@@ -423,6 +423,7 @@ interface FetchWelcomePickupRequest {
 interface PutWelcomePickupRequest {
   descriptor: WelcomePickupDescriptor;
   welcome_b64: string;
+  manifest?: GroupManifest | null;
   headers: Record<string, string>;
 }
 

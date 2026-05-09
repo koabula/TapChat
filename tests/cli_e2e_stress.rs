@@ -4,11 +4,12 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 const STRESS_CASE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[test]
+#[ignore = "disabled by default because this long-running stress suite is run manually"]
 fn cli_e2e_stress_suite() -> Result<()> {
     for test_name in [
         "cli_multi_device_join_and_switch_e2e_work",

@@ -3,13 +3,15 @@
 use anyhow::Result;
 
 use crate::ffi_api::{
-    CoreEffect, CoreEvent, PersistStateEffect, ReadAttachmentBytesEffect,
-    UserNotificationEffect, WriteDownloadedAttachmentEffect,
+    CoreEffect, CoreEvent, PersistStateEffect, ReadAttachmentBytesEffect, UserNotificationEffect,
+    WriteDownloadedAttachmentEffect,
 };
 use crate::transport_contract::{
-    BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
-    PublishSharedStateRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    AppendGroupEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
+    FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchWelcomePickupRequest, GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
+    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
+    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
 };
 
 pub trait TransportPort {
@@ -33,10 +35,7 @@ pub trait TransportPort {
         action: MessageRequestActionRequest,
     ) -> Result<Vec<CoreEvent>>;
 
-    async fn fetch_allowlist(
-        &mut self,
-        fetch: FetchAllowlistRequest,
-    ) -> Result<Vec<CoreEvent>>;
+    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>>;
 
     async fn replace_allowlist(
         &mut self,
@@ -47,6 +46,41 @@ pub trait TransportPort {
         &mut self,
         publish: PublishSharedStateRequest,
     ) -> Result<Vec<CoreEvent>>;
+
+    async fn append_group_envelope(
+        &mut self,
+        _append: AppendGroupEnvelopeRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group append transport is not implemented by this platform")
+    }
+
+    async fn fetch_group_outbox(
+        &mut self,
+        _fetch: FetchGroupOutboxRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group fetch transport is not implemented by this platform")
+    }
+
+    async fn get_group_outbox_head(
+        &mut self,
+        _get: GetGroupOutboxHeadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group head transport is not implemented by this platform")
+    }
+
+    async fn fetch_welcome_pickup(
+        &mut self,
+        _fetch: FetchWelcomePickupRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("welcome pickup fetch transport is not implemented by this platform")
+    }
+
+    async fn put_welcome_pickup(
+        &mut self,
+        _put: PutWelcomePickupRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("welcome pickup put transport is not implemented by this platform")
+    }
 }
 
 pub trait RealtimePort {
@@ -56,6 +90,13 @@ pub trait RealtimePort {
     ) -> Result<Vec<CoreEvent>>;
 
     async fn close_realtime(&mut self, device_id: String) -> Result<Vec<CoreEvent>>;
+
+    async fn open_group_realtime(
+        &mut self,
+        _subscription: GroupRealtimeSubscriptionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group realtime is not implemented by this platform")
+    }
 }
 
 pub trait BlobIoPort {
@@ -113,14 +154,14 @@ where
         CoreEffect::FetchAllowlist { fetch } => ports.fetch_allowlist(fetch).await,
         CoreEffect::ReplaceAllowlist { update } => ports.replace_allowlist(update).await,
         CoreEffect::PublishSharedState { publish } => ports.publish_shared_state(publish).await,
-        CoreEffect::OpenGroupRealtimeConnection { .. }
-        | CoreEffect::AppendGroupEnvelope { .. }
-        | CoreEffect::FetchGroupOutbox { .. }
-        | CoreEffect::GetGroupOutboxHead { .. }
-        | CoreEffect::FetchWelcomePickup { .. }
-        | CoreEffect::PutWelcomePickup { .. } => {
-            anyhow::bail!("group phase not implemented")
+        CoreEffect::OpenGroupRealtimeConnection { subscription } => {
+            ports.open_group_realtime(subscription).await
         }
+        CoreEffect::AppendGroupEnvelope { append } => ports.append_group_envelope(append).await,
+        CoreEffect::FetchGroupOutbox { fetch } => ports.fetch_group_outbox(fetch).await,
+        CoreEffect::GetGroupOutboxHead { get } => ports.get_group_outbox_head(get).await,
+        CoreEffect::FetchWelcomePickup { fetch } => ports.fetch_welcome_pickup(fetch).await,
+        CoreEffect::PutWelcomePickup { put } => ports.put_welcome_pickup(put).await,
         CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,
         CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
         CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,
@@ -142,9 +183,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi_api::{
-        HttpMethod, HttpRequestEffect, SystemStatus, TimerEffect,
-    };
+    use crate::ffi_api::{HttpMethod, HttpRequestEffect, SystemStatus, TimerEffect};
     use std::collections::BTreeMap;
 
     #[derive(Default)]

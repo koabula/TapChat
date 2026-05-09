@@ -7,8 +7,8 @@ use crate::conversation::RecoveryStatus;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
-    Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupRole, IdentityBundle,
-    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary,
+    Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope, GroupRole,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary,
 };
 use crate::persistence::{CorePersistenceSnapshot, PersistOp, PersistedContact};
 use crate::sync_engine::DeviceSyncState;
@@ -257,6 +257,45 @@ pub enum CoreEvent {
     },
     UserConfirmedRebuild {
         conversation_id: String,
+    },
+    GroupOutboxFetched {
+        group_id: String,
+        records: Vec<crate::model::GroupOutboxRecord>,
+        to_seq: u64,
+    },
+    GroupOutboxFetchFailed {
+        group_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    GroupEnvelopeAppended {
+        group_id: String,
+        message_id: String,
+        seq: u64,
+    },
+    GroupEnvelopeAppendFailed {
+        group_id: String,
+        message_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    WelcomePickupFetched {
+        descriptor: crate::model::WelcomePickupDescriptor,
+        welcome_b64: String,
+        manifest: Option<crate::model::GroupManifest>,
+    },
+    WelcomePickupFetchFailed {
+        descriptor: crate::model::WelcomePickupDescriptor,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    WelcomePickupPut {
+        descriptor: crate::model::WelcomePickupDescriptor,
+    },
+    WelcomePickupPutFailed {
+        descriptor: crate::model::WelcomePickupDescriptor,
+        retryable: bool,
+        detail: Option<String>,
     },
 }
 
@@ -557,6 +596,16 @@ pub(crate) struct PendingOutboxItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingGroupOutboxItem {
+    pub(crate) envelope: GroupEnvelope,
+    pub(crate) capability: crate::model::GroupCapability,
+    pub(crate) retries: u8,
+    pub(crate) in_flight: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plaintext_cache: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingAckState {
     pub(crate) ack: Ack,
     pub(crate) retries: u8,
@@ -598,12 +647,8 @@ pub(crate) struct RealtimeSessionState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PendingAllowlistMutation {
-    Add {
-        user_id: String,
-    },
-    Remove {
-        user_id: String,
-    },
+    Add { user_id: String },
+    Remove { user_id: String },
 }
 
 #[derive(Debug)]
@@ -616,6 +661,9 @@ pub(crate) struct CoreState {
     pub(crate) sync_states: BTreeMap<String, DeviceSyncState>,
     pub(crate) outbox: Vec<Envelope>,
     pub(crate) pending_outbox: Vec<PendingOutboxItem>,
+    pub(crate) group_states: BTreeMap<String, crate::persistence::PersistedGroupState>,
+    pub(crate) group_cursors: BTreeMap<String, GroupCursor>,
+    pub(crate) pending_group_outbox: Vec<PendingGroupOutboxItem>,
     pub(crate) pending_acks: BTreeMap<String, PendingAckState>,
     pub(crate) pending_blob_uploads: BTreeMap<String, PendingBlobUpload>,
     pub(crate) pending_blob_downloads: BTreeMap<String, PendingBlobDownload>,
@@ -632,6 +680,7 @@ pub(crate) struct CoreState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum PendingRequest {
     GetHead {
         device_id: String,
@@ -644,6 +693,23 @@ pub(crate) enum PendingRequest {
     AppendEnvelope {
         message_id: String,
         peer_user_id: String,
+    },
+    AppendGroupEnvelope {
+        group_id: String,
+        message_id: String,
+    },
+    FetchGroupOutbox {
+        group_id: String,
+        from_seq: u64,
+        limit: u64,
+    },
+    PutWelcomePickup {
+        group_id: String,
+        device_id: String,
+    },
+    FetchWelcomePickup {
+        group_id: String,
+        device_id: String,
     },
     Ack {
         device_id: String,
@@ -720,6 +786,9 @@ impl Default for CoreState {
             sync_states: BTreeMap::new(),
             outbox: Vec::new(),
             pending_outbox: Vec::new(),
+            group_states: BTreeMap::new(),
+            group_cursors: BTreeMap::new(),
+            pending_group_outbox: Vec::new(),
             pending_acks: BTreeMap::new(),
             pending_blob_uploads: BTreeMap::new(),
             pending_blob_downloads: BTreeMap::new(),

@@ -7,8 +7,8 @@ use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::PublishedKeyPackage;
 use crate::model::{
-    Ack, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope, GroupManifest, GroupRole,
-    IdentityBundle, MlsStateSummary, WelcomePickupDescriptor,
+    Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupManifest,
+    GroupRole, IdentityBundle, MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::PrepareBlobUploadResult;
@@ -90,6 +90,8 @@ pub struct PersistedOutgoingGroupEnvelope {
     pub message_id: String,
     pub group_id: String,
     pub envelope: GroupEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<GroupCapability>,
     pub retries: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_cache: Option<String>,
@@ -607,8 +609,8 @@ mod tests {
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        CURRENT_MODEL_VERSION, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
-        MessageType, SenderProof, WakeHint,
+        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
+        WakeHint, CURRENT_MODEL_VERSION,
     };
     use base64::Engine as _;
 

@@ -21,6 +21,8 @@ mod tests {
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    const CAROL_MNEMONIC: &str =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
     #[test]
     fn module_name_is_stable() {
@@ -46,9 +48,6 @@ mod tests {
                 group_id: "group:project".into(),
                 invitee_user_ids: vec!["user:eve".into()],
             },
-            CoreCommand::RequestJoinGroup {
-                invite_url: "tapchat://join/group:project".into(),
-            },
             CoreCommand::ApproveGroupJoin {
                 group_id: "group:project".into(),
                 request_id: "request:1".into(),
@@ -71,26 +70,11 @@ mod tests {
     }
 
     #[test]
-    fn group_core_commands_return_stable_unsupported_error() {
+    fn group_membership_workflow_commands_return_stable_unsupported_error() {
         let commands = vec![
-            CoreCommand::CreateGroupConversation {
-                title: "Project".into(),
-                member_user_ids: vec!["user:bob".into()],
-            },
-            CoreCommand::SyncGroupOutbox {
-                group_id: "group:project".into(),
-                reason: None,
-            },
-            CoreCommand::SendGroupTextMessage {
-                conversation_id: "conv:group:project".into(),
-                plaintext: "hello group".into(),
-            },
             CoreCommand::InviteToGroup {
                 group_id: "group:project".into(),
                 invitee_user_ids: vec!["user:eve".into()],
-            },
-            CoreCommand::RequestJoinGroup {
-                invite_url: "tapchat://join/group:project".into(),
             },
             CoreCommand::ApproveGroupJoin {
                 group_id: "group:project".into(),
@@ -109,10 +93,54 @@ mod tests {
         for command in commands {
             let error = engine
                 .handle_command(command)
-                .expect_err("group command should be unsupported in phase 0");
+                .expect_err("membership workflow command should be unsupported in phase 2");
             assert_eq!(error.code(), "unsupported");
-            assert_eq!(error.message(), "group phase not implemented");
+            assert_eq!(
+                error.message(),
+                "group membership workflow is not implemented"
+            );
         }
+    }
+
+    #[test]
+    fn create_group_conversation_generates_real_group_effects() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("import carol");
+
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
+            })
+            .expect("create group");
+
+        let summary = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        assert_eq!(summary.kind, Some(ConversationKind::Group));
+        assert_eq!(summary.title.as_deref(), Some("Project"));
+        assert_eq!(summary.member_count, Some(3));
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::AppendGroupEnvelope { append }
+                if append.envelope.message_type == crate::model::GroupMessageType::MlsCommit
+        )));
+        assert_eq!(
+            output
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, CoreEffect::PutWelcomePickup { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -405,7 +433,12 @@ mod tests {
             })
             .expect("second download");
 
-        let task_ids: Vec<_> = engine.state.pending_blob_downloads.keys().cloned().collect();
+        let task_ids: Vec<_> = engine
+            .state
+            .pending_blob_downloads
+            .keys()
+            .cloned()
+            .collect();
         assert_eq!(task_ids.len(), 2);
         assert!(task_ids.iter().all(|task_id| {
             task_id.starts_with("blob-download:msg:download:") && task_id.len() > 32
@@ -1708,10 +1741,7 @@ mod tests {
             }
         }
 
-        assert!(!engine
-            .state
-            .pending_blob_downloads
-            .contains_key(&task_id));
+        assert!(!engine.state.pending_blob_downloads.contains_key(&task_id));
     }
 
     #[test]
