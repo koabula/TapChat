@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import type { ConversationSummary } from "../lib/types";
+import type { ConversationSummary, GroupCursor, GroupRole } from "../lib/types";
+import type { GroupConversationSummary } from "../lib/tauri";
 
 export interface Conversation {
   conversation_id: string;
@@ -12,6 +13,27 @@ export interface Conversation {
   last_activity_key: string;
   unread_count: number;
   has_unread: boolean;
+  // Group-specific metadata (all optional; direct conversations default
+  // to the placeholder values below). Mirrors the core's
+  // `ConversationSummary` extension added in Phase 6 Wave A.
+  kind: "direct" | "group";
+  title: string | null;
+  group_id: string | null;
+  member_count: number | null;
+  group_role: GroupRole | null;
+  group_cursor: GroupCursor | null;
+  /**
+   * Unix ms timestamp when the group was dissolved (owner-only atomic
+   * seal, PLAN_GROUP Phase 6 / Wave A). `null` for active groups and
+   * for every direct conversation.
+   *
+   * Populated from `GroupConversationSummary` via
+   * [`mergeGroupConversationSnapshot`]; the underlying
+   * `ConversationSummary` sent over the `core-update` event does not
+   * carry this field, so direct-only refresh paths always leave it
+   * `null`.
+   */
+  dissolved_at: number | null;
 }
 
 interface ContactDisplayName {
@@ -35,6 +57,18 @@ interface ConversationsState {
     contacts: ContactDisplayName[],
     options?: SetConversationsOptions,
   ) => void;
+  /**
+   * Merge authoritative group-specific metadata (title, member_count,
+   * group_role, dissolved_at) into the store.
+   *
+   * Called from `useCoreUpdate` after the hook fetches a fresh
+   * `listGroupConversations` payload on every `core-update` that may
+   * have touched the group roster. Unlike [`mergeConversationSnapshot`]
+   * this method preserves existing `message_count` / `last_message`
+   * fields derived from the direct-style snapshot — it only refines
+   * group metadata without resetting the chat-preview fields.
+   */
+  mergeGroupConversationSnapshot: (snapshots: GroupConversationSummary[]) => void;
   setActiveConversation: (id: string | null) => void;
   addConversation: (conversation: Conversation) => void;
   updateConversation: (id: string, updates: Partial<Conversation>) => void;
@@ -103,6 +137,17 @@ function mergeConversationState(
         conversation.conversation_id === activeConversationId
           ? false
           : shouldMarkUnread || prior?.has_unread || conversation.has_unread,
+      // Preserve group-specific metadata that arrived earlier through a
+      // group-only merge path (`mergeGroupConversationSnapshot`) when
+      // the direct-style `mergeConversationSnapshot` refresh does not
+      // carry it.
+      kind: conversation.kind ?? prior?.kind ?? "direct",
+      title: conversation.title ?? prior?.title ?? null,
+      group_id: conversation.group_id ?? prior?.group_id ?? null,
+      member_count: conversation.member_count ?? prior?.member_count ?? null,
+      group_role: conversation.group_role ?? prior?.group_role ?? null,
+      group_cursor: conversation.group_cursor ?? prior?.group_cursor ?? null,
+      dissolved_at: conversation.dissolved_at ?? prior?.dissolved_at ?? null,
     };
   });
 }
@@ -135,6 +180,17 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         last_activity_key: activityKeyForConversationSummary(conversation),
         unread_count: 0,
         has_unread: false,
+        kind: conversation.kind ?? "direct",
+        title: conversation.title ?? null,
+        group_id: conversation.group_id ?? null,
+        member_count: conversation.member_count ?? null,
+        group_role: conversation.group_role ?? null,
+        group_cursor: conversation.group_cursor ?? null,
+        // `ConversationSummary` does not currently carry `dissolved_at`;
+        // the `useCoreUpdate` hook fans out to `getGroupSnapshot` for
+        // groups and merges the authoritative dissolved_at via the
+        // group-specific merger (see `mergeGroupConversationSnapshot`).
+        dissolved_at: null,
       }));
 
       return {
@@ -145,6 +201,37 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           options?.markUnread ?? false,
         ),
       };
+    }),
+  mergeGroupConversationSnapshot: (snapshots) =>
+    set((state) => {
+      if (snapshots.length === 0) {
+        return state;
+      }
+      const byId = new Map(
+        snapshots.map((summary) => [summary.conversation_id, summary]),
+      );
+      const conversations = state.conversations.map((conversation) => {
+        const group = byId.get(conversation.conversation_id);
+        if (!group) {
+          return conversation;
+        }
+        return {
+          ...conversation,
+          // The group-specific snapshot owns the authoritative group
+          // metadata; direct-style last_message / last_activity_key
+          // fields are untouched here.
+          kind: "group" as const,
+          title: group.title,
+          group_id: group.group_id,
+          member_count: group.member_count,
+          group_role: group.local_role,
+          dissolved_at: group.dissolved_at,
+          // Surface the group state (active / dissolved / etc) so UI
+          // components can branch on it without a separate fetch.
+          state: group.conversation_state,
+        };
+      });
+      return { conversations };
     }),
   setActiveConversation: (id) =>
     set((state) => ({

@@ -238,3 +238,327 @@ export async function setDebugMode(enabled: boolean): Promise<void> {
 export async function getDebugMode(): Promise<boolean> {
   return invoke("get_debug_mode");
 }
+
+// ---------------------------------------------------------------------------
+// Groups (Phase 6 — PLAN_GROUP)
+//
+// Thin invoke wrappers over the `commands::group::*` Tauri handlers
+// defined in `app/desktop/src-tauri/src/commands/group.rs`. Every
+// wrapper mirrors the underlying Tauri command 1:1 and deliberately
+// preserves snake_case on nested fields so the wire shape matches the
+// Rust side (see app/desktop/src-tauri/src/commands/group.rs:GroupSnapshotView etc).
+// ---------------------------------------------------------------------------
+
+import type {
+  GroupCursor,
+  GroupJoinPolicy,
+  GroupMemberInvitePolicy,
+  GroupManifest,
+  GroupRole,
+  StorageRef,
+  WelcomePickupDescriptor,
+} from "./types";
+
+export interface GroupConversationSummary {
+  group_id: string;
+  conversation_id: string;
+  title: string;
+  owner_user_id: string;
+  member_count: number;
+  local_role: GroupRole | null;
+  conversation_state: "active" | "needs_rebuild" | "dissolved" | string;
+  dissolved_at: number | null;
+  last_message_preview: string | null;
+  message_count: number;
+}
+
+export interface WelcomePickupShareable extends WelcomePickupDescriptor {
+  /** `tapchat://welcome-pickup/<base64(descriptor json)>` */
+  url: string;
+}
+
+export interface GroupInviteView {
+  group_id: string;
+  invite_id: string;
+  invite_url: string;
+  join_policy: GroupJoinPolicy;
+  expires_at: number;
+  max_uses: number | null;
+  inviter_user_id: string;
+  created_at: number;
+}
+
+export interface GroupJoinRequestView {
+  request_id: string;
+  group_id: string;
+  joiner_user_id: string;
+  joiner_device_id: string;
+  requested_at: number;
+  status: "pending" | "approved" | "rejected" | string;
+  invite_id: string;
+}
+
+export interface GroupSnapshotView {
+  group_id: string;
+  conversation_id: string;
+  manifest: GroupManifest;
+  local_role: GroupRole | null;
+  cursor: GroupCursor | null;
+  invites: GroupInviteView[];
+  join_requests: GroupJoinRequestView[];
+  pending_outbox_count: number;
+  dissolved_at: number | null;
+  conversation_state: "active" | "needs_rebuild" | "dissolved" | string;
+}
+
+/**
+ * A single row the chat view renders. The variant is discriminated on
+ * the `kind` field so React components can switch behaviour directly.
+ */
+export type GroupMessageView =
+  | {
+      kind: "bubble";
+      message_id: string;
+      sender_device_id: string;
+      created_at: number;
+      plaintext: string | null;
+      has_attachment: boolean;
+      storage_refs: StorageRef[];
+      raw_message_type: string;
+    }
+  | {
+      kind: "system_banner";
+      message_id: string;
+      created_at: number;
+      text: string;
+      raw_message_type: string;
+    };
+
+export interface CreateGroupConversationResult {
+  group_id: string;
+  conversation_id: string;
+  title: string;
+  member_count: number;
+  local_role: GroupRole | null;
+  welcome_pickups: WelcomePickupShareable[];
+  pending_group_outbox: number;
+}
+
+export interface SendGroupTextResult {
+  message_id: string;
+  conversation_id: string;
+  sender_user_id: string;
+  sender_device_id: string;
+  plaintext: string;
+  created_at: number;
+  pending_group_outbox: number;
+}
+
+export interface SyncGroupOutboxResult {
+  group_id: string;
+  cursor: GroupCursor | null;
+  dissolved_at: number | null;
+}
+
+export interface InviteToGroupResult {
+  group_id: string;
+  welcome_pickups: WelcomePickupShareable[];
+}
+
+export interface CreateGroupInviteLinkResult {
+  group_id: string;
+  invite_id: string;
+  invite_url: string;
+  expires_at: number;
+  max_uses: number | null;
+  join_policy: GroupJoinPolicy;
+}
+
+export interface RevokeGroupInviteLinkResult {
+  group_id: string;
+  invite_id: string;
+}
+
+export interface SubmitGroupJoinRequestResult {
+  request_id: string;
+  group_id: string;
+  status: "pending" | "approved" | "rejected" | string;
+}
+
+export interface GroupJoinStatusView {
+  group_id: string;
+  request_id: string;
+  status: "pending" | "approved" | "rejected" | string;
+  group_imported: boolean;
+  welcome_pickup: WelcomePickupShareable | null;
+}
+
+export interface ApproveGroupJoinResult {
+  group_id: string;
+  request_id: string;
+  welcome_pickups: WelcomePickupShareable[];
+}
+
+export interface UpdateGroupMetadataResult {
+  group_id: string;
+  title: string | null;
+  join_policy: GroupJoinPolicy | null;
+  member_invite_policy: GroupMemberInvitePolicy | null;
+  roster_version: number | null;
+}
+
+export interface DissolveGroupResult {
+  group_id: string;
+  conversation_id: string | null;
+  dissolved_at: number | null;
+  conversation_state: "active" | "needs_rebuild" | "dissolved" | string;
+  pending_group_outbox: number;
+}
+
+// Read-only projections ------------------------------------------------------
+
+export async function listGroupConversations(): Promise<GroupConversationSummary[]> {
+  return invoke("list_group_conversations");
+}
+
+export async function getGroupSnapshot(groupId: string): Promise<GroupSnapshotView> {
+  return invoke("get_group_snapshot", { groupId });
+}
+
+export async function getGroupMessages(
+  conversationId: string,
+): Promise<GroupMessageView[]> {
+  return invoke("get_group_messages", { conversationId });
+}
+
+// Core write paths -----------------------------------------------------------
+
+export async function createGroupConversation(
+  title: string,
+  memberUserIds: string[],
+): Promise<CreateGroupConversationResult> {
+  return invoke("create_group_conversation", { title, memberUserIds });
+}
+
+export async function sendGroupTextMessage(
+  conversationId: string,
+  plaintext: string,
+): Promise<SendGroupTextResult> {
+  return invoke("send_group_text_message", { conversationId, plaintext });
+}
+
+export async function syncGroupOutbox(
+  groupId: string,
+  reason?: string,
+): Promise<SyncGroupOutboxResult> {
+  return invoke("sync_group_outbox", { groupId, reason });
+}
+
+// Invite lifecycle -----------------------------------------------------------
+
+export async function inviteToGroup(
+  groupId: string,
+  inviteeUserIds: string[],
+): Promise<InviteToGroupResult> {
+  return invoke("invite_to_group", { groupId, inviteeUserIds });
+}
+
+export async function createGroupInviteLink(
+  groupId: string,
+  expiresAt: number,
+  maxUses?: number,
+): Promise<CreateGroupInviteLinkResult> {
+  return invoke("create_group_invite_link", { groupId, expiresAt, maxUses });
+}
+
+export async function revokeGroupInviteLink(
+  groupId: string,
+  inviteId: string,
+): Promise<RevokeGroupInviteLinkResult> {
+  return invoke("revoke_group_invite_link", { groupId, inviteId });
+}
+
+export async function listGroupInvites(groupId: string): Promise<GroupInviteView[]> {
+  return invoke("list_group_invites", { groupId });
+}
+
+// Join flow ------------------------------------------------------------------
+
+export async function submitGroupJoinRequest(
+  inviteUrl: string,
+): Promise<SubmitGroupJoinRequestResult> {
+  return invoke("submit_group_join_request", { inviteUrl });
+}
+
+export async function listGroupJoinRequests(
+  groupId: string,
+): Promise<GroupJoinRequestView[]> {
+  return invoke("list_group_join_requests", { groupId });
+}
+
+export async function getGroupJoinRequestStatus(
+  groupId: string,
+  requestId: string,
+): Promise<GroupJoinStatusView> {
+  return invoke("get_group_join_request_status", { groupId, requestId });
+}
+
+export async function approveGroupJoin(
+  groupId: string,
+  requestId: string,
+): Promise<ApproveGroupJoinResult> {
+  return invoke("approve_group_join", { groupId, requestId });
+}
+
+export async function rejectGroupJoin(
+  groupId: string,
+  requestId: string,
+  reason?: string,
+): Promise<void> {
+  return invoke("reject_group_join", { groupId, requestId, reason });
+}
+
+// Membership + metadata ------------------------------------------------------
+
+export async function leaveGroup(groupId: string): Promise<void> {
+  return invoke("leave_group", { groupId });
+}
+
+export async function removeGroupMember(
+  groupId: string,
+  targetUserId: string,
+): Promise<void> {
+  return invoke("remove_group_member", { groupId, targetUserId });
+}
+
+export async function transferGroupOwnership(
+  groupId: string,
+  newOwnerUserId: string,
+): Promise<void> {
+  return invoke("transfer_group_ownership", { groupId, newOwnerUserId });
+}
+
+export async function setGroupAdmin(
+  groupId: string,
+  targetUserId: string,
+  isAdmin: boolean,
+): Promise<void> {
+  return invoke("set_group_admin", { groupId, targetUserId, isAdmin });
+}
+
+export async function updateGroupMetadata(
+  groupId: string,
+  updates: {
+    title?: string;
+    joinPolicy?: GroupJoinPolicy;
+    memberInvitePolicy?: GroupMemberInvitePolicy;
+  },
+): Promise<UpdateGroupMetadataResult> {
+  return invoke("update_group_metadata", { groupId, ...updates });
+}
+
+// Dissolve -------------------------------------------------------------------
+
+export async function dissolveGroup(groupId: string): Promise<DissolveGroupResult> {
+  return invoke("dissolve_group", { groupId });
+}

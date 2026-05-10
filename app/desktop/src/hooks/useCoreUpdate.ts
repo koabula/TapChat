@@ -6,6 +6,12 @@ import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
 import { useMessageRequestsStore } from "../store/requests";
+import { useGroupsStore } from "../store/groups";
+import {
+  getGroupSnapshot,
+  listGroupConversations,
+  type GroupConversationSummary,
+} from "../lib/tauri";
 
 import type {
   CoreUpdateEvent,
@@ -38,12 +44,27 @@ export function useCoreUpdate() {
   const mergeConversationSnapshot = useConversationsStore(
     (s) => s.mergeConversationSnapshot,
   );
+  const mergeGroupConversationSnapshot = useConversationsStore(
+    (s) => s.mergeGroupConversationSnapshot,
+  );
   const setContacts = useContactsStore((s) => s.setContacts);
   const sessionState = useSessionStore((s) => s.sessionState);
   const setDeviceId = useSessionStore((s) => s.setDeviceId);
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
+  const setGroupSnapshot = useGroupsStore((s) => s.setSnapshot);
+  const removeGroupSnapshot = useGroupsStore((s) => s.removeSnapshot);
+  const clearGroups = useGroupsStore((s) => s.clear);
   const latestConversationRequestIdRef = useRef(0);
   const latestAppliedConversationRequestIdRef = useRef(0);
+  /**
+   * Debounce group-snapshot refreshes: back-to-back core-update events
+   * that touch the same group (e.g. a commit + its ack) should coalesce
+   * into a single `getGroupSnapshot` fetch within a short window.
+   * Tracks the in-flight debounce timers keyed by group_id.
+   */
+  const groupRefreshTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
 
   const applyConversationSnapshot = (
     requestId: number,
@@ -70,6 +91,74 @@ export function useCoreUpdate() {
     applyConversationSnapshot(requestId, conversations, contacts, markUnread);
   };
 
+  /**
+   * Fan out a single group-snapshot refresh with short debounce.
+   *
+   * The Rust core may emit multiple back-to-back `core-update` events
+   * for the same group (MLS commit, control envelope, seal ack, etc).
+   * Debouncing lets the UI coalesce these into a single
+   * `getGroupSnapshot` fetch per burst while still guaranteeing the
+   * snapshot is fresh once the burst ends.
+   *
+   * Requirements R2.4 / R5.2 / R19.2.
+   */
+  const scheduleGroupSnapshotRefresh = (groupId: string) => {
+    const timers = groupRefreshTimersRef.current;
+    const existing = timers.get(groupId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    const handle = setTimeout(() => {
+      timers.delete(groupId);
+      getGroupSnapshot(groupId)
+        .then((snapshot) => {
+          setGroupSnapshot(snapshot);
+        })
+        .catch((err) => {
+          // Non-fatal — the snapshot will be refreshed on the next
+          // core-update or foreground fetch.
+          console.debug(
+            `[useCoreUpdate] getGroupSnapshot(${groupId}) failed: ${String(err)}`,
+          );
+        });
+    }, 250);
+    timers.set(groupId, handle);
+  };
+
+  /**
+   * Pull the freshly-flattened group conversation list from the Tauri
+   * layer and fan out per-group snapshot refreshes. Groups that have
+   * vanished from the list (e.g. after a profile switch) are evicted
+   * from the store.
+   */
+  const refreshGroupsFromBackend = async () => {
+    let summaries: GroupConversationSummary[];
+    try {
+      summaries = await listGroupConversations();
+    } catch (err) {
+      console.debug(
+        `[useCoreUpdate] listGroupConversations failed: ${String(err)}`,
+      );
+      return;
+    }
+    mergeGroupConversationSnapshot(summaries);
+    const visible = new Set(summaries.map((summary) => summary.group_id));
+    for (const summary of summaries) {
+      scheduleGroupSnapshotRefresh(summary.group_id);
+    }
+    const known = Object.keys(useGroupsStore.getState().snapshots);
+    for (const groupId of known) {
+      if (!visible.has(groupId)) {
+        removeGroupSnapshot(groupId);
+        const pending = groupRefreshTimersRef.current.get(groupId);
+        if (pending) {
+          clearTimeout(pending);
+          groupRefreshTimersRef.current.delete(groupId);
+        }
+      }
+    }
+  };
+
   const fetchAndSetData = async () => {
     try {
       console.debug("[useCoreUpdate] fetching initial data");
@@ -84,6 +173,11 @@ export function useCoreUpdate() {
       console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
       const requestId = ++latestConversationRequestIdRef.current;
       applyConversationSnapshot(requestId, conversations, mappedContacts, false);
+
+      // Fan out group-specific snapshot refreshes. Keeps groups in
+      // sync on every session start without requiring the ChatView
+      // component to refetch on mount.
+      await refreshGroupsFromBackend();
 
       const requestsResult = await invoke<{
         view_model?: { message_requests?: MessageRequestItem[] };
@@ -112,7 +206,14 @@ export function useCoreUpdate() {
     console.debug("[useCoreUpdate] clearing stores");
     setConversations([]);
     setContacts([]);
+    clearGroups();
     useConversationsStore.getState().setActiveConversation(null);
+    // Clear any in-flight group-snapshot refreshes so a lingering
+    // fetch from the previous profile does not race a fresh store.
+    for (const timer of groupRefreshTimersRef.current.values()) {
+      clearTimeout(timer);
+    }
+    groupRefreshTimersRef.current.clear();
   };
 
   useEffect(() => {
@@ -153,6 +254,16 @@ export function useCoreUpdate() {
             );
           });
         }
+        // Keep group snapshots in lock-step with the conversation list.
+        // Every conversation change that could touch a group (membership
+        // commit, new join, metadata update, dissolve) goes through
+        // this branch, so we always re-fetch the flat group list and
+        // fan out per-group snapshot refreshes.
+        void refreshGroupsFromBackend().catch((err) => {
+          console.debug(
+            `[useCoreUpdate] failed to refresh groups from backend: ${String(err)}`,
+          );
+        });
       } else if (state_update.contacts_changed) {
         setConversations(useConversationsStore.getState().conversations, {
           markUnread: false,
@@ -185,10 +296,14 @@ export function useCoreUpdate() {
     };
   }, [
     mergeConversationSnapshot,
+    mergeGroupConversationSnapshot,
     setConversations,
     setContacts,
     setDeviceId,
     setRequests,
+    setGroupSnapshot,
+    removeGroupSnapshot,
+    clearGroups,
     sessionState,
   ]);
 }
