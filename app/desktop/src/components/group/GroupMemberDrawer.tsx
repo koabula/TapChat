@@ -10,6 +10,9 @@ import {
   ArrowRight,
   Zap,
   AlertCircle,
+  Link2,
+  UserCheck,
+  Settings as SettingsIcon,
 } from "lucide-react";
 
 import { useGroupsStore } from "@/store/groups";
@@ -22,6 +25,9 @@ import {
 } from "@/lib/tauri";
 import type { GroupMember, GroupRole } from "@/lib/types";
 import DissolveConfirmDialog from "./DissolveConfirmDialog";
+import GroupInviteDialog from "./GroupInviteDialog";
+import GroupJoinApprovalPanel from "./GroupJoinApprovalPanel";
+import GroupSettingsPanel from "./GroupSettingsPanel";
 
 interface GroupMemberDrawerProps {
   open: boolean;
@@ -53,12 +59,18 @@ export default function GroupMemberDrawer({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dissolveOpen, setDissolveOpen] = useState(false);
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [approvalOpen, setApprovalOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     if (!open) {
       setBusy(null);
       setError(null);
       setDissolveOpen(false);
+      setInviteOpen(false);
+      setApprovalOpen(false);
+      setSettingsOpen(false);
     }
   }, [open]);
 
@@ -151,6 +163,10 @@ export default function GroupMemberDrawer({
     });
   };
 
+  const pendingJoinCount = snapshot?.join_requests.filter(
+    (request) => request.status === "pending",
+  ).length ?? 0;
+
   if (!open) return null;
 
   return (
@@ -174,6 +190,40 @@ export default function GroupMemberDrawer({
           <X size={18} />
         </button>
       </header>
+
+      {/* Action row — cosmetic gating: only shows buttons the user's
+          role can actually use. The authoritative check still lives
+          in the core/cloudflare (R14). */}
+      {(isOwner || snapshot?.local_role === "admin") && !dissolved && (
+        <nav className="flex items-center gap-2 p-2 border-b border-default">
+          <button
+            className="btn btn-ghost text-xs flex-1"
+            onClick={() => setInviteOpen(true)}
+            title="Manage invite links"
+          >
+            <Link2 size={14} /> Invites
+          </button>
+          <button
+            className="btn btn-ghost text-xs flex-1 relative"
+            onClick={() => setApprovalOpen(true)}
+            title="Review join requests"
+          >
+            <UserCheck size={14} /> Requests
+            {pendingJoinCount > 0 && (
+              <span className="absolute -top-1 -right-1 badge badge-primary text-[10px]">
+                {pendingJoinCount}
+              </span>
+            )}
+          </button>
+          <button
+            className="btn btn-ghost text-xs flex-1"
+            onClick={() => setSettingsOpen(true)}
+            title="Group settings"
+          >
+            <SettingsIcon size={14} /> Settings
+          </button>
+        </nav>
+      )}
 
       <div className="flex-1 overflow-y-auto">
         {!snapshot ? (
@@ -248,6 +298,22 @@ export default function GroupMemberDrawer({
           }}
         />
       )}
+
+      <GroupInviteDialog
+        open={inviteOpen}
+        groupId={groupId}
+        onClose={() => setInviteOpen(false)}
+      />
+      <GroupJoinApprovalPanel
+        open={approvalOpen}
+        groupId={groupId}
+        onClose={() => setApprovalOpen(false)}
+      />
+      <GroupSettingsPanel
+        open={settingsOpen}
+        groupId={groupId}
+        onClose={() => setSettingsOpen(false)}
+      />
     </aside>
   );
 }
