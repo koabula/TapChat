@@ -456,6 +456,28 @@ impl MlsAdapter {
         self.groups.contains_key(conversation_id)
     }
 
+    pub fn member_device_ids_for_user(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+    ) -> CoreResult<Vec<String>> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let mut result = Vec::new();
+        for member in state.group.members() {
+            let identity = extract_sender_identity(&member.credential)?;
+            let parts: Vec<&str> = identity.split('|').collect();
+            if parts.first() == Some(&user_id) {
+                if let Some(device_id) = parts.get(1) {
+                    result.push(device_id.to_string());
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn export_persisted_group_state(&self, conversation_id: &str) -> CoreResult<String> {
         if !self.groups.contains_key(conversation_id) {
             return Err(CoreError::invalid_input(

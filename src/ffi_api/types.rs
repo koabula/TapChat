@@ -134,6 +134,21 @@ pub enum CoreCommand {
         group_id: String,
         target_user_id: String,
     },
+    TransferGroupOwnership {
+        group_id: String,
+        new_owner_user_id: String,
+    },
+    SetGroupAdmin {
+        group_id: String,
+        target_user_id: String,
+        is_admin: bool,
+    },
+    UpdateGroupMetadata {
+        group_id: String,
+        title: Option<String>,
+        join_policy: Option<crate::model::GroupJoinPolicy>,
+        member_invite_policy: Option<crate::model::GroupMemberInvitePolicy>,
+    },
     RefreshIdentityState {
         user_id: String,
     },
@@ -719,6 +734,8 @@ pub(crate) struct PendingAckState {
 pub(crate) struct PendingBlobUpload {
     pub(crate) task_id: String,
     pub(crate) conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group_id: Option<String>,
     pub(crate) descriptor: AttachmentDescriptor,
     pub(crate) blob_ciphertext_b64: Option<String>,
     pub(crate) payload_metadata: Option<AttachmentPayloadMetadata>,

@@ -138,6 +138,8 @@ pub enum PersistedPendingBlobTransfer {
     Upload {
         task_id: String,
         conversation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
         message_id: String,
         attachment_id: String,
         blob_ciphertext_b64: Option<String>,

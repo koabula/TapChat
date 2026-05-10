@@ -307,6 +307,7 @@ impl CoreEngine {
                 PersistedPendingBlobTransfer::Upload {
                     task_id,
                     conversation_id,
+                    group_id,
                     message_id,
                     attachment_id,
                     blob_ciphertext_b64,
@@ -323,6 +324,7 @@ impl CoreEngine {
                         PendingBlobUpload {
                             task_id,
                             conversation_id,
+                            group_id,
                             descriptor: AttachmentDescriptor {
                                 attachment_id,
                                 mime_type,
@@ -579,11 +581,30 @@ impl CoreEngine {
                 request_id,
                 reason,
             } => self.reject_group_join(group_id, request_id, reason),
-            CoreCommand::InviteToGroup { .. }
-            | CoreCommand::LeaveGroup { .. }
-            | CoreCommand::RemoveGroupMember { .. } => Err(CoreError::unsupported(
-                "group membership workflow is not implemented",
-            )),
+            CoreCommand::InviteToGroup {
+                group_id,
+                invitee_user_ids,
+            } => self.invite_to_group(group_id, invitee_user_ids),
+            CoreCommand::LeaveGroup { group_id } => self.leave_group(group_id),
+            CoreCommand::RemoveGroupMember {
+                group_id,
+                target_user_id,
+            } => self.remove_group_member(group_id, target_user_id),
+            CoreCommand::TransferGroupOwnership {
+                group_id,
+                new_owner_user_id,
+            } => self.transfer_group_ownership(group_id, new_owner_user_id),
+            CoreCommand::SetGroupAdmin {
+                group_id,
+                target_user_id,
+                is_admin,
+            } => self.set_group_admin(group_id, target_user_id, is_admin),
+            CoreCommand::UpdateGroupMetadata {
+                group_id,
+                title,
+                join_policy,
+                member_invite_policy,
+            } => self.update_group_metadata(group_id, title, join_policy, member_invite_policy),
             CoreCommand::RequestJoinGroup { invite_url } => self.request_join_group(invite_url),
             CoreCommand::ReconcileConversationMembership { conversation_id } => {
                 self.reconcile_conversation_membership(conversation_id)
@@ -2430,20 +2451,848 @@ impl CoreEngine {
         })
     }
 
+    fn invite_to_group(
+        &mut self,
+        group_id: String,
+        invitee_user_ids: Vec<String>,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can invite new members",
+            ));
+        }
+        let mut invitee_user_ids = invitee_user_ids
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<_>>();
+        invitee_user_ids.sort();
+        invitee_user_ids.dedup();
+        if invitee_user_ids.is_empty() {
+            return Err(CoreError::invalid_input(
+                "invitee_user_ids must not be empty",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let mut manifest = group_state.manifest.clone();
+        let existing_ids: BTreeSet<String> = manifest
+            .members
+            .iter()
+            .filter(|m| matches!(m.status, GroupMemberStatus::Active))
+            .map(|m| m.user_id.clone())
+            .collect();
+        let new_ids: Vec<&String> = invitee_user_ids
+            .iter()
+            .filter(|id| !existing_ids.contains(*id))
+            .collect();
+        if new_ids.is_empty() {
+            return Err(CoreError::invalid_input(
+                "all invitees are already active members of this group",
+            ));
+        }
+        let mut peer_keypackages = Vec::new();
+        for user_id in &invitee_user_ids {
+            if existing_ids.contains(user_id) {
+                continue;
+            }
+            let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
+            let kps = active_peer_key_packages(&bundle)?;
+            if kps.is_empty() {
+                return Err(CoreError::invalid_state(format!(
+                    "invitee {user_id} has no active key packages",
+                )));
+            }
+            peer_keypackages.extend(kps);
+        }
+        if peer_keypackages.is_empty() {
+            return Err(CoreError::invalid_input(
+                "no active key packages found for any invitee",
+            ));
+        }
+        let adapter = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+        let artifacts = adapter.add_members(&group_state.conversation_id, &peer_keypackages)?;
+        let summary = adapter.export_group_summary(&group_state.conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary);
+        let now = current_unix_millis(self.state.message_nonce);
+        for user_id in &invitee_user_ids {
+            if existing_ids.contains(user_id) {
+                continue;
+            }
+            manifest.members.push(GroupMember {
+                user_id: user_id.clone(),
+                role: GroupRole::Member,
+                status: GroupMemberStatus::Active,
+            });
+        }
+        self.apply_membership_change_to_manifest(&mut manifest, artifacts.epoch, now)?;
+        self.sync_conversation_members_from_manifest(
+            &group_state.conversation_id,
+            &manifest,
+        )?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+        let capability = self.group_capability(&group_id, role)?;
+        let membership_proof =
+            self.build_membership_proof(&group_id, manifest.roster_version, "invite")?;
+        let mut commit = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.commit_b64,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_plaintext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let mut control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupEnvelopeVisibility::Protocol,
+            control_plaintext.payload_b64,
+        )?;
+        control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: commit.message_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: control.message_id.clone(),
+                },
+            ],
+        )];
+        for welcome in artifacts.welcomes {
+            let descriptor =
+                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            effects.push(CoreEffect::PutWelcomePickup {
+                put: PutWelcomePickupRequest {
+                    descriptor,
+                    welcome_b64: welcome.payload_b64,
+                    manifest: Some(manifest.clone()),
+                    headers: BTreeMap::new(),
+                },
+            });
+        }
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                messages: vec![
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id.clone(),
+                        message_id: commit.message_id,
+                        message_type: MessageType::MlsCommit,
+                    },
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id,
+                        message_id: control.message_id,
+                        message_type: MessageType::ControlDeviceMembershipChanged,
+                    },
+                ],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn remove_group_member(
+        &mut self,
+        group_id: String,
+        target_user_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let target_user_id = target_user_id.trim().to_string();
+        if target_user_id.is_empty() {
+            return Err(CoreError::invalid_input("target_user_id must not be empty"));
+        }
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        if target_user_id == local_identity.user_identity.user_id {
+            return Err(CoreError::invalid_input(
+                "cannot remove yourself; use LeaveGroup instead",
+            ));
+        }
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can remove a group member",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let mut manifest = group_state.manifest.clone();
+        let target_member = manifest
+            .members
+            .iter()
+            .find(|m| m.user_id == target_user_id && m.status == GroupMemberStatus::Active)
+            .ok_or_else(|| {
+                CoreError::invalid_input("target user is not an active member of this group")
+            })?;
+        if target_member.role == GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "cannot remove the group owner; transfer ownership first",
+            ));
+        }
+        let member_device_ids: Vec<String> = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .member_device_ids_for_user(&group_state.conversation_id, &target_user_id)?;
+        if member_device_ids.is_empty() {
+            let summary = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                .export_group_summary(&group_state.conversation_id)?;
+            return Err(CoreError::invalid_state(format!(
+                "target user has no devices in MLS group; known member devices: {:?}",
+                summary.member_device_ids
+            )));
+        }
+        let adapter = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+        let artifacts = adapter.remove_members(&group_state.conversation_id, &member_device_ids)?;
+        let summary = adapter.export_group_summary(&group_state.conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary);
+        let now = current_unix_millis(self.state.message_nonce);
+        for member in &mut manifest.members {
+            if member.user_id == target_user_id
+                && member.status == GroupMemberStatus::Active
+            {
+                member.status = GroupMemberStatus::Removed;
+            }
+        }
+        self.apply_membership_change_to_manifest(&mut manifest, artifacts.epoch, now)?;
+        self.sync_conversation_members_from_manifest(
+            &group_state.conversation_id,
+            &manifest,
+        )?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+        let capability = self.group_capability(&group_id, role)?;
+        let membership_proof =
+            self.build_membership_proof(&group_id, manifest.roster_version, "remove")?;
+        let mut commit = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.commit_b64,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_plaintext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let mut control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupEnvelopeVisibility::Protocol,
+            control_plaintext.payload_b64,
+        )?;
+        control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        let effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: commit.message_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: control.message_id.clone(),
+                },
+            ],
+        )];
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                messages: vec![
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id.clone(),
+                        message_id: commit.message_id,
+                        message_type: MessageType::MlsCommit,
+                    },
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id,
+                        message_id: control.message_id,
+                        message_type: MessageType::ControlDeviceMembershipChanged,
+                    },
+                ],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn leave_group(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let role = group_state.local_role.unwrap_or(GroupRole::Member);
+        if role == GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "owner cannot leave without transferring ownership first; use TransferGroupOwnership",
+            ));
+        }
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        let conversation_id = group_state.conversation_id.clone();
+        let leave_payload = serde_json::to_vec(&serde_json::json!({
+            "group_id": group_id,
+            "leaving_user_id": local_identity.user_identity.user_id,
+            "leaving_device_id": local_identity.device_identity.device_id,
+            "left_at": current_unix_millis(self.state.message_nonce),
+        }))
+        .map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode leave payload: {error}"))
+        })?;
+        let leave_b64 = STANDARD.encode(&leave_payload);
+        let capability = self.group_capability(&group_id, role)?;
+        let envelope = self.build_group_envelope(
+            &group_id,
+            &conversation_id,
+            GroupMessageType::ControlGroupLeaveRequested,
+            GroupEnvelopeVisibility::Visible,
+            leave_b64,
+        )?;
+        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        if let Some(conversation) = self.state.conversations.get_mut(&conversation_id) {
+            conversation.conversation.state = ConversationState::NeedsRebuild;
+            conversation.recovery_status = RecoveryStatus::NeedsRebuild;
+        }
+        let mut manifest = group_state.manifest.clone();
+        for member in &mut manifest.members {
+            if member.user_id == local_identity.user_identity.user_id {
+                member.status = GroupMemberStatus::Left;
+            }
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        manifest.roster_version = manifest.roster_version.saturating_add(1);
+        manifest.updated_at = now;
+        manifest.signer_user_id = local_identity.user_identity.user_id.clone();
+        manifest.signer_device_id = local_identity.device_identity.device_id.clone();
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: conversation_id.clone(),
+                manifest,
+                local_role: None,
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                system_statuses_changed: vec![SystemStatus::ConversationNeedsRebuild],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![
+                persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveGroupState {
+                            group_id: group_id.clone(),
+                        },
+                        PersistOp::SaveOutgoingGroupEnvelope {
+                            message_id: envelope.message_id.clone(),
+                        },
+                    ],
+                ),
+            ],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id,
+                    message_id: envelope.message_id,
+                    message_type: MessageType::ControlDeviceMembershipChanged,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn transfer_group_ownership(
+        &mut self,
+        group_id: String,
+        new_owner_user_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let new_owner_user_id = new_owner_user_id.trim().to_string();
+        if new_owner_user_id.is_empty() {
+            return Err(CoreError::invalid_input("new_owner_user_id must not be empty"));
+        }
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        if new_owner_user_id == local_identity.user_identity.user_id {
+            return Err(CoreError::invalid_input(
+                "new_owner_user_id must be different from the current owner",
+            ));
+        }
+        let role = self.local_group_role(&group_id)?;
+        if role != GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "only the current owner can transfer ownership",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let mut manifest = group_state.manifest.clone();
+        let new_owner = manifest
+            .members
+            .iter()
+            .find(|m| m.user_id == new_owner_user_id && m.status == GroupMemberStatus::Active)
+            .ok_or_else(|| {
+                CoreError::invalid_input(
+                    "new owner must be an active member of this group",
+                )
+            })?;
+        if new_owner.role == GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "new owner is already the current owner",
+            ));
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        for member in &mut manifest.members {
+            if member.user_id == local_identity.user_identity.user_id
+                && member.role == GroupRole::Owner
+            {
+                member.role = GroupRole::Admin;
+            }
+            if member.user_id == new_owner_user_id {
+                member.role = GroupRole::Owner;
+            }
+        }
+        manifest.owner_user_id = new_owner_user_id.clone();
+        if !manifest.admins.iter().any(|a| a == &new_owner_user_id) {
+            manifest.admins.retain(|a| a != &local_identity.user_identity.user_id);
+        }
+        manifest.roster_version = manifest.roster_version.saturating_add(1);
+        manifest.updated_at = now;
+        manifest.signer_user_id = local_identity.user_identity.user_id.clone();
+        manifest.signer_device_id = local_identity.device_identity.device_id.clone();
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let metadata_b64 = STANDARD.encode(&metadata_payload);
+        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
+        let membership_proof =
+            self.build_membership_proof(&group_id, manifest.roster_version, "transfer_ownership")?;
+        let mut envelope = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMetadataUpdated,
+            GroupEnvelopeVisibility::Visible,
+            metadata_b64,
+        )?;
+        envelope.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(envelope.clone(), capability.clone(), None);
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: Some(GroupRole::Admin),
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
+                    },
+                    PersistOp::SaveOutgoingGroupEnvelope {
+                        message_id: envelope.message_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id: group_state.conversation_id,
+                    message_id: envelope.message_id,
+                    message_type: MessageType::ControlIdentityStateUpdated,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn set_group_admin(
+        &mut self,
+        group_id: String,
+        target_user_id: String,
+        is_admin: bool,
+    ) -> CoreResult<CoreOutput> {
+        let target_user_id = target_user_id.trim().to_string();
+        if target_user_id.is_empty() {
+            return Err(CoreError::invalid_input("target_user_id must not be empty"));
+        }
+        let role = self.local_group_role(&group_id)?;
+        if role != GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "only the owner can appoint or remove admins",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let mut manifest = group_state.manifest.clone();
+        let target = manifest
+            .members
+            .iter_mut()
+            .find(|m| m.user_id == target_user_id && m.status == GroupMemberStatus::Active)
+            .ok_or_else(|| {
+                CoreError::invalid_input("target user is not an active member of this group")
+            })?;
+        if target.role == GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "cannot change the owner role with SetGroupAdmin; use TransferGroupOwnership",
+            ));
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        if is_admin {
+            target.role = GroupRole::Admin;
+            if !manifest.admins.contains(&target_user_id) {
+                manifest.admins.push(target_user_id.clone());
+            }
+        } else {
+            target.role = GroupRole::Member;
+            manifest.admins.retain(|a| a != &target_user_id);
+        }
+        manifest.roster_version = manifest.roster_version.saturating_add(1);
+        manifest.updated_at = now;
+        manifest.signer_user_id = self.local_identity_user_id()?;
+        manifest.signer_device_id = self.local_identity_device_id()?;
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .export_group_summary(&group_state.conversation_id)?;
+        manifest.mls_epoch_hint = summary.epoch;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+        let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let metadata_b64 = STANDARD.encode(&metadata_payload);
+        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
+        let membership_proof =
+            self.build_membership_proof(&group_id, manifest.roster_version, "set_admin")?;
+        let mut envelope = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMetadataUpdated,
+            GroupEnvelopeVisibility::Visible,
+            metadata_b64,
+        )?;
+        envelope.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![
+                persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveGroupState {
+                            group_id: group_id.clone(),
+                        },
+                        PersistOp::SaveOutgoingGroupEnvelope {
+                            message_id: envelope.message_id.clone(),
+                        },
+                    ],
+                ),
+            ],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id: group_state.conversation_id,
+                    message_id: envelope.message_id,
+                    message_type: MessageType::ControlIdentityStateUpdated,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn update_group_metadata(
+        &mut self,
+        group_id: String,
+        title: Option<String>,
+        join_policy: Option<GroupJoinPolicy>,
+        member_invite_policy: Option<GroupMemberInvitePolicy>,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can update group metadata",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let mut manifest = group_state.manifest.clone();
+        let mut changed = false;
+        if let Some(new_title) = title {
+            let new_title = new_title.trim().to_string();
+            if new_title.is_empty() {
+                return Err(CoreError::invalid_input("title must not be empty"));
+            }
+            if new_title != manifest.title {
+                manifest.title = new_title;
+                changed = true;
+            }
+        }
+        if let Some(new_join_policy) = join_policy {
+            if new_join_policy != manifest.join_policy {
+                manifest.join_policy = new_join_policy;
+                changed = true;
+            }
+        }
+        if let Some(new_invite_policy) = member_invite_policy {
+            if new_invite_policy != manifest.member_invite_policy {
+                manifest.member_invite_policy = new_invite_policy;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(CoreOutput::default());
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .export_group_summary(&group_state.conversation_id)?;
+        manifest.roster_version = manifest.roster_version.saturating_add(1);
+        manifest.mls_epoch_hint = summary.epoch;
+        manifest.updated_at = now;
+        manifest.signer_user_id = self.local_identity_user_id()?;
+        manifest.signer_device_id = self.local_identity_device_id()?;
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup,
+            },
+        );
+        let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let metadata_b64 = STANDARD.encode(&metadata_payload);
+        let capability = self.group_capability(&group_id, role)?;
+        let membership_proof = if role == GroupRole::Owner {
+            Some(self.build_membership_proof(
+                &group_id,
+                manifest.roster_version,
+                "update_metadata",
+            )?)
+        } else {
+            None
+        };
+        let mut envelope = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMetadataUpdated,
+            GroupEnvelopeVisibility::Visible,
+            metadata_b64,
+        )?;
+        if let Some(proof) = membership_proof {
+            envelope.membership_proof = Some(proof);
+        }
+        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
+                    },
+                    PersistOp::SaveOutgoingGroupEnvelope {
+                        message_id: envelope.message_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id: group_state.conversation_id,
+                    message_id: envelope.message_id,
+                    message_type: MessageType::ControlIdentityStateUpdated,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
     fn send_attachment_message(
         &mut self,
         conversation_id: String,
         attachment_descriptor: AttachmentDescriptor,
     ) -> CoreResult<CoreOutput> {
-        self.ensure_conversation_ready_for_send(&conversation_id)?;
+        let is_group = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .map(|c| c.conversation.kind == ConversationKind::Group)
+            .unwrap_or(false);
+        if is_group {
+            self.ensure_group_ready_for_send(&conversation_id)?;
+        } else {
+            self.ensure_conversation_ready_for_send(&conversation_id)?;
+        }
         let message_nonce = self.next_message_nonce();
-        let message_id = self.next_message_id(&conversation_id, "attachment", message_nonce);
+        let message_id = self.next_message_id(
+            &conversation_id,
+            if is_group { "group-attachment" } else { "attachment" },
+            message_nonce,
+        );
+        let group_id = if is_group {
+            Some(self.group_id_for_conversation(&conversation_id)?.to_string())
+        } else {
+            None
+        };
         let task_id = format!("blob-upload:{message_id}");
         self.state.pending_blob_uploads.insert(
             task_id.clone(),
             PendingBlobUpload {
                 task_id: task_id.clone(),
                 conversation_id: conversation_id.clone(),
+                group_id,
                 descriptor: attachment_descriptor.clone(),
                 blob_ciphertext_b64: None,
                 payload_metadata: None,
@@ -2539,6 +3388,16 @@ impl CoreEngine {
             .or_else(|| {
                 self.state
                     .pending_outbox
+                    .iter()
+                    .find(|item| {
+                        item.envelope.conversation_id == conversation_id
+                            && item.envelope.message_id == message_id
+                    })
+                    .and_then(|item| item.plaintext_cache.as_deref())
+            })
+            .or_else(|| {
+                self.state
+                    .pending_group_outbox
                     .iter()
                     .find(|item| {
                         item.envelope.conversation_id == conversation_id
@@ -4006,6 +4865,281 @@ impl CoreEngine {
         ))
     }
 
+    fn local_identity_user_id(&self) -> CoreResult<String> {
+        Ok(self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .user_identity
+            .user_id
+            .clone())
+    }
+
+    fn local_identity_device_id(&self) -> CoreResult<String> {
+        Ok(self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .device_identity
+            .device_id
+            .clone())
+    }
+
+    fn build_membership_proof(
+        &self,
+        group_id: &str,
+        roster_version: u64,
+        operation: &str,
+    ) -> CoreResult<SenderProof> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        Ok(SenderProof {
+            proof_type: "membership_signature".into(),
+            value: identity.sign_sender_proof(
+                format!("membership_proof:{group_id}:{roster_version}:{operation}")
+                    .as_bytes(),
+            ),
+        })
+    }
+
+    fn apply_membership_change_to_manifest(
+        &self,
+        manifest: &mut GroupManifest,
+        epoch: u64,
+        now: u64,
+    ) -> CoreResult<()> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        manifest.roster_version = manifest.roster_version.saturating_add(1);
+        manifest.mls_epoch_hint = epoch;
+        manifest.updated_at = now;
+        manifest.signer_user_id = identity.user_identity.user_id.clone();
+        manifest.signer_device_id = identity.device_identity.device_id.clone();
+        manifest.signature = self.sign_manifest(manifest)?;
+        manifest.validate()
+    }
+
+    fn sync_conversation_members_from_manifest(
+        &mut self,
+        conversation_id: &str,
+        manifest: &GroupManifest,
+    ) -> CoreResult<()> {
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let conversation = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let mut member_users: Vec<String> = manifest
+            .members
+            .iter()
+            .filter(|m| matches!(m.status, GroupMemberStatus::Active))
+            .map(|m| m.user_id.clone())
+            .collect();
+        member_users.sort();
+        member_users.dedup();
+        conversation.conversation.member_users = member_users;
+        let mut member_devices = vec![ConversationMember {
+            user_id: local_identity.user_identity.user_id.clone(),
+            device_id: local_identity.device_identity.device_id.clone(),
+            status: DeviceStatusKind::Active,
+        }];
+        if let Ok(summary) = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .export_group_summary(conversation_id)
+        {
+            for device_id in &summary.member_device_ids {
+                if device_id != &local_identity.device_identity.device_id {
+                    member_devices.push(ConversationMember {
+                        user_id: String::new(),
+                        device_id: device_id.clone(),
+                        status: DeviceStatusKind::Active,
+                    });
+                }
+            }
+        }
+        conversation.conversation.member_devices = member_devices;
+        conversation.conversation.updated_at = manifest.updated_at;
+        Ok(())
+    }
+
+    fn verify_membership_operation_authority(
+        &self,
+        envelope: &GroupEnvelope,
+        manifest: &GroupManifest,
+    ) -> CoreResult<()> {
+        let sender_role = manifest
+            .members
+            .iter()
+            .find(|m| {
+                m.user_id == envelope.sender_user_id
+                    && matches!(m.status, GroupMemberStatus::Active)
+            })
+            .map(|m| m.role);
+        match sender_role {
+            Some(GroupRole::Owner | GroupRole::Admin) => {}
+            Some(GroupRole::Member) | None => {
+                return Err(CoreError::invalid_input(
+                    "sender is not an active owner or admin; membership operation rejected",
+                ));
+            }
+        }
+        let proof = envelope
+            .membership_proof
+            .as_ref()
+            .ok_or_else(|| {
+                CoreError::invalid_input(
+                    "membership operation requires membership_proof",
+                )
+            })?;
+        if proof.proof_type != "membership_signature" {
+            return Err(CoreError::invalid_input(
+                "membership_proof type must be membership_signature",
+            ));
+        }
+        if proof.value.trim().is_empty() {
+            return Err(CoreError::invalid_input(
+                "membership_proof value must not be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    fn try_apply_control_manifest_update(
+        &mut self,
+        conversation_id: &str,
+        group_id: &str,
+        record: &GroupOutboxRecord,
+        current_state: &PersistedGroupState,
+    ) {
+        if !matches!(
+            record.envelope.message_type,
+            GroupMessageType::ControlGroupMembershipChanged
+                | GroupMessageType::ControlGroupMetadataUpdated
+        ) {
+            return;
+        }
+        let Some(ciphertext) = &record.envelope.inline_ciphertext else {
+            return;
+        };
+        let mls = match self.state.mls_adapter.as_mut() {
+            Some(adapter) => adapter,
+            None => return,
+        };
+        let result = match mls.ingest_message(
+            conversation_id,
+            &record.envelope.sender_device_id,
+            MessageType::MlsApplication,
+            ciphertext,
+        ) {
+            Ok(result) => result,
+            Err(_) => return,
+        };
+        let plaintext = match result {
+            IngestResult::AppliedApplication(app) => app.plaintext,
+            _ => return,
+        };
+        let updated = match serde_json::from_slice::<GroupManifest>(&plaintext) {
+            Ok(manifest) => manifest,
+            Err(_) => return,
+        };
+        if updated.group_id != group_id {
+            return;
+        }
+        if updated.roster_version <= current_state.manifest.roster_version {
+            log::warn!(
+                "rejected stale manifest update for group {group_id}: new roster_version {} is not newer than current {}",
+                updated.roster_version,
+                current_state.manifest.roster_version
+            );
+            return;
+        }
+        if let Err(err) = updated.validate() {
+            log::warn!(
+                "rejected invalid manifest update for group {group_id}: {err}"
+            );
+            return;
+        }
+        if !Self::validate_manifest_transition(&current_state.manifest, &updated) {
+            log::warn!(
+                "rejected invalid manifest transition for group {group_id} at roster_version {} -> {}",
+                current_state.manifest.roster_version,
+                updated.roster_version
+            );
+            return;
+        }
+        let local_user_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|id| id.user_identity.user_id.clone());
+        let updated_local_role = local_user_id.as_ref().and_then(|uid| {
+            updated
+                .members
+                .iter()
+                .find(|m| &m.user_id == uid && m.status == GroupMemberStatus::Active)
+                .map(|m| m.role)
+        });
+        self.state.group_states.insert(
+            group_id.to_string(),
+            PersistedGroupState {
+                group_id: group_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                manifest: updated.clone(),
+                local_role: updated_local_role,
+                welcome_pickup: current_state.welcome_pickup.clone(),
+            },
+        );
+        let _ = self.sync_conversation_members_from_manifest(conversation_id, &updated);
+    }
+
+    fn validate_manifest_transition(
+        old: &GroupManifest,
+        new: &GroupManifest,
+    ) -> bool {
+        if old.group_id != new.group_id || old.conversation_id != new.conversation_id {
+            return false;
+        }
+        let active_count = |m: &GroupManifest| {
+            m.members
+                .iter()
+                .filter(|m| m.status == GroupMemberStatus::Active)
+                .count()
+        };
+        let active_owner_count = |m: &GroupManifest| {
+            m.members
+                .iter()
+                .filter(|m| m.role == GroupRole::Owner && m.status == GroupMemberStatus::Active)
+                .count()
+        };
+        if active_owner_count(new) != 1 {
+            return false;
+        }
+        if new.owner_user_id != new.members.iter().find(|m| m.role == GroupRole::Owner && m.status == GroupMemberStatus::Active).map(|m| m.user_id.as_str()).unwrap_or("") {
+            return false;
+        }
+        if active_count(new) == 0 {
+            return false;
+        }
+        true
+    }
+
     fn welcome_pickup_descriptor(
         &self,
         group_id: &str,
@@ -5295,8 +6429,6 @@ impl CoreEngine {
             .pending_blob_uploads
             .remove(&task_id)
             .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
-        let peer_user_id = self.peer_user_for_conversation(&task.conversation_id)?;
-        let recipients = self.recipient_device_ids(&task.conversation_id)?;
         let prepared = task.prepared_upload.ok_or_else(|| {
             CoreError::invalid_state("blob upload completed before upload target was prepared")
         })?;
@@ -5312,49 +6444,88 @@ impl CoreEngine {
                 "failed to encode attachment payload metadata: {error}"
             ))
         })?;
-        let mut envelopes = Vec::new();
-        for recipient in recipients {
-            let mut envelope = self.build_envelope(
-                &task.conversation_id,
-                &recipient,
-                MessageType::MlsApplication,
-                task.metadata_ciphertext.clone().ok_or_else(|| {
-                    CoreError::invalid_state(
-                        "blob upload completed before metadata ciphertext was prepared",
-                    )
-                })?,
+        let metadata_ciphertext = task.metadata_ciphertext.clone().ok_or_else(|| {
+            CoreError::invalid_state(
+                "blob upload completed before metadata ciphertext was prepared",
+            )
+        })?;
+        let storage_ref = StorageRef {
+            kind: "attachment".into(),
+            object_ref: final_ref.clone(),
+            size_bytes: task
+                .blob_ciphertext_b64
+                .as_ref()
+                .and_then(|value| STANDARD.decode(value).ok())
+                .map(|bytes| bytes.len() as u64)
+                .or(Some(payload_metadata.size_bytes))
+                .unwrap_or(task.descriptor.size_bytes),
+            mime_type: payload_metadata.mime_type.clone(),
+            file_name: payload_metadata
+                .file_name
+                .clone()
+                .or_else(|| task.descriptor.file_name.clone()),
+            expires_at: prepared.expires_at,
+        };
+        if let Some(group_id) = task.group_id {
+            let conversation_id = task.conversation_id.clone();
+            let capability = self.group_capability(
+                &group_id,
+                self.local_group_role(&group_id).unwrap_or(GroupRole::Member),
             )?;
-            envelope.storage_refs.push(StorageRef {
-                kind: "attachment".into(),
-                object_ref: final_ref.clone(),
-                size_bytes: task
-                    .blob_ciphertext_b64
-                    .as_ref()
-                    .and_then(|value| STANDARD.decode(value).ok())
-                    .map(|bytes| bytes.len() as u64)
-                    .or(Some(payload_metadata.size_bytes))
-                    .unwrap_or(task.descriptor.size_bytes),
-                mime_type: payload_metadata.mime_type.clone(),
-                file_name: payload_metadata
-                    .file_name
-                    .clone()
-                    .or_else(|| task.descriptor.file_name.clone()),
-                expires_at: prepared.expires_at,
-            });
-            envelopes.push(envelope);
+            let mut envelope = self.build_group_envelope(
+                &group_id,
+                &conversation_id,
+                GroupMessageType::MlsApplication,
+                GroupEnvelopeVisibility::Visible,
+                metadata_ciphertext,
+            )?;
+            envelope.storage_refs.push(storage_ref);
+            self.enqueue_group_envelope(envelope.clone(), capability, Some(payload_metadata_json));
+            Ok(merge_outputs(
+                CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![
+                        persist_effect(
+                            &self.state,
+                            vec![
+                                PersistOp::DeletePendingBlobTransfer { task_id },
+                                PersistOp::SaveOutgoingGroupEnvelope {
+                                    message_id: envelope.message_id,
+                                },
+                            ],
+                        ),
+                    ],
+                    view_model: None,
+                },
+                self.flush_pending_transport()?,
+            ))
+        } else {
+            let peer_user_id = self.peer_user_for_conversation(&task.conversation_id)?;
+            let recipients = self.recipient_device_ids(&task.conversation_id)?;
+            let mut envelopes = Vec::new();
+            for recipient in recipients {
+                let mut envelope = self.build_envelope(
+                    &task.conversation_id,
+                    &recipient,
+                    MessageType::MlsApplication,
+                    metadata_ciphertext.clone(),
+                )?;
+                envelope.storage_refs.push(storage_ref.clone());
+                envelopes.push(envelope);
+            }
+            self.enqueue_envelopes_with_plaintext(peer_user_id, envelopes, payload_metadata_json);
+            Ok(merge_outputs(
+                CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::DeletePendingBlobTransfer { task_id }],
+                    )],
+                    view_model: None,
+                },
+                self.flush_pending_transport()?,
+            ))
         }
-        self.enqueue_envelopes_with_plaintext(peer_user_id, envelopes, payload_metadata_json);
-        Ok(merge_outputs(
-            CoreOutput {
-                state_update: CoreStateUpdate::default(),
-                effects: vec![persist_effect(
-                    &self.state,
-                    vec![PersistOp::DeletePendingBlobTransfer { task_id }],
-                )],
-                view_model: None,
-            },
-            self.flush_pending_transport()?,
-        ))
     }
 
     fn handle_attachment_bytes_loaded(
@@ -6493,6 +7664,26 @@ impl CoreEngine {
             {
                 continue;
             }
+            let is_membership_operation = matches!(
+                record.envelope.message_type,
+                GroupMessageType::MlsCommit
+                    | GroupMessageType::ControlGroupMembershipChanged
+                    | GroupMessageType::ControlGroupMetadataUpdated
+            );
+            if is_membership_operation {
+                if let Err(err) = self.verify_membership_operation_authority(
+                    &record.envelope,
+                    &group_state.manifest,
+                ) {
+                    log::warn!(
+                        "rejected membership operation from {} ({}) in group {}: {err}",
+                        record.envelope.sender_user_id,
+                        record.envelope.sender_device_id,
+                        group_id
+                    );
+                    continue;
+                }
+            }
             let message_type = group_message_type_to_direct(record.envelope.message_type);
             if matches!(
                 record.envelope.message_type,
@@ -6553,6 +7744,12 @@ impl CoreEngine {
                 }
             } else {
                 self.store_group_record_message(&conversation_id, &record, message_type, None)?;
+                self.try_apply_control_manifest_update(
+                    &conversation_id,
+                    &group_id,
+                    &record,
+                    &group_state,
+                );
             }
             messages.push(MessageSummary {
                 conversation_id: conversation_id.clone(),
@@ -7134,6 +8331,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .map(|task| PersistedPendingBlobTransfer::Upload {
                 task_id: task.task_id.clone(),
                 conversation_id: task.conversation_id.clone(),
+                group_id: task.group_id.clone(),
                 message_id: task.message_id.clone(),
                 attachment_id: task.descriptor.attachment_id.clone(),
                 blob_ciphertext_b64: task.blob_ciphertext_b64.clone(),

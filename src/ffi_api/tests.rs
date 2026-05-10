@@ -66,8 +66,8 @@ mod tests {
     }
 
     #[test]
-    fn group_membership_workflow_commands_return_stable_unsupported_error() {
-        let commands = vec![
+    fn group_membership_workflow_commands_are_implemented() {
+        let commands: Vec<CoreCommand> = vec![
             CoreCommand::InviteToGroup {
                 group_id: "group:project".into(),
                 invitee_user_ids: vec!["user:eve".into()],
@@ -79,17 +79,20 @@ mod tests {
                 group_id: "group:project".into(),
                 target_user_id: "user:eve".into(),
             },
+            CoreCommand::TransferGroupOwnership {
+                group_id: "group:project".into(),
+                new_owner_user_id: "user:bob".into(),
+            },
         ];
 
         let mut engine = CoreEngine::new();
         for command in commands {
             let error = engine
                 .handle_command(command)
-                .expect_err("membership workflow command should be unsupported in phase 2");
-            assert_eq!(error.code(), "unsupported");
-            assert_eq!(
-                error.message(),
-                "group membership workflow is not implemented"
+                .expect_err("membership workflow command without setup should fail");
+            assert!(
+                error.code() != "unsupported",
+                "command should be implemented, got unsupported for {error:?}"
             );
         }
     }
