@@ -31,6 +31,15 @@ interface GroupOutboxMeta {
   headSeq: number;
   retentionDays: number;
   maxInlineBytes: number;
+  /**
+   * Once true, the durable object permanently rejects all append-type
+   * requests with HTTP 403 `group_sealed` regardless of capability. Per
+   * PROTOCOL_GROUP_CN.md §10.4 sealing is irreversible in v1; there is no
+   * code path that sets this back to false.
+   */
+  sealed?: boolean;
+  /** Millisecond timestamp the seal first succeeded. Defaults to 0. */
+  sealedAt?: number;
 }
 
 interface StoredGroupRecordIndex {
@@ -87,6 +96,7 @@ export class GroupOutboxService {
 
   async appendEnvelope(input: AppendGroupEnvelopeRequest, now: number): Promise<AppendGroupEnvelopeResult> {
     this.validateAppendRequest(input);
+    await this.rejectIfSealed();
 
     const existingSeq = await this.state.get<number>(`${IDEMPOTENCY_PREFIX}${input.envelope.messageId}`);
     if (existingSeq !== undefined) {
@@ -188,6 +198,7 @@ export class GroupOutboxService {
     if (input.groupId !== this.groupId || input.document.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "group_id does not match group invite route");
     }
+    await this.rejectIfSealed();
     this.validateInviteDocument(input.document, now);
     const key = `${INVITE_PREFIX}${input.document.inviteId}`;
     const existing = await this.state.get<StoredGroupInvite>(key);
@@ -241,6 +252,7 @@ export class GroupOutboxService {
     if (payload.groupId !== this.groupId || input.request.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "join request group does not match route");
     }
+    await this.rejectIfSealed();
     if (payload.inviteId !== input.request.inviteId) {
       throw new HttpError(403, "invalid_capability", "join request invite does not match bearer token");
     }
@@ -309,6 +321,7 @@ export class GroupOutboxService {
     if (input.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "group_id does not match group join route");
     }
+    await this.rejectIfSealed();
     const key = `${JOIN_REQUEST_PREFIX}${input.requestId}`;
     const stored = await this.state.get<StoredGroupJoinRequest>(key);
     if (!stored || stored.request.groupId !== this.groupId) {
@@ -340,6 +353,43 @@ export class GroupOutboxService {
 
   private async getMeta(): Promise<GroupOutboxMeta> {
     return (await this.state.get<GroupOutboxMeta>(META_KEY)) ?? this.defaults;
+  }
+
+  /**
+   * Idempotent seal of the group outbox. The very first caller flips
+   * `sealed = true` and records `sealedAt = now`; subsequent callers are
+   * rejected with HTTP 409 `already_sealed` regardless of their
+   * capability (PROTOCOL_GROUP_CN.md §10.4 — seals are irreversible).
+   *
+   * Callers must already have authenticated owner-signed
+   * `seal_group` capability at the transport layer; this method only
+   * enforces the storage-side invariant.
+   */
+  async sealOutbox(now: number): Promise<{ sealed: boolean; sealedAt: number; wasAlreadySealed: boolean }> {
+    const meta = await this.getMeta();
+    if (meta.sealed === true) {
+      throw new HttpError(409, "already_sealed", "group outbox is already sealed");
+    }
+    const nextMeta: GroupOutboxMeta = { ...meta, sealed: true, sealedAt: now };
+    await this.state.put(META_KEY, nextMeta);
+    return { sealed: true, sealedAt: now, wasAlreadySealed: false };
+  }
+
+  async getSealStatus(): Promise<{ sealed: boolean; sealedAt: number }> {
+    const meta = await this.getMeta();
+    return { sealed: meta.sealed === true, sealedAt: meta.sealedAt ?? 0 };
+  }
+
+  /**
+   * Reject any append-type flow on a sealed outbox with the canonical
+   * `403 group_sealed` response. Reads (fetch / head / subscribe-replay)
+   * are explicitly allowed to continue, so only write paths call this.
+   */
+  private async rejectIfSealed(): Promise<void> {
+    const meta = await this.getMeta();
+    if (meta.sealed === true) {
+      throw new HttpError(403, "group_sealed", "group outbox is sealed and cannot accept new writes");
+    }
   }
 
   private validateAppendRequest(input: AppendGroupEnvelopeRequest): void {

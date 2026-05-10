@@ -103,7 +103,8 @@ export type GroupCapabilityOperation =
   | "manage_invites"
   | "approve_join"
   | "remove_member"
-  | "update_group_metadata";
+  | "update_group_metadata"
+  | "seal_group";
 
 export interface GroupCapability {
   version: string;

@@ -260,7 +260,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return stub.fetch(request);
     }
 
-    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head)$/);
+    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head|seal)$/);
     if (groupOutboxMatch) {
       const groupId = decodeURIComponent(groupOutboxMatch[1]);
       const operation = groupOutboxMatch[2];
@@ -270,6 +270,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "POST" && operation === "messages") {
         const body = (await request.clone().json()) as AppendGroupEnvelopeRequest;
         validateGroupAppendAuthorization(request, groupId, body, now);
+      } else if (request.method === "POST" && operation === "seal") {
+        // Owner-only seal capability check happens twice: once at the
+        // worker boundary (here) to fail fast before we wake up the
+        // durable object, and once inside the durable object so that
+        // the storage-side invariant is never bypassed.
+        validateGroupOperationAuthorization(
+          request,
+          groupId,
+          readGroupCapabilityHeader(request),
+          now,
+          "seal_group",
+          ["owner"]
+        );
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         validateGroupReadAuthorization(request, groupId, readGroupCapabilityHeader(request), now);
       }

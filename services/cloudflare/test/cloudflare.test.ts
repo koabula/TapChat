@@ -1351,3 +1351,194 @@ test("ack semantics reject backwards ack and cleanup only removes expired acked 
   assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), false);
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
 });
+
+test("group outbox seal succeeds for owner and records sealed timestamp", async () => {
+  // Owner-signed `seal_group` capability must be accepted on the very
+  // first POST to `/outbox/seal`. The response carries `sealedAt` so
+  // clients can surface the transition (PROTOCOL_GROUP_CN.md §10.4).
+  const { env } = createEnv();
+  const capability = sampleGroupCapability(
+    "group:project",
+    ["read", "seal_group"],
+    "owner"
+  );
+
+  const response = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: groupHeaders(capability),
+      body: "{}"
+    }),
+    env
+  );
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    sealed: boolean;
+    sealedAt: number;
+    wasAlreadySealed: boolean;
+  };
+  assert.equal(body.sealed, true);
+  assert.equal(body.wasAlreadySealed, false);
+  assert.ok(body.sealedAt > 0, "sealedAt must be a positive timestamp");
+});
+
+test("group outbox seal returns 409 already_sealed on repeat", async () => {
+  // Re-seals must be idempotent at the terminal-state level but observable
+  // via HTTP 409 `already_sealed` so operator tooling can distinguish a
+  // fresh seal from a no-op retry.
+  const { env } = createEnv();
+  const capability = sampleGroupCapability(
+    "group:project",
+    ["read", "seal_group"],
+    "owner"
+  );
+
+  const first = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: groupHeaders(capability),
+      body: "{}"
+    }),
+    env
+  );
+  assert.equal(first.status, 200);
+
+  const repeat = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: groupHeaders(capability),
+      body: "{}"
+    }),
+    env
+  );
+  assert.equal(repeat.status, 409);
+  const body = (await repeat.json()) as { error?: string; message?: string };
+  assert.equal(body.error, "already_sealed");
+});
+
+test("group outbox seal rejects non-owner capability with 403 unauthorized", async () => {
+  // `seal_group` is owner-exclusive per PROTOCOL_GROUP_CN.md §10.4.
+  // Even an admin holding the operation in their capability must be
+  // rejected at the worker boundary. We also cover the case where an
+  // owner signs a capability missing `seal_group` to verify the operation
+  // flag is not inferred from role alone.
+  const { env } = createEnv();
+  const adminWithSealOp = sampleGroupCapability(
+    "group:project",
+    ["read", "seal_group"],
+    "admin"
+  );
+  const ownerMissingSealOp = sampleGroupCapability(
+    "group:project",
+    ["read", "append_application"],
+    "owner"
+  );
+
+  const adminResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: groupHeaders(adminWithSealOp),
+      body: "{}"
+    }),
+    env
+  );
+  assert.equal(adminResp.status, 403);
+  const adminBody = (await adminResp.json()) as { error?: string };
+  assert.equal(adminBody.error, "invalid_capability");
+
+  const ownerResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: groupHeaders(ownerMissingSealOp),
+      body: "{}"
+    }),
+    env
+  );
+  assert.equal(ownerResp.status, 403);
+  const ownerBody = (await ownerResp.json()) as { error?: string };
+  assert.equal(ownerBody.error, "invalid_capability");
+});
+
+test("group outbox append after seal returns 403 group_sealed", async () => {
+  // After a successful seal, any subsequent append must be rejected with
+  // the canonical `403 group_sealed` regardless of capability. Existing
+  // reads continue to work.
+  const { env } = createEnv();
+  const ownerCap = sampleGroupCapability(
+    "group:project",
+    ["read", "append_application", "append_membership", "seal_group"],
+    "owner"
+  );
+
+  // Append one record prior to sealing so fetch has something to return.
+  const initialAppend = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(ownerCap),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(
+        sampleGroupAppend("group:project", "msg:group:pre-seal", "mls_application", ownerCap)
+      )
+    }),
+    env
+  );
+  assert.equal(initialAppend.status, 200);
+
+  // Seal the outbox.
+  const sealResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: groupHeaders(ownerCap),
+      body: "{}"
+    }),
+    env
+  );
+  assert.equal(sealResp.status, 200);
+
+  // Subsequent append must be rejected.
+  const postSealAppend = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(ownerCap),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(
+        sampleGroupAppend("group:project", "msg:group:post-seal", "mls_application", ownerCap)
+      )
+    }),
+    env
+  );
+  assert.equal(postSealAppend.status, 403);
+  const appendBody = (await postSealAppend.json()) as { error?: string };
+  assert.equal(appendBody.error, "group_sealed");
+
+  // Reads continue to work: fetch the pre-seal record, and head remains
+  // the final pre-seal seq.
+  const fetchResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=1&limit=10", {
+      headers: groupHeaders(ownerCap)
+    }),
+    env
+  );
+  assert.equal(fetchResp.status, 200);
+  const fetchBody = (await fetchResp.json()) as {
+    records: Array<{ seq: number; messageId: string }>;
+  };
+  assert.deepEqual(
+    fetchBody.records.map((record) => [record.seq, record.messageId]),
+    [[1, "msg:group:pre-seal"]]
+  );
+
+  const headResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: groupHeaders(ownerCap)
+    }),
+    env
+  );
+  assert.equal(headResp.status, 200);
+  const headBody = (await headResp.json()) as { headSeq: number };
+  assert.equal(headBody.headSeq, 1);
+});

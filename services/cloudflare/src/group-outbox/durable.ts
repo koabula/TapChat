@@ -1,4 +1,4 @@
-import { HttpError } from "../auth/capability";
+import { HttpError, readGroupCapabilityHeader, validateGroupOperationAuthorization } from "../auth/capability";
 import { GroupOutboxService } from "./service";
 import { getBearerToken } from "../auth/capability";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
@@ -146,6 +146,17 @@ export async function handleGroupOutboxDurableRequest(
 
     if (url.pathname.endsWith("/head") && request.method === "GET") {
       return jsonResponse(await service.getHead());
+    }
+
+    if (url.pathname.endsWith("/outbox/seal") && request.method === "POST") {
+      // Owner-signed, owner-only seal of the group outbox. Per
+      // PROTOCOL_GROUP_CN.md §10.4 the seal is irreversible: a follow-up
+      // request will receive 409 `already_sealed`.
+      const capability = readGroupCapabilityHeader(request);
+      validateGroupOperationAuthorization(request, deps.groupId, capability, now, "seal_group", [
+        "owner"
+      ]);
+      return jsonResponse(await service.sealOutbox(now));
     }
 
     if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "POST") {
