@@ -24,6 +24,7 @@ pub enum Command {
     Contact(ContactCommand),
     Conversation(ConversationCommand),
     Message(MessageCommand),
+    Group(GroupCommand),
     Sync(SyncCommand),
     Runtime(RuntimeCommand),
 }
@@ -289,6 +290,247 @@ pub enum MessageSubcommand {
         profile: Option<PathBuf>,
         #[arg(long)]
         conversation_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct GroupCommand {
+    #[command(subcommand)]
+    pub command: GroupSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GroupSubcommand {
+    /// Create a new group conversation and publish the initial MLS commit
+    Create {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        title: String,
+        /// Comma-separated list of invitee user ids (at least one required)
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        members: Vec<String>,
+    },
+    /// List all groups this profile currently participates in
+    List {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    /// Show a single group's manifest, members, cursor and recovery state
+    Show {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+    },
+    /// Send a text message into the MLS group via the group outbox
+    SendText {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        conversation_id: String,
+        #[arg(long)]
+        text: String,
+    },
+    /// Send an attachment into the MLS group via the group outbox
+    SendAttachment {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        conversation_id: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Download an attachment previously sent in the group
+    DownloadAttachment {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        conversation_id: String,
+        #[arg(long)]
+        message_id: String,
+        #[arg(long)]
+        reference: String,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// List stored messages for the conversation backing this group
+    ListMessages {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        conversation_id: String,
+    },
+    /// Pull new records from the group outbox
+    Sync {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+    },
+    /// Leave a group this profile is currently a member of
+    Leave {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+    },
+    /// Transfer ownership to another active member (owner only)
+    TransferOwnership {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        new_owner_user_id: String,
+    },
+    /// Grant or revoke admin role for a member (owner only)
+    SetAdmin {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        user_id: String,
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Update group metadata (title / join policy / member invite policy)
+    UpdateMetadata {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        title: Option<String>,
+        /// One of `closed`, `approval_required`, `open_by_invite`
+        #[arg(long)]
+        join_policy: Option<String>,
+        /// One of `owner_admin_only`, `request_owner_approval`
+        #[arg(long)]
+        member_invite_policy: Option<String>,
+    },
+    Invite(GroupInviteCommand),
+    Join(GroupJoinCommand),
+    Member(GroupMemberCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct GroupInviteCommand {
+    #[command(subcommand)]
+    pub command: GroupInviteSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GroupInviteSubcommand {
+    /// Create a signed invite link usable by join submit
+    Create {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        /// Seconds from now until the invite expires
+        #[arg(long, default_value_t = 3600)]
+        expires_in_secs: u64,
+        /// Optional maximum number of times the invite may be used
+        #[arg(long)]
+        max_uses: Option<u64>,
+    },
+    /// Revoke a previously issued invite link by id
+    Revoke {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        invite_id: String,
+    },
+    /// List invites this profile has issued for a group
+    List {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct GroupJoinCommand {
+    #[command(subcommand)]
+    pub command: GroupJoinSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GroupJoinSubcommand {
+    /// Submit a join request against an invite URL (joiner side)
+    Submit {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        invite_url: String,
+    },
+    /// Import a group from a welcome pickup URL handed out by the owner/admin
+    ByPickup {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// Welcome pickup URL (tapchat://welcome-pickup/<base64-json>) or raw descriptor JSON
+        #[arg(long)]
+        pickup: String,
+    },
+    /// List pending join requests (owner/admin side)
+    List {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+    },
+    /// Approve a pending join request (owner/admin side)
+    Approve {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        request_id: String,
+    },
+    /// Reject a pending join request (owner/admin side)
+    Reject {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Poll the server for this join request's status and pick up welcome when available
+    Status {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        request_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct GroupMemberCommand {
+    #[command(subcommand)]
+    pub command: GroupMemberSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GroupMemberSubcommand {
+    /// Remove a member from the group (owner/admin only)
+    Remove {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        user_id: String,
     },
 }
 

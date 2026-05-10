@@ -574,6 +574,7 @@ pub enum GroupMemberInvitePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMember {
+    #[serde(alias = "user_id")]
     pub user_id: String,
     pub role: GroupRole,
     pub status: GroupMemberStatus,
@@ -589,7 +590,11 @@ impl Validate for GroupMember {
 #[serde(rename_all = "camelCase")]
 pub struct GroupOutboxDescriptor {
     pub endpoint: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "subscribe_endpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub subscribe_endpoint: Option<String>,
 }
 
@@ -607,21 +612,35 @@ impl Validate for GroupOutboxDescriptor {
 #[serde(rename_all = "camelCase")]
 pub struct GroupManifest {
     pub version: String,
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "conversation_id")]
     pub conversation_id: String,
     pub title: String,
+    #[serde(alias = "owner_user_id")]
     pub owner_user_id: String,
     pub admins: Vec<String>,
     pub members: Vec<GroupMember>,
+    #[serde(alias = "join_policy")]
     pub join_policy: GroupJoinPolicy,
+    #[serde(alias = "member_invite_policy")]
     pub member_invite_policy: GroupMemberInvitePolicy,
+    #[serde(alias = "roster_version")]
     pub roster_version: u64,
+    #[serde(alias = "mls_epoch_hint")]
     pub mls_epoch_hint: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "last_commit_message_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_commit_message_id: Option<String>,
     pub outbox: GroupOutboxDescriptor,
+    #[serde(alias = "updated_at")]
     pub updated_at: u64,
+    #[serde(alias = "signer_user_id")]
     pub signer_user_id: String,
+    #[serde(alias = "signer_device_id")]
     pub signer_device_id: String,
     pub signature: String,
 }
@@ -694,11 +713,15 @@ pub enum GroupCapabilityOperation {
 pub struct GroupCapability {
     pub version: String,
     pub service: CapabilityService,
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "user_id")]
     pub user_id: String,
+    #[serde(alias = "device_id")]
     pub device_id: String,
     pub operations: Vec<GroupCapabilityOperation>,
     pub role: GroupRole,
+    #[serde(alias = "expires_at")]
     pub expires_at: u64,
     pub signature: String,
 }
@@ -749,20 +772,40 @@ pub enum GroupEnvelopeVisibility {
 #[serde(rename_all = "camelCase")]
 pub struct GroupEnvelope {
     pub version: String,
+    #[serde(alias = "message_id")]
     pub message_id: String,
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "conversation_id")]
     pub conversation_id: String,
+    #[serde(alias = "sender_user_id")]
     pub sender_user_id: String,
+    #[serde(alias = "sender_device_id")]
     pub sender_device_id: String,
+    #[serde(alias = "created_at")]
     pub created_at: u64,
+    #[serde(alias = "message_type")]
     pub message_type: GroupMessageType,
     pub visibility: GroupEnvelopeVisibility,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "inline_ciphertext",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inline_ciphertext: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        alias = "storage_refs",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub storage_refs: Vec<StorageRef>,
+    #[serde(alias = "sender_proof")]
     pub sender_proof: SenderProof,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "membership_proof",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub membership_proof: Option<SenderProof>,
 }
 
@@ -809,10 +852,17 @@ pub enum GroupOutboxRecordState {
 #[serde(rename_all = "camelCase")]
 pub struct GroupOutboxRecord {
     pub seq: u64,
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "message_id")]
     pub message_id: String,
+    #[serde(alias = "received_at")]
     pub received_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "expires_at",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub expires_at: Option<u64>,
     pub state: GroupOutboxRecordState,
     pub envelope: GroupEnvelope,
@@ -840,8 +890,11 @@ impl Validate for GroupOutboxRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupCursor {
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "last_fetched_seq")]
     pub last_fetched_seq: u64,
+    #[serde(alias = "updated_at")]
     pub updated_at: u64,
 }
 
@@ -854,10 +907,13 @@ impl Validate for GroupCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WelcomePickupDescriptor {
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "device_id")]
     pub device_id: String,
     pub endpoint: String,
     pub capability: String,
+    #[serde(alias = "expires_at")]
     pub expires_at: u64,
 }
 
@@ -875,13 +931,23 @@ impl Validate for WelcomePickupDescriptor {
 pub struct GroupInviteTokenPayload {
     pub version: String,
     pub service: String,
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "invite_id")]
     pub invite_id: String,
+    #[serde(alias = "inviter_user_id")]
     pub inviter_user_id: String,
+    #[serde(alias = "inviter_device_id")]
     pub inviter_device_id: String,
+    #[serde(alias = "join_policy")]
     pub join_policy: GroupJoinPolicy,
+    #[serde(alias = "expires_at")]
     pub expires_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "max_uses",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_uses: Option<u64>,
 }
 
@@ -904,21 +970,42 @@ impl Validate for GroupInviteTokenPayload {
 #[serde(rename_all = "camelCase")]
 pub struct GroupInviteDocument {
     pub version: String,
+    #[serde(alias = "group_id")]
     pub group_id: String,
     pub title: String,
+    #[serde(alias = "invite_id")]
     pub invite_id: String,
+    #[serde(alias = "join_policy")]
     pub join_policy: GroupJoinPolicy,
+    #[serde(alias = "inviter_user_id")]
     pub inviter_user_id: String,
+    #[serde(alias = "inviter_device_id")]
     pub inviter_device_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "inviter_contact_share_url",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub inviter_contact_share_url: Option<String>,
+    #[serde(alias = "owner_user_id")]
     pub owner_user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "owner_contact_share_url",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub owner_contact_share_url: Option<String>,
+    #[serde(alias = "join_request_endpoint")]
     pub join_request_endpoint: String,
+    #[serde(alias = "created_at")]
     pub created_at: u64,
+    #[serde(alias = "expires_at")]
     pub expires_at: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "max_uses",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_uses: Option<u64>,
     pub signature: String,
 }
@@ -951,17 +1038,29 @@ pub enum GroupJoinRequestStatus {
 #[serde(rename_all = "camelCase")]
 pub struct GroupJoinRequest {
     pub version: String,
+    #[serde(alias = "request_id")]
     pub request_id: String,
+    #[serde(alias = "group_id")]
     pub group_id: String,
+    #[serde(alias = "invite_id")]
     pub invite_id: String,
+    #[serde(alias = "joiner_user_id")]
     pub joiner_user_id: String,
+    #[serde(alias = "joiner_device_id")]
     pub joiner_device_id: String,
+    #[serde(alias = "joiner_contact_share_url")]
     pub joiner_contact_share_url: String,
+    #[serde(alias = "requested_at")]
     pub requested_at: u64,
+    #[serde(alias = "request_capability")]
     pub request_capability: String,
     pub signature: String,
     pub status: GroupJoinRequestStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "auto_approve",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_approve: Option<bool>,
 }
 

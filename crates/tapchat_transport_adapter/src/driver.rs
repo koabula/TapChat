@@ -1133,6 +1133,15 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
             left_view
                 .message_requests
                 .append(&mut right_view.message_requests);
+            left_view
+                .group_invites
+                .append(&mut right_view.group_invites);
+            left_view
+                .group_join_requests
+                .append(&mut right_view.group_join_requests);
+            left_view
+                .welcome_pickups
+                .append(&mut right_view.welcome_pickups);
             if right_view.allowlist.is_some() {
                 left_view.allowlist = right_view.allowlist.take();
             }

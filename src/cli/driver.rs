@@ -1209,7 +1209,7 @@ impl TransportPort for CoreDriver {
             base.trim_end_matches('/'),
             get.group_id
         );
-        let response = self
+        let response = match self
             .runtime
             .client
             .get(url)
@@ -1222,10 +1222,41 @@ impl TransportPort for CoreDriver {
                 to_camel_case_json_string(&serde_json::to_string(&get.capability)?)?,
             )
             .send()
-            .await?;
-        let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
-        let _result: GetGroupOutboxHeadResult = serde_json::from_str(&body)?;
-        Ok(Vec::new())
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
+                    group_id: get.group_id,
+                    retryable: true,
+                    detail: Some(error.to_string()),
+                }]);
+            }
+        };
+        let status = response.status().as_u16();
+        let body_text = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
+                group_id: get.group_id,
+                retryable: status >= 500,
+                detail: Some(body_text),
+            }]);
+        }
+        let body = to_snake_case_json_string(&body_text).unwrap_or(body_text);
+        let result: GetGroupOutboxHeadResult = match serde_json::from_str(&body) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
+                    group_id: get.group_id,
+                    retryable: false,
+                    detail: Some(error.to_string()),
+                }]);
+            }
+        };
+        Ok(vec![CoreEvent::GroupOutboxHeadFetched {
+            group_id: get.group_id,
+            head_seq: result.head_seq,
+        }])
     }
 
     async fn put_welcome_pickup(&mut self, put: PutWelcomePickupRequest) -> Result<Vec<CoreEvent>> {
@@ -1751,6 +1782,15 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
             left_view
                 .message_requests
                 .append(&mut right_view.message_requests);
+            left_view
+                .group_invites
+                .append(&mut right_view.group_invites);
+            left_view
+                .group_join_requests
+                .append(&mut right_view.group_join_requests);
+            left_view
+                .welcome_pickups
+                .append(&mut right_view.welcome_pickups);
             if right_view.allowlist.is_some() {
                 left_view.allowlist = right_view.allowlist.take();
             }

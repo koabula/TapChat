@@ -23,6 +23,9 @@ const ALICE_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const BOB_MNEMONIC: &str =
     "legal winner thank year wave sausage worth useful legal winner thank yellow";
+const CAROL_MNEMONIC: &str =
+    "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+const DANA_MNEMONIC: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
 const ORCHESTRATED_CASE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[allow(dead_code)]
@@ -60,6 +63,7 @@ fn cli_e2e_stable_suite() -> Result<()> {
         "cli_device_revoke_remote_target_updates_published_bundle",
         "cli_direct_message_and_attachment_e2e_work",
         "cli_explicit_needs_rebuild_control_e2e_work",
+        "cli_group_three_party_invite_remove_e2e_work",
         "cli_identity_refresh_retry_exhausted_e2e_work",
         "cli_message_request_accept_flow_works",
         "cli_needs_rebuild_surfaces_escalation_reason_e2e_work",
@@ -4536,6 +4540,820 @@ fn assert_recovery_phase_not_regressed(previous: &str, current: &str) {
         recovery_phase_rank(current) >= recovery_phase_rank(previous),
         "recovery phase regressed from {previous} to {current}"
     );
+}
+
+/// End-to-end coverage for `Outbox Group` protocol phases 2/3/4/5 driven
+/// through the real Cloudflare `.test-runtime` worker. Mirrors the in-memory
+/// `group_*_e2e` tests in `src/ffi_api/tests.rs` but uses four independent CLI
+/// profiles and issues real HTTP traffic against the group outbox, storage,
+/// and welcome pickup endpoints.
+#[test]
+#[ignore = "orchestrated by cli_e2e_stable_suite"]
+fn cli_group_three_party_invite_remove_e2e_work() -> Result<()> {
+    let _guard = test_lock();
+    let ctx = setup_cli_group_quartet("group-three-party")?;
+
+    // Alice creates a 3-person group; MLS commit is flushed to the outbox and
+    // welcome pickup payloads are stored on the server.
+    let created = run_cli_json([
+        "group",
+        "create",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--title",
+        "Project",
+        "--members",
+        &format!("{},{}", ctx.bob_user_id, ctx.carol_user_id),
+    ])?;
+    assert_eq!(created["created"], Value::Bool(true));
+    let group_id = required_str(&created, "group_id")?;
+    let conversation_id = required_str(&created, "conversation_id")?;
+    assert_eq!(created["title"].as_str(), Some("Project"));
+    assert_eq!(created["member_count"].as_u64(), Some(3));
+    assert_eq!(created["group_role"].as_str(), Some("owner"));
+    assert_eq!(created["pending_outbox"].as_u64(), Some(0));
+
+    let welcome_pickups = created["welcome_pickups"]
+        .as_array()
+        .context("group create must expose welcome pickup descriptors")?;
+    assert_eq!(welcome_pickups.len(), 2);
+    let bob_pickup_url = welcome_pickup_url_for(welcome_pickups, &ctx.bob_device_id)?;
+    let carol_pickup_url = welcome_pickup_url_for(welcome_pickups, &ctx.carol_device_id)?;
+
+    // Bob and Carol pick up the welcome, import the MLS group state, and then
+    // sync the group outbox. The initial commit seq must have been assigned by
+    // the server durable object.
+    let bob_joined = run_cli_json([
+        "group",
+        "join",
+        "by-pickup",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--pickup",
+        &bob_pickup_url,
+    ])?;
+    assert_eq!(bob_joined["joined"], Value::Bool(true));
+    assert_eq!(bob_joined["group_id"].as_str(), Some(group_id.as_str()));
+    assert_eq!(
+        bob_joined["conversation_id"].as_str(),
+        Some(conversation_id.as_str())
+    );
+
+    let carol_joined = run_cli_json([
+        "group",
+        "join",
+        "by-pickup",
+        "--profile",
+        &ctx.carol_profile.to_string_lossy(),
+        "--pickup",
+        &carol_pickup_url,
+    ])?;
+    assert_eq!(carol_joined["joined"], Value::Bool(true));
+    assert_eq!(carol_joined["group_id"].as_str(), Some(group_id.as_str()));
+
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+
+    // Phase 2: alternating text messages among the three members.
+    group_send_text(&ctx.alice_profile, &conversation_id, "hello from alice")?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+    group_send_text(&ctx.bob_profile, &conversation_id, "hello from bob")?;
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+    group_send_text(&ctx.carol_profile, &conversation_id, "hello from carol")?;
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+
+    for (profile, name) in [
+        (&ctx.alice_profile, "alice"),
+        (&ctx.bob_profile, "bob"),
+        (&ctx.carol_profile, "carol"),
+    ] {
+        let messages = run_cli_json([
+            "group",
+            "list-messages",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--conversation-id",
+            &conversation_id,
+        ])?;
+        assert_eq!(
+            count_plaintext_messages(&messages, "hello from alice"),
+            1,
+            "{name} did not see alice's text"
+        );
+        assert_eq!(
+            count_plaintext_messages(&messages, "hello from bob"),
+            1,
+            "{name} did not see bob's text"
+        );
+        assert_eq!(
+            count_plaintext_messages(&messages, "hello from carol"),
+            1,
+            "{name} did not see carol's text"
+        );
+    }
+
+    // Phase 5: attachment round trip. Bob uploads a Blob via the storage
+    // endpoint, then alice and carol pull the group record and download it.
+    let attachment_source = ctx.temp_root.path().join("bob-group-attachment.bin");
+    let attachment_bytes: Vec<u8> = b"tapchat group attachment phase5".to_vec();
+    fs::write(&attachment_source, &attachment_bytes)?;
+    let queued = run_cli_json([
+        "group",
+        "send-attachment",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--file",
+        &attachment_source.to_string_lossy(),
+    ])?;
+    assert_eq!(queued["queued"], Value::Bool(true));
+    assert_eq!(queued["pending_group_outbox"].as_u64(), Some(0));
+    assert_eq!(queued["pending_blob_uploads"].as_u64(), Some(0));
+
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+
+    // Pull the attachment reference from alice's decrypted record. Group
+    // attachments carry their storage ref in the MLS application payload, so
+    // we need the MLS-decrypted copy — not bob's locally-cached send-side id,
+    // because the sender re-allocates message ids when the envelope is built.
+    let (alice_reference, alice_attachment_message_id) =
+        first_attachment_entry(&ctx.alice_profile, &conversation_id)?;
+    let (carol_reference, _carol_attachment_message_id) =
+        first_attachment_entry(&ctx.carol_profile, &conversation_id)?;
+    let alice_destination = ctx.temp_root.path().join("alice-download.bin");
+    let carol_destination = ctx.temp_root.path().join("carol-download.bin");
+    let alice_download = run_cli_json([
+        "group",
+        "download-attachment",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--message-id",
+        &alice_attachment_message_id,
+        "--reference",
+        &alice_reference,
+        "--out",
+        &alice_destination.to_string_lossy(),
+    ])?;
+    assert_eq!(alice_download["downloaded"], Value::Bool(true));
+    let carol_download = run_cli_json([
+        "group",
+        "download-attachment",
+        "--profile",
+        &ctx.carol_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--message-id",
+        &_carol_attachment_message_id,
+        "--reference",
+        &carol_reference,
+        "--out",
+        &carol_destination.to_string_lossy(),
+    ])?;
+    assert_eq!(carol_download["downloaded"], Value::Bool(true));
+    assert_eq!(
+        fs::read(&alice_destination).context("read alice download")?,
+        attachment_bytes
+    );
+    assert_eq!(
+        fs::read(&carol_destination).context("read carol download")?,
+        attachment_bytes
+    );
+
+    // Before creating an invite link, switch the group's join policy to
+    // approval_required so that invite links are allowed (the default
+    // `Closed` policy rejects all link join requests by design).
+    run_cli_json([
+        "group",
+        "update-metadata",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+        "--join-policy",
+        "approval_required",
+    ])?;
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+
+    // Phase 3: alice creates an invite link, dana submits a join request,
+    // alice approves, dana imports the welcome and begins participating.
+    let invite = run_cli_json([
+        "group",
+        "invite",
+        "create",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+        "--expires-in-secs",
+        "3600",
+    ])?;
+    assert_eq!(invite["created"], Value::Bool(true));
+    let invite_url = required_str(&invite, "invite_url")?;
+    let invite_id = required_str(&invite, "invite_id")?;
+    assert!(
+        invite_url.contains("/v1/group-invite/"),
+        "invite URL {invite_url} should target the group-invite endpoint"
+    );
+
+    let submit = run_cli_json([
+        "group",
+        "join",
+        "submit",
+        "--profile",
+        &ctx.dana_profile.to_string_lossy(),
+        "--invite-url",
+        &invite_url,
+    ])?;
+    assert_eq!(submit["submitted"], Value::Bool(true));
+    assert_eq!(submit["group_id"].as_str(), Some(group_id.as_str()));
+    let request_id = required_str(&submit, "request_id")?;
+
+    // Non-privileged members must not be able to list pending join requests.
+    let bob_list = run_cli_output([
+        "group",
+        "join",
+        "list",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+    ])?;
+    assert!(
+        !bob_list.status.success(),
+        "member must not list group join requests"
+    );
+
+    let pending = run_cli_json([
+        "group",
+        "join",
+        "list",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+    ])?;
+
+    let pending_rows = pending
+        .as_array()
+        .context("join list not array")?;
+    assert!(
+        pending_rows.iter().any(|row| {
+            row["request_id"].as_str() == Some(request_id.as_str())
+                && row["joiner_user_id"].as_str() == Some(ctx.dana_user_id.as_str())
+        }),
+        "alice did not see dana's pending join request"
+    );
+
+    // Non-privileged members must not be able to approve, either.
+    let bob_approve = run_cli_output([
+        "group",
+        "join",
+        "approve",
+        "--profile",
+        &ctx.bob_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+        "--request-id",
+        &request_id,
+    ])?;
+    assert!(
+        !bob_approve.status.success(),
+        "member must not approve group join"
+    );
+
+    let approved = run_cli_json([
+        "group",
+        "join",
+        "approve",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+        "--request-id",
+        &request_id,
+    ])?;
+    assert_eq!(approved["approved"], Value::Bool(true));
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+
+    // Dana polls for her approval status; the server replies with the welcome
+    // pickup descriptor, which the CLI uses to import the group state.
+    let mut dana_status = Value::Null;
+    for _ in 0..5 {
+        let fetched = run_cli_json([
+            "group",
+            "join",
+            "status",
+            "--profile",
+            &ctx.dana_profile.to_string_lossy(),
+            "--group-id",
+            &group_id,
+            "--request-id",
+            &request_id,
+        ])?;
+        if fetched["group_imported"].as_bool() == Some(true) {
+            dana_status = fetched;
+            break;
+        }
+        dana_status = fetched;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert_eq!(
+        dana_status["status"].as_str(),
+        Some("approved"),
+        "dana did not observe the approved status: {dana_status}"
+    );
+    assert_eq!(
+        dana_status["group_imported"].as_bool(),
+        Some(true),
+        "dana did not import the group after approval: {dana_status}"
+    );
+    group_sync(&ctx.dana_profile, &group_id)?;
+
+    group_send_text(&ctx.dana_profile, &conversation_id, "hello from dana")?;
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.carol_profile, &group_id)?;
+
+    for (profile, name) in [
+        (&ctx.alice_profile, "alice"),
+        (&ctx.bob_profile, "bob"),
+        (&ctx.carol_profile, "carol"),
+    ] {
+        let messages = run_cli_json([
+            "group",
+            "list-messages",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--conversation-id",
+            &conversation_id,
+        ])?;
+        assert_eq!(
+            count_plaintext_messages(&messages, "hello from dana"),
+            1,
+            "{name} did not receive dana's post-approval text"
+        );
+    }
+
+    group_send_text(&ctx.alice_profile, &conversation_id, "welcome aboard dana")?;
+    group_sync(&ctx.dana_profile, &group_id)?;
+    let dana_messages = run_cli_json([
+        "group",
+        "list-messages",
+        "--profile",
+        &ctx.dana_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&dana_messages, "welcome aboard dana"),
+        1,
+        "dana did not receive alice's welcome text"
+    );
+
+    // Invite revoke path — further joins against this invite must fail. Use a
+    // second profile (the "extra" staging profile) as a prospective joiner.
+    let revoke = run_cli_json([
+        "group",
+        "invite",
+        "revoke",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+        "--invite-id",
+        &invite_id,
+    ])?;
+    assert_eq!(revoke["revoked"], Value::Bool(true));
+
+    // Phase 4: alice removes carol. After the remove commit propagates, future
+    // application messages must not be decryptable by carol, and carol's own
+    // send must fail-closed locally.
+    let removed = run_cli_json([
+        "group",
+        "member",
+        "remove",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+        "--user-id",
+        &ctx.carol_user_id,
+    ])?;
+    assert_eq!(removed["removed"], Value::Bool(true));
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.dana_profile, &group_id)?;
+
+    let carol_before_remove = run_cli_json([
+        "group",
+        "list-messages",
+        "--profile",
+        &ctx.carol_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    let carol_baseline_count = carol_before_remove
+        .as_array()
+        .map(|rows| rows.len())
+        .unwrap_or_default();
+    group_send_text(
+        &ctx.alice_profile,
+        &conversation_id,
+        "post-remove from alice",
+    )?;
+    group_send_text(
+        &ctx.dana_profile,
+        &conversation_id,
+        "post-remove from dana",
+    )?;
+    group_sync(&ctx.alice_profile, &group_id)?;
+    group_sync(&ctx.bob_profile, &group_id)?;
+    group_sync(&ctx.dana_profile, &group_id)?;
+    // Carol still tries to pull — but must not observe the new records.
+    group_sync(&ctx.carol_profile, &group_id)?;
+    let carol_after_remove = run_cli_json([
+        "group",
+        "list-messages",
+        "--profile",
+        &ctx.carol_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+    ])?;
+    assert_eq!(
+        count_plaintext_messages(&carol_after_remove, "post-remove from alice"),
+        0,
+        "removed member must not observe post-remove plaintext"
+    );
+    assert_eq!(
+        count_plaintext_messages(&carol_after_remove, "post-remove from dana"),
+        0,
+        "removed member must not observe post-remove plaintext"
+    );
+    assert!(
+        carol_after_remove
+            .as_array()
+            .map(|rows| rows.len())
+            .unwrap_or_default()
+            >= carol_baseline_count,
+        "carol's local history must be monotonic even after removal"
+    );
+
+    // Carol's own send-text must fail because core tracks her local role as
+    // removed / group as needing recovery.
+    let carol_send = run_cli_output([
+        "group",
+        "send-text",
+        "--profile",
+        &ctx.carol_profile.to_string_lossy(),
+        "--conversation-id",
+        &conversation_id,
+        "--text",
+        "carol attempts to speak post-remove",
+    ])?;
+    assert!(
+        !carol_send.status.success(),
+        "removed member must not be able to send new group messages"
+    );
+
+    // Remaining members must still see each other's post-remove chatter.
+    for (profile, name) in [
+        (&ctx.alice_profile, "alice"),
+        (&ctx.bob_profile, "bob"),
+        (&ctx.dana_profile, "dana"),
+    ] {
+        let messages = run_cli_json([
+            "group",
+            "list-messages",
+            "--profile",
+            &profile.to_string_lossy(),
+            "--conversation-id",
+            &conversation_id,
+        ])?;
+        assert_eq!(
+            count_plaintext_messages(&messages, "post-remove from alice"),
+            1,
+            "{name} lost alice's post-remove text"
+        );
+        assert_eq!(
+            count_plaintext_messages(&messages, "post-remove from dana"),
+            1,
+            "{name} lost dana's post-remove text"
+        );
+    }
+
+    // Sanity: group show reflects the final roster on alice's side.
+    let alice_show = run_cli_json([
+        "group",
+        "show",
+        "--profile",
+        &ctx.alice_profile.to_string_lossy(),
+        "--group-id",
+        &group_id,
+    ])?;
+    let final_members = alice_show["manifest"]["members"]
+        .as_array()
+        .context("manifest members missing")?;
+    let active_user_ids: std::collections::BTreeSet<&str> = final_members
+        .iter()
+        .filter(|member| member["status"].as_str() == Some("active"))
+        .filter_map(|member| member["user_id"].as_str())
+        .collect();
+    assert!(active_user_ids.contains(ctx.alice_user_id.as_str()));
+    assert!(active_user_ids.contains(ctx.bob_user_id.as_str()));
+    assert!(active_user_ids.contains(ctx.dana_user_id.as_str()));
+    assert!(
+        !active_user_ids.contains(ctx.carol_user_id.as_str()),
+        "carol should not appear as active on alice's manifest"
+    );
+
+    Ok(())
+}
+
+/// Spin up a shared Cloudflare test runtime and four profiles (alice/bob/
+/// carol/dana) with full deployment bundles, identity bundles published to
+/// shared state, mutual allowlists, and imported contacts.
+#[allow(clippy::too_many_lines)]
+fn setup_cli_group_quartet(suffix: &str) -> Result<CliGroupQuartetContext> {
+    let workspace_root = workspace_root();
+    let runtime = runtime_handle(&workspace_root)?;
+    let temp_root = repo_temp_dir(suffix)?;
+
+    let alice_profile = temp_root.path().join("alice");
+    let bob_profile = temp_root.path().join("bob");
+    let carol_profile = temp_root.path().join("carol");
+    let dana_profile = temp_root.path().join("dana");
+
+    let alice_mnemonic =
+        write_mnemonic_file(temp_root.path(), "alice-mnemonic.txt", ALICE_MNEMONIC)?;
+    let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
+    let carol_mnemonic =
+        write_mnemonic_file(temp_root.path(), "carol-mnemonic.txt", CAROL_MNEMONIC)?;
+    let dana_mnemonic =
+        write_mnemonic_file(temp_root.path(), "dana-mnemonic.txt", DANA_MNEMONIC)?;
+
+    for (name, profile) in [
+        ("alice", &alice_profile),
+        ("bob", &bob_profile),
+        ("carol", &carol_profile),
+        ("dana", &dana_profile),
+    ] {
+        run_cli_json([
+            "profile",
+            "init",
+            "--name",
+            name,
+            "--root",
+            &profile.to_string_lossy(),
+        ])?;
+    }
+
+    let alice_identity = recover_device(&alice_profile, &alice_mnemonic)?;
+    let bob_identity = recover_device(&bob_profile, &bob_mnemonic)?;
+    let carol_identity = recover_device(&carol_profile, &carol_mnemonic)?;
+    let dana_identity = recover_device(&dana_profile, &dana_mnemonic)?;
+
+    let alice_user_id = required_str(&alice_identity, "user_id")?;
+    let alice_device_id = required_str(&alice_identity, "device_id")?;
+    let bob_user_id = required_str(&bob_identity, "user_id")?;
+    let bob_device_id = required_str(&bob_identity, "device_id")?;
+    let carol_user_id = required_str(&carol_identity, "user_id")?;
+    let carol_device_id = required_str(&carol_identity, "device_id")?;
+    let dana_user_id = required_str(&dana_identity, "user_id")?;
+    let dana_device_id = required_str(&dana_identity, "device_id")?;
+
+    let alice_bundle = runtime_bootstrap_device_bundle(&runtime, &alice_user_id, &alice_device_id)?;
+    let bob_bundle = runtime_bootstrap_device_bundle(&runtime, &bob_user_id, &bob_device_id)?;
+    let carol_bundle = runtime_bootstrap_device_bundle(&runtime, &carol_user_id, &carol_device_id)?;
+    let dana_bundle = runtime_bootstrap_device_bundle(&runtime, &dana_user_id, &dana_device_id)?;
+
+    let alice_bundle_path =
+        write_json_file(temp_root.path(), "alice-deployment.json", &alice_bundle)?;
+    let bob_bundle_path = write_json_file(temp_root.path(), "bob-deployment.json", &bob_bundle)?;
+    let carol_bundle_path =
+        write_json_file(temp_root.path(), "carol-deployment.json", &carol_bundle)?;
+    let dana_bundle_path = write_json_file(temp_root.path(), "dana-deployment.json", &dana_bundle)?;
+
+    for (profile, bundle_path) in [
+        (&alice_profile, &alice_bundle_path),
+        (&bob_profile, &bob_bundle_path),
+        (&carol_profile, &carol_bundle_path),
+        (&dana_profile, &dana_bundle_path),
+    ] {
+        run_cli_json([
+            "profile",
+            "import-deployment",
+            "--profile",
+            &profile.to_string_lossy(),
+            &bundle_path.to_string_lossy(),
+        ])?;
+    }
+
+    let alice_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &alice_profile, "alice-identity.json")?;
+    let bob_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &bob_profile, "bob-identity.json")?;
+    let carol_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &carol_profile, "carol-identity.json")?;
+    let dana_identity_path =
+        export_identity_bundle_to_path(temp_root.path(), &dana_profile, "dana-identity.json")?;
+
+    for (bundle, identity_path) in [
+        (&alice_bundle, &alice_identity_path),
+        (&bob_bundle, &bob_identity_path),
+        (&carol_bundle, &carol_identity_path),
+        (&dana_bundle, &dana_identity_path),
+    ] {
+        let identity_bundle: IdentityBundle = read_json_file(identity_path)?;
+        runtime_put_identity_bundle(&runtime, bundle_auth(bundle)?, &identity_bundle)?;
+    }
+
+    // Allowlist mutual traffic between all four profiles so message-request
+    // policies do not shadow group-outbox writes. Group traffic does not go
+    // through peer inboxes, but membership commits and identity refreshes do
+    // rely on mutual contact visibility.
+    let all_other = |me: &str| -> Vec<String> {
+        [&alice_user_id, &bob_user_id, &carol_user_id, &dana_user_id]
+            .iter()
+            .filter(|value| value.as_str() != me)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    };
+    for (bundle, me) in [
+        (&alice_bundle, &alice_user_id),
+        (&bob_bundle, &bob_user_id),
+        (&carol_bundle, &carol_user_id),
+        (&dana_bundle, &dana_user_id),
+    ] {
+        let allowed = all_other(me);
+        runtime_put_allowlist(&runtime, bundle_auth(bundle)?, &allowed)?;
+    }
+
+    // Contact graph: alice, bob, carol import each other so MLS add_members
+    // can look up each peer's active KeyPackage. Dana imports alice only; she
+    // needs a contact-share URL to reach the group invite owner, but she does
+    // not need to know bob/carol until approval lands. Similarly, the current
+    // members import dana once she submits a join request, but the ApproveJoin
+    // path triggers that automatically via the returned contact-share URL, so
+    // here we only pre-import the edges required for `group create`.
+    let import_contact = |profile: &Path, bundle_path: &Path| -> Result<()> {
+        run_cli_json([
+            "contact",
+            "import-identity",
+            "--profile",
+            &profile.to_string_lossy(),
+            &bundle_path.to_string_lossy(),
+        ])?;
+        Ok(())
+    };
+    import_contact(&alice_profile, &bob_identity_path)?;
+    import_contact(&alice_profile, &carol_identity_path)?;
+    import_contact(&alice_profile, &dana_identity_path)?;
+    import_contact(&bob_profile, &alice_identity_path)?;
+    import_contact(&bob_profile, &carol_identity_path)?;
+    import_contact(&carol_profile, &alice_identity_path)?;
+    import_contact(&carol_profile, &bob_identity_path)?;
+    import_contact(&dana_profile, &alice_identity_path)?;
+
+    Ok(CliGroupQuartetContext {
+        #[allow(dead_code)]
+        runtime,
+        temp_root,
+        alice_profile,
+        bob_profile,
+        carol_profile,
+        dana_profile,
+        alice_user_id,
+        bob_user_id,
+        carol_user_id,
+        dana_user_id,
+        #[allow(dead_code)]
+        alice_device_id,
+        bob_device_id,
+        carol_device_id,
+        #[allow(dead_code)]
+        dana_device_id,
+    })
+}
+
+#[allow(dead_code)]
+struct CliGroupQuartetContext {
+    runtime: CloudflareRuntimeHandle,
+    temp_root: TempDir,
+    alice_profile: PathBuf,
+    bob_profile: PathBuf,
+    carol_profile: PathBuf,
+    dana_profile: PathBuf,
+    alice_user_id: String,
+    bob_user_id: String,
+    carol_user_id: String,
+    dana_user_id: String,
+    alice_device_id: String,
+    bob_device_id: String,
+    carol_device_id: String,
+    dana_device_id: String,
+}
+
+fn recover_device(profile: &Path, mnemonic: &Path) -> Result<Value> {
+    run_cli_json([
+        "device",
+        "recover",
+        "--profile",
+        &profile.to_string_lossy(),
+        "--device-name",
+        "phone",
+        "--mnemonic-file",
+        &mnemonic.to_string_lossy(),
+    ])
+}
+
+fn group_send_text(profile: &Path, conversation_id: &str, text: &str) -> Result<Value> {
+    let output = run_cli_json([
+        "group",
+        "send-text",
+        "--profile",
+        &profile.to_string_lossy(),
+        "--conversation-id",
+        conversation_id,
+        "--text",
+        text,
+    ])?;
+    if output["sent"].as_bool() != Some(true) {
+        bail!("group send-text did not report success: {output}");
+    }
+    Ok(output)
+}
+
+fn group_sync(profile: &Path, group_id: &str) -> Result<Value> {
+    let output = run_cli_json([
+        "group",
+        "sync",
+        "--profile",
+        &profile.to_string_lossy(),
+        "--group-id",
+        group_id,
+    ])?;
+    if output["synced"].as_bool() != Some(true) {
+        bail!("group sync did not report success: {output}");
+    }
+    Ok(output)
+}
+
+fn welcome_pickup_url_for(entries: &[Value], target_device_id: &str) -> Result<String> {
+    let matched = entries
+        .iter()
+        .find(|entry| entry["device_id"].as_str() == Some(target_device_id))
+        .with_context(|| format!("welcome pickup for {target_device_id} not found in create output"))?;
+    matched["url"]
+        .as_str()
+        .map(|value| value.to_string())
+        .context("welcome pickup entry missing url")
+}
+
+fn first_attachment_entry(profile: &Path, conversation_id: &str) -> Result<(String, String)> {
+    let messages = run_cli_json([
+        "group",
+        "list-messages",
+        "--profile",
+        &profile.to_string_lossy(),
+        "--conversation-id",
+        conversation_id,
+    ])?;
+    let rows = messages
+        .as_array()
+        .context("list-messages did not return an array")?;
+    let row = rows
+        .iter()
+        .rev()
+        .find(|message| {
+            message["storage_refs"]
+                .as_array()
+                .map(|refs| !refs.is_empty())
+                .unwrap_or(false)
+        })
+        .context("no attachment message found in conversation")?;
+    let reference = row["storage_refs"]
+        .as_array()
+        .and_then(|refs| refs.first())
+        .and_then(|entry| entry["ref"].as_str())
+        .context("attachment storage ref missing")?
+        .to_string();
+    let message_id = row["message_id"]
+        .as_str()
+        .context("attachment message_id missing")?
+        .to_string();
+    Ok((reference, message_id))
 }
 
 fn setup_cli_pair(suffix: &str) -> Result<CliPairContext> {

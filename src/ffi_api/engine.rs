@@ -36,7 +36,8 @@ use crate::transport_contract::{
     DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest,
     FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
     FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult,
-    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetHeadResult, GroupJoinDecision,
+    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest,
+    GetGroupOutboxHeadRequest, GetHeadResult, GroupJoinDecision,
     ListGroupJoinRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
     MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
     PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
@@ -609,6 +610,10 @@ impl CoreEngine {
             CoreCommand::ListGroupJoinRequests { group_id } => {
                 self.list_group_join_requests(group_id)
             }
+            CoreCommand::GetGroupJoinRequestStatus {
+                group_id,
+                request_id,
+            } => self.get_group_join_request_status(group_id, request_id),
             CoreCommand::ApproveGroupJoin {
                 group_id,
                 request_id,
@@ -882,6 +887,14 @@ impl CoreEngine {
                 }],
                 view_model: None,
             }),
+            CoreEvent::GroupOutboxHeadFetched { group_id, head_seq } => {
+                self.handle_group_outbox_head_fetched(group_id, head_seq)
+            }
+            CoreEvent::GroupOutboxHeadFetchFailed {
+                group_id: _,
+                retryable: _,
+                detail: _,
+            } => Ok(CoreOutput::default()),
             CoreEvent::GroupEnvelopeAppended {
                 group_id,
                 message_id,
@@ -1961,6 +1974,14 @@ impl CoreEngine {
             });
         }
 
+        let pickup_descriptors: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.descriptor.clone()),
+                _ => None,
+            })
+            .collect();
+
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
@@ -1975,6 +1996,7 @@ impl CoreEngine {
                     message_id: commit_envelope.message_id,
                     message_type: MessageType::MlsCommit,
                 }],
+                welcome_pickups: pickup_descriptors,
                 ..CoreViewModel::default()
             }),
         })
@@ -2269,6 +2291,52 @@ impl CoreEngine {
         })
     }
 
+    fn get_group_join_request_status(
+        &mut self,
+        group_id: String,
+        request_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let stored = self
+            .state
+            .group_join_requests
+            .get(&request_id)
+            .cloned()
+            .ok_or_else(|| {
+                CoreError::invalid_input("group join request does not exist locally")
+            })?;
+        if stored.group_id != group_id {
+            return Err(CoreError::invalid_input(
+                "group join request id does not belong to this group",
+            ));
+        }
+        let base = self.deployment_http_base()?;
+        let endpoint = format!(
+            "{}/v1/groups/{}/join-requests/{}",
+            base.trim_end_matches('/'),
+            stored.request.group_id,
+            stored.request.request_id,
+        );
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::GetGroupJoinRequestStatus {
+                get: GetGroupJoinRequestStatusRequest {
+                    group_id: stored.group_id.clone(),
+                    request_id: stored.request_id.clone(),
+                    request_capability: stored.request.request_capability.clone(),
+                    endpoint,
+                    headers: BTreeMap::new(),
+                },
+            }],
+            view_model: Some(CoreViewModel {
+                group_join_requests: vec![stored.request.clone()],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
     fn approve_group_join(
         &mut self,
         group_id: String,
@@ -2414,6 +2482,13 @@ impl CoreEngine {
                 },
             });
         }
+        let pickup_descriptors: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.descriptor.clone()),
+                _ => None,
+            })
+            .collect();
         let start_cursor = GroupCursor {
             group_id: group_id.clone(),
             last_fetched_seq: 0,
@@ -2453,6 +2528,7 @@ impl CoreEngine {
                         message_type: MessageType::ControlDeviceMembershipChanged,
                     },
                 ],
+                welcome_pickups: pickup_descriptors,
                 ..CoreViewModel::default()
             }),
         })
@@ -2646,6 +2722,13 @@ impl CoreEngine {
                 },
             });
         }
+        let pickup_descriptors: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.descriptor.clone()),
+                _ => None,
+            })
+            .collect();
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
@@ -2666,6 +2749,7 @@ impl CoreEngine {
                         message_type: MessageType::ControlDeviceMembershipChanged,
                     },
                 ],
+                welcome_pickups: pickup_descriptors,
                 ..CoreViewModel::default()
             }),
         })
@@ -7723,6 +7807,41 @@ impl CoreEngine {
         }
     }
 
+    fn handle_group_outbox_head_fetched(
+        &mut self,
+        group_id: String,
+        head_seq: u64,
+    ) -> CoreResult<CoreOutput> {
+        // This event is emitted after a successful welcome pickup so that the
+        // fresh joiner skips every outbox record produced before she was
+        // added: those records belong to MLS epochs she cannot decrypt and
+        // would otherwise trip the sync engine into a false recovery loop.
+        // The head is advisory -- only advance the cursor, never roll it
+        // back, so concurrent fetches that already progressed past `head`
+        // keep their progress.
+        let Some(cursor) = self.state.group_cursors.get_mut(&group_id) else {
+            return Ok(CoreOutput::default());
+        };
+        if head_seq <= cursor.last_fetched_seq {
+            return Ok(CoreOutput::default());
+        }
+        cursor.last_fetched_seq = head_seq;
+        cursor.updated_at = current_unix_millis(self.state.message_nonce);
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveGroupCursor {
+                    group_id: group_id.clone(),
+                }],
+            )],
+            view_model: None,
+        })
+    }
+
     fn handle_group_outbox_records(
         &mut self,
         group_id: String,
@@ -8169,28 +8288,46 @@ impl CoreEngine {
         self.state
             .mls_summaries
             .insert(group_state.conversation_id.clone(), summary);
+        // The welcome established a cryptographically valid group state at
+        // the MLS epoch where the approver added this device. Any outbox
+        // records that predate that epoch cannot be decrypted by us and
+        // would otherwise trip MLS's `process_message` into returning
+        // `PendingRetry`, which would incorrectly flip our recovery status
+        // to `NeedsRecovery`. We proactively advance the group cursor to
+        // the current server head so future syncs only consider records
+        // emitted after we joined; the head lookup is issued as an effect
+        // so the driver can perform the real HTTP call.
+        let head_request = CoreEffect::GetGroupOutboxHead {
+            get: GetGroupOutboxHeadRequest {
+                group_id: group_state.group_id.clone(),
+                capability: self.group_capability_for_state(&group_state)?,
+            },
+        };
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![
-                    PersistOp::SaveConversation {
-                        conversation_id: group_state.conversation_id.clone(),
-                    },
-                    PersistOp::SaveMlsState {
-                        conversation_id: group_state.conversation_id.clone(),
-                    },
-                    PersistOp::SaveGroupState {
-                        group_id: group_state.group_id.clone(),
-                    },
-                    PersistOp::SaveGroupCursor {
-                        group_id: group_state.group_id.clone(),
-                    },
-                ],
-            )],
+            effects: vec![
+                persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveConversation {
+                            conversation_id: group_state.conversation_id.clone(),
+                        },
+                        PersistOp::SaveMlsState {
+                            conversation_id: group_state.conversation_id.clone(),
+                        },
+                        PersistOp::SaveGroupState {
+                            group_id: group_state.group_id.clone(),
+                        },
+                        PersistOp::SaveGroupCursor {
+                            group_id: group_state.group_id.clone(),
+                        },
+                    ],
+                ),
+                head_request,
+            ],
             view_model: Some(CoreViewModel {
                 conversations: vec![self.conversation_summary(&group_state.conversation_id)?],
                 ..CoreViewModel::default()

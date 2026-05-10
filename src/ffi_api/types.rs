@@ -115,6 +115,10 @@ pub enum CoreCommand {
     ListGroupJoinRequests {
         group_id: String,
     },
+    GetGroupJoinRequestStatus {
+        group_id: String,
+        request_id: String,
+    },
     RequestJoinGroup {
         invite_url: String,
     },
@@ -308,6 +312,15 @@ pub enum CoreEvent {
         to_seq: u64,
     },
     GroupOutboxFetchFailed {
+        group_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    },
+    GroupOutboxHeadFetched {
+        group_id: String,
+        head_seq: u64,
+    },
+    GroupOutboxHeadFetchFailed {
         group_id: String,
         retryable: bool,
         detail: Option<String>,
@@ -691,6 +704,15 @@ pub struct CoreViewModel {
     pub group_invites: Vec<PersistedGroupInvite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_join_requests: Vec<GroupJoinRequest>,
+    /// Welcome pickup descriptors produced by the most recent command.
+    ///
+    /// Populated when the owner/admin creates a group or approves a join
+    /// request; the invitee(s) need these descriptors out-of-band to fetch
+    /// the MLS welcome from the server. The descriptors are intentionally
+    /// scoped to a single `(group_id, device_id)` pair and capabilities are
+    /// short-lived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub welcome_pickups: Vec<crate::model::WelcomePickupDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

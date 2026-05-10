@@ -1878,11 +1878,13 @@ async fn setup_pair_with_runtime_options(options: CloudflareRuntimeOptions) -> R
         .run_command_until_idle(CoreCommand::CreateOrLoadIdentity {
             mnemonic: Some(ALICE_MNEMONIC.into()),
             device_name: Some("phone".into()),
+            display_name: None,
         })
         .await?;
     bob.run_command_until_idle(CoreCommand::CreateOrLoadIdentity {
         mnemonic: Some(BOB_MNEMONIC.into()),
         device_name: Some("phone".into()),
+        display_name: None,
     })
     .await?;
 
@@ -2143,6 +2145,7 @@ async fn publish_bob_bundle(
             .context("bob laptop local identity")?,
         &concrete_deployment_bundle(&ctx.bob_laptop_bundle, &ctx.bob_user_id),
         vec![phone_profile, laptop_profile],
+        None,
     )?;
     ctx.runtime
         .put_identity_bundle(&ctx.bob_laptop_auth, &merged)
@@ -2184,6 +2187,7 @@ fn publish_identity_bundle_with_devices(
         local_identity,
         deployment,
         devices,
+        None,
     )?)
 }
 

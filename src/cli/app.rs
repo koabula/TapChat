@@ -18,9 +18,11 @@ use super::args::{
     Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
     CloudflareRuntimeSubcommand, Command, ContactAllowlistCommand, ContactAllowlistSubcommand,
     ContactCommand, ContactRequestsCommand, ContactRequestsSubcommand, ContactSubcommand,
-    ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand, MessageCommand,
-    MessageSubcommand, OutputFormat, ProfileCommand, ProfileSubcommand, RuntimeCommand,
-    RuntimeSubcommand, SyncCommand, SyncSubcommand,
+    ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand, GroupCommand,
+    GroupInviteCommand, GroupInviteSubcommand, GroupJoinCommand, GroupJoinSubcommand,
+    GroupMemberCommand, GroupMemberSubcommand, GroupSubcommand, MessageCommand, MessageSubcommand,
+    OutputFormat, ProfileCommand, ProfileSubcommand, RuntimeCommand, RuntimeSubcommand,
+    SyncCommand, SyncSubcommand,
 };
 use super::driver::CoreDriver;
 use super::profile::{Profile, ProfileRegistry, RuntimeMetadata};
@@ -52,6 +54,7 @@ impl CliApp {
             Command::Contact(command) => self.run_contact(command).await,
             Command::Conversation(command) => self.run_conversation(command).await,
             Command::Message(command) => self.run_message(command).await,
+            Command::Group(command) => self.run_group(command).await,
             Command::Sync(command) => self.run_sync(command).await,
             Command::Runtime(command) => self.run_runtime(command).await,
         }
@@ -576,6 +579,684 @@ impl CliApp {
         }
     }
 
+    async fn run_group(&self, command: GroupCommand) -> Result<()> {
+        match command.command {
+            GroupSubcommand::Create {
+                profile,
+                title,
+                members,
+            } => {
+                if title.trim().is_empty() {
+                    bail!("group title must not be empty");
+                }
+                let member_user_ids: Vec<String> = members
+                    .into_iter()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .collect();
+                if member_user_ids.is_empty() {
+                    bail!(
+                        "at least one member user id is required (pass --members as a comma separated list)"
+                    );
+                }
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::CreateGroupConversation {
+                        title: title.clone(),
+                        member_user_ids: member_user_ids.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let view = output
+                    .view_model
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("core did not return a view model for group create"))?;
+                let summary = view
+                    .conversations
+                    .first()
+                    .ok_or_else(|| anyhow!("core did not return a group summary"))?;
+                let group_id = summary
+                    .group_id
+                    .clone()
+                    .ok_or_else(|| anyhow!("core created a conversation without a group id"))?;
+                let welcome_pickups: Vec<_> = view
+                    .welcome_pickups
+                    .iter()
+                    .map(|descriptor| {
+                        serde_json::json!({
+                            "group_id": descriptor.group_id,
+                            "device_id": descriptor.device_id,
+                            "endpoint": descriptor.endpoint,
+                            "expires_at": descriptor.expires_at,
+                            "url": welcome_pickup_url(descriptor),
+                        })
+                    })
+                    .collect();
+                self.print_value(&serde_json::json!({
+                    "created": true,
+                    "group_id": group_id,
+                    "conversation_id": summary.conversation_id,
+                    "title": summary.title,
+                    "member_count": summary.member_count,
+                    "group_role": summary.group_role,
+                    "invited_user_ids": member_user_ids,
+                    "welcome_pickups": welcome_pickups,
+                    "pending_outbox": driver.pending_outbox_count(),
+                }))
+            }
+            GroupSubcommand::List { profile } => {
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
+                let driver = load_driver(&profile)?;
+                let snapshot = profile.load_snapshot()?;
+                let cursors: std::collections::BTreeMap<String, _> = snapshot
+                    .group_cursors
+                    .into_iter()
+                    .map(|persisted| (persisted.group_id.clone(), persisted.cursor))
+                    .collect();
+                let rows: Vec<_> = snapshot
+                    .group_states
+                    .into_iter()
+                    .map(|state| {
+                        let conversation = driver.conversation_state(&state.conversation_id);
+                        let mls_status = driver.mls_status(&state.conversation_id);
+                        serde_json::json!({
+                            "group_id": state.group_id,
+                            "conversation_id": state.conversation_id,
+                            "title": state.manifest.title,
+                            "local_role": state.local_role,
+                            "owner_user_id": state.manifest.owner_user_id,
+                            "member_count": state.manifest.members.len(),
+                            "roster_version": state.manifest.roster_version,
+                            "conversation_state":
+                                conversation.map(|state| state.conversation.state),
+                            "recovery_status":
+                                conversation.map(|state| state.recovery_status),
+                            "mls_status": mls_status,
+                            "cursor": cursors.get(&state.group_id),
+                        })
+                    })
+                    .collect();
+                self.print_value(&rows)
+            }
+            GroupSubcommand::Show { profile, group_id } => {
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
+                let driver = load_driver(&profile)?;
+                let snapshot = profile.load_snapshot()?;
+                let group = snapshot
+                    .group_states
+                    .iter()
+                    .find(|state| state.group_id == group_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("group does not exist"))?;
+                let cursor = snapshot
+                    .group_cursors
+                    .iter()
+                    .find(|persisted| persisted.group_id == group_id)
+                    .map(|persisted| persisted.cursor.clone());
+                let invites: Vec<_> = snapshot
+                    .group_invites
+                    .iter()
+                    .filter(|invite| invite.group_id == group_id)
+                    .cloned()
+                    .collect();
+                let join_requests: Vec<_> = snapshot
+                    .group_join_requests
+                    .iter()
+                    .filter(|request| request.group_id == group_id)
+                    .cloned()
+                    .collect();
+                let conversation_state =
+                    driver.conversation_state(&group.conversation_id);
+                let members = driver.conversation_members(&group.conversation_id);
+                self.print_value(&serde_json::json!({
+                    "group_id": group.group_id,
+                    "conversation_id": group.conversation_id,
+                    "manifest": group.manifest,
+                    "local_role": group.local_role,
+                    "welcome_pickup": group.welcome_pickup,
+                    "cursor": cursor,
+                    "conversation_state":
+                        conversation_state.map(|state| state.conversation.state),
+                    "recovery_status":
+                        conversation_state.map(|state| state.recovery_status),
+                    "recovery":
+                        driver.recovery_context_snapshot(&group.conversation_id),
+                    "mls_status": driver.mls_status(&group.conversation_id),
+                    "message_count": conversation_state
+                        .map(|state| state.messages.len()),
+                    "members": members,
+                    "invites": invites,
+                    "join_requests": join_requests,
+                }))
+            }
+            GroupSubcommand::SendText {
+                profile,
+                conversation_id,
+                text,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let notification_offset = driver.notifications().len();
+                let output = driver
+                    .run_command_until_idle(CoreCommand::SendGroupTextMessage {
+                        conversation_id: conversation_id.clone(),
+                        plaintext: text,
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "sent": true,
+                    "conversation_id": conversation_id,
+                    "message_id": output
+                        .view_model
+                        .as_ref()
+                        .and_then(|view| view.messages.first())
+                        .map(|msg| msg.message_id.clone()),
+                    "pending_group_outbox": driver
+                        .latest_snapshot()
+                        .map(|snapshot| snapshot.pending_group_outbox.len())
+                        .unwrap_or_default(),
+                    "latest_notification":
+                        latest_notification_since(&driver, notification_offset),
+                }))
+            }
+            GroupSubcommand::SendAttachment {
+                profile,
+                conversation_id,
+                file,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let descriptor = attachment_descriptor(&file)?;
+                let notification_offset = driver.notifications().len();
+                let output = driver
+                    .run_command_until_idle(CoreCommand::SendAttachmentMessage {
+                        conversation_id: conversation_id.clone(),
+                        attachment_descriptor: descriptor,
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "queued": true,
+                    "conversation_id": conversation_id,
+                    "file": file,
+                    "message_id": output
+                        .view_model
+                        .as_ref()
+                        .and_then(|view| view.messages.first())
+                        .map(|msg| msg.message_id.clone()),
+                    "pending_group_outbox": driver
+                        .latest_snapshot()
+                        .map(|snapshot| snapshot.pending_group_outbox.len())
+                        .unwrap_or_default(),
+                    "pending_blob_uploads": driver.pending_blob_upload_count(),
+                    "latest_notification":
+                        latest_notification_since(&driver, notification_offset),
+                }))
+            }
+            GroupSubcommand::DownloadAttachment {
+                profile,
+                conversation_id,
+                message_id,
+                reference,
+                out,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let destination = out.unwrap_or_else(|| {
+                    profile
+                        .metadata()
+                        .inbox_attachments_dir
+                        .join(format!("{message_id}.bin"))
+                });
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::DownloadAttachment {
+                        conversation_id: conversation_id.clone(),
+                        message_id: message_id.clone(),
+                        reference,
+                        destination: destination.to_string_lossy().to_string(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "downloaded": true,
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "destination": destination,
+                }))
+            }
+            GroupSubcommand::ListMessages {
+                profile,
+                conversation_id,
+            } => {
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
+                let driver = load_driver(&profile)?;
+                let state = driver
+                    .conversation_state(&conversation_id)
+                    .ok_or_else(|| anyhow!("conversation not found"))?;
+                self.print_value(&state.messages)
+            }
+            GroupSubcommand::Sync { profile, group_id } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let notification_offset = driver.notifications().len();
+                driver
+                    .run_command_until_idle(CoreCommand::SyncGroupOutbox {
+                        group_id: group_id.clone(),
+                        reason: Some("cli-group-sync".into()),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let snapshot = profile.load_snapshot()?;
+                let cursor = snapshot
+                    .group_cursors
+                    .into_iter()
+                    .find(|persisted| persisted.group_id == group_id)
+                    .map(|persisted| persisted.cursor);
+                self.print_value(&serde_json::json!({
+                    "synced": true,
+                    "group_id": group_id,
+                    "cursor": cursor,
+                    "latest_notification":
+                        latest_notification_since(&driver, notification_offset),
+                }))
+            }
+            GroupSubcommand::Leave { profile, group_id } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::LeaveGroup {
+                        group_id: group_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "left": true,
+                    "group_id": group_id,
+                }))
+            }
+            GroupSubcommand::TransferOwnership {
+                profile,
+                group_id,
+                new_owner_user_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::TransferGroupOwnership {
+                        group_id: group_id.clone(),
+                        new_owner_user_id: new_owner_user_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "transferred": true,
+                    "group_id": group_id,
+                    "new_owner_user_id": new_owner_user_id,
+                }))
+            }
+            GroupSubcommand::SetAdmin {
+                profile,
+                group_id,
+                user_id,
+                admin,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::SetGroupAdmin {
+                        group_id: group_id.clone(),
+                        target_user_id: user_id.clone(),
+                        is_admin: admin,
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "updated": true,
+                    "group_id": group_id,
+                    "user_id": user_id,
+                    "is_admin": admin,
+                }))
+            }
+            GroupSubcommand::UpdateMetadata {
+                profile,
+                group_id,
+                title,
+                join_policy,
+                member_invite_policy,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let parsed_join_policy = join_policy
+                    .as_deref()
+                    .map(parse_group_join_policy)
+                    .transpose()?;
+                let parsed_member_invite_policy = member_invite_policy
+                    .as_deref()
+                    .map(parse_group_member_invite_policy)
+                    .transpose()?;
+                driver
+                    .run_command_until_idle(CoreCommand::UpdateGroupMetadata {
+                        group_id: group_id.clone(),
+                        title: title.clone(),
+                        join_policy: parsed_join_policy,
+                        member_invite_policy: parsed_member_invite_policy,
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let snapshot = profile.load_snapshot()?;
+                let manifest = snapshot
+                    .group_states
+                    .iter()
+                    .find(|state| state.group_id == group_id)
+                    .map(|state| state.manifest.clone());
+                self.print_value(&serde_json::json!({
+                    "updated": true,
+                    "group_id": group_id,
+                    "title": manifest.as_ref().map(|m| m.title.clone()),
+                    "join_policy": manifest.as_ref().map(|m| m.join_policy),
+                    "member_invite_policy":
+                        manifest.as_ref().map(|m| m.member_invite_policy),
+                    "roster_version": manifest.as_ref().map(|m| m.roster_version),
+                }))
+            }
+            GroupSubcommand::Invite(command) => self.run_group_invite(command).await,
+            GroupSubcommand::Join(command) => self.run_group_join(command).await,
+            GroupSubcommand::Member(command) => self.run_group_member(command).await,
+        }
+    }
+
+    async fn run_group_invite(&self, command: GroupInviteCommand) -> Result<()> {
+        match command.command {
+            GroupInviteSubcommand::Create {
+                profile,
+                group_id,
+                expires_in_secs,
+                max_uses,
+            } => {
+                if expires_in_secs == 0 {
+                    bail!("expires_in_secs must be greater than zero");
+                }
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .context("compute current time for invite expiry")?;
+                let expires_at = now_ms
+                    .checked_add(expires_in_secs.saturating_mul(1_000))
+                    .ok_or_else(|| anyhow!("invite expiry overflow"))?;
+                let notification_offset = driver.notifications().len();
+                driver
+                    .run_command_until_idle(CoreCommand::CreateGroupInviteLink {
+                        group_id: group_id.clone(),
+                        expires_at,
+                        max_uses,
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let snapshot = profile.load_snapshot()?;
+                let invite = snapshot
+                    .group_invites
+                    .into_iter()
+                    .filter(|invite| invite.group_id == group_id)
+                    .max_by_key(|invite| invite.document.created_at)
+                    .ok_or_else(|| {
+                        let notification = latest_notification_since(&driver, notification_offset)
+                            .unwrap_or_else(|| "(no notification)".into());
+                        anyhow!(
+                            "group invite was not persisted (transport may have failed): {notification}"
+                        )
+                    })?;
+                self.print_value(&serde_json::json!({
+                    "created": true,
+                    "group_id": group_id,
+                    "invite_id": invite.invite_id,
+                    "invite_url": invite.invite_url,
+                    "expires_at": invite.document.expires_at,
+                    "max_uses": invite.document.max_uses,
+                    "join_policy": invite.document.join_policy,
+                }))
+            }
+            GroupInviteSubcommand::Revoke {
+                profile,
+                group_id,
+                invite_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::RevokeGroupInviteLink {
+                        group_id: group_id.clone(),
+                        invite_id: invite_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "revoked": true,
+                    "group_id": group_id,
+                    "invite_id": invite_id,
+                }))
+            }
+            GroupInviteSubcommand::List { profile, group_id } => {
+                let profile = Profile::open(resolve_profile_path(profile)?)?;
+                let snapshot = profile.load_snapshot()?;
+                let rows: Vec<_> = snapshot
+                    .group_invites
+                    .into_iter()
+                    .filter(|invite| invite.group_id == group_id)
+                    .map(|invite| {
+                        serde_json::json!({
+                            "invite_id": invite.invite_id,
+                            "invite_url": invite.invite_url,
+                            "expires_at": invite.document.expires_at,
+                            "max_uses": invite.document.max_uses,
+                            "join_policy": invite.document.join_policy,
+                            "created_at": invite.document.created_at,
+                        })
+                    })
+                    .collect();
+                self.print_value(&rows)
+            }
+        }
+    }
+
+    async fn run_group_join(&self, command: GroupJoinCommand) -> Result<()> {
+        match command.command {
+            GroupJoinSubcommand::Submit {
+                profile,
+                invite_url,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let notification_offset = driver.notifications().len();
+                let output = driver
+                    .run_command_until_idle(CoreCommand::FetchGroupInvite {
+                        invite_url: invite_url.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let request = output
+                    .view_model
+                    .as_ref()
+                    .and_then(|view| view.group_join_requests.first())
+                    .cloned();
+                let request_id = request
+                    .as_ref()
+                    .map(|value| value.request_id.clone())
+                    .or_else(|| {
+                        driver
+                            .latest_snapshot()
+                            .and_then(|snapshot| {
+                                snapshot
+                                    .group_join_requests
+                                    .iter()
+                                    .max_by_key(|persisted| persisted.request.requested_at)
+                                    .map(|persisted| persisted.request_id.clone())
+                            })
+                    });
+                self.print_value(&serde_json::json!({
+                    "submitted": true,
+                    "invite_url": invite_url,
+                    "request_id": request_id,
+                    "group_id": request.as_ref().map(|r| r.group_id.clone()),
+                    "status": request.as_ref().map(|r| r.status),
+                    "latest_notification":
+                        latest_notification_since(&driver, notification_offset),
+                }))
+            }
+            GroupJoinSubcommand::ByPickup { profile, pickup } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let notification_offset = driver.notifications().len();
+                driver
+                    .run_command_until_idle(CoreCommand::RequestJoinGroup {
+                        invite_url: pickup.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let snapshot = profile.load_snapshot()?;
+                let latest_group = snapshot
+                    .group_states
+                    .into_iter()
+                    .max_by_key(|state| state.manifest.updated_at);
+                self.print_value(&serde_json::json!({
+                    "joined": latest_group.is_some(),
+                    "group_id":
+                        latest_group.as_ref().map(|state| state.group_id.clone()),
+                    "conversation_id":
+                        latest_group.as_ref().map(|state| state.conversation_id.clone()),
+                    "title":
+                        latest_group.as_ref().map(|state| state.manifest.title.clone()),
+                    "local_role":
+                        latest_group.as_ref().and_then(|state| state.local_role),
+                    "latest_notification":
+                        latest_notification_since(&driver, notification_offset),
+                }))
+            }
+            GroupJoinSubcommand::List { profile, group_id } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ListGroupJoinRequests {
+                        group_id: group_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let rows = output
+                    .view_model
+                    .as_ref()
+                    .map(|view| view.group_join_requests.clone())
+                    .unwrap_or_default();
+                self.print_value(&rows)
+            }
+            GroupJoinSubcommand::Approve {
+                profile,
+                group_id,
+                request_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::ApproveGroupJoin {
+                        group_id: group_id.clone(),
+                        request_id: request_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "approved": true,
+                    "group_id": group_id,
+                    "request_id": request_id,
+                }))
+            }
+            GroupJoinSubcommand::Reject {
+                profile,
+                group_id,
+                request_id,
+                reason,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::RejectGroupJoin {
+                        group_id: group_id.clone(),
+                        request_id: request_id.clone(),
+                        reason: reason.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "rejected": true,
+                    "group_id": group_id,
+                    "request_id": request_id,
+                    "reason": reason,
+                }))
+            }
+            GroupJoinSubcommand::Status {
+                profile,
+                group_id,
+                request_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::GetGroupJoinRequestStatus {
+                        group_id: group_id.clone(),
+                        request_id: request_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let snapshot = profile.load_snapshot()?;
+                let persisted = snapshot
+                    .group_join_requests
+                    .iter()
+                    .find(|persisted| persisted.request_id == request_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("group join request not found in snapshot"))?;
+                let imported = snapshot
+                    .group_states
+                    .iter()
+                    .any(|state| state.group_id == persisted.group_id);
+                self.print_value(&serde_json::json!({
+                    "group_id": persisted.group_id,
+                    "request_id": persisted.request_id,
+                    "status": persisted.request.status,
+                    "welcome_pickup": persisted.welcome_pickup,
+                    "manifest": persisted.manifest,
+                    "start_cursor": persisted.start_cursor,
+                    "group_imported": imported,
+                }))
+            }
+        }
+    }
+
+    async fn run_group_member(&self, command: GroupMemberCommand) -> Result<()> {
+        match command.command {
+            GroupMemberSubcommand::Remove {
+                profile,
+                group_id,
+                user_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::RemoveGroupMember {
+                        group_id: group_id.clone(),
+                        target_user_id: user_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "removed": true,
+                    "group_id": group_id,
+                    "user_id": user_id,
+                }))
+            }
+        }
+    }
+
     async fn run_sync(&self, command: SyncCommand) -> Result<()> {
         match command.command {
             SyncSubcommand::Once { profile } => {
@@ -1057,6 +1738,41 @@ fn load_deployment_from_snapshot(snapshot: CorePersistenceSnapshot) -> Result<De
         .deployment
         .map(|deployment| deployment.deployment_bundle)
         .ok_or_else(|| anyhow!("deployment bundle is not configured"))
+}
+
+/// Encode a welcome pickup descriptor as the `tapchat://welcome-pickup/<base64>`
+/// URL the joiner can pass to `group join by-pickup`. The encoding mirrors
+/// `engine.rs::request_join_group`, which accepts either the raw descriptor
+/// JSON or the URL wrapper.
+fn welcome_pickup_url(descriptor: &crate::model::WelcomePickupDescriptor) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let payload = serde_json::to_vec(descriptor).unwrap_or_default();
+    format!("tapchat://welcome-pickup/{}", STANDARD.encode(payload))
+}
+
+fn parse_group_join_policy(value: &str) -> Result<crate::model::GroupJoinPolicy> {
+    match value {
+        "closed" => Ok(crate::model::GroupJoinPolicy::Closed),
+        "approval_required" => Ok(crate::model::GroupJoinPolicy::ApprovalRequired),
+        "open_by_invite" => Ok(crate::model::GroupJoinPolicy::OpenByInvite),
+        other => Err(anyhow!(
+            "unknown join policy {other:?} (expected closed|approval_required|open_by_invite)"
+        )),
+    }
+}
+
+fn parse_group_member_invite_policy(
+    value: &str,
+) -> Result<crate::model::GroupMemberInvitePolicy> {
+    match value {
+        "owner_admin_only" => Ok(crate::model::GroupMemberInvitePolicy::OwnerAdminOnly),
+        "request_owner_approval" => {
+            Ok(crate::model::GroupMemberInvitePolicy::RequestOwnerApproval)
+        }
+        other => Err(anyhow!(
+            "unknown member invite policy {other:?} (expected owner_admin_only|request_owner_approval)"
+        )),
+    }
 }
 
 fn attachment_descriptor(path: &Path) -> Result<AttachmentDescriptor> {

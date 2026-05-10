@@ -284,4 +284,16 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
       sharingSecret: this.envRef.SHARING_TOKEN_SECRET ?? "replace-me"
     });
   }
+
+  // Cloudflare's runtime requires any durable object that calls `setAlarm()`
+  // to expose a matching `alarm()` handler. We currently rely on alarms as a
+  // best-effort cleanup hook for expired invites and old outbox records; the
+  // service itself is responsible for deleting stale entries at read/write
+  // time, so the alarm body is intentionally a no-op for now.
+  async alarm(): Promise<void> {
+    // Intentional no-op. Future cleanup (e.g. invite garbage collection, TTL
+    // enforcement on outbox records) can be wired here once the group outbox
+    // service exposes an explicit cleanup method analogous to
+    // `InboxService.cleanExpiredRecords`.
+  }
 }
