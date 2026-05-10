@@ -101,9 +101,7 @@ pub fn extract_error_code(body: &str) -> Option<String> {
 /// the current wall clock as appropriate.
 pub fn extract_sealed_at(body: &str) -> Option<u64> {
     let value: Value = serde_json::from_str(body).ok()?;
-    value
-        .get("sealed_at")
-        .and_then(|v| v.as_u64())
+    value.get("sealed_at").and_then(|v| v.as_u64())
 }
 
 #[cfg(test)]

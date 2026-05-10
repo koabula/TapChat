@@ -707,8 +707,7 @@ impl CliApp {
                     .filter(|request| request.group_id == group_id)
                     .cloned()
                     .collect();
-                let conversation_state =
-                    driver.conversation_state(&group.conversation_id);
+                let conversation_state = driver.conversation_state(&group.conversation_id);
                 let members = driver.conversation_members(&group.conversation_id);
                 self.print_value(&serde_json::json!({
                     "group_id": group.group_id,
@@ -1027,9 +1026,7 @@ impl CliApp {
             snapshot
                 .conversations
                 .iter()
-                .find(|conversation| {
-                    conversation.conversation_id == state.conversation_id
-                })
+                .find(|conversation| conversation.conversation_id == state.conversation_id)
                 .map(|conv| format!("{:?}", conv.state.conversation.state).to_lowercase())
         });
 
@@ -1160,15 +1157,13 @@ impl CliApp {
                     .as_ref()
                     .map(|value| value.request_id.clone())
                     .or_else(|| {
-                        driver
-                            .latest_snapshot()
-                            .and_then(|snapshot| {
-                                snapshot
-                                    .group_join_requests
-                                    .iter()
-                                    .max_by_key(|persisted| persisted.request.requested_at)
-                                    .map(|persisted| persisted.request_id.clone())
-                            })
+                        driver.latest_snapshot().and_then(|snapshot| {
+                            snapshot
+                                .group_join_requests
+                                .iter()
+                                .max_by_key(|persisted| persisted.request.requested_at)
+                                .map(|persisted| persisted.request_id.clone())
+                        })
                     });
                 self.print_value(&serde_json::json!({
                     "submitted": true,
@@ -1834,9 +1829,7 @@ fn parse_group_join_policy(value: &str) -> Result<crate::model::GroupJoinPolicy>
     }
 }
 
-fn parse_group_member_invite_policy(
-    value: &str,
-) -> Result<crate::model::GroupMemberInvitePolicy> {
+fn parse_group_member_invite_policy(value: &str) -> Result<crate::model::GroupMemberInvitePolicy> {
     match value {
         "owner_admin_only" => Ok(crate::model::GroupMemberInvitePolicy::OwnerAdminOnly),
         "request_owner_approval" => {

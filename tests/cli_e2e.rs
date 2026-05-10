@@ -4803,9 +4803,7 @@ fn cli_group_three_party_invite_remove_e2e_work() -> Result<()> {
         &group_id,
     ])?;
 
-    let pending_rows = pending
-        .as_array()
-        .context("join list not array")?;
+    let pending_rows = pending.as_array().context("join list not array")?;
     assert!(
         pending_rows.iter().any(|row| {
             row["request_id"].as_str() == Some(request_id.as_str())
@@ -4973,11 +4971,7 @@ fn cli_group_three_party_invite_remove_e2e_work() -> Result<()> {
         &conversation_id,
         "post-remove from alice",
     )?;
-    group_send_text(
-        &ctx.dana_profile,
-        &conversation_id,
-        "post-remove from dana",
-    )?;
+    group_send_text(&ctx.dana_profile, &conversation_id, "post-remove from dana")?;
     group_sync(&ctx.alice_profile, &group_id)?;
     group_sync(&ctx.bob_profile, &group_id)?;
     group_sync(&ctx.dana_profile, &group_id)?;
@@ -5100,8 +5094,7 @@ fn setup_cli_group_quartet(suffix: &str) -> Result<CliGroupQuartetContext> {
     let bob_mnemonic = write_mnemonic_file(temp_root.path(), "bob-mnemonic.txt", BOB_MNEMONIC)?;
     let carol_mnemonic =
         write_mnemonic_file(temp_root.path(), "carol-mnemonic.txt", CAROL_MNEMONIC)?;
-    let dana_mnemonic =
-        write_mnemonic_file(temp_root.path(), "dana-mnemonic.txt", DANA_MNEMONIC)?;
+    let dana_mnemonic = write_mnemonic_file(temp_root.path(), "dana-mnemonic.txt", DANA_MNEMONIC)?;
 
     for (name, profile) in [
         ("alice", &alice_profile),
@@ -5314,7 +5307,9 @@ fn welcome_pickup_url_for(entries: &[Value], target_device_id: &str) -> Result<S
     let matched = entries
         .iter()
         .find(|entry| entry["device_id"].as_str() == Some(target_device_id))
-        .with_context(|| format!("welcome pickup for {target_device_id} not found in create output"))?;
+        .with_context(|| {
+            format!("welcome pickup for {target_device_id} not found in create output")
+        })?;
     matched["url"]
         .as_str()
         .map(|value| value.to_string())

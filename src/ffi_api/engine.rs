@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
+use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
@@ -37,14 +37,14 @@ use crate::transport_contract::{
     FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
     FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult,
     FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest,
-    GetGroupOutboxHeadRequest, GetHeadResult, GroupJoinDecision,
-    ListGroupJoinRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
-    MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
-    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
-    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
+    GetGroupOutboxHeadRequest, GetHeadResult, GroupJoinDecision, ListGroupJoinRequestsRequest,
+    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
+    MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::Signer;
 use log;
 use sha2::{Digest, Sha256};
@@ -2316,9 +2316,7 @@ impl CoreEngine {
             .group_join_requests
             .get(&request_id)
             .cloned()
-            .ok_or_else(|| {
-                CoreError::invalid_input("group join request does not exist locally")
-            })?;
+            .ok_or_else(|| CoreError::invalid_input("group join request does not exist locally"))?;
         if stored.group_id != group_id {
             return Err(CoreError::invalid_input(
                 "group join request id does not belong to this group",
@@ -8149,10 +8147,7 @@ impl CoreEngine {
         // the MLS remove_commit and `control_group_dissolved` are already
         // durable on the outbox, preserving the four-step atomic contract
         // (design.md Dissolve-group decision).
-        let ready_to_seal = self
-            .state
-            .pending_group_seal
-            .contains_key(&group_id)
+        let ready_to_seal = self.state.pending_group_seal.contains_key(&group_id)
             && !self
                 .state
                 .pending_group_outbox
@@ -8279,9 +8274,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
         if group_state.dissolved_at.is_some() {
-            return Err(CoreError::invalid_input(
-                "group is already dissolved",
-            ));
+            return Err(CoreError::invalid_input("group is already dissolved"));
         }
         if self.state.pending_group_seal.contains_key(&group_id) {
             return Err(CoreError::invalid_input(
@@ -8500,7 +8493,8 @@ impl CoreEngine {
         sealed_at: u64,
         was_already_sealed: bool,
     ) -> CoreResult<CoreOutput> {
-        let _ = was_already_sealed; // Observability signal only (see design.md).
+        // Observability signal only (see design.md).
+        let _ = was_already_sealed;
         // Drop any lingering pending seal entry — whether or not the seal
         // effect was issued (it may have been a retry pending a
         // `GroupOutboxSealFailed` earlier), the terminal state is now
@@ -8643,9 +8637,8 @@ impl CoreEngine {
             effects: vec![CoreEffect::EmitUserNotification {
                 notification: UserNotificationEffect {
                     status: SystemStatus::TemporaryNetworkFailure,
-                    message: detail.unwrap_or_else(|| {
-                        format!("failed to seal dissolved group {group_id}")
-                    }),
+                    message: detail
+                        .unwrap_or_else(|| format!("failed to seal dissolved group {group_id}")),
                 },
             }],
             view_model: None,

@@ -37,7 +37,9 @@ use crate::transport_contract::{
     SubmitGroupJoinResult,
 };
 
-use super::util::{extract_error_code, extract_sealed_at, to_camel_case_json_string, to_snake_case_json_string};
+use super::util::{
+    extract_error_code, extract_sealed_at, to_camel_case_json_string, to_snake_case_json_string,
+};
 
 pub struct DriverRuntime {
     client: Client,
@@ -1269,10 +1271,7 @@ impl TransportPort for CoreDriver {
     ///   - 403 → `GroupOutboxSealFailed { retryable: false }`
     ///   - 5xx / network → `GroupOutboxSealFailed { retryable: true }`
     ///   - body parse errors → `GroupOutboxSealFailed { retryable: false }`
-    async fn seal_group_outbox(
-        &mut self,
-        seal: SealGroupOutboxRequest,
-    ) -> Result<Vec<CoreEvent>> {
+    async fn seal_group_outbox(&mut self, seal: SealGroupOutboxRequest) -> Result<Vec<CoreEvent>> {
         let base = self
             .engine
             .refresh_snapshot()
@@ -2055,7 +2054,10 @@ mod tests {
                 assert_eq!(*sealed_at, 1_700_000_000_500);
                 assert!(*was_already_sealed);
             }
-            other => panic!("expected GroupOutboxSealed for 409 already_sealed, got {:?}", other),
+            other => panic!(
+                "expected GroupOutboxSealed for 409 already_sealed, got {:?}",
+                other
+            ),
         }
     }
 
@@ -2105,7 +2107,10 @@ mod tests {
                 assert_eq!(*status, Some(503));
                 assert_eq!(code.as_deref(), Some("temporary_unavailable"));
             }
-            other => panic!("expected retryable GroupOutboxSealFailed for 503, got {:?}", other),
+            other => panic!(
+                "expected retryable GroupOutboxSealFailed for 503, got {:?}",
+                other
+            ),
         }
     }
 }

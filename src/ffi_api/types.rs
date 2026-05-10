@@ -843,7 +843,8 @@ pub(crate) struct CoreState {
     /// the owner's next `DissolveGroup` call re-enqueues the pending seal.
     /// The MLS commit itself is persisted via `pending_group_outbox` and is
     /// replayed normally on startup.
-    pub(crate) pending_group_seal: BTreeMap<String, crate::transport_contract::SealGroupOutboxRequest>,
+    pub(crate) pending_group_seal:
+        BTreeMap<String, crate::transport_contract::SealGroupOutboxRequest>,
     pub(crate) pending_acks: BTreeMap<String, PendingAckState>,
     pub(crate) pending_blob_uploads: BTreeMap<String, PendingBlobUpload>,
     pub(crate) pending_blob_downloads: BTreeMap<String, PendingBlobDownload>,

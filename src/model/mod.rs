@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
 
+#[cfg(test)]
+mod welcome_pickup_property_tests;
+
 pub const CURRENT_MODEL_VERSION: &str = "0.1";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -795,11 +798,7 @@ pub struct GroupEnvelope {
         skip_serializing_if = "Option::is_none"
     )]
     pub inline_ciphertext: Option<String>,
-    #[serde(
-        default,
-        alias = "storage_refs",
-        skip_serializing_if = "Vec::is_empty"
-    )]
+    #[serde(default, alias = "storage_refs", skip_serializing_if = "Vec::is_empty")]
     pub storage_refs: Vec<StorageRef>,
     #[serde(alias = "sender_proof")]
     pub sender_proof: SenderProof,
@@ -860,11 +859,7 @@ pub struct GroupOutboxRecord {
     pub message_id: String,
     #[serde(alias = "received_at")]
     pub received_at: u64,
-    #[serde(
-        default,
-        alias = "expires_at",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, alias = "expires_at", skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
     pub state: GroupOutboxRecordState,
     pub envelope: GroupEnvelope,
@@ -960,15 +955,16 @@ impl WelcomePickupDescriptor {
     pub fn from_welcome_pickup_url(url: &str) -> CoreResult<Self> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         let trimmed = url.trim();
-        let json_bytes: Vec<u8> = if let Some(payload) =
-            trimmed.strip_prefix("tapchat://welcome-pickup/")
-        {
-            STANDARD.decode(payload).map_err(|error| {
-                CoreError::invalid_input(format!("welcome pickup URL base64 decode failed: {error}"))
-            })?
-        } else {
-            trimmed.as_bytes().to_vec()
-        };
+        let json_bytes: Vec<u8> =
+            if let Some(payload) = trimmed.strip_prefix("tapchat://welcome-pickup/") {
+                STANDARD.decode(payload).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "welcome pickup URL base64 decode failed: {error}"
+                    ))
+                })?
+            } else {
+                trimmed.as_bytes().to_vec()
+            };
         let descriptor: Self = serde_json::from_slice(&json_bytes).map_err(|error| {
             CoreError::invalid_input(format!("welcome pickup payload parse failed: {error}"))
         })?;
@@ -994,11 +990,7 @@ pub struct GroupInviteTokenPayload {
     pub join_policy: GroupJoinPolicy,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
-    #[serde(
-        default,
-        alias = "max_uses",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, alias = "max_uses", skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u64>,
 }
 
@@ -1052,11 +1044,7 @@ pub struct GroupInviteDocument {
     pub created_at: u64,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
-    #[serde(
-        default,
-        alias = "max_uses",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, alias = "max_uses", skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<u64>,
     pub signature: String,
 }
@@ -1672,7 +1660,9 @@ mod tests {
         let descriptor = WelcomePickupDescriptor {
             group_id: "group:7f3a".into(),
             device_id: "device:bob:phone".into(),
-            endpoint: "https://example.com/v1/groups/group%3A7f3a/welcome-pickup/device%3Abob%3Aphone".into(),
+            endpoint:
+                "https://example.com/v1/groups/group%3A7f3a/welcome-pickup/device%3Abob%3Aphone"
+                    .into(),
             capability: "cap-bob-123".into(),
             expires_at: 1_775_004_800_000,
         };
@@ -1688,8 +1678,8 @@ mod tests {
         // Raw JSON form must also decode to the same descriptor so
         // joiners can paste either format.
         let raw_json = serde_json::to_string(&descriptor).expect("serialize descriptor");
-        let decoded_from_json =
-            WelcomePickupDescriptor::from_welcome_pickup_url(&raw_json).expect("roundtrip raw JSON");
+        let decoded_from_json = WelcomePickupDescriptor::from_welcome_pickup_url(&raw_json)
+            .expect("roundtrip raw JSON");
         assert_eq!(decoded_from_json, descriptor);
     }
 

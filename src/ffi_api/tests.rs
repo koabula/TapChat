@@ -95,8 +95,7 @@ mod tests {
             "DissolveGroup must serialise group_id in snake_case; got {json}"
         );
 
-        let decoded: CoreCommand =
-            serde_json::from_str(&json).expect("deserialize DissolveGroup");
+        let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize DissolveGroup");
         assert_eq!(decoded, command);
     }
 
@@ -493,10 +492,7 @@ mod tests {
 
         // Step (c): seal is staged but not yet emitted as an effect.
         assert!(
-            alice
-                .state
-                .pending_group_seal
-                .contains_key(&group_id),
+            alice.state.pending_group_seal.contains_key(&group_id),
             "the seal request must be staged before its effect is emitted"
         );
         assert!(
@@ -750,10 +746,7 @@ mod tests {
             })
             .expect("handle retryable seal failure");
         assert!(
-            alice
-                .state
-                .pending_group_seal
-                .contains_key(&group_id),
+            alice.state.pending_group_seal.contains_key(&group_id),
             "a retryable seal failure must re-stage the pending seal"
         );
         assert!(
@@ -766,12 +759,10 @@ mod tests {
                 .is_none(),
             "a retryable seal failure must NOT mark the group dissolved"
         );
-        assert!(
-            retry_output
-                .state_update
-                .system_statuses_changed
-                .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure)
-        );
+        assert!(retry_output
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure));
 
         // Simulate a non-retryable seal failure (e.g. 403 unauthorized).
         // The staged seal must be cleared and the user must see a
@@ -786,10 +777,7 @@ mod tests {
             })
             .expect("handle terminal seal failure");
         assert!(
-            !alice
-                .state
-                .pending_group_seal
-                .contains_key(&group_id),
+            !alice.state.pending_group_seal.contains_key(&group_id),
             "a non-retryable seal failure must drop the staged seal"
         );
         assert!(
@@ -803,14 +791,11 @@ mod tests {
             "a non-retryable seal failure must NOT mark the group dissolved"
         );
         assert!(
-            terminal_output
-                .effects
-                .iter()
-                .any(|effect| matches!(
-                    effect,
-                    CoreEffect::EmitUserNotification { notification }
-                        if notification.status == crate::ffi_api::SystemStatus::TemporaryNetworkFailure
-                )),
+            terminal_output.effects.iter().any(|effect| matches!(
+                effect,
+                CoreEffect::EmitUserNotification { notification }
+                    if notification.status == crate::ffi_api::SystemStatus::TemporaryNetworkFailure
+            )),
             "a non-retryable seal failure must surface a user notification"
         );
     }

@@ -134,10 +134,7 @@ pub trait TransportPort {
         anyhow::bail!("group join decision transport is not implemented by this platform")
     }
 
-    async fn seal_group_outbox(
-        &mut self,
-        _seal: SealGroupOutboxRequest,
-    ) -> Result<Vec<CoreEvent>> {
+    async fn seal_group_outbox(&mut self, _seal: SealGroupOutboxRequest) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("group outbox seal transport is not implemented by this platform")
     }
 }
