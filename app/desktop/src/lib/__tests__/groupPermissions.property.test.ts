@@ -248,6 +248,52 @@ describe("groupPermissions.canPerform", () => {
     );
   });
 
+  test("dissolved owner view is read-only for every concrete UI action", () => {
+    const owner: GroupMember = {
+      user_id: "user:alice",
+      role: "owner",
+      status: "active",
+    };
+    const member: GroupMember = {
+      user_id: "user:bob",
+      role: "member",
+      status: "active",
+    };
+    const manifest: GroupManifest = {
+      version: "0.1",
+      group_id: "group:project",
+      conversation_id: "conv:group:project",
+      title: "Project",
+      owner_user_id: owner.user_id,
+      admins: [],
+      members: [owner, member],
+      join_policy: "approval_required",
+      member_invite_policy: "request_owner_approval",
+      roster_version: 1,
+      mls_epoch_hint: 0,
+      outbox: {
+        endpoint: "https://example.com/v1/groups/group%3Aproject/outbox",
+      },
+      updated_at: 1,
+      signer_user_id: owner.user_id,
+      signer_device_id: "device:alice:phone",
+      signature: "sig",
+    };
+
+    for (const action of ACTIONS) {
+      const allowed = canPerform(action, {
+        manifest,
+        localRole: "owner",
+        localUserId: owner.user_id,
+        dissolvedAt: 1_700_000_000_000,
+        target: member,
+      });
+      if (allowed) {
+        throw new Error(`dissolved group must render ${action} as read-only`);
+      }
+    }
+  });
+
   test("non-active local members reject every action", () => {
     fc.assert(
       fc.property(arbAction, arbContext, fc.constantFrom("pending", "removed", "left" as GroupMemberStatus), (action, baseCtx, badStatus) => {

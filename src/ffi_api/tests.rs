@@ -521,6 +521,99 @@ mod tests {
     }
 
     #[test]
+    fn dissolve_group_waits_for_preexisting_pending_outbox_before_seal() {
+        // The seal is allowed only after the entire group outbox queue is
+        // empty, not merely after the dissolve command's own commit/control
+        // messages are acknowledged. This prevents an older pending group
+        // append from being stranded behind an irreversible seal.
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+
+        let preexisting_pending: Vec<String> = alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| item.envelope.group_id == group_id)
+            .map(|item| item.envelope.message_id.clone())
+            .collect();
+        assert!(
+            !preexisting_pending.is_empty(),
+            "group creation must leave at least one preexisting pending append for this guard"
+        );
+
+        alice
+            .handle_command(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("dissolve");
+
+        let dissolve_pending: Vec<String> = alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.group_id == group_id
+                    && !preexisting_pending.contains(&item.envelope.message_id)
+            })
+            .map(|item| item.envelope.message_id.clone())
+            .collect();
+        assert!(
+            !dissolve_pending.is_empty(),
+            "dissolve must stage its own pending commit/control appends"
+        );
+
+        for (index, message_id) in dissolve_pending.iter().enumerate() {
+            let output = alice
+                .handle_event(CoreEvent::GroupEnvelopeAppended {
+                    group_id: group_id.clone(),
+                    message_id: message_id.clone(),
+                    seq: (index as u64) + 10,
+                })
+                .expect("ack dissolve append");
+            assert!(
+                !output
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, CoreEffect::SealGroupOutbox { .. })),
+                "seal must not be emitted while older group outbox entries remain pending"
+            );
+        }
+
+        let mut final_output = None;
+        for (index, message_id) in preexisting_pending.iter().enumerate() {
+            final_output = Some(
+                alice
+                    .handle_event(CoreEvent::GroupEnvelopeAppended {
+                        group_id: group_id.clone(),
+                        message_id: message_id.clone(),
+                        seq: (index as u64) + 99,
+                    })
+                    .expect("ack preexisting append"),
+            );
+        }
+        let final_output = final_output.expect("at least one preexisting ack");
+        assert!(
+            final_output
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::SealGroupOutbox { .. })),
+            "seal must be emitted once the final pending group append is acknowledged"
+        );
+    }
+
+    #[test]
     fn dissolve_group_does_not_set_dissolved_at_until_seal_ack() {
         // Even after every pending commit/control is acknowledged AND the
         // SealGroupOutbox effect is emitted, `dissolved_at` must only be

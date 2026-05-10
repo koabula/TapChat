@@ -6,12 +6,15 @@ import {
   type AppendEnvelopeRequest,
   type AppendGroupEnvelopeRequest,
   type BootstrapDeviceRequest,
+  type CreateGroupInviteRequest,
+  type DecideGroupJoinRequest,
   type DeploymentBundle,
   type GroupCapability,
   type GroupCapabilityOperation,
   type GroupMessageType,
   type IdentityBundle,
-  type MessageRequestListResult
+  type MessageRequestListResult,
+  type SubmitGroupJoinRequest
 } from "../src/types/contracts";
 import type {
   DurableObjectId,
@@ -1466,9 +1469,75 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
   const { env } = createEnv();
   const ownerCap = sampleGroupCapability(
     "group:project",
-    ["read", "append_application", "append_membership", "seal_group"],
+    ["read", "append_application", "append_membership", "manage_invites", "approve_join", "seal_group"],
     "owner"
   );
+
+  const preSealInvite = {
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    capability: ownerCap,
+    document: {
+      version: CURRENT_MODEL_VERSION,
+      groupId: "group:project",
+      title: "Project",
+      inviteId: "invite:pre-seal",
+      joinPolicy: "approval_required",
+      inviterUserId: "user:alice",
+      inviterDeviceId: "device:alice:phone",
+      ownerUserId: "user:alice",
+      joinRequestEndpoint: "https://example.com/v1/groups/group%3Aproject/join-requests",
+      createdAt: 1_000,
+      expiresAt: Date.now() + 60_000,
+      signature: "unsigned"
+    }
+  } satisfies CreateGroupInviteRequest;
+
+  const inviteResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/invites", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(ownerCap),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(preSealInvite)
+    }),
+    env
+  );
+  assert.equal(inviteResp.status, 200);
+  const inviteBody = (await inviteResp.json()) as { inviteUrl: string };
+  const inviteToken = decodeURIComponent(inviteBody.inviteUrl.split("/").pop() ?? "");
+
+  const preSealJoin = {
+    version: CURRENT_MODEL_VERSION,
+    inviteToken,
+    request: {
+      version: CURRENT_MODEL_VERSION,
+      requestId: "req:pre-seal",
+      groupId: "group:project",
+      inviteId: "invite:pre-seal",
+      joinerUserId: "user:dana",
+      joinerDeviceId: "device:dana:phone",
+      joinerContactShareUrl: "https://example.com/contact/dana",
+      requestedAt: 1_000,
+      requestCapability: "join-capability",
+      signature: "join-signature",
+      status: "pending"
+    }
+  } satisfies SubmitGroupJoinRequest;
+
+  const joinResp = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/join-requests", {
+      method: "POST",
+      headers: {
+        ...authHeaders(inviteToken),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(preSealJoin)
+    }),
+    env
+  );
+  assert.equal(joinResp.status, 200);
 
   // Append one record prior to sealing so fetch has something to return.
   const initialAppend = await handleRequest(
@@ -1514,6 +1583,67 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
   assert.equal(postSealAppend.status, 403);
   const appendBody = (await postSealAppend.json()) as { error?: string };
   assert.equal(appendBody.error, "group_sealed");
+
+  const postSealInvite = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/invites", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(ownerCap),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        ...preSealInvite,
+        document: {
+          ...preSealInvite.document,
+          inviteId: "invite:post-seal"
+        }
+      } satisfies CreateGroupInviteRequest)
+    }),
+    env
+  );
+  assert.equal(postSealInvite.status, 403);
+  assert.equal(((await postSealInvite.json()) as { error?: string }).error, "group_sealed");
+
+  const postSealJoin = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/join-requests", {
+      method: "POST",
+      headers: {
+        ...authHeaders(inviteToken),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        ...preSealJoin,
+        request: {
+          ...preSealJoin.request,
+          requestId: "req:post-seal"
+        }
+      } satisfies SubmitGroupJoinRequest)
+    }),
+    env
+  );
+  assert.equal(postSealJoin.status, 403);
+  assert.equal(((await postSealJoin.json()) as { error?: string }).error, "group_sealed");
+
+  const postSealDecision = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/join-requests/req%3Apre-seal/decision", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(ownerCap),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: "group:project",
+        requestId: "req:pre-seal",
+        decision: "reject",
+        capability: ownerCap,
+        reason: "closed"
+      } satisfies DecideGroupJoinRequest)
+    }),
+    env
+  );
+  assert.equal(postSealDecision.status, 403);
+  assert.equal(((await postSealDecision.json()) as { error?: string }).error, "group_sealed");
 
   // Reads continue to work: fetch the pre-seal record, and head remains
   // the final pre-seal seq.
