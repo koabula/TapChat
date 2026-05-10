@@ -1025,9 +1025,12 @@ impl CliApp {
     }
 
     fn print_value<T: Serialize>(&self, value: &T) -> Result<()> {
+        let raw = serde_json::to_string(value)?;
+        let normalized: serde_json::Value = serde_json::from_str(&raw)?;
+        let normalized = crate::cli::util::camel_to_snake_value(normalized);
         match self.output {
-            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
-            OutputFormat::Text => println!("{}", serde_json::to_string_pretty(value)?),
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&normalized)?),
+            OutputFormat::Text => println!("{}", serde_json::to_string_pretty(&normalized)?),
         }
         Ok(())
     }

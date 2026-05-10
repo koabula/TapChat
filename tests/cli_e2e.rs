@@ -48,7 +48,7 @@ struct CliLaptopContext {
 }
 
 #[test]
-#[ignore = "disabled while stabilizing phase 0 group model work"]
+#[ignore = "run via cargo test --ignored; orchestrates every cli_e2e case in sequence"]
 fn cli_e2e_stable_suite() -> Result<()> {
     for test_name in [
         "cleanup_test_temp_script_removes_cli_temp_artifacts",
@@ -2132,12 +2132,16 @@ fn cli_device_revoke_remote_target_updates_published_bundle() -> Result<()> {
 
     let mut snapshot: Value = read_json_file(&ctx.bob_profile.join("snapshot.json"))?;
     snapshot["snapshot"]["deployment"]["local_bundle"] = serde_json::to_value(&merged_identity)?;
+    // `IdentityBundle` serializes with `rename_all = "camelCase"`, so the patched snapshot
+    // here stores `deviceId`, not `device_id`. Downstream CLI commands (e.g. `contact show`)
+    // normalize their JSON output to snake_case via `print_value`, but direct patches like
+    // this self-check against the raw serialized bundle.
     assert!(
         snapshot["snapshot"]["deployment"]["local_bundle"]["devices"]
             .as_array()
             .context("patched local bundle devices missing")?
             .iter()
-            .any(|device| device["device_id"].as_str() == Some(laptop.laptop_device_id.as_str()))
+            .any(|device| device["deviceId"].as_str() == Some(laptop.laptop_device_id.as_str()))
     );
     fs::write(
         ctx.bob_profile.join("snapshot.json"),
@@ -4929,7 +4933,16 @@ fn patch_contact_identity_bundle_ref(profile: &Path, user_id: &str, reference: &
         .iter_mut()
         .find(|row| row["user_id"].as_str() == Some(user_id))
         .context("contact missing in snapshot")?;
-    contact["bundle"]["identity_bundle_ref"] = Value::String(reference.to_string());
+    // `IdentityBundle` serializes with `rename_all = "camelCase"`, so the field key on
+    // disk is `identityBundleRef`. We overwrite the camelCase key (and clear any stale
+    // snake_case alias, otherwise serde rejects the file as a duplicate field).
+    if let Some(bundle) = contact["bundle"].as_object_mut() {
+        bundle.remove("identity_bundle_ref");
+        bundle.insert(
+            "identityBundleRef".to_string(),
+            Value::String(reference.to_string()),
+        );
+    }
     fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
     Ok(())
 }

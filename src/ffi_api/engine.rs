@@ -4577,25 +4577,27 @@ impl CoreEngine {
 
         // Check if conversation is still recovering
         if recovery_status == RecoveryStatus::NeedsRecovery {
-            // Check the actual MLS group state to determine if recovery is complete
-            // The MLS summary reflects the true cryptographic state of the group
-            let mls_status = self
-                .state
-                .mls_summaries
-                .get(conversation_id)
-                .map(|s| s.status);
-
-            // If MLS group is Active, recovery has completed - clear recovery state
-            if mls_status == Some(MlsStateStatus::Active) {
-                self.state.recovery_contexts.remove(conversation_id);
-                if let Some(state) = self.state.conversations.get_mut(conversation_id) {
-                    state.recovery_status = RecoveryStatus::Healthy;
-                }
-            } else {
-                // MLS group is still recovering or status unknown
+            // The authoritative signal is the active recovery context: if a
+            // context still exists, recovery has not converged and we must
+            // fail-closed so the sender does not overclaim delivery.
+            //
+            // `mls_summaries` staying `Active` is *not* sufficient evidence
+            // that recovery completed -- e.g. after a peer device change the
+            // MLS group may still be cryptographically valid for the old
+            // roster while a new commit is being prepared. Trusting the MLS
+            // status alone here caused the sender to accept new messages
+            // during recovery and regress the "fail-closed during recovery"
+            // guarantee.
+            if self.state.recovery_contexts.contains_key(conversation_id) {
                 return Err(CoreError::temporary_failure(
                     "conversation membership is still recovering",
                 ));
+            }
+            // No active recovery context left: recovery completed in a prior
+            // step but the conversation's recovery_status field was never
+            // cleared. Treat the conversation as healthy going forward.
+            if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                state.recovery_status = RecoveryStatus::Healthy;
             }
         }
         self.direct_peer_contact_bundle(&peer_user_id)?;
