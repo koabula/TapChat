@@ -674,6 +674,7 @@ impl CliApp {
                                 conversation.map(|state| state.recovery_status),
                             "mls_status": mls_status,
                             "cursor": cursors.get(&state.group_id),
+                            "dissolved_at": state.dissolved_at,
                         })
                     })
                     .collect();
@@ -715,6 +716,7 @@ impl CliApp {
                     "manifest": group.manifest,
                     "local_role": group.local_role,
                     "welcome_pickup": group.welcome_pickup,
+                    "dissolved_at": group.dissolved_at,
                     "cursor": cursor,
                     "conversation_state":
                         conversation_state.map(|state| state.conversation.state),
@@ -961,10 +963,82 @@ impl CliApp {
                     "roster_version": manifest.as_ref().map(|m| m.roster_version),
                 }))
             }
+            GroupSubcommand::Dissolve {
+                profile,
+                group_id,
+                yes,
+            } => self.run_group_dissolve(profile, group_id, yes).await,
             GroupSubcommand::Invite(command) => self.run_group_invite(command).await,
             GroupSubcommand::Join(command) => self.run_group_join(command).await,
             GroupSubcommand::Member(command) => self.run_group_member(command).await,
         }
+    }
+
+    /// Owner-only interactive group dissolve.
+    ///
+    /// Per task C.2, when `--yes` is absent the CLI MUST read a line from
+    /// stdin and accept only `"y"` / `"yes"` (case-insensitive) as the
+    /// confirmation token. All other inputs (including empty lines,
+    /// EOF, and unrecognised strings) abort with exit code 0 and the
+    /// message `"Aborted."`. This applies uniformly to interactive, CI,
+    /// and piped stdin environments — there is no `isatty` bypass.
+    async fn run_group_dissolve(
+        &self,
+        profile: Option<PathBuf>,
+        group_id: String,
+        yes: bool,
+    ) -> Result<()> {
+        use std::io::{BufRead, Write};
+
+        if !yes {
+            let mut stdout = std::io::stdout().lock();
+            write!(
+                stdout,
+                "Dissolve group '{}'? This cannot be undone. [y/N]: ",
+                group_id
+            )?;
+            stdout.flush()?;
+            drop(stdout);
+
+            let mut line = String::new();
+            let bytes_read = std::io::stdin().lock().read_line(&mut line)?;
+            if !dissolve_confirmation_accepted(bytes_read, &line) {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+
+        let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+        let mut driver = load_driver(&profile)?;
+        driver
+            .run_command_until_idle(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .await?;
+        persist_driver(&mut profile, &driver)?;
+
+        let snapshot = profile.load_snapshot()?;
+        let group_state = snapshot
+            .group_states
+            .iter()
+            .find(|state| state.group_id == group_id);
+        let dissolved_at = group_state.and_then(|state| state.dissolved_at);
+        let conversation_state = group_state.and_then(|state| {
+            snapshot
+                .conversations
+                .iter()
+                .find(|conversation| {
+                    conversation.conversation_id == state.conversation_id
+                })
+                .map(|conv| format!("{:?}", conv.state.conversation.state).to_lowercase())
+        });
+
+        self.print_value(&serde_json::json!({
+            "dissolved": true,
+            "group_id": group_id,
+            "dissolved_at": dissolved_at,
+            "conversation_state": conversation_state,
+        }))
     }
 
     async fn run_group_invite(&self, command: GroupInviteCommand) -> Result<()> {
@@ -1899,4 +1973,69 @@ async fn get_head(bundle: &DeploymentBundle, device_id: &str) -> Result<GetHeadR
     }
     let body = response.text().await?;
     Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
+}
+
+/// Evaluate whether a `group dissolve` confirmation response from stdin
+/// should be treated as "proceed".
+///
+/// Accepts only `"y"` / `"yes"` (case-insensitive, with surrounding
+/// whitespace trimmed). Everything else — including EOF (`bytes_read ==
+/// 0`), empty lines, `"n"`, `"no"`, and any unrecognised token — is
+/// treated as "abort". Per task C.2 the CLI MUST apply this rule
+/// uniformly; there is no `isatty` bypass or CI auto-accept.
+pub(crate) fn dissolve_confirmation_accepted(bytes_read: usize, raw_input: &str) -> bool {
+    if bytes_read == 0 {
+        return false;
+    }
+    let normalized = raw_input.trim().to_ascii_lowercase();
+    matches!(normalized.as_str(), "y" | "yes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dissolve_confirmation_accepted;
+
+    #[test]
+    fn group_dissolve_cli_aborts_on_empty_or_no_input() {
+        // Empty line, just Enter, must abort.
+        assert!(!dissolve_confirmation_accepted(1, "\n"));
+        // Whitespace-only, must abort.
+        assert!(!dissolve_confirmation_accepted(4, "   \n"));
+        // Explicit `n` / `no`, must abort.
+        assert!(!dissolve_confirmation_accepted(2, "n\n"));
+        assert!(!dissolve_confirmation_accepted(3, "no\n"));
+        assert!(!dissolve_confirmation_accepted(3, "NO\n"));
+        // Any unrecognised token, must abort.
+        assert!(!dissolve_confirmation_accepted(9, "whatever\n"));
+        // EOF (bytes_read == 0), must abort — even if the buffer happens
+        // to contain leftover data from a previous read.
+        assert!(!dissolve_confirmation_accepted(0, ""));
+        assert!(!dissolve_confirmation_accepted(0, "y"));
+    }
+
+    #[test]
+    fn group_dissolve_cli_proceeds_on_y_yes_case_insensitive() {
+        assert!(dissolve_confirmation_accepted(2, "y\n"));
+        assert!(dissolve_confirmation_accepted(2, "Y\n"));
+        assert!(dissolve_confirmation_accepted(4, "yes\n"));
+        assert!(dissolve_confirmation_accepted(4, "YES\n"));
+        assert!(dissolve_confirmation_accepted(4, "Yes\n"));
+        // Surrounding whitespace is trimmed before normalisation.
+        assert!(dissolve_confirmation_accepted(6, "  y \n"));
+        assert!(dissolve_confirmation_accepted(8, "  YES \n"));
+    }
+
+    #[test]
+    fn group_dissolve_cli_yes_flag_bypasses_stdin() {
+        // The `--yes` flag is evaluated by the command handler *before*
+        // calling `dissolve_confirmation_accepted`, so the helper itself
+        // only governs the interactive path. This test documents the
+        // contract: any non-empty `y`/`yes` input is accepted; every
+        // other path is a caller-side choice.
+        //
+        // If `--yes` were ever to delegate to this helper with a
+        // sentinel value, the helper would still refuse because the
+        // sentinel is not `y`/`yes`:
+        assert!(!dissolve_confirmation_accepted(4, "--yes\n"));
+    }
 }

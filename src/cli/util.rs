@@ -82,6 +82,30 @@ fn camel_to_snake(value: &str) -> String {
     output
 }
 
+/// Best-effort extraction of the `error` or `code` field from a JSON body
+/// returned by the Cloudflare group outbox. Both field names are accepted
+/// because the current worker returns `{ "error": "..." }` but historical
+/// clients observe `{ "code": "..." }` as well.
+pub fn extract_error_code(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("error")
+        .or_else(|| value.get("code"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Best-effort extraction of `sealed_at` from a JSON body returned by
+/// the Cloudflare group outbox seal endpoint. Returns `None` when the
+/// field is missing or not a number — callers can fall back to `0` or
+/// the current wall clock as appropriate.
+pub fn extract_sealed_at(body: &str) -> Option<u64> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("sealed_at")
+        .and_then(|v| v.as_u64())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

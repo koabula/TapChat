@@ -33,10 +33,11 @@ use crate::transport_contract::{
     ListGroupJoinRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
     PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    RevokeGroupInviteResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
+    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
+    SubmitGroupJoinResult,
 };
 
-use super::util::{to_camel_case_json_string, to_snake_case_json_string};
+use super::util::{extract_error_code, extract_sealed_at, to_camel_case_json_string, to_snake_case_json_string};
 
 pub struct DriverRuntime {
     client: Client,
@@ -1259,6 +1260,69 @@ impl TransportPort for CoreDriver {
         }])
     }
 
+    /// Owner-signed seal of a group outbox. Issues `POST /v1/groups/<id>/
+    /// outbox/seal` with the same capability/bearer pattern as the other
+    /// group endpoints. Maps:
+    ///   - 200 → `CoreEvent::GroupOutboxSealed { was_already_sealed: false }`
+    ///   - 409 `already_sealed` → `GroupOutboxSealed { was_already_sealed: true }`
+    ///     (terminal state identical)
+    ///   - 403 → `GroupOutboxSealFailed { retryable: false }`
+    ///   - 5xx / network → `GroupOutboxSealFailed { retryable: true }`
+    ///   - body parse errors → `GroupOutboxSealFailed { retryable: false }`
+    async fn seal_group_outbox(
+        &mut self,
+        seal: SealGroupOutboxRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let url = format!(
+            "{}/v1/groups/{}/outbox/seal",
+            base.trim_end_matches('/'),
+            seal.group_id
+        );
+
+        let response = match self
+            .runtime
+            .client
+            .post(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", seal.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&seal.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(vec![CoreEvent::GroupOutboxSealFailed {
+                    group_id: seal.group_id,
+                    retryable: true,
+                    status: None,
+                    code: None,
+                    detail: Some(error.to_string()),
+                }]);
+            }
+        };
+
+        let status = response.status().as_u16();
+        let body_text = response.text().await.unwrap_or_default();
+        Ok(map_seal_group_outbox_response(
+            seal.group_id,
+            status,
+            &body_text,
+        ))
+    }
+
     async fn put_welcome_pickup(&mut self, put: PutWelcomePickupRequest) -> Result<Vec<CoreEvent>> {
         let response = self
             .runtime
@@ -1712,6 +1776,82 @@ fn looks_like_json(value: &str) -> bool {
     trimmed.starts_with('{') || trimmed.starts_with('[')
 }
 
+/// Pure mapping from a `POST /outbox/seal` HTTP response (status + body)
+/// to the `CoreEvent` the engine expects.
+///
+/// Rules (mirrors `SealGroupOutboxService` on the Cloudflare side):
+///   - 200 JSON with `sealed_at` → `GroupOutboxSealed { was_already_sealed: false }`
+///   - 409 with `code == "already_sealed"` → `GroupOutboxSealed { was_already_sealed: true }`
+///     (the terminal state is identical; this is the idempotent-repeat path)
+///   - 409 with any other code → `GroupOutboxSealFailed { retryable: false }`
+///   - 4xx (non-409) → `GroupOutboxSealFailed { retryable: false }`
+///   - 5xx → `GroupOutboxSealFailed { retryable: true }`
+///   - 200 body parse error → `GroupOutboxSealFailed { retryable: false }`
+///
+/// Kept as a standalone pure function so unit tests can exercise it
+/// without spinning up a real HTTP server.
+pub(crate) fn map_seal_group_outbox_response(
+    group_id: String,
+    status: u16,
+    body_text: &str,
+) -> Vec<CoreEvent> {
+    // 409 `already_sealed` is semantically equivalent to a successful
+    // seal — both end with the server-side `sealed` flag in effect —
+    // so we map to `GroupOutboxSealed { was_already_sealed: true }` and
+    // let the engine transition `dissolved_at` normally.
+    if status == 409 {
+        let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
+        let code = extract_error_code(&body);
+        if code.as_deref() == Some("already_sealed") {
+            let sealed_at = extract_sealed_at(&body).unwrap_or(0);
+            return vec![CoreEvent::GroupOutboxSealed {
+                group_id,
+                sealed_at,
+                was_already_sealed: true,
+            }];
+        }
+        return vec![CoreEvent::GroupOutboxSealFailed {
+            group_id,
+            retryable: false,
+            status: Some(status),
+            code,
+            detail: Some(body_text.to_string()),
+        }];
+    }
+
+    if !(200..300).contains(&status) {
+        let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
+        let code = extract_error_code(&body);
+        let retryable = status >= 500;
+        return vec![CoreEvent::GroupOutboxSealFailed {
+            group_id,
+            retryable,
+            status: Some(status),
+            code,
+            detail: Some(body_text.to_string()),
+        }];
+    }
+
+    let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
+    let result: SealGroupOutboxResult = match serde_json::from_str(&body) {
+        Ok(result) => result,
+        Err(error) => {
+            return vec![CoreEvent::GroupOutboxSealFailed {
+                group_id,
+                retryable: false,
+                status: Some(status),
+                code: None,
+                detail: Some(error.to_string()),
+            }];
+        }
+    };
+    vec![CoreEvent::GroupOutboxSealed {
+        group_id,
+        sealed_at: result.sealed_at,
+        was_already_sealed: result.was_already_sealed,
+    }]
+}
+
 fn parse_realtime_event(device_id: &str, text: &str) -> Result<CoreEvent> {
     let normalized = to_snake_case_json_string(text)?;
     let value: serde_json::Value = serde_json::from_str(&normalized)?;
@@ -1871,5 +2011,101 @@ mod tests {
             scheduled_at: Instant::now(),
         };
         assert!(Instant::now() < timer.scheduled_at + Duration::from_millis(timer.delay_ms));
+    }
+
+    #[test]
+    fn seal_group_outbox_driver_maps_200_to_sealed_event() {
+        let events = super::map_seal_group_outbox_response(
+            "group:project".into(),
+            200,
+            "{\"sealed\":true,\"sealedAt\":1700000000000,\"wasAlreadySealed\":false}",
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::CoreEvent::GroupOutboxSealed {
+                group_id,
+                sealed_at,
+                was_already_sealed,
+            } => {
+                assert_eq!(group_id, "group:project");
+                assert_eq!(*sealed_at, 1_700_000_000_000);
+                assert!(!*was_already_sealed);
+            }
+            other => panic!("expected GroupOutboxSealed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn seal_group_outbox_driver_maps_409_to_sealed_event_not_failure() {
+        // 409 `already_sealed` is a success — both endpoints end up in the
+        // same terminal state, the only difference is observability.
+        let events = super::map_seal_group_outbox_response(
+            "group:project".into(),
+            409,
+            "{\"error\":\"already_sealed\",\"sealed_at\":1700000000500}",
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::CoreEvent::GroupOutboxSealed {
+                group_id,
+                sealed_at,
+                was_already_sealed,
+            } => {
+                assert_eq!(group_id, "group:project");
+                assert_eq!(*sealed_at, 1_700_000_000_500);
+                assert!(*was_already_sealed);
+            }
+            other => panic!("expected GroupOutboxSealed for 409 already_sealed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn seal_group_outbox_driver_maps_403_to_non_retryable_failure() {
+        let events = super::map_seal_group_outbox_response(
+            "group:project".into(),
+            403,
+            "{\"error\":\"unauthorized\",\"message\":\"capability rejected\"}",
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::CoreEvent::GroupOutboxSealFailed {
+                group_id,
+                retryable,
+                status,
+                code,
+                detail: _,
+            } => {
+                assert_eq!(group_id, "group:project");
+                assert!(!*retryable, "403 must be non-retryable");
+                assert_eq!(*status, Some(403));
+                assert_eq!(code.as_deref(), Some("unauthorized"));
+            }
+            other => panic!("expected GroupOutboxSealFailed for 403, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn seal_group_outbox_driver_maps_5xx_to_retryable_failure() {
+        let events = super::map_seal_group_outbox_response(
+            "group:project".into(),
+            503,
+            "{\"error\":\"temporary_unavailable\"}",
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::CoreEvent::GroupOutboxSealFailed {
+                group_id,
+                retryable,
+                status,
+                code,
+                ..
+            } => {
+                assert_eq!(group_id, "group:project");
+                assert!(*retryable, "5xx must be retryable");
+                assert_eq!(*status, Some(503));
+                assert_eq!(code.as_deref(), Some("temporary_unavailable"));
+            }
+            other => panic!("expected retryable GroupOutboxSealFailed for 503, got {:?}", other),
+        }
     }
 }

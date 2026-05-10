@@ -410,6 +410,23 @@ pub enum GroupSubcommand {
         #[arg(long)]
         member_invite_policy: Option<String>,
     },
+    /// Atomically dissolve a group (owner-only). Issues a single MLS
+    /// remove_members commit covering every other active member, appends
+    /// a visible `control_group_dissolved` control message, and seals the
+    /// group outbox so no further messages can be appended. Dissolves are
+    /// irreversible.
+    Dissolve {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        /// Skip the interactive `[y/N]` confirmation prompt. MUST be
+        /// passed explicitly — even in CI / non-interactive environments
+        /// the CLI still reads stdin for confirmation when `--yes` is
+        /// absent, so automation must supply the flag.
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
+    },
     Invite(GroupInviteCommand),
     Join(GroupJoinCommand),
     Member(GroupMemberCommand),
