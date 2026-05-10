@@ -17,6 +17,13 @@ const TEXTAREA_LINE_HEIGHT_PX = 24;
 
 interface MessageInputProps {
   conversationId: string;
+  /**
+   * Dispatch target for the text send. `"group"` routes to
+   * `send_group_text_message` (which maps to
+   * `CoreCommand::SendGroupTextMessage`); anything else (or absent)
+   * uses the classic direct-conversation `send_text` path.
+   */
+  conversationKind?: "direct" | "group";
   onSent?: (msg?: { message_id: string; conversation_id: string; sender_device_id: string; plaintext: string; created_at: number }) => void;
 }
 
@@ -38,7 +45,7 @@ interface DragDropPayload {
   paths: string[];
 }
 
-export default function MessageInput({ conversationId, onSent }: MessageInputProps) {
+export default function MessageInput({ conversationId, conversationKind = "direct", onSent }: MessageInputProps) {
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
@@ -200,10 +207,23 @@ export default function MessageInput({ conversationId, onSent }: MessageInputPro
     const textToSend = inputText;
     setSending(true);
     try {
-      const result = await invoke<SendMessageResult>("send_text", {
-        conversationId,
-        plaintext: textToSend,
-      });
+      // Route to the group-specific command when the parent signals a
+      // group conversation. Both commands return the same shape
+      // (message_id + sender_device_id + created_at + ...), so the UI
+      // below can normalise them into the common onSent callback.
+      const result =
+        conversationKind === "group"
+          ? await invoke<SendMessageResult & { sender_user_id: string; pending_group_outbox: number }>(
+              "send_group_text_message",
+              {
+                conversationId,
+                plaintext: textToSend,
+              },
+            )
+          : await invoke<SendMessageResult>("send_text", {
+              conversationId,
+              plaintext: textToSend,
+            });
       setInputText("");
       onSentWithMessage?.(result);
     } catch (err) {

@@ -1,13 +1,15 @@
 import { useState } from "react";
 import { Outlet, useNavigate } from "react-router";
-import { Plus, Users, Settings } from "lucide-react";
+import { Plus, Users, Settings, UsersRound } from "lucide-react";
 import ConversationList from "./ConversationList";
 import { NetworkIndicator } from "@/components/SystemBanner";
 import { useMessageRequestsStore } from "@/store/requests";
+import GroupCreateDialog from "@/pages/groups/GroupCreateDialog";
 
 export default function ChatLayout() {
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
+  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const requests = useMessageRequestsStore((s) => s.requests);
 
   return (
@@ -63,6 +65,13 @@ export default function ChatLayout() {
           </button>
           <button
             className="btn btn-ghost px-2"
+            title="New group"
+            onClick={() => setGroupDialogOpen(true)}
+          >
+            <UsersRound size={20} />
+          </button>
+          <button
+            className="btn btn-ghost px-2"
             title="Contacts (Ctrl+2)"
             onClick={() => navigate("/contacts")}
           >
@@ -82,6 +91,11 @@ export default function ChatLayout() {
       <main className="flex-1 flex flex-col overflow-hidden">
         <Outlet />
       </main>
+
+      <GroupCreateDialog
+        open={groupDialogOpen}
+        onClose={() => setGroupDialogOpen(false)}
+      />
     </div>
   );
 }
