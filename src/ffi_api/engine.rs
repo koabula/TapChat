@@ -3103,7 +3103,12 @@ impl CoreEngine {
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
-        let metadata_b64 = STANDARD.encode(&metadata_payload);
+        let metadata_ciphertext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &metadata_payload)?;
         let capability = self.group_capability(&group_id, GroupRole::Owner)?;
         let membership_proof =
             self.build_membership_proof(&group_id, manifest.roster_version, "transfer_ownership")?;
@@ -3112,7 +3117,7 @@ impl CoreEngine {
             &group_state.conversation_id,
             GroupMessageType::ControlGroupMetadataUpdated,
             GroupEnvelopeVisibility::Visible,
-            metadata_b64,
+            metadata_ciphertext.payload_b64,
         )?;
         envelope.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(envelope.clone(), capability.clone(), None);
@@ -3227,7 +3232,12 @@ impl CoreEngine {
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
-        let metadata_b64 = STANDARD.encode(&metadata_payload);
+        let metadata_ciphertext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &metadata_payload)?;
         let capability = self.group_capability(&group_id, GroupRole::Owner)?;
         let membership_proof =
             self.build_membership_proof(&group_id, manifest.roster_version, "set_admin")?;
@@ -3236,7 +3246,7 @@ impl CoreEngine {
             &group_state.conversation_id,
             GroupMessageType::ControlGroupMetadataUpdated,
             GroupEnvelopeVisibility::Visible,
-            metadata_b64,
+            metadata_ciphertext.payload_b64,
         )?;
         envelope.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(envelope.clone(), capability, None);
@@ -3342,7 +3352,12 @@ impl CoreEngine {
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
-        let metadata_b64 = STANDARD.encode(&metadata_payload);
+        let metadata_ciphertext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &metadata_payload)?;
         let capability = self.group_capability(&group_id, role)?;
         let membership_proof = if matches!(role, GroupRole::Owner | GroupRole::Admin) {
             Some(self.build_membership_proof(
@@ -3358,7 +3373,7 @@ impl CoreEngine {
             &group_state.conversation_id,
             GroupMessageType::ControlGroupMetadataUpdated,
             GroupEnvelopeVisibility::Visible,
-            metadata_b64,
+            metadata_ciphertext.payload_b64,
         )?;
         if let Some(proof) = membership_proof {
             envelope.membership_proof = Some(proof);
@@ -7912,6 +7927,12 @@ impl CoreEngine {
             {
                 continue;
             }
+            let group_state = self
+                .state
+                .group_states
+                .get(&group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                .clone();
             let is_membership_operation = matches!(
                 record.envelope.message_type,
                 GroupMessageType::MlsCommit

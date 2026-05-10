@@ -32,7 +32,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use common::{
     bundle_auth, export_identity_bundle_to_path, read_json_file, repo_temp_dir, required_str,
     run_cli_json, with_tokio, workspace_root, write_json_file, write_mnemonic_file,
@@ -40,14 +40,15 @@ use common::{
 use reqwest::StatusCode;
 use serde_json::Value;
 use tapchat_core::model::{DeploymentBundle, IdentityBundle};
-use tapchat_desktop_lib::test_support::{
-    approve_group_join_impl, build_test_app_state_for_profile, create_group_conversation_impl,
-    create_group_invite_link_impl, dissolve_group_impl, get_group_join_request_status_impl,
-    get_group_messages_impl, get_group_snapshot_impl, list_group_conversations_impl,
-    remove_group_member_impl, send_group_text_message_impl, submit_group_join_request_impl,
-    sync_group_outbox_impl, update_group_metadata_impl, GroupMessageView,
-};
 use tapchat_desktop_lib::AppState;
+use tapchat_desktop_lib::test_support::{
+    GroupMessageView, approve_group_join_impl, build_test_app_state_for_profile,
+    create_group_conversation_impl, create_group_invite_link_impl, dissolve_group_impl,
+    get_group_join_request_status_impl, get_group_messages_impl, get_group_snapshot_impl,
+    leave_group_impl, list_group_conversations_impl, remove_group_member_impl,
+    send_group_text_message_impl, set_group_admin_impl, submit_group_join_request_impl,
+    sync_group_outbox_impl, transfer_group_ownership_impl, update_group_metadata_impl,
+};
 use tapchat_transport_adapter::CloudflareRuntimeHandle;
 use tempfile::TempDir;
 
@@ -350,6 +351,19 @@ fn desktop_group_three_user_text_minimal_e2e() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn desktop_group_membership_management_minimal_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-membership")?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for desktop_group_membership_management_minimal_e2e")?;
+
+    rt.block_on(run_membership_management_minimal(&ctx))?;
+    Ok(())
+}
+
 async fn run_three_user_text_minimal(ctx: &QuartetContext) -> Result<()> {
     let alice = DesktopHarness::new(&ctx.alice_profile).await?;
 
@@ -424,6 +438,142 @@ async fn run_three_user_text_minimal(ctx: &QuartetContext) -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
+    let alice = DesktopHarness::new(&ctx.alice_profile).await?;
+
+    let created = create_group_conversation_impl(
+        &alice.state,
+        "Membership Project".into(),
+        vec![
+            ctx.bob_user_id.clone(),
+            ctx.carol_user_id.clone(),
+            ctx.dana_user_id.clone(),
+        ],
+    )
+    .await
+    .map_err(|e| anyhow!("create_group_conversation_impl: {e}"))?;
+    assert_eq!(created.member_count, 4);
+    assert_eq!(created.welcome_pickups.len(), 3);
+
+    let group_id = created.group_id.clone();
+    let conversation_id = created.conversation_id.clone();
+
+    let welcome_pickups: Vec<Value> = created
+        .welcome_pickups
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "device_id": p.device_id,
+                "url": p.url,
+            })
+        })
+        .collect();
+    let bob_pickup = find_welcome_pickup_url(&welcome_pickups, &ctx.bob_device_id)?;
+    let carol_pickup = find_welcome_pickup_url(&welcome_pickups, &ctx.carol_device_id)?;
+    let dana_pickup = find_welcome_pickup_url(&welcome_pickups, &ctx.dana_device_id)?;
+
+    let bob = DesktopHarness::new(&ctx.bob_profile).await?;
+    let carol = DesktopHarness::new(&ctx.carol_profile).await?;
+    let dana = DesktopHarness::new(&ctx.dana_profile).await?;
+
+    for (label, harness, pickup) in [
+        ("bob", &bob, bob_pickup),
+        ("carol", &carol, carol_pickup),
+        ("dana", &dana, dana_pickup),
+    ] {
+        let result = submit_group_join_request_impl(&harness.state, pickup)
+            .await
+            .map_err(|e| anyhow!("{label} submit_group_join_request_impl: {e}"))?;
+        assert_eq!(result.status, "approved");
+        assert_eq!(result.group_id, group_id);
+    }
+
+    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol, &dana]).await?;
+
+    leave_group_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob leave_group_impl: {e}"))?;
+    let bob_send = send_group_text_message_impl(
+        &bob.state,
+        conversation_id.clone(),
+        "bob after leave".into(),
+    )
+    .await;
+    assert!(
+        bob_send.is_err(),
+        "bob must fail-closed after leave but got Ok: {bob_send:?}"
+    );
+
+    set_group_admin_impl(
+        &alice.state,
+        group_id.clone(),
+        ctx.carol_user_id.clone(),
+        true,
+    )
+    .await
+    .map_err(|e| anyhow!("alice set_group_admin_impl: {e}"))?;
+    sync_group_outbox_impl(&carol.state, group_id.clone(), None)
+        .await
+        .ok();
+    let carol_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol get_group_snapshot_impl after admin: {e}"))?;
+    assert_eq!(format!("{:?}", carol_snapshot.local_role), "Some(Admin)");
+
+    transfer_group_ownership_impl(&alice.state, group_id.clone(), ctx.carol_user_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice transfer_group_ownership_impl: {e}"))?;
+    sync_group_outbox_impl(&carol.state, group_id.clone(), None)
+        .await
+        .ok();
+    let carol_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol get_group_snapshot_impl after transfer: {e}"))?;
+    assert_eq!(format!("{:?}", carol_snapshot.local_role), "Some(Owner)");
+
+    let former_owner_admin_change = set_group_admin_impl(
+        &alice.state,
+        group_id.clone(),
+        ctx.dana_user_id.clone(),
+        false,
+    )
+    .await;
+    assert!(
+        former_owner_admin_change.is_err(),
+        "former owner must not perform owner-only admin changes"
+    );
+
+    leave_group_impl(&alice.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice leave_group_impl after transfer: {e}"))?;
+    let alice_send = send_group_text_message_impl(
+        &alice.state,
+        conversation_id.clone(),
+        "alice after leave".into(),
+    )
+    .await;
+    assert!(
+        alice_send.is_err(),
+        "alice must fail-closed after leaving but got Ok: {alice_send:?}"
+    );
+
+    remove_group_member_impl(&carol.state, group_id.clone(), ctx.dana_user_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol remove_group_member_impl: {e}"))?;
+    sync_group_outbox_impl(&dana.state, group_id.clone(), None)
+        .await
+        .ok();
+    let dana_send =
+        send_group_text_message_impl(&dana.state, conversation_id, "dana after remove".into())
+            .await;
+    assert!(
+        dana_send.is_err(),
+        "dana must fail-closed after removal but got Ok: {dana_send:?}"
+    );
 
     Ok(())
 }

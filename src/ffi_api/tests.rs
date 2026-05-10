@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::attachment_crypto::{
-        AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
+        ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata, AttachmentPayloadMetadata,
     };
     use crate::ffi_api::engine;
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
@@ -12,18 +12,18 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        ConversationKind, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth, Envelope,
-        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument,
-        GroupJoinRequest, GroupJoinRequestStatus, GroupMessageType, GroupOutboxRecord,
-        GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord, InboxRecordState,
-        MessageType, SenderProof, StorageBaseInfo, WakeHint, WelcomePickupDescriptor,
-        CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, ConversationKind, DeliveryClass, DeploymentBundle,
+        DeviceRuntimeAuth, Envelope, GroupCapabilityOperation, GroupEnvelope,
+        GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
+        GroupMemberStatus, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
+        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
+        WakeHint, WelcomePickupDescriptor,
     };
     use crate::persistence::{CorePersistenceSnapshot, PersistOp};
     use crate::transport_contract::{
         GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult,
     };
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::{BTreeMap, BTreeSet};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -759,10 +759,12 @@ mod tests {
                 .is_none(),
             "a retryable seal failure must NOT mark the group dissolved"
         );
-        assert!(retry_output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure));
+        assert!(
+            retry_output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure)
+        );
 
         // Simulate a non-retryable seal failure (e.g. 403 unauthorized).
         // The staged seal must be cleared and the user must see a
@@ -949,6 +951,159 @@ mod tests {
     }
 
     #[test]
+    fn group_attachment_non_member_cannot_sync_or_decrypt() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        let mut dana = harness_user("dana", DANA_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob, &mut carol, &mut dana]);
+        let mut harness =
+            GroupHarness::with_bundles(&[&alice, &bob, &carol, &dana].map(|u| HarnessUser {
+                name: u.name,
+                bundle: u.bundle.clone(),
+                engine: CoreEngine::new(),
+            }));
+        let (group_id, conversation_id) = harness.create_group(
+            &mut alice,
+            "Project",
+            vec![bob.bundle.user_id.clone(), carol.bundle.user_id.clone()],
+        );
+        harness.import_welcome(&mut bob, &group_id);
+        harness.import_welcome(&mut carol, &group_id);
+        harness.sync_group(&mut bob, &group_id);
+        harness.sync_group(&mut carol, &group_id);
+
+        harness.send_attachment(&mut alice, &conversation_id, sample_attachment_descriptor());
+        harness.sync_group(&mut bob, &group_id);
+        let bob_attachment = group_attachment_message(&bob, &conversation_id);
+
+        let sync_err = dana
+            .engine
+            .handle_command(CoreCommand::SyncGroupOutbox {
+                group_id: group_id.clone(),
+                reason: Some("non-member sync".into()),
+            })
+            .expect_err("non-member must not sync a group without local state");
+        assert_eq!(sync_err.code(), "invalid_input");
+        assert!(
+            !dana.engine.state.group_states.contains_key(&group_id),
+            "non-member must not materialize group state by syncing"
+        );
+        assert!(
+            !dana
+                .engine
+                .state
+                .conversations
+                .contains_key(&conversation_id),
+            "non-member must not materialize the group conversation"
+        );
+        assert!(
+            dana.engine
+                .handle_command(CoreCommand::DownloadAttachment {
+                    conversation_id,
+                    message_id: bob_attachment.0,
+                    reference: bob_attachment.1,
+                    destination: "dana/download/file.bin".into(),
+                })
+                .is_err(),
+            "non-member must not download/decrypt a group attachment"
+        );
+    }
+
+    #[test]
+    fn group_attachment_removed_member_cannot_decrypt_new_attachment() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob, &mut carol]);
+        let mut harness =
+            GroupHarness::with_bundles(&[&alice, &bob, &carol].map(|u| HarnessUser {
+                name: u.name,
+                bundle: u.bundle.clone(),
+                engine: CoreEngine::new(),
+            }));
+        let (group_id, conversation_id) = harness.create_group(
+            &mut alice,
+            "Project",
+            vec![bob.bundle.user_id.clone(), carol.bundle.user_id.clone()],
+        );
+        harness.import_welcome(&mut bob, &group_id);
+        harness.import_welcome(&mut carol, &group_id);
+        harness.sync_group(&mut bob, &group_id);
+        harness.sync_group(&mut carol, &group_id);
+
+        let remove_output = alice
+            .engine
+            .handle_command(CoreCommand::RemoveGroupMember {
+                group_id: group_id.clone(),
+                target_user_id: carol.bundle.user_id.clone(),
+            })
+            .expect("owner removes carol");
+        harness.drain(&mut alice, remove_output);
+        harness.sync_group(&mut bob, &group_id);
+        harness.send_attachment(&mut alice, &conversation_id, sample_attachment_descriptor());
+        harness.sync_group(&mut bob, &group_id);
+        let bob_attachment = group_attachment_message(&bob, &conversation_id);
+        harness.download_attachment(
+            &mut bob,
+            &conversation_id,
+            &bob_attachment.0,
+            &bob_attachment.1,
+            "bob/post-remove/file.bin",
+        );
+        assert_eq!(
+            harness.downloaded_attachments["bob/post-remove/file.bin"],
+            vec![1, 2, 3, 4]
+        );
+
+        let _ = carol
+            .engine
+            .handle_command(CoreCommand::SyncGroupOutbox {
+                group_id: group_id.clone(),
+                reason: Some("removed member attachment sync".into()),
+            })
+            .and_then(|output| Ok(harness.drain(&mut carol, output)));
+        let carol_has_post_remove_attachment = carol
+            .engine
+            .state
+            .conversations
+            .get(&conversation_id)
+            .map(|conversation| {
+                conversation.messages.iter().any(|message| {
+                    message.message_type == MessageType::MlsApplication
+                        && message.message_id == bob_attachment.0
+                })
+            })
+            .unwrap_or_default();
+        assert!(
+            !carol_has_post_remove_attachment,
+            "removed member must not ingest post-remove attachment application messages"
+        );
+        assert!(
+            carol
+                .engine
+                .handle_command(CoreCommand::DownloadAttachment {
+                    conversation_id: conversation_id.clone(),
+                    message_id: bob_attachment.0,
+                    reference: bob_attachment.1,
+                    destination: "carol/post-remove/file.bin".into(),
+                })
+                .is_err(),
+            "removed member must not decrypt a post-remove attachment"
+        );
+        assert!(
+            carol
+                .engine
+                .handle_command(CoreCommand::SendAttachmentMessage {
+                    conversation_id,
+                    attachment_descriptor: sample_attachment_descriptor(),
+                })
+                .is_err(),
+            "removed member must not send new group attachments"
+        );
+    }
+
+    #[test]
     fn group_member_management_remove_e2e() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
@@ -1011,12 +1166,16 @@ mod tests {
         harness.sync_group(&mut bob, &group_id);
         harness.send_text(&mut bob, &conversation_id, "after remove from bob");
         harness.sync_group(&mut alice, &group_id);
-        assert!(group_plaintexts(&bob, &conversation_id)
-            .iter()
-            .any(|text| text == "after remove from alice"));
-        assert!(group_plaintexts(&alice, &conversation_id)
-            .iter()
-            .any(|text| text == "after remove from bob"));
+        assert!(
+            group_plaintexts(&bob, &conversation_id)
+                .iter()
+                .any(|text| text == "after remove from alice")
+        );
+        assert!(
+            group_plaintexts(&alice, &conversation_id)
+                .iter()
+                .any(|text| text == "after remove from bob")
+        );
 
         let carol_before = group_plaintexts(&carol, &conversation_id);
         let _ = carol
@@ -1050,6 +1209,224 @@ mod tests {
                 })
                 .is_err(),
             "removed member must not be able to send attachments"
+        );
+    }
+
+    #[test]
+    fn group_member_management_leave_transfer_and_admin_e2e() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        let mut dana = harness_user("dana", DANA_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob, &mut carol, &mut dana]);
+        let mut harness =
+            GroupHarness::with_bundles(&[&alice, &bob, &carol, &dana].map(|u| HarnessUser {
+                name: u.name,
+                bundle: u.bundle.clone(),
+                engine: CoreEngine::new(),
+            }));
+        let (group_id, conversation_id) = harness.create_group(
+            &mut alice,
+            "Project",
+            vec![
+                bob.bundle.user_id.clone(),
+                carol.bundle.user_id.clone(),
+                dana.bundle.user_id.clone(),
+            ],
+        );
+        harness.import_welcome(&mut bob, &group_id);
+        harness.import_welcome(&mut carol, &group_id);
+        harness.import_welcome(&mut dana, &group_id);
+        harness.sync_group(&mut bob, &group_id);
+        harness.sync_group(&mut carol, &group_id);
+        harness.sync_group(&mut dana, &group_id);
+
+        let bob_leave = bob
+            .engine
+            .handle_command(CoreCommand::LeaveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("bob leaves");
+        harness.drain(&mut bob, bob_leave);
+        let bob_state = bob
+            .engine
+            .state
+            .group_states
+            .get(&group_id)
+            .expect("bob group");
+        assert_eq!(bob_state.local_role, None);
+        assert!(bob_state.manifest.members.iter().any(|member| {
+            member.user_id == bob.bundle.user_id && member.status == GroupMemberStatus::Left
+        }));
+        assert!(
+            bob.engine
+                .handle_command(CoreCommand::SendGroupTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "left member text".into(),
+                })
+                .is_err(),
+            "left member must not send group text"
+        );
+        assert!(
+            bob.engine
+                .handle_command(CoreCommand::SendAttachmentMessage {
+                    conversation_id: conversation_id.clone(),
+                    attachment_descriptor: sample_attachment_descriptor(),
+                })
+                .is_err(),
+            "left member must not send group attachments"
+        );
+        harness.sync_group(&mut alice, &group_id);
+        assert!(
+            alice
+                .engine
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("alice conversation")
+                .messages
+                .iter()
+                .any(|message| message.message_type == MessageType::ControlDeviceMembershipChanged),
+            "owner should receive the visible leave request"
+        );
+
+        assert!(
+            carol
+                .engine
+                .handle_command(CoreCommand::SetGroupAdmin {
+                    group_id: group_id.clone(),
+                    target_user_id: dana.bundle.user_id.clone(),
+                    is_admin: true,
+                })
+                .is_err(),
+            "plain member must not appoint admins"
+        );
+        let promote = alice
+            .engine
+            .handle_command(CoreCommand::SetGroupAdmin {
+                group_id: group_id.clone(),
+                target_user_id: carol.bundle.user_id.clone(),
+                is_admin: true,
+            })
+            .expect("owner promotes carol");
+        harness.drain(&mut alice, promote);
+        harness.sync_group(&mut carol, &group_id);
+        assert_eq!(
+            carol
+                .engine
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("carol group")
+                .local_role,
+            Some(GroupRole::Admin)
+        );
+        let admin_remove = carol
+            .engine
+            .handle_command(CoreCommand::RemoveGroupMember {
+                group_id: group_id.clone(),
+                target_user_id: dana.bundle.user_id.clone(),
+            })
+            .expect("admin removes dana");
+        harness.drain(&mut carol, admin_remove);
+        assert!(
+            carol
+                .engine
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("carol group")
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.user_id == dana.bundle.user_id
+                    && member.status == GroupMemberStatus::Removed)
+        );
+
+        let mut owner = harness_user("owner", ALICE_MNEMONIC, "phone");
+        let mut successor = harness_user("successor", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut owner, &mut successor]);
+        let mut transfer_harness =
+            GroupHarness::with_bundles(&[&owner, &successor].map(|u| HarnessUser {
+                name: u.name,
+                bundle: u.bundle.clone(),
+                engine: CoreEngine::new(),
+            }));
+        let (transfer_group_id, transfer_conversation_id) = transfer_harness.create_group(
+            &mut owner,
+            "Transfer Project",
+            vec![successor.bundle.user_id.clone()],
+        );
+        transfer_harness.import_welcome(&mut successor, &transfer_group_id);
+        transfer_harness.sync_group(&mut successor, &transfer_group_id);
+
+        let transfer = owner
+            .engine
+            .handle_command(CoreCommand::TransferGroupOwnership {
+                group_id: transfer_group_id.clone(),
+                new_owner_user_id: successor.bundle.user_id.clone(),
+            })
+            .expect("transfer ownership to successor");
+        transfer_harness.drain(&mut owner, transfer);
+        transfer_harness.sync_group(&mut successor, &transfer_group_id);
+        assert_eq!(
+            owner
+                .engine
+                .state
+                .group_states
+                .get(&transfer_group_id)
+                .expect("owner group")
+                .local_role,
+            Some(GroupRole::Admin)
+        );
+        assert_eq!(
+            successor
+                .engine
+                .state
+                .group_states
+                .get(&transfer_group_id)
+                .expect("successor group")
+                .local_role,
+            Some(GroupRole::Owner)
+        );
+        assert!(
+            owner
+                .engine
+                .handle_command(CoreCommand::SetGroupAdmin {
+                    group_id: transfer_group_id.clone(),
+                    target_user_id: successor.bundle.user_id.clone(),
+                    is_admin: false,
+                })
+                .is_err(),
+            "former owner must not perform owner-only admin changes"
+        );
+        assert!(
+            owner
+                .engine
+                .handle_command(CoreCommand::LeaveGroup {
+                    group_id: transfer_group_id.clone(),
+                })
+                .is_ok(),
+            "former owner can leave after transfer"
+        );
+        assert!(
+            successor
+                .engine
+                .handle_command(CoreCommand::DissolveGroup {
+                    group_id: transfer_group_id
+                })
+                .is_ok(),
+            "new owner can perform owner-only dissolve"
+        );
+        assert!(
+            owner
+                .engine
+                .handle_command(CoreCommand::SendGroupTextMessage {
+                    conversation_id: transfer_conversation_id,
+                    plaintext: "former owner after leave".into(),
+                })
+                .is_err(),
+            "former owner must not send after leaving"
         );
     }
 
@@ -1381,21 +1758,25 @@ mod tests {
 
         let mut descriptor = sample_attachment_descriptor();
         descriptor.size_bytes = 0;
-        assert!(alice
-            .handle_command(CoreCommand::SendAttachmentMessage {
-                conversation_id: conversation_id.clone(),
-                attachment_descriptor: descriptor,
-            })
-            .is_err());
+        assert!(
+            alice
+                .handle_command(CoreCommand::SendAttachmentMessage {
+                    conversation_id: conversation_id.clone(),
+                    attachment_descriptor: descriptor,
+                })
+                .is_err()
+        );
 
         let mut descriptor = sample_attachment_descriptor();
         descriptor.file_name = Some("nested/file.bin".into());
-        assert!(alice
-            .handle_command(CoreCommand::SendAttachmentMessage {
-                conversation_id,
-                attachment_descriptor: descriptor,
-            })
-            .is_err());
+        assert!(
+            alice
+                .handle_command(CoreCommand::SendAttachmentMessage {
+                    conversation_id,
+                    attachment_descriptor: descriptor,
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -1582,10 +1963,12 @@ mod tests {
             .expect("fetch response");
 
         assert!(output.state_update.conversations_changed);
-        assert!(engine
-            .state
-            .conversations
-            .contains_key(&expected_conversation_id));
+        assert!(
+            engine
+                .state
+                .conversations
+                .contains_key(&expected_conversation_id)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -1803,10 +2186,12 @@ mod tests {
         });
 
         let persist = persist.expect("persist effect");
-        assert!(persist
-            .ops
-            .iter()
-            .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. })));
+        assert!(
+            persist
+                .ops
+                .iter()
+                .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. }))
+        );
         assert!(persist.snapshot.is_some());
     }
 
@@ -1848,10 +2233,12 @@ mod tests {
         let snapshot = extract_snapshot(&output);
 
         assert!(!snapshot.mls_state_persistence_blocked);
-        assert!(snapshot
-            .mls_states
-            .iter()
-            .all(|state| state.serialized_group_state.is_some()));
+        assert!(
+            snapshot
+                .mls_states
+                .iter()
+                .all(|state| state.serialized_group_state.is_some())
+        );
     }
 
     #[test]
@@ -1908,15 +2295,19 @@ mod tests {
             })
             .expect("message request response");
 
-        assert!(!alice
-            .state
-            .pending_outbox
-            .iter()
-            .any(|item| item.envelope.message_id == pending_message_id));
-        assert!(output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval));
+        assert!(
+            !alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| item.envelope.message_id == pending_message_id)
+        );
+        assert!(
+            output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -1968,15 +2359,19 @@ mod tests {
             })
             .expect("rejected response");
 
-        assert!(!alice
-            .state
-            .pending_outbox
-            .iter()
-            .any(|item| item.envelope.message_id == pending_message_id));
-        assert!(output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy));
+        assert!(
+            !alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| item.envelope.message_id == pending_message_id)
+        );
+        assert!(
+            output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy)
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -2151,10 +2546,12 @@ mod tests {
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
 
-        assert!(resumed
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. })));
+        assert!(
+            resumed
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. }))
+        );
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -2467,10 +2864,12 @@ mod tests {
                     if timer.timer_id == format!("refresh_identity:{}", bob_bundle.user_id)
                 )));
             } else {
-                assert!(output
-                    .state_update
-                    .system_statuses_changed
-                    .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
+                assert!(
+                    output
+                        .state_update
+                        .system_statuses_changed
+                        .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild)
+                );
             }
         }
 
@@ -2791,10 +3190,12 @@ mod tests {
                     })
                     .expect("retry timer");
             } else {
-                assert!(!output
-                    .effects
-                    .iter()
-                    .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
+                assert!(
+                    !output
+                        .effects
+                        .iter()
+                        .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. }))
+                );
             }
         }
 
@@ -3052,11 +3453,13 @@ mod tests {
             .get(&merged.user_id)
             .expect("updated contact");
         assert_eq!(updated.bundle.devices.len(), 2);
-        assert!(updated
-            .bundle
-            .devices
-            .iter()
-            .any(|device| device.device_id == bob_laptop_profile.device_id));
+        assert!(
+            updated
+                .bundle
+                .devices
+                .iter()
+                .any(|device| device.device_id == bob_laptop_profile.device_id)
+        );
     }
 
     #[test]
@@ -3172,12 +3575,16 @@ mod tests {
             })
             .collect();
         assert!(!remove_commits.is_empty());
-        assert!(remove_commits
-            .iter()
-            .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
-        assert!(remove_commits
-            .iter()
-            .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id));
+        assert!(
+            remove_commits
+                .iter()
+                .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id)
+        );
+        assert!(
+            remove_commits
+                .iter()
+                .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id)
+        );
     }
 
     #[test]
@@ -3302,18 +3709,22 @@ mod tests {
                     .iter()
                     .any(|message| message.message_type == MessageType::MlsWelcome)
         }));
-        assert!(restored.state.pending_outbox[pending_before..]
-            .iter()
-            .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            }));
-        assert!(restored.state.pending_outbox[pending_before..]
-            .iter()
-            .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsWelcome
-            }));
+        assert!(
+            restored.state.pending_outbox[pending_before..]
+                .iter()
+                .any(|item| {
+                    item.envelope.conversation_id == conversation_id
+                        && item.envelope.message_type == MessageType::MlsCommit
+                })
+        );
+        assert!(
+            restored.state.pending_outbox[pending_before..]
+                .iter()
+                .any(|item| {
+                    item.envelope.conversation_id == conversation_id
+                        && item.envelope.message_type == MessageType::MlsWelcome
+                })
+        );
         assert_eq!(
             restored
                 .state
@@ -3358,14 +3769,18 @@ mod tests {
             .expect("reimport deployment");
 
         assert_eq!(publish_shared_state_effects(&output).len(), 2);
-        assert!(publish_shared_state_effects(&output)
-            .iter()
-            .any(|publish| publish.document_kind
-                == crate::transport_contract::SharedStateDocumentKind::IdentityBundle));
-        assert!(publish_shared_state_effects(&output)
-            .iter()
-            .any(|publish| publish.document_kind
-                == crate::transport_contract::SharedStateDocumentKind::DeviceStatus));
+        assert!(
+            publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind
+                    == crate::transport_contract::SharedStateDocumentKind::IdentityBundle)
+        );
+        assert!(
+            publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind
+                    == crate::transport_contract::SharedStateDocumentKind::DeviceStatus)
+        );
     }
 
     #[test]
