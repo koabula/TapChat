@@ -24,6 +24,7 @@ import {
   transferGroupOwnership,
 } from "@/lib/tauri";
 import type { GroupMember, GroupRole } from "@/lib/types";
+import { canPerform } from "@/lib/groupPermissions";
 import DissolveConfirmDialog from "./DissolveConfirmDialog";
 import GroupInviteDialog from "./GroupInviteDialog";
 import GroupJoinApprovalPanel from "./GroupJoinApprovalPanel";
@@ -97,17 +98,25 @@ export default function GroupMemberDrawer({
     () => members.filter((m) => m.status === "active"),
     [members],
   );
-  const otherOwnersPresent = useMemo(
-    () => members.some((m) => m.role === "owner" && m.user_id !== localUserId),
-    [members, localUserId],
-  );
   const canLeave = useMemo(() => {
-    // Per R10.5 an owner cannot leave until ownership has been
-    // transferred away. Admins and members may leave freely.
-    if (dissolved) return false;
-    if (!isOwner) return true;
-    return otherOwnersPresent;
-  }, [dissolved, isOwner, otherOwnersPresent]);
+    if (!snapshot) return false;
+    return canPerform("leave", {
+      manifest: snapshot.manifest,
+      localRole,
+      localUserId,
+      dissolvedAt: snapshot.dissolved_at ?? null,
+    });
+  }, [snapshot, localRole, localUserId]);
+
+  const canDissolve = useMemo(() => {
+    if (!snapshot) return false;
+    return canPerform("dissolve", {
+      manifest: snapshot.manifest,
+      localRole,
+      localUserId,
+      dissolvedAt: snapshot.dissolved_at ?? null,
+    });
+  }, [snapshot, localRole, localUserId]);
 
   const runCommand = async (
     id: string,
@@ -267,7 +276,7 @@ export default function GroupMemberDrawer({
         >
           <LogOut size={16} /> Leave group
         </button>
-        {isOwner && !dissolved && (
+        {isOwner && canDissolve && (
           <button
             className="btn btn-danger w-full justify-start text-sm"
             onClick={() => setDissolveOpen(true)}
@@ -339,10 +348,6 @@ function MemberList({
   onToggleAdmin,
   onTransfer,
 }: MemberListProps) {
-  const isOwner = localRole === "owner";
-  const isAdmin = localRole === "admin";
-  const isPrivileged = isOwner || isAdmin;
-
   const sorted = [...members].sort((a, b) => {
     // Owner → admin → member; within a role sort by user_id.
     const rank = (role: GroupRole) =>
@@ -352,6 +357,32 @@ function MemberList({
     }
     return a.user_id.localeCompare(b.user_id);
   });
+
+  // Stable manifest projection for the `canPerform` calls below. We
+  // derive it once per render instead of re-constructing for every
+  // row.
+  const manifestForGate = useMemo(() => {
+    // `canPerform` only reads the `members` and `member_invite_policy`
+    // fields on this code path, so we build a minimal projection.
+    return {
+      version: "0.1",
+      group_id: "",
+      conversation_id: "",
+      title: "",
+      owner_user_id: "",
+      admins: [],
+      members,
+      join_policy: "closed",
+      member_invite_policy: "owner_admin_only",
+      roster_version: 0,
+      mls_epoch_hint: 0,
+      outbox: { endpoint: "" },
+      updated_at: 0,
+      signer_user_id: "",
+      signer_device_id: "",
+      signature: "",
+    } as const;
+  }, [members]);
 
   return (
     <ul className="p-3 space-y-2">
@@ -366,19 +397,19 @@ function MemberList({
                 ? "Transferring..."
                 : null;
 
-        // Cosmetic gating per R14: hide destructive actions for roles
-        // the core will reject anyway. The core is still authoritative.
-        const canRemove =
-          isPrivileged &&
-          !dissolved &&
-          !isSelf &&
-          member.role !== "owner" &&
-          // Admins may only remove ordinary members.
-          (isOwner || member.role === "member");
-        const canToggleAdmin =
-          isOwner && !dissolved && !isSelf && member.role !== "owner";
-        const canTransfer =
-          isOwner && !dissolved && !isSelf;
+        // Authoritative gate: canPerform covers every rule from
+        // §5.1 plus dissolved / removed / left cases, matched by
+        // the fast-check property test on §5.1.
+        const gateCtx = {
+          manifest: manifestForGate as unknown as import("@/lib/types").GroupManifest,
+          localRole,
+          localUserId,
+          dissolvedAt: dissolved ? Date.now() : null,
+          target: member,
+        };
+        const canRemove = canPerform("remove_member", gateCtx);
+        const canToggleAdmin = canPerform("set_admin", gateCtx);
+        const canTransfer = canPerform("transfer_ownership", gateCtx);
 
         return (
           <li
