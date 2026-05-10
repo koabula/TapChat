@@ -127,6 +127,7 @@ export type GroupMessageType =
   | "control_group_join_approved"
   | "control_group_join_rejected"
   | "control_group_leave_requested"
+  | "control_group_dissolved"
   | "control_conversation_needs_rebuild";
 
 export type GroupEnvelopeVisibility = "visible" | "protocol";
@@ -202,6 +203,17 @@ export interface GetGroupOutboxHeadResult {
 export interface GetGroupOutboxHeadRequest {
   groupId: string;
   capability: GroupCapability;
+}
+
+export interface SealGroupOutboxRequest {
+  groupId: string;
+  capability: GroupCapability;
+}
+
+export interface SealGroupOutboxResult {
+  sealed: boolean;
+  sealedAt: number;
+  wasAlreadySealed: boolean;
 }
 
 export interface GroupRealtimeSubscriptionRequest {

@@ -120,7 +120,8 @@ export type GroupCapabilityOperation =
   | "manage_invites"
   | "approve_join"
   | "remove_member"
-  | "update_group_metadata";
+  | "update_group_metadata"
+  | "seal_group";
 
 export interface GroupCapability {
   version: string;
@@ -143,6 +144,7 @@ export type GroupMessageType =
   | "control_group_join_approved"
   | "control_group_join_rejected"
   | "control_group_leave_requested"
+  | "control_group_dissolved"
   | "control_conversation_needs_rebuild";
 
 export type GroupEnvelopeVisibility = "visible" | "protocol";
@@ -351,6 +353,7 @@ export type CoreEffect =
   | { type: "append_group_envelope"; append: AppendGroupEnvelopeRequest }
   | { type: "fetch_group_outbox"; fetch: FetchGroupOutboxRequest }
   | { type: "get_group_outbox_head"; get: GetGroupOutboxHeadRequest }
+  | { type: "seal_group_outbox"; seal: SealGroupOutboxRequest }
   | { type: "fetch_welcome_pickup"; fetch: FetchWelcomePickupRequest }
   | { type: "put_welcome_pickup"; put: PutWelcomePickupRequest }
   | { type: "fetch_identity_bundle"; fetch: FetchIdentityBundleRequest }
@@ -411,6 +414,11 @@ interface FetchGroupOutboxRequest {
 }
 
 interface GetGroupOutboxHeadRequest {
+  group_id: string;
+  capability: GroupCapability;
+}
+
+export interface SealGroupOutboxRequest {
   group_id: string;
   capability: GroupCapability;
 }
