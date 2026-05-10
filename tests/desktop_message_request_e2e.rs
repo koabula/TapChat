@@ -1,15 +1,13 @@
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use serde_json::Value;
+use anyhow::{anyhow, Context, Result};
+use common::{
+    binary_path, bundle_auth, export_identity_bundle_to_path, read_json_file, repo_temp_dir,
+    required_str, run_cli_json, with_tokio, workspace_root, write_json_file, write_mnemonic_file,
+};
 use tapchat_core::desktop_app;
-use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle, MessageType};
+use tapchat_core::model::{IdentityBundle, MessageType};
 use tapchat_transport_adapter::CloudflareRuntimeHandle;
-use tempfile::{Builder, TempDir};
 
 const ALICE_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -235,6 +233,11 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
     let bob_messages_after = desktop_app::message_list(&bob_profile, &bob_conversation_id)?;
     assert_has_plaintext_application(&bob_messages_after, "second from alice")?;
 
+    // Silence the unused-import warning — these helpers are exercised
+    // only when this test is stressed; keeping the binding lets the
+    // common module surface dead-code in a single place.
+    let _ = (binary_path(), alice_device_id, bob_device_id, alice_user_id);
+
     Ok(())
 }
 
@@ -256,121 +259,4 @@ fn assert_has_plaintext_application(
             .map(|message| (&message.message_type, &message.plaintext))
             .collect::<Vec<_>>()
     ))
-}
-
-fn bundle_auth(bundle: &DeploymentBundle) -> Result<&DeviceRuntimeAuth> {
-    bundle
-        .device_runtime_auth
-        .as_ref()
-        .ok_or_else(|| anyhow!("deployment bundle missing device runtime auth"))
-}
-
-fn export_identity_bundle_to_path(
-    registry_path: &Path,
-    root: &Path,
-    profile: &Path,
-    name: &str,
-) -> Result<PathBuf> {
-    let output = root.join(name);
-    let exported = run_cli_json(
-        registry_path,
-        [
-            "profile",
-            "export-identity",
-            "--profile",
-            &profile.to_string_lossy(),
-            "--out",
-            &output.to_string_lossy(),
-        ],
-    )?;
-    assert_eq!(
-        required_str(&exported, "written")?,
-        output.to_string_lossy()
-    );
-    Ok(output)
-}
-
-fn run_cli_json<I, S>(registry_path: &Path, args: I) -> Result<Value>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut command = Command::new(binary_path());
-    command
-        .current_dir(workspace_root())
-        .arg("--output")
-        .arg("json")
-        .env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path);
-    for arg in args {
-        command.arg(arg.as_ref());
-    }
-    let output = command.output().context("run tapchat cli")?;
-    if !output.status.success() {
-        bail!(
-            "tapchat command failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let stdout = String::from_utf8(output.stdout).context("decode cli stdout as utf-8")?;
-    serde_json::from_str(&stdout).map_err(|error| {
-        anyhow!(
-            "failed to parse cli json output: {error}\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })
-}
-
-fn required_str(value: &Value, field: &str) -> Result<String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("missing string field {field}"))
-}
-
-fn write_mnemonic_file(root: &Path, name: &str, mnemonic: &str) -> Result<PathBuf> {
-    let path = root.join(name);
-    fs::write(&path, mnemonic).with_context(|| format!("write mnemonic {}", path.display()))?;
-    Ok(path)
-}
-
-fn write_json_file<T: Serialize>(root: &Path, name: &str, value: &T) -> Result<PathBuf> {
-    let path = root.join(name);
-    fs::write(&path, serde_json::to_vec_pretty(value)?)
-        .with_context(|| format!("write json {}", path.display()))?;
-    Ok(path)
-}
-
-fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("decode {}", path.display()))
-}
-
-fn repo_temp_dir(suffix: &str) -> Result<TempDir> {
-    Builder::new()
-        .prefix(&format!(".tmp-desktop-e2e-{suffix}-"))
-        .tempdir_in(workspace_root())
-        .context("create desktop e2e temp dir")
-}
-
-fn binary_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_tapchat"))
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn with_tokio<F, Fut, T>(build: F) -> Result<T>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop e2e helper")?
-        .block_on(build())
 }

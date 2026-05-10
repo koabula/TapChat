@@ -226,7 +226,12 @@ fn last_application_preview(
     messages
         .iter()
         .rev()
-        .find(|msg| matches!(msg.message_type, tapchat_core::model::MessageType::MlsApplication))
+        .find(|msg| {
+            matches!(
+                msg.message_type,
+                tapchat_core::model::MessageType::MlsApplication
+            )
+        })
         .and_then(|msg| msg.plaintext.as_ref())
         .map(|text| {
             if text.chars().count() > 50 {
@@ -242,12 +247,15 @@ fn last_application_preview(
 /// Count the user-facing application messages in a conversation so the
 /// sidebar can surface a total. Mirrors the convention used by
 /// `commands/conversation.rs::list_conversations`.
-fn application_message_count(
-    messages: &[tapchat_core::conversation::StoredMessage],
-) -> usize {
+fn application_message_count(messages: &[tapchat_core::conversation::StoredMessage]) -> usize {
     messages
         .iter()
-        .filter(|msg| matches!(msg.message_type, tapchat_core::model::MessageType::MlsApplication))
+        .filter(|msg| {
+            matches!(
+                msg.message_type,
+                tapchat_core::model::MessageType::MlsApplication
+            )
+        })
         .count()
 }
 
@@ -264,6 +272,16 @@ fn application_message_count(
 #[tauri::command]
 pub async fn list_group_conversations(
     state: State<'_, AppState>,
+) -> Result<Vec<GroupConversationSummary>, String> {
+    list_group_conversations_impl(state.inner()).await
+}
+
+/// Shared body for [`list_group_conversations`] and the test-path
+/// equivalent used by `tests/desktop_group_e2e.rs`. Reads the
+/// engine snapshot and projects every group conversation into the
+/// sidebar-ready view.
+pub async fn list_group_conversations_impl(
+    state: &AppState,
 ) -> Result<Vec<GroupConversationSummary>, String> {
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
@@ -310,6 +328,15 @@ pub async fn list_group_conversations(
 #[tauri::command]
 pub async fn get_group_snapshot(
     state: State<'_, AppState>,
+    group_id: String,
+) -> Result<GroupSnapshotView, String> {
+    get_group_snapshot_impl(state.inner(), group_id).await
+}
+
+/// Shared body for [`get_group_snapshot`]. Mirrors the production
+/// command behaviour except that tests don't need an `AppHandle`.
+pub async fn get_group_snapshot_impl(
+    state: &AppState,
     group_id: String,
 ) -> Result<GroupSnapshotView, String> {
     let inner = state.inner.read().await;
@@ -383,6 +410,16 @@ pub async fn get_group_snapshot(
 #[tauri::command]
 pub async fn get_group_messages(
     state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Vec<GroupMessageView>, String> {
+    get_group_messages_impl(state.inner(), conversation_id).await
+}
+
+/// Shared body for [`get_group_messages`]. Identical snapshot walk;
+/// the only difference vs. the production command is the lack of
+/// `State<'_, AppState>` indirection.
+pub async fn get_group_messages_impl(
+    state: &AppState,
     conversation_id: String,
 ) -> Result<Vec<GroupMessageView>, String> {
     let inner = state.inner.read().await;
@@ -503,7 +540,9 @@ pub async fn create_group_conversation(
         .view_model
         .as_ref()
         .and_then(|vm| vm.conversations.first())
-        .ok_or_else(|| "core did not return a conversation summary for the new group".to_string())?;
+        .ok_or_else(|| {
+            "core did not return a conversation summary for the new group".to_string()
+        })?;
     let group_id = summary
         .group_id
         .clone()
@@ -1008,12 +1047,8 @@ pub async fn get_group_join_request_status(
     let persisted = snapshot
         .group_join_requests
         .iter()
-        .find(|persisted| {
-            persisted.group_id == group_id && persisted.request_id == request_id
-        })
-        .ok_or_else(|| {
-            format!("join request '{request_id}' not found for group '{group_id}'")
-        })?;
+        .find(|persisted| persisted.group_id == group_id && persisted.request_id == request_id)
+        .ok_or_else(|| format!("join request '{request_id}' not found for group '{group_id}'"))?;
 
     let group_imported = snapshot
         .group_states
@@ -1253,12 +1288,11 @@ pub async fn update_group_metadata(
     }
     // Reject a no-op call so we don't waste a roster_version bump.
     if title.is_none() && join_policy.is_none() && member_invite_policy.is_none() {
-        return Err("at least one field (title, join_policy, member_invite_policy) must be supplied".into());
+        return Err(
+            "at least one field (title, join_policy, member_invite_policy) must be supplied".into(),
+        );
     }
-    let parsed_join_policy = join_policy
-        .as_deref()
-        .map(parse_join_policy)
-        .transpose()?;
+    let parsed_join_policy = join_policy.as_deref().map(parse_join_policy).transpose()?;
     let parsed_member_invite_policy = member_invite_policy
         .as_deref()
         .map(parse_member_invite_policy)
@@ -1387,7 +1421,6 @@ fn _reserve_crypto_imports() {
     let _ = Sha256::new();
 }
 
-
 // ---------------------------------------------------------------------------
 // Pure argument-normalisation helper for `create_group_conversation`.
 //
@@ -1426,4 +1459,761 @@ pub(crate) fn normalize_create_group_inputs(
         return Err("at least one member user id is required".into());
     }
     Ok((trimmed_title, members))
+}
+
+// ---------------------------------------------------------------------------
+// Test-accessible `_impl` siblings for every write-path Tauri command.
+//
+// Architecture note (Wave G.4 / Path C from the spec investigation):
+//
+// The desktop crate is a `cdylib` (Tauri needs it to build the webview
+// container). Rust integration tests under `tests/*.rs` live in the
+// root crate and therefore cannot call `#[tauri::command]` functions
+// directly — those bodies require an `AppHandle`, which in turn
+// requires a running webview event loop we deliberately don't start
+// for unit tests.
+//
+// So for every write-path group Tauri command `foo(app, ...)` we
+// expose a sibling `foo_impl(state: &AppState, ...)` whose body
+// mirrors the production command's logic **byte-for-byte**, except:
+//
+//   1. `drive_core_with_handle(&app, ...)` is replaced with
+//      `drive_core_without_handle(state, ...)` — same effect-draining
+//      and persistence semantics, skipping only the UI emit and the
+//      `AppHandle::emit("core-update", ...)`.
+//   2. `app.state::<AppState>()` reads become direct `state.inner.read()`
+//      calls (the `State<'_, AppState>` indirection from Tauri is
+//      absent here).
+//
+// The production `#[tauri::command]` bodies above are left **unchanged**
+// to keep the regression surface at zero. Any divergence between the
+// two paths is either an input-validation rule (which lives in a
+// pure helper: `normalize_create_group_inputs`, `parse_join_policy`,
+// `parse_member_invite_policy`, all called by both paths) or an
+// arithmetic projection over the post-drive snapshot (which is small
+// enough per-command that duplication is cheaper than a generic
+// async-closure-taking helper).
+// ---------------------------------------------------------------------------
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::lifecycle::drive_core_without_handle;
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn create_group_conversation_impl(
+    state: &AppState,
+    title: String,
+    member_user_ids: Vec<String>,
+) -> Result<CreateGroupConversationResult, String> {
+    let (trimmed_title, members) = normalize_create_group_inputs(&title, &member_user_ids)?;
+
+    let output = drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::CreateGroupConversation {
+            title: trimmed_title,
+            member_user_ids: members,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+
+    let summary = output
+        .view_model
+        .as_ref()
+        .and_then(|vm| vm.conversations.first())
+        .ok_or_else(|| {
+            "core did not return a conversation summary for the new group".to_string()
+        })?;
+    let group_id = summary
+        .group_id
+        .clone()
+        .ok_or_else(|| "new conversation is missing a group_id".to_string())?;
+    let conversation_id = summary.conversation_id.clone();
+
+    let welcome_pickups: Vec<WelcomePickupShareable> = output
+        .view_model
+        .as_ref()
+        .map(|vm| {
+            vm.welcome_pickups
+                .iter()
+                .map(WelcomePickupShareable::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let local_role = snapshot
+        .group_states
+        .iter()
+        .find(|st| st.group_id == group_id)
+        .and_then(|st| st.local_role);
+
+    let pending_group_outbox = snapshot
+        .pending_group_outbox
+        .iter()
+        .filter(|item| item.envelope.group_id == group_id)
+        .count();
+
+    Ok(CreateGroupConversationResult {
+        group_id,
+        conversation_id,
+        title: summary.title.clone().unwrap_or_default(),
+        member_count: summary.member_count.unwrap_or_default(),
+        local_role,
+        welcome_pickups,
+        pending_group_outbox,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn send_group_text_message_impl(
+    state: &AppState,
+    conversation_id: String,
+    plaintext: String,
+) -> Result<SendGroupTextResult, String> {
+    if plaintext.is_empty() {
+        return Err("plaintext must not be empty".into());
+    }
+
+    let output = drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::SendGroupTextMessage {
+            conversation_id: conversation_id.clone(),
+            plaintext: plaintext.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let message_id = output
+        .view_model
+        .as_ref()
+        .and_then(|vm| vm.messages.first())
+        .map(|m| m.message_id.clone())
+        .unwrap_or_default();
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+    let (sender_user_id, sender_device_id) = snapshot
+        .local_identity
+        .as_ref()
+        .map(|li| {
+            (
+                li.state.user_identity.user_id.clone(),
+                li.state.device_identity.device_id.clone(),
+            )
+        })
+        .unwrap_or_default();
+
+    let group_id = snapshot
+        .group_states
+        .iter()
+        .find(|g| g.conversation_id == conversation_id)
+        .map(|g| g.group_id.clone());
+    let pending_group_outbox = group_id
+        .as_ref()
+        .map(|gid| {
+            snapshot
+                .pending_group_outbox
+                .iter()
+                .filter(|item| item.envelope.group_id == *gid)
+                .count()
+        })
+        .unwrap_or_default();
+
+    Ok(SendGroupTextResult {
+        message_id,
+        conversation_id,
+        sender_user_id,
+        sender_device_id,
+        plaintext,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        pending_group_outbox,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn sync_group_outbox_impl(
+    state: &AppState,
+    group_id: String,
+    reason: Option<String>,
+) -> Result<SyncGroupOutboxResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::SyncGroupOutbox {
+            group_id: group_id.clone(),
+            reason,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+    let cursor = snapshot
+        .group_cursors
+        .iter()
+        .find(|persisted| persisted.group_id == group_id)
+        .map(|persisted| persisted.cursor.clone());
+    let dissolved_at = snapshot
+        .group_states
+        .iter()
+        .find(|st| st.group_id == group_id)
+        .and_then(|st| st.dissolved_at);
+
+    Ok(SyncGroupOutboxResult {
+        group_id,
+        cursor,
+        dissolved_at,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn invite_to_group_impl(
+    state: &AppState,
+    group_id: String,
+    invitee_user_ids: Vec<String>,
+) -> Result<InviteToGroupResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    let invitees: Vec<String> = invitee_user_ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if invitees.is_empty() {
+        return Err("at least one invitee user id is required".into());
+    }
+
+    let output = drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::InviteToGroup {
+            group_id: group_id.clone(),
+            invitee_user_ids: invitees,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let welcome_pickups: Vec<WelcomePickupShareable> = output
+        .view_model
+        .as_ref()
+        .map(|vm| {
+            vm.welcome_pickups
+                .iter()
+                .map(WelcomePickupShareable::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(InviteToGroupResult {
+        group_id,
+        welcome_pickups,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn create_group_invite_link_impl(
+    state: &AppState,
+    group_id: String,
+    expires_at: u64,
+    max_uses: Option<u64>,
+) -> Result<CreateGroupInviteLinkResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if expires_at <= now_ms {
+        return Err("expires_at must be in the future".into());
+    }
+    if let Some(max) = max_uses {
+        if max == 0 {
+            return Err("max_uses must be greater than zero when supplied".into());
+        }
+    }
+
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::CreateGroupInviteLink {
+            group_id: group_id.clone(),
+            expires_at,
+            max_uses,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+    let invite = snapshot
+        .group_invites
+        .iter()
+        .filter(|invite| invite.group_id == group_id)
+        .next_back()
+        .cloned()
+        .ok_or_else(|| "core did not persist the new invite".to_string())?;
+
+    Ok(CreateGroupInviteLinkResult {
+        group_id: invite.group_id,
+        invite_id: invite.invite_id,
+        invite_url: invite.invite_url,
+        expires_at: invite.document.expires_at,
+        max_uses: invite.document.max_uses,
+        join_policy: invite.document.join_policy,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn revoke_group_invite_link_impl(
+    state: &AppState,
+    group_id: String,
+    invite_id: String,
+) -> Result<RevokeGroupInviteLinkResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if invite_id.trim().is_empty() {
+        return Err("invite_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::RevokeGroupInviteLink {
+            group_id: group_id.clone(),
+            invite_id: invite_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(RevokeGroupInviteLinkResult {
+        group_id,
+        invite_id,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn list_group_invites_impl(
+    state: &AppState,
+    group_id: String,
+) -> Result<Vec<GroupInviteView>, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+    let invites = snapshot
+        .group_invites
+        .iter()
+        .filter(|invite| invite.group_id == group_id)
+        .map(GroupInviteView::from)
+        .collect();
+    Ok(invites)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn submit_group_join_request_impl(
+    state: &AppState,
+    invite_url: String,
+) -> Result<SubmitGroupJoinRequestResult, String> {
+    let trimmed = invite_url.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("invite_url must not be empty".into());
+    }
+
+    let is_welcome_pickup = trimmed.starts_with("tapchat://welcome-pickup/");
+    let command = if is_welcome_pickup {
+        CoreCommand::RequestJoinGroup {
+            invite_url: trimmed.clone(),
+        }
+    } else {
+        CoreCommand::SubmitGroupJoinRequest {
+            invite_url: trimmed.clone(),
+        }
+    };
+
+    let output = drive_core_without_handle(state, CoreInput::Command(command))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if is_welcome_pickup {
+        let inner = state.inner.read().await;
+        let snapshot = inner.engine.refresh_snapshot();
+        let group = output
+            .view_model
+            .as_ref()
+            .and_then(|vm| vm.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .or_else(|| snapshot.group_states.last().map(|st| st.group_id.clone()))
+            .ok_or_else(|| "welcome pickup did not import a group".to_string())?;
+        return Ok(SubmitGroupJoinRequestResult {
+            request_id: format!("pickup:{group}"),
+            group_id: group,
+            status: "approved".into(),
+        });
+    }
+
+    let request = output
+        .view_model
+        .as_ref()
+        .and_then(|vm| vm.group_join_requests.first())
+        .cloned()
+        .ok_or_else(|| "core did not return a join request".to_string())?;
+    Ok(SubmitGroupJoinRequestResult {
+        request_id: request.request_id,
+        group_id: request.group_id,
+        status: format!("{:?}", request.status).to_lowercase(),
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn list_group_join_requests_impl(
+    state: &AppState,
+    group_id: String,
+) -> Result<Vec<GroupJoinRequestView>, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    let output = drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::ListGroupJoinRequests {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let requests = output
+        .view_model
+        .map(|vm| {
+            vm.group_join_requests
+                .iter()
+                .filter(|request| request.group_id == group_id)
+                .map(GroupJoinRequestView::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(requests)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn get_group_join_request_status_impl(
+    state: &AppState,
+    group_id: String,
+    request_id: String,
+) -> Result<GroupJoinStatusView, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if request_id.trim().is_empty() {
+        return Err("request_id must not be empty".into());
+    }
+
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::GetGroupJoinRequestStatus {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+
+    let persisted = snapshot
+        .group_join_requests
+        .iter()
+        .find(|persisted| persisted.group_id == group_id && persisted.request_id == request_id)
+        .ok_or_else(|| format!("join request '{request_id}' not found for group '{group_id}'"))?;
+
+    let group_imported = snapshot
+        .group_states
+        .iter()
+        .any(|st| st.group_id == group_id);
+
+    let welcome_pickup = persisted
+        .welcome_pickup
+        .as_ref()
+        .map(WelcomePickupShareable::from);
+
+    Ok(GroupJoinStatusView {
+        group_id: persisted.group_id.clone(),
+        request_id: persisted.request_id.clone(),
+        status: format!("{:?}", persisted.request.status).to_lowercase(),
+        group_imported,
+        welcome_pickup,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn approve_group_join_impl(
+    state: &AppState,
+    group_id: String,
+    request_id: String,
+) -> Result<ApproveGroupJoinResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if request_id.trim().is_empty() {
+        return Err("request_id must not be empty".into());
+    }
+
+    let output = drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::ApproveGroupJoin {
+            group_id: group_id.clone(),
+            request_id: request_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let welcome_pickups: Vec<WelcomePickupShareable> = output
+        .view_model
+        .as_ref()
+        .map(|vm| {
+            vm.welcome_pickups
+                .iter()
+                .map(WelcomePickupShareable::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(ApproveGroupJoinResult {
+        group_id,
+        request_id,
+        welcome_pickups,
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn reject_group_join_impl(
+    state: &AppState,
+    group_id: String,
+    request_id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if request_id.trim().is_empty() {
+        return Err("request_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::RejectGroupJoin {
+            group_id,
+            request_id,
+            reason,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn leave_group_impl(state: &AppState, group_id: String) -> Result<(), String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::LeaveGroup { group_id }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn remove_group_member_impl(
+    state: &AppState,
+    group_id: String,
+    target_user_id: String,
+) -> Result<(), String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if target_user_id.trim().is_empty() {
+        return Err("target_user_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::RemoveGroupMember {
+            group_id,
+            target_user_id,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn transfer_group_ownership_impl(
+    state: &AppState,
+    group_id: String,
+    new_owner_user_id: String,
+) -> Result<(), String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if new_owner_user_id.trim().is_empty() {
+        return Err("new_owner_user_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::TransferGroupOwnership {
+            group_id,
+            new_owner_user_id,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn set_group_admin_impl(
+    state: &AppState,
+    group_id: String,
+    target_user_id: String,
+    is_admin: bool,
+) -> Result<(), String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if target_user_id.trim().is_empty() {
+        return Err("target_user_id must not be empty".into());
+    }
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::SetGroupAdmin {
+            group_id,
+            target_user_id,
+            is_admin,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn update_group_metadata_impl(
+    state: &AppState,
+    group_id: String,
+    title: Option<String>,
+    join_policy: Option<String>,
+    member_invite_policy: Option<String>,
+) -> Result<UpdateGroupMetadataResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    if title.is_none() && join_policy.is_none() && member_invite_policy.is_none() {
+        return Err(
+            "at least one field (title, join_policy, member_invite_policy) must be supplied".into(),
+        );
+    }
+    let parsed_join_policy = join_policy.as_deref().map(parse_join_policy).transpose()?;
+    let parsed_member_invite_policy = member_invite_policy
+        .as_deref()
+        .map(parse_member_invite_policy)
+        .transpose()?;
+    let trimmed_title = title.map(|s| s.trim().to_string());
+    if let Some(ref t) = trimmed_title {
+        if t.is_empty() {
+            return Err("title must not be whitespace-only".into());
+        }
+    }
+
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::UpdateGroupMetadata {
+            group_id: group_id.clone(),
+            title: trimmed_title,
+            join_policy: parsed_join_policy,
+            member_invite_policy: parsed_member_invite_policy,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+    let manifest = snapshot
+        .group_states
+        .iter()
+        .find(|st| st.group_id == group_id)
+        .map(|st| st.manifest.clone())
+        .ok_or_else(|| format!("group '{group_id}' not found after update"))?;
+
+    Ok(UpdateGroupMetadataResult {
+        group_id,
+        title: Some(manifest.title),
+        join_policy: Some(manifest.join_policy),
+        member_invite_policy: Some(manifest.member_invite_policy),
+        roster_version: Some(manifest.roster_version),
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn dissolve_group_impl(
+    state: &AppState,
+    group_id: String,
+) -> Result<DissolveGroupResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::DissolveGroup {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+    let group = snapshot
+        .group_states
+        .iter()
+        .find(|st| st.group_id == group_id)
+        .ok_or_else(|| format!("group '{group_id}' not found after dissolve"))?;
+    let conversation_state = snapshot
+        .conversations
+        .iter()
+        .find(|c| c.conversation_id == group.conversation_id)
+        .map(|c| conversation_state_string(c.state.conversation.state))
+        .unwrap_or_else(|| "active".into());
+    let pending_group_outbox = snapshot
+        .pending_group_outbox
+        .iter()
+        .filter(|item| item.envelope.group_id == group_id)
+        .count();
+
+    Ok(DissolveGroupResult {
+        group_id: group.group_id.clone(),
+        conversation_id: Some(group.conversation_id.clone()),
+        dissolved_at: group.dissolved_at,
+        conversation_state,
+        pending_group_outbox,
+    })
 }

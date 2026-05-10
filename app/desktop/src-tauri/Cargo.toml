@@ -7,6 +7,14 @@ edition = "2021"
 name = "tapchat_desktop_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+# Exposes test helpers (`build_test_app_state_for_profile`,
+# `drive_core_without_handle`, and `pub use`-re-exports of the group
+# command `_impl` functions) that the desktop integration test
+# `tests/desktop_group_e2e.rs` in the root crate depends on. Not
+# enabled in production builds.
+test-support = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

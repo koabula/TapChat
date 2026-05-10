@@ -300,6 +300,53 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
     Ok(output)
 }
 
+/// Test-only sibling of [`drive_core_with_handle`] that does NOT require
+/// a `tauri::AppHandle`. Used by the desktop integration test
+/// `tests/desktop_group_e2e.rs` to exercise the group Tauri command
+/// `_impl` functions without spinning up a webview (the webview2
+/// DLL linkage Tauri's `cdylib` introduces on Windows is the main reason
+/// we can't just call the `#[tauri::command]` bodies directly from a
+/// pure `cargo test` integration binary).
+///
+/// Behavioural parity with `drive_core_with_handle`, minus the two
+/// UI-only bits:
+///   1. `ports.set_app_handle(..)` is **not** called. A downstream
+///      effect that genuinely depends on the handle (realtime progress
+///      emits, timer callbacks that drive core, etc.) will no-op
+///      instead of panicking — platform ports already guard for the
+///      "no handle" case, per `ports/timer.rs::schedule_timer`.
+///   2. `app.emit("core-update", ..)` is skipped. Integration tests
+///      query snapshots directly via `AppState.inner` rather than
+///      subscribing to UI events.
+///
+/// Everything else — effect draining, ack flushing, persistence, retry
+/// semantics — is identical.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn drive_core_without_handle(state: &AppState, input: CoreInput) -> Result<CoreOutput> {
+    let output = {
+        let mut inner = state.inner.write().await;
+        match input {
+            CoreInput::Command(cmd) => inner.engine.handle_command(cmd)?,
+            CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
+        }
+    };
+
+    // Execute effects — each may produce new events that feed back
+    // into the engine. No UI emit; no AppHandle registration.
+    let effects = output.effects.clone();
+    for effect in effects {
+        let events = {
+            let mut inner = state.inner.write().await;
+            execute_platform_effect(&mut inner.ports, effect).await?
+        };
+        for event in events {
+            Box::pin(drive_core_without_handle(state, CoreInput::Event(event))).await?;
+        }
+    }
+
+    Ok(output)
+}
+
 /// Transition from onboarding to active session.
 /// Called when onboarding completes successfully.
 #[tauri::command]

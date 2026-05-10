@@ -24,6 +24,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tapchat-desktop",
  "tapchat_transport_adapter",
  "tempfile",
  "tokio",

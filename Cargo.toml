@@ -41,3 +41,4 @@ log = "0.4"
 
 [dev-dependencies]
 tapchat_transport_adapter = { path = "crates/tapchat_transport_adapter" }
+tapchat-desktop = { path = "app/desktop/src-tauri", features = ["test-support"] }

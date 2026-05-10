@@ -13,6 +13,9 @@ use tauri::Manager;
 
 pub use state::{AppState, SessionState};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 /// Debug mode flag — when enabled, [TIMETEST] instrumentation is logged.
 pub static DEBUG_MODE: AtomicBool = AtomicBool::new(false);
 
