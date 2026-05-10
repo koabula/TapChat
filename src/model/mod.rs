@@ -928,6 +928,55 @@ impl Validate for WelcomePickupDescriptor {
     }
 }
 
+impl WelcomePickupDescriptor {
+    /// Produce the canonical `tapchat://welcome-pickup/<base64(json)>` URL
+    /// used to hand a welcome pickup out-of-band to a new joiner.
+    ///
+    /// This encoder is the single source of truth shared by the CLI
+    /// (`group create` / `group join submit`) and the desktop Tauri layer
+    /// (R1.4 / R6.3 hard constraint: both MUST produce identical strings
+    /// for the same descriptor). Do NOT re-implement base64 encoding in
+    /// other call sites — always call this method.
+    ///
+    /// Pairs with `decode_welcome_pickup_url` and with
+    /// `engine.rs::request_join_group`, which accepts either the raw
+    /// descriptor JSON or the URL wrapper.
+    pub fn to_welcome_pickup_url(&self) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        // `serde_json::to_vec` on a well-formed descriptor cannot fail
+        // (all fields are owned primitive types), so `unwrap_or_default`
+        // is safe and keeps the signature infallible.
+        let payload = serde_json::to_vec(self).unwrap_or_default();
+        format!("tapchat://welcome-pickup/{}", STANDARD.encode(payload))
+    }
+
+    /// Inverse of [`to_welcome_pickup_url`].
+    ///
+    /// Accepts both the `tapchat://welcome-pickup/<b64>` form and raw
+    /// descriptor JSON so joiners can paste either format.
+    ///
+    /// Returns a validation error when the URL/JSON cannot be decoded
+    /// into a well-formed [`WelcomePickupDescriptor`].
+    pub fn from_welcome_pickup_url(url: &str) -> CoreResult<Self> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let trimmed = url.trim();
+        let json_bytes: Vec<u8> = if let Some(payload) =
+            trimmed.strip_prefix("tapchat://welcome-pickup/")
+        {
+            STANDARD.decode(payload).map_err(|error| {
+                CoreError::invalid_input(format!("welcome pickup URL base64 decode failed: {error}"))
+            })?
+        } else {
+            trimmed.as_bytes().to_vec()
+        };
+        let descriptor: Self = serde_json::from_slice(&json_bytes).map_err(|error| {
+            CoreError::invalid_input(format!("welcome pickup payload parse failed: {error}"))
+        })?;
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupInviteTokenPayload {
@@ -1612,6 +1661,66 @@ mod tests {
         let decoded: GroupCapabilityOperation =
             serde_json::from_str(&json).expect("deserialize SealGroup operation");
         assert_eq!(decoded, GroupCapabilityOperation::SealGroup);
+    }
+
+    #[test]
+    fn welcome_pickup_url_round_trips_bytewise() {
+        // Every well-formed descriptor must produce a URL that, after
+        // base64-decoding the payload, deserialises back into the
+        // *identical* descriptor (field-by-field equality). This is the
+        // R1.4 / R6.3 shared-encoder invariant.
+        let descriptor = WelcomePickupDescriptor {
+            group_id: "group:7f3a".into(),
+            device_id: "device:bob:phone".into(),
+            endpoint: "https://example.com/v1/groups/group%3A7f3a/welcome-pickup/device%3Abob%3Aphone".into(),
+            capability: "cap-bob-123".into(),
+            expires_at: 1_775_004_800_000,
+        };
+        let url = descriptor.to_welcome_pickup_url();
+        assert!(
+            url.starts_with("tapchat://welcome-pickup/"),
+            "URL must use the tapchat://welcome-pickup/ prefix; got {url}"
+        );
+        let decoded =
+            WelcomePickupDescriptor::from_welcome_pickup_url(&url).expect("roundtrip decode");
+        assert_eq!(decoded, descriptor);
+
+        // Raw JSON form must also decode to the same descriptor so
+        // joiners can paste either format.
+        let raw_json = serde_json::to_string(&descriptor).expect("serialize descriptor");
+        let decoded_from_json =
+            WelcomePickupDescriptor::from_welcome_pickup_url(&raw_json).expect("roundtrip raw JSON");
+        assert_eq!(decoded_from_json, descriptor);
+    }
+
+    #[test]
+    fn welcome_pickup_url_rejects_malformed_input() {
+        // Malformed base64 payload.
+        assert!(WelcomePickupDescriptor::from_welcome_pickup_url(
+            "tapchat://welcome-pickup/!!!not-base64!!!"
+        )
+        .is_err());
+
+        // Valid base64 but the payload is not a descriptor JSON.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let junk_b64 = STANDARD.encode(b"not descriptor json");
+        let url = format!("tapchat://welcome-pickup/{junk_b64}");
+        assert!(WelcomePickupDescriptor::from_welcome_pickup_url(&url).is_err());
+
+        // Valid JSON shape but missing required fields must fail
+        // validation.
+        let incomplete = serde_json::json!({
+            "groupId": "group:7f3a",
+            "deviceId": "",
+            "endpoint": "",
+            "capability": "",
+            "expiresAt": 0,
+        });
+        let url = format!(
+            "tapchat://welcome-pickup/{}",
+            STANDARD.encode(incomplete.to_string().as_bytes())
+        );
+        assert!(WelcomePickupDescriptor::from_welcome_pickup_url(&url).is_err());
     }
 
     #[test]

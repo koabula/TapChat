@@ -1815,13 +1815,12 @@ fn load_deployment_from_snapshot(snapshot: CorePersistenceSnapshot) -> Result<De
 }
 
 /// Encode a welcome pickup descriptor as the `tapchat://welcome-pickup/<base64>`
-/// URL the joiner can pass to `group join by-pickup`. The encoding mirrors
-/// `engine.rs::request_join_group`, which accepts either the raw descriptor
-/// JSON or the URL wrapper.
+/// URL the joiner can pass to `group join by-pickup`. Thin delegate to
+/// `WelcomePickupDescriptor::to_welcome_pickup_url` so the CLI and the
+/// desktop Tauri layer produce byte-identical URLs for the same descriptor
+/// (R1.4 / R6.3 shared-encoder invariant).
 fn welcome_pickup_url(descriptor: &crate::model::WelcomePickupDescriptor) -> String {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let payload = serde_json::to_vec(descriptor).unwrap_or_default();
-    format!("tapchat://welcome-pickup/{}", STANDARD.encode(payload))
+    descriptor.to_welcome_pickup_url()
 }
 
 fn parse_group_join_policy(value: &str) -> Result<crate::model::GroupJoinPolicy> {
