@@ -189,13 +189,13 @@ class FakeGroupOutboxStub implements DurableObjectStub {
   private readonly groupId: string;
   private readonly state: MemoryState;
   private readonly spillStore: MemoryR2Store;
-  private readonly env: { maxInlineBytes: number; retentionDays: number };
+  private readonly env: { maxInlineBytes: number; retentionDays: number; sharingSecret: string };
 
   constructor(
     groupId: string,
     state: MemoryState,
     spillStore: MemoryR2Store,
-    env: { maxInlineBytes: number; retentionDays: number }
+    env: { maxInlineBytes: number; retentionDays: number; sharingSecret: string }
   ) {
     this.groupId = groupId;
     this.state = state;
@@ -276,7 +276,8 @@ function createEnv(options?: {
             groupId,
             new FakeGroupOutboxStub(groupId, new MemoryState(), bucket, {
               maxInlineBytes,
-              retentionDays
+              retentionDays,
+              sharingSecret
             })
           );
         }
@@ -756,6 +757,7 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
       body: JSON.stringify({
         taskId: "task-1",
         conversationId: "conv:alice:bob",
+        storageScope: "direct",
         messageId: "msg:blob",
         mimeType: "application/octet-stream",
         sizeBytes: 4
@@ -790,7 +792,27 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
     blobRef: string;
   };
   assert.equal(prepared.version, CURRENT_MODEL_VERSION);
-  assert.equal(prepared.blobRef, "blob/user:bob/device:bob:phone/conv:alice:bob/msg:blob-task-1");
+  assert.equal(prepared.blobRef, "blob/user:bob/device:bob:phone/direct/direct/conv:alice:bob/msg:blob-task-1");
+
+  const wrongSize = await handleRequest(
+    new Request(prepared.uploadTarget, {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: new Uint8Array([1, 2, 3])
+    }),
+    env
+  );
+  assert.equal(wrongSize.status, 400);
+
+  const wrongAction = await handleRequest(
+    new Request(prepared.downloadTarget.replace("/blob/", "/upload/"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: new Uint8Array([1, 2, 3, 4])
+    }),
+    env
+  );
+  assert.equal(wrongAction.status, 403);
 
   const upload = await handleRequest(
     new Request(prepared.uploadTarget, {
@@ -805,6 +827,17 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
   assert.equal(upload.status, 204);
   assert.equal(download.status, 200);
   assert.deepEqual(new Uint8Array(await download.arrayBuffer()), new Uint8Array([1, 2, 3, 4]));
+
+  const expiredToken = await signSharingPayload("secret", {
+    action: "download",
+    blobKey: prepared.blobRef,
+    expiresAt: Date.now() - 1
+  });
+  const expired = await handleRequest(
+    new Request(`https://example.com/v1/storage/blob/${encodeURIComponent(prepared.blobRef)}?token=${encodeURIComponent(expiredToken)}`),
+    env
+  );
+  assert.equal(expired.status, 403);
 });
 
 test("shared-state writes accept device runtime auth", async () => {
@@ -1051,27 +1084,8 @@ test("group outbox enforces operation and role permissions", async () => {
   );
   assert.equal(memberDenied.status, 403);
 
-  const adminWithoutControl = sampleGroupCapability("group:project", ["read", "append_membership"], "admin");
-  const adminWithoutControlDenied = await handleRequest(
-    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
-      method: "POST",
-      headers: {
-        ...groupHeaders(adminWithoutControl),
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(sampleGroupAppend(
-        "group:project",
-        "msg:membership-no-control",
-        "control_group_membership_changed",
-        adminWithoutControl
-      ))
-    }),
-    env
-  );
-  assert.equal(adminWithoutControlDenied.status, 403);
-
-  const admin = sampleGroupCapability("group:project", ["read", "append_control", "append_membership"], "admin");
-  const adminAllowed = await handleRequest(
+  const admin = sampleGroupCapability("group:project", ["read", "append_membership"], "admin");
+  const adminMembershipAllowed = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
       method: "POST",
       headers: {
@@ -1087,7 +1101,120 @@ test("group outbox enforces operation and role permissions", async () => {
     }),
     env
   );
-  assert.equal(adminAllowed.status, 200);
+  assert.equal(adminMembershipAllowed.status, 200);
+
+  const memberLeave = sampleGroupCapability("group:project", ["read", "append_control"], "member");
+  const leaveAllowed = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(memberLeave),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend(
+        "group:project",
+        "msg:leave-allowed",
+        "control_group_leave_requested",
+        memberLeave
+      ))
+    }),
+    env
+  );
+  assert.equal(leaveAllowed.status, 200);
+
+  for (const messageType of ["mls_commit", "control_group_join_approved", "control_group_metadata_updated"] as GroupMessageType[]) {
+    const denied = await handleRequest(
+      new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+        method: "POST",
+        headers: {
+          ...groupHeaders(memberWithMembership),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(sampleGroupAppend(
+          "group:project",
+          `msg:member-denied:${messageType}`,
+          messageType,
+          memberWithMembership
+        ))
+      }),
+      env
+    );
+    assert.equal(denied.status, 403, `${messageType} must reject member capability`);
+  }
+
+  const adminMetadataWithoutUpdate = sampleGroupCapability("group:project", ["read", "append_membership"], "admin");
+  const metadataDenied = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(adminMetadataWithoutUpdate),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend(
+        "group:project",
+        "msg:metadata-denied",
+        "control_group_metadata_updated",
+        adminMetadataWithoutUpdate
+      ))
+    }),
+    env
+  );
+  assert.equal(metadataDenied.status, 403);
+});
+
+test("group join decision rejects server-generated approval artifacts on reject", async () => {
+  const state = new MemoryState();
+  const spillStore = new MemoryR2Store();
+  await state.put("join-request:req:1", {
+    request: {
+      version: CURRENT_MODEL_VERSION,
+      requestId: "req:1",
+      groupId: "group:project",
+      inviteId: "invite:1",
+      joinerUserId: "user:dana",
+      joinerDeviceId: "device:dana:phone",
+      joinerContactShareUrl: "https://example.com/contact/dana",
+      requestCapability: "join-capability",
+      requestedAt: 1,
+      autoApprove: false,
+      status: "pending",
+      signature: "join-signature"
+    }
+  });
+
+  const response = await handleGroupOutboxDurableRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/join-requests/req%3A1/decision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: "group:project",
+        requestId: "req:1",
+        decision: "reject",
+        reason: "no",
+        welcomePickup: {
+          groupId: "group:project",
+          deviceId: "device:dana:phone",
+          endpoint: "https://example.com/v1/groups/group:project/welcome-pickup/device:dana:phone",
+          capability: "welcome-capability",
+          expiresAt: Date.now() + 60_000
+        },
+        manifest: { groupId: "group:project" },
+        startCursor: { groupId: "group:project", lastFetchedSeq: 0, updatedAt: 1 }
+      })
+    }),
+    {
+      groupId: "group:project",
+      state,
+      spillStore,
+      maxInlineBytes: 128,
+      retentionDays: 30,
+      sharingSecret: "secret",
+      now: 1_000
+    }
+  );
+
+  assert.equal(response.status, 400);
 });
 
 test("group outbox spills large records to R2 and fetches them back", async () => {

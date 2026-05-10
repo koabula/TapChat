@@ -10,6 +10,7 @@ export interface StorageRef {
   ref: string;
   sizeBytes: number;
   mimeType: string;
+  fileName?: string;
   expiresAt?: number;
 }
 
@@ -402,6 +403,8 @@ export interface GetHeadResult {
 export interface PrepareBlobUploadRequest {
   taskId: string;
   conversationId: string;
+  groupId?: string;
+  storageScope?: "direct" | "group";
   messageId: string;
   mimeType: string;
   sizeBytes: number;

@@ -308,6 +308,10 @@ pub struct DecideGroupJoinResult {
 pub struct PrepareBlobUploadRequest {
     pub task_id: String,
     pub conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_scope: Option<String>,
     pub message_id: String,
     pub mime_type: String,
     pub size_bytes: u64,
@@ -483,10 +487,10 @@ pub struct PublishSharedStateRequest {
 mod tests {
     use super::*;
     use crate::model::{
-        CURRENT_MODEL_VERSION, CapabilityService, DeliveryClass, GroupCapability,
-        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType,
-        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, MessageType, SenderProof, StorageRef,
-        WelcomePickupDescriptor,
+        CapabilityService, DeliveryClass, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        GroupEnvelopeVisibility, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState,
+        GroupRole, MessageType, SenderProof, StorageRef, WelcomePickupDescriptor,
+        CURRENT_MODEL_VERSION,
     };
 
     #[test]

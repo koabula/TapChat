@@ -1,15 +1,15 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{timeout, Duration, Instant};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 use crate::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
@@ -19,8 +19,8 @@ use crate::ffi_api::{
 use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::platform_ports::{
-    BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
-    TransportPort, execute_platform_effect,
+    execute_platform_effect, BlobIoPort, NotificationPort, PersistencePort, RealtimePort,
+    SecureStoragePort, TimerPort, TransportPort,
 };
 use crate::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
@@ -1771,7 +1771,7 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScheduledTimer, parse_realtime_event};
+    use super::{parse_realtime_event, ScheduledTimer};
     use tokio::time::{Duration, Instant};
 
     #[test]

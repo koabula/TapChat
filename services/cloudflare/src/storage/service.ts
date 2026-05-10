@@ -3,8 +3,38 @@ import type { JsonBlobStore } from "../types/runtime";
 import { HttpError } from "../auth/capability";
 import { signSharingPayload, verifySharingPayload } from "./sharing";
 
+const MAX_BLOB_BYTES = 25 * 1024 * 1024;
+const MAX_MIME_TYPE_LENGTH = 255;
+const MAX_FILE_NAME_BYTES = 255;
+
 function sanitizeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
+}
+
+function requireNonEmpty(value: string | undefined, field: string): string {
+  if (!value || value.trim().length === 0) {
+    throw new HttpError(400, "invalid_input", `${field} is required`);
+  }
+  return value;
+}
+
+function validateMimeType(mimeType: string): void {
+  if (mimeType.trim().length === 0 || mimeType.length > MAX_MIME_TYPE_LENGTH || /[\r\n]/.test(mimeType)) {
+    throw new HttpError(400, "invalid_input", "mime type is invalid");
+  }
+}
+
+function validateFileName(fileName: string | undefined): void {
+  if (fileName === undefined) {
+    return;
+  }
+  if (
+    fileName.trim().length === 0 ||
+    fileName.length > MAX_FILE_NAME_BYTES ||
+    /[\/\\\0\r\n]/.test(fileName)
+  ) {
+    throw new HttpError(400, "invalid_input", "file name is invalid");
+  }
 }
 
 export class StorageService {
@@ -23,20 +53,35 @@ export class StorageService {
     owner: { userId: string; deviceId: string },
     now: number
   ): Promise<PrepareBlobUploadResult> {
-    if (!input.taskId || !input.conversationId || !input.messageId || !input.mimeType || input.sizeBytes <= 0) {
-      throw new HttpError(400, "invalid_input", "prepare upload request is missing required fields");
+    const taskId = requireNonEmpty(input.taskId, "taskId");
+    const conversationId = requireNonEmpty(input.conversationId, "conversationId");
+    const messageId = requireNonEmpty(input.messageId, "messageId");
+    validateMimeType(input.mimeType);
+    validateFileName(input.fileName);
+    if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_BLOB_BYTES) {
+      throw new HttpError(400, "invalid_input", "sizeBytes is outside supported limits");
+    }
+    const storageScope = input.storageScope ?? (input.groupId ? "group" : "direct");
+    if (storageScope !== "direct" && storageScope !== "group") {
+      throw new HttpError(400, "invalid_input", "storageScope is invalid");
+    }
+    if (storageScope === "group" && (!input.groupId || input.groupId.trim().length === 0)) {
+      throw new HttpError(400, "invalid_input", "groupId is required for group storage");
     }
     const blobKey = [
       "blob",
       sanitizeSegment(owner.userId),
       sanitizeSegment(owner.deviceId),
-      sanitizeSegment(input.conversationId),
-      `${sanitizeSegment(input.messageId)}-${sanitizeSegment(input.taskId)}`
+      storageScope,
+      storageScope === "group" ? sanitizeSegment(input.groupId!) : "direct",
+      sanitizeSegment(conversationId),
+      `${sanitizeSegment(messageId)}-${sanitizeSegment(taskId)}`
     ].join("/");
     const expiresAt = now + 15 * 60 * 1000;
     const uploadToken = await signSharingPayload(this.secret, {
       action: "upload",
       blobKey,
+      sizeBytes: input.sizeBytes,
       expiresAt
     });
     const downloadToken = await signSharingPayload(this.secret, {
@@ -57,9 +102,12 @@ export class StorageService {
   }
 
   async uploadBlob(blobKey: string, token: string, body: ArrayBuffer, metadata: Record<string, string>, now: number): Promise<void> {
-    const payload = await this.verifyToken<{ action: string; blobKey: string }>(token, now);
+    const payload = await this.verifyToken<{ action: string; blobKey: string; sizeBytes?: number }>(token, now);
     if (payload.action !== "upload" || payload.blobKey !== blobKey) {
       throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
+    }
+    if (!Number.isSafeInteger(payload.sizeBytes) || body.byteLength !== payload.sizeBytes) {
+      throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
     await this.store.putBytes(blobKey, body, metadata);
   }

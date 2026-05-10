@@ -680,8 +680,8 @@ mod tests {
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        CURRENT_MODEL_VERSION, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
-        MessageType, SenderProof, WakeHint,
+        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
+        WakeHint, CURRENT_MODEL_VERSION,
     };
     use base64::Engine as _;
 

@@ -158,9 +158,12 @@ export function validateGroupAppendAuthorization(
       throw new HttpError(403, "invalid_capability", `group capability does not grant ${required}`);
     }
   }
-  if (isMembershipControlMessage(body.envelope.messageType) && capability.role === "member") {
-    throw new HttpError(403, "invalid_capability", "member role cannot append membership control messages");
+  for (const role of allowedGroupAppendRoles(body.envelope.messageType)) {
+    if (capability.role === role) {
+      return;
+    }
   }
+  throw new HttpError(403, "invalid_capability", `group role cannot append ${body.envelope.messageType}`);
 }
 
 export function validateWelcomePickupAuthorization(
@@ -211,23 +214,37 @@ function validateGroupCapabilityBase(
 }
 
 function requiredGroupAppendOperations(messageType: GroupMessageType): GroupCapabilityOperation[] {
-  if (messageType === "mls_application") {
-    return ["append_application"];
+  switch (messageType) {
+    case "mls_application":
+      return ["append_application"];
+    case "mls_commit":
+    case "control_group_membership_changed":
+      return ["append_membership"];
+    case "control_group_metadata_updated":
+      return ["update_group_metadata"];
+    case "control_group_join_approved":
+    case "control_group_join_rejected":
+      return ["approve_join"];
+    case "control_group_leave_requested":
+    case "control_group_join_requested":
+    case "control_conversation_needs_rebuild":
+      return ["append_control"];
+    default:
+      return ["append_control"];
   }
-  if (isMembershipControlMessage(messageType)) {
-    return ["append_control", "append_membership"];
-  }
-  return ["append_control"];
 }
 
-function isMembershipControlMessage(messageType: GroupMessageType): boolean {
-  return (
-    messageType === "control_group_membership_changed" ||
-    messageType === "control_group_join_requested" ||
-    messageType === "control_group_join_approved" ||
-    messageType === "control_group_join_rejected" ||
-    messageType === "control_group_leave_requested"
-  );
+function allowedGroupAppendRoles(messageType: GroupMessageType): Array<GroupCapability["role"]> {
+  switch (messageType) {
+    case "mls_commit":
+    case "control_group_membership_changed":
+    case "control_group_metadata_updated":
+    case "control_group_join_approved":
+    case "control_group_join_rejected":
+      return ["owner", "admin"];
+    default:
+      return ["owner", "admin", "member"];
+  }
 }
 
 async function verifySignedToken<T>(secret: string, request: Request, now: number): Promise<T> {

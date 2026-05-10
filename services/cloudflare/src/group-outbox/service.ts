@@ -320,6 +320,9 @@ export class GroupOutboxService {
     if (input.decision === "approve" && (!input.welcomePickup || !input.manifest || !input.startCursor)) {
       throw new HttpError(400, "invalid_input", "approved join request requires welcome pickup, manifest, and start cursor");
     }
+    if (input.decision === "reject" && (input.welcomePickup || input.manifest || input.startCursor)) {
+      throw new HttpError(400, "invalid_input", "rejected join request must not include welcome pickup, manifest, or start cursor");
+    }
     const request: GroupJoinRequest = {
       ...stored.request,
       status: input.decision === "approve" ? "approved" : "rejected"
