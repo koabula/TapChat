@@ -14,7 +14,7 @@ use crate::transport_contract::{
     GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest, MessageRequestActionRequest,
     PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    SubmitGroupJoinRequest,
+    SealGroupOutboxRequest, SubmitGroupJoinRequest,
 };
 
 pub trait TransportPort {
@@ -133,6 +133,13 @@ pub trait TransportPort {
     ) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("group join decision transport is not implemented by this platform")
     }
+
+    async fn seal_group_outbox(
+        &mut self,
+        _seal: SealGroupOutboxRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group outbox seal transport is not implemented by this platform")
+    }
 }
 
 pub trait RealtimePort {
@@ -227,6 +234,7 @@ where
         CoreEffect::DecideGroupJoinRequest { decide } => {
             ports.decide_group_join_request(decide).await
         }
+        CoreEffect::SealGroupOutbox { seal } => ports.seal_group_outbox(seal).await,
         CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,
         CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
         CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,

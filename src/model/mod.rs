@@ -706,6 +706,7 @@ pub enum GroupCapabilityOperation {
     ApproveJoin,
     RemoveMember,
     UpdateGroupMetadata,
+    SealGroup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,6 +759,7 @@ pub enum GroupMessageType {
     ControlGroupJoinApproved,
     ControlGroupJoinRejected,
     ControlGroupLeaveRequested,
+    ControlGroupDissolved,
     ControlConversationNeedsRebuild,
 }
 
@@ -1119,6 +1121,7 @@ pub enum ConversationKind {
 pub enum ConversationState {
     Active,
     NeedsRebuild,
+    Dissolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1589,6 +1592,26 @@ mod tests {
         let json = serde_json::to_string(&GroupEnvelopeVisibility::Protocol)
             .expect("serialize visibility");
         assert_eq!(json, "\"protocol\"");
+    }
+
+    #[test]
+    fn group_message_type_roundtrip_covers_control_group_dissolved() {
+        let json = serde_json::to_string(&GroupMessageType::ControlGroupDissolved)
+            .expect("serialize ControlGroupDissolved");
+        assert_eq!(json, "\"control_group_dissolved\"");
+        let decoded: GroupMessageType =
+            serde_json::from_str(&json).expect("deserialize ControlGroupDissolved");
+        assert_eq!(decoded, GroupMessageType::ControlGroupDissolved);
+    }
+
+    #[test]
+    fn group_capability_operation_roundtrip_covers_seal_group() {
+        let json = serde_json::to_string(&GroupCapabilityOperation::SealGroup)
+            .expect("serialize SealGroup operation");
+        assert_eq!(json, "\"seal_group\"");
+        let decoded: GroupCapabilityOperation =
+            serde_json::from_str(&json).expect("deserialize SealGroup operation");
+        assert_eq!(decoded, GroupCapabilityOperation::SealGroup);
     }
 
     #[test]

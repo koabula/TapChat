@@ -26,7 +26,7 @@ use crate::transport_contract::{
     MessageRequestItem, MessageRequestRealtimeChange, PrepareBlobUploadRequest,
     PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    SharedStateDocumentKind, SubmitGroupJoinRequest,
+    SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -152,6 +152,9 @@ pub enum CoreCommand {
         title: Option<String>,
         join_policy: Option<crate::model::GroupJoinPolicy>,
         member_invite_policy: Option<crate::model::GroupMemberInvitePolicy>,
+    },
+    DissolveGroup {
+        group_id: String,
     },
     RefreshIdentityState {
         user_id: String,
@@ -336,6 +339,19 @@ pub enum CoreEvent {
         retryable: bool,
         detail: Option<String>,
     },
+    GroupOutboxSealed {
+        group_id: String,
+        sealed_at: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        was_already_sealed: bool,
+    },
+    GroupOutboxSealFailed {
+        group_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
     WelcomePickupFetched {
         descriptor: crate::model::WelcomePickupDescriptor,
         welcome_b64: String,
@@ -515,6 +531,9 @@ pub enum CoreEffect {
     },
     GetGroupOutboxHead {
         get: GetGroupOutboxHeadRequest,
+    },
+    SealGroupOutbox {
+        seal: SealGroupOutboxRequest,
     },
     FetchWelcomePickup {
         fetch: FetchWelcomePickupRequest,
@@ -809,6 +828,22 @@ pub(crate) struct CoreState {
     pub(crate) group_invites: BTreeMap<String, PersistedGroupInvite>,
     pub(crate) group_join_requests: BTreeMap<String, PersistedGroupJoinRequest>,
     pub(crate) pending_group_join_approvals: BTreeMap<String, PersistedPendingGroupJoinApproval>,
+    /// In-memory staging for owner-signed `SealGroupOutbox` requests.
+    ///
+    /// Keyed by `group_id`. An entry is inserted when
+    /// `dissolve_group` finishes step (a)+(b) (MLS remove_members commit
+    /// and `control_group_dissolved` control message enqueued). The entry
+    /// is consumed into a real `CoreEffect::SealGroupOutbox` by
+    /// `handle_group_envelope_appended` once every pending_group_outbox
+    /// entry belonging to that group has been acknowledged — i.e. step (c)
+    /// only runs after steps (a)+(b) succeed, in line with the four-step
+    /// atomic contract in `design.md` (Dissolve-group decision section).
+    ///
+    /// Not persisted: if the process dies between the commit and the seal
+    /// the owner's next `DissolveGroup` call re-enqueues the pending seal.
+    /// The MLS commit itself is persisted via `pending_group_outbox` and is
+    /// replayed normally on startup.
+    pub(crate) pending_group_seal: BTreeMap<String, crate::transport_contract::SealGroupOutboxRequest>,
     pub(crate) pending_acks: BTreeMap<String, PendingAckState>,
     pub(crate) pending_blob_uploads: BTreeMap<String, PendingBlobUpload>,
     pub(crate) pending_blob_downloads: BTreeMap<String, PendingBlobDownload>,
@@ -950,6 +985,7 @@ impl Default for CoreState {
             group_invites: BTreeMap::new(),
             group_join_requests: BTreeMap::new(),
             pending_group_join_approvals: BTreeMap::new(),
+            pending_group_seal: BTreeMap::new(),
             pending_acks: BTreeMap::new(),
             pending_blob_uploads: BTreeMap::new(),
             pending_blob_downloads: BTreeMap::new(),

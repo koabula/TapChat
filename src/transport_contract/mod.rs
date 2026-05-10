@@ -136,6 +136,37 @@ pub struct GetGroupOutboxHeadResult {
     pub head_seq: u64,
 }
 
+/// Owner-signed request to seal a group outbox, rendering all subsequent
+/// appends (by any capability holder) permanently rejected by the transport.
+///
+/// Per `PROTOCOL_GROUP_CN.md §10.4` and `.kiro/specs/desktop-group-ui-mvp`
+/// requirement R13.2/R13.3, the attached capability MUST have `role ==
+/// GroupRole::Owner` and MUST include `GroupCapabilityOperation::SealGroup`
+/// in its `operations` set. Callers are responsible for minting such a
+/// capability through the ordinary owner signing path; the transport layer
+/// does not mint capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealGroupOutboxRequest {
+    pub group_id: String,
+    pub capability: GroupCapability,
+}
+
+/// Normal response returned by the first successful seal. `sealed_at` is the
+/// millisecond timestamp the transport recorded for the seal transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealGroupOutboxResult {
+    pub sealed_at: u64,
+    /// `true` when the transport reports `409 already_sealed`. The client
+    /// treats this as a success (the terminal state is identical) but keeps
+    /// the signal so that upper layers may surface it separately if desired.
+    #[serde(default, skip_serializing_if = "core_is_false")]
+    pub was_already_sealed: bool,
+}
+
+fn core_is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupRealtimeSubscriptionRequest {
     pub group_id: String,
@@ -662,5 +693,76 @@ mod tests {
                 value: "member-proof".into(),
             }),
         }
+    }
+
+    #[test]
+    fn seal_group_outbox_request_round_trips_case_conversion() {
+        // `SealGroupOutboxRequest` is the owner-signed payload scheduled by
+        // `CoreCommand::DissolveGroup` step (c). Its wire format must survive a
+        // JSON round-trip with the nested `GroupCapability` preserving its
+        // `camelCase` serialisation while the top-level request stays
+        // `snake_case` (matching the rest of the transport contract).
+        let request = SealGroupOutboxRequest {
+            group_id: "group:project".into(),
+            capability: sample_group_capability(),
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize seal request");
+        assert!(
+            json.contains("\"group_id\":\"group:project\""),
+            "seal request must serialise group_id in snake_case; got {json}"
+        );
+        // Nested capability uses camelCase per GroupCapability's serde attr.
+        assert!(
+            json.contains("\"groupId\":\"group:project\""),
+            "nested GroupCapability must serialise groupId in camelCase; got {json}"
+        );
+
+        let decoded: SealGroupOutboxRequest =
+            serde_json::from_str(&json).expect("deserialize seal request");
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn seal_group_outbox_result_handles_already_sealed() {
+        // Terminal state is the same whether the request is the first seal or a
+        // repeat; the `was_already_sealed` signal is only an observability
+        // hint, defaulting to `false` so legacy payloads without the field
+        // still deserialise.
+        let primary = SealGroupOutboxResult {
+            sealed_at: 1_700_000_000_000,
+            was_already_sealed: false,
+        };
+        let repeat = SealGroupOutboxResult {
+            sealed_at: 1_700_000_000_500,
+            was_already_sealed: true,
+        };
+
+        let primary_json = serde_json::to_string(&primary).expect("serialize primary");
+        // `was_already_sealed` defaults to `false` and is skipped on serialise.
+        assert!(
+            !primary_json.contains("was_already_sealed"),
+            "was_already_sealed must be omitted when false; got {primary_json}"
+        );
+        let repeat_json = serde_json::to_string(&repeat).expect("serialize repeat");
+        assert!(
+            repeat_json.contains("\"was_already_sealed\":true"),
+            "was_already_sealed must be emitted when true; got {repeat_json}"
+        );
+
+        let decoded_primary: SealGroupOutboxResult =
+            serde_json::from_str(&primary_json).expect("deserialize primary");
+        let decoded_repeat: SealGroupOutboxResult =
+            serde_json::from_str(&repeat_json).expect("deserialize repeat");
+        assert_eq!(decoded_primary, primary);
+        assert_eq!(decoded_repeat, repeat);
+
+        // Legacy wire payload without `was_already_sealed` must default to
+        // `false` (backward compatibility with older clients).
+        let legacy_json = "{\"sealed_at\":1700000000000}";
+        let decoded_legacy: SealGroupOutboxResult =
+            serde_json::from_str(legacy_json).expect("deserialize legacy result");
+        assert_eq!(decoded_legacy.sealed_at, 1_700_000_000_000);
+        assert!(!decoded_legacy.was_already_sealed);
     }
 }

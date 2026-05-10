@@ -42,7 +42,7 @@ use crate::transport_contract::{
     MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
     PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
     PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
+    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Signer;
@@ -503,6 +503,7 @@ impl CoreEngine {
                 group_invites,
                 group_join_requests,
                 pending_group_join_approvals,
+                pending_group_seal: BTreeMap::new(),
                 pending_acks,
                 pending_blob_uploads,
                 pending_blob_downloads,
@@ -698,6 +699,7 @@ impl CoreEngine {
                 display_name,
             } => self.set_contact_display_name(user_id, display_name),
             CoreCommand::DeleteContact { user_id } => self.delete_contact(user_id),
+            CoreCommand::DissolveGroup { group_id } => self.dissolve_group(group_id),
         }
     }
 
@@ -1225,6 +1227,18 @@ impl CoreEngine {
                     ..CoreViewModel::default()
                 }),
             }),
+            CoreEvent::GroupOutboxSealed {
+                group_id,
+                sealed_at,
+                was_already_sealed,
+            } => self.handle_group_outbox_sealed(group_id, sealed_at, was_already_sealed),
+            CoreEvent::GroupOutboxSealFailed {
+                group_id,
+                retryable,
+                status,
+                code,
+                detail,
+            } => self.handle_group_outbox_seal_failed(group_id, retryable, status, code, detail),
         }
     }
 
@@ -1894,6 +1908,7 @@ impl CoreEngine {
             manifest: manifest.clone(),
             local_role: Some(GroupRole::Owner),
             welcome_pickup: None,
+            dissolved_at: None,
         };
         self.state
             .group_states
@@ -2417,6 +2432,7 @@ impl CoreEngine {
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
 
@@ -2661,6 +2677,7 @@ impl CoreEngine {
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -2844,6 +2861,7 @@ impl CoreEngine {
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -2982,6 +3000,7 @@ impl CoreEngine {
                 manifest,
                 local_role: None,
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -3107,6 +3126,7 @@ impl CoreEngine {
                 manifest: manifest.clone(),
                 local_role: Some(GroupRole::Admin),
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -3203,6 +3223,7 @@ impl CoreEngine {
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -3317,6 +3338,7 @@ impl CoreEngine {
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
+                dissolved_at: group_state.dissolved_at,
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -5223,6 +5245,7 @@ impl CoreEngine {
                 manifest: updated.clone(),
                 local_role: updated_local_role,
                 welcome_pickup: current_state.welcome_pickup.clone(),
+                dissolved_at: current_state.dissolved_at,
             },
         );
         let _ = self.sync_conversation_members_from_manifest(conversation_id, &updated);
@@ -5378,6 +5401,9 @@ impl CoreEngine {
         if conversation.conversation.kind != ConversationKind::Group {
             return Err(CoreError::invalid_input("conversation is not a group"));
         }
+        if conversation.conversation.state == ConversationState::Dissolved {
+            return Err(CoreError::invalid_input("group is dissolved"));
+        }
         if conversation.conversation.state == ConversationState::NeedsRebuild
             || conversation.recovery_status != RecoveryStatus::Healthy
         {
@@ -5406,6 +5432,16 @@ impl CoreEngine {
             .values()
             .find(|state| state.conversation_id == conversation_id)
             .ok_or_else(|| CoreError::invalid_input("group conversation does not exist"))?;
+        // A.5: dissolved groups fail-closed locally before any transport
+        // layer gets involved — even if `ConversationState` has not yet been
+        // flipped to Dissolved (the transition happens on
+        // `CoreEvent::GroupOutboxSealed`, so between the initial
+        // `DissolveGroup` command and the seal ack there is a brief window
+        // where `dissolved_at.is_some()` but conversation state is still
+        // Active).
+        if group_state.dissolved_at.is_some() {
+            return Err(CoreError::invalid_input("group is dissolved"));
+        }
         let Some(local_role) = group_state.local_role else {
             return Err(CoreError::invalid_input("local group member is not active"));
         };
@@ -8106,6 +8142,36 @@ impl CoreEngine {
                 });
             }
         }
+
+        // Step (c) of `DissolveGroup`: emit the SealGroupOutbox effect only
+        // after every pending commit/control for this group has been
+        // acknowledged. This guarantees the seal is applied strictly after
+        // the MLS remove_commit and `control_group_dissolved` are already
+        // durable on the outbox, preserving the four-step atomic contract
+        // (design.md Dissolve-group decision).
+        let ready_to_seal = self
+            .state
+            .pending_group_seal
+            .contains_key(&group_id)
+            && !self
+                .state
+                .pending_group_outbox
+                .iter()
+                .any(|item| item.envelope.group_id == group_id);
+        let mut seal_effect: Option<CoreEffect> = None;
+        if ready_to_seal {
+            if let Some(request) = self.state.pending_group_seal.remove(&group_id) {
+                seal_effect = Some(CoreEffect::SealGroupOutbox { seal: request });
+            }
+        }
+
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::DeleteOutgoingGroupEnvelope { message_id }],
+        )];
+        if let Some(effect) = seal_effect {
+            effects.push(effect);
+        }
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
@@ -8113,10 +8179,7 @@ impl CoreEngine {
                 messages_changed: !messages.is_empty(),
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![PersistOp::DeleteOutgoingGroupEnvelope { message_id }],
-            )],
+            effects,
             view_model: Some(CoreViewModel {
                 messages,
                 ..CoreViewModel::default()
@@ -8165,6 +8228,423 @@ impl CoreEngine {
                     status: SystemStatus::TemporaryNetworkFailure,
                     message: detail.unwrap_or_else(|| {
                         format!("group append failed for {group_id}/{message_id}")
+                    }),
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    /// Owner-only atomic dissolve of a group.
+    ///
+    /// Implements the four-step sequence locked in by the `design.md`
+    /// Dissolve-group decision (B-full):
+    ///   (a) Issue a single MLS `remove_members` commit covering every
+    ///       other active member's devices in one epoch bump.
+    ///   (b) Append a `ControlGroupDissolved` envelope
+    ///       (`visibility = Visible`) carrying the post-dissolve manifest
+    ///       so that remaining clients render a single "group dissolved"
+    ///       banner instead of N membership-changed banners.
+    ///   (c) Stage a `SealGroupOutbox` request in `pending_group_seal`.
+    ///       The actual `CoreEffect::SealGroupOutbox` is emitted only
+    ///       after both (a) and (b) have been acknowledged by the
+    ///       transport (see `handle_group_envelope_appended`) so that the
+    ///       seal cannot precede the commit/control messages on the wire.
+    ///   (d) On `CoreEvent::GroupOutboxSealed` the engine flips
+    ///       `group_state.dissolved_at = Some(sealed_at)` and transitions
+    ///       the conversation state to `ConversationState::Dissolved`
+    ///       (see `handle_group_outbox_sealed`).
+    ///
+    /// `dissolved_at` is deliberately *not* set in this method — only step
+    /// (d) is allowed to mark the group dissolved, guaranteeing we never
+    /// fail-closed locally on a dissolve whose seal never reached the
+    /// server.
+    fn dissolve_group(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        let role = self.local_group_role(&group_id)?;
+        if role != GroupRole::Owner {
+            return Err(CoreError::invalid_input(
+                "only the group owner can dissolve the group",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        if group_state.dissolved_at.is_some() {
+            return Err(CoreError::invalid_input(
+                "group is already dissolved",
+            ));
+        }
+        if self.state.pending_group_seal.contains_key(&group_id) {
+            return Err(CoreError::invalid_input(
+                "a dissolve is already in progress for this group",
+            ));
+        }
+
+        // Build the list of non-owner active members. Step (a) removes all
+        // their MLS devices in a single commit so receivers observe a single
+        // epoch bump (PROTOCOL_GROUP_CN.md §10.4 non-goal: avoid N-epoch
+        // staircase).
+        let mut manifest = group_state.manifest.clone();
+        let target_user_ids: Vec<String> = manifest
+            .members
+            .iter()
+            .filter(|m| {
+                m.status == GroupMemberStatus::Active
+                    && m.user_id != local_identity.user_identity.user_id
+            })
+            .map(|m| m.user_id.clone())
+            .collect();
+
+        let mut all_device_ids: Vec<String> = Vec::new();
+        {
+            let adapter = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+            for user_id in &target_user_ids {
+                let device_ids =
+                    adapter.member_device_ids_for_user(&group_state.conversation_id, user_id)?;
+                all_device_ids.extend(device_ids);
+            }
+        }
+        all_device_ids.sort();
+        all_device_ids.dedup();
+
+        // Produce the single MLS remove commit. If there are no other
+        // members (a lone-owner group), we still must emit the
+        // `ControlGroupDissolved` visible message and seal the outbox so
+        // third parties cannot revive the log, but there is nothing for MLS
+        // to remove — in that case we simulate "commit" by passing an empty
+        // set and letting the adapter surface the protocol-level epoch bump
+        // that follows from a no-op membership change.
+        let artifacts = {
+            let adapter = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+            if all_device_ids.is_empty() {
+                // Lone-owner groups: no MLS commit is produced. We still
+                // walk through the rest of the dissolve flow so the outbox
+                // is sealed and subsequent sends fail-closed.
+                None
+            } else {
+                Some(adapter.remove_members(&group_state.conversation_id, &all_device_ids)?)
+            }
+        };
+        if let Some(_) = &artifacts {
+            let summary = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                .export_group_summary(&group_state.conversation_id)?;
+            self.state
+                .mls_summaries
+                .insert(group_state.conversation_id.clone(), summary);
+        }
+
+        let now = current_unix_millis(self.state.message_nonce);
+        for member in &mut manifest.members {
+            if member.status == GroupMemberStatus::Active
+                && member.user_id != local_identity.user_identity.user_id
+            {
+                member.status = GroupMemberStatus::Removed;
+            }
+        }
+        let epoch = artifacts
+            .as_ref()
+            .map(|artifacts| artifacts.epoch)
+            .unwrap_or(manifest.mls_epoch_hint);
+        self.apply_membership_change_to_manifest(&mut manifest, epoch, now)?;
+        self.sync_conversation_members_from_manifest(&group_state.conversation_id, &manifest)?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup,
+                // A.4 contract: `dissolved_at` is NOT set here. It is only
+                // set in `handle_group_outbox_sealed` after the
+                // SealGroupOutbox effect has been acknowledged, ensuring we
+                // never flag the group as dissolved locally before the
+                // server-side seal is in effect.
+                dissolved_at: None,
+            },
+        );
+
+        // Owner-level capability includes `SealGroup` (see
+        // `group_capability_operations`). We reuse it for both the commit
+        // and the control envelope — the append capability is a superset.
+        let capability = self.group_capability(&group_id, role)?;
+        let membership_proof =
+            self.build_membership_proof(&group_id, manifest.roster_version, "dissolve")?;
+        let mut persist_ops: Vec<PersistOp> = vec![
+            PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            },
+            PersistOp::SaveMlsState {
+                conversation_id: group_state.conversation_id.clone(),
+            },
+        ];
+        let mut messages: Vec<MessageSummary> = Vec::new();
+        if let Some(artifacts) = artifacts {
+            let mut commit = self.build_group_envelope(
+                &group_id,
+                &group_state.conversation_id,
+                GroupMessageType::MlsCommit,
+                GroupEnvelopeVisibility::Protocol,
+                artifacts.commit_b64,
+            )?;
+            commit.membership_proof = Some(membership_proof.clone());
+            let commit_message_id = commit.message_id.clone();
+            self.enqueue_group_envelope(commit, capability.clone(), None);
+            persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
+                message_id: commit_message_id.clone(),
+            });
+            messages.push(MessageSummary {
+                conversation_id: group_state.conversation_id.clone(),
+                message_id: commit_message_id,
+                message_type: MessageType::MlsCommit,
+            });
+        }
+
+        // Step (b): visible `ControlGroupDissolved` control message. The
+        // payload is the final (all-removed) manifest so every receiving
+        // client can render a single "group dissolved" banner by reading
+        // `message_type = control_group_dissolved` and showing a localized
+        // string (the Desktop UI locks the text to
+        // "This group has been dissolved by the owner." per R3.6).
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_plaintext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let mut control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupDissolved,
+            GroupEnvelopeVisibility::Visible,
+            control_plaintext.payload_b64,
+        )?;
+        control.membership_proof = Some(membership_proof);
+        let control_message_id = control.message_id.clone();
+        self.enqueue_group_envelope(control, capability.clone(), None);
+        persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
+            message_id: control_message_id.clone(),
+        });
+        messages.push(MessageSummary {
+            conversation_id: group_state.conversation_id.clone(),
+            message_id: control_message_id,
+            message_type: MessageType::ControlConversationNeedsRebuild,
+        });
+
+        // Step (c): stage the owner-signed seal request. Actual
+        // `CoreEffect::SealGroupOutbox` is emitted by
+        // `handle_group_envelope_appended` once this group's
+        // `pending_group_outbox` is drained.
+        self.state.pending_group_seal.insert(
+            group_id.clone(),
+            SealGroupOutboxRequest {
+                group_id: group_id.clone(),
+                capability,
+            },
+        );
+
+        let effects = vec![persist_effect(&self.state, persist_ops)];
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                messages,
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    /// Handle `CoreEvent::GroupOutboxSealed` — step (d) of `DissolveGroup`.
+    ///
+    /// When the Cloudflare outbox acknowledges the seal request, transition
+    /// the local group state to dissolved (`dissolved_at` +
+    /// `ConversationState::Dissolved`). This is the *only* place that may
+    /// set `dissolved_at` — every other code path that inspects
+    /// `dissolved_at` relies on it being set strictly after the server has
+    /// acknowledged the seal.
+    ///
+    /// A `was_already_sealed = true` variant (HTTP 409) is treated as
+    /// success: the terminal state is identical whether we observed the
+    /// transition or the server had seen it before.
+    fn handle_group_outbox_sealed(
+        &mut self,
+        group_id: String,
+        sealed_at: u64,
+        was_already_sealed: bool,
+    ) -> CoreResult<CoreOutput> {
+        let _ = was_already_sealed; // Observability signal only (see design.md).
+        // Drop any lingering pending seal entry — whether or not the seal
+        // effect was issued (it may have been a retry pending a
+        // `GroupOutboxSealFailed` earlier), the terminal state is now
+        // "sealed on the server", so no further seal effects are needed.
+        self.state.pending_group_seal.remove(&group_id);
+
+        let group_state = match self.state.group_states.get(&group_id) {
+            Some(state) => state.clone(),
+            None => {
+                // The group could have been removed locally since the effect
+                // was issued (e.g. profile reset). Nothing to transition.
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![],
+                    view_model: None,
+                });
+            }
+        };
+        let conversation_id = group_state.conversation_id.clone();
+
+        let mut persist_ops: Vec<PersistOp> = Vec::new();
+        // Set the dissolved marker only now — after the server acknowledged.
+        let mut updated_group_state = group_state.clone();
+        let transitioned = updated_group_state.dissolved_at.is_none();
+        if transitioned {
+            updated_group_state.dissolved_at = Some(sealed_at);
+            self.state
+                .group_states
+                .insert(group_id.clone(), updated_group_state);
+            persist_ops.push(PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            });
+        }
+
+        // Transition the conversation to `Dissolved` so existing rendering
+        // paths treat the log as read-only archive. We avoid overwriting a
+        // `NeedsRebuild` state because that signals an unresolvable MLS
+        // fault which must not be masked by dissolve.
+        if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+            if state.conversation.state != ConversationState::NeedsRebuild
+                && state.conversation.state != ConversationState::Dissolved
+            {
+                state.conversation.state = ConversationState::Dissolved;
+                state.conversation.updated_at = sealed_at;
+                persist_ops.push(PersistOp::SaveConversation {
+                    conversation_id: conversation_id.clone(),
+                });
+            }
+        }
+
+        let effects = if persist_ops.is_empty() {
+            Vec::new()
+        } else {
+            vec![persist_effect(&self.state, persist_ops)]
+        };
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: transitioned,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: None,
+        })
+    }
+
+    /// Handle `CoreEvent::GroupOutboxSealFailed`.
+    ///
+    /// Retryable failures (network errors, 5xx) re-stage the pending seal so
+    /// the next `flush_pending_transport` cycle can re-emit the effect. A
+    /// retryable seal failure does NOT set `dissolved_at` — the group
+    /// remains locally open until the server confirms the seal (step (d)
+    /// contract).
+    ///
+    /// Non-retryable failures surface as a temporary-network-failure
+    /// notification so the UI can re-present the dissolve dialog to the
+    /// owner. We keep the manifest change (removed members) intact: once
+    /// the MLS commit has reached the outbox, those members cannot send
+    /// again anyway. The owner's retry will re-mint the seal capability
+    /// and try again.
+    fn handle_group_outbox_seal_failed(
+        &mut self,
+        group_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let _ = (status, code.clone());
+        if retryable {
+            // The pending seal entry was consumed when the effect was
+            // dispatched. For retry we need to rebuild it. The owner's
+            // current role + capability is still valid because their
+            // removal was to members, not to self.
+            let role = match self.local_group_role(&group_id) {
+                Ok(role) => role,
+                Err(_) => {
+                    // Group no longer known locally — abort retry.
+                    return Ok(CoreOutput::default());
+                }
+            };
+            if role == GroupRole::Owner {
+                match self.group_capability(&group_id, role) {
+                    Ok(capability) => {
+                        self.state.pending_group_seal.insert(
+                            group_id.clone(),
+                            SealGroupOutboxRequest {
+                                group_id: group_id.clone(),
+                                capability,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        // Can't rebuild capability (unlikely); fall through
+                        // to surfacing a notification.
+                    }
+                }
+            }
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::ScheduleTimer {
+                    timer: TimerEffect {
+                        timer_id: format!("retry_group_seal:{group_id}"),
+                        delay_ms: 0,
+                    },
+                }],
+                view_model: None,
+            });
+        }
+
+        // Non-retryable: clear pending state and surface the failure.
+        self.state.pending_group_seal.remove(&group_id);
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::EmitUserNotification {
+                notification: UserNotificationEffect {
+                    status: SystemStatus::TemporaryNetworkFailure,
+                    message: detail.unwrap_or_else(|| {
+                        format!("failed to seal dissolved group {group_id}")
                     }),
                 },
             }],
@@ -8256,6 +8736,7 @@ impl CoreEngine {
                     manifest,
                     local_role,
                     welcome_pickup: Some(descriptor.clone()),
+                    dissolved_at: None,
                 },
             );
         }
@@ -8419,7 +8900,20 @@ fn group_capability_for_manifest(manifest: &GroupManifest, role: GroupRole) -> G
 
 fn group_capability_operations(role: GroupRole) -> Vec<GroupCapabilityOperation> {
     match role {
-        GroupRole::Owner | GroupRole::Admin => vec![
+        GroupRole::Owner => vec![
+            GroupCapabilityOperation::Read,
+            GroupCapabilityOperation::Subscribe,
+            GroupCapabilityOperation::AppendApplication,
+            GroupCapabilityOperation::AppendControl,
+            GroupCapabilityOperation::AppendMembership,
+            GroupCapabilityOperation::ManageInvites,
+            GroupCapabilityOperation::ApproveJoin,
+            GroupCapabilityOperation::RemoveMember,
+            GroupCapabilityOperation::UpdateGroupMetadata,
+            // Only the owner may seal the outbox (PROTOCOL_GROUP_CN.md §10.4).
+            GroupCapabilityOperation::SealGroup,
+        ],
+        GroupRole::Admin => vec![
             GroupCapabilityOperation::Read,
             GroupCapabilityOperation::Subscribe,
             GroupCapabilityOperation::AppendApplication,
@@ -8455,7 +8949,13 @@ fn group_message_type_to_direct(message_type: GroupMessageType) -> MessageType {
         | GroupMessageType::ControlGroupJoinRequested
         | GroupMessageType::ControlGroupJoinApproved
         | GroupMessageType::ControlGroupJoinRejected
-        | GroupMessageType::ControlGroupLeaveRequested => {
+        | GroupMessageType::ControlGroupLeaveRequested
+        | GroupMessageType::ControlGroupDissolved => {
+            // Dissolve is a terminal membership-change event; fold it into the
+            // existing membership-changed bucket here so direct-chat message
+            // type derivation stays a pure model projection. The
+            // dissolve-specific behaviour (owner-only, seal outbox, etc.)
+            // lives in the engine path added by later A.2-A.6 tasks.
             MessageType::ControlDeviceMembershipChanged
         }
         GroupMessageType::ControlGroupMetadataUpdated => MessageType::ControlIdentityStateUpdated,

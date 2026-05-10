@@ -20,7 +20,9 @@ mod tests {
         CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{CorePersistenceSnapshot, PersistOp};
-    use crate::transport_contract::GroupJoinDecision;
+    use crate::transport_contract::{
+        GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult,
+    };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,6 +75,117 @@ mod tests {
     }
 
     #[test]
+    fn core_command_dissolve_group_serializes() {
+        // `CoreCommand::DissolveGroup` is the owner-only atomic dissolve
+        // primitive defined in PLAN_GROUP Phase 6 (task A.2). The snake_case
+        // `type` tag and `group_id` field must round-trip exactly so the
+        // Tauri command layer and the CLI produce identical JSON for the
+        // same user action.
+        let command = CoreCommand::DissolveGroup {
+            group_id: "group:project".into(),
+        };
+
+        let json = serde_json::to_string(&command).expect("serialize DissolveGroup");
+        assert!(
+            json.contains("\"type\":\"dissolve_group\""),
+            "DissolveGroup must serialise type tag as 'dissolve_group'; got {json}"
+        );
+        assert!(
+            json.contains("\"group_id\":\"group:project\""),
+            "DissolveGroup must serialise group_id in snake_case; got {json}"
+        );
+
+        let decoded: CoreCommand =
+            serde_json::from_str(&json).expect("deserialize DissolveGroup");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn core_event_group_outbox_sealed_variants_serialize() {
+        // Both `GroupOutboxSealed` and `GroupOutboxSealFailed` are emitted by
+        // the owner driver (`seal_group_outbox`) after A.4's dissolve
+        // sequence schedules `CoreEffect::SealGroupOutbox`. Their JSON
+        // contract is stable so that C.3's driver and G.4's desktop e2e
+        // observe the same bytes on the wire.
+        let sealed = CoreEvent::GroupOutboxSealed {
+            group_id: "group:project".into(),
+            sealed_at: 1_700_000_000_000,
+            was_already_sealed: false,
+        };
+        let sealed_repeat = CoreEvent::GroupOutboxSealed {
+            group_id: "group:project".into(),
+            sealed_at: 1_700_000_000_500,
+            was_already_sealed: true,
+        };
+        let failed = CoreEvent::GroupOutboxSealFailed {
+            group_id: "group:project".into(),
+            retryable: false,
+            status: Some(403),
+            code: Some("unauthorized".into()),
+            detail: Some("capability does not authorize seal_group".into()),
+        };
+
+        let sealed_json = serde_json::to_string(&sealed).expect("serialize sealed");
+        assert!(
+            sealed_json.contains("\"type\":\"group_outbox_sealed\""),
+            "GroupOutboxSealed must tag as group_outbox_sealed; got {sealed_json}"
+        );
+        // When `was_already_sealed == false` the field should be omitted to
+        // keep the wire payload compact and tolerate older decoders.
+        assert!(
+            !sealed_json.contains("was_already_sealed"),
+            "was_already_sealed must be omitted when false; got {sealed_json}"
+        );
+        let decoded_sealed: CoreEvent =
+            serde_json::from_str(&sealed_json).expect("deserialize sealed");
+        assert_eq!(decoded_sealed, sealed);
+
+        let repeat_json = serde_json::to_string(&sealed_repeat).expect("serialize repeat");
+        assert!(
+            repeat_json.contains("\"was_already_sealed\":true"),
+            "was_already_sealed must be emitted when true; got {repeat_json}"
+        );
+        let decoded_repeat: CoreEvent =
+            serde_json::from_str(&repeat_json).expect("deserialize repeat");
+        assert_eq!(decoded_repeat, sealed_repeat);
+
+        let failed_json = serde_json::to_string(&failed).expect("serialize failed");
+        assert!(
+            failed_json.contains("\"type\":\"group_outbox_seal_failed\""),
+            "GroupOutboxSealFailed must tag as group_outbox_seal_failed; got {failed_json}"
+        );
+        assert!(
+            failed_json.contains("\"retryable\":false"),
+            "retryable field must round-trip; got {failed_json}"
+        );
+        let decoded_failed: CoreEvent =
+            serde_json::from_str(&failed_json).expect("deserialize failed");
+        assert_eq!(decoded_failed, failed);
+
+        // Ensure `SealGroupOutboxRequest` / `SealGroupOutboxResult` remain
+        // accessible from this module so downstream tests can build effect
+        // fixtures in subsequent waves (A.4 and beyond).
+        let _ = SealGroupOutboxRequest {
+            group_id: "group:project".into(),
+            capability: crate::model::GroupCapability {
+                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                service: crate::model::CapabilityService::GroupOutbox,
+                group_id: "group:project".into(),
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                operations: vec![GroupCapabilityOperation::SealGroup],
+                role: GroupRole::Owner,
+                expires_at: 999,
+                signature: "sig".into(),
+            },
+        };
+        let _ = SealGroupOutboxResult {
+            sealed_at: 1,
+            was_already_sealed: true,
+        };
+    }
+
+    #[test]
     fn group_membership_workflow_commands_are_implemented() {
         let commands: Vec<CoreCommand> = vec![
             CoreCommand::InviteToGroup {
@@ -106,7 +219,7 @@ mod tests {
 
     #[test]
     fn group_capability_operations_match_role_matrix() {
-        let privileged = vec![
+        let admin_privileged = vec![
             GroupCapabilityOperation::Read,
             GroupCapabilityOperation::Subscribe,
             GroupCapabilityOperation::AppendApplication,
@@ -117,6 +230,11 @@ mod tests {
             GroupCapabilityOperation::RemoveMember,
             GroupCapabilityOperation::UpdateGroupMetadata,
         ];
+        // Owners get every admin operation plus `SealGroup`, which per
+        // PROTOCOL_GROUP_CN.md §10.4 is owner-exclusive (Cloudflare rejects
+        // any seal request signed by a non-owner capability).
+        let mut owner_privileged = admin_privileged.clone();
+        owner_privileged.push(GroupCapabilityOperation::SealGroup);
         let member = vec![
             GroupCapabilityOperation::Read,
             GroupCapabilityOperation::Subscribe,
@@ -126,11 +244,11 @@ mod tests {
 
         assert_eq!(
             engine::test_group_capability_operations(GroupRole::Owner),
-            privileged
+            owner_privileged
         );
         assert_eq!(
             engine::test_group_capability_operations(GroupRole::Admin),
-            privileged
+            admin_privileged
         );
         assert_eq!(
             engine::test_group_capability_operations(GroupRole::Member),
@@ -191,6 +309,7 @@ mod tests {
                 GroupCapabilityOperation::ApproveJoin,
                 GroupCapabilityOperation::RemoveMember,
                 GroupCapabilityOperation::UpdateGroupMetadata,
+                GroupCapabilityOperation::SealGroup,
             ]
         );
         assert_eq!(
@@ -246,6 +365,360 @@ mod tests {
         assert!(
             restored.state.pending_group_outbox.is_empty(),
             "pending group sends without a local role must not regain member capability"
+        );
+    }
+
+    #[test]
+    fn dissolve_group_requires_owner_role() {
+        // Dissolve is owner-only per PROTOCOL_GROUP_CN §10.4 and R12.1.
+        // A freshly-joined member trying to dissolve must hit the core's
+        // authoritative role check and produce no side-effects.
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let summary = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+
+        // Simulate alice losing ownership by demoting her local role to
+        // Member — the core's `local_group_role` gate must refuse Dissolve
+        // regardless of manifest state on the wire.
+        let group_state = alice
+            .state
+            .group_states
+            .get_mut(&group_id)
+            .expect("group state");
+        group_state.local_role = Some(GroupRole::Member);
+
+        let initial_pending = alice.state.pending_group_outbox.len();
+        let initial_seal = alice.state.pending_group_seal.len();
+
+        let error = alice
+            .handle_command(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect_err("non-owner cannot dissolve");
+        assert_eq!(error.code(), "invalid_input");
+
+        // No commit envelope, no seal, no dissolved_at.
+        assert_eq!(alice.state.pending_group_outbox.len(), initial_pending);
+        assert_eq!(alice.state.pending_group_seal.len(), initial_seal);
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group still exists")
+                .dissolved_at
+                .is_none(),
+            "a refused dissolve must not set dissolved_at"
+        );
+    }
+
+    #[test]
+    fn dissolve_group_emits_remove_commit_then_dissolved_control_then_seal_effect() {
+        // Success path invariant for step (a)+(b)+(c) ordering:
+        //   - A single MLS remove_members commit enqueued first.
+        //   - A `ControlGroupDissolved` envelope enqueued second, with
+        //     `visibility = Visible`.
+        //   - No `SealGroupOutbox` effect yet — seal is strictly deferred
+        //     until every pending outbox append for this group is
+        //     acknowledged (handled by `handle_group_envelope_appended`).
+        //   - `pending_group_seal` contains the staged request so the seal
+        //     effect will be issued after acks arrive.
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("import carol");
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+
+        // Drain the initial-create commit from the pending queue so the
+        // dissolve flow observes a clean baseline. We do not need the MLS
+        // adapter to actually deliver that commit — simply clearing the
+        // local staging queue is enough for this unit-level ordering check.
+        alice.state.pending_group_outbox.clear();
+
+        let dissolve = alice
+            .handle_command(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("dissolve");
+
+        // Inspect the now-pending group outbox items: they must be
+        // exactly [remove_commit, control_group_dissolved] in that order.
+        let items = &alice.state.pending_group_outbox;
+        assert!(
+            items.len() >= 2,
+            "expected commit + control queued; got {}",
+            items.len()
+        );
+        assert_eq!(
+            items[0].envelope.message_type,
+            GroupMessageType::MlsCommit,
+            "step (a): the MLS remove_members commit must be enqueued first"
+        );
+        assert_eq!(
+            items[1].envelope.message_type,
+            GroupMessageType::ControlGroupDissolved,
+            "step (b): ControlGroupDissolved must immediately follow the remove commit"
+        );
+        assert_eq!(
+            items[1].envelope.visibility,
+            GroupEnvelopeVisibility::Visible,
+            "ControlGroupDissolved must be visible (PROTOCOL_GROUP_CN §10.4)"
+        );
+
+        // Step (c): seal is staged but not yet emitted as an effect.
+        assert!(
+            alice
+                .state
+                .pending_group_seal
+                .contains_key(&group_id),
+            "the seal request must be staged before its effect is emitted"
+        );
+        assert!(
+            !dissolve
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::SealGroupOutbox { .. })),
+            "seal effect must not be emitted before commit/control are acknowledged"
+        );
+
+        // And step (d): dissolved_at stays None until a GroupOutboxSealed
+        // event comes back.
+        let group_state = alice
+            .state
+            .group_states
+            .get(&group_id)
+            .expect("group still present");
+        assert!(
+            group_state.dissolved_at.is_none(),
+            "dissolved_at must remain None until the seal is acknowledged"
+        );
+    }
+
+    #[test]
+    fn dissolve_group_does_not_set_dissolved_at_until_seal_ack() {
+        // Even after every pending commit/control is acknowledged AND the
+        // SealGroupOutbox effect is emitted, `dissolved_at` must only be
+        // set once the `GroupOutboxSealed` event comes back through the
+        // engine (strict step-(d) contract).
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+        alice.state.pending_group_outbox.clear();
+
+        alice
+            .handle_command(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("dissolve");
+
+        // Simulate the commit + control envelopes being successfully
+        // appended by the transport. The second of these two
+        // acknowledgements must trigger the seal effect.
+        let pending_ids: Vec<String> = alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .map(|item| item.envelope.message_id.clone())
+            .collect();
+        assert!(
+            pending_ids.len() >= 1,
+            "dissolve must have staged at least one outbox append"
+        );
+        let mut seal_effect_observed = false;
+        for (index, message_id) in pending_ids.iter().enumerate() {
+            let output = alice
+                .handle_event(CoreEvent::GroupEnvelopeAppended {
+                    group_id: group_id.clone(),
+                    message_id: message_id.clone(),
+                    seq: (index as u64) + 1,
+                })
+                .expect("handle group envelope appended");
+            if output
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::SealGroupOutbox { .. }))
+            {
+                seal_effect_observed = true;
+            }
+        }
+        assert!(
+            seal_effect_observed,
+            "SealGroupOutbox effect must be emitted after the last pending append is acknowledged"
+        );
+
+        // Between the effect being emitted and the ack arriving,
+        // `dissolved_at` must still be None.
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .dissolved_at
+                .is_none(),
+            "dissolved_at must remain None until GroupOutboxSealed is observed"
+        );
+
+        // Now inject the success event — the transition must occur.
+        let sealed_at = 1_700_000_000_000_u64;
+        alice
+            .handle_event(CoreEvent::GroupOutboxSealed {
+                group_id: group_id.clone(),
+                sealed_at,
+                was_already_sealed: false,
+            })
+            .expect("handle sealed");
+        assert_eq!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .dissolved_at,
+            Some(sealed_at),
+            "dissolved_at must be set after GroupOutboxSealed arrives"
+        );
+    }
+
+    #[test]
+    fn dissolve_group_propagates_seal_failure_without_marking_dissolved() {
+        // A retryable seal failure must re-stage the seal in
+        // `pending_group_seal` so the next flush re-emits the effect, and
+        // must NOT set `dissolved_at`. A non-retryable failure must clear
+        // the staged seal and surface a system-status notification —
+        // again, NOT setting `dissolved_at`.
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+        alice.state.pending_group_outbox.clear();
+        alice
+            .handle_command(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("dissolve");
+
+        // Simulate a retryable seal failure (network / 5xx). The pending
+        // seal entry must be rebuilt so the next flush reissues the effect.
+        let retry_output = alice
+            .handle_event(CoreEvent::GroupOutboxSealFailed {
+                group_id: group_id.clone(),
+                retryable: true,
+                status: Some(503),
+                code: None,
+                detail: Some("upstream unavailable".into()),
+            })
+            .expect("handle retryable seal failure");
+        assert!(
+            alice
+                .state
+                .pending_group_seal
+                .contains_key(&group_id),
+            "a retryable seal failure must re-stage the pending seal"
+        );
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .dissolved_at
+                .is_none(),
+            "a retryable seal failure must NOT mark the group dissolved"
+        );
+        assert!(
+            retry_output
+                .state_update
+                .system_statuses_changed
+                .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure)
+        );
+
+        // Simulate a non-retryable seal failure (e.g. 403 unauthorized).
+        // The staged seal must be cleared and the user must see a
+        // surfaced notification — still no dissolved_at.
+        let terminal_output = alice
+            .handle_event(CoreEvent::GroupOutboxSealFailed {
+                group_id: group_id.clone(),
+                retryable: false,
+                status: Some(403),
+                code: Some("unauthorized".into()),
+                detail: Some("capability rejected".into()),
+            })
+            .expect("handle terminal seal failure");
+        assert!(
+            !alice
+                .state
+                .pending_group_seal
+                .contains_key(&group_id),
+            "a non-retryable seal failure must drop the staged seal"
+        );
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .dissolved_at
+                .is_none(),
+            "a non-retryable seal failure must NOT mark the group dissolved"
+        );
+        assert!(
+            terminal_output
+                .effects
+                .iter()
+                .any(|effect| matches!(
+                    effect,
+                    CoreEffect::EmitUserNotification { notification }
+                        if notification.status == crate::ffi_api::SystemStatus::TemporaryNetworkFailure
+                )),
+            "a non-retryable seal failure must surface a user notification"
         );
     }
 

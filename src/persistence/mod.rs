@@ -78,6 +78,8 @@ pub struct PersistedGroupState {
     pub local_role: Option<GroupRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome_pickup: Option<WelcomePickupDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dissolved_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1033,6 +1035,54 @@ mod tests {
 
         let error = decode_snapshot(bytes.as_bytes()).expect_err("unsupported version should fail");
         assert_eq!(error.code(), "unsupported");
+    }
+
+    #[test]
+    fn persisted_group_state_without_dissolved_at_field_deserializes_as_none() {
+        // Old snapshots predating the dissolve feature wrote PersistedGroupState
+        // without the `dissolved_at` field. The new field is marked
+        // `#[serde(default)]`, so deserialising such a snapshot must succeed and
+        // yield `dissolved_at == None` (backward compatibility with on-disk
+        // state from prior releases).
+        let legacy_json = serde_json::json!({
+            "group_id": "group:alice",
+            "conversation_id": "conv:group:alice",
+            "manifest": {
+                "version": CURRENT_MODEL_VERSION,
+                "groupId": "group:alice",
+                "conversationId": "conv:group:alice",
+                "title": "Alice's Group",
+                "ownerUserId": "user:alice",
+                "admins": [],
+                "members": [{
+                    "userId": "user:alice",
+                    "role": "owner",
+                    "status": "active"
+                }],
+                "joinPolicy": "approval_required",
+                "memberInvitePolicy": "owner_admin_only",
+                "rosterVersion": 1,
+                "mlsEpochHint": 1,
+                "outbox": {
+                    "version": CURRENT_MODEL_VERSION,
+                    "endpoint": "https://example.com/group-outbox",
+                    "headSeq": 0
+                },
+                "updatedAt": 0,
+                "signerUserId": "user:alice",
+                "signerDeviceId": "device:alice:phone",
+                "signature": "legacy-sig"
+            },
+            "local_role": "owner"
+        })
+        .to_string();
+
+        let decoded: PersistedGroupState =
+            serde_json::from_str(&legacy_json).expect("legacy PersistedGroupState should decode");
+        assert!(decoded.dissolved_at.is_none());
+        assert_eq!(decoded.group_id, "group:alice");
+        assert_eq!(decoded.local_role, Some(GroupRole::Owner));
+        assert!(decoded.welcome_pickup.is_none());
     }
 
     fn sample_contact_device(user_id: &str, device_id: &str) -> crate::model::DeviceContactProfile {
