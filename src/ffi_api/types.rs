@@ -419,6 +419,17 @@ pub enum CoreEvent {
         retryable: bool,
         detail: Option<String>,
     },
+    GroupWebSocketConnected {
+        group_id: String,
+    },
+    GroupWebSocketDisconnected {
+        group_id: String,
+        error: Option<String>,
+    },
+    GroupRealtimeEventReceived {
+        group_id: String,
+        event: RealtimeEvent,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +446,15 @@ pub enum RealtimeEvent {
         sender_user_id: String,
         request_id: String,
         change: MessageRequestRealtimeChange,
+    },
+    GroupHeadUpdated {
+        group_id: String,
+        seq: u64,
+    },
+    GroupOutboxRecordAvailable {
+        group_id: String,
+        seq: u64,
+        record: Option<crate::model::GroupOutboxRecord>,
     },
 }
 
@@ -806,6 +826,13 @@ pub(crate) struct RealtimeSessionState {
     pub(crate) needs_reconnect: bool,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GroupRealtimeSessionState {
+    pub(crate) connected: bool,
+    pub(crate) last_known_seq: u64,
+    pub(crate) needs_reconnect: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PendingAllowlistMutation {
     Add { user_id: String },
@@ -849,6 +876,7 @@ pub(crate) struct CoreState {
     pub(crate) pending_blob_uploads: BTreeMap<String, PendingBlobUpload>,
     pub(crate) pending_blob_downloads: BTreeMap<String, PendingBlobDownload>,
     pub(crate) realtime_sessions: BTreeMap<String, RealtimeSessionState>,
+    pub(crate) group_realtime_sessions: BTreeMap<String, GroupRealtimeSessionState>,
     pub(crate) mls_adapter: Option<MlsAdapter>,
     pub(crate) mls_summaries: BTreeMap<String, MlsStateSummary>,
     pub(crate) published_key_package: Option<PublishedKeyPackage>,
@@ -991,6 +1019,7 @@ impl Default for CoreState {
             pending_blob_uploads: BTreeMap::new(),
             pending_blob_downloads: BTreeMap::new(),
             realtime_sessions: BTreeMap::new(),
+            group_realtime_sessions: BTreeMap::new(),
             mls_adapter: None,
             mls_summaries: BTreeMap::new(),
             published_key_package: None,

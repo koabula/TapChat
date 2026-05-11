@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 
 use tapchat_core::ffi_api::CoreEvent;
-use tapchat_core::transport_contract::RealtimeSubscriptionRequest;
+use tapchat_core::transport_contract::{GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest};
 
 use crate::commands::session::set_ws_connection_snapshot;
 use crate::platform::profile::ProfileManagerInner;
@@ -41,6 +41,7 @@ impl Default for ConnectionId {
 /// Realtime connection manager for WebSocket subscriptions.
 pub struct RealtimeManager {
     sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
+    group_sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
     #[allow(dead_code)]
     profile_inner: Arc<RwLock<ProfileManagerInner>>,
     app_handle: Option<Arc<AppHandle>>,
@@ -98,12 +99,24 @@ pub enum WsServerEvent {
         request_id: String,
         change: String,
     },
+    GroupHeadUpdated {
+        #[serde(rename = "groupId")]
+        group_id: String,
+        seq: u64,
+    },
+    GroupOutboxRecordAvailable {
+        #[serde(rename = "groupId")]
+        group_id: String,
+        seq: u64,
+        record: Option<serde_json::Value>,
+    },
 }
 
 impl RealtimeManager {
     pub fn new(profile_inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            group_sessions: Arc::new(RwLock::new(HashMap::new())),
             profile_inner,
             app_handle: None,
             connection_counter: Arc::new(RwLock::new(0)),
@@ -361,6 +374,303 @@ impl RealtimeManager {
             .map(|s| (s.connection_id.as_str().to_string(), s.connected, s.stale))
     }
 
+    /// Open a group outbox realtime WebSocket connection.
+    /// If an existing connection exists for this group, it will be marked stale and closed.
+    pub async fn open_group_connection(
+        &self,
+        subscription: GroupRealtimeSubscriptionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let group_id = subscription.group_id.clone();
+        let endpoint = subscription.endpoint.clone();
+
+        log::info!(
+            "RealtimeManager::open_group_connection: group_id={}, endpoint={}, last_seq={}",
+            group_id,
+            summarize_endpoint(&endpoint),
+            subscription.last_seq
+        );
+
+        // Check for existing group session
+        {
+            let sessions = self.group_sessions.read().await;
+            if let Some(session) = sessions.get(&group_id) {
+                if session.endpoint == endpoint && (session.connecting || session.connected) {
+                    log::debug!(
+                        "RealtimeManager: reusing active or connecting group session for group_id={}",
+                        group_id
+                    );
+                    return Ok(vec![CoreEvent::GroupWebSocketConnected {
+                        group_id,
+                    }]);
+                }
+            }
+        }
+
+        let connection_id = self.next_connection_id().await;
+        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+
+        // Mark existing stale and replace
+        let stale_stop_tx;
+        {
+            let mut sessions = self.group_sessions.write().await;
+            let old = sessions.insert(
+                group_id.clone(),
+                RealtimeSession {
+                    device_id: group_id.clone(),
+                    endpoint: endpoint.clone(),
+                    connection_id: connection_id.clone(),
+                    connecting: true,
+                    connected: false,
+                    stale: false,
+                    stop_tx: stop_tx.clone(),
+                    connected_at: None,
+                },
+            );
+
+            if let Some(mut old_session) = old {
+                stale_stop_tx = Some(old_session.stop_tx.clone());
+                old_session.stale = true;
+                sessions.insert(group_id.clone(), old_session);
+            } else {
+                stale_stop_tx = None;
+            }
+        }
+
+        if let Some(tx) = stale_stop_tx {
+            let _ = tx.send(()).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Build WebSocket URL: the group outbox subscribe endpoint is already a full URL
+        let ws_url = {
+            let url = if endpoint.starts_with("https://") {
+                endpoint.replace("https://", "wss://")
+            } else if endpoint.starts_with("http://") {
+                endpoint.replace("http://", "ws://")
+            } else {
+                endpoint.clone()
+            };
+            format!("{url}?last_seq={}", subscription.last_seq)
+        };
+
+        log::info!("RealtimeManager: built group ws_url={}", ws_url);
+
+        // Create request with group capability header
+        let capability_json = serde_json::to_string(&subscription.capability)
+            .map_err(|e| anyhow::anyhow!("serialize group capability: {e}"))?;
+
+        let request = Request::builder()
+            .uri(&ws_url)
+            .method("GET")
+            .header("Host", self.extract_host(&endpoint)?)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .header("Sec-WebSocket-Version", "13")
+            .header("X-Tapchat-Group-Capability", &capability_json)
+            .body(())
+            .context("build group websocket request")?;
+
+        // Connect
+        let (ws_stream, _) =
+            match connect_async_tls_with_config(request, None, false, None).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let mut sessions = self.group_sessions.write().await;
+                    if sessions
+                        .get(&group_id)
+                        .is_some_and(|session| session.connection_id == connection_id)
+                    {
+                        sessions.remove(&group_id);
+                    }
+                    let detail = format!("group websocket connect: {}", error);
+                    log::warn!(
+                        "RealtimeManager: group websocket connect failed group_id={} error={}",
+                        group_id,
+                        detail
+                    );
+                    return Ok(vec![CoreEvent::GroupWebSocketDisconnected {
+                        group_id,
+                        error: Some(detail),
+                    }]);
+                }
+            };
+
+        // Mark connected
+        {
+            let mut sessions = self.group_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&group_id) {
+                if session.connection_id == connection_id && !session.stale {
+                    session.connecting = false;
+                    session.connected = true;
+                    session.connected_at = Some(Instant::now());
+                }
+            }
+        }
+
+        // Spawn read loop with group-specific semantics
+        let sessions_ref = self.group_sessions.clone();
+        let app_handle_ref = self.app_handle.clone();
+        let group_id_clone = group_id.clone();
+        tokio::spawn(async move {
+            Self::group_read_loop(
+                ws_stream,
+                sessions_ref,
+                group_id_clone,
+                connection_id,
+                stop_rx,
+                app_handle_ref,
+            )
+            .await;
+        });
+
+        Ok(vec![CoreEvent::GroupWebSocketConnected { group_id }])
+    }
+
+    async fn group_read_loop(
+        ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
+        group_id: String,
+        connection_id: ConnectionId,
+        mut stop_rx: mpsc::Receiver<()>,
+        app_handle: Option<Arc<AppHandle>>,
+    ) {
+        let (mut write, mut read) = ws_stream.split();
+
+        loop {
+            tokio::select! {
+                _ = stop_rx.recv() => {
+                    let _ = write.close().await;
+                    let should_emit = {
+                        let sessions_guard = sessions.read().await;
+                        match sessions_guard.get(&group_id) {
+                            Some(session) => session.connection_id == connection_id && !session.stale,
+                            None => true,
+                        }
+                    };
+                    if should_emit {
+                        if let Some(app) = &app_handle {
+                            let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                device_id: group_id.clone(),
+                                event_type: "group_disconnected".to_string(),
+                                data: None,
+                            });
+                        }
+                    }
+                    break;
+                }
+
+                msg = read.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            let is_active = {
+                                let sessions_guard = sessions.read().await;
+                                match sessions_guard.get(&group_id) {
+                                    Some(session) => session.connection_id == connection_id && !session.stale,
+                                    None => false,
+                                }
+                            };
+
+                            if !is_active {
+                                log::warn!(
+                                    "RealtimeManager: ignoring group message for stale connection {}",
+                                    connection_id.as_str()
+                                );
+                                continue;
+                            }
+
+                            if let Ok(event) = serde_json::from_str::<WsServerEvent>(&text) {
+                                log::info!("RealtimeManager: group {}", summarize_ws_event(&group_id, &event));
+
+                                if let Some(app) = &app_handle {
+                                    let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                        device_id: group_id.clone(),
+                                        event_type: event.event_type_name(),
+                                        data: Some(text.to_string()),
+                                    });
+                                }
+                            } else {
+                                log::warn!("Group WS event failed to parse for {}: {}", group_id, text);
+                            }
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            let is_active = {
+                                let sessions_guard = sessions.read().await;
+                                match sessions_guard.get(&group_id) {
+                                    Some(session) => session.connection_id == connection_id && !session.stale,
+                                    None => false,
+                                }
+                            };
+                            if is_active {
+                                let _ = write.send(Message::Pong(data)).await;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            let should_emit = {
+                                let mut sessions_guard = sessions.write().await;
+                                match sessions_guard.get_mut(&group_id) {
+                                    Some(session) if session.connection_id == connection_id && !session.stale => {
+                                        session.connected = false;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+
+                            if should_emit {
+                                if let Some(app) = &app_handle {
+                                    let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                        device_id: group_id.clone(),
+                                        event_type: "group_disconnected".to_string(),
+                                        data: None,
+                                    });
+                                }
+                            }
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            log::error!("Group WS error for {}: {:?}", group_id, e);
+
+                            let should_emit = {
+                                let mut sessions_guard = sessions.write().await;
+                                match sessions_guard.get_mut(&group_id) {
+                                    Some(session) if session.connection_id == connection_id && !session.stale => {
+                                        session.connected = false;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+
+                            if should_emit {
+                                if let Some(app) = &app_handle {
+                                    let _ = app.emit("realtime-event", RealtimeEventPayload {
+                                        device_id: group_id.clone(),
+                                        event_type: "group_error".to_string(),
+                                        data: Some(e.to_string()),
+                                    });
+                                }
+                            }
+                            break;
+                        }
+                        None => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut sessions_guard = sessions.write().await;
+        if let Some(session) = sessions_guard.get(&group_id) {
+            if session.connection_id == connection_id {
+                sessions_guard.remove(&group_id);
+            }
+        }
+    }
+
     async fn reserve_connection(&self, device_id: &str, endpoint: &str) -> ConnectionReservation {
         let connection_id = self.next_connection_id().await;
         let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
@@ -513,6 +823,8 @@ impl RealtimeManager {
                                             device_id, seq, crate::ts_ms());
                                     }
                                     WsServerEvent::MessageRequestChanged { .. } => {}
+                                    WsServerEvent::GroupHeadUpdated { .. } => {}
+                                    WsServerEvent::GroupOutboxRecordAvailable { .. } => {}
                                 }
 
                                 // Emit to frontend
@@ -640,6 +952,8 @@ impl WsServerEvent {
             WsServerEvent::HeadUpdated { .. } => "head_updated",
             WsServerEvent::InboxRecordAvailable { .. } => "inbox_record_available",
             WsServerEvent::MessageRequestChanged { .. } => "message_request_changed",
+            WsServerEvent::GroupHeadUpdated { .. } => "group_head_updated",
+            WsServerEvent::GroupOutboxRecordAvailable { .. } => "group_outbox_record_available",
         }
         .to_string()
     }
@@ -661,6 +975,16 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
         } => format!(
             "device_id={device_id} type=message_request_changed sender_user_id={sender_user_id} request_id={request_id} change={change}"
         ),
+        WsServerEvent::GroupHeadUpdated {
+            group_id, seq, ..
+        } => {
+            format!("group_id={group_id} type=group_head_updated seq={seq}")
+        }
+        WsServerEvent::GroupOutboxRecordAvailable {
+            group_id, seq, ..
+        } => {
+            format!("group_id={group_id} type=group_outbox_record_available seq={seq}")
+        }
     }
 }
 

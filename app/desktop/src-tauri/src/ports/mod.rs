@@ -32,7 +32,8 @@ use tapchat_core::transport_contract::{
     GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult, ListGroupJoinRequestsRequest,
     ListGroupJoinRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
     PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest,
     RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
     SubmitGroupJoinResult,
 };
@@ -952,6 +953,13 @@ impl RealtimePort for DesktopPlatformPorts {
 
     async fn close_realtime(&mut self, device_id: String) -> Result<Vec<CoreEvent>> {
         self.realtime.close_connection(&device_id).await
+    }
+
+    async fn open_group_realtime(
+        &mut self,
+        subscription: GroupRealtimeSubscriptionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        self.realtime.open_group_connection(subscription).await
     }
 }
 

@@ -210,6 +210,13 @@ pub struct PersistedRealtimeSession {
     pub needs_reconnect: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGroupRealtimeSession {
+    pub group_id: String,
+    pub last_known_seq: u64,
+    pub needs_reconnect: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CorePersistenceSnapshot {
     #[serde(default)]
@@ -250,6 +257,8 @@ pub struct CorePersistenceSnapshot {
     pub recovery_contexts: Vec<PersistedRecoveryContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub realtime_sessions: Vec<PersistedRealtimeSession>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_realtime_sessions: Vec<PersistedGroupRealtimeSession>,
     #[serde(default)]
     pub mls_state_persistence_blocked: bool,
 }
@@ -369,6 +378,7 @@ pub struct InMemoryPersistence {
     pending_blob_transfers: BTreeMap<String, PersistedPendingBlobTransfer>,
     recovery_contexts: BTreeMap<String, PersistedRecoveryContext>,
     realtime_sessions: BTreeMap<String, PersistedRealtimeSession>,
+    group_realtime_sessions: BTreeMap<String, PersistedGroupRealtimeSession>,
 }
 
 impl InMemoryPersistence {
@@ -478,6 +488,12 @@ impl InMemoryPersistence {
             .cloned()
             .map(|session| (session.device_id.clone(), session))
             .collect();
+        self.group_realtime_sessions = snapshot
+            .group_realtime_sessions
+            .iter()
+            .cloned()
+            .map(|session| (session.group_id.clone(), session))
+            .collect();
     }
 
     pub fn load_snapshot(&self) -> CorePersistenceSnapshot {
@@ -505,6 +521,7 @@ impl InMemoryPersistence {
             pending_blob_transfers: self.pending_blob_transfers.values().cloned().collect(),
             recovery_contexts: self.recovery_contexts.values().cloned().collect(),
             realtime_sessions: self.realtime_sessions.values().cloned().collect(),
+            group_realtime_sessions: self.group_realtime_sessions.values().cloned().collect(),
             mls_state_persistence_blocked: self
                 .mls_states
                 .values()
@@ -829,6 +846,7 @@ mod tests {
                 last_known_seq: 3,
                 needs_reconnect: true,
             }],
+            group_realtime_sessions: vec![],
             mls_states: vec![PersistedMlsState {
                 conversation_id: "conv:one".into(),
                 summary: MlsStateSummary {
@@ -981,6 +999,7 @@ mod tests {
             pending_blob_transfers: vec![],
             recovery_contexts: vec![],
             realtime_sessions: vec![],
+            group_realtime_sessions: vec![],
             mls_state_persistence_blocked: false,
         };
 

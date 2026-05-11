@@ -270,7 +270,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return stub.fetch(request);
     }
 
-    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head|seal)$/);
+    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head|seal|subscribe)$/);
     if (groupOutboxMatch) {
       const groupId = decodeURIComponent(groupOutboxMatch[1]);
       const operation = groupOutboxMatch[2];
@@ -297,6 +297,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         );
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         validateGroupReadAuthorization(request, groupId, readGroupCapabilityHeader(request), now);
+      } else if (operation === "subscribe") {
+        validateGroupOperationAuthorization(
+          request,
+          groupId,
+          readGroupCapabilityHeader(request),
+          now,
+          "subscribe"
+        );
       }
 
       return stub.fetch(request);

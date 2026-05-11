@@ -23,9 +23,10 @@ use crate::model::{
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
     PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
-    PersistedGroupState, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
-    PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
-    PersistedRealtimeSession, PersistedRecoveryContext, PersistedRecoveryEscalationReason,
+    PersistedGroupRealtimeSession, PersistedGroupState, PersistedLocalIdentity,
+    PersistedMlsState, PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope,
+    PersistedPendingAck, PersistedPendingBlobTransfer, PersistedRealtimeSession,
+    PersistedRecoveryContext, PersistedRecoveryEscalationReason,
     PersistedRecoveryPhase, PersistedRecoveryReason, PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
@@ -425,6 +426,21 @@ impl CoreEngine {
             })
             .collect();
 
+        let group_realtime_sessions = snapshot
+            .group_realtime_sessions
+            .into_iter()
+            .map(|session| {
+                (
+                    session.group_id.clone(),
+                    GroupRealtimeSessionState {
+                        connected: false,
+                        last_known_seq: session.last_known_seq,
+                        needs_reconnect: session.needs_reconnect,
+                    },
+                )
+            })
+            .collect();
+
         let recovery_contexts = snapshot
             .recovery_contexts
             .into_iter()
@@ -513,6 +529,7 @@ impl CoreEngine {
                 pending_blob_uploads,
                 pending_blob_downloads,
                 realtime_sessions,
+                group_realtime_sessions,
                 mls_adapter: restored_mls.adapter,
                 mls_summaries,
                 published_key_package: persisted_deployment
@@ -719,6 +736,15 @@ impl CoreEngine {
             }
             CoreEvent::RealtimeEventReceived { device_id, event } => {
                 self.handle_realtime_event(device_id, event)
+            }
+            CoreEvent::GroupWebSocketConnected { group_id } => {
+                self.handle_group_websocket_connected(group_id)
+            }
+            CoreEvent::GroupWebSocketDisconnected { group_id, error } => {
+                self.handle_group_websocket_disconnected(group_id, error)
+            }
+            CoreEvent::GroupRealtimeEventReceived { group_id, event } => {
+                self.handle_group_realtime_event(group_id, event)
             }
             CoreEvent::WakeupReceived { device_id, .. } => self.sync_inbox(device_id),
             CoreEvent::InboxRecordsFetched {
@@ -4201,8 +4227,51 @@ impl CoreEngine {
             .device_identity
             .device_id
             .clone();
-        let output = self.sync_inbox(device_id)?;
+        let mut output = self.sync_inbox(device_id)?;
+        let group_effects = self.start_group_realtime()?;
+        output.effects.extend(group_effects);
         self.merge_with_transport_flush(output)
+    }
+
+    fn start_group_realtime(&mut self) -> CoreResult<Vec<CoreEffect>> {
+        let mut effects = Vec::new();
+        let group_ids: Vec<String> = self.state.group_states.keys().cloned().collect();
+        for group_id in group_ids {
+            let group_state = match self.state.group_states.get(&group_id) {
+                Some(state) => state.clone(),
+                None => continue,
+            };
+            let subscribe_endpoint = match &group_state.manifest.outbox.subscribe_endpoint {
+                Some(endpoint) => endpoint.clone(),
+                None => continue,
+            };
+            let last_seq = self
+                .state
+                .group_cursors
+                .get(&group_id)
+                .map(|cursor| cursor.last_fetched_seq)
+                .unwrap_or(0);
+            let local_role = group_state.local_role.unwrap_or(crate::model::GroupRole::Member);
+            let capability = group_capability_for_manifest(&group_state.manifest, local_role);
+            self.state
+                .group_realtime_sessions
+                .entry(group_id.clone())
+                .or_insert_with(|| GroupRealtimeSessionState {
+                    connected: false,
+                    last_known_seq: last_seq,
+                    needs_reconnect: false,
+                });
+            effects.push(CoreEffect::OpenGroupRealtimeConnection {
+                subscription: crate::transport_contract::GroupRealtimeSubscriptionRequest {
+                    group_id,
+                    endpoint: subscribe_endpoint,
+                    last_seq,
+                    capability,
+                    headers: BTreeMap::new(),
+                },
+            });
+        }
+        Ok(effects)
     }
 
     fn handle_websocket_connected(&mut self, device_id: String) -> CoreResult<CoreOutput> {
@@ -4264,6 +4333,175 @@ impl CoreEngine {
         })
     }
 
+    fn handle_group_websocket_connected(
+        &mut self,
+        group_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let session = self
+            .state
+            .group_realtime_sessions
+            .entry(group_id)
+            .or_default();
+        session.connected = true;
+        session.needs_reconnect = false;
+        Ok(CoreOutput::default())
+    }
+
+    fn handle_group_websocket_disconnected(
+        &mut self,
+        group_id: String,
+        _error: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let session = self
+            .state
+            .group_realtime_sessions
+            .entry(group_id.clone())
+            .or_default();
+        session.connected = false;
+        session.needs_reconnect = true;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::ScheduleTimer {
+                timer: TimerEffect {
+                    timer_id: format!("group_sync:{group_id}"),
+                    delay_ms: 5_000,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn handle_group_realtime_event(
+        &mut self,
+        group_id: String,
+        event: RealtimeEvent,
+    ) -> CoreResult<CoreOutput> {
+        match event {
+            RealtimeEvent::GroupHeadUpdated { group_id: event_group_id, seq } => {
+                if event_group_id != group_id {
+                    return Ok(CoreOutput::default());
+                }
+                self.state
+                    .group_realtime_sessions
+                    .entry(group_id.clone())
+                    .or_default()
+                    .last_known_seq = seq;
+                let needs_backfill = self
+                    .state
+                    .group_cursors
+                    .get(&group_id)
+                    .map(|cursor| seq > cursor.last_fetched_seq)
+                    .unwrap_or(true);
+                if needs_backfill {
+                    let group_state = self
+                        .state
+                        .group_states
+                        .get(&group_id)
+                        .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                        .clone();
+                    let capability = group_capability_for_manifest(
+                        &group_state.manifest,
+                        group_state.local_role.unwrap_or(crate::model::GroupRole::Member),
+                    );
+                    let from_seq = self
+                        .state
+                        .group_cursors
+                        .get(&group_id)
+                        .map(|cursor| cursor.last_fetched_seq.saturating_add(1))
+                        .unwrap_or(1);
+                    let fetch = crate::transport_contract::FetchGroupOutboxRequest {
+                        group_id: group_id.clone(),
+                        from_seq,
+                        limit: 100,
+                        capability,
+                    };
+                    Ok(CoreOutput {
+                        state_update: CoreStateUpdate {
+                            checkpoints_changed: true,
+                            ..CoreStateUpdate::default()
+                        },
+                        effects: vec![CoreEffect::FetchGroupOutbox {
+                            fetch,
+                        }],
+                        view_model: None,
+                    })
+                } else {
+                    Ok(CoreOutput::default())
+                }
+            }
+            RealtimeEvent::GroupOutboxRecordAvailable {
+                group_id: event_group_id,
+                seq,
+                record,
+            } => {
+                if event_group_id != group_id {
+                    return Ok(CoreOutput::default());
+                }
+                self.state
+                    .group_realtime_sessions
+                    .entry(group_id.clone())
+                    .or_default()
+                    .last_known_seq = seq;
+                if let Some(record) = record {
+                    let output = self.handle_group_outbox_records(
+                        group_id,
+                        vec![record],
+                        seq,
+                    )?;
+                    Ok(output)
+                } else {
+                    let needs_backfill = self
+                        .state
+                        .group_cursors
+                        .get(&group_id)
+                        .map(|cursor| seq > cursor.last_fetched_seq)
+                        .unwrap_or(true);
+                    if needs_backfill {
+                        let group_state = self
+                            .state
+                            .group_states
+                            .get(&group_id)
+                            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                            .clone();
+                        let capability = group_capability_for_manifest(
+                            &group_state.manifest,
+                            group_state.local_role.unwrap_or(crate::model::GroupRole::Member),
+                        );
+                        let from_seq = self
+                            .state
+                            .group_cursors
+                            .get(&group_id)
+                            .map(|cursor| cursor.last_fetched_seq.saturating_add(1))
+                            .unwrap_or(1);
+                        let fetch = crate::transport_contract::FetchGroupOutboxRequest {
+                            group_id: group_id.clone(),
+                            from_seq,
+                            limit: 100,
+                            capability,
+                        };
+                        Ok(CoreOutput {
+                            state_update: CoreStateUpdate {
+                                checkpoints_changed: true,
+                                ..CoreStateUpdate::default()
+                            },
+                            effects: vec![CoreEffect::FetchGroupOutbox {
+                                fetch,
+                            }],
+                            view_model: None,
+                        })
+                    } else {
+                        Ok(CoreOutput::default())
+                    }
+                }
+            }
+            _ => Ok(CoreOutput::default()),
+        }
+    }
+
     fn handle_realtime_event(
         &mut self,
         device_id: String,
@@ -4323,12 +4561,16 @@ impl CoreEngine {
                 }
             }
             RealtimeEvent::MessageRequestChanged { .. } => self.list_message_requests(),
+            _ => Ok(CoreOutput::default()),
         }
     }
 
     fn handle_timer(&mut self, timer_id: String) -> CoreResult<CoreOutput> {
         if let Some(device_id) = timer_id.strip_prefix("sync:") {
             return self.sync_inbox(device_id.to_string());
+        }
+        if let Some(group_id) = timer_id.strip_prefix("group_sync:") {
+            return self.sync_group_outbox(group_id.to_string());
         }
         if let Some(user_id) = timer_id.strip_prefix("refresh_identity:") {
             let has_pending_recovery = self
@@ -4883,9 +5125,18 @@ impl CoreEngine {
             role: GroupRole::Member,
             status: GroupMemberStatus::Active,
         }));
+        let messages_endpoint = self.group_outbox_messages_endpoint(group_id)?;
+        let subscribe_endpoint = self.state.deployment_bundle.as_ref().map(|deployment| {
+            let base = deployment
+                .inbox_http_endpoint
+                .trim_end_matches('/')
+                .replace("https://", "wss://")
+                .replace("http://", "ws://");
+            format!("{base}/v1/groups/{group_id}/outbox/subscribe")
+        });
         let outbox = GroupOutboxDescriptor {
-            endpoint: self.group_outbox_messages_endpoint(group_id)?,
-            subscribe_endpoint: None,
+            endpoint: messages_endpoint,
+            subscribe_endpoint,
         };
         let signature_payload = format!(
             "group_manifest:{group_id}:{conversation_id}:{title}:{}:{epoch}:{now}",
@@ -5470,6 +5721,15 @@ impl CoreEngine {
         });
         if !local_is_active {
             return Err(CoreError::invalid_input("local group member is not active"));
+        }
+        let has_pending_membership_commit = self.state.pending_group_outbox.iter().any(|item| {
+            item.envelope.group_id == group_state.group_id
+                && item.envelope.message_type == GroupMessageType::MlsCommit
+        });
+        if has_pending_membership_commit {
+            return Err(CoreError::temporary_failure(
+                "group has a pending membership commit; send is blocked until MLS state converges",
+            ));
         }
         Ok(())
     }
@@ -8022,6 +8282,15 @@ impl CoreEngine {
                         .insert(conversation_id.clone(), summary);
                 }
             } else {
+                if record.envelope.message_type
+                    == GroupMessageType::ControlConversationNeedsRebuild
+                {
+                    return self.escalate_conversation_to_rebuild(
+                        &conversation_id,
+                        RecoveryEscalationReason::ExplicitNeedsRebuildControl,
+                        "group outbox received control_conversation_needs_rebuild",
+                    );
+                }
                 let is_manifest_control = matches!(
                     record.envelope.message_type,
                     GroupMessageType::ControlGroupMembershipChanged
@@ -9205,6 +9474,15 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .iter()
             .map(|(device_id, session)| PersistedRealtimeSession {
                 device_id: device_id.clone(),
+                last_known_seq: session.last_known_seq,
+                needs_reconnect: session.needs_reconnect,
+            })
+            .collect(),
+        group_realtime_sessions: state
+            .group_realtime_sessions
+            .iter()
+            .map(|(group_id, session)| PersistedGroupRealtimeSession {
+                group_id: group_id.clone(),
                 last_known_seq: session.last_known_seq,
                 needs_reconnect: session.needs_reconnect,
             })

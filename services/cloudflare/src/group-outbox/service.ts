@@ -25,7 +25,7 @@ import type {
   SubmitGroupJoinResult,
   WelcomePickupDescriptor
 } from "../types/contracts";
-import type { DurableObjectStorageLike, JsonBlobStore } from "../types/runtime";
+import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../types/runtime";
 
 interface GroupOutboxMeta {
   headSeq: number;
@@ -81,17 +81,20 @@ export class GroupOutboxService {
   private readonly state: DurableObjectStorageLike;
   private readonly spillStore: JsonBlobStore;
   private readonly defaults: GroupOutboxMeta;
+  private readonly sessions: SessionSink[];
 
   constructor(
     groupId: string,
     state: DurableObjectStorageLike,
     spillStore: JsonBlobStore,
-    defaults: GroupOutboxMeta
+    defaults: GroupOutboxMeta,
+    sessions: SessionSink[]
   ) {
     this.groupId = groupId;
     this.state = state;
     this.spillStore = spillStore;
     this.defaults = defaults;
+    this.sessions = sessions;
   }
 
   async appendEnvelope(input: AppendGroupEnvelopeRequest, now: number): Promise<AppendGroupEnvelopeResult> {
@@ -145,6 +148,9 @@ export class GroupOutboxService {
     await this.state.put(`${IDEMPOTENCY_PREFIX}${record.messageId}`, seq);
     await this.state.put(META_KEY, { ...meta, headSeq: seq });
     await this.state.setAlarm(expiresAt);
+
+    this.publish({ event: "group_head_updated", groupId: this.groupId, seq });
+    this.publish({ event: "group_outbox_record_available", groupId: this.groupId, seq, record });
 
     return { accepted: true, seq };
   }
@@ -469,6 +475,13 @@ export class GroupOutboxService {
     const hasStorageRefs = (envelope.storageRefs?.length ?? 0) > 0;
     if (!hasInline && !hasStorageRefs) {
       throw new HttpError(400, "invalid_input", "group envelope must include inline_ciphertext or storage_refs");
+    }
+  }
+
+  private publish(event: Record<string, unknown>): void {
+    const payload = JSON.stringify(event);
+    for (const session of this.sessions) {
+      session.send(payload);
     }
   }
 }

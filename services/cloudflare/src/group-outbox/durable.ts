@@ -11,7 +11,7 @@ import type {
   RevokeGroupInviteRequest,
   SubmitGroupJoinRequest
 } from "../types/contracts";
-import type { DurableObjectStorageLike, Env, JsonBlobStore } from "../types/runtime";
+import type { DurableObjectStorageLike, Env, JsonBlobStore, SessionSink } from "../types/runtime";
 
 class DurableObjectStorageAdapter implements DurableObjectStorageLike {
   private readonly storage: DurableObjectState["storage"];
@@ -112,10 +112,12 @@ export async function handleGroupOutboxDurableRequest(
     groupId: string;
     state: DurableObjectStorageLike;
     spillStore: JsonBlobStore;
+    sessions: SessionSink[];
     maxInlineBytes: number;
     retentionDays: number;
     sharingSecret: string;
     now?: number;
+    onUpgrade?: () => Response;
   }
 ): Promise<Response> {
   const now = deps.now ?? Date.now();
@@ -124,9 +126,13 @@ export async function handleGroupOutboxDurableRequest(
     headSeq: 0,
     retentionDays: deps.retentionDays,
     maxInlineBytes: deps.maxInlineBytes
-  });
+  }, deps.sessions);
 
   try {
+    if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
+      return deps.onUpgrade();
+    }
+
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = (await request.json()) as AppendGroupEnvelopeRequest;
       return jsonResponse(await service.appendEnvelope(body, now));
@@ -261,6 +267,7 @@ async function verifyInviteToken(secret: string, token: string, now: number): Pr
 }
 
 export class GroupOutboxDurableObject extends DurableObjectBase {
+  private readonly sessions = new Map<string, ManagedSession>();
   private readonly stateRef: DurableObjectState;
   private readonly envRef: Env;
 
@@ -290,9 +297,36 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
       groupId,
       state: new DurableObjectStorageAdapter(this.stateRef.storage),
       spillStore: new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
+      sessions: Array.from(this.sessions.values()).map(
+        (session) =>
+          ({
+            send(payload: string): void {
+              session.send(payload);
+            }
+          }) satisfies SessionSink
+      ),
       maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
-      sharingSecret: this.envRef.SHARING_TOKEN_SECRET ?? "replace-me"
+      sharingSecret: this.envRef.SHARING_TOKEN_SECRET ?? "replace-me",
+      onUpgrade: () => {
+        const pair = new WebSocketPair();
+        const client = pair[0];
+        const server = pair[1];
+        server.accept();
+        const sessionId = crypto.randomUUID();
+        const session = new ManagedSession(server);
+        this.sessions.set(sessionId, session);
+        queueMicrotask(() => {
+          session.markReady();
+        });
+        server.addEventListener("close", () => {
+          this.sessions.delete(sessionId);
+        });
+        return new Response(null, {
+          status: 101,
+          webSocket: client
+        } as ResponseInit & { webSocket: WebSocket });
+      }
     });
   }
 
@@ -306,5 +340,43 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
     // enforcement on outbox records) can be wired here once the group outbox
     // service exposes an explicit cleanup method analogous to
     // `InboxService.cleanExpiredRecords`.
+  }
+}
+
+class ManagedSession {
+  private readonly socket: WebSocket;
+  private ready = false;
+  private readonly queuedPayloads: string[] = [];
+
+  constructor(socket: WebSocket) {
+    this.socket = socket;
+  }
+
+  send(payload: string): void {
+    if (!this.ready) {
+      this.queuedPayloads.push(payload);
+      return;
+    }
+    this.dispatch(payload);
+  }
+
+  markReady(): void {
+    if (this.ready) {
+      return;
+    }
+    this.ready = true;
+    while (this.queuedPayloads.length > 0) {
+      const payload = this.queuedPayloads.shift();
+      if (payload === undefined) {
+        break;
+      }
+      this.dispatch(payload);
+    }
+  }
+
+  private dispatch(payload: string): void {
+    setTimeout(() => {
+      this.socket.send(payload);
+    }, 0);
   }
 }
