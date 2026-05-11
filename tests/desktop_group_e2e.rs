@@ -953,6 +953,278 @@ async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Phase 10 completeness: WS disconnect recovery + wakeup-loss recovery for groups
+// ---------------------------------------------------------------------------
+
+/// Group wakeup-loss recovery: a member who misses all realtime
+/// notifications (and any wakeup hint) must still catch every message
+/// through `SyncGroupOutbox` alone.
+///
+/// Exercises the group outbox equivalent of PLAN.md §7.4: GetHead →
+/// FetchMessages → Ack for the group outbox log.
+#[test]
+fn desktop_group_wakeup_loss_recovery_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-wakeup-loss")?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for desktop_group_wakeup_loss_recovery_e2e")?;
+
+    rt.block_on(run_group_wakeup_loss_recovery(&ctx))?;
+    Ok(())
+}
+
+async fn run_group_wakeup_loss_recovery(ctx: &QuartetContext) -> Result<()> {
+    // Step 1: create a 3-user group (alice owner, bob + carol members).
+    let (alice, bob, carol, group_id, conversation_id) =
+        create_three_user_group(ctx, "Wakeup Loss Recovery").await?;
+
+    // Step 2: alice sends several initial messages while all members
+    // sync to establish a common baseline.
+    send_group_text_message_impl(&alice.state, conversation_id.clone(), "pre-offline-1".into())
+        .await
+        .map_err(|e| anyhow!("alice send pre-offline-1: {e}"))?;
+    sync_group_outbox_impl(&alice.state, group_id.clone(), None).await.ok();
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None).await.ok();
+    sync_group_outbox_impl(&carol.state, group_id.clone(), None).await.ok();
+
+    send_group_text_message_impl(&alice.state, conversation_id.clone(), "pre-offline-2".into())
+        .await
+        .map_err(|e| anyhow!("alice send pre-offline-2: {e}"))?;
+    sync_group_outbox_impl(&alice.state, group_id.clone(), None).await.ok();
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None).await.ok();
+    sync_group_outbox_impl(&carol.state, group_id.clone(), None).await.ok();
+
+    // Step 3: bob is now "offline" — alice sends several messages that
+    // bob will NOT sync until later. Carol stays online as a control
+    // group.
+    let offline_messages = &[
+        "offline-msg-alpha",
+        "offline-msg-beta",
+        "offline-msg-gamma",
+    ];
+    for plaintext in offline_messages {
+        send_group_text_message_impl(&alice.state, conversation_id.clone(), plaintext.to_string())
+            .await
+            .map_err(|e| anyhow!("alice send offline {plaintext}: {e}"))?;
+        // Only carol (online member) syncs.
+        sync_group_outbox_impl(&carol.state, group_id.clone(), None)
+            .await
+            .map_err(|e| anyhow!("carol sync offline {plaintext}: {e}"))?;
+    }
+
+    // Verify carol sees all offline messages.
+    let carol_messages = get_group_messages_impl(&carol.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol get_group_messages_impl: {e}"))?;
+    for plaintext in offline_messages {
+        assert!(
+            has_bubble_with_plaintext(&carol_messages, plaintext),
+            "carol should see offline message \"{plaintext}\""
+        );
+    }
+
+    // Step 4: bob comes back online and syncs (wakeup loss recovery).
+    // bob, having missed all realtime events and wakeup hints, must
+    // recover purely through SyncGroupOutbox (internal head check +
+    // fetch).
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None)
+        .await
+        .map_err(|e| anyhow!("bob sync after wakeup loss: {e}"))?;
+
+    // Step 5: verify bob sees every offline message.
+    let bob_messages = get_group_messages_impl(&bob.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob get_group_messages_impl after wakeup loss: {e}"))?;
+    for plaintext in offline_messages {
+        assert!(
+            has_bubble_with_plaintext(&bob_messages, plaintext),
+            "bob should recover offline message \"{plaintext}\" via wakeup loss recovery"
+        );
+    }
+
+    // bob must also see the pre-offline messages.
+    for plaintext in ["pre-offline-1", "pre-offline-2"] {
+        assert!(
+            has_bubble_with_plaintext(&bob_messages, plaintext),
+            "bob should still have pre-offline message \"{plaintext}\""
+        );
+    }
+
+    // Step 6: cursor must be fully advanced.
+    let bob_snapshot = get_group_snapshot_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob snapshot after wakeup loss: {e}"))?;
+    let bob_cursor = bob_snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    let carol_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol snapshot after wakeup loss: {e}"))?;
+    let carol_cursor = carol_snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    assert!(
+        bob_cursor >= carol_cursor,
+        "bob cursor ({bob_cursor}) should be >= carol cursor ({carol_cursor}) after wakeup loss recovery"
+    );
+
+    // Step 7: after recovery, bob can receive new messages normally.
+    send_group_text_message_impl(&alice.state, conversation_id.clone(), "post-recovery".into())
+        .await
+        .map_err(|e| anyhow!("alice send post-recovery: {e}"))?;
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None)
+        .await
+        .map_err(|e| anyhow!("bob sync post-recovery: {e}"))?;
+    let bob_final = get_group_messages_impl(&bob.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob messages post-recovery: {e}"))?;
+    assert!(
+        has_bubble_with_plaintext(&bob_final, "post-recovery"),
+        "bob should receive post-recovery message normally"
+    );
+
+    Ok(())
+}
+
+/// Group WebSocket disconnect recovery: simulates a member losing their
+/// realtime subscription while messages continue to flow. The member must
+/// recover all missed messages through `SyncGroupOutbox` and then
+/// continue to receive future messages normally.
+#[test]
+fn desktop_group_ws_disconnect_recovery_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-ws-disconnect")?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for desktop_group_ws_disconnect_recovery_e2e")?;
+
+    rt.block_on(run_group_ws_disconnect_recovery(&ctx))?;
+    Ok(())
+}
+
+async fn run_group_ws_disconnect_recovery(ctx: &QuartetContext) -> Result<()> {
+    // Step 1: create 3-user group.
+    let (alice, bob, carol, group_id, conversation_id) =
+        create_three_user_group(ctx, "WS Disconnect Recovery").await?;
+
+    // Establish baseline sync.
+    send_group_text_message_impl(&alice.state, conversation_id.clone(), "baseline".into())
+        .await
+        .map_err(|e| anyhow!("alice send baseline: {e}"))?;
+    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol]).await?;
+    let bob_baseline = get_group_messages_impl(&bob.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob baseline messages: {e}"))?;
+    assert!(has_bubble_with_plaintext(&bob_baseline, "baseline"));
+
+    // Step 2: simulate bob's realtime subscription dropping. Alice sends
+    // messages during the disconnect window, and carol (who is online)
+    // stays synced. bob does NOT sync during this window.
+    let disconnect_messages = &[
+        "during-disconnect-A",
+        "during-disconnect-B",
+        "during-disconnect-C",
+    ];
+    for plaintext in disconnect_messages {
+        send_group_text_message_impl(&alice.state, conversation_id.clone(), plaintext.to_string())
+            .await
+            .map_err(|e| anyhow!("alice send disconnect {plaintext}: {e}"))?;
+        // Only carol syncs.
+        sync_group_outbox_impl(&carol.state, group_id.clone(), None)
+            .await
+            .map_err(|e| anyhow!("carol sync disconnect {plaintext}: {e}"))?;
+    }
+
+    // Carol must see all disconnect messages.
+    let carol_during = get_group_messages_impl(&carol.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol messages during disconnect: {e}"))?;
+    for plaintext in disconnect_messages {
+        assert!(
+            has_bubble_with_plaintext(&carol_during, plaintext),
+            "carol should see disconnect message \"{plaintext}\""
+        );
+    }
+
+    // Step 3: bob reconnects (syncs). He must catch all missed messages.
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None)
+        .await
+        .map_err(|e| anyhow!("bob sync after reconnect: {e}"))?;
+
+    let bob_recovered = get_group_messages_impl(&bob.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob messages after reconnect: {e}"))?;
+    for plaintext in disconnect_messages {
+        assert!(
+            has_bubble_with_plaintext(&bob_recovered, plaintext),
+            "bob should recover disconnect message \"{plaintext}\""
+        );
+    }
+
+    // Step 4: verify bob cursor caught up to carol's.
+    let bob_snapshot = get_group_snapshot_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob snapshot after reconnect: {e}"))?;
+    let carol_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol snapshot after disconnect: {e}"))?;
+    let bob_cursor = bob_snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    let carol_cursor = carol_snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    assert!(
+        bob_cursor >= carol_cursor,
+        "bob cursor ({bob_cursor}) should be >= carol cursor ({carol_cursor}) after reconnect"
+    );
+
+    // Step 5: after reconnect, bob can send and receive messages normally.
+    send_group_text_message_impl(&bob.state, conversation_id.clone(), "bob-post-reconnect".into())
+        .await
+        .map_err(|e| anyhow!("bob send post-reconnect: {e}"))?;
+    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol]).await?;
+    for (label, harness) in [("alice", &alice), ("carol", &carol)] {
+        let messages = get_group_messages_impl(&harness.state, conversation_id.clone())
+            .await
+            .map_err(|e| anyhow!("{label} messages post-reconnect: {e}"))?;
+        assert!(
+            has_bubble_with_plaintext(&messages, "bob-post-reconnect"),
+            "{label} should see bob's post-reconnect message"
+        );
+    }
+
+    // Step 6: send one more round through alice, verify all three members
+    // see it normally (confirming the group is fully converged).
+    send_group_text_message_impl(&alice.state, conversation_id.clone(), "final-convergence".into())
+        .await
+        .map_err(|e| anyhow!("alice send final-convergence: {e}"))?;
+    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol]).await?;
+    for (label, harness) in [("alice", &alice), ("bob", &bob), ("carol", &carol)] {
+        let messages = get_group_messages_impl(&harness.state, conversation_id.clone())
+            .await
+            .map_err(|e| anyhow!("{label} final messages: {e}"))?;
+        assert!(
+            has_bubble_with_plaintext(&messages, "final-convergence"),
+            "{label} should see final-convergence message"
+        );
+    }
+
+    Ok(())
+}
+
 async fn sync_all_group_outboxes<'a, const N: usize>(
     group_id: &str,
     harnesses: [&'a DesktopHarness; N],

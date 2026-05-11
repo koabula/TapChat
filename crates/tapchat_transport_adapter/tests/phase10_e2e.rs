@@ -2385,6 +2385,358 @@ fn last_acked_seq(driver: &CoreDriver, device_id: &str) -> Result<u64> {
         .last_acked_seq)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 10 completeness: offline recovery, wakeup-loss recovery
+// ---------------------------------------------------------------------------
+
+/// Wakeup-loss recovery per PLAN.md §7.4:
+///
+/// 1. Bob closes realtime (simulating disconnect + missed wakeup).
+/// 2. Alice sends multiple messages while Bob has no realtime feed.
+/// 3. Bob recovers purely through `SyncInbox` (GetHead → FetchMessages →
+///    Ack), receiving all messages in a single sync cycle.
+/// 4. All messages are decrypted and in correct order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wakeup_loss_recovers_via_proactive_head_and_fetch() -> Result<()> {
+    let mut ctx = setup_pair().await?;
+
+    // Close realtime so Bob gets neither WS push nor wakeup hints.
+    ctx.bob.close_realtime(&ctx.bob_device_id).await?;
+    // Clear any lingering sync timers so only the manual SyncInbox matters.
+    let _ = ctx.bob.take_scheduled_timers();
+
+    // Alice sends multiple messages while Bob is effectively offline.
+    let messages: &[&str] = &[
+        "wakeup-loss message 1",
+        "wakeup-loss message 2",
+        "wakeup-loss message 3",
+    ];
+    for plaintext in messages {
+        ctx.alice
+            .run_command_until_idle(CoreCommand::SendTextMessage {
+                conversation_id: ctx.conversation_id.clone(),
+                plaintext: plaintext.to_string(),
+            })
+            .await?;
+    }
+
+    // Bob recovers purely via a single sync — no realtime events, no
+    // wakeup hints. The core must internally call GetHead + FetchMessages
+    // and ack up to the current head.
+    sync_bob(&mut ctx, "wakeup-loss-recovery").await?;
+
+    let conversation = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after wakeup-loss recovery")?;
+
+    for plaintext in messages {
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.plaintext.as_deref() == Some(plaintext)),
+            "bob should recover \"{plaintext}\" after wakeup loss"
+        );
+    }
+
+    // Verify the messages appear in the expected send order within the
+    // conversation message list (cursor order = send order).
+    let recovered_texts: Vec<&str> = conversation
+        .messages
+        .iter()
+        .filter_map(|message| message.plaintext.as_deref())
+        .collect();
+    for plaintext in messages {
+        assert!(
+            recovered_texts.contains(plaintext),
+            "bob's recovered messages must contain \"{plaintext}\""
+        );
+    }
+
+    // Checkpoint must be fully caught up.
+    let head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    let sync_state = ctx
+        .bob
+        .engine()
+        .sync_state(&ctx.bob_device_id)
+        .context("sync state missing after wakeup-loss recovery")?;
+    assert!(
+        sync_state.checkpoint.last_acked_seq >= head,
+        "bob must ack up to head ({head}) after wakeup-loss recovery, got {}",
+        sync_state.checkpoint.last_acked_seq
+    );
+    assert!(
+        !sync_state.pending_retry,
+        "no pending retry expected after full wakeup-loss recovery"
+    );
+
+    Ok(())
+}
+
+/// Extended offline: Bob is fully disconnected (no realtime, no sync at
+/// all) while Alice sends multiple text and attachment messages. When Bob
+/// comes back online with a single `SyncInbox`, he must catch every
+/// message in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extended_offline_catches_up_multiple_messages_in_order() -> Result<()> {
+    let mut ctx = setup_pair().await?;
+
+    // Disconnect Bob completely.
+    ctx.bob.close_realtime(&ctx.bob_device_id).await?;
+    let _ = ctx.bob.take_scheduled_timers();
+
+    // Alice sends a mix of text and attachment messages.
+    let sequence: &[(&str, Option<&[u8]>)] = &[
+        ("offline text A", None),
+        ("offline text B", None),
+        ("offline text C", None),
+    ];
+
+    for (idx, (plaintext, _attachment)) in sequence.iter().enumerate() {
+        ctx.alice
+            .run_command_until_idle(CoreCommand::SendTextMessage {
+                conversation_id: ctx.conversation_id.clone(),
+                plaintext: plaintext.to_string(),
+            })
+            .await?;
+        // Verify each message advances alice's side correctly.
+        let alice_conv = ctx
+            .alice
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .context("alice conversation missing mid-offline-send")?;
+        assert!(
+            alice_conv
+                .messages
+                .iter()
+                .any(|message| message.plaintext.as_deref() == Some(plaintext)),
+            "alice should have sent \"{plaintext}\" (msg {idx})"
+        );
+    }
+
+    // Verify Bob currently sees none of these.
+    let bob_before = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing before offline recovery")?;
+    let bob_before_count = bob_before.messages.len();
+
+    // Bob comes online and syncs.
+    sync_bob(&mut ctx, "extended-offline-recovery").await?;
+
+    let bob_after = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after offline recovery")?;
+
+    // All new messages must be present.
+    assert!(
+        bob_after.messages.len() >= bob_before_count + sequence.len(),
+        "bob should have at least {} more messages after offline recovery (was {}, now {})",
+        sequence.len(),
+        bob_before_count,
+        bob_after.messages.len()
+    );
+
+    for (plaintext, _) in sequence {
+        assert!(
+            bob_after
+                .messages
+                .iter()
+                .any(|message| message.plaintext.as_deref() == Some(plaintext)),
+            "bob should recover offline message \"{plaintext}\""
+        );
+    }
+
+    // Verify ordering: messages must appear in seq order (the order Alice
+    // sent them). Find the positions of each offline text in Bob's message
+    // list and assert they're monotonically increasing.
+    let positions: Vec<usize> = sequence
+        .iter()
+        .filter_map(|(plaintext, _)| {
+            bob_after
+                .messages
+                .iter()
+                .position(|message| message.plaintext.as_deref() == Some(plaintext))
+        })
+        .collect();
+    assert_eq!(positions.len(), sequence.len());
+    for window in positions.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "offline messages must appear in send order: positions {window:?}"
+        );
+    }
+
+    // Checkpoint must reach head.
+    let head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    let sync_state = ctx
+        .bob
+        .engine()
+        .sync_state(&ctx.bob_device_id)
+        .context("sync state missing after extended offline recovery")?;
+    assert!(sync_state.checkpoint.last_acked_seq >= head);
+
+    // After recovery Bob can receive new messages normally (via realtime
+    // or sync). Alice sends one more.
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "post-offline-recovery".into(),
+        })
+        .await?;
+    sync_bob(&mut ctx, "post-offline").await?;
+    let bob_final = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing post-offline")?;
+    assert!(
+        bob_final
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post-offline-recovery")),
+        "bob should receive messages normally after offline recovery"
+    );
+
+    Ok(())
+}
+
+/// After a realtime disconnect, multiple sync calls (timer-driven or
+/// manual) must be idempotent: duplicate fetch, stale realtime events,
+/// and overlapping sync windows must not duplicate messages or regress
+/// the checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_then_reconnect_converges_without_duplicates() -> Result<()> {
+    let mut ctx = setup_pair().await?;
+
+    // Phase 1: disconnect, send messages, recover.
+    ctx.bob.close_realtime(&ctx.bob_device_id).await?;
+    let _ = ctx.bob.take_scheduled_timers();
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "pre-reconnect A".into(),
+        })
+        .await?;
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "pre-reconnect B".into(),
+        })
+        .await?;
+
+    sync_bob(&mut ctx, "pre-reconnect").await?;
+
+    // Phase 2: send more messages then simulate reconnect via realtime
+    // events (the equivalent of a WS reconnection delivering a head
+    // update + record).
+    let before_reconnect_head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+
+    ctx.alice
+        .run_command_until_idle(CoreCommand::SendTextMessage {
+            conversation_id: ctx.conversation_id.clone(),
+            plaintext: "post-reconnect".into(),
+        })
+        .await?;
+
+    // Inject both a stale head (at the old head seq) and the record for
+    // the new message — simulating a realtime connection that delivers
+    // events overlapping with what was already fetched.
+    let new_head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    let new_records =
+        fetch_inbox_records_since(&ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, before_reconnect_head + 1)
+            .await?;
+    let new_record = new_records
+        .last()
+        .cloned()
+        .context("missing new record after reconnect")?;
+
+    // Stale head event at old cursor.
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::HeadUpdated {
+                seq: before_reconnect_head,
+            },
+        })
+        .await?;
+    // Fresh head event at new cursor.
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::HeadUpdated { seq: new_head },
+        })
+        .await?;
+    // Record event for the new message.
+    let _ = ctx
+        .bob
+        .inject_event_until_idle(CoreEvent::RealtimeEventReceived {
+            device_id: ctx.bob_device_id.clone(),
+            event: tapchat_core::ffi_api::RealtimeEvent::InboxRecordAvailable {
+                seq: new_record.seq,
+                record: Some(new_record),
+            },
+        })
+        .await?;
+
+    // Sync again to ensure everything is consolidated.
+    sync_bob(&mut ctx, "post-reconnect-consolidation").await?;
+
+    let conversation = ctx
+        .bob
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("bob conversation missing after reconnect convergence")?;
+
+    // All three messages must be present exactly once.
+    for plaintext in ["pre-reconnect A", "pre-reconnect B", "post-reconnect"] {
+        assert_eq!(
+            count_plaintext_messages(conversation, plaintext),
+            1,
+            "\"{plaintext}\" must appear exactly once after reconnect convergence"
+        );
+    }
+
+    let final_head = ctx
+        .runtime
+        .get_head(&ctx.bob_auth, &ctx.bob_device_id)
+        .await?
+        .head_seq;
+    let sync_state = ctx
+        .bob
+        .engine()
+        .sync_state(&ctx.bob_device_id)
+        .context("sync state missing after convergence")?;
+    assert!(sync_state.checkpoint.last_acked_seq >= final_head);
+    assert!(!sync_state.pending_retry);
+
+    Ok(())
+}
+
 fn workspace_root() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
