@@ -6,6 +6,7 @@ pub mod timer;
 pub mod transport;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -68,7 +69,10 @@ impl DesktopPlatformPorts {
             persistence: DesktopPersistence::new(profile_inner),
             notification: notification::NotificationManager::new(),
             timer: timer::TimerManager::new(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .expect("build desktop transport HTTP client"),
             app_handle: None,
             current_conversation_id: None,
         }
