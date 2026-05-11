@@ -954,32 +954,40 @@ async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 10 completeness: WS disconnect recovery + wakeup-loss recovery for groups
+// Phase 10 completeness: sync gap recovery for groups
+//
+// These tests verify that a group member who falls behind (for any
+// reason — WS disconnect, missed wakeup, manual refresh, app resume)
+// can catch up through `SyncGroupOutbox` alone. The recovery path
+// (GetHead → FetchMessages → Ack for the group outbox log) is the
+// same regardless of the cause of the gap; realtime connect/disconnect
+// lifecycle is tested at the transport-adapter layer (phase10_e2e.rs).
 // ---------------------------------------------------------------------------
 
-/// Group wakeup-loss recovery: a member who misses all realtime
-/// notifications (and any wakeup hint) must still catch every message
-/// through `SyncGroupOutbox` alone.
+/// Group sync gap recovery: a member who stops syncing while messages
+/// continue to flow must catch every missed message when they resume
+/// syncing through `SyncGroupOutbox`.
 ///
 /// Exercises the group outbox equivalent of PLAN.md §7.4: GetHead →
-/// FetchMessages → Ack for the group outbox log.
+/// FetchMessages → Ack, using only the cursor-based pull path with no
+/// realtime push events.
 #[test]
-fn desktop_group_wakeup_loss_recovery_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-wakeup-loss")?;
+fn desktop_group_sync_gap_recovery_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-sync-gap")?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime for desktop_group_wakeup_loss_recovery_e2e")?;
+        .context("build tokio runtime for desktop_group_sync_gap_recovery_e2e")?;
 
-    rt.block_on(run_group_wakeup_loss_recovery(&ctx))?;
+    rt.block_on(run_group_sync_gap_recovery(&ctx))?;
     Ok(())
 }
 
-async fn run_group_wakeup_loss_recovery(ctx: &QuartetContext) -> Result<()> {
+async fn run_group_sync_gap_recovery(ctx: &QuartetContext) -> Result<()> {
     // Step 1: create a 3-user group (alice owner, bob + carol members).
     let (alice, bob, carol, group_id, conversation_id) =
-        create_three_user_group(ctx, "Wakeup Loss Recovery").await?;
+        create_three_user_group(ctx, "Sync Gap Recovery").await?;
 
     // Step 2: alice sends several initial messages while all members
     // sync to establish a common baseline.
@@ -997,9 +1005,8 @@ async fn run_group_wakeup_loss_recovery(ctx: &QuartetContext) -> Result<()> {
     sync_group_outbox_impl(&bob.state, group_id.clone(), None).await.ok();
     sync_group_outbox_impl(&carol.state, group_id.clone(), None).await.ok();
 
-    // Step 3: bob is now "offline" — alice sends several messages that
-    // bob will NOT sync until later. Carol stays online as a control
-    // group.
+    // Step 3: bob stops syncing while alice sends several messages.
+    // Carol stays synced as a control group.
     let offline_messages = &[
         "offline-msg-alpha",
         "offline-msg-beta",
@@ -1026,10 +1033,10 @@ async fn run_group_wakeup_loss_recovery(ctx: &QuartetContext) -> Result<()> {
         );
     }
 
-    // Step 4: bob comes back online and syncs (wakeup loss recovery).
-    // bob, having missed all realtime events and wakeup hints, must
+    // Step 4: bob resumes syncing. Having missed the messages, he must
     // recover purely through SyncGroupOutbox (internal head check +
-    // fetch).
+    // fetch). This is the same recovery path used for wakeup loss,
+    // WS disconnect, or manual refresh.
     sync_group_outbox_impl(&bob.state, group_id.clone(), None)
         .await
         .map_err(|e| anyhow!("bob sync after wakeup loss: {e}"))?;
@@ -1093,27 +1100,28 @@ async fn run_group_wakeup_loss_recovery(ctx: &QuartetContext) -> Result<()> {
     Ok(())
 }
 
-/// Group WebSocket disconnect recovery: simulates a member losing their
-/// realtime subscription while messages continue to flow. The member must
-/// recover all missed messages through `SyncGroupOutbox` and then
-/// continue to receive future messages normally.
+/// Group sync gap recovery with cursor alignment: simulates a member who
+/// stops syncing while messages continue to flow, then catches up through
+/// `SyncGroupOutbox`. The recovered member's cursor must reach the online
+/// member's cursor, and all members must converge so future messages are
+/// seen by everyone.
 #[test]
-fn desktop_group_ws_disconnect_recovery_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-ws-disconnect")?;
+fn desktop_group_sync_gap_with_cursor_alignment_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-sync-gap-cursor")?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime for desktop_group_ws_disconnect_recovery_e2e")?;
+        .context("build tokio runtime for desktop_group_sync_gap_with_cursor_alignment_e2e")?;
 
-    rt.block_on(run_group_ws_disconnect_recovery(&ctx))?;
+    rt.block_on(run_group_sync_gap_with_cursor_alignment(&ctx))?;
     Ok(())
 }
 
-async fn run_group_ws_disconnect_recovery(ctx: &QuartetContext) -> Result<()> {
+async fn run_group_sync_gap_with_cursor_alignment(ctx: &QuartetContext) -> Result<()> {
     // Step 1: create 3-user group.
     let (alice, bob, carol, group_id, conversation_id) =
-        create_three_user_group(ctx, "WS Disconnect Recovery").await?;
+        create_three_user_group(ctx, "Sync Gap Cursor Align").await?;
 
     // Establish baseline sync.
     send_group_text_message_impl(&alice.state, conversation_id.clone(), "baseline".into())
@@ -1125,9 +1133,9 @@ async fn run_group_ws_disconnect_recovery(ctx: &QuartetContext) -> Result<()> {
         .map_err(|e| anyhow!("bob baseline messages: {e}"))?;
     assert!(has_bubble_with_plaintext(&bob_baseline, "baseline"));
 
-    // Step 2: simulate bob's realtime subscription dropping. Alice sends
-    // messages during the disconnect window, and carol (who is online)
-    // stays synced. bob does NOT sync during this window.
+    // Step 2: bob stops syncing. Alice sends messages during this
+    // window while carol (who stays synced) sees them. bob does NOT
+    // sync during this window, creating a cursor gap.
     let disconnect_messages = &[
         "during-disconnect-A",
         "during-disconnect-B",
@@ -1154,7 +1162,7 @@ async fn run_group_ws_disconnect_recovery(ctx: &QuartetContext) -> Result<()> {
         );
     }
 
-    // Step 3: bob reconnects (syncs). He must catch all missed messages.
+    // Step 3: bob resumes syncing. He must catch all missed messages.
     sync_group_outbox_impl(&bob.state, group_id.clone(), None)
         .await
         .map_err(|e| anyhow!("bob sync after reconnect: {e}"))?;
@@ -1169,7 +1177,7 @@ async fn run_group_ws_disconnect_recovery(ctx: &QuartetContext) -> Result<()> {
         );
     }
 
-    // Step 4: verify bob cursor caught up to carol's.
+    // Step 4: verify bob's cursor caught up to carol's (the online member).
     let bob_snapshot = get_group_snapshot_impl(&bob.state, group_id.clone())
         .await
         .map_err(|e| anyhow!("bob snapshot after reconnect: {e}"))?;
@@ -1191,7 +1199,7 @@ async fn run_group_ws_disconnect_recovery(ctx: &QuartetContext) -> Result<()> {
         "bob cursor ({bob_cursor}) should be >= carol cursor ({carol_cursor}) after reconnect"
     );
 
-    // Step 5: after reconnect, bob can send and receive messages normally.
+    // Step 5: after catching up, bob can send and receive normally.
     send_group_text_message_impl(&bob.state, conversation_id.clone(), "bob-post-reconnect".into())
         .await
         .map_err(|e| anyhow!("bob send post-reconnect: {e}"))?;

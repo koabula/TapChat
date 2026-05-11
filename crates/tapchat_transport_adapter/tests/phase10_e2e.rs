@@ -2441,17 +2441,22 @@ async fn wakeup_loss_recovers_via_proactive_head_and_fetch() -> Result<()> {
         );
     }
 
-    // Verify the messages appear in the expected send order within the
-    // conversation message list (cursor order = send order).
-    let recovered_texts: Vec<&str> = conversation
-        .messages
+    // Verify messages appear in send order within the recovered
+    // conversation (cursor order = send order).
+    let positions: Vec<usize> = messages
         .iter()
-        .filter_map(|message| message.plaintext.as_deref())
+        .filter_map(|plaintext| {
+            conversation
+                .messages
+                .iter()
+                .position(|message| message.plaintext.as_deref() == Some(plaintext))
+        })
         .collect();
-    for plaintext in messages {
+    assert_eq!(positions.len(), messages.len());
+    for window in positions.windows(2) {
         assert!(
-            recovered_texts.contains(plaintext),
-            "bob's recovered messages must contain \"{plaintext}\""
+            window[0] < window[1],
+            "wakeup-loss recovered messages must appear in send order: positions {window:?}"
         );
     }
 
@@ -2480,9 +2485,8 @@ async fn wakeup_loss_recovers_via_proactive_head_and_fetch() -> Result<()> {
 }
 
 /// Extended offline: Bob is fully disconnected (no realtime, no sync at
-/// all) while Alice sends multiple text and attachment messages. When Bob
-/// comes back online with a single `SyncInbox`, he must catch every
-/// message in order.
+/// all) while Alice sends multiple text messages. When Bob comes back
+/// online, he must catch every message in order through `SyncInbox`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extended_offline_catches_up_multiple_messages_in_order() -> Result<()> {
     let mut ctx = setup_pair().await?;
@@ -2491,14 +2495,13 @@ async fn extended_offline_catches_up_multiple_messages_in_order() -> Result<()> 
     ctx.bob.close_realtime(&ctx.bob_device_id).await?;
     let _ = ctx.bob.take_scheduled_timers();
 
-    // Alice sends a mix of text and attachment messages.
-    let sequence: &[(&str, Option<&[u8]>)] = &[
-        ("offline text A", None),
-        ("offline text B", None),
-        ("offline text C", None),
+    let sequence: &[&str] = &[
+        "offline text A",
+        "offline text B",
+        "offline text C",
     ];
 
-    for (idx, (plaintext, _attachment)) in sequence.iter().enumerate() {
+    for (idx, plaintext) in sequence.iter().enumerate() {
         ctx.alice
             .run_command_until_idle(CoreCommand::SendTextMessage {
                 conversation_id: ctx.conversation_id.clone(),
@@ -2546,7 +2549,7 @@ async fn extended_offline_catches_up_multiple_messages_in_order() -> Result<()> 
         bob_after.messages.len()
     );
 
-    for (plaintext, _) in sequence {
+    for plaintext in sequence {
         assert!(
             bob_after
                 .messages
@@ -2561,7 +2564,7 @@ async fn extended_offline_catches_up_multiple_messages_in_order() -> Result<()> 
     // list and assert they're monotonically increasing.
     let positions: Vec<usize> = sequence
         .iter()
-        .filter_map(|(plaintext, _)| {
+        .filter_map(|plaintext| {
             bob_after
                 .messages
                 .iter()
