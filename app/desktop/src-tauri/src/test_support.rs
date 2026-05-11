@@ -43,6 +43,7 @@ pub use crate::commands::group::{
     set_group_admin_impl, submit_group_join_request_impl, sync_group_outbox_impl,
     transfer_group_ownership_impl, update_group_metadata_impl,
 };
+pub use crate::commands::message::{download_attachment_impl, send_attachment_impl};
 
 // Re-export the projection types so integration tests can pattern-
 // match against them (`GroupMessageView::SystemBanner { .. }`, etc.)

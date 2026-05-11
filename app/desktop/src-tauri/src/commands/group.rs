@@ -965,12 +965,24 @@ pub async fn submit_group_join_request(
         });
     }
 
-    let request = output
+    let request = if let Some(request) = output
         .view_model
         .as_ref()
         .and_then(|vm| vm.group_join_requests.first())
         .cloned()
-        .ok_or_else(|| "core did not return a join request".to_string())?;
+    {
+        request
+    } else {
+        let state = app.state::<AppState>();
+        let inner = state.inner.read().await;
+        inner
+            .engine
+            .refresh_snapshot()
+            .group_join_requests
+            .last()
+            .map(|persisted| persisted.request.clone())
+            .ok_or_else(|| "core did not return a join request".to_string())?
+    };
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,
         group_id: request.group_id,
@@ -1088,6 +1100,15 @@ pub async fn approve_group_join(
     if request_id.trim().is_empty() {
         return Err("request_id must not be empty".into());
     }
+
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ListGroupJoinRequests {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let output = drive_core_with_handle(
         &app,
@@ -1865,12 +1886,23 @@ pub async fn submit_group_join_request_impl(
         });
     }
 
-    let request = output
+    let request = if let Some(request) = output
         .view_model
         .as_ref()
         .and_then(|vm| vm.group_join_requests.first())
         .cloned()
-        .ok_or_else(|| "core did not return a join request".to_string())?;
+    {
+        request
+    } else {
+        let inner = state.inner.read().await;
+        inner
+            .engine
+            .refresh_snapshot()
+            .group_join_requests
+            .last()
+            .map(|persisted| persisted.request.clone())
+            .ok_or_else(|| "core did not return a join request".to_string())?
+    };
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,
         group_id: request.group_id,
@@ -1971,6 +2003,15 @@ pub async fn approve_group_join_impl(
     if request_id.trim().is_empty() {
         return Err("request_id must not be empty".into());
     }
+
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::ListGroupJoinRequests {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let output = drive_core_without_handle(
         state,

@@ -7,10 +7,11 @@ pub mod transport;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 use tapchat_core::ffi_api::{
     CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect, ReadAttachmentBytesEffect,
     UserNotificationEffect, WriteDownloadedAttachmentEffect,
@@ -21,10 +22,18 @@ use tapchat_core::platform_ports::{
     TransportPort,
 };
 use tapchat_core::transport_contract::{
-    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
-    PrepareBlobUploadRequest, PublishSharedStateRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest,
+    AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
+    BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest, CreateGroupInviteResult,
+    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
+    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
+    FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult,
+    GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult, ListGroupJoinRequestsRequest,
+    ListGroupJoinRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
+    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
+    SubmitGroupJoinResult,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -149,6 +158,36 @@ impl DesktopPlatformPorts {
             token
         )))
     }
+
+    async fn inbox_base_url(&self) -> Result<String> {
+        let pm = self.transport.profile_inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active profile found"))?;
+        let deployment = profile
+            .load_snapshot()
+            .context("load active profile snapshot")?
+            .deployment
+            .ok_or_else(|| anyhow::anyhow!("deployment bundle is missing"))?;
+        Ok(deployment.deployment_bundle.inbox_http_endpoint)
+    }
+
+    async fn group_outbox_endpoint(&self, group_id: &str) -> Result<String> {
+        let pm = self.transport.profile_inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active profile found"))?;
+        profile
+            .load_snapshot()
+            .context("load active profile snapshot")?
+            .group_states
+            .into_iter()
+            .find(|state| state.group_id == group_id)
+            .map(|state| state.manifest.outbox.endpoint)
+            .ok_or_else(|| anyhow::anyhow!("group outbox endpoint is missing"))
+    }
 }
 
 fn summarize_share_url(url: Option<&str>) -> String {
@@ -223,7 +262,9 @@ impl TransportPort for DesktopPlatformPorts {
                             };
                             return self.transport.execute_http_request(modified_request).await;
                         } else {
-                            log::warn!("[TransportPort] Failed to generate contact_share_url, sending original request");
+                            log::warn!(
+                                "[TransportPort] Failed to generate contact_share_url, sending original request"
+                            );
                         }
                     }
                 } else {
@@ -278,6 +319,622 @@ impl TransportPort for DesktopPlatformPorts {
     ) -> Result<Vec<CoreEvent>> {
         transport::publish_shared_state(&self.client, publish).await
     }
+
+    async fn append_group_envelope(
+        &mut self,
+        append: AppendGroupEnvelopeRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let endpoint = self.group_outbox_endpoint(&append.group_id).await?;
+        let request = self
+            .client
+            .post(endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", append.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&append.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&append)?)?);
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
+                        group_id: append.group_id,
+                        message_id: append.envelope.message_id,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: AppendGroupEnvelopeResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupEnvelopeAppended {
+                    group_id: append.group_id,
+                    message_id: append.envelope.message_id,
+                    seq: result.seq,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
+                group_id: append.group_id,
+                message_id: append.envelope.message_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn fetch_group_outbox(
+        &mut self,
+        fetch: FetchGroupOutboxRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let url = format!(
+            "{}/v1/groups/{}/outbox/messages?fromSeq={}&limit={}",
+            base.trim_end_matches('/'),
+            fetch.group_id,
+            fetch.from_seq,
+            fetch.limit
+        );
+        let request = self
+            .client
+            .get(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", fetch.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&fetch.capability)?)?,
+            );
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
+                        group_id: fetch.group_id,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: FetchGroupOutboxResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupOutboxFetched {
+                    group_id: fetch.group_id,
+                    records: result.records,
+                    to_seq: result.to_seq,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
+                group_id: fetch.group_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn get_group_outbox_head(
+        &mut self,
+        get: GetGroupOutboxHeadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let url = format!(
+            "{}/v1/groups/{}/outbox/head",
+            base.trim_end_matches('/'),
+            get.group_id
+        );
+        let response = match self
+            .client
+            .get(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", get.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&get.capability)?)?,
+            )
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
+                    group_id: get.group_id,
+                    retryable: true,
+                    detail: Some(error.to_string()),
+                }]);
+            }
+        };
+        let status = response.status().as_u16();
+        let body_text = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
+                group_id: get.group_id,
+                retryable: status >= 500,
+                detail: Some(body_text),
+            }]);
+        }
+        let body = to_snake_case_json_string(&body_text).unwrap_or(body_text);
+        let result: GetGroupOutboxHeadResult = match serde_json::from_str(&body) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
+                    group_id: get.group_id,
+                    retryable: false,
+                    detail: Some(error.to_string()),
+                }]);
+            }
+        };
+        Ok(vec![CoreEvent::GroupOutboxHeadFetched {
+            group_id: get.group_id,
+            head_seq: result.head_seq,
+        }])
+    }
+
+    async fn put_welcome_pickup(&mut self, put: PutWelcomePickupRequest) -> Result<Vec<CoreEvent>> {
+        let response = self
+            .client
+            .put(&put.descriptor.endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", put.descriptor.capability),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&put)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::WelcomePickupPutFailed {
+                        descriptor: put.descriptor,
+                        retryable: status >= 500,
+                        detail: response.text().await.ok(),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
+                let _result: PutWelcomePickupResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::WelcomePickupPut {
+                    descriptor: put.descriptor,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::WelcomePickupPutFailed {
+                descriptor: put.descriptor,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn fetch_welcome_pickup(
+        &mut self,
+        fetch: FetchWelcomePickupRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let response = self
+            .client
+            .get(&fetch.descriptor.endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", fetch.descriptor.capability),
+            )
+            .header(
+                "X-Tapchat-Welcome-Pickup",
+                to_camel_case_json_string(&serde_json::to_string(&fetch.descriptor)?)?,
+            )
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::WelcomePickupFetchFailed {
+                        descriptor: fetch.descriptor,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: FetchWelcomePickupResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::WelcomePickupFetched {
+                    descriptor: fetch.descriptor,
+                    welcome_b64: result.welcome_b64,
+                    manifest: result.manifest,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::WelcomePickupFetchFailed {
+                descriptor: fetch.descriptor,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn create_group_invite(
+        &mut self,
+        create: CreateGroupInviteRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/invites",
+                base.trim_end_matches('/'),
+                create.group_id
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", create.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&create)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupInviteCreateFailed {
+                        group_id: create.group_id,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: CreateGroupInviteResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupInviteCreated {
+                    invite_url: result.invite_url,
+                    invite: result.invite,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupInviteCreateFailed {
+                group_id: create.group_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn revoke_group_invite(
+        &mut self,
+        revoke: RevokeGroupInviteRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/invites/{}/revoke",
+                base.trim_end_matches('/'),
+                revoke.group_id,
+                revoke.invite_id
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", revoke.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&revoke)?)?)
+            .send()
+            .await?;
+        if !(200..300).contains(&response.status().as_u16()) {
+            anyhow::bail!("group invite revoke failed: {}", response.text().await?);
+        }
+        let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
+        let result: RevokeGroupInviteResult = serde_json::from_str(&body)?;
+        Ok(vec![CoreEvent::GroupInviteRevoked {
+            group_id: revoke.group_id,
+            invite_id: result.invite_id,
+        }])
+    }
+
+    async fn fetch_group_invite(
+        &mut self,
+        fetch: FetchGroupInviteRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let response = self.client.get(&fetch.invite_url).send().await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupInviteFetchFailed {
+                        invite_url: fetch.invite_url,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: FetchGroupInviteResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupInviteFetched {
+                    invite_url: fetch.invite_url,
+                    invite: result.invite,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupInviteFetchFailed {
+                invite_url: fetch.invite_url,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn submit_group_join_request(
+        &mut self,
+        submit: SubmitGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/join-requests",
+                base.trim_end_matches('/'),
+                submit.request.group_id
+            ))
+            .header("Authorization", format!("Bearer {}", submit.invite_token))
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&submit)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
+                        invite_url: submit.invite_token,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: SubmitGroupJoinResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupJoinRequestSubmitted {
+                    request: result.request,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
+                invite_url: submit.invite_token,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn list_group_join_requests(
+        &mut self,
+        list: ListGroupJoinRequestsRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/groups/{}/join-requests",
+                base.trim_end_matches('/'),
+                list.group_id
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", list.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&list.capability)?)?,
+            )
+            .send()
+            .await?;
+        if !(200..300).contains(&response.status().as_u16()) {
+            anyhow::bail!("group join list failed: {}", response.text().await?);
+        }
+        let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
+        let result: ListGroupJoinRequestsResult = serde_json::from_str(&body)?;
+        Ok(vec![CoreEvent::GroupJoinRequestsListed {
+            group_id: list.group_id,
+            requests: result.requests,
+        }])
+    }
+
+    async fn get_group_join_request_status(
+        &mut self,
+        get: GetGroupJoinRequestStatusRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let response = self
+            .client
+            .get(&get.endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", get.request_capability),
+            )
+            .send()
+            .await?;
+        if !(200..300).contains(&response.status().as_u16()) {
+            anyhow::bail!("group join status failed: {}", response.text().await?);
+        }
+        let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
+        let result: GetGroupJoinRequestStatusResult = serde_json::from_str(&body)?;
+        Ok(vec![CoreEvent::GroupJoinRequestStatusFetched {
+            request: result.request,
+            welcome_pickup: result.welcome_pickup,
+            manifest: result.manifest,
+            start_cursor: result.start_cursor,
+        }])
+    }
+
+    async fn decide_group_join_request(
+        &mut self,
+        decide: DecideGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/join-requests/{}/decision",
+                base.trim_end_matches('/'),
+                decide.group_id,
+                decide.request_id
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", decide.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&decide)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupJoinDecisionFailed {
+                        group_id: decide.group_id,
+                        request_id: decide.request_id,
+                        retryable: status >= 500,
+                        detail: Some(body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: DecideGroupJoinResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupJoinDecisionApplied {
+                    request: result.request,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupJoinDecisionFailed {
+                group_id: decide.group_id,
+                request_id: decide.request_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn seal_group_outbox(&mut self, seal: SealGroupOutboxRequest) -> Result<Vec<CoreEvent>> {
+        let base = self.inbox_base_url().await?;
+        let url = format!(
+            "{}/v1/groups/{}/outbox/seal",
+            base.trim_end_matches('/'),
+            seal.group_id
+        );
+        let response = match self
+            .client
+            .post(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", seal.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&seal.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(vec![CoreEvent::GroupOutboxSealFailed {
+                    group_id: seal.group_id,
+                    retryable: true,
+                    status: None,
+                    code: None,
+                    detail: Some(error.to_string()),
+                }]);
+            }
+        };
+        let status = response.status().as_u16();
+        let body_text = response.text().await.unwrap_or_default();
+        Ok(map_seal_group_outbox_response(
+            seal.group_id,
+            status,
+            &body_text,
+        ))
+    }
+}
+
+fn map_seal_group_outbox_response(
+    group_id: String,
+    status: u16,
+    body_text: &str,
+) -> Vec<CoreEvent> {
+    if status == 409 {
+        let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
+        let code = extract_error_code(&body);
+        if code.as_deref() == Some("already_sealed") {
+            let sealed_at = extract_sealed_at(&body).unwrap_or(0);
+            return vec![CoreEvent::GroupOutboxSealed {
+                group_id,
+                sealed_at,
+                was_already_sealed: true,
+            }];
+        }
+        return vec![CoreEvent::GroupOutboxSealFailed {
+            group_id,
+            retryable: false,
+            status: Some(status),
+            code,
+            detail: Some(body_text.to_string()),
+        }];
+    }
+
+    if !(200..300).contains(&status) {
+        let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
+        return vec![CoreEvent::GroupOutboxSealFailed {
+            group_id,
+            retryable: status >= 500,
+            status: Some(status),
+            code: extract_error_code(&body),
+            detail: Some(body_text.to_string()),
+        }];
+    }
+
+    let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
+    let result: SealGroupOutboxResult = match serde_json::from_str(&body) {
+        Ok(result) => result,
+        Err(error) => {
+            return vec![CoreEvent::GroupOutboxSealFailed {
+                group_id,
+                retryable: false,
+                status: Some(status),
+                code: None,
+                detail: Some(error.to_string()),
+            }];
+        }
+    };
+    vec![CoreEvent::GroupOutboxSealed {
+        group_id,
+        sealed_at: result.sealed_at,
+        was_already_sealed: result.was_already_sealed,
+    }]
+}
+
+fn extract_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .or_else(|| value.get("error").and_then(|error| error.get("code")))
+                .and_then(|code| code.as_str())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn extract_sealed_at(body: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("sealed_at")
+                .or_else(|| value.get("sealedAt"))
+                .and_then(|sealed_at| sealed_at.as_u64())
+        })
 }
 
 // --- RealtimePort ---

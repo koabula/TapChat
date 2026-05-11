@@ -9,4 +9,5 @@ pub mod message;
 pub mod profile;
 pub mod request;
 pub mod session;
+#[cfg(feature = "gui")]
 pub mod utility;

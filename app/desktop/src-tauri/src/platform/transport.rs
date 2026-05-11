@@ -65,11 +65,18 @@ impl DesktopTransport {
     /// Get the base URL for API calls.
     async fn get_base_url(&self) -> Option<String> {
         let pm = self.profile_inner.read().await;
-        // Access the active profile's runtime metadata
-        pm.active_profile
-            .as_ref()
-            .and_then(|p| p.load_runtime_metadata().ok())
-            .and_then(|r| r.base_url)
+        let profile = pm.active_profile.as_ref()?;
+        profile
+            .load_runtime_metadata()
+            .ok()
+            .and_then(|runtime| runtime.base_url.or(runtime.public_base_url))
+            .or_else(|| {
+                profile
+                    .load_snapshot()
+                    .ok()
+                    .and_then(|snapshot| snapshot.deployment)
+                    .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            })
     }
 
     /// Execute a generic HTTP request.
@@ -394,10 +401,13 @@ impl DesktopTransport {
         &self,
         request: FetchIdentityBundleRequest,
     ) -> Result<IdentityBundle> {
-        // The share URL points to the bundle endpoint
+        let reference = request
+            .reference
+            .as_ref()
+            .context("identity bundle fetch missing reference")?;
         let response = self
             .client
-            .get(&request.user_id) // user_id is actually the share URL in this context
+            .get(reference)
             .send()
             .await
             .context("fetch identity bundle")?;
@@ -408,7 +418,9 @@ impl DesktopTransport {
             anyhow::bail!("fetch bundle failed: {} - {}", status, error_body);
         }
 
-        response.json().await.context("parse identity bundle")
+        let body = response.text().await.context("read identity bundle")?;
+        let body = to_snake_case_json_string(&body)?;
+        serde_json::from_str(&body).context("parse identity bundle")
     }
 
     /// Prepare blob upload.

@@ -12,7 +12,7 @@ use crate::model::{
     MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
-use crate::transport_contract::PrepareBlobUploadResult;
+use crate::transport_contract::{PrepareBlobUploadResult, SealGroupOutboxRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedLocalIdentity {
@@ -235,6 +235,8 @@ pub struct CorePersistenceSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_group_outbox: Vec<PersistedOutgoingGroupEnvelope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_group_seal: Vec<SealGroupOutboxRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_invites: Vec<PersistedGroupInvite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_join_requests: Vec<PersistedGroupJoinRequest>,
@@ -362,6 +364,7 @@ pub struct InMemoryPersistence {
     group_invites: BTreeMap<String, PersistedGroupInvite>,
     group_join_requests: BTreeMap<String, PersistedGroupJoinRequest>,
     pending_group_join_approvals: BTreeMap<String, PersistedPendingGroupJoinApproval>,
+    pending_group_seal: BTreeMap<String, SealGroupOutboxRequest>,
     pending_acks: BTreeMap<String, PersistedPendingAck>,
     pending_blob_transfers: BTreeMap<String, PersistedPendingBlobTransfer>,
     recovery_contexts: BTreeMap<String, PersistedRecoveryContext>,
@@ -420,6 +423,12 @@ impl InMemoryPersistence {
             .iter()
             .cloned()
             .map(|item| (item.message_id.clone(), item))
+            .collect();
+        self.pending_group_seal = snapshot
+            .pending_group_seal
+            .iter()
+            .cloned()
+            .map(|seal| (seal.group_id.clone(), seal))
             .collect();
         self.group_invites = snapshot
             .group_invites
@@ -491,6 +500,7 @@ impl InMemoryPersistence {
                 .values()
                 .cloned()
                 .collect(),
+            pending_group_seal: self.pending_group_seal.values().cloned().collect(),
             pending_acks: self.pending_acks.values().cloned().collect(),
             pending_blob_transfers: self.pending_blob_transfers.values().cloned().collect(),
             recovery_contexts: self.recovery_contexts.values().cloned().collect(),
@@ -773,6 +783,7 @@ mod tests {
             group_states: vec![],
             group_cursors: vec![],
             pending_group_outbox: vec![],
+            pending_group_seal: vec![],
             group_invites: vec![],
             group_join_requests: vec![],
             pending_group_join_approvals: vec![],
@@ -962,6 +973,7 @@ mod tests {
             group_states: vec![],
             group_cursors: vec![],
             pending_group_outbox: vec![],
+            pending_group_seal: vec![],
             group_invites: vec![],
             group_join_requests: vec![],
             pending_group_join_approvals: vec![],

@@ -36,6 +36,7 @@ impl NotificationManager {
 
     /// Show notification using Tauri plugin with app handle.
     pub fn show_notification(&self, title: &str, body: &str) -> anyhow::Result<()> {
+        #[cfg(feature = "gui")]
         if let Some(app) = &self.app_handle {
             use tauri_plugin_notification::NotificationExt;
 
@@ -48,6 +49,11 @@ impl NotificationManager {
             // Fallback to logging if no app handle
             log::info!("Notification (no handle): {} - {}", title, body);
         }
+        #[cfg(not(feature = "gui"))]
+        {
+            let _ = &self.app_handle;
+            log::info!("Notification (test-support): {} - {}", title, body);
+        }
 
         Ok(())
     }
@@ -59,6 +65,7 @@ impl NotificationManager {
         body: &str,
         icon_path: &str,
     ) -> anyhow::Result<()> {
+        #[cfg(feature = "gui")]
         if let Some(app) = &self.app_handle {
             use tauri_plugin_notification::NotificationExt;
 
@@ -70,6 +77,11 @@ impl NotificationManager {
                 .show()?;
         } else {
             log::info!("Notification (no handle): {} - {}", title, body);
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            let _ = (&self.app_handle, icon_path);
+            log::info!("Notification (test-support): {} - {}", title, body);
         }
 
         Ok(())

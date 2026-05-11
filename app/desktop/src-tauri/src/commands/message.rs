@@ -6,6 +6,8 @@ use tapchat_core::attachment_crypto::{decrypt_blob, AttachmentPayloadMetadata};
 use tapchat_core::ffi_api::AttachmentDescriptor;
 use tapchat_core::{CoreCommand, CoreOutput};
 
+#[cfg(any(test, feature = "test-support"))]
+use crate::lifecycle::drive_core_without_handle;
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
 use crate::timetest;
@@ -107,6 +109,32 @@ pub async fn send_attachment(
     .map_err(|e| e.to_string())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub async fn send_attachment_impl(
+    state: &AppState,
+    conversation_id: String,
+    file_path: String,
+    mime_type: String,
+    size_bytes: u64,
+    file_name: Option<String>,
+) -> Result<CoreOutput, String> {
+    let descriptor = AttachmentDescriptor {
+        attachment_id: file_path,
+        mime_type,
+        size_bytes,
+        file_name,
+    };
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::SendAttachmentMessage {
+            conversation_id,
+            attachment_descriptor: descriptor,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn download_attachment(
     app: tauri::AppHandle,
@@ -117,6 +145,27 @@ pub async fn download_attachment(
 ) -> Result<CoreOutput, String> {
     drive_core_with_handle(
         &app,
+        CoreInput::Command(CoreCommand::DownloadAttachment {
+            conversation_id,
+            message_id,
+            reference,
+            destination,
+        }),
+    )
+    .await
+    .map_err(|e| normalize_attachment_error(&e.to_string()))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn download_attachment_impl(
+    state: &AppState,
+    conversation_id: String,
+    message_id: String,
+    reference: String,
+    destination: String,
+) -> Result<CoreOutput, String> {
+    drive_core_without_handle(
+        state,
         CoreInput::Command(CoreCommand::DownloadAttachment {
             conversation_id,
             message_id,

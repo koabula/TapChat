@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::attachment_crypto::{AttachmentPayloadMetadata, decrypt_blob, encrypt_blob};
+use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
 use crate::conversation::{
     ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
 };
@@ -44,7 +44,7 @@ use crate::transport_contract::{
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
     SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Signer;
 use log;
 use sha2::{Digest, Sha256};
@@ -307,6 +307,11 @@ impl CoreEngine {
                 })
             })
             .collect::<Vec<_>>();
+        let pending_group_seal = snapshot
+            .pending_group_seal
+            .into_iter()
+            .map(|seal| (seal.group_id.clone(), seal))
+            .collect::<BTreeMap<_, _>>();
         let group_invites = snapshot
             .group_invites
             .into_iter()
@@ -503,7 +508,7 @@ impl CoreEngine {
                 group_invites,
                 group_join_requests,
                 pending_group_join_approvals,
-                pending_group_seal: BTreeMap::new(),
+                pending_group_seal,
                 pending_acks,
                 pending_blob_uploads,
                 pending_blob_downloads,
@@ -9105,6 +9110,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 plaintext_cache: item.plaintext_cache.clone(),
             })
             .collect(),
+        pending_group_seal: state.pending_group_seal.values().cloned().collect(),
         group_invites: state.group_invites.values().cloned().collect(),
         group_join_requests: state.group_join_requests.values().cloned().collect(),
         pending_group_join_approvals: state

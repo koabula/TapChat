@@ -58,6 +58,14 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function forwardRequestWithBody(request: Request, body: string): Request {
+  return new Request(request.url, {
+    method: request.method,
+    headers: new Headers(request.headers),
+    body
+  });
+}
+
 class R2JsonBlobStore {
   private readonly bucket: Env["TAPCHAT_STORAGE"];
 
@@ -241,8 +249,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const stub = env.INBOX.get(objectId);
 
       if (request.method === "POST" && operation === "messages") {
-        const body = (await request.clone().json()) as AppendEnvelopeRequest;
+        const bodyText = await request.text();
+        const body = JSON.parse(bodyText) as AppendEnvelopeRequest;
         validateAppendAuthorization(request, deviceId, body, now);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_read", now);
       } else if (request.method === "POST" && operation === "ack") {
@@ -268,8 +278,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const stub = env.GROUP_OUTBOX.get(objectId);
 
       if (request.method === "POST" && operation === "messages") {
-        const body = (await request.clone().json()) as AppendGroupEnvelopeRequest;
+        const bodyText = await request.text();
+        const body = JSON.parse(bodyText) as AppendGroupEnvelopeRequest;
         validateGroupAppendAuthorization(request, groupId, body, now);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
       } else if (request.method === "POST" && operation === "seal") {
         // Owner-only seal capability check happens twice: once at the
         // worker boundary (here) to fail fast before we wake up the
@@ -313,10 +325,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const groupInviteMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/invites(?:\/([^/]+)\/revoke)?$/);
     if (groupInviteMatch && request.method === "POST") {
       const groupId = decodeURIComponent(groupInviteMatch[1]);
-      const body = await request.clone().json() as { capability?: GroupCapability };
+      const bodyText = await request.text();
+      const body = JSON.parse(bodyText) as { capability?: GroupCapability };
       validateGroupOperationAuthorization(request, groupId, body.capability as GroupCapability, now, "manage_invites");
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
 
     const joinCollectionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests$/);
@@ -351,10 +364,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const joinDecisionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/decision$/);
     if (joinDecisionMatch && request.method === "POST") {
       const groupId = decodeURIComponent(joinDecisionMatch[1]);
-      const body = await request.clone().json() as { capability?: GroupCapability };
+      const bodyText = await request.text();
+      const body = JSON.parse(bodyText) as { capability?: GroupCapability };
       validateGroupOperationAuthorization(request, groupId, body.capability as GroupCapability, now, "approve_join");
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
 
     const joinStatusMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)$/);

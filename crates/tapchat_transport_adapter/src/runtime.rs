@@ -1,3 +1,4 @@
+use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Stdio;
@@ -69,6 +70,10 @@ impl CloudflareRuntimeHandle {
         let workspace_root = workspace_root.as_ref();
         let service_root = workspace_root.join("services").join("cloudflare");
         let temp_dir = tempfile::tempdir_in(workspace_root).context("create transport temp dir")?;
+        let runtime_home = temp_dir.path().join("home");
+        let runtime_config = runtime_home.join(".config");
+        fs::create_dir_all(runtime_config.join("wrangler").join("logs"))
+            .context("create transport runtime home")?;
         let port = reserve_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let websocket_base_url = format!("ws://127.0.0.1:{port}");
@@ -83,6 +88,10 @@ impl CloudflareRuntimeHandle {
             .env("TAPCHAT_TRANSPORT_PERSIST_TO", temp_dir.path())
             .env("TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET", &bootstrap_secret)
             .env("TAPCHAT_TRANSPORT_SHARING_SECRET", &sharing_secret)
+            .env("HOME", &runtime_home)
+            .env("USERPROFILE", &runtime_home)
+            .env("XDG_CONFIG_HOME", &runtime_config)
+            .env("WRANGLER_HOME", runtime_config.join("wrangler"))
             .env_remove("MAX_INLINE_BYTES")
             .env_remove("RETENTION_DAYS")
             .env_remove("RATE_LIMIT_PER_MINUTE")

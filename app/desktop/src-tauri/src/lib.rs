@@ -1,3 +1,5 @@
+#![cfg_attr(all(feature = "test-support", not(feature = "gui")), allow(dead_code))]
+
 mod commands;
 mod lifecycle;
 mod platform;
@@ -7,8 +9,11 @@ mod state;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "gui")]
 use tauri::menu::{Menu, MenuItem};
+#[cfg(feature = "gui")]
 use tauri::tray::TrayIconBuilder;
+#[cfg(feature = "gui")]
 use tauri::Manager;
 
 pub use state::{AppState, SessionState};
@@ -45,6 +50,7 @@ macro_rules! timetest {
 }
 
 /// Startup configuration parsed from command line arguments.
+#[cfg(feature = "gui")]
 struct StartupConfig {
     /// Specific profile name to load (enables multi-instance mode).
     profile_name: Option<String>,
@@ -53,6 +59,7 @@ struct StartupConfig {
 }
 
 /// Parse command line arguments to determine startup mode.
+#[cfg(feature = "gui")]
 fn parse_startup_args() -> StartupConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut profile_name = None;
@@ -89,6 +96,7 @@ fn parse_startup_args() -> StartupConfig {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(feature = "gui")]
 pub fn run() {
     // Parse startup arguments
     let config = parse_startup_args();
@@ -124,9 +132,11 @@ pub fn run() {
     // Determine log file name based on profile (multi-instance mode)
     let log_file_name = config.profile_name.as_ref().map(|n| format!("{}.log", n));
 
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    #[cfg(feature = "gui")]
+    let builder = builder.plugin(tauri_plugin_dialog::init());
+
     builder
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
