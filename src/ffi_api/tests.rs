@@ -4119,6 +4119,20 @@ mod tests {
                             })
                             .expect("group envelope appended")
                     }
+                    CoreEffect::GetGroupOutboxHead { get } => {
+                        let head_seq = self
+                            .outboxes
+                            .get(&get.group_id)
+                            .and_then(|records| records.last())
+                            .map(|record| record.seq)
+                            .unwrap_or(0);
+                        user.engine
+                            .handle_event(CoreEvent::GroupOutboxHeadFetched {
+                                group_id: get.group_id,
+                                head_seq,
+                            })
+                            .expect("group outbox head fetched")
+                    }
                     CoreEffect::FetchGroupOutbox { fetch } => {
                         let records = self
                             .outboxes

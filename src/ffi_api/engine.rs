@@ -53,6 +53,10 @@ use sha2::{Digest, Sha256};
 const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_ATTACHMENT_MIME_TYPE_LEN: usize = 255;
 const MAX_ATTACHMENT_FILE_NAME_LEN: usize = 255;
+/// Batch size for group outbox fetches during sync catch-up.
+/// Increased from 100 to reduce round-trips when many messages accumulated
+/// while the member was offline.
+const GROUP_OUTBOX_FETCH_LIMIT: u64 = 1000;
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
@@ -540,6 +544,8 @@ impl CoreEngine {
                 recovery_contexts,
                 pending_allowlist_mutation: None,
                 local_display_name,
+                pending_sync_group_head: BTreeSet::new(),
+                group_sync_target_head: BTreeMap::new(),
             },
         };
 
@@ -2109,27 +2115,23 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let cursor = self
-            .state
-            .group_cursors
-            .get(&group_id)
-            .cloned()
-            .unwrap_or(GroupCursor {
-                group_id: group_id.clone(),
-                last_fetched_seq: 0,
-                updated_at: 0,
-            });
+        // Check head first so we only fetch when there is a real gap.
+        // This avoids a wasteful fetch round-trip when the cursor is already
+        // caught up — each group on every AppForegrounded / AppStarted fires
+        // sync_group_outbox, and without the pre-check each one would issue
+        // an HTTP fetch regardless of whether new records exist.
+        self.state
+            .pending_sync_group_head
+            .insert(group_id.clone());
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
                 system_statuses_changed: vec![SystemStatus::SyncInProgress],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![CoreEffect::FetchGroupOutbox {
-                fetch: FetchGroupOutboxRequest {
+            effects: vec![CoreEffect::GetGroupOutboxHead {
+                get: GetGroupOutboxHeadRequest {
                     group_id,
-                    from_seq: cursor.last_fetched_seq.saturating_add(1).max(1),
-                    limit: 100,
                     capability: self.group_capability_for_state(&state)?,
                 },
             }],
@@ -4416,7 +4418,7 @@ impl CoreEngine {
                     let fetch = crate::transport_contract::FetchGroupOutboxRequest {
                         group_id: group_id.clone(),
                         from_seq,
-                        limit: 100,
+                        limit: GROUP_OUTBOX_FETCH_LIMIT,
                         capability,
                     };
                     Ok(CoreOutput {
@@ -4480,7 +4482,7 @@ impl CoreEngine {
                         let fetch = crate::transport_contract::FetchGroupOutboxRequest {
                             group_id: group_id.clone(),
                             from_seq,
-                            limit: 100,
+                            limit: GROUP_OUTBOX_FETCH_LIMIT,
                             capability,
                         };
                         Ok(CoreOutput {
@@ -8126,34 +8128,86 @@ impl CoreEngine {
         group_id: String,
         head_seq: u64,
     ) -> CoreResult<CoreOutput> {
-        // This event is emitted after a successful welcome pickup so that the
-        // fresh joiner skips every outbox record produced before she was
-        // added: those records belong to MLS epochs she cannot decrypt and
-        // would otherwise trip the sync engine into a false recovery loop.
-        // The head is advisory -- only advance the cursor, never roll it
-        // back, so concurrent fetches that already progressed past `head`
-        // keep their progress.
-        let Some(cursor) = self.state.group_cursors.get_mut(&group_id) else {
-            return Ok(CoreOutput::default());
-        };
-        if head_seq <= cursor.last_fetched_seq {
-            return Ok(CoreOutput::default());
-        }
-        cursor.last_fetched_seq = head_seq;
-        cursor.updated_at = current_unix_millis(self.state.message_nonce);
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                checkpoints_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![PersistOp::SaveGroupCursor {
+        // If this head request was issued by sync_group_outbox (not by the
+        // welcome-pickup join fast-forward path), fetch the actual records
+        // rather than skipping ahead.
+        if self.state.pending_sync_group_head.remove(&group_id) {
+            let cursor = self
+                .state
+                .group_cursors
+                .get(&group_id)
+                .cloned()
+                .unwrap_or(GroupCursor {
                     group_id: group_id.clone(),
+                    last_fetched_seq: 0,
+                    updated_at: 0,
+                });
+            let from_seq = cursor.last_fetched_seq.saturating_add(1).max(1);
+            if head_seq < from_seq {
+                // Already caught up — nothing to fetch.
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        checkpoints_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![],
+                    view_model: None,
+                });
+            }
+            // Store the target head so the fetch loop in
+            // handle_group_outbox_records knows when it has caught up.
+            self.state
+                .group_sync_target_head
+                .insert(group_id.clone(), head_seq);
+            let state = self
+                .state
+                .group_states
+                .get(&group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                .clone();
+            let limit = GROUP_OUTBOX_FETCH_LIMIT;
+            Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::FetchGroupOutbox {
+                    fetch: FetchGroupOutboxRequest {
+                        group_id,
+                        from_seq,
+                        limit,
+                        capability: self.group_capability_for_state(&state)?,
+                    },
                 }],
-            )],
-            view_model: None,
-        })
+                view_model: None,
+            })
+        } else {
+            // Welcome-pickup join fast-forward path: skip every outbox record
+            // produced before the joiner was added because those records belong
+            // to MLS epochs she cannot decrypt.
+            let Some(cursor) = self.state.group_cursors.get_mut(&group_id) else {
+                return Ok(CoreOutput::default());
+            };
+            if head_seq <= cursor.last_fetched_seq {
+                return Ok(CoreOutput::default());
+            }
+            cursor.last_fetched_seq = head_seq;
+            cursor.updated_at = current_unix_millis(self.state.message_nonce);
+            Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveGroupCursor {
+                        group_id: group_id.clone(),
+                    }],
+                )],
+                view_model: None,
+            })
+        }
     }
 
     fn handle_group_outbox_records(
@@ -8323,7 +8377,12 @@ impl CoreEngine {
                 updated_at: now,
             },
         );
-        self.merge_with_transport_flush(CoreOutput {
+        let target_head = self
+            .state
+            .group_sync_target_head
+            .get(&group_id)
+            .copied();
+        let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: !messages.is_empty(),
                 messages_changed: !messages.is_empty(),
@@ -8339,7 +8398,9 @@ impl CoreEngine {
                     PersistOp::SaveMlsState {
                         conversation_id: conversation_id.clone(),
                     },
-                    PersistOp::SaveGroupCursor { group_id },
+                    PersistOp::SaveGroupCursor {
+                        group_id: group_id.clone(),
+                    },
                 ],
             )],
             view_model: Some(CoreViewModel {
@@ -8347,7 +8408,30 @@ impl CoreEngine {
                 messages,
                 ..CoreViewModel::default()
             }),
-        })
+        };
+        // Continue fetching if we haven't caught up to the target head.
+        if let Some(head_seq) = target_head {
+            if to_seq < head_seq {
+                let state = self
+                    .state
+                    .group_states
+                    .get(&group_id)
+                    .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                    .clone();
+                let next_fetch = CoreEffect::FetchGroupOutbox {
+                    fetch: FetchGroupOutboxRequest {
+                        group_id,
+                        from_seq: to_seq.saturating_add(1),
+                        limit: GROUP_OUTBOX_FETCH_LIMIT,
+                        capability: self.group_capability_for_state(&state)?,
+                    },
+                };
+                output.effects.push(next_fetch);
+            } else {
+                self.state.group_sync_target_head.remove(&group_id);
+            }
+        }
+        self.merge_with_transport_flush(output)
     }
 
     fn store_group_record_message(

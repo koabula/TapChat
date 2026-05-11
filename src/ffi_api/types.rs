@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::attachment_crypto::AttachmentPayloadMetadata;
 use crate::conversation::LocalConversationState;
@@ -886,6 +886,14 @@ pub(crate) struct CoreState {
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
     pub(crate) pending_allowlist_mutation: Option<PendingAllowlistMutation>,
     pub(crate) local_display_name: Option<String>,
+    /// Set of group_ids that are waiting for a head response to trigger a sync fetch.
+    /// When the head response arrives, handle_group_outbox_head_fetched checks this set
+    /// to decide whether to fetch records (sync path) or skip ahead (welcome pickup path).
+    pub(crate) pending_sync_group_head: BTreeSet<String>,
+    /// The target head_seq for an in-progress group sync fetch loop.
+    /// When handle_group_outbox_records finishes a batch with to_seq < target_head_seq,
+    /// it continues fetching from to_seq+1 until caught up.
+    pub(crate) group_sync_target_head: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1029,6 +1037,8 @@ impl Default for CoreState {
             recovery_contexts: BTreeMap::new(),
             pending_allowlist_mutation: None,
             local_display_name: None,
+            pending_sync_group_head: BTreeSet::new(),
+            group_sync_target_head: BTreeMap::new(),
         }
     }
 }
