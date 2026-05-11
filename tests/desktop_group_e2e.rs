@@ -414,6 +414,19 @@ fn desktop_group_restart_recovery_minimal_e2e() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn desktop_group_dana_post_approval_send_sync_regression() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-dana-post-approval")?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for desktop_group_dana_post_approval_send_sync_regression")?;
+
+    rt.block_on(run_dana_post_approval_send_sync_regression(&ctx))?;
+    Ok(())
+}
+
 async fn run_three_user_text_minimal(ctx: &QuartetContext) -> Result<()> {
     let alice = DesktopHarness::new(&ctx.alice_profile).await?;
 
@@ -695,6 +708,113 @@ fn find_attachment_message(messages: &[GroupMessageView]) -> Result<(String, Str
             _ => None,
         })
         .context("group attachment message missing")
+}
+
+async fn run_dana_post_approval_send_sync_regression(ctx: &QuartetContext) -> Result<()> {
+    let (alice, bob, carol, group_id, conversation_id) =
+        create_three_user_group(ctx, "Desktop Dana Approval Regression").await?;
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        update_group_metadata_impl(
+            &alice.state,
+            group_id.clone(),
+            None,
+            Some("approval_required".into()),
+            None,
+        ),
+    )
+    .await
+    .context("alice update_group_metadata_impl timed out")?
+    .map_err(|e| anyhow!("alice update_group_metadata_impl: {e}"))?;
+    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol]).await?;
+
+    let expires_at = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64)
+        + 3_600_000;
+    let invite = tokio::time::timeout(
+        Duration::from_secs(15),
+        create_group_invite_link_impl(&alice.state, group_id.clone(), expires_at, None),
+    )
+    .await
+    .context("alice create_group_invite_link_impl timed out")?
+    .map_err(|e| anyhow!("alice create_group_invite_link_impl: {e}"))?;
+
+    let dana = DesktopHarness::new(&ctx.dana_profile).await?;
+    let dana_submit = tokio::time::timeout(
+        Duration::from_secs(15),
+        submit_group_join_request_impl(&dana.state, invite.invite_url.clone()),
+    )
+    .await
+    .context("dana submit_group_join_request_impl timed out")?
+    .map_err(|e| anyhow!("dana submit_group_join_request_impl: {e}"))?;
+    assert_eq!(dana_submit.group_id, group_id);
+    assert_eq!(dana_submit.status, "pending");
+
+    let approval = tokio::time::timeout(
+        Duration::from_secs(15),
+        approve_group_join_impl(&alice.state, group_id.clone(), dana_submit.request_id.clone()),
+    )
+    .await
+    .context("alice approve_group_join_impl timed out")?
+    .map_err(|e| anyhow!("alice approve_group_join_impl: {e}"))?;
+    let dana_pickup = approval
+        .welcome_pickups
+        .iter()
+        .find(|pickup| pickup.device_id == ctx.dana_device_id)
+        .map(|pickup| pickup.url.clone())
+        .context("approval did not return dana welcome pickup")?;
+
+    let dana_import = tokio::time::timeout(
+        Duration::from_secs(15),
+        submit_group_join_request_impl(&dana.state, dana_pickup),
+    )
+    .await
+    .context("dana import approved welcome pickup timed out")?
+    .map_err(|e| anyhow!("dana import approved welcome pickup: {e}"))?;
+    assert_eq!(dana_import.group_id, group_id);
+    assert_eq!(dana_import.status, "approved");
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        sync_group_outbox_impl(&dana.state, group_id.clone(), None),
+    )
+    .await
+    .context("dana sync_group_outbox_impl after import timed out")?
+    .map_err(|e| anyhow!("dana sync_group_outbox_impl after import: {e}"))?;
+
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        send_group_text_message_impl(
+            &dana.state,
+            conversation_id.clone(),
+            "dana focused regression".into(),
+        ),
+    )
+    .await
+    .context("dana send_group_text_message_impl timed out")?
+    .map_err(|e| anyhow!("dana send_group_text_message_impl: {e}"))?;
+
+    for (label, harness) in [("alice", &alice), ("bob", &bob), ("carol", &carol)] {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            sync_group_outbox_impl(&harness.state, group_id.clone(), None),
+        )
+        .await
+        .with_context(|| format!("{label} sync_group_outbox_impl after dana send timed out"))?
+        .map_err(|e| anyhow!("{label} sync_group_outbox_impl after dana send: {e}"))?;
+        let messages = get_group_messages_impl(&harness.state, conversation_id.clone())
+            .await
+            .map_err(|e| anyhow!("{label} get_group_messages_impl after dana send: {e}"))?;
+        assert!(
+            has_bubble_with_plaintext(&messages, "dana focused regression"),
+            "{label} did not receive dana's focused regression text"
+        );
+    }
+
+    Ok(())
 }
 
 async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
