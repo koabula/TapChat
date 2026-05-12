@@ -1604,6 +1604,25 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
   assert.equal(postSealInvite.status, 403);
   assert.equal(((await postSealInvite.json()) as { error?: string }).error, "group_sealed");
 
+  const postSealRevoke = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/invites/invite%3Apre-seal/revoke", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(ownerCap),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: "group:project",
+        inviteId: "invite:pre-seal",
+        capability: ownerCap
+      })
+    }),
+    env
+  );
+  assert.equal(postSealRevoke.status, 403);
+  assert.equal(((await postSealRevoke.json()) as { error?: string }).error, "group_sealed");
+
   const postSealJoin = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/join-requests", {
       method: "POST",

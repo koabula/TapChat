@@ -88,7 +88,7 @@ export class GroupOutboxService {
     state: DurableObjectStorageLike,
     spillStore: JsonBlobStore,
     defaults: GroupOutboxMeta,
-    sessions: SessionSink[]
+    sessions: SessionSink[] = []
   ) {
     this.groupId = groupId;
     this.state = state;
@@ -98,8 +98,8 @@ export class GroupOutboxService {
   }
 
   async appendEnvelope(input: AppendGroupEnvelopeRequest, now: number): Promise<AppendGroupEnvelopeResult> {
-    this.validateAppendRequest(input);
     await this.rejectIfSealed();
+    this.validateAppendRequest(input);
 
     const existingSeq = await this.state.get<number>(`${IDEMPOTENCY_PREFIX}${input.envelope.messageId}`);
     if (existingSeq !== undefined) {
@@ -241,6 +241,7 @@ export class GroupOutboxService {
     if (input.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "group_id does not match group invite route");
     }
+    await this.rejectIfSealed();
     const key = `${INVITE_PREFIX}${input.inviteId}`;
     const stored = await this.state.get<StoredGroupInvite>(key);
     if (!stored) {
