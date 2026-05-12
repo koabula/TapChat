@@ -9193,11 +9193,14 @@ impl CoreEngine {
     /// Phase 8: register a new device in an existing group.
     ///
     /// When a user provisions an additional device, every group the user
-    /// belongs to must learn about it. Depending on the group's MLS state
-    /// the core either issues an External Add (with a Welcome for the new
-    /// device) or signals that the existing group must be rebuilt. The
-    /// updated manifest is published as a `ControlGroupMembershipChanged`
-    /// message signed by the user's active owner/admin device.
+    /// belongs to must learn about it. The core issues an MLS External Add
+    /// with a Welcome for the new device so it can decrypt future messages.
+    /// The updated manifest is published as a `ControlGroupMembershipChanged`
+    /// message signed by the calling device.
+    ///
+    /// Only owners and admins may execute this operation — members do not
+    /// hold the `append_membership` capability required to write the MLS
+    /// commit to the group outbox.
     fn add_group_member_device(
         &mut self,
         group_id: String,
@@ -9210,20 +9213,222 @@ impl CoreEngine {
                 "add_group_member_device may only add devices for the local user",
             ));
         }
-        let _ = device_id;
-        let _ = group_id;
-        Err(CoreError::invalid_input(
-            "add_group_member_device is not yet implemented (Phase 8)",
-        ))
+        let local_device_id = self.local_identity_device_id()?;
+        if device_id == local_device_id {
+            return Err(CoreError::invalid_input(
+                "cannot add the current device; it is already an MLS member of this group",
+            ));
+        }
+        let device_id = device_id.trim().to_string();
+        if device_id.is_empty() {
+            return Err(CoreError::invalid_input("device_id must not be empty"));
+        }
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can register a new device in a group",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        if group_state.dissolved_at.is_some() {
+            return Err(CoreError::invalid_input(
+                "cannot add a device to a dissolved group",
+            ));
+        }
+        if group_state
+            .manifest
+            .member_devices
+            .iter()
+            .any(|d| d.device_id == device_id && d.status == GroupMemberStatus::Active)
+        {
+            return Err(CoreError::invalid_input(
+                "device is already an active member of this group",
+            ));
+        }
+        let bundle = self
+            .state
+            .local_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity bundle is not initialized"))?;
+        let device_profile = bundle
+            .devices
+            .iter()
+            .find(|d| d.device_id == device_id && matches!(d.status, DeviceStatusKind::Active))
+            .ok_or_else(|| CoreError::invalid_input(
+                "target device is not an active device of the local user",
+            ))?;
+        let peer_keypackage = PeerDeviceKeyPackage {
+            user_id: local_user_id.clone(),
+            device_id: device_id.clone(),
+            device_public_key: device_profile.device_public_key.clone(),
+            key_package_b64: device_profile.keypackage_ref.object_ref.clone(),
+        };
+        let (artifacts, summary) = {
+            let adapter = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+            let artifacts =
+                adapter.add_members(&group_state.conversation_id, &[peer_keypackage])?;
+            let summary = adapter.export_group_summary(&group_state.conversation_id)?;
+            (artifacts, summary)
+        };
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary);
+
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
+        manifest.member_devices.push(GroupMemberDevice {
+            user_id: local_user_id.clone(),
+            device_id: device_id.clone(),
+            status: GroupMemberStatus::Active,
+        });
+        let now = current_unix_millis(self.state.message_nonce);
+        self.apply_membership_change_to_manifest(&mut manifest, artifacts.epoch, now)?;
+        self.sync_conversation_members_from_manifest(&group_state.conversation_id, &manifest)?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: None,
+            },
+        );
+
+        let capability = self.group_capability(&group_id, role)?;
+        let mut commit = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.commit_b64,
+        )?;
+        manifest.last_commit_message_id = Some(commit.message_id.clone());
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("MLS adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let mut control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupEnvelopeVisibility::Protocol,
+            control_payload.payload_b64,
+        )?;
+        let membership_proof = self.build_membership_proof(
+            "add_device",
+            &previous_manifest,
+            &manifest,
+            &commit.message_id,
+            &control.message_id,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
+        control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: None,
+            },
+        );
+
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: commit.message_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: control.message_id.clone(),
+                },
+            ],
+        )];
+        for welcome in artifacts.welcomes {
+            let descriptor =
+                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            effects.push(CoreEffect::PutWelcomePickup {
+                put: PutWelcomePickupRequest {
+                    descriptor,
+                    welcome_b64: welcome.payload_b64,
+                    manifest: Some(manifest.clone()),
+                    headers: BTreeMap::new(),
+                },
+            });
+        }
+        let pickup_descriptors: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.descriptor.clone()),
+                _ => None,
+            })
+            .collect();
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                messages: vec![
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id.clone(),
+                        message_id: commit.message_id,
+                        message_type: MessageType::MlsCommit,
+                    },
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id,
+                        message_id: control.message_id,
+                        message_type: MessageType::ControlDeviceMembershipChanged,
+                    },
+                ],
+                welcome_pickups: pickup_descriptors,
+                ..CoreViewModel::default()
+            }),
+        })
     }
 
     /// Phase 8: remove a decommissioned device from an existing group.
     ///
     /// When a user removes a device from their account the group must
     /// advance its MLS epoch so the decommissioned device can no longer
-    /// decrypt future messages. The core generates an MLS Remove proposal
-    /// covering the target device, bumps the manifest roster version, and
-    /// publishes a `ControlGroupMembershipChanged` message.
+    /// decrypt future messages. The core generates an MLS Remove covering
+    /// the target device, bumps the manifest roster version, and publishes
+    /// a `ControlGroupMembershipChanged` message.
+    ///
+    /// Only owners and admins may execute this operation. The calling
+    /// device cannot remove itself.
     fn remove_group_member_device(
         &mut self,
         group_id: String,
@@ -9236,11 +9441,208 @@ impl CoreEngine {
                 "remove_group_member_device may only remove devices for the local user",
             ));
         }
-        let _ = device_id;
-        let _ = group_id;
-        Err(CoreError::invalid_input(
-            "remove_group_member_device is not yet implemented (Phase 8)",
-        ))
+        let local_device_id = self.local_identity_device_id()?;
+        let device_id = device_id.trim().to_string();
+        if device_id.is_empty() {
+            return Err(CoreError::invalid_input("device_id must not be empty"));
+        }
+        if device_id == local_device_id {
+            return Err(CoreError::invalid_input(
+                "cannot remove the current device from a group; use LeaveGroup instead",
+            ));
+        }
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can remove a device from a group",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        if group_state.dissolved_at.is_some() {
+            return Err(CoreError::invalid_input(
+                "cannot remove a device from a dissolved group",
+            ));
+        }
+        let device_entry = group_state
+            .manifest
+            .member_devices
+            .iter()
+            .find(|d| d.device_id == device_id && d.status == GroupMemberStatus::Active)
+            .ok_or_else(|| CoreError::invalid_input(
+                "target device is not an active member of this group",
+            ))?;
+        if device_entry.user_id != local_user_id {
+            return Err(CoreError::invalid_input(
+                "target device does not belong to the local user",
+            ));
+        }
+        // Ensure at least one device for this user remains in the group.
+        let other_active_device_count = group_state
+            .manifest
+            .member_devices
+            .iter()
+            .filter(|d| {
+                d.user_id == local_user_id
+                    && d.device_id != device_id
+                    && d.status == GroupMemberStatus::Active
+            })
+            .count();
+        if other_active_device_count == 0 {
+            return Err(CoreError::invalid_input(
+                "cannot remove the last device of the local user from a group; use LeaveGroup instead",
+            ));
+        }
+        let target_device_ids = {
+            let adapter = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+            adapter.member_device_ids_for_user(&group_state.conversation_id, &local_user_id)?
+        };
+        let mls_device_id = target_device_ids
+            .iter()
+            .find(|id| *id == &device_id)
+            .ok_or_else(|| CoreError::invalid_input(
+                "target device is not registered in the MLS group state",
+            ))?
+            .clone();
+        let (artifacts, summary) = {
+            let adapter = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+            let artifacts =
+                adapter.remove_members(&group_state.conversation_id, &[mls_device_id])?;
+            let summary = adapter.export_group_summary(&group_state.conversation_id)?;
+            (artifacts, summary)
+        };
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary);
+
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
+        if let Some(entry) = manifest
+            .member_devices
+            .iter_mut()
+            .find(|d| d.device_id == device_id)
+        {
+            entry.status = GroupMemberStatus::Removed;
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        self.apply_membership_change_to_manifest(&mut manifest, artifacts.epoch, now)?;
+        self.sync_conversation_members_from_manifest(&group_state.conversation_id, &manifest)?;
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: None,
+            },
+        );
+
+        let capability = self.group_capability(&group_id, role)?;
+        let mut commit = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.commit_b64,
+        )?;
+        manifest.last_commit_message_id = Some(commit.message_id.clone());
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("MLS adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let mut control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupEnvelopeVisibility::Protocol,
+            control_payload.payload_b64,
+        )?;
+        let membership_proof = self.build_membership_proof(
+            "remove_device",
+            &previous_manifest,
+            &manifest,
+            &commit.message_id,
+            &control.message_id,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
+        control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: None,
+            },
+        );
+
+        let effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: commit.message_id.clone(),
+                },
+                PersistOp::SaveOutgoingGroupEnvelope {
+                    message_id: control.message_id.clone(),
+                },
+            ],
+        )];
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                messages: vec![
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id.clone(),
+                        message_id: commit.message_id,
+                        message_type: MessageType::MlsCommit,
+                    },
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id,
+                        message_id: control.message_id,
+                        message_type: MessageType::ControlDeviceMembershipChanged,
+                    },
+                ],
+                ..CoreViewModel::default()
+            }),
+        })
     }
 
     /// Handle `CoreEvent::GroupOutboxSealed` — step (d) of `DissolveGroup`.
