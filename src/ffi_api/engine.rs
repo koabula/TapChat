@@ -6874,8 +6874,50 @@ impl CoreEngine {
                 group_id,
                 message_id,
             } => {
+                let body_str = body.as_deref().unwrap_or("");
+                // Detect server-side optimistic-concurrency rejection. When
+                // the server returns HTTP 409 roster_version_conflict another
+                // writer already advanced the membership chain. The local
+                // manifest has been updated by the concurrent commit, so the
+                // stale envelope (with its old membership proof) is removed
+                // and the caller must re-invoke the high-level command to
+                // rebuild the proof from the current manifest state.
+                if let Ok(error_obj) =
+                    serde_json::from_str::<serde_json::Value>(body_str)
+                {
+                    if error_obj
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|code| code == "roster_version_conflict")
+                    {
+                        self.state
+                            .pending_group_outbox
+                            .retain(|item| item.envelope.message_id != message_id);
+                        return Ok(merge_outputs(
+                            CoreOutput {
+                                state_update: CoreStateUpdate {
+                                    system_statuses_changed: vec![
+                                        SystemStatus::TemporaryNetworkFailure,
+                                    ],
+                                    ..CoreStateUpdate::default()
+                                },
+                                effects: vec![CoreEffect::EmitUserNotification {
+                                    notification: UserNotificationEffect {
+                                        status: SystemStatus::TemporaryNetworkFailure,
+                                        message: format!(
+                                            "group membership operation for {} conflicted; sync and retry",
+                                            group_id
+                                        ),
+                                    },
+                                }],
+                                view_model: None,
+                            },
+                            self.sync_group_outbox(group_id.clone())?,
+                        ));
+                    }
+                }
                 let result: AppendGroupEnvelopeResult = serde_json::from_str(
-                    body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"),
+                    body_str,
                 )
                 .map_err(|error| {
                     CoreError::invalid_input(format!(
@@ -9223,18 +9265,18 @@ impl CoreEngine {
         if device_id.is_empty() {
             return Err(CoreError::invalid_input("device_id must not be empty"));
         }
-        let role = self.local_group_role(&group_id)?;
-        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
-            return Err(CoreError::invalid_input(
-                "only owner or admin can register a new device in a group",
-            ));
-        }
         let group_state = self
             .state
             .group_states
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can register a new device in a group",
+            ));
+        }
         if group_state.dissolved_at.is_some() {
             return Err(CoreError::invalid_input(
                 "cannot add a device to a dissolved group",
@@ -9451,18 +9493,18 @@ impl CoreEngine {
                 "cannot remove the current device from a group; use LeaveGroup instead",
             ));
         }
-        let role = self.local_group_role(&group_id)?;
-        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
-            return Err(CoreError::invalid_input(
-                "only owner or admin can remove a device from a group",
-            ));
-        }
         let group_state = self
             .state
             .group_states
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can remove a device from a group",
+            ));
+        }
         if group_state.dissolved_at.is_some() {
             return Err(CoreError::invalid_input(
                 "cannot remove a device from a dissolved group",

@@ -4593,9 +4593,18 @@ mod tests {
                     proof_type: "signature".into(),
                     value: "forged".into(),
                 },
-                membership_proof: Some(SenderProof {
+                membership_proof: Some(crate::model::GroupMembershipProof {
                     proof_type: "membership_signature".into(),
-                    value: "forged".into(),
+                    operation: "invite".into(),
+                    signer_user_id: "user:alice".into(),
+                    signer_device_id: "device:alice:phone".into(),
+                    previous_roster_version: 1,
+                    new_roster_version: 2,
+                    previous_commit_message_id: None,
+                    commit_message_id: "msg:commit:1".into(),
+                    control_message_id: "msg:control:1".into(),
+                    new_manifest_sha256: "sha256:forged".into(),
+                    signature: "forged".into(),
                 }),
             };
             self.outboxes
@@ -4952,5 +4961,233 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("tapchat-{prefix}-{nanos}.bin"))
+    }
+
+    // ── Phase 8: add/remove group member device ──
+
+    #[test]
+    fn group_device_commands_round_trip_json() {
+        let commands = vec![
+            CoreCommand::AddGroupMemberDevice {
+                group_id: "group:project".into(),
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+            },
+            CoreCommand::RemoveGroupMemberDevice {
+                group_id: "group:project".into(),
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+            },
+        ];
+
+        for command in commands {
+            let json = serde_json::to_string(&command).expect("serialize");
+            assert!(json.contains("group_id"));
+            let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, command, "round-trip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn add_group_member_device_rejects_current_device() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let summary = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+        let local_device = alice.local_device_id().expect("local device id");
+
+        let err = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                user_id: alice
+                    .local_identity()
+                    .expect("identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+                device_id: local_device.to_string(),
+            })
+            .expect_err("cannot add current device");
+        assert!(
+            err.to_string().contains("current device"),
+            "expected 'current device' rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_group_member_device_rejects_wrong_user() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+
+        let err = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id,
+                user_id: bob_bundle.user_id.clone(),
+                device_id: "device:bob:tablet".into(),
+            })
+            .expect_err("cannot add another user's device");
+        assert!(
+            err.to_string().contains("only add devices for the local user"),
+            "expected local-user-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_group_member_device_rejects_non_existent_group() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let local_user_id = alice
+            .local_identity()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+
+        let err = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id: "group:nonexistent".into(),
+                user_id: local_user_id,
+                device_id: "device:alice:tablet".into(),
+            })
+            .expect_err("non-existent group must fail");
+        assert!(
+            err.to_string().contains("group does not exist"),
+            "expected 'group does not exist', got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_group_member_device_rejects_duplicate() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+        let local_user_id = alice
+            .local_identity()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let local_device = alice.local_device_id().expect("local device id");
+
+        // The current device is already in the group (it was the creator).
+        let err = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                user_id: local_user_id.clone(),
+                device_id: local_device.to_string(),
+            })
+            .expect_err("duplicate device must fail");
+        assert!(
+            err.to_string().contains("current device"),
+            "expected duplicate/current-device rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_group_member_device_rejects_current_device() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+        let local_user_id = alice
+            .local_identity()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let local_device = alice.local_device_id().expect("local device id");
+
+        let err = alice
+            .handle_command(CoreCommand::RemoveGroupMemberDevice {
+                group_id,
+                user_id: local_user_id,
+                device_id: local_device.to_string(),
+            })
+            .expect_err("cannot remove current device");
+        assert!(
+            err.to_string().contains("cannot remove the current device"),
+            "expected 'cannot remove the current device', got: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_group_member_device_rejects_wrong_user() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+
+        let err = alice
+            .handle_command(CoreCommand::RemoveGroupMemberDevice {
+                group_id,
+                user_id: bob_bundle.user_id.clone(),
+                device_id: "device:bob:phone".into(),
+            })
+            .expect_err("cannot remove another user's device");
+        assert!(
+            err.to_string().contains("may only remove devices for the local user"),
+            "expected local-user-only rejection, got: {err}"
+        );
     }
 }

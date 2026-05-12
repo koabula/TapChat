@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 
 use crate::model::{
     Ack, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupInviteDocument,
-    GroupJoinRequest, GroupManifest, GroupOutboxRecord, IdentityBundle, InboxRecord,
-    WelcomePickupDescriptor,
+    GroupJoinRequest, GroupManifest, GroupOutboxRecord, IdentityBundle,
+    InboxRecord, WelcomePickupDescriptor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -545,9 +545,9 @@ mod tests {
     use super::*;
     use crate::model::{
         CapabilityService, DeliveryClass, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
-        GroupEnvelopeVisibility, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState,
-        GroupRole, MessageType, SenderProof, StorageRef, WelcomePickupDescriptor,
-        CURRENT_MODEL_VERSION,
+        GroupEnvelopeVisibility, GroupMembershipProof, GroupMessageType, GroupOutboxRecord,
+        GroupOutboxRecordState, GroupRole, MessageType, SenderProof, StorageRef,
+        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
 
     #[test]
@@ -639,6 +639,8 @@ mod tests {
             group_id: "group:project".into(),
             envelope: sample_group_envelope(),
             capability: sample_group_capability(),
+            expected_previous_roster_version: None,
+            expected_previous_commit_message_id: None,
         };
         let json = serde_json::to_string(&append).expect("serialize append");
         let decoded: AppendGroupEnvelopeRequest =
@@ -714,9 +716,18 @@ mod tests {
                 proof_type: "signature".into(),
                 value: "proof".into(),
             },
-            membership_proof: Some(SenderProof {
-                proof_type: "membership".into(),
-                value: "member-proof".into(),
+            membership_proof: Some(GroupMembershipProof {
+                proof_type: "membership_signature".into(),
+                operation: "invite".into(),
+                signer_user_id: "user:alice".into(),
+                signer_device_id: "device:alice:phone".into(),
+                previous_roster_version: 1,
+                new_roster_version: 2,
+                previous_commit_message_id: None,
+                commit_message_id: "msg:commit:1".into(),
+                control_message_id: "msg:control:1".into(),
+                new_manifest_sha256: "sha256:abc".into(),
+                signature: "member-proof".into(),
             }),
         }
     }
