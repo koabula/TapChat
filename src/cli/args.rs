@@ -549,6 +549,24 @@ pub enum GroupMemberSubcommand {
         #[arg(long)]
         user_id: String,
     },
+    /// Register a new device in an existing group (owner/admin only)
+    AddDevice {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        device_id: String,
+    },
+    /// Remove a decommissioned device from an existing group (owner/admin only)
+    RemoveDevice {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        device_id: String,
+    },
 }
 
 #[derive(Debug, Args)]

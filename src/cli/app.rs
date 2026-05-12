@@ -1323,6 +1323,50 @@ impl CliApp {
                     "user_id": user_id,
                 }))
             }
+            GroupMemberSubcommand::AddDevice {
+                profile,
+                group_id,
+                device_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let user_id = local_user_id(&driver)?;
+                driver
+                    .run_command_until_idle(CoreCommand::AddGroupMemberDevice {
+                        group_id: group_id.clone(),
+                        user_id,
+                        device_id: device_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "device_added": true,
+                    "group_id": group_id,
+                    "device_id": device_id,
+                }))
+            }
+            GroupMemberSubcommand::RemoveDevice {
+                profile,
+                group_id,
+                device_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let user_id = local_user_id(&driver)?;
+                driver
+                    .run_command_until_idle(CoreCommand::RemoveGroupMemberDevice {
+                        group_id: group_id.clone(),
+                        user_id,
+                        device_id: device_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "device_removed": true,
+                    "group_id": group_id,
+                    "device_id": device_id,
+                }))
+            }
         }
     }
 
@@ -1871,6 +1915,13 @@ fn local_device_id(driver: &CoreDriver) -> Result<String> {
     driver
         .local_identity()
         .map(|identity| identity.device_identity.device_id.clone())
+        .ok_or_else(|| anyhow!("local identity is not initialized"))
+}
+
+fn local_user_id(driver: &CoreDriver) -> Result<String> {
+    driver
+        .local_identity()
+        .map(|identity| identity.user_identity.user_id.clone())
         .ok_or_else(|| anyhow!("local identity is not initialized"))
 }
 

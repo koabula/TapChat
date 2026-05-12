@@ -1323,6 +1323,9 @@ mod tests {
         harness.drain(&mut alice, remove_output);
 
         harness.sync_group(&mut bob, &group_id);
+        // The sender must sync to process the matching control message
+        // and clear the pending membership transition before sending.
+        harness.sync_group(&mut alice, &group_id);
         harness.send_text(&mut alice, &conversation_id, "after remove from alice");
         harness.sync_group(&mut bob, &group_id);
         harness.send_text(&mut bob, &conversation_id, "after remove from bob");

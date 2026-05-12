@@ -5983,10 +5983,19 @@ impl CoreEngine {
         if group_state.dissolved_at.is_some() {
             return Err(CoreError::invalid_input("group is dissolved"));
         }
-        if group_state.pending_membership_transition.is_some() {
-            return Err(CoreError::temporary_failure(
-                "group has a pending membership transition; send is blocked until manifest control is verified",
-            ));
+        // The pending membership transition check protects receivers from
+        // sending application messages before the matching control message
+        // for a membership change is processed. When the pending transition
+        // was signed by the local user the sender is the same user who
+        // initiated the change and already holds a consistent manifest —
+        // no need to block.
+        if let Some(ref pending) = group_state.pending_membership_transition {
+            let local_user_id = &local_identity.user_identity.user_id;
+            if pending.proof.signer_user_id != *local_user_id {
+                return Err(CoreError::temporary_failure(
+                    "group has a pending membership transition from another user; send is blocked until manifest control is verified",
+                ));
+            }
         }
         let Some(local_role) = group_state.local_role else {
             return Err(CoreError::invalid_input("local group member is not active"));
@@ -8866,6 +8875,21 @@ impl CoreEngine {
                     message_id: message_id.clone(),
                     message_type,
                 });
+                // When the sender's own control message is acknowledged by
+                // the server, the membership transition is complete — the
+                // manifest update has been durably published. Clear any
+                // pending transition so subsequent sends are unblocked.
+                if matches!(
+                    record.envelope.message_type,
+                    GroupMessageType::ControlGroupMembershipChanged
+                        | GroupMessageType::ControlGroupMetadataUpdated
+                        | GroupMessageType::ControlGroupDissolved
+                ) && group_state.pending_membership_transition.is_some()
+                {
+                    if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                        state.pending_membership_transition = None;
+                    }
+                }
             }
         }
 
