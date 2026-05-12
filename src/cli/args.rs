@@ -112,6 +112,13 @@ pub enum DeviceSubcommand {
         #[arg(long)]
         profile: Option<PathBuf>,
     },
+    /// Register a new device in all existing groups (Phase 8)
+    SyncGroups {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        device_id: String,
+    },
     Revoke {
         #[arg(long)]
         profile: Option<PathBuf>,

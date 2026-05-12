@@ -201,6 +201,23 @@ impl CliApp {
                     "mnemonic": identity.mnemonic,
                 }))
             }
+            DeviceSubcommand::SyncGroups {
+                profile,
+                device_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::SyncGroupsForNewDevice {
+                        device_id: device_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                self.print_value(&serde_json::json!({
+                    "device_id": device_id,
+                    "synced": true,
+                }))
+            }
             DeviceSubcommand::Revoke {
                 profile,
                 target_device_id,

@@ -739,6 +739,9 @@ impl CoreEngine {
                 user_id,
                 device_id,
             } => self.remove_group_member_device(group_id, user_id, device_id),
+            CoreCommand::SyncGroupsForNewDevice { device_id } => {
+                self.sync_groups_for_new_device(device_id)
+            }
         }
     }
 
@@ -9709,6 +9712,154 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         })
+    }
+
+    /// Phase 8: register a newly provisioned device in every group the
+    /// local user belongs to.
+    ///
+    /// Iterates over all known groups, and for each group where the local
+    /// user holds an owner or admin role and the target device is not
+    /// already present, performs an MLS External Add, writes a Welcome to
+    /// the device's welcome pickup, and publishes a
+    /// `ControlGroupMembershipChanged` message.
+    ///
+    /// Groups where the device is already registered, where the local user
+    /// does not hold sufficient permissions, or that have been dissolved
+    /// are silently skipped. Failures for individual groups are collected
+    /// and reported; a single failed group does not abort the batch.
+    fn sync_groups_for_new_device(
+        &mut self,
+        device_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let local_user_id = self.local_identity_user_id()?;
+        let local_device_id = self.local_identity_device_id()?;
+        let device_id = device_id.trim().to_string();
+        if device_id.is_empty() {
+            return Err(CoreError::invalid_input("device_id must not be empty"));
+        }
+        if device_id == local_device_id {
+            return Err(CoreError::invalid_input(
+                "cannot sync groups for the current device; it is already a member of its groups",
+            ));
+        }
+        // Verify the target device is an active device of the local user
+        // before iterating over groups.
+        let bundle = self
+            .state
+            .local_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity bundle is not initialized"))?;
+        bundle
+            .devices
+            .iter()
+            .find(|d| d.device_id == device_id && matches!(d.status, DeviceStatusKind::Active))
+            .ok_or_else(|| CoreError::invalid_input(
+                "target device is not an active device of the local user",
+            ))?;
+
+        // Collect group ids first to avoid borrowing conflicts during
+        // iteration (add_group_member_device borrows &mut self).
+        let candidate_group_ids: Vec<String> = self
+            .state
+            .group_states
+            .values()
+            .filter(|state| {
+                // Only operate on groups where the local user holds a
+                // role that allows writing membership operations.
+                matches!(state.local_role, Some(GroupRole::Owner | GroupRole::Admin))
+                    && state.dissolved_at.is_none()
+                    && !state
+                        .manifest
+                        .member_devices
+                        .iter()
+                        .any(|d| d.device_id == device_id && d.status == GroupMemberStatus::Active)
+            })
+            .map(|state| state.group_id.clone())
+            .collect();
+
+        if candidate_group_ids.is_empty() {
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![],
+                view_model: Some(CoreViewModel {
+                    group_sync_results: Some(GroupSyncResults {
+                        device_id: device_id.clone(),
+                        total_candidates: 0,
+                        succeeded: 0,
+                        skipped: 0,
+                        errors: vec![],
+                    }),
+                    ..CoreViewModel::default()
+                }),
+            });
+        }
+
+        let total_candidates = candidate_group_ids.len() as u64;
+        let mut succeeded = 0u64;
+        let mut skipped = 0u64;
+        let mut errors: Vec<GroupSyncError> = Vec::new();
+        let mut aggregate = CoreOutput::default();
+
+        for group_id in candidate_group_ids {
+            match self.add_group_member_device(
+                group_id.clone(),
+                local_user_id.clone(),
+                device_id.clone(),
+            ) {
+                Ok(output) => {
+                    succeeded = succeeded.saturating_add(1);
+                    aggregate = merge_outputs(aggregate, output);
+                }
+                Err(err) => {
+                    // Distinguish between expected skips and unexpected
+                    // failures. Expected skips include groups where the
+                    // device was already registered between our snapshot
+                    // and the call (concurrent registration) or where
+                    // the role changed concurrently.
+                    if err.to_string().contains("already an active member")
+                        || err.to_string().contains("owner or admin")
+                        || err.to_string().contains("dissolved")
+                    {
+                        skipped = skipped.saturating_add(1);
+                    } else {
+                        errors.push(GroupSyncError {
+                            group_id: group_id.clone(),
+                            error: err.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let all_succeeded = errors.is_empty();
+        let state_update = CoreStateUpdate {
+            conversations_changed: succeeded > 0,
+            messages_changed: succeeded > 0,
+            ..CoreStateUpdate::default()
+        };
+        // Merge the state update into the aggregate.
+        aggregate.state_update = CoreStateUpdate {
+            conversations_changed: state_update.conversations_changed
+                || aggregate.state_update.conversations_changed,
+            messages_changed: state_update.messages_changed
+                || aggregate.state_update.messages_changed,
+            ..aggregate.state_update
+        };
+        if !all_succeeded {
+            aggregate.state_update.system_statuses_changed =
+                vec![SystemStatus::TemporaryNetworkFailure];
+        }
+        aggregate.view_model = Some(CoreViewModel {
+            group_sync_results: Some(GroupSyncResults {
+                device_id,
+                total_candidates,
+                succeeded,
+                skipped,
+                errors,
+            }),
+            ..aggregate.view_model.unwrap_or_default()
+        });
+        Ok(aggregate)
     }
 
     /// Handle `CoreEvent::GroupOutboxSealed` — step (d) of `DissolveGroup`.

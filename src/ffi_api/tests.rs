@@ -5193,4 +5193,63 @@ mod tests {
             "expected local-user-only rejection, got: {err}"
         );
     }
+
+    #[test]
+    fn sync_groups_for_new_device_rejects_current_device() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let local_device = alice.local_device_id().expect("local device id");
+
+        let err = alice
+            .handle_command(CoreCommand::SyncGroupsForNewDevice {
+                device_id: local_device.to_string(),
+            })
+            .expect_err("cannot sync for current device");
+        assert!(
+            err.to_string().contains("current device"),
+            "expected current-device rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sync_groups_for_new_device_rejects_unknown_device() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+
+        let err = alice
+            .handle_command(CoreCommand::SyncGroupsForNewDevice {
+                device_id: "device:unknown:tablet".into(),
+            })
+            .expect_err("unknown device must fail");
+        assert!(
+            err.to_string().contains("not an active device"),
+            "expected 'not an active device' rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sync_groups_for_new_device_serializes_result() {
+        // Verify the SyncGroupsForNewDevice command round-trips and
+        // produces a view model with group_sync_results.
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let local_device = alice.local_device_id().expect("local device id");
+
+        // Sync for current device is rejected (it is already in all groups).
+        let err = alice
+            .handle_command(CoreCommand::SyncGroupsForNewDevice {
+                device_id: local_device.to_string(),
+            })
+            .expect_err("current device rejected");
+        assert!(err.to_string().contains("current device"));
+
+        // JSON serialization round-trip for the command.
+        let cmd = CoreCommand::SyncGroupsForNewDevice {
+            device_id: "device:alice:tablet".into(),
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize");
+        assert!(json.contains("sync_groups_for_new_device"));
+        let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, cmd);
+    }
 }

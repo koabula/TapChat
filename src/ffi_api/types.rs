@@ -148,6 +148,14 @@ pub enum CoreCommand {
         user_id: String,
         device_id: String,
     },
+    /// Phase 8: register a newly provisioned device in every group the
+    /// local user belongs to. For each group where the caller holds an
+    /// owner or admin role and the target device is not already present,
+    /// the core issues an MLS External Add with a Welcome so the new
+    /// device can decrypt future messages.
+    SyncGroupsForNewDevice {
+        device_id: String,
+    },
     TransferGroupOwnership {
         group_id: String,
         new_owner_user_id: String,
@@ -731,6 +739,23 @@ pub struct AppendResultSummary {
     pub seq: Option<u64>,
 }
 
+/// Result of a single failed group operation within a batch sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSyncError {
+    pub group_id: String,
+    pub error: String,
+}
+
+/// Summary produced by `SyncGroupsForNewDevice`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSyncResults {
+    pub device_id: String,
+    pub total_candidates: u64,
+    pub succeeded: u64,
+    pub skipped: u64,
+    pub errors: Vec<GroupSyncError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CoreViewModel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -762,6 +787,9 @@ pub struct CoreViewModel {
     /// short-lived.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub welcome_pickups: Vec<crate::model::WelcomePickupDescriptor>,
+    /// Result summary for `SyncGroupsForNewDevice` batch operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_sync_results: Option<GroupSyncResults>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
