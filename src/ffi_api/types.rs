@@ -97,6 +97,11 @@ pub enum CoreCommand {
         group_id: String,
         invitee_user_ids: Vec<String>,
     },
+    AddGroupMemberDevice {
+        group_id: String,
+        user_id: String,
+        device_id: String,
+    },
     CreateGroupInviteLink {
         group_id: String,
         expires_at: u64,
@@ -137,6 +142,11 @@ pub enum CoreCommand {
     RemoveGroupMember {
         group_id: String,
         target_user_id: String,
+    },
+    RemoveGroupMemberDevice {
+        group_id: String,
+        user_id: String,
+        device_id: String,
     },
     TransferGroupOwnership {
         group_id: String,

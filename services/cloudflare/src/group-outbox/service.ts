@@ -40,6 +40,20 @@ interface GroupOutboxMeta {
   sealed?: boolean;
   /** Millisecond timestamp the seal first succeeded. Defaults to 0. */
   sealedAt?: number;
+  /**
+   * Latest roster version observed from a successfully appended
+   * membership operation. Used for optimistic concurrency: a writer
+   * may supply expectedPreviousRosterVersion and the server rejects
+   * the append with 409 when the stored version does not match.
+   */
+  currentRosterVersion?: number;
+  /**
+   * Latest commit message id from a successfully appended membership
+   * operation. Paired with currentRosterVersion for double-entry
+   * optimistic concurrency; a stale commit-message-id also triggers
+   * 409 `roster_version_conflict`.
+   */
+  lastCommitMessageId?: string;
 }
 
 interface StoredGroupRecordIndex {
@@ -107,6 +121,36 @@ export class GroupOutboxService {
     }
 
     const meta = await this.getMeta();
+
+    // Optimistic concurrency: when the caller supplies an expected
+    // previous roster version or commit message id, the server
+    // compares against the last-known values from prior membership
+    // operations. A mismatch means another writer raced ahead and
+    // the caller must re-sync before retrying.
+    // Per PROTOCOL_GROUP_CN.md §5.2 the server only checks linear
+    // write conflicts; signature verification remains the
+    // receiver's responsibility.
+    if (input.expectedPreviousRosterVersion !== undefined) {
+      const storedRosterVersion = meta.currentRosterVersion ?? 0;
+      if (input.expectedPreviousRosterVersion !== storedRosterVersion) {
+        throw new HttpError(
+          409,
+          "roster_version_conflict",
+          `expected previous roster version ${input.expectedPreviousRosterVersion} but current is ${storedRosterVersion}`
+        );
+      }
+    }
+    if (input.expectedPreviousCommitMessageId !== undefined) {
+      const storedCommitMessageId = meta.lastCommitMessageId ?? "";
+      if (input.expectedPreviousCommitMessageId !== storedCommitMessageId) {
+        throw new HttpError(
+          409,
+          "roster_version_conflict",
+          `expected previous commit message id does not match current`
+        );
+      }
+    }
+
     const seq = meta.headSeq + 1;
     const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1000;
     const record: GroupOutboxRecord = {
@@ -145,8 +189,23 @@ export class GroupOutboxService {
       });
     }
 
+    // Advance the server-tracked roster version and commit chain when
+    // the envelope carries a membership proof. The proof's
+    // newRosterVersion and commitMessageId become the canonical
+    // reference for the next optimistic-concurrency check.
+    let nextMeta = { ...meta, headSeq: seq };
+    const proof = input.envelope.membershipProof;
+    if (proof && proof.type === "membership_signature") {
+      if (typeof proof.newRosterVersion === "number") {
+        nextMeta.currentRosterVersion = proof.newRosterVersion;
+      }
+      if (typeof proof.commitMessageId === "string" && proof.commitMessageId.length > 0) {
+        nextMeta.lastCommitMessageId = proof.commitMessageId;
+      }
+    }
+
     await this.state.put(`${IDEMPOTENCY_PREFIX}${record.messageId}`, seq);
-    await this.state.put(META_KEY, { ...meta, headSeq: seq });
+    await this.state.put(META_KEY, nextMeta);
     await this.state.setAlarm(expiresAt);
 
     this.publish({ event: "group_head_updated", groupId: this.groupId, seq });
@@ -192,7 +251,11 @@ export class GroupOutboxService {
 
   async getHead(): Promise<GetGroupOutboxHeadResult> {
     const meta = await this.getMeta();
-    return { headSeq: meta.headSeq };
+    return {
+      headSeq: meta.headSeq,
+      currentRosterVersion: meta.currentRosterVersion,
+      lastCommitMessageId: meta.lastCommitMessageId
+    };
   }
 
   async createInvite(

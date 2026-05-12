@@ -69,6 +69,12 @@ export interface GroupMember {
   status: GroupMemberStatus;
 }
 
+export interface GroupMemberDevice {
+  userId: string;
+  deviceId: string;
+  status: GroupMemberStatus;
+}
+
 export interface GroupOutboxDescriptor {
   endpoint: string;
   subscribeEndpoint?: string;
@@ -82,6 +88,7 @@ export interface GroupManifest {
   ownerUserId: string;
   admins: string[];
   members: GroupMember[];
+  memberDevices?: GroupMemberDevice[];
   joinPolicy: GroupJoinPolicy;
   memberInvitePolicy: GroupMemberInvitePolicy;
   rosterVersion: number;
@@ -145,7 +152,21 @@ export interface GroupEnvelope {
   inlineCiphertext?: string;
   storageRefs?: StorageRef[];
   senderProof: SenderProof;
-  membershipProof?: SenderProof;
+  membershipProof?: GroupMembershipProof;
+}
+
+export interface GroupMembershipProof {
+  type: "membership_signature";
+  operation: string;
+  signerUserId: string;
+  signerDeviceId: string;
+  previousRosterVersion: number;
+  newRosterVersion: number;
+  previousCommitMessageId?: string;
+  commitMessageId: string;
+  controlMessageId: string;
+  newManifestSha256: string;
+  signature: string;
 }
 
 export interface GroupOutboxRecord {
@@ -177,6 +198,8 @@ export interface AppendGroupEnvelopeRequest {
   groupId: string;
   envelope: GroupEnvelope;
   capability: GroupCapability;
+  expectedPreviousRosterVersion?: number;
+  expectedPreviousCommitMessageId?: string;
 }
 
 export interface AppendGroupEnvelopeResult {
@@ -198,6 +221,8 @@ export interface FetchGroupOutboxResult {
 
 export interface GetGroupOutboxHeadResult {
   headSeq: number;
+  currentRosterVersion?: number;
+  lastCommitMessageId?: string;
 }
 
 export interface GetGroupOutboxHeadRequest {

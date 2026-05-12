@@ -6,7 +6,7 @@ use crate::conversation::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
-use crate::identity::IdentityManager;
+use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::mls_adapter::{
     CreateConversationArtifacts, IngestResult, MlsAdapter, PeerDeviceKeyPackage,
     RemoveMembersArtifacts,
@@ -15,14 +15,15 @@ use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCapabilityOperation,
     GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy,
-    GroupJoinRequest, GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberInvitePolicy,
-    GroupMemberStatus, GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord,
+    GroupJoinRequest, GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberDevice,
+    GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord,
     GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord, MessageType, MlsStateStatus,
     MlsStateSummary, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
     PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
+    PersistedPendingGroupMembershipTransition,
     PersistedGroupRealtimeSession, PersistedGroupState, PersistedLocalIdentity,
     PersistedMlsState, PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope,
     PersistedPendingAck, PersistedPendingBlobTransfer, PersistedRealtimeSession,
@@ -46,7 +47,7 @@ use crate::transport_contract::{
     SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signer, Verifier};
 use log;
 use sha2::{Digest, Sha256};
 
@@ -728,6 +729,16 @@ impl CoreEngine {
             } => self.set_contact_display_name(user_id, display_name),
             CoreCommand::DeleteContact { user_id } => self.delete_contact(user_id),
             CoreCommand::DissolveGroup { group_id } => self.dissolve_group(group_id),
+            CoreCommand::AddGroupMemberDevice {
+                group_id,
+                user_id,
+                device_id,
+            } => self.add_group_member_device(group_id, user_id, device_id),
+            CoreCommand::RemoveGroupMemberDevice {
+                group_id,
+                user_id,
+                device_id,
+            } => self.remove_group_member_device(group_id, user_id, device_id),
         }
     }
 
@@ -1876,6 +1887,11 @@ impl CoreEngine {
             device_id: local_identity.device_identity.device_id.clone(),
             status: DeviceStatusKind::Active,
         }];
+        let mut manifest_member_devices = vec![GroupMemberDevice {
+            user_id: local_identity.user_identity.user_id.clone(),
+            device_id: local_identity.device_identity.device_id.clone(),
+            status: GroupMemberStatus::Active,
+        }];
         for user_id in &member_user_ids {
             let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
             for device in bundle
@@ -1893,6 +1909,11 @@ impl CoreEngine {
                     user_id: user_id.clone(),
                     device_id: device.device_id.clone(),
                     status: DeviceStatusKind::Active,
+                });
+                manifest_member_devices.push(GroupMemberDevice {
+                    user_id: user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    status: GroupMemberStatus::Active,
                 });
             }
         }
@@ -1935,6 +1956,7 @@ impl CoreEngine {
             &title,
             &local_identity,
             &member_user_ids,
+            manifest_member_devices,
             summary.epoch,
             now,
         )?;
@@ -1946,6 +1968,7 @@ impl CoreEngine {
             local_role: Some(GroupRole::Owner),
             welcome_pickup: None,
             dissolved_at: None,
+            pending_membership_transition: None,
         };
         self.state
             .group_states
@@ -2437,7 +2460,8 @@ impl CoreEngine {
         self.state
             .mls_summaries
             .insert(group_state.conversation_id.clone(), summary);
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         if !manifest
             .members
             .iter()
@@ -2462,14 +2486,13 @@ impl CoreEngine {
                 conversation_id: group_state.conversation_id.clone(),
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
-                welcome_pickup: group_state.welcome_pickup,
+                welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
             },
         );
 
         let capability = self.group_capability(&group_id, role)?;
-        let membership_proof =
-            self.build_membership_proof(&group_id, manifest.roster_version, "approve_join")?;
         let mut commit = self.build_group_envelope(
             &group_id,
             &group_state.conversation_id,
@@ -2477,8 +2500,9 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             artifacts.commit_b64,
         )?;
-        commit.membership_proof = Some(membership_proof.clone());
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        manifest.last_commit_message_id = Some(commit.message_id.clone());
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
         let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
@@ -2495,8 +2519,29 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             control_payload.payload_b64,
         )?;
+        let membership_proof = self.build_membership_proof(
+            "approve_join",
+            &previous_manifest,
+            &manifest,
+            &commit.message_id,
+            &control.message_id,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
         self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
+            },
+        );
 
         let mut effects = vec![persist_effect(
             &self.state,
@@ -2642,7 +2687,8 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         let existing_ids: BTreeSet<String> = manifest
             .members
             .iter()
@@ -2707,13 +2753,12 @@ impl CoreEngine {
                 conversation_id: group_state.conversation_id.clone(),
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
-                welcome_pickup: group_state.welcome_pickup,
+                welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
-        let membership_proof =
-            self.build_membership_proof(&group_id, manifest.roster_version, "invite")?;
         let mut commit = self.build_group_envelope(
             &group_id,
             &group_state.conversation_id,
@@ -2721,8 +2766,9 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             artifacts.commit_b64,
         )?;
-        commit.membership_proof = Some(membership_proof.clone());
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        manifest.last_commit_message_id = Some(commit.message_id.clone());
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
         let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
@@ -2739,8 +2785,29 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             control_plaintext.payload_b64,
         )?;
+        let membership_proof = self.build_membership_proof(
+            "invite",
+            &previous_manifest,
+            &manifest,
+            &commit.message_id,
+            &control.message_id,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
         self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
+            },
+        );
         let mut effects = vec![persist_effect(
             &self.state,
             vec![
@@ -2835,7 +2902,8 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         let target_member = manifest
             .members
             .iter()
@@ -2891,13 +2959,12 @@ impl CoreEngine {
                 conversation_id: group_state.conversation_id.clone(),
                 manifest: manifest.clone(),
                 local_role: group_state.local_role,
-                welcome_pickup: group_state.welcome_pickup,
+                welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
-        let membership_proof =
-            self.build_membership_proof(&group_id, manifest.roster_version, "remove")?;
         let mut commit = self.build_group_envelope(
             &group_id,
             &group_state.conversation_id,
@@ -2905,8 +2972,9 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             artifacts.commit_b64,
         )?;
-        commit.membership_proof = Some(membership_proof.clone());
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        manifest.last_commit_message_id = Some(commit.message_id.clone());
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
         let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
@@ -2923,8 +2991,29 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             control_plaintext.payload_b64,
         )?;
+        let membership_proof = self.build_membership_proof(
+            "remove",
+            &previous_manifest,
+            &manifest,
+            &commit.message_id,
+            &control.message_id,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
         self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.state.group_states.insert(
+            group_id.clone(),
+            PersistedGroupState {
+                group_id: group_id.clone(),
+                conversation_id: group_state.conversation_id.clone(),
+                manifest: manifest.clone(),
+                local_role: group_state.local_role,
+                welcome_pickup: group_state.welcome_pickup.clone(),
+                dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
+            },
+        );
         let effects = vec![persist_effect(
             &self.state,
             vec![
@@ -3010,7 +3099,8 @@ impl CoreEngine {
             conversation.conversation.state = ConversationState::NeedsRebuild;
             conversation.recovery_status = RecoveryStatus::NeedsRebuild;
         }
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         for member in &mut manifest.members {
             if member.user_id == local_identity.user_identity.user_id {
                 member.status = GroupMemberStatus::Left;
@@ -3032,6 +3122,7 @@ impl CoreEngine {
                 local_role: None,
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition,
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -3097,7 +3188,8 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         let new_owner = manifest
             .members
             .iter()
@@ -3142,15 +3234,20 @@ impl CoreEngine {
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .encrypt_application(&group_state.conversation_id, &metadata_payload)?;
-        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
-        let membership_proof =
-            self.build_membership_proof(&group_id, manifest.roster_version, "transfer_ownership")?;
         let mut envelope = self.build_group_envelope(
             &group_id,
             &group_state.conversation_id,
             GroupMessageType::ControlGroupMetadataUpdated,
             GroupEnvelopeVisibility::Visible,
             metadata_ciphertext.payload_b64,
+        )?;
+        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
+        let membership_proof = self.build_membership_proof(
+            "transfer_ownership",
+            &previous_manifest,
+            &manifest,
+            &envelope.message_id,
+            &envelope.message_id,
         )?;
         envelope.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(envelope.clone(), capability.clone(), None);
@@ -3163,6 +3260,7 @@ impl CoreEngine {
                 local_role: Some(GroupRole::Admin),
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -3215,7 +3313,8 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         let target = manifest
             .members
             .iter_mut()
@@ -3260,6 +3359,7 @@ impl CoreEngine {
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -3271,15 +3371,20 @@ impl CoreEngine {
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .encrypt_application(&group_state.conversation_id, &metadata_payload)?;
-        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
-        let membership_proof =
-            self.build_membership_proof(&group_id, manifest.roster_version, "set_admin")?;
         let mut envelope = self.build_group_envelope(
             &group_id,
             &group_state.conversation_id,
             GroupMessageType::ControlGroupMetadataUpdated,
             GroupEnvelopeVisibility::Visible,
             metadata_ciphertext.payload_b64,
+        )?;
+        let capability = self.group_capability(&group_id, GroupRole::Owner)?;
+        let membership_proof = self.build_membership_proof(
+            "set_admin",
+            &previous_manifest,
+            &manifest,
+            &envelope.message_id,
+            &envelope.message_id,
         )?;
         envelope.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(envelope.clone(), capability, None);
@@ -3330,7 +3435,8 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         let mut changed = false;
         if let Some(new_title) = title {
             let new_title = new_title.trim().to_string();
@@ -3380,6 +3486,7 @@ impl CoreEngine {
                 local_role: group_state.local_role,
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
+                pending_membership_transition: group_state.pending_membership_transition.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -3392,15 +3499,6 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .encrypt_application(&group_state.conversation_id, &metadata_payload)?;
         let capability = self.group_capability(&group_id, role)?;
-        let membership_proof = if matches!(role, GroupRole::Owner | GroupRole::Admin) {
-            Some(self.build_membership_proof(
-                &group_id,
-                manifest.roster_version,
-                "update_metadata",
-            )?)
-        } else {
-            None
-        };
         let mut envelope = self.build_group_envelope(
             &group_id,
             &group_state.conversation_id,
@@ -3408,9 +3506,13 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Visible,
             metadata_ciphertext.payload_b64,
         )?;
-        if let Some(proof) = membership_proof {
-            envelope.membership_proof = Some(proof);
-        }
+        envelope.membership_proof = Some(self.build_membership_proof(
+            "update_metadata",
+            &previous_manifest,
+            &manifest,
+            &envelope.message_id,
+            &envelope.message_id,
+        )?);
         self.enqueue_group_envelope(envelope.clone(), capability, None);
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
@@ -5114,6 +5216,7 @@ impl CoreEngine {
         title: &str,
         identity: &crate::identity::LocalIdentityState,
         member_user_ids: &[String],
+        member_devices: Vec<GroupMemberDevice>,
         epoch: u64,
         now: u64,
     ) -> CoreResult<GroupManifest> {
@@ -5140,11 +5243,7 @@ impl CoreEngine {
             endpoint: messages_endpoint,
             subscribe_endpoint,
         };
-        let signature_payload = format!(
-            "group_manifest:{group_id}:{conversation_id}:{title}:{}:{epoch}:{now}",
-            identity.user_identity.user_id
-        );
-        Ok(GroupManifest {
+        let mut manifest = GroupManifest {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             group_id: group_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -5152,6 +5251,7 @@ impl CoreEngine {
             owner_user_id: identity.user_identity.user_id.clone(),
             admins: Vec::new(),
             members,
+            member_devices,
             join_policy: GroupJoinPolicy::Closed,
             member_invite_policy: GroupMemberInvitePolicy::OwnerAdminOnly,
             roster_version: 1,
@@ -5161,8 +5261,10 @@ impl CoreEngine {
             updated_at: now,
             signer_user_id: identity.user_identity.user_id.clone(),
             signer_device_id: identity.device_identity.device_id.clone(),
-            signature: identity.sign_sender_proof(signature_payload.as_bytes()),
-        })
+            signature: String::new(),
+        };
+        manifest.signature = identity.sign_sender_proof(&Self::manifest_signing_payload(&manifest)?);
+        Ok(manifest)
     }
 
     fn build_group_envelope(
@@ -5273,16 +5375,89 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
             .clone();
-        Ok(identity.sign_sender_proof(
-            format!(
-                "group_manifest:{}:{}:{}:{}",
-                manifest.group_id,
-                manifest.conversation_id,
-                manifest.roster_version,
-                manifest.updated_at
-            )
-            .as_bytes(),
-        ))
+        Ok(identity.sign_sender_proof(&Self::manifest_signing_payload(manifest)?))
+    }
+
+    fn manifest_signing_payload(manifest: &GroupManifest) -> CoreResult<Vec<u8>> {
+        let mut unsigned = manifest.clone();
+        unsigned.signature.clear();
+        let encoded = serde_json::to_vec(&unsigned).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest signing payload: {error}"))
+        })?;
+        let mut payload = b"tapchat.group_manifest.v1\n".to_vec();
+        payload.extend(encoded);
+        Ok(payload)
+    }
+
+    fn manifest_sha256(manifest: &GroupManifest) -> CoreResult<String> {
+        let mut unsigned = manifest.clone();
+        unsigned.signature.clear();
+        let encoded = serde_json::to_vec(&unsigned).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest hash payload: {error}"))
+        })?;
+        Ok(hex_lower(&Sha256::digest(encoded)))
+    }
+
+    fn membership_proof_payload(proof: &GroupMembershipProof) -> Vec<u8> {
+        format!(
+            "tapchat.group.membership.v1\nproof_type={}\noperation={}\nsigner_user_id={}\nsigner_device_id={}\nprevious_roster_version={}\nnew_roster_version={}\nprevious_commit_message_id={}\ncommit_message_id={}\ncontrol_message_id={}\nnew_manifest_sha256={}",
+            proof.proof_type,
+            proof.operation,
+            proof.signer_user_id,
+            proof.signer_device_id,
+            proof.previous_roster_version,
+            proof.new_roster_version,
+            proof.previous_commit_message_id.as_deref().unwrap_or(""),
+            proof.commit_message_id,
+            proof.control_message_id,
+            proof.new_manifest_sha256,
+        )
+        .into_bytes()
+    }
+
+    fn verify_device_signature(
+        &self,
+        signer_user_id: &str,
+        signer_device_id: &str,
+        payload: &[u8],
+        signature_hex: &str,
+    ) -> CoreResult<()> {
+        let bundle = if self
+            .state
+            .local_identity
+            .as_ref()
+            .is_some_and(|identity| identity.user_identity.user_id == signer_user_id)
+        {
+            self.state.local_bundle.as_ref()
+        } else {
+            self.state
+                .contacts
+                .get(signer_user_id)
+                .map(|contact| &contact.bundle)
+        }
+        .ok_or_else(|| CoreError::invalid_input("signer identity bundle is missing"))?;
+        let device = bundle
+            .devices
+            .iter()
+            .find(|device| {
+                device.device_id == signer_device_id
+                    && matches!(device.status, DeviceStatusKind::Active)
+            })
+            .ok_or_else(|| CoreError::invalid_input("signer device is not active"))?;
+        let verifying_key = parse_verifying_key(&device.device_public_key)?;
+        let signature = parse_signature(signature_hex)?;
+        verifying_key
+            .verify(payload, &signature)
+            .map_err(|_| CoreError::invalid_input("device signature mismatch"))
+    }
+
+    fn verify_manifest_signature(&self, manifest: &GroupManifest) -> CoreResult<()> {
+        self.verify_device_signature(
+            &manifest.signer_user_id,
+            &manifest.signer_device_id,
+            &Self::manifest_signing_payload(manifest)?,
+            &manifest.signature,
+        )
     }
 
     fn local_identity_user_id(&self) -> CoreResult<String> {
@@ -5309,21 +5484,33 @@ impl CoreEngine {
 
     fn build_membership_proof(
         &self,
-        group_id: &str,
-        roster_version: u64,
         operation: &str,
-    ) -> CoreResult<SenderProof> {
+        previous: &GroupManifest,
+        updated: &GroupManifest,
+        commit_message_id: &str,
+        control_message_id: &str,
+    ) -> CoreResult<GroupMembershipProof> {
         let identity = self
             .state
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        Ok(SenderProof {
+        let mut proof = GroupMembershipProof {
             proof_type: "membership_signature".into(),
-            value: identity.sign_sender_proof(
-                format!("membership_proof:{group_id}:{roster_version}:{operation}").as_bytes(),
-            ),
-        })
+            operation: operation.to_string(),
+            signer_user_id: identity.user_identity.user_id.clone(),
+            signer_device_id: identity.device_identity.device_id.clone(),
+            previous_roster_version: previous.roster_version,
+            new_roster_version: updated.roster_version,
+            previous_commit_message_id: previous.last_commit_message_id.clone(),
+            commit_message_id: commit_message_id.to_string(),
+            control_message_id: control_message_id.to_string(),
+            new_manifest_sha256: Self::manifest_sha256(updated)?,
+            signature: String::new(),
+        };
+        proof.signature = identity.sign_sender_proof(&Self::membership_proof_payload(&proof));
+        proof.validate()?;
+        Ok(proof)
     }
 
     fn apply_membership_change_to_manifest(
@@ -5402,7 +5589,7 @@ impl CoreEngine {
         &self,
         envelope: &GroupEnvelope,
         manifest: &GroupManifest,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<GroupMembershipProof> {
         let sender_role = manifest
             .members
             .iter()
@@ -5422,17 +5609,55 @@ impl CoreEngine {
         let proof = envelope.membership_proof.as_ref().ok_or_else(|| {
             CoreError::invalid_input("membership operation requires membership_proof")
         })?;
-        if proof.proof_type != "membership_signature" {
+        proof.validate()?;
+        if proof.signer_user_id != envelope.sender_user_id
+            || proof.signer_device_id != envelope.sender_device_id
+        {
             return Err(CoreError::invalid_input(
-                "membership_proof type must be membership_signature",
+                "membership proof signer must match envelope sender",
             ));
         }
-        if proof.value.trim().is_empty() {
+        if proof.previous_roster_version != manifest.roster_version {
             return Err(CoreError::invalid_input(
-                "membership_proof value must not be empty",
+                "membership proof previous roster_version does not match local manifest",
             ));
         }
-        Ok(())
+        if proof.previous_commit_message_id != manifest.last_commit_message_id {
+            return Err(CoreError::invalid_input(
+                "membership proof previous commit does not match local manifest",
+            ));
+        }
+        match envelope.message_type {
+            GroupMessageType::MlsCommit => {
+                if proof.commit_message_id != envelope.message_id {
+                    return Err(CoreError::invalid_input(
+                        "membership commit proof does not reference this commit",
+                    ));
+                }
+                if proof.control_message_id.trim().is_empty() {
+                    return Err(CoreError::invalid_input(
+                        "membership commit proof must reference a control message",
+                    ));
+                }
+            }
+            GroupMessageType::ControlGroupMembershipChanged
+            | GroupMessageType::ControlGroupMetadataUpdated
+            | GroupMessageType::ControlGroupDissolved => {
+                if proof.control_message_id != envelope.message_id {
+                    return Err(CoreError::invalid_input(
+                        "membership control proof does not reference this control message",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        self.verify_device_signature(
+            &proof.signer_user_id,
+            &proof.signer_device_id,
+            &Self::membership_proof_payload(proof),
+            &proof.signature,
+        )?;
+        Ok(proof.clone())
     }
 
     fn try_apply_control_manifest_update(
@@ -5476,6 +5701,20 @@ impl CoreEngine {
         if updated.group_id != group_id {
             return false;
         }
+        if let Some(pending) = &current_state.pending_membership_transition {
+            if pending.control_message_id != record.envelope.message_id {
+                log::warn!(
+                    "rejected manifest control for group {group_id}: control id does not match pending membership transition"
+                );
+                return false;
+            }
+            if record.envelope.membership_proof.as_ref() != Some(&pending.proof) {
+                log::warn!(
+                    "rejected manifest control for group {group_id}: proof does not match pending membership transition"
+                );
+                return false;
+            }
+        }
         if updated.roster_version <= current_state.manifest.roster_version {
             log::warn!(
                 "rejected stale manifest update for group {group_id}: new roster_version {} is not newer than current {}",
@@ -5488,12 +5727,42 @@ impl CoreEngine {
             log::warn!("rejected invalid manifest update for group {group_id}: {err}");
             return false;
         }
+        if let Some(proof) = record.envelope.membership_proof.as_ref() {
+            let manifest_hash = match Self::manifest_sha256(&updated) {
+                Ok(hash) => hash,
+                Err(err) => {
+                    log::warn!("failed to hash manifest update for group {group_id}: {err}");
+                    return false;
+                }
+            };
+            let commit_matches = if record.envelope.message_type
+                == GroupMessageType::ControlGroupMembershipChanged
+            {
+                updated.last_commit_message_id.as_ref() == Some(&proof.commit_message_id)
+            } else {
+                true
+            };
+            if manifest_hash != proof.new_manifest_sha256
+                || updated.roster_version != proof.new_roster_version
+                || current_state.manifest.roster_version != proof.previous_roster_version
+                || !commit_matches
+            {
+                log::warn!(
+                    "rejected manifest update for group {group_id}: manifest transition does not match proof"
+                );
+                return false;
+            }
+        }
         if !Self::validate_manifest_transition(&current_state.manifest, &updated) {
             log::warn!(
                 "rejected invalid manifest transition for group {group_id} at roster_version {} -> {}",
                 current_state.manifest.roster_version,
                 updated.roster_version
             );
+            return false;
+        }
+        if let Err(err) = self.verify_manifest_signature(&updated) {
+            log::warn!("rejected manifest update with invalid signature for group {group_id}: {err}");
             return false;
         }
         let local_user_id = self
@@ -5517,6 +5786,7 @@ impl CoreEngine {
                 local_role: updated_local_role,
                 welcome_pickup: current_state.welcome_pickup.clone(),
                 dissolved_at: current_state.dissolved_at,
+                pending_membership_transition: None,
             },
         );
         let _ = self.sync_conversation_members_from_manifest(conversation_id, &updated);
@@ -5712,6 +5982,11 @@ impl CoreEngine {
         // Active).
         if group_state.dissolved_at.is_some() {
             return Err(CoreError::invalid_input("group is dissolved"));
+        }
+        if group_state.pending_membership_transition.is_some() {
+            return Err(CoreError::temporary_failure(
+                "group has a pending membership transition; send is blocked until manifest control is verified",
+            ));
         }
         let Some(local_role) = group_state.local_role else {
             return Err(CoreError::invalid_input("local group member is not active"));
@@ -6219,12 +6494,24 @@ impl CoreEngine {
             }
             let item = self.state.pending_group_outbox[index].clone();
             self.state.pending_group_outbox[index].in_flight = true;
+            let expected_previous_roster_version = item
+                .envelope
+                .membership_proof
+                .as_ref()
+                .map(|proof| proof.previous_roster_version);
+            let expected_previous_commit_message_id = item
+                .envelope
+                .membership_proof
+                .as_ref()
+                .and_then(|proof| proof.previous_commit_message_id.clone());
             effects.push(CoreEffect::AppendGroupEnvelope {
                 append: AppendGroupEnvelopeRequest {
                     version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                     group_id: item.envelope.group_id.clone(),
                     envelope: item.envelope,
                     capability: item.capability,
+                    expected_previous_roster_version,
+                    expected_previous_commit_message_id,
                 },
             });
         }
@@ -8257,11 +8544,14 @@ impl CoreEngine {
                 GroupMessageType::MlsCommit
                     | GroupMessageType::ControlGroupMembershipChanged
                     | GroupMessageType::ControlGroupMetadataUpdated
+                    | GroupMessageType::ControlGroupDissolved
             );
-            if is_membership_operation {
-                if let Err(err) = self
+            let membership_proof = if is_membership_operation {
+                match self
                     .verify_membership_operation_authority(&record.envelope, &group_state.manifest)
                 {
+                    Ok(proof) => Some(proof),
+                    Err(err) => {
                     log::warn!(
                         "rejected membership operation from {} ({}) in group {}: {err}",
                         record.envelope.sender_user_id,
@@ -8270,7 +8560,10 @@ impl CoreEngine {
                     );
                     continue;
                 }
-            }
+                }
+            } else {
+                None
+            };
             let message_type = group_message_type_to_direct(record.envelope.message_type);
             if matches!(
                 record.envelope.message_type,
@@ -8305,12 +8598,26 @@ impl CoreEngine {
                             message_type,
                             String::from_utf8(application.plaintext).ok(),
                         )?,
-                    IngestResult::AppliedCommit { .. } => self.store_group_record_message(
-                        &conversation_id,
-                        &record,
-                        message_type,
-                        None,
-                    )?,
+                    IngestResult::AppliedCommit { .. } => {
+                        if let Some(proof) = membership_proof.clone() {
+                            let mut state = self
+                                .state
+                                .group_states
+                                .get(&group_id)
+                                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                                .clone();
+                            state.pending_membership_transition =
+                                Some(PersistedPendingGroupMembershipTransition {
+                                    group_id: group_id.clone(),
+                                    conversation_id: conversation_id.clone(),
+                                    commit_message_id: record.envelope.message_id.clone(),
+                                    control_message_id: proof.control_message_id.clone(),
+                                    proof,
+                                });
+                            self.state.group_states.insert(group_id.clone(), state);
+                        }
+                        self.store_group_record_message(&conversation_id, &record, message_type, None)?
+                    }
                     IngestResult::PendingRetry => {
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
                         continue;
@@ -8665,7 +8972,8 @@ impl CoreEngine {
         // their MLS devices in a single commit so receivers observe a single
         // epoch bump (PROTOCOL_GROUP_CN.md §10.4 non-goal: avoid N-epoch
         // staircase).
-        let mut manifest = group_state.manifest.clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
         let target_user_ids: Vec<String> = manifest
             .members
             .iter()
@@ -8754,6 +9062,7 @@ impl CoreEngine {
                 // never flag the group as dissolved locally before the
                 // server-side seal is in effect.
                 dissolved_at: None,
+                pending_membership_transition: None,
             },
         );
 
@@ -8761,8 +9070,6 @@ impl CoreEngine {
         // `group_capability_operations`). We reuse it for both the commit
         // and the control envelope — the append capability is a superset.
         let capability = self.group_capability(&group_id, role)?;
-        let membership_proof =
-            self.build_membership_proof(&group_id, manifest.roster_version, "dissolve")?;
         let mut persist_ops: Vec<PersistOp> = vec![
             PersistOp::SaveGroupState {
                 group_id: group_id.clone(),
@@ -8772,33 +9079,42 @@ impl CoreEngine {
             },
         ];
         let mut messages: Vec<MessageSummary> = Vec::new();
-        if let Some(artifacts) = artifacts {
-            let mut commit = self.build_group_envelope(
+
+        // Build any MLS commit envelope first so its message_id can be
+        // referenced by the membership proof and manifest chain.
+        let commit_message_id: Option<String> = if let Some(artifacts) = artifacts {
+            let commit = self.build_group_envelope(
                 &group_id,
                 &group_state.conversation_id,
                 GroupMessageType::MlsCommit,
                 GroupEnvelopeVisibility::Protocol,
                 artifacts.commit_b64,
             )?;
-            commit.membership_proof = Some(membership_proof.clone());
             let commit_message_id = commit.message_id.clone();
+            // A staged commit envelope does not yet carry a membership proof;
+            // it will be patched below once the proof is constructed.
             self.enqueue_group_envelope(commit, capability.clone(), None);
             persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
                 message_id: commit_message_id.clone(),
             });
             messages.push(MessageSummary {
                 conversation_id: group_state.conversation_id.clone(),
-                message_id: commit_message_id,
+                message_id: commit_message_id.clone(),
                 message_type: MessageType::MlsCommit,
             });
-        }
+            Some(commit_message_id)
+        } else {
+            None
+        };
 
-        // Step (b): visible `ControlGroupDissolved` control message. The
-        // payload is the final (all-removed) manifest so every receiving
-        // client can render a single "group dissolved" banner by reading
-        // `message_type = control_group_dissolved` and showing a localized
-        // string (the Desktop UI locks the text to
-        // "This group has been dissolved by the owner." per R3.6).
+        // Wire the commit message into the manifest chain before signing.
+        if let Some(ref commit_id) = commit_message_id {
+            manifest.last_commit_message_id = Some(commit_id.clone());
+        }
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+
+        // Step (b): visible `ControlGroupDissolved` control message.
         let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
@@ -8815,8 +9131,28 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Visible,
             control_plaintext.payload_b64,
         )?;
-        control.membership_proof = Some(membership_proof);
         let control_message_id = control.message_id.clone();
+
+        let membership_proof = self.build_membership_proof(
+            "dissolve",
+            &previous_manifest,
+            &manifest,
+            commit_message_id.as_deref().unwrap_or(&control_message_id),
+            &control_message_id,
+        )?;
+        // Patch the already-enqueued commit with its proof.
+        if let Some(ref commit_id) = commit_message_id {
+            if let Some(item) = self
+                .state
+                .pending_group_outbox
+                .iter_mut()
+                .rev()
+                .find(|item| item.envelope.message_id == *commit_id)
+            {
+                item.envelope.membership_proof = Some(membership_proof.clone());
+            }
+        }
+        control.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(control, capability.clone(), None);
         persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
             message_id: control_message_id.clone(),
@@ -8852,6 +9188,59 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         })
+    }
+
+    /// Phase 8: register a new device in an existing group.
+    ///
+    /// When a user provisions an additional device, every group the user
+    /// belongs to must learn about it. Depending on the group's MLS state
+    /// the core either issues an External Add (with a Welcome for the new
+    /// device) or signals that the existing group must be rebuilt. The
+    /// updated manifest is published as a `ControlGroupMembershipChanged`
+    /// message signed by the user's active owner/admin device.
+    fn add_group_member_device(
+        &mut self,
+        group_id: String,
+        user_id: String,
+        device_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let local_user_id = self.local_identity_user_id()?;
+        if user_id != local_user_id {
+            return Err(CoreError::invalid_input(
+                "add_group_member_device may only add devices for the local user",
+            ));
+        }
+        let _ = device_id;
+        let _ = group_id;
+        Err(CoreError::invalid_input(
+            "add_group_member_device is not yet implemented (Phase 8)",
+        ))
+    }
+
+    /// Phase 8: remove a decommissioned device from an existing group.
+    ///
+    /// When a user removes a device from their account the group must
+    /// advance its MLS epoch so the decommissioned device can no longer
+    /// decrypt future messages. The core generates an MLS Remove proposal
+    /// covering the target device, bumps the manifest roster version, and
+    /// publishes a `ControlGroupMembershipChanged` message.
+    fn remove_group_member_device(
+        &mut self,
+        group_id: String,
+        user_id: String,
+        device_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let local_user_id = self.local_identity_user_id()?;
+        if user_id != local_user_id {
+            return Err(CoreError::invalid_input(
+                "remove_group_member_device may only remove devices for the local user",
+            ));
+        }
+        let _ = device_id;
+        let _ = group_id;
+        Err(CoreError::invalid_input(
+            "remove_group_member_device is not yet implemented (Phase 8)",
+        ))
     }
 
     /// Handle `CoreEvent::GroupOutboxSealed` — step (d) of `DissolveGroup`.
@@ -9109,6 +9498,7 @@ impl CoreEngine {
                     local_role,
                     welcome_pickup: Some(descriptor.clone()),
                     dissolved_at: None,
+                    pending_membership_transition: None,
                 },
             );
         }

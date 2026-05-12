@@ -8,8 +8,8 @@ use crate::identity::LocalIdentityState;
 use crate::mls_adapter::PublishedKeyPackage;
 use crate::model::{
     Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
-    GroupInviteDocument, GroupJoinRequest, GroupManifest, GroupRole, IdentityBundle,
-    MlsStateSummary, WelcomePickupDescriptor,
+    GroupInviteDocument, GroupJoinRequest, GroupManifest, GroupMembershipProof, GroupRole,
+    IdentityBundle, MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{PrepareBlobUploadResult, SealGroupOutboxRequest};
@@ -80,6 +80,17 @@ pub struct PersistedGroupState {
     pub welcome_pickup: Option<WelcomePickupDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dissolved_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_membership_transition: Option<PersistedPendingGroupMembershipTransition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedPendingGroupMembershipTransition {
+    pub group_id: String,
+    pub conversation_id: String,
+    pub commit_message_id: String,
+    pub control_message_id: String,
+    pub proof: GroupMembershipProof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

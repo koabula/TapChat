@@ -103,6 +103,18 @@ pub struct AppendGroupEnvelopeRequest {
     pub group_id: String,
     pub envelope: GroupEnvelope,
     pub capability: GroupCapability,
+    #[serde(
+        default,
+        alias = "expected_previous_roster_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_previous_roster_version: Option<u64>,
+    #[serde(
+        default,
+        alias = "expected_previous_commit_message_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expected_previous_commit_message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,8 +144,22 @@ pub struct GetGroupOutboxHeadRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetGroupOutboxHeadResult {
+    #[serde(alias = "head_seq")]
     pub head_seq: u64,
+    #[serde(
+        default,
+        alias = "current_roster_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub current_roster_version: Option<u64>,
+    #[serde(
+        default,
+        alias = "last_commit_message_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_commit_message_id: Option<String>,
 }
 
 /// Owner-signed request to seal a group outbox, rendering all subsequent

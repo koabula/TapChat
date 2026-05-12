@@ -591,6 +591,23 @@ impl Validate for GroupMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupMemberDevice {
+    #[serde(alias = "user_id")]
+    pub user_id: String,
+    #[serde(alias = "device_id")]
+    pub device_id: String,
+    pub status: GroupMemberStatus,
+}
+
+impl Validate for GroupMemberDevice {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("user_id", &self.user_id)?;
+        validate_required("device_id", &self.device_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GroupOutboxDescriptor {
     pub endpoint: String,
     #[serde(
@@ -624,6 +641,8 @@ pub struct GroupManifest {
     pub owner_user_id: String,
     pub admins: Vec<String>,
     pub members: Vec<GroupMember>,
+    #[serde(default, alias = "member_devices", skip_serializing_if = "Vec::is_empty")]
+    pub member_devices: Vec<GroupMemberDevice>,
     #[serde(alias = "join_policy")]
     pub join_policy: GroupJoinPolicy,
     #[serde(alias = "member_invite_policy")]
@@ -664,6 +683,14 @@ impl Validate for GroupManifest {
         }
         for member in &self.members {
             member.validate()?;
+        }
+        for device in &self.member_devices {
+            device.validate()?;
+            if !self.members.iter().any(|member| member.user_id == device.user_id) {
+                return Err(CoreError::invalid_input(
+                    "group member device user_id must exist in members",
+                ));
+            }
         }
         let active_owner_count = self
             .members
@@ -775,6 +802,62 @@ pub enum GroupEnvelopeVisibility {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GroupMembershipProof {
+    #[serde(rename = "type", alias = "proof_type")]
+    pub proof_type: String,
+    pub operation: String,
+    #[serde(alias = "signer_user_id")]
+    pub signer_user_id: String,
+    #[serde(alias = "signer_device_id")]
+    pub signer_device_id: String,
+    #[serde(alias = "previous_roster_version")]
+    pub previous_roster_version: u64,
+    #[serde(alias = "new_roster_version")]
+    pub new_roster_version: u64,
+    #[serde(
+        default,
+        alias = "previous_commit_message_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub previous_commit_message_id: Option<String>,
+    #[serde(alias = "commit_message_id")]
+    pub commit_message_id: String,
+    #[serde(alias = "control_message_id")]
+    pub control_message_id: String,
+    #[serde(alias = "new_manifest_sha256")]
+    pub new_manifest_sha256: String,
+    pub signature: String,
+}
+
+impl Validate for GroupMembershipProof {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("type", &self.proof_type)?;
+        if self.proof_type != "membership_signature" {
+            return Err(CoreError::invalid_input(
+                "membership proof type must be membership_signature",
+            ));
+        }
+        validate_required("operation", &self.operation)?;
+        validate_required("signer_user_id", &self.signer_user_id)?;
+        validate_required("signer_device_id", &self.signer_device_id)?;
+        validate_required("commit_message_id", &self.commit_message_id)?;
+        validate_required("control_message_id", &self.control_message_id)?;
+        validate_required("new_manifest_sha256", &self.new_manifest_sha256)?;
+        validate_required("signature", &self.signature)?;
+        if self.new_roster_version != self.previous_roster_version.saturating_add(1) {
+            return Err(CoreError::invalid_input(
+                "membership proof roster_version must advance by one",
+            ));
+        }
+        if let Some(message_id) = &self.previous_commit_message_id {
+            validate_required("previous_commit_message_id", message_id)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GroupEnvelope {
     pub version: String,
     #[serde(alias = "message_id")]
@@ -807,7 +890,7 @@ pub struct GroupEnvelope {
         alias = "membership_proof",
         skip_serializing_if = "Option::is_none"
     )]
-    pub membership_proof: Option<SenderProof>,
+    pub membership_proof: Option<GroupMembershipProof>,
 }
 
 impl Validate for GroupEnvelope {
