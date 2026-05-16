@@ -465,12 +465,20 @@ pub async fn get_group_messages_impl(
                 // Protocol messages never surface in the chat UI.
             }
             tapchat_core::model::MessageType::ControlConversationNeedsRebuild => {
-                // Visible rebuild banner (R3.3 control surfaces).
+                let is_dissolved = message.plaintext.as_deref() == Some("control_group_dissolved");
                 out.push(GroupMessageView::SystemBanner {
                     message_id: message.message_id.clone(),
                     created_at: message.created_at,
-                    text: system_banner_text(GroupMessageType::ControlConversationNeedsRebuild),
-                    raw_message_type: "control_conversation_needs_rebuild".into(),
+                    text: if is_dissolved {
+                        system_banner_text(GroupMessageType::ControlGroupDissolved)
+                    } else {
+                        system_banner_text(GroupMessageType::ControlConversationNeedsRebuild)
+                    },
+                    raw_message_type: if is_dissolved {
+                        "control_group_dissolved".into()
+                    } else {
+                        "control_conversation_needs_rebuild".into()
+                    },
                 });
             }
         }

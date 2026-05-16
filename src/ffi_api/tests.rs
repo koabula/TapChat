@@ -1321,11 +1321,7 @@ mod tests {
                 if append.envelope.message_type == GroupMessageType::ControlGroupMembershipChanged
         )));
         harness.drain(&mut alice, remove_output);
-
         harness.sync_group(&mut bob, &group_id);
-        // The sender must sync to process the matching control message
-        // and clear the pending membership transition before sending.
-        harness.sync_group(&mut alice, &group_id);
         harness.send_text(&mut alice, &conversation_id, "after remove from alice");
         harness.sync_group(&mut bob, &group_id);
         harness.send_text(&mut bob, &conversation_id, "after remove from bob");
@@ -4091,9 +4087,9 @@ mod tests {
 
         fn drain(&mut self, user: &mut HarnessUser, output: CoreOutput) -> CoreOutput {
             let mut aggregate = CoreOutput::default();
-            let mut queue = output.effects;
+            let mut queue: std::collections::VecDeque<_> = output.effects.into();
             aggregate.view_model = output.view_model;
-            while let Some(effect) = queue.pop() {
+            while let Some(effect) = queue.pop_front() {
                 let next = match effect {
                     CoreEffect::AppendGroupEnvelope { append } => {
                         let seq = self
@@ -5054,7 +5050,8 @@ mod tests {
             })
             .expect_err("cannot add another user's device");
         assert!(
-            err.to_string().contains("only add devices for the local user"),
+            err.to_string()
+                .contains("only add devices for the local user"),
             "expected local-user-only rejection, got: {err}"
         );
     }
@@ -5189,7 +5186,8 @@ mod tests {
             })
             .expect_err("cannot remove another user's device");
         assert!(
-            err.to_string().contains("may only remove devices for the local user"),
+            err.to_string()
+                .contains("may only remove devices for the local user"),
             "expected local-user-only rejection, got: {err}"
         );
     }
@@ -5251,5 +5249,312 @@ mod tests {
         assert!(json.contains("sync_groups_for_new_device"));
         let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, cmd);
+    }
+
+    // Security: verify_membership_operation_authority rejection paths.
+
+    fn fake_proof(
+        signer_user_id: &str,
+        signer_device_id: &str,
+        operation: &str,
+        previous_roster_version: u64,
+        new_roster_version: u64,
+        previous_commit_message_id: Option<&str>,
+        commit_message_id: &str,
+        control_message_id: &str,
+        new_manifest_sha256: &str,
+        signature: &str,
+    ) -> crate::model::GroupMembershipProof {
+        crate::model::GroupMembershipProof {
+            proof_type: "membership_signature".into(),
+            operation: operation.into(),
+            signer_user_id: signer_user_id.into(),
+            signer_device_id: signer_device_id.into(),
+            previous_roster_version,
+            new_roster_version,
+            previous_commit_message_id: previous_commit_message_id.map(|s| s.into()),
+            commit_message_id: commit_message_id.into(),
+            control_message_id: control_message_id.into(),
+            new_manifest_sha256: new_manifest_sha256.into(),
+            signature: signature.into(),
+        }
+    }
+
+    fn user_id(engine: &CoreEngine) -> String {
+        engine
+            .local_identity()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone()
+    }
+
+    fn device_id(engine: &CoreEngine) -> String {
+        engine.local_device_id().expect("device").to_string()
+    }
+
+    #[test]
+    fn membership_proof_roster_version_mismatch_is_rejected() {
+        let alice_bundle = sample_identity_bundle(ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        bob.engine
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: alice_bundle.clone(),
+            })
+            .expect("import alice");
+        let output = bob
+            .engine
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![alice_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+        let conversation_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .conversation_id
+            .clone();
+        let mut harness = GroupHarness::default();
+        harness.drain(&mut bob, output);
+        let roster = engine_state(&bob, &group_id).manifest.roster_version;
+
+        let forged = GroupEnvelope {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            message_id: "forged-roster-skip".into(),
+            group_id: group_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sender_user_id: user_id(&bob.engine),
+            sender_device_id: device_id(&bob.engine),
+            created_at: 99,
+            message_type: GroupMessageType::MlsCommit,
+            visibility: GroupEnvelopeVisibility::Protocol,
+            inline_ciphertext: Some("Zm9yZ2Vk".into()),
+            storage_refs: vec![],
+            sender_proof: SenderProof {
+                proof_type: "signature".into(),
+                value: "forged".into(),
+            },
+            membership_proof: Some(fake_proof(
+                &user_id(&bob.engine),
+                &device_id(&bob.engine),
+                "invite",
+                99,
+                100,
+                None,
+                "forged-roster-skip",
+                "forged-roster-ctrl",
+                "sha256:forged",
+                "forged",
+            )),
+        };
+        harness
+            .outboxes
+            .entry(group_id.clone())
+            .or_default()
+            .push(GroupOutboxRecord {
+                seq: 99,
+                group_id: group_id.clone(),
+                message_id: forged.message_id.clone(),
+                received_at: 99,
+                expires_at: None,
+                state: GroupOutboxRecordState::Available,
+                envelope: forged,
+            });
+        harness.sync_group(&mut bob, &group_id);
+        let roster_after = engine_state(&bob, &group_id).manifest.roster_version;
+        assert_eq!(
+            roster_after, roster,
+            "roster version must not change when proof with wrong previous version is synced"
+        );
+    }
+
+    #[test]
+    fn membership_proof_missing_on_control_is_rejected() {
+        let alice_bundle = sample_identity_bundle(ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        bob.engine
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: alice_bundle.clone(),
+            })
+            .expect("import alice");
+        let output = bob
+            .engine
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![alice_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+        let conversation_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .conversation_id
+            .clone();
+        let mut harness = GroupHarness::default();
+        harness.drain(&mut bob, output);
+        let roster_before = engine_state(&bob, &group_id).manifest.roster_version;
+
+        // A ControlGroupMembershipChanged without a membership_proof must
+        // be rejected.
+        let forged = GroupEnvelope {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            message_id: "forged-no-proof".into(),
+            group_id: group_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sender_user_id: user_id(&bob.engine),
+            sender_device_id: device_id(&bob.engine),
+            created_at: 99,
+            message_type: GroupMessageType::ControlGroupMembershipChanged,
+            visibility: GroupEnvelopeVisibility::Protocol,
+            inline_ciphertext: Some("Zm9yZ2Vk".into()),
+            storage_refs: vec![],
+            sender_proof: SenderProof {
+                proof_type: "signature".into(),
+                value: "forged".into(),
+            },
+            membership_proof: None,
+        };
+        harness
+            .outboxes
+            .entry(group_id.clone())
+            .or_default()
+            .push(GroupOutboxRecord {
+                seq: 99,
+                group_id: group_id.clone(),
+                message_id: forged.message_id.clone(),
+                received_at: 99,
+                expires_at: None,
+                state: GroupOutboxRecordState::Available,
+                envelope: forged,
+            });
+        harness.sync_group(&mut bob, &group_id);
+        let roster_after = engine_state(&bob, &group_id).manifest.roster_version;
+        assert_eq!(
+            roster_after, roster_before,
+            "roster version must not change when control without proof is synced"
+        );
+    }
+
+    #[test]
+    fn membership_proof_commit_message_chain_mismatch_is_rejected() {
+        let alice_bundle = sample_identity_bundle(ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        bob.engine
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: alice_bundle.clone(),
+            })
+            .expect("import alice");
+        let output = bob
+            .engine
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![alice_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+        let conversation_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .conversation_id
+            .clone();
+        let mut harness = GroupHarness::default();
+        harness.drain(&mut bob, output);
+        let state_before = engine_state(&bob, &group_id).clone();
+        let roster = state_before.manifest.roster_version;
+        let last_commit = state_before.manifest.last_commit_message_id.clone();
+
+        // Forged proof claims previous_commit_message_id = "nonexistent",
+        // which does not match the local manifest.
+        let forged = GroupEnvelope {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            message_id: "forged-chain-break".into(),
+            group_id: group_id.clone(),
+            conversation_id: conversation_id.clone(),
+            sender_user_id: user_id(&bob.engine),
+            sender_device_id: device_id(&bob.engine),
+            created_at: 99,
+            message_type: GroupMessageType::MlsCommit,
+            visibility: GroupEnvelopeVisibility::Protocol,
+            inline_ciphertext: Some("Zm9yZ2Vk".into()),
+            storage_refs: vec![],
+            sender_proof: SenderProof {
+                proof_type: "signature".into(),
+                value: "forged".into(),
+            },
+            membership_proof: Some(fake_proof(
+                &user_id(&bob.engine),
+                &device_id(&bob.engine),
+                "invite",
+                roster,
+                roster.saturating_add(1),
+                Some("nonexistent-commit-id"),
+                "forged-chain-break",
+                "forged-chain-ctrl",
+                "sha256:forged",
+                "forged",
+            )),
+        };
+        harness
+            .outboxes
+            .entry(group_id.clone())
+            .or_default()
+            .push(GroupOutboxRecord {
+                seq: 99,
+                group_id: group_id.clone(),
+                message_id: forged.message_id.clone(),
+                received_at: 99,
+                expires_at: None,
+                state: GroupOutboxRecordState::Available,
+                envelope: forged,
+            });
+        harness.sync_group(&mut bob, &group_id);
+        let state_after = engine_state(&bob, &group_id);
+        assert_eq!(
+            state_after.manifest.roster_version, roster,
+            "roster version must not change when proof with broken commit chain is synced"
+        );
+        assert_eq!(
+            state_after.manifest.last_commit_message_id, last_commit,
+            "last_commit_message_id must not change"
+        );
+    }
+
+    fn engine_state<'a>(
+        user: &'a HarnessUser,
+        group_id: &str,
+    ) -> &'a crate::persistence::PersistedGroupState {
+        user.engine
+            .state
+            .group_states
+            .get(group_id)
+            .expect("group state")
     }
 }
