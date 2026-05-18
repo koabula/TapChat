@@ -319,6 +319,16 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .filter(|item| item.envelope.message_type
+                    == MessageType::ControlGroupWelcomePickup)
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -262,20 +262,16 @@ export default function GroupMemberDrawer({
       </div>
 
       <footer className="p-3 border-t border-default space-y-2">
-        <button
-          className="btn btn-ghost w-full justify-start text-sm"
-          onClick={handleLeave}
-          disabled={!canLeave || busy !== null}
-          title={
-            !canLeave
-              ? dissolved
-                ? "You are no longer a member of this group."
-                : "Transfer ownership to another member before leaving."
-              : undefined
-          }
-        >
-          <LogOut size={16} /> Leave group
-        </button>
+        {!isOwner && (
+          <button
+            className="btn btn-ghost w-full justify-start text-sm"
+            onClick={handleLeave}
+            disabled={!canLeave || busy !== null}
+            title={!canLeave && dissolved ? "You are no longer a member of this group." : undefined}
+          >
+            <LogOut size={16} /> Leave group
+          </button>
+        )}
         {isOwner && canDissolve && (
           <button
             className="btn btn-danger w-full justify-start text-sm"

@@ -2,6 +2,7 @@
 //!
 //! Uses embedded minimal wrangler for OAuth login and REST API for deployment.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -9,6 +10,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use tapchat_core::cli::profile::RuntimeMetadata;
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
+use tapchat_core::cli::util::to_snake_case_json_string;
+use tapchat_core::model::DeploymentBundle;
+use tapchat_core::persistence::PersistedDeployment;
 use tapchat_core::CoreCommand;
 
 use crate::commands::cloudflare_rest::{
@@ -49,6 +53,158 @@ pub struct LoginResult {
     pub account_id: Option<String>,
     pub account_name: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudflareRuntimeStatus {
+    pub bound: bool,
+    pub endpoint: Option<String>,
+    pub features: Vec<String>,
+    pub supports_group_outbox: bool,
+    pub supports_welcome_pickup: bool,
+    pub needs_upgrade: bool,
+    pub last_error: Option<String>,
+}
+
+const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] =
+    &["group_outbox_mvp", "welcome_pickup_mvp", "message_requests"];
+
+fn status_from_features(
+    bound: bool,
+    endpoint: Option<String>,
+    features: Vec<String>,
+    last_error: Option<String>,
+) -> CloudflareRuntimeStatus {
+    let supports_group_outbox = features.iter().any(|feature| feature == "group_outbox_mvp");
+    let supports_welcome_pickup = features.iter().any(|feature| feature == "welcome_pickup_mvp");
+    let has_message_requests = features.iter().any(|feature| feature == "message_requests");
+    let needs_upgrade =
+        bound && !(supports_group_outbox && supports_welcome_pickup && has_message_requests);
+    CloudflareRuntimeStatus {
+        bound,
+        endpoint,
+        features,
+        supports_group_outbox,
+        supports_welcome_pickup,
+        needs_upgrade,
+        last_error,
+    }
+}
+
+pub async fn runtime_status_for_deployment(
+    deployment: Option<PersistedDeployment>,
+) -> CloudflareRuntimeStatus {
+    let Some(deployment) = deployment else {
+        return status_from_features(false, None, Vec::new(), None);
+    };
+    let endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
+    let local_features = deployment.deployment_bundle.runtime_config.features.clone();
+    let client = match reqwest::Client::builder().build() {
+        Ok(client) => client,
+        Err(error) => {
+            return status_from_features(
+                true,
+                Some(endpoint),
+                local_features,
+                Some(format!("failed to build runtime status client: {error}")),
+            );
+        }
+    };
+    let url = format!("{}/v1/deployment-bundle", endpoint.trim_end_matches('/'));
+    match client.get(url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return status_from_features(
+                    true,
+                    Some(endpoint),
+                    local_features,
+                    Some(format!("deployment bundle check returned HTTP {status}: {body}")),
+                );
+            }
+            let normalized = to_snake_case_json_string(&body).unwrap_or(body);
+            match serde_json::from_str::<DeploymentBundle>(&normalized) {
+                Ok(bundle) => status_from_features(
+                    true,
+                    Some(endpoint),
+                    bundle.runtime_config.features,
+                    None,
+                ),
+                Err(error) => status_from_features(
+                    true,
+                    Some(endpoint),
+                    local_features,
+                    Some(format!("deployment bundle parse failed: {error}")),
+                ),
+            }
+        }
+        Err(error) => status_from_features(
+            true,
+            Some(endpoint),
+            local_features,
+            Some(format!("deployment bundle check failed: {error}")),
+        ),
+    }
+}
+
+pub fn runtime_missing_group_outbox_message(status: &CloudflareRuntimeStatus) -> Option<String> {
+    if !status.bound {
+        return Some("runtime_missing_group_outbox: Cloudflare runtime is not deployed.".into());
+    }
+    if status.needs_upgrade {
+        let missing = REQUIRED_GROUP_RUNTIME_FEATURES
+            .iter()
+            .filter(|feature| !status.features.iter().any(|value| value == **feature))
+            .copied()
+            .collect::<Vec<_>>();
+        let suffix = if missing.is_empty() {
+            status
+                .last_error
+                .as_ref()
+                .map(|error| format!(" Runtime check failed: {error}"))
+                .unwrap_or_default()
+        } else {
+            format!(" Missing features: {}.", missing.join(", "))
+        };
+        return Some(format!(
+            "runtime_missing_group_outbox: Cloudflare runtime does not support group outbox. Upgrade runtime.{suffix}"
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{runtime_missing_group_outbox_message, status_from_features};
+
+    #[test]
+    fn runtime_status_requires_group_features_for_upgrade_clearance() {
+        let legacy = status_from_features(
+            true,
+            Some("https://example.worker.dev".into()),
+            vec!["generic_sync".into(), "message_requests".into()],
+            None,
+        );
+        assert!(legacy.needs_upgrade);
+        assert!(runtime_missing_group_outbox_message(&legacy)
+            .expect("upgrade message")
+            .contains("runtime_missing_group_outbox"));
+
+        let current = status_from_features(
+            true,
+            Some("https://example.worker.dev".into()),
+            vec![
+                "generic_sync".into(),
+                "message_requests".into(),
+                "group_outbox_mvp".into(),
+                "welcome_pickup_mvp".into(),
+            ],
+            None,
+        );
+        assert!(!current.needs_upgrade);
+        assert!(runtime_missing_group_outbox_message(&current).is_none());
+    }
 }
 
 /// Resolve embedded runtime root.
@@ -444,6 +600,30 @@ pub async fn cloudflare_deploy(
     .await
     .map_err(|e| format!("Import deployment failed: {}", e))?;
 
+    let pending_group_ids = {
+        let inner = state.inner.read().await;
+        inner
+            .engine
+            .refresh_snapshot()
+            .pending_group_outbox
+            .iter()
+            .map(|item| item.group_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    for group_id in pending_group_ids {
+        drive_core_with_handle(
+            &app,
+            CoreInput::Command(CoreCommand::SyncGroupOutbox {
+                group_id,
+                reason: Some("runtime_upgraded".into()),
+            }),
+        )
+        .await
+        .map_err(|e| format!("Retry pending group outbox failed: {}", e))?;
+    }
+
     // Save runtime metadata
     {
         let inner = state.inner.read().await;
@@ -542,13 +722,13 @@ fn load_oauth_token() -> Result<String, String> {
 
 /// Check deployment status
 #[tauri::command]
-pub async fn cloudflare_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn cloudflare_status(
+    state: State<'_, AppState>,
+) -> Result<CloudflareRuntimeStatus, String> {
     let inner = state.inner.read().await;
 
     let deployment = inner.engine.refresh_snapshot().deployment;
+    drop(inner);
 
-    Ok(serde_json::json!({
-        "bound": deployment.is_some(),
-        "endpoint": deployment.as_ref().map(|d| d.deployment_bundle.inbox_http_endpoint.clone())
-    }))
+    Ok(runtime_status_for_deployment(deployment).await)
 }

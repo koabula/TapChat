@@ -233,6 +233,9 @@ export interface MessageRequestItem {
   message_count: number;
   last_message_id: string;
   last_conversation_id: string;
+  request_kind?: "direct" | "group_invite";
+  group_id?: string;
+  group_title?: string;
 }
 
 // Message Request Action Output (matches Rust MessageRequestActionOutput)
@@ -316,11 +319,17 @@ export interface CloudflareProgressEvent {
   phase: string;
   message: string;
   progress: number;
+  progress_percent?: number;
 }
 
 export interface CloudflareStatus {
   bound: boolean;
-  endpoint?: string;
+  endpoint?: string | null;
+  features: string[];
+  supports_group_outbox: boolean;
+  supports_welcome_pickup: boolean;
+  needs_upgrade: boolean;
+  last_error?: string | null;
 }
 
 // Session

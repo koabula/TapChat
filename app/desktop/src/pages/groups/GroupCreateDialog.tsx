@@ -5,6 +5,10 @@ import { Users, Copy, Check, X, AlertCircle } from "lucide-react";
 
 import { useContactsStore } from "@/store/contacts";
 import {
+  cloudflareDeploy,
+  cloudflareLogin,
+  cloudflarePreflight,
+  cloudflareStatus,
   createGroupConversation,
   type CreateGroupConversationResult,
   type WelcomePickupShareable,
@@ -46,6 +50,8 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
   const [created, setCreated] = useState<CreateGroupConversationResult | null>(null);
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
   const [copyError, setCopyError] = useState<string | null>(null);
+  const [runtimeUpgradeRequired, setRuntimeUpgradeRequired] = useState(false);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
 
   // Reset the modal each time it opens so stale state does not leak
   // across invocations.
@@ -58,6 +64,8 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
       setCreated(null);
       setCopiedUrl(null);
       setCopyError(null);
+      setRuntimeUpgradeRequired(false);
+      setRuntimeBusy(false);
     }
   }, [open]);
 
@@ -88,9 +96,46 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
       );
       setCreated(result);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("runtime_missing_group_outbox")) {
+        setRuntimeUpgradeRequired(true);
+        setError("Cloudflare runtime needs an upgrade before group creation.");
+      } else {
+        setError(message);
+      }
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleRuntimeUpgrade = async () => {
+    setRuntimeBusy(true);
+    setError(null);
+    try {
+      const preflight = await cloudflarePreflight();
+      if (!preflight.ready) {
+        const login = await cloudflareLogin();
+        if (!login.success) {
+          setError(login.error || "Cloudflare login failed.");
+          return;
+        }
+      }
+      const deployed = await cloudflareDeploy();
+      if (!deployed.success) {
+        setError(deployed.error || "Cloudflare runtime upgrade failed.");
+        return;
+      }
+      const status = await cloudflareStatus();
+      if (status.needs_upgrade) {
+        setError(status.last_error || "Cloudflare runtime still needs an upgrade.");
+        return;
+      }
+      setRuntimeUpgradeRequired(false);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRuntimeBusy(false);
     }
   };
 
@@ -208,7 +253,18 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
                   className="flex items-start gap-2 p-3 rounded-lg bg-red-500/10 text-sm text-red-500"
                 >
                   <AlertCircle size={16} className="shrink-0 mt-0.5" />
-                  <div className="break-words">{error}</div>
+                  <div className="break-words">
+                    <div>{error}</div>
+                    {runtimeUpgradeRequired && (
+                      <button
+                        className="btn btn-primary mt-3"
+                        onClick={handleRuntimeUpgrade}
+                        disabled={runtimeBusy}
+                      >
+                        {runtimeBusy ? "Upgrading..." : "Upgrade Cloudflare runtime"}
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -250,6 +306,10 @@ function WelcomePickupSharing({
   return (
     <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
       <div className="p-4 space-y-3 flex-1 overflow-y-auto">
+        <p className="text-primary-color text-sm font-medium">
+          Invites sent. Invitees will see this group in Message Requests after
+          their inbox syncs.
+        </p>
         <p className="text-secondary-color text-sm">
           Share each welcome pickup URL with the matching device. The
           invitee imports the group by opening the URL in TapChat. These

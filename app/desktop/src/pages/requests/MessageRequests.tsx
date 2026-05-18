@@ -2,11 +2,17 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
-import { useMessageRequestsStore } from "@/store/requests";
-import { useConversationsStore } from "@/store/conversations";
+import { listGroupConversations } from "@/lib/tauri";
 import { useContactsStore } from "@/store/contacts";
+import { useConversationsStore } from "@/store/conversations";
+import { useMessageRequestsStore } from "@/store/requests";
 
-import type { ContactSummary, ConversationSummary, MessageRequestActionOutput } from "@/lib/types";
+import type {
+  ContactSummary,
+  ConversationSummary,
+  MessageRequestActionOutput,
+  MessageRequestItem,
+} from "@/lib/types";
 
 export default function MessageRequests() {
   const navigate = useNavigate();
@@ -19,15 +25,16 @@ export default function MessageRequests() {
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
 
-  // Sync from backend on mount
   useEffect(() => {
-    loadFromBackend();
+    void loadFromBackend();
   }, []);
 
   const loadFromBackend = async () => {
     setLoading(true);
     try {
-      const result = await invoke<{ view_model?: { message_requests?: typeof requests } }>("list_message_requests");
+      const result = await invoke<{
+        view_model?: { message_requests?: MessageRequestItem[] };
+      }>("list_message_requests");
       if (result.view_model?.message_requests) {
         useMessageRequestsStore.getState().setRequests(result.view_model.message_requests);
       }
@@ -46,21 +53,24 @@ export default function MessageRequests() {
     return `${Math.floor(hours / 24)}d ago`;
   };
 
-  const handleAction = async (requestId: string, action: "accept" | "reject") => {
+  const handleAction = async (
+    request: MessageRequestItem,
+    action: "accept" | "reject",
+  ) => {
+    const requestId = request.request_id;
     setActing(requestId);
     try {
-      const result = await invoke<MessageRequestActionOutput>("act_on_message_request", { requestId, action });
-
-      // Remove from local store immediately
+      const result = await invoke<MessageRequestActionOutput>("act_on_message_request", {
+        requestId,
+        action,
+      });
       removeRequest(requestId);
 
-      // If accepted and conversation was created, refresh conversations and contacts
       if (action === "accept" && result.accepted) {
         console.debug(
           `[MessageRequests] Accepted request requestId=${requestId} conversationAvailable=${Boolean(result.conversation_id)}`,
         );
 
-        // Refresh conversations to show the newly created conversation
         try {
           const contacts = await invoke<ContactSummary[]>("list_contacts");
           const contactsByUserId = new Map(
@@ -79,21 +89,25 @@ export default function MessageRequests() {
               user_id: contact.user_id,
               display_name: contact.display_name ?? null,
             })),
-            { markUnread: false },
+            { markUnread: false, replace: true },
           );
           console.debug(`[MessageRequests] Refreshed conversations count=${conversations.length}`);
 
-          // Refresh contacts
-          setContacts(contacts.map(c => ({
-            user_id: c.user_id,
-            display_name: c.display_name ?? null,
-            device_count: c.device_count,
-            last_refresh: null,
-          })));
+          setContacts(
+            contacts.map((contact) => ({
+              user_id: contact.user_id,
+              display_name: contact.display_name ?? null,
+              device_count: contact.device_count,
+              last_refresh: null,
+            })),
+          );
           console.debug(`[MessageRequests] Refreshed contacts count=${contacts.length}`);
 
-          // Navigate to the new conversation if one was created
-          if (result.conversation_id) {
+          if (request.request_kind === "group_invite" && request.group_id) {
+            const groups = await listGroupConversations();
+            const group = groups.find((summary) => summary.group_id === request.group_id);
+            navigate(group ? `/chat/${group.conversation_id}` : "/");
+          } else if (result.conversation_id) {
             navigate(`/chat/${result.conversation_id}`);
           } else {
             navigate("/");
@@ -105,8 +119,7 @@ export default function MessageRequests() {
       }
     } catch (err) {
       console.error(`[MessageRequests] Failed to ${action} request ${requestId}: ${String(err)}`);
-      // Reload from backend on error to restore state
-      loadFromBackend();
+      void loadFromBackend();
     } finally {
       setActing(null);
     }
@@ -115,24 +128,17 @@ export default function MessageRequests() {
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
       <div className="flex-1 flex min-h-0 flex-col">
-        {/* Header */}
         <header className="flex items-center p-3 border-b border-default">
-          <button
-            className="btn btn-ghost px-2"
-            onClick={() => navigate("/")}
-          >
-            ←
+          <button className="btn btn-ghost px-2" onClick={() => navigate("/")}>
+            Back
           </button>
           <h1 className="font-semibold text-primary-color ml-2">
             Message Requests ({requests.length})
           </h1>
         </header>
 
-        {/* Request list */}
         <div className="flex-1 overflow-y-auto overscroll-contain p-4">
-          {loading && (
-            <div className="text-center text-muted-color">Loading...</div>
-          )}
+          {loading && <div className="text-center text-muted-color">Loading...</div>}
 
           {!loading && requests.length === 0 && (
             <div className="text-center text-muted-color">
@@ -140,47 +146,54 @@ export default function MessageRequests() {
             </div>
           )}
 
-          {!loading && requests.map((req) => (
-            <div
-              key={req.request_id}
-              className="card mb-4"
-            >
-              <div className="flex items-center gap-3 mb-2">
-                <div className="avatar">
-                  <span>{req.sender_display_name?.[0] || "?"}</span>
+          {!loading &&
+            requests.map((req) => (
+              <div key={req.request_id} className="card mb-4">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="avatar">
+                    <span>{req.sender_display_name?.[0] || "?"}</span>
+                  </div>
+                  <div>
+                    <span className="text-primary-color">
+                      {req.sender_display_name || "Unknown"}
+                    </span>
+                    <span className="text-muted-color text-xs block truncate">
+                      {req.sender_user_id}
+                    </span>
+                  </div>
                 </div>
-                <div>
-                  <span className="text-primary-color">
-                    {req.sender_display_name || "Unknown"}
-                  </span>
-                  <span className="text-muted-color text-xs block truncate">
-                    {req.sender_user_id}
-                  </span>
+
+                <div className="text-secondary-color text-sm mb-2">
+                  {req.request_kind === "group_invite" ? (
+                    <>
+                      Group invite: {req.group_title || "Untitled group"} - First seen{" "}
+                      {formatTime(req.first_seen_at)}
+                    </>
+                  ) : (
+                    <>
+                      {req.message_count} messages - First seen {formatTime(req.first_seen_at)}
+                    </>
+                  )}
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => handleAction(req, "accept")}
+                    disabled={acting === req.request_id}
+                  >
+                    Accept
+                  </button>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={() => handleAction(req, "reject")}
+                    disabled={acting === req.request_id}
+                  >
+                    Reject
+                  </button>
                 </div>
               </div>
-
-              <div className="text-secondary-color text-sm mb-2">
-                {req.message_count} messages · First seen {formatTime(req.first_seen_at)}
-              </div>
-
-              <div className="flex gap-2">
-                <button
-                  className="btn btn-primary"
-                  onClick={() => handleAction(req.request_id, "accept")}
-                  disabled={acting === req.request_id}
-                >
-                  Accept
-                </button>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => handleAction(req.request_id, "reject")}
-                  disabled={acting === req.request_id}
-                >
-                  Reject
-                </button>
-              </div>
-            </div>
-          ))}
+            ))}
         </div>
       </div>
     </div>

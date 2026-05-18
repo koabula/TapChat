@@ -477,6 +477,8 @@ test("issues device deployment bundle with runtime auth and security features", 
   assert.ok(bundle.runtimeConfig.features.includes("message_requests"));
   assert.ok(bundle.runtimeConfig.features.includes("allowlist"));
   assert.ok(bundle.runtimeConfig.features.includes("rate_limit"));
+  assert.ok(bundle.runtimeConfig.features.includes("group_outbox_mvp"));
+  assert.ok(bundle.runtimeConfig.features.includes("welcome_pickup_mvp"));
 });
 
 test("bootstrap rejects expired token", async () => {

@@ -30,7 +30,8 @@ export type MessageType =
   | "mls_welcome"
   | "control_device_membership_changed"
   | "control_identity_state_updated"
-  | "control_conversation_needs_rebuild";
+  | "control_conversation_needs_rebuild"
+  | "control_group_welcome_pickup";
 
 export interface Envelope {
   version: string;
@@ -674,6 +675,9 @@ export interface MessageRequestItem {
   messageCount: number;
   lastMessageId: string;
   lastConversationId: string;
+  requestKind?: "direct" | "group_invite";
+  groupId?: string;
+  groupTitle?: string;
 }
 
 export interface MessageRequestListResult {

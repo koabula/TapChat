@@ -162,17 +162,34 @@ export async function cloudflarePreflight(): Promise<PreflightResult> {
   return invoke("cloudflare_preflight");
 }
 
-export async function cloudflareLogin(): Promise<boolean> {
+export interface CloudflareLoginResult {
+  success: boolean;
+  account_id: string | null;
+  account_name: string | null;
+  error: string | null;
+}
+
+export async function cloudflareLogin(): Promise<CloudflareLoginResult> {
   return invoke("cloudflare_login");
 }
 
-export async function cloudflareDeploy(): Promise<void> {
+export interface CloudflareDeployResult {
+  success: boolean;
+  worker_name: string;
+  worker_url: string;
+  error: string | null;
+}
+
+export async function cloudflareDeploy(): Promise<CloudflareDeployResult> {
   return invoke("cloudflare_deploy");
 }
 
 export async function cloudflareStatus(): Promise<CloudflareStatus> {
   return invoke("cloudflare_status");
 }
+
+export const getCloudflareStatus = cloudflareStatus;
+export const deployCloudflare = cloudflareDeploy;
 
 // Session
 export async function startRealtimeSession(): Promise<void> {

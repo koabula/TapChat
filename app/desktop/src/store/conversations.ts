@@ -43,6 +43,7 @@ interface ContactDisplayName {
 
 interface SetConversationsOptions {
   markUnread?: boolean;
+  replace?: boolean;
 }
 
 interface ConversationsState {
@@ -97,12 +98,13 @@ function mergeConversationState(
   incoming: Conversation[],
   activeConversationId: string | null,
   markUnread: boolean,
+  replace: boolean,
 ): Conversation[] {
   const previousById = new Map(
     previous.map((conversation) => [conversation.conversation_id, conversation]),
   );
 
-  return incoming.map((conversation) => {
+  const mergedIncoming = incoming.map((conversation) => {
     const prior = previousById.get(conversation.conversation_id);
     const activityChanged =
       prior !== undefined && prior.last_activity_key !== conversation.last_activity_key;
@@ -150,6 +152,14 @@ function mergeConversationState(
       dissolved_at: conversation.dissolved_at ?? prior?.dissolved_at ?? null,
     };
   });
+  if (replace) {
+    return mergedIncoming;
+  }
+  const incomingIds = new Set(incoming.map((conversation) => conversation.conversation_id));
+  return [
+    ...mergedIncoming,
+    ...previous.filter((conversation) => !incomingIds.has(conversation.conversation_id)),
+  ];
 }
 
 export const useConversationsStore = create<ConversationsState>((set) => ({
@@ -162,6 +172,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         conversations,
         state.activeConversationId,
         options?.markUnread ?? false,
+        options?.replace ?? false,
       ),
     })),
   mergeConversationSnapshot: (snapshots, contacts, options) =>
@@ -199,6 +210,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           mappedConversations,
           state.activeConversationId,
           options?.markUnread ?? false,
+          options?.replace ?? false,
         ),
       };
     }),

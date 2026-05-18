@@ -11,8 +11,17 @@ import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
 import { useSessionStore } from "@/store/session";
 import { useGroupsStore } from "@/store/groups";
-import { getGroupMessages, type GroupMessageView } from "@/lib/tauri";
-import type { Message, CoreUpdateEvent } from "@/lib/types";
+import {
+  cloudflareDeploy,
+  cloudflareLogin,
+  cloudflarePreflight,
+  cloudflareStatus,
+  getGroupMessages,
+  getGroupSnapshot,
+  syncGroupOutbox,
+  type GroupMessageView,
+} from "@/lib/tauri";
+import type { Message, CoreUpdateEvent, CloudflareStatus } from "@/lib/types";
 
 interface SendMessageResult {
   message_id: string;
@@ -28,6 +37,9 @@ export default function ChatView() {
   const [groupMessages, setGroupMessages] = useState<GroupMessageView[]>([]);
   const [loading, setLoading] = useState(false);
   const [memberDrawerOpen, setMemberDrawerOpen] = useState(false);
+  const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
+  const [transportBusy, setTransportBusy] = useState(false);
+  const [transportError, setTransportError] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -42,6 +54,7 @@ export default function ChatView() {
     ],
   );
   const setActiveGroupId = useGroupsStore((s) => s.setActiveGroupId);
+  const setGroupSnapshot = useGroupsStore((s) => s.setSnapshot);
 
   const activeConversation = useMemo(
     () => conversations.find((c) => c.conversation_id === conversationId),
@@ -61,17 +74,33 @@ export default function ChatView() {
       groupSnapshot.manifest.members.find((m) => m.user_id === localUserId) ?? null
     );
   }, [isGroup, groupSnapshot, localUserId]);
+  const pendingGroupSetup =
+    isGroup && (groupSnapshot?.pending_outbox_count ?? 0) > 0;
   const composerDisabled =
     dissolved ||
+    pendingGroupSetup ||
     (isGroup &&
       (groupSnapshot?.local_role == null ||
         localMember?.status === "removed" ||
         localMember?.status === "left"));
   const composerTooltip = dissolved
     ? "This group has been dissolved."
+    : pendingGroupSetup
+      ? "Group transport is waiting for Cloudflare runtime upgrade or sync."
     : composerDisabled
       ? "You are no longer a member of this group."
       : undefined;
+
+  useEffect(() => {
+    if (!pendingGroupSetup) {
+      return;
+    }
+    cloudflareStatus()
+      .then(setRuntimeStatus)
+      .catch((err) => {
+        console.debug(`[ChatView] cloudflare_status failed: ${String(err)}`);
+      });
+  }, [pendingGroupSetup]);
 
   const peerName = useMemo(() => {
     if (!conversationId || !activeConversation) return "Contact";
@@ -98,6 +127,55 @@ export default function ChatView() {
     if (!messagesContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
     shouldAutoScrollRef.current = scrollHeight - scrollTop - clientHeight < 100;
+  };
+
+  const refreshCurrentGroupSnapshot = async () => {
+    if (!activeConversation?.group_id) return;
+    const fresh = await getGroupSnapshot(activeConversation.group_id);
+    setGroupSnapshot(fresh);
+  };
+
+  const handleUpgradeRuntime = async () => {
+    if (!activeConversation?.group_id) return;
+    setTransportBusy(true);
+    setTransportError(null);
+    try {
+      const preflight = await cloudflarePreflight();
+      if (!preflight.ready) {
+        const login = await cloudflareLogin();
+        if (!login.success) {
+          setTransportError(login.error || "Cloudflare login failed.");
+          return;
+        }
+      }
+      const result = await cloudflareDeploy();
+      if (!result.success) {
+        setTransportError(result.error || "Cloudflare runtime upgrade failed.");
+        return;
+      }
+      setRuntimeStatus(await cloudflareStatus());
+      await syncGroupOutbox(activeConversation.group_id, "runtime_upgraded");
+      await refreshCurrentGroupSnapshot();
+    } catch (err) {
+      setTransportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransportBusy(false);
+    }
+  };
+
+  const handleSyncGroupTransport = async () => {
+    if (!activeConversation?.group_id) return;
+    setTransportBusy(true);
+    setTransportError(null);
+    try {
+      await syncGroupOutbox(activeConversation.group_id, "manual_retry");
+      await refreshCurrentGroupSnapshot();
+      setRuntimeStatus(await cloudflareStatus());
+    } catch (err) {
+      setTransportError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransportBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -527,11 +605,35 @@ export default function ChatView() {
 
       {composerDisabled ? (
         <div
-          className="flex items-center gap-2 p-4 border-t border-default bg-surface-elevated text-sm text-muted-color"
+          className="flex flex-wrap items-center gap-2 p-4 border-t border-default bg-surface-elevated text-sm text-muted-color"
           title={composerTooltip}
         >
           <UserX size={16} />
           <span>{composerTooltip ?? "You cannot send messages to this conversation."}</span>
+          {pendingGroupSetup && (
+            <>
+              {runtimeStatus?.needs_upgrade ? (
+                <button
+                  className="btn btn-primary text-xs"
+                  onClick={handleUpgradeRuntime}
+                  disabled={transportBusy}
+                >
+                  {transportBusy ? "Upgrading..." : "Upgrade Cloudflare runtime"}
+                </button>
+              ) : (
+                <button
+                  className="btn btn-secondary text-xs"
+                  onClick={handleSyncGroupTransport}
+                  disabled={transportBusy}
+                >
+                  {transportBusy ? "Syncing..." : "Sync group transport"}
+                </button>
+              )}
+              {transportError && (
+                <span className="basis-full text-error break-words">{transportError}</span>
+              )}
+            </>
+          )}
         </div>
       ) : (
         <MessageInput

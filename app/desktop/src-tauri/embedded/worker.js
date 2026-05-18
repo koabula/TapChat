@@ -670,6 +670,7 @@ var InboxService = class {
     return await this.state.get(this.messageRequestKey(match.senderUserId)) ?? null;
   }
   toMessageRequestItem(entry) {
+    const groupInvite = this.groupInviteMetadata(entry);
     return {
       requestId: entry.requestId,
       recipientDeviceId: entry.recipientDeviceId,
@@ -681,8 +682,32 @@ var InboxService = class {
       lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
       lastMessageId: entry.lastMessageId,
-      lastConversationId: entry.lastConversationId
+      lastConversationId: entry.lastConversationId,
+      requestKind: groupInvite ? "group_invite" : "direct",
+      groupId: groupInvite?.groupId,
+      groupTitle: groupInvite?.title
     };
+  }
+  groupInviteMetadata(entry) {
+    for (let index = entry.pendingRequests.length - 1; index >= 0; index -= 1) {
+      const request = entry.pendingRequests[index];
+      if (request.envelope.messageType !== "control_group_welcome_pickup") {
+        continue;
+      }
+      const encoded = request.envelope.inlineCiphertext;
+      if (!encoded) {
+        return null;
+      }
+      try {
+        const payload = JSON.parse(atob(encoded));
+        if (payload.groupId && payload.title) {
+          return payload;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 };
 

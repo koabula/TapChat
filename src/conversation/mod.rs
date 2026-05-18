@@ -96,7 +96,7 @@ impl ConversationManager {
                 peer_active_device_ids: peer_device_ids,
             },
         )?;
-        let conversation_id = build_direct_conversation_id(local_user_id, peer_user_id);
+        let conversation_id = direct_conversation_id(local_user_id, peer_user_id);
         let mut member_users = vec![local_user_id.to_string(), peer_user_id.to_string()];
         member_users.sort();
         member_users.dedup();
@@ -270,7 +270,7 @@ pub struct AppliedEnvelopeEffect {
     pub duplicate_message: bool,
 }
 
-fn build_direct_conversation_id(a: &str, b: &str) -> String {
+pub fn direct_conversation_id(a: &str, b: &str) -> String {
     let mut parts = [a.to_string(), b.to_string()];
     parts.sort();
     format!("conv:{}:{}", parts[0], parts[1])

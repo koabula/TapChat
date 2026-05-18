@@ -36,6 +36,9 @@ use tapchat_core::model::{
 use tapchat_core::persistence::PersistedGroupInvite;
 use tapchat_core::CoreCommand;
 
+use crate::commands::cloudflare::{
+    runtime_missing_group_outbox_message, runtime_status_for_deployment,
+};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
 
@@ -461,7 +464,8 @@ pub async fn get_group_messages_impl(
                 // Same as above — direct conversation concern.
             }
             tapchat_core::model::MessageType::MlsWelcome
-            | tapchat_core::model::MessageType::MlsCommit => {
+            | tapchat_core::model::MessageType::MlsCommit
+            | tapchat_core::model::MessageType::ControlGroupWelcomePickup => {
                 // Protocol messages never surface in the chat UI.
             }
             tapchat_core::model::MessageType::ControlConversationNeedsRebuild => {
@@ -524,6 +528,15 @@ pub async fn create_group_conversation(
     member_user_ids: Vec<String>,
 ) -> Result<CreateGroupConversationResult, String> {
     let (trimmed_title, members) = normalize_create_group_inputs(&title, &member_user_ids)?;
+    let deployment = {
+        let state = app.state::<AppState>();
+        let inner = state.inner.read().await;
+        inner.engine.refresh_snapshot().deployment
+    };
+    let runtime_status = runtime_status_for_deployment(deployment).await;
+    if let Some(message) = runtime_missing_group_outbox_message(&runtime_status) {
+        return Err(message);
+    }
 
     let output = drive_core_with_handle(
         &app,
@@ -1534,6 +1547,14 @@ pub async fn create_group_conversation_impl(
     member_user_ids: Vec<String>,
 ) -> Result<CreateGroupConversationResult, String> {
     let (trimmed_title, members) = normalize_create_group_inputs(&title, &member_user_ids)?;
+    let deployment = {
+        let inner = state.inner.read().await;
+        inner.engine.refresh_snapshot().deployment
+    };
+    let runtime_status = runtime_status_for_deployment(deployment).await;
+    if let Some(message) = runtime_missing_group_outbox_message(&runtime_status) {
+        return Err(message);
+    }
 
     let output = drive_core_without_handle(
         state,

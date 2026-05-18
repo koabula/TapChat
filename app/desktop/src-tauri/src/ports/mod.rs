@@ -348,11 +348,17 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    let detail = if status == 404 {
+                        "Cloudflare runtime does not support group outbox. Upgrade runtime."
+                            .to_string()
+                    } else {
+                        body
+                    };
                     return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                         group_id: append.group_id,
                         message_id: append.envelope.message_id,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(detail),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);

@@ -12,6 +12,9 @@ export interface MessageRequestItem {
   message_count: number;
   last_message_id: string;
   last_conversation_id: string;
+  request_kind?: "direct" | "group_invite";
+  group_id?: string;
+  group_title?: string;
 }
 
 interface MessageRequestsState {

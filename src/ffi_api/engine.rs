@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
 use crate::conversation::{
-    ConversationManager, LocalConversationState, ReconcileMembershipInput, RecoveryStatus,
+    direct_conversation_id, ConversationManager, LocalConversationState, ReconcileMembershipInput,
+    RecoveryStatus,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
@@ -49,6 +50,7 @@ use crate::transport_contract::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, Verifier};
 use log;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
@@ -86,6 +88,21 @@ pub struct SyncCheckpointSnapshot {
 pub struct RealtimeSessionSnapshot {
     pub last_known_seq: u64,
     pub needs_reconnect: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupWelcomePickupControl {
+    version: String,
+    #[serde(alias = "group_id")]
+    group_id: String,
+    #[serde(alias = "conversation_id")]
+    conversation_id: String,
+    title: String,
+    #[serde(alias = "inviter_user_id")]
+    inviter_user_id: String,
+    #[serde(alias = "welcome_pickup_descriptor")]
+    welcome_pickup_descriptor: WelcomePickupDescriptor,
 }
 
 fn validate_attachment_descriptor(descriptor: &AttachmentDescriptor) -> CoreResult<()> {
@@ -819,7 +836,7 @@ impl CoreEngine {
                 view_model: None,
             }),
             CoreEvent::MessageRequestActionCompleted { result } => {
-                Ok(self.message_request_action_output(result))
+                self.message_request_action_output(result)
             }
             CoreEvent::MessageRequestActionFailed {
                 request_id,
@@ -935,6 +952,7 @@ impl CoreEngine {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
                         message: detail
+                            .map(|detail| format!("group outbox fetch failed: {detail}"))
                             .unwrap_or_else(|| format!("group outbox fetch failed for {group_id}")),
                     },
                 }],
@@ -976,9 +994,11 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| {
-                            format!("welcome pickup fetch failed for {}", descriptor.device_id)
-                        }),
+                        message: detail
+                            .map(|detail| format!("welcome pickup fetch failed: {detail}"))
+                            .unwrap_or_else(|| {
+                                format!("welcome pickup fetch failed for {}", descriptor.device_id)
+                            }),
                     },
                 }],
                 view_model: None,
@@ -996,9 +1016,11 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| {
-                            format!("welcome pickup put failed for {}", descriptor.device_id)
-                        }),
+                        message: detail
+                            .map(|detail| format!("welcome pickup put failed: {detail}"))
+                            .unwrap_or_else(|| {
+                                format!("welcome pickup put failed for {}", descriptor.device_id)
+                            }),
                     },
                 }],
                 view_model: None,
@@ -1925,6 +1947,10 @@ impl CoreEngine {
                 "group must include at least one active invited device",
             ));
         }
+        let invitee_user_by_device: BTreeMap<String, String> = peer_keypackages
+            .iter()
+            .map(|package| (package.device_id.clone(), package.user_id.clone()))
+            .collect();
 
         let group_id = self.next_group_id(&title, &member_user_ids);
         let conversation_id = format!("conv:{group_id}");
@@ -2069,41 +2095,71 @@ impl CoreEngine {
             },
         );
 
-        let mut effects = vec![persist_effect(
-            &self.state,
-            vec![
-                PersistOp::SaveConversation {
-                    conversation_id: conversation_id.clone(),
-                },
-                PersistOp::SaveMlsState {
-                    conversation_id: conversation_id.clone(),
-                },
-                PersistOp::SaveGroupState {
-                    group_id: group_id.clone(),
-                },
-                PersistOp::SaveGroupCursor {
-                    group_id: group_id.clone(),
-                },
-                PersistOp::SaveOutgoingGroupEnvelope {
-                    message_id: commit.message_id.clone(),
-                },
-                PersistOp::SaveOutgoingGroupEnvelope {
-                    message_id: control.message_id.clone(),
-                },
-            ],
-        )];
+        let mut persist_ops = vec![
+            PersistOp::SaveConversation {
+                conversation_id: conversation_id.clone(),
+            },
+            PersistOp::SaveMlsState {
+                conversation_id: conversation_id.clone(),
+            },
+            PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            },
+            PersistOp::SaveGroupCursor {
+                group_id: group_id.clone(),
+            },
+            PersistOp::SaveOutgoingGroupEnvelope {
+                message_id: commit.message_id.clone(),
+            },
+            PersistOp::SaveOutgoingGroupEnvelope {
+                message_id: control.message_id.clone(),
+            },
+        ];
+        let mut transport_effects = Vec::new();
         for welcome in artifacts.welcomes {
             let descriptor =
                 self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
-            effects.push(CoreEffect::PutWelcomePickup {
+            transport_effects.push(CoreEffect::PutWelcomePickup {
                 put: PutWelcomePickupRequest {
-                    descriptor,
+                    descriptor: descriptor.clone(),
                     welcome_b64: welcome.payload_b64,
                     manifest: Some(manifest.clone()),
                     headers: BTreeMap::new(),
                 },
             });
+            if let Some(invitee_user_id) = invitee_user_by_device.get(&welcome.recipient_device_id)
+            {
+                let direct_conversation_id = direct_conversation_id(
+                    &local_identity.user_identity.user_id,
+                    invitee_user_id,
+                );
+                let invite = GroupWelcomePickupControl {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: group_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    title: title.clone(),
+                    inviter_user_id: local_identity.user_identity.user_id.clone(),
+                    welcome_pickup_descriptor: descriptor,
+                };
+                let invite_payload = serde_json::to_vec(&invite).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "failed to encode group welcome pickup control: {error}"
+                    ))
+                })?;
+                let envelope = self.build_envelope(
+                    &direct_conversation_id,
+                    &welcome.recipient_device_id,
+                    MessageType::ControlGroupWelcomePickup,
+                    STANDARD.encode(invite_payload),
+                )?;
+                persist_ops.push(PersistOp::SaveOutgoingEnvelope {
+                    message_id: envelope.message_id.clone(),
+                });
+                self.enqueue_envelopes(invitee_user_id.clone(), vec![envelope]);
+            }
         }
+        let mut effects = vec![persist_effect(&self.state, persist_ops)];
+        effects.extend(transport_effects);
 
         let pickup_descriptors: Vec<_> = effects
             .iter()
@@ -4525,7 +4581,7 @@ impl CoreEngine {
     fn handle_group_websocket_disconnected(
         &mut self,
         group_id: String,
-        _error: Option<String>,
+        error: Option<String>,
     ) -> CoreResult<CoreOutput> {
         let session = self
             .state
@@ -4534,18 +4590,36 @@ impl CoreEngine {
             .or_default();
         session.connected = false;
         session.needs_reconnect = true;
+        let notification = error.and_then(|detail| {
+            if detail.contains("404") {
+                Some(CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message:
+                            "Cloudflare runtime does not support group outbox. Upgrade runtime."
+                                .into(),
+                    },
+                })
+            } else {
+                None
+            }
+        });
+        let mut effects = vec![CoreEffect::ScheduleTimer {
+            timer: TimerEffect {
+                timer_id: format!("group_sync:{group_id}"),
+                delay_ms: 5_000,
+            },
+        }];
+        if let Some(notification) = notification {
+            effects.push(notification);
+        }
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
                 system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![CoreEffect::ScheduleTimer {
-                timer: TimerEffect {
-                    timer_id: format!("group_sync:{group_id}"),
-                    delay_ms: 5_000,
-                },
-            }],
+            effects,
             view_model: None,
         })
     }
@@ -7915,6 +7989,45 @@ impl CoreEngine {
                     }
                     _ => {
                         ackable = true;
+                        if record.envelope.message_type == MessageType::ControlGroupWelcomePickup {
+                            let payload_b64 =
+                                record.envelope.inline_ciphertext.as_deref().ok_or_else(|| {
+                                    CoreError::invalid_input(
+                                        "group welcome pickup control is missing payload",
+                                    )
+                                })?;
+                            let payload = STANDARD.decode(payload_b64).map_err(|error| {
+                                CoreError::invalid_input(format!(
+                                    "failed to decode group welcome pickup control: {error}"
+                                ))
+                            })?;
+                            let invite: GroupWelcomePickupControl =
+                                serde_json::from_slice(&payload).map_err(|error| {
+                                    CoreError::invalid_input(format!(
+                                        "failed to parse group welcome pickup control: {error}"
+                                    ))
+                                })?;
+                            invite.welcome_pickup_descriptor.validate()?;
+                            if let Some(state) = self.state.conversations.get_mut(&conversation_id)
+                            {
+                                if let Some(message) = state
+                                    .messages
+                                    .iter_mut()
+                                    .find(|message| message.message_id == record.message_id)
+                                {
+                                    message.plaintext =
+                                        Some(format!("Group invite: {}", invite.title));
+                                }
+                            }
+                            if !self.state.group_states.contains_key(&invite.group_id) {
+                                output.effects.push(CoreEffect::FetchWelcomePickup {
+                                    fetch: FetchWelcomePickupRequest {
+                                        descriptor: invite.welcome_pickup_descriptor,
+                                        headers: BTreeMap::new(),
+                                    },
+                                });
+                            }
+                        }
                         if apply_effect.identity_refresh_needed {
                             let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
                             output =
@@ -8222,9 +8335,11 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: body.unwrap_or_else(|| {
-                            format!("group fetch returned status {status} for {group_id}")
-                        }),
+                        message: body
+                            .map(|body| format!("group outbox fetch failed: {body}"))
+                            .unwrap_or_else(|| {
+                                format!("group fetch returned status {status} for {group_id}")
+                            }),
                     },
                 }],
                 view_model: None,
@@ -8244,11 +8359,15 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: body.unwrap_or_else(|| {
-                            format!(
-                                "welcome pickup returned status {status} for {group_id}/{device_id}"
-                            )
-                        }),
+                        message: body
+                            .map(|body| {
+                                format!("welcome pickup transfer failed: {body}")
+                            })
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "welcome pickup returned status {status} for {group_id}/{device_id}"
+                                )
+                            }),
                     },
                 }],
                 view_model: None,
@@ -8424,7 +8543,10 @@ impl CoreEngine {
         }
     }
 
-    fn message_request_action_output(&self, result: MessageRequestActionResult) -> CoreOutput {
+    fn message_request_action_output(
+        &mut self,
+        result: MessageRequestActionResult,
+    ) -> CoreResult<CoreOutput> {
         let message = match result.action {
             MessageRequestAction::Accept => {
                 format!("accepted message request {}", result.request_id)
@@ -8433,7 +8555,7 @@ impl CoreEngine {
                 format!("rejected message request {}", result.request_id)
             }
         };
-        CoreOutput {
+        let output = CoreOutput {
             state_update: CoreStateUpdate::default(),
             effects: vec![CoreEffect::EmitUserNotification {
                 notification: UserNotificationEffect {
@@ -8455,7 +8577,12 @@ impl CoreEngine {
                 }],
                 ..CoreViewModel::default()
             }),
+        };
+        if result.accepted && result.action == MessageRequestAction::Accept {
+            let device_id = self.local_device_id_required()?;
+            return Ok(merge_outputs(output, self.sync_inbox(device_id)?));
         }
+        Ok(output)
     }
 
     fn allowlist_output(&self, document: AllowlistDocument, updated: bool) -> CoreOutput {
@@ -9157,9 +9284,11 @@ impl CoreEngine {
             effects: vec![CoreEffect::EmitUserNotification {
                 notification: UserNotificationEffect {
                     status: SystemStatus::TemporaryNetworkFailure,
-                    message: detail.unwrap_or_else(|| {
-                        format!("group append failed for {group_id}/{message_id}")
-                    }),
+                    message: detail
+                        .map(|detail| format!("group append failed: {detail}"))
+                        .unwrap_or_else(|| {
+                            format!("group append failed for {group_id}/{message_id}")
+                        }),
                 },
             }],
             view_model: None,

@@ -71,12 +71,13 @@ export function useCoreUpdate() {
     conversations: ConversationSummary[],
     contacts: Array<{ user_id: string; display_name: string | null }>,
     markUnread: boolean,
+    replace: boolean,
   ) => {
     if (requestId < latestAppliedConversationRequestIdRef.current) {
       return;
     }
     latestAppliedConversationRequestIdRef.current = requestId;
-    mergeConversationSnapshot(conversations, contacts, { markUnread });
+    mergeConversationSnapshot(conversations, contacts, { markUnread, replace });
   };
 
   const refreshConversationsFromBackend = async (
@@ -88,7 +89,7 @@ export function useCoreUpdate() {
     if (requestId < latestConversationRequestIdRef.current) {
       return;
     }
-    applyConversationSnapshot(requestId, conversations, contacts, markUnread);
+    applyConversationSnapshot(requestId, conversations, contacts, markUnread, true);
   };
 
   /**
@@ -172,7 +173,7 @@ export function useCoreUpdate() {
       const conversations = await fetchConversationSnapshot();
       console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
       const requestId = ++latestConversationRequestIdRef.current;
-      applyConversationSnapshot(requestId, conversations, mappedContacts, false);
+      applyConversationSnapshot(requestId, conversations, mappedContacts, false, true);
 
       // Fan out group-specific snapshot refreshes. Keeps groups in
       // sync on every session start without requiring the ChatView
@@ -204,7 +205,7 @@ export function useCoreUpdate() {
 
   const clearStores = () => {
     console.debug("[useCoreUpdate] clearing stores");
-    setConversations([]);
+    setConversations([], { replace: true });
     setContacts([]);
     clearGroups();
     useConversationsStore.getState().setActiveConversation(null);
@@ -243,6 +244,7 @@ export function useCoreUpdate() {
             view_model.conversations,
             nextContacts,
             state_update.messages_changed,
+            false,
           );
         } else {
           void refreshConversationsFromBackend(
@@ -267,6 +269,7 @@ export function useCoreUpdate() {
       } else if (state_update.contacts_changed) {
         setConversations(useConversationsStore.getState().conversations, {
           markUnread: false,
+          replace: true,
         });
       }
 

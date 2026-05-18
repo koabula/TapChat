@@ -7,6 +7,11 @@ import { Check, Circle, Loader, X } from "lucide-react";
 interface RuntimeStatus {
   bound: boolean;
   endpoint: string | null;
+  features: string[];
+  supports_group_outbox: boolean;
+  supports_welcome_pickup: boolean;
+  needs_upgrade: boolean;
+  last_error: string | null;
 }
 
 interface AccountInfo {
@@ -123,6 +128,8 @@ export default function Runtime() {
       setDeployResult(result);
       if (!result.success) {
         setError(result.error || "Deployment failed");
+      } else {
+        await loadStatus();
       }
     } catch (err) {
       setError(String(err));
@@ -165,6 +172,29 @@ export default function Runtime() {
                   <span className="text-primary-color text-sm block truncate">
                     {status.endpoint}
                   </span>
+                </div>
+              )}
+
+              {status?.bound && (
+                <div className="mt-3 space-y-2 text-sm">
+                  <CapabilityRow
+                    label="Group outbox"
+                    ok={status.supports_group_outbox}
+                  />
+                  <CapabilityRow
+                    label="Welcome pickup"
+                    ok={status.supports_welcome_pickup}
+                  />
+                  {status.needs_upgrade && (
+                    <div className="rounded bg-yellow-500/10 px-3 py-2 text-yellow-500">
+                      Cloudflare runtime needs an upgrade for group messaging.
+                    </div>
+                  )}
+                  {status.last_error && (
+                    <div className="rounded bg-error/10 px-3 py-2 text-error break-words">
+                      {status.last_error}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -241,9 +271,11 @@ export default function Runtime() {
             )}
 
             {/* Deploy controls */}
-            {!status?.bound && !deploying && !deployResult && preflight && (
+            {(!status?.bound || status?.needs_upgrade) && !deploying && !deployResult && preflight && (
               <div className="card mb-4 animate-fade-in-up">
-                <h2 className="text-sm font-medium text-muted-color mb-3">Prerequisites</h2>
+                <h2 className="text-sm font-medium text-muted-color mb-3">
+                  {status?.needs_upgrade ? "Upgrade Runtime" : "Prerequisites"}
+                </h2>
 
                 <div className="space-y-3 mb-4">
                   {/* Embedded runtime */}
@@ -278,7 +310,7 @@ export default function Runtime() {
                 {/* Deploy button */}
                 {preflight.ready && (
                   <button className="btn btn-primary w-full transition-fast animate-scale-in" onClick={handleDeploy}>
-                    Deploy Runtime
+                    {status?.needs_upgrade ? "Upgrade Runtime" : "Deploy Runtime"}
                   </button>
                 )}
 
@@ -292,7 +324,7 @@ export default function Runtime() {
             )}
 
             {/* Redeploy option */}
-            {status?.bound && !deploying && (
+            {status?.bound && !status.needs_upgrade && !deploying && (
               <button className="btn btn-secondary w-full transition-fast" onClick={handleDeploy}>
                 Update / Redeploy
               </button>
@@ -310,6 +342,17 @@ export default function Runtime() {
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+function CapabilityRow({ label, ok }: { label: string; ok: boolean }) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-secondary-color">{label}</span>
+      <span className={ok ? "text-primary-color" : "text-yellow-500"}>
+        {ok ? "Ready" : "Missing"}
+      </span>
     </div>
   );
 }

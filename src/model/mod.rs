@@ -444,6 +444,7 @@ pub enum MessageType {
     ControlDeviceMembershipChanged,
     ControlIdentityStateUpdated,
     ControlConversationNeedsRebuild,
+    ControlGroupWelcomePickup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

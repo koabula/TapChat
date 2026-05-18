@@ -56,6 +56,11 @@ interface RateLimitState {
   hourCount: number;
 }
 
+interface GroupWelcomePickupControlPayload {
+  groupId?: string;
+  title?: string;
+}
+
 const META_KEY = "meta";
 const IDEMPOTENCY_PREFIX = "idempotency:";
 const APPEND_RESULT_PREFIX = "append-result:";
@@ -510,6 +515,7 @@ export class InboxService {
   }
 
   private toMessageRequestItem(entry: MessageRequestEntry): MessageRequestItem {
+    const groupInvite = this.groupInviteMetadata(entry);
     return {
       requestId: entry.requestId,
       recipientDeviceId: entry.recipientDeviceId,
@@ -521,8 +527,33 @@ export class InboxService {
       lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
       lastMessageId: entry.lastMessageId,
-      lastConversationId: entry.lastConversationId
+      lastConversationId: entry.lastConversationId,
+      requestKind: groupInvite ? "group_invite" : "direct",
+      groupId: groupInvite?.groupId,
+      groupTitle: groupInvite?.title
     };
+  }
+
+  private groupInviteMetadata(entry: MessageRequestEntry): GroupWelcomePickupControlPayload | null {
+    for (let index = entry.pendingRequests.length - 1; index >= 0; index -= 1) {
+      const request = entry.pendingRequests[index];
+      if (request.envelope.messageType !== "control_group_welcome_pickup") {
+        continue;
+      }
+      const encoded = request.envelope.inlineCiphertext;
+      if (!encoded) {
+        return null;
+      }
+      try {
+        const payload = JSON.parse(atob(encoded)) as GroupWelcomePickupControlPayload;
+        if (payload.groupId && payload.title) {
+          return payload;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 }
 
