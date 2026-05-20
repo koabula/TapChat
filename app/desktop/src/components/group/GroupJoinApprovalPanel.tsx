@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { writeText as clipboardWriteText } from "@tauri-apps/plugin-clipboard-manager";
 import { AlertCircle, Check, X, Copy, UserCheck, UserX } from "lucide-react";
 
@@ -10,6 +11,7 @@ import {
   type GroupJoinRequestView,
   type WelcomePickupShareable,
 } from "@/lib/tauri";
+import type { RealtimeEventPayload } from "@/lib/types";
 import { useGroupsStore } from "@/store/groups";
 
 interface GroupJoinApprovalPanelProps {
@@ -54,6 +56,22 @@ export default function GroupJoinApprovalPanel({
       setRejectReason({});
       void refresh();
     }
+  }, [open, groupId]);
+
+  useEffect(() => {
+    if (!open) return;
+    const unlisten = listen<RealtimeEventPayload>("realtime-event", (event) => {
+      const payload = event.payload;
+      if (
+        payload.event_type === "group_join_request_available" &&
+        payload.device_id === groupId
+      ) {
+        void refresh();
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
   }, [open, groupId]);
 
   const refresh = async () => {

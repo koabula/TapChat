@@ -163,7 +163,17 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
       keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
-      features: ["generic_sync", "attachment_v1", "message_requests", "allowlist", "rate_limit", "group_outbox_mvp", "welcome_pickup_mvp"]
+      features: [
+        "generic_sync",
+        "attachment_v1",
+        "message_requests",
+        "allowlist",
+        "rate_limit",
+        "group_outbox_mvp",
+        "welcome_pickup_mvp",
+        "short_group_invite",
+        "group_member_subscribe"
+      ]
     }
   };
 }
@@ -303,7 +313,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           groupId,
           readGroupCapabilityHeader(request),
           now,
-          "subscribe"
+          "subscribe",
+          ["owner", "admin", "member"]
         );
       }
 

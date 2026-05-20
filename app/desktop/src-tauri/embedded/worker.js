@@ -1,1 +1,2554 @@
-var _e=new TextEncoder;function Ie(r){let e="";for(let t of r)e+=String.fromCharCode(t);return btoa(e).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"")}function Re(r){let e=r.replace(/-/g,"+").replace(/_/g,"/"),t=e+"=".repeat((4-e.length%4)%4),i=atob(t),n=new Uint8Array(i.length);for(let s=0;s<i.length;s+=1)n[s]=i.charCodeAt(s);return n}async function ke(r){return crypto.subtle.importKey("raw",_e.encode(r),{name:"HMAC",hash:"SHA-256"},!1,["sign","verify"])}async function q(r,e){let t=_e.encode(JSON.stringify(e)),i=await ke(r),n=new Uint8Array(await crypto.subtle.sign("HMAC",i,t));return`${Ie(t)}.${Ie(n)}`}async function _(r,e,t){let[i,n]=e.split(".");if(!i||!n)throw new Error("invalid sharing token");let s=Re(i),a=Re(n),c=await ke(r),g=s.buffer.slice(s.byteOffset,s.byteOffset+s.byteLength),m=a.buffer.slice(a.byteOffset,a.byteOffset+a.byteLength);if(!await crypto.subtle.verify("HMAC",c,m,g))throw new Error("invalid sharing token");let p=JSON.parse(new TextDecoder().decode(s));if(p.expiresAt!==void 0&&p.expiresAt<=t)throw new Error("sharing token expired");return p}var o=class extends Error{status;code;constructor(e,t,i){super(i),this.status=e,this.code=t}};function G(r){let e=r.headers.get("Authorization")?.trim();if(!e)throw new o(401,"invalid_capability","missing Authorization header");if(!e.startsWith("Bearer "))throw new o(401,"invalid_capability","Authorization header must use Bearer token");let t=e.slice(7).trim();if(!t)throw new o(401,"invalid_capability","Bearer token must not be empty");return t}function Se(r,e,t,i){let n=G(r),s=r.headers.get("X-Tapchat-Capability");if(!s)throw new o(401,"invalid_capability","missing X-Tapchat-Capability header");let a;try{a=JSON.parse(s)}catch{throw new o(400,"invalid_capability","X-Tapchat-Capability is not valid JSON")}if(t.version!=="0.1"||a.version!=="0.1")throw new o(400,"unsupported_version","append capability version is not supported");if(a.signature!==n)throw new o(403,"invalid_capability","capability signature does not match bearer token");if(a.service!=="inbox")throw new o(403,"invalid_capability","capability service must be inbox");if(!a.operations.includes("append"))throw new o(403,"invalid_capability","capability does not grant append");if(a.targetDeviceId!==e)throw new o(403,"invalid_capability","capability target device does not match request path");let c=new URL(r.url);if(a.endpoint!==`${c.origin}${c.pathname}`)throw new o(403,"invalid_capability","capability endpoint does not match request path");if(a.expiresAt<=i)throw new o(403,"capability_expired","append capability is expired");if(t.recipientDeviceId!==e||t.envelope.recipientDeviceId!==e)throw new o(403,"invalid_capability","recipient device does not match target inbox");if(a.conversationScope?.length&&!a.conversationScope.includes(t.envelope.conversationId))throw new o(403,"invalid_capability","conversation is outside capability scope");let g=new TextEncoder().encode(JSON.stringify(t.envelope)).byteLength;if(a.constraints?.maxBytes!==void 0&&g>a.constraints.maxBytes)throw new o(413,"payload_too_large","envelope exceeds capability size limit")}function T(r){let e=r.headers.get("X-Tapchat-Group-Capability");if(!e)throw new o(401,"invalid_capability","missing X-Tapchat-Group-Capability header");try{return JSON.parse(e)}catch{throw new o(400,"invalid_capability","X-Tapchat-Group-Capability is not valid JSON")}}function xe(r,e,t,i){if(!t)throw new o(401,"invalid_capability","missing group capability");if(Z(r,e,t,i),!t.operations.includes("read"))throw new o(403,"invalid_capability","group capability does not grant read")}function S(r,e,t,i,n,s=["owner","admin"]){if(Z(r,e,t,i),!t.operations.includes(n))throw new o(403,"invalid_capability",`group capability does not grant ${n}`);if(!s.includes(t.role))throw new o(403,"invalid_capability",`group role cannot use ${n}`)}function Pe(r,e,t,i){let n=t.capability;if(!n)throw new o(401,"invalid_capability","missing group capability");if(Z(r,e,n,i),t.groupId!==e||t.envelope.groupId!==e)throw new o(403,"invalid_capability","group capability scope does not match request group");for(let s of Me(t.envelope.messageType))if(!n.operations.includes(s))throw new o(403,"invalid_capability",`group capability does not grant ${s}`);for(let s of je(t.envelope.messageType))if(n.role===s)return;throw new o(403,"invalid_capability",`group role cannot append ${t.envelope.messageType}`)}function Q(r,e,t,i,n){let s=G(r);if(i.groupId!==e||i.deviceId!==t)throw new o(403,"invalid_capability","welcome pickup descriptor scope does not match request path");let a=new URL(r.url);if(i.endpoint!==`${a.origin}${a.pathname}`)throw new o(403,"invalid_capability","welcome pickup endpoint does not match request path");if(i.expiresAt<=n)throw new o(403,"capability_expired","welcome pickup capability is expired");if(i.capability!==s)throw new o(403,"invalid_capability","welcome pickup capability does not match bearer token")}function Z(r,e,t,i){let n=G(r);if(t.version!=="0.1")throw new o(400,"unsupported_version","group capability version is not supported");if(t.signature!==n)throw new o(403,"invalid_capability","group capability signature does not match bearer token");if(t.service!=="group_outbox")throw new o(403,"invalid_capability","group capability service must be group_outbox");if(t.groupId!==e)throw new o(403,"invalid_capability","group capability groupId does not match request path");if(t.expiresAt<=i)throw new o(403,"capability_expired","group capability is expired")}function Me(r){switch(r){case"mls_application":return["append_application"];case"mls_commit":case"control_group_membership_changed":return["append_membership"];case"control_group_metadata_updated":return["update_group_metadata"];case"control_group_join_approved":case"control_group_join_rejected":return["approve_join"];case"control_group_leave_requested":case"control_group_join_requested":case"control_conversation_needs_rebuild":return["append_control"];default:return["append_control"]}}function je(r){switch(r){case"mls_commit":case"control_group_membership_changed":case"control_group_metadata_updated":case"control_group_join_approved":case"control_group_join_rejected":return["owner","admin"];default:return["owner","admin","member"]}}async function $(r,e,t){let i=G(e);try{return await _(r,i,t)}catch(n){let s=n instanceof Error?n.message:"invalid signed token";throw s.includes("expired")?new o(403,"capability_expired",s):new o(403,"invalid_capability",s)}}async function $e(r,e,t){let i=await $(e,r,t);if(i.version!=="0.1")throw new o(400,"unsupported_version","device runtime token version is not supported");if(i.service!=="device_runtime")throw new o(403,"invalid_capability","token service must be device_runtime");if(!i.userId||!i.deviceId||!i.scopes.length)throw new o(403,"invalid_capability","device runtime token is malformed");return i}async function Ae(r,e,t,i,n){let s=await $(e,r,n);if(s.version!=="0.1")throw new o(400,"unsupported_version","bootstrap token version is not supported");if(s.service!=="bootstrap")throw new o(403,"invalid_capability","token service must be bootstrap");if(s.userId!==t||s.deviceId!==i)throw new o(403,"invalid_capability","bootstrap token scope does not match request");if(!s.operations.includes("issue_device_bundle"))throw new o(403,"invalid_capability","bootstrap token does not grant device bundle issuance");return s}async function U(r,e,t,i){let n=await $e(r,e,i);if(!n.scopes.includes(t))throw new o(403,"invalid_capability",`device runtime token does not grant ${t}`);return n}async function qe(r,e,t,i,n,s){let a=await U(r,e,n,s);if(a.userId!==t||a.deviceId!==i)throw new o(403,"invalid_capability","device runtime token scope does not match request path");return a}async function B(r,e,t,i,n){let s=await U(r,e,i,n);if(s.deviceId!==t)throw new o(403,"invalid_capability","device runtime token scope does not match request path");return s}async function Ge(r,e,t,i,n,s){try{return await qe(r,e,t,i,"shared_state_write",s)}catch(c){if(!(c instanceof o)||c.code==="capability_expired")throw c}let a=await $(e,r,s);if(a.version!=="0.1")throw new o(400,"unsupported_version","shared-state token version is not supported");if(a.service!=="shared_state")throw new o(403,"invalid_capability","token service must be shared_state");if(a.userId!==t)throw new o(403,"invalid_capability","token userId does not match request path");if(!a.objectKinds.includes(n))throw new o(403,"invalid_capability","token does not grant this shared-state object kind");return a}async function ee(r,e,t,i,n,s){try{return await qe(r,e,t,i,"keypackage_write",s)}catch(c){if(!(c instanceof o)||c.code==="capability_expired")throw c}let a=await $(e,r,s);if(a.version!=="0.1")throw new o(400,"unsupported_version","keypackage token version is not supported");if(a.service!=="keypackages")throw new o(403,"invalid_capability","token service must be keypackages");if(a.userId!==t||a.deviceId!==i)throw new o(403,"invalid_capability","token scope does not match request path");if(a.keyPackageId&&a.keyPackageId!==n)throw new o(403,"invalid_capability","token keyPackageId does not match request path");return a}var te="meta",Te="idempotency:",De="record:",J="invite:",N="join-request:",L=class{groupId;state;spillStore;defaults;sessions;constructor(e,t,i,n,s=[]){this.groupId=e,this.state=t,this.spillStore=i,this.defaults=n,this.sessions=s}async appendEnvelope(e,t){await this.rejectIfSealed(),this.validateAppendRequest(e);let i=await this.state.get(`${Te}${e.envelope.messageId}`);if(i!==void 0)return{accepted:!0,seq:i};let n=await this.getMeta();if(e.expectedPreviousRosterVersion!==void 0){let b=n.currentRosterVersion??0;if(e.expectedPreviousRosterVersion!==b)throw new o(409,"roster_version_conflict",`expected previous roster version ${e.expectedPreviousRosterVersion} but current is ${b}`)}if(e.expectedPreviousCommitMessageId!==void 0){let b=n.lastCommitMessageId??"";if(e.expectedPreviousCommitMessageId!==b)throw new o(409,"roster_version_conflict","expected previous commit message id does not match current")}let s=n.headSeq+1,a=t+n.retentionDays*24*60*60*1e3,c={seq:s,groupId:this.groupId,messageId:e.envelope.messageId,receivedAt:t,expiresAt:a,state:"available",envelope:e.envelope},g=JSON.stringify(c),m=`${De}${s}`;if(new TextEncoder().encode(g).byteLength<=n.maxInlineBytes&&e.envelope.inlineCiphertext)await this.state.put(m,{seq:s,groupId:c.groupId,messageId:c.messageId,receivedAt:c.receivedAt,expiresAt:a,state:c.state,inlineRecord:c});else{let b=`group-outbox-payload/${this.groupId}/${s}.json`;await this.spillStore.putJson(b,c),await this.state.put(m,{seq:s,groupId:c.groupId,messageId:c.messageId,receivedAt:c.receivedAt,expiresAt:a,state:c.state,payloadRef:b})}let f={...n,headSeq:s},p=e.envelope.membershipProof;return p&&p.type==="membership_signature"&&(typeof p.newRosterVersion=="number"&&(f.currentRosterVersion=p.newRosterVersion),typeof p.commitMessageId=="string"&&p.commitMessageId.length>0&&(f.lastCommitMessageId=p.commitMessageId)),await this.state.put(`${Te}${c.messageId}`,s),await this.state.put(te,f),await this.state.setAlarm(a),this.publish({event:"group_head_updated",groupId:this.groupId,seq:s}),this.publish({event:"group_outbox_record_available",groupId:this.groupId,seq:s,record:c}),{accepted:!0,seq:s}}async fetchOutbox(e){if(e.groupId!==this.groupId)throw new o(400,"invalid_input","group_id does not match group outbox route");if(e.limit<=0)throw new o(400,"invalid_input","limit must be greater than zero");let t=await this.getMeta(),i=[],n=Math.min(t.headSeq,e.fromSeq+e.limit-1);for(let s=e.fromSeq;s<=n;s+=1){let a=await this.state.get(`${De}${s}`);if(!a)continue;if(a.inlineRecord){i.push(a.inlineRecord);continue}if(!a.payloadRef)throw new o(500,"temporary_unavailable","group record payload reference is missing");let c=await this.spillStore.getJson(a.payloadRef);c&&i.push(c)}return{toSeq:i.length>0?i[i.length-1].seq:t.headSeq,records:i}}async getHead(){let e=await this.getMeta();return{headSeq:e.headSeq,currentRosterVersion:e.currentRosterVersion,lastCommitMessageId:e.lastCommitMessageId}}async createInvite(e,t,i,n){if(e.groupId!==this.groupId||e.document.groupId!==this.groupId)throw new o(400,"invalid_input","group_id does not match group invite route");await this.rejectIfSealed(),this.validateInviteDocument(e.document,n);let s=`${J}${e.document.inviteId}`,a=await this.state.get(s);if(a){if(a.document.signature!==e.document.signature)throw new o(409,"conflict","invite id already exists with a different document");return{inviteUrl:a.inviteUrl,invite:a.document}}let c={inviteUrl:t,token:i,document:{...e.document,signature:i},uses:0,maxUses:e.maxUses??e.document.maxUses};return await this.state.put(s,c),await this.state.setAlarm(e.document.expiresAt),{inviteUrl:t,invite:c.document}}async fetchInvite(e,t){if(e.groupId!==this.groupId)throw new o(400,"invalid_input","invite token group does not match route");let i=await this.loadUsableInvite(e.inviteId,t);if(i.token!==i.document.signature)throw new o(403,"invalid_capability","invite signature is invalid");return{invite:i.document}}async fetchInviteById(e,t){let i=await this.loadUsableInvite(e,t);if(i.token!==i.document.signature)throw new o(403,"invalid_capability","invite signature is invalid");return{invite:i.document}}async revokeInvite(e,t){if(e.groupId!==this.groupId)throw new o(400,"invalid_input","group_id does not match group invite route");await this.rejectIfSealed();let i=`${J}${e.inviteId}`,n=await this.state.get(i);if(!n)throw new o(404,"not_found","invite not found");return await this.state.put(i,{...n,revokedAt:t}),{accepted:!0,inviteId:e.inviteId}}async submitJoinRequest(e,t,i){if(t.groupId!==this.groupId||e.request.groupId!==this.groupId)throw new o(400,"invalid_input","join request group does not match route");if(await this.rejectIfSealed(),t.inviteId!==e.request.inviteId)throw new o(403,"invalid_capability","join request invite does not match bearer token");let n=await this.loadUsableInvite(t.inviteId,i);if(n.document.joinPolicy==="closed")throw new o(403,"invalid_invite","invite does not allow link join requests");this.validateJoinRequest(e.request,i);let s=`${N}${e.request.requestId}`,a=await this.state.get(s);if(a){if(JSON.stringify(a.request)!==JSON.stringify(e.request))throw new o(409,"conflict","join request id already exists with different content");return{accepted:!0,request:a.request,autoApprove:a.request.autoApprove}}let c={...e.request,status:"pending",autoApprove:n.document.joinPolicy==="open_by_invite"};return await this.state.put(s,{request:c}),await this.state.put(`${J}${t.inviteId}`,{...n,uses:n.uses+1}),{accepted:!0,request:c,autoApprove:c.autoApprove}}async listJoinRequests(){let e=await this.state.list({prefix:N});return{requests:Array.from(e.values()).map(i=>i.request).filter(i=>i.groupId===this.groupId&&i.status==="pending").sort((i,n)=>i.requestedAt-n.requestedAt||i.requestId.localeCompare(n.requestId))}}async getJoinRequestStatus(e,t){let i=await this.state.get(`${N}${e}`);if(!i||i.request.groupId!==this.groupId)throw new o(404,"not_found","join request not found");if(i.request.requestCapability!==t)throw new o(403,"invalid_capability","join request capability does not match bearer token");return i.request.status!=="approved"?{request:i.request}:{request:i.request,welcomePickup:i.welcomePickup,manifest:i.manifest,startCursor:i.startCursor}}async decideJoinRequest(e){if(e.groupId!==this.groupId)throw new o(400,"invalid_input","group_id does not match group join route");await this.rejectIfSealed();let t=`${N}${e.requestId}`,i=await this.state.get(t);if(!i||i.request.groupId!==this.groupId)throw new o(404,"not_found","join request not found");if(i.request.status!=="pending")throw new o(409,"conflict","join request is already terminal");if(e.decision==="approve"&&(!e.welcomePickup||!e.manifest||!e.startCursor))throw new o(400,"invalid_input","approved join request requires welcome pickup, manifest, and start cursor");if(e.decision==="reject"&&(e.welcomePickup||e.manifest||e.startCursor))throw new o(400,"invalid_input","rejected join request must not include welcome pickup, manifest, or start cursor");let n={...i.request,status:e.decision==="approve"?"approved":"rejected"},s={request:n,welcomePickup:e.decision==="approve"?e.welcomePickup:void 0,manifest:e.decision==="approve"?e.manifest:void 0,startCursor:e.decision==="approve"?e.startCursor:void 0,reason:e.decision==="reject"?e.reason:void 0};return await this.state.put(t,s),{accepted:!0,request:n}}async getMeta(){return await this.state.get(te)??this.defaults}async sealOutbox(e){let t=await this.getMeta();if(t.sealed===!0)throw new o(409,"already_sealed","group outbox is already sealed");let i={...t,sealed:!0,sealedAt:e};return await this.state.put(te,i),{sealed:!0,sealedAt:e,wasAlreadySealed:!1}}async getSealStatus(){let e=await this.getMeta();return{sealed:e.sealed===!0,sealedAt:e.sealedAt??0}}async rejectIfSealed(){if((await this.getMeta()).sealed===!0)throw new o(403,"group_sealed","group outbox is sealed and cannot accept new writes")}validateAppendRequest(e){if(e.groupId!==this.groupId||e.envelope.groupId!==this.groupId)throw new o(400,"invalid_input","group_id does not match group outbox route");this.validateEnvelope(e.envelope)}async loadUsableInvite(e,t){let i=await this.state.get(`${J}${e}`);if(!i||i.document.groupId!==this.groupId)throw new o(404,"not_found","invite not found");if(i.revokedAt!==void 0)throw new o(403,"invalid_invite","invite is revoked");if(i.document.expiresAt<=t)throw new o(403,"capability_expired","invite is expired");if(i.maxUses!==void 0&&i.uses>=i.maxUses)throw new o(403,"invalid_invite","invite max uses exceeded");return i}validateInviteDocument(e,t){if(!e.groupId||!e.inviteId||!e.title||!e.inviterUserId||!e.inviterDeviceId||!e.ownerUserId||!e.joinRequestEndpoint||!e.signature)throw new o(400,"invalid_input","invite document is missing required fields");if(e.expiresAt<=t)throw new o(400,"invalid_input","invite must not already be expired")}validateJoinRequest(e,t){if(!e.requestId||!e.groupId||!e.inviteId||!e.joinerUserId||!e.joinerDeviceId||!e.joinerContactShareUrl||!e.requestCapability||!e.signature)throw new o(400,"invalid_input","join request is missing required fields");if(e.requestedAt>t+300*1e3)throw new o(400,"invalid_input","join request timestamp is too far in the future")}validateEnvelope(e){if(!e.messageId||!e.groupId||!e.conversationId||!e.senderUserId||!e.senderDeviceId)throw new o(400,"invalid_input","group envelope is missing required fields");if(!e.senderProof?.type||!e.senderProof.value)throw new o(400,"invalid_input","group envelope sender proof is required");let t=!!e.inlineCiphertext,i=(e.storageRefs?.length??0)>0;if(!t&&!i)throw new o(400,"invalid_input","group envelope must include inline_ciphertext or storage_refs")}publish(e){let t=JSON.stringify(e);for(let i of this.sessions)i.send(t)}};var ie=class{storage;constructor(e){this.storage=e}async get(e){return await this.storage.get(e)??void 0}async put(e,t){await this.storage.put(e,t)}async delete(e){await this.storage.delete(e)}async list(e){return this.storage.list(e)}async setAlarm(e){await this.storage.setAlarm(e)}},re=class{bucket;constructor(e){this.bucket=e}async putJson(e,t){await this.bucket.put(e,JSON.stringify(t))}async getJson(e){let t=await this.bucket.get(e);return t?await t.json():null}async putBytes(e,t){await this.bucket.put(e,t)}async getBytes(e){let t=await this.bucket.get(e);return t?t.arrayBuffer():null}async delete(e){await this.bucket.delete(e)}};function Je(r){if(!r||typeof r!="object"||Array.isArray(r))return r;let e=r;return e.version!==void 0?r:{version:"0.1",...e}}function y(r,e=200){return new Response(JSON.stringify(Je(r)),{status:e,headers:{"content-type":"application/json"}})}var Ne=globalThis.DurableObject??class{constructor(r,e){}};async function Le(r,e){let t=e.now??Date.now(),i=new URL(r.url),n=new L(e.groupId,e.state,e.spillStore,{headSeq:0,retentionDays:e.retentionDays,maxInlineBytes:e.maxInlineBytes},e.sessions);try{if(i.pathname.endsWith("/subscribe")&&e.onUpgrade)return e.onUpgrade();if(i.pathname.endsWith("/messages")&&r.method==="POST"){let p=await r.json();return y(await n.appendEnvelope(p,t))}if(i.pathname.endsWith("/messages")&&r.method==="GET"){let p=Number(i.searchParams.get("fromSeq")??"1"),b=Number(i.searchParams.get("limit")??"100"),D=JSON.parse(r.headers.get("X-Tapchat-Group-Capability")??"{}");return y(await n.fetchOutbox({groupId:e.groupId,fromSeq:p,limit:b,capability:D}))}if(i.pathname.endsWith("/head")&&r.method==="GET")return y(await n.getHead());if(i.pathname.endsWith("/outbox/seal")&&r.method==="POST"){let p=T(r);return S(r,e.groupId,p,t,"seal_group",["owner"]),y(await n.sealOutbox(t))}if(i.pathname.match(/\/v1\/groups\/[^/]+\/invites$/)&&r.method==="POST"){let p=await r.json(),b=await q(e.sharingSecret,{version:p.document.version,service:"group_invite",groupId:e.groupId,inviteId:p.document.inviteId,inviterUserId:p.document.inviterUserId,inviterDeviceId:p.document.inviterDeviceId,joinPolicy:p.document.joinPolicy,expiresAt:p.document.expiresAt,maxUses:p.maxUses??p.document.maxUses});return y(await n.createInvite(p,`${i.origin}/v1/group-invite/${encodeURIComponent(e.groupId)}/${encodeURIComponent(p.document.inviteId)}`,b,t))}let s=i.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);if(s&&r.method==="GET"){if(decodeURIComponent(s[1])!==e.groupId)throw new o(400,"invalid_input","group invite route does not match durable object");return y(await n.fetchInviteById(decodeURIComponent(s[2]),t))}let a=i.pathname.match(/\/v1\/group-invite\/([^/]+)$/);if(a&&r.method==="GET"){let p=await ne(e.sharingSecret,decodeURIComponent(a[1]),t);return y(await n.fetchInvite(p,t))}let c=i.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);if(c&&r.method==="POST"){let p=await r.json();return y(await n.revokeInvite({version:p.version,groupId:e.groupId,inviteId:decodeURIComponent(c[1]),capability:p.capability},t))}let g=i.pathname.match(/\/v1\/groups\/[^/]+\/join-requests$/);if(g&&r.method==="POST"){let p=G(r),b=await ne(e.sharingSecret,p,t),D=await r.json();return y(await n.submitJoinRequest({...D,inviteToken:p},b,t))}if(g&&r.method==="GET")return y(await n.listJoinRequests());let m=i.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)$/);if(m&&r.method==="GET")return y(await n.getJoinRequestStatus(decodeURIComponent(m[1]),G(r)));let f=i.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/decision$/);if(f&&r.method==="POST"){let p=await r.json();return y(await n.decideJoinRequest({...p,groupId:e.groupId,requestId:decodeURIComponent(f[1])}))}return y({error:"not_found"},404)}catch(s){if(s instanceof o)return y({error:s.code,message:s.message},s.status);let c=s.message??"internal error";return y({error:"temporary_unavailable",message:c},500)}}async function ne(r,e,t){try{let i=await _(r,e,t);if(i.version!=="0.1"||i.service!=="group_invite"||!i.groupId||!i.inviteId)throw new Error("malformed group invite token");return i}catch(i){let n=i instanceof Error?i.message:"invalid group invite token";throw n.includes("expired")?new o(403,"capability_expired",n):new o(403,"invalid_capability",n)}}async function We(r,e,t){let i=r.pathname.match(/\/v1\/groups\/([^/]+)\//),n=decodeURIComponent(i?.[1]??"");if(!n){let s=r.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);s&&(n=decodeURIComponent(s[1]))}if(!n){let s=r.pathname.match(/\/v1\/group-invite\/([^/]+)$/);s&&(n=(await ne(e,decodeURIComponent(s[1]),t)).groupId)}return n}var se=class extends Ne{sessions=new Map;stateRef;envRef;constructor(e,t){super(e,t),this.stateRef=e,this.envRef=t}async fetch(e){let t=new URL(e.url),i=this.envRef.SHARING_TOKEN_SECRET??"replace-me",n=await We(t,i,Date.now());return Le(e,{groupId:n,state:new ie(this.stateRef.storage),spillStore:new re(this.envRef.TAPCHAT_STORAGE),sessions:Array.from(this.sessions.values()).map(s=>({send(a){s.send(a)}})),maxInlineBytes:Number(this.envRef.MAX_INLINE_BYTES??"4096"),retentionDays:Number(this.envRef.RETENTION_DAYS??"30"),sharingSecret:this.envRef.SHARING_TOKEN_SECRET??"replace-me",onUpgrade:()=>{let s=new WebSocketPair,a=s[0],c=s[1];c.accept();let g=crypto.randomUUID(),m=new oe(c);return this.sessions.set(g,m),queueMicrotask(()=>{m.markReady()}),c.addEventListener("close",()=>{this.sessions.delete(g)}),new Response(null,{status:101,webSocket:a})}})}async alarm(){}},oe=class{socket;ready=!1;queuedPayloads=[];constructor(e){this.socket=e}send(e){if(!this.ready){this.queuedPayloads.push(e);return}this.dispatch(e)}markReady(){if(!this.ready)for(this.ready=!0;this.queuedPayloads.length>0;){let e=this.queuedPayloads.shift();if(e===void 0)break;this.dispatch(e)}}dispatch(e){setTimeout(()=>{this.socket.send(e)},0)}};var ae="meta",ce="idempotency:",O="append-result:",de="record:",Ee="allowlist",Ue="message-request:",Ke="rate-limit:",C=class{deviceId;state;spillStore;sessions;defaults;constructor(e,t,i,n,s){this.deviceId=e,this.state=t,this.spillStore=i,this.sessions=n,this.defaults=s}async appendEnvelope(e,t){this.validateAppendRequest(e);let i=await this.state.get(`${O}${e.envelope.messageId}`);if(i)return i;await this.enforceRateLimit(e.envelope.senderUserId,t);let n=await this.getAllowlist(t);if(n.rejectedSenderUserIds.includes(e.envelope.senderUserId)){let a={accepted:!0,seq:0,deliveredTo:"rejected",queuedAsRequest:!1};return await this.state.put(`${O}${e.envelope.messageId}`,a),a}if(n.allowedSenderUserIds.includes(e.envelope.senderUserId)){let a=await this.deliverEnvelope(e,t);return await this.state.put(`${O}${e.envelope.messageId}`,a),a}let s=await this.queueMessageRequest(e,t);return await this.state.put(`${O}${e.envelope.messageId}`,s),s}async fetchMessages(e){if(e.deviceId!==this.deviceId)throw new o(400,"invalid_input","device_id does not match inbox route");if(e.limit<=0)throw new o(400,"invalid_input","limit must be greater than zero");let t=await this.getMeta(),i=[],n=Math.min(t.headSeq,e.fromSeq+e.limit-1);for(let s=e.fromSeq;s<=n;s+=1){let a=await this.state.get(`${de}${s}`);if(!a)continue;if(a.inlineRecord){i.push(a.inlineRecord);continue}if(!a.payloadRef)throw new o(500,"temporary_unavailable","record payload reference is missing");let c=await this.spillStore.getJson(a.payloadRef);c&&i.push(c)}return{toSeq:i.length>0?i[i.length-1].seq:t.headSeq,records:i}}async ack(e){if(e.ack.deviceId!==this.deviceId)throw new o(400,"invalid_input","ack device_id does not match inbox route");let t=await this.getMeta();if(e.ack.ackSeq<t.ackedSeq)throw new o(409,"invalid_ack","ack_seq must not move backwards");let i=Math.max(t.ackedSeq,e.ack.ackSeq);return await this.state.put(ae,{...t,ackedSeq:i}),await this.state.setAlarm(Date.now()),{accepted:!0,ackSeq:i}}async getHead(){return{headSeq:(await this.getMeta()).headSeq}}async getAllowlist(e=Date.now()){return await this.state.get(Ee)??{version:"0.1",deviceId:this.deviceId,updatedAt:e,allowedSenderUserIds:[],rejectedSenderUserIds:[]}}async replaceAllowlist(e,t,i){let n={version:"0.1",deviceId:this.deviceId,updatedAt:i,allowedSenderUserIds:Array.from(new Set(e)).sort(),rejectedSenderUserIds:Array.from(new Set(t.filter(s=>!e.includes(s)))).sort()};return await this.state.put(Ee,n),n}async listMessageRequests(){let e=await this.state.get(this.messageRequestIndexKey());if(!e?.length)return[];let t=[];for(let i of e){let n=await this.state.get(this.messageRequestKey(i));n&&t.push(this.toMessageRequestItem(n))}return t.sort((i,n)=>i.firstSeenAt-n.firstSeenAt||i.senderUserId.localeCompare(n.senderUserId)),t}async acceptMessageRequest(e,t){let i=await this.findMessageRequest(e);if(!i)throw new o(404,"not_found","message request not found");let n=await this.getAllowlist(t);await this.replaceAllowlist([...n.allowedSenderUserIds,i.senderUserId],n.rejectedSenderUserIds.filter(a=>a!==i.senderUserId),t);let s=0;for(let a of i.pendingRequests){let c=await this.deliverEnvelope(a,t);await this.state.put(`${O}${a.envelope.messageId}`,c),s+=c.seq===void 0?0:1}return await this.deleteMessageRequest(i.senderUserId,"accepted"),{accepted:!0,requestId:i.requestId,senderUserId:i.senderUserId,senderBundleShareUrl:i.senderBundleShareUrl,senderBundleHash:i.senderBundleHash,senderDisplayName:i.senderDisplayName,promotedCount:s}}async rejectMessageRequest(e,t){let i=await this.findMessageRequest(e);if(!i)throw new o(404,"not_found","message request not found");let n=await this.getAllowlist(t);return await this.replaceAllowlist(n.allowedSenderUserIds.filter(s=>s!==i.senderUserId),[...n.rejectedSenderUserIds,i.senderUserId],t),await this.deleteMessageRequest(i.senderUserId,"rejected"),{accepted:!0,requestId:i.requestId,senderUserId:i.senderUserId,senderBundleShareUrl:i.senderBundleShareUrl,senderBundleHash:i.senderBundleHash,senderDisplayName:i.senderDisplayName,promotedCount:0}}async cleanExpiredRecords(e){let t=await this.getMeta();for(let i=1;i<=t.ackedSeq;i+=1){let n=`${de}${i}`,s=await this.state.get(n);!s||s.expiresAt===void 0||s.expiresAt>e||(s.payloadRef&&await this.spillStore.delete(s.payloadRef),await this.state.delete(n),await this.state.delete(`${ce}${s.messageId}`))}}async getMeta(){return await this.state.get(ae)??this.defaults}async deliverEnvelope(e,t){let i=await this.getMeta(),n=await this.state.get(`${ce}${e.envelope.messageId}`);if(n!==void 0)return{accepted:!0,seq:n,deliveredTo:"inbox"};let s=i.headSeq+1,a=t+i.retentionDays*24*60*60*1e3,c={seq:s,recipientDeviceId:this.deviceId,messageId:e.envelope.messageId,receivedAt:t,expiresAt:a,state:"available",envelope:e.envelope},g=JSON.stringify(c),m=`${de}${s}`;if(new TextEncoder().encode(g).byteLength<=i.maxInlineBytes&&e.envelope.inlineCiphertext){let f={seq:s,messageId:c.messageId,recipientDeviceId:c.recipientDeviceId,receivedAt:c.receivedAt,expiresAt:a,state:c.state,inlineRecord:c};await this.state.put(m,f)}else{let f=`inbox-payload/${this.deviceId}/${s}.json`;await this.spillStore.putJson(f,c);let p={seq:s,messageId:c.messageId,recipientDeviceId:c.recipientDeviceId,receivedAt:c.receivedAt,expiresAt:a,state:c.state,payloadRef:f};await this.state.put(m,p)}return await this.state.put(`${ce}${c.messageId}`,s),await this.state.put(ae,{...i,headSeq:s}),await this.state.setAlarm(a),this.publish({event:"head_updated",deviceId:this.deviceId,seq:s}),this.publish({event:"inbox_record_available",deviceId:this.deviceId,seq:s,record:c}),{accepted:!0,seq:s,deliveredTo:"inbox"}}async queueMessageRequest(e,t){let i=e.envelope.senderUserId,n=this.messageRequestKey(i),s=this.requestIdForSender(i),c=await this.state.get(n)??{requestId:s,recipientDeviceId:this.deviceId,senderUserId:i,senderBundleShareUrl:e.senderBundleShareUrl,senderBundleHash:e.senderBundleHash,senderDisplayName:e.senderDisplayName,firstSeenAt:t,lastSeenAt:t,messageCount:0,lastMessageId:e.envelope.messageId,lastConversationId:e.envelope.conversationId,pendingRequests:[]};return c.senderBundleShareUrl??=e.senderBundleShareUrl,c.senderBundleHash??=e.senderBundleHash,c.senderDisplayName??=e.senderDisplayName,c.lastSeenAt=t,c.messageCount+=1,c.lastMessageId=e.envelope.messageId,c.lastConversationId=e.envelope.conversationId,c.pendingRequests.push(e),await this.state.put(n,c),await this.addMessageRequestIndex(i),this.publish({event:"message_request_changed",deviceId:this.deviceId,senderUserId:i,requestId:s,change:"queued"}),{accepted:!0,seq:0,deliveredTo:"message_request",queuedAsRequest:!0,requestId:s}}async enforceRateLimit(e,t){let i=await this.getMeta(),n=i.rateLimitPerMinute,s=i.rateLimitPerHour;if(n<=0&&s<=0)return;let a=`${Ke}${e}`,c=Math.floor(t/6e4)*6e4,g=Math.floor(t/36e5)*36e5,m=await this.state.get(a)??{minuteWindowStart:c,minuteCount:0,hourWindowStart:g,hourCount:0};if(m.minuteWindowStart!==c&&(m.minuteWindowStart=c,m.minuteCount=0),m.hourWindowStart!==g&&(m.hourWindowStart=g,m.hourCount=0),n>0&&m.minuteCount>=n)throw new o(429,"rate_limited","append rate limit exceeded for minute window");if(s>0&&m.hourCount>=s)throw new o(429,"rate_limited","append rate limit exceeded for hour window");m.minuteCount+=1,m.hourCount+=1,await this.state.put(a,m)}publish(e){let t=JSON.stringify(e);for(let i of this.sessions)i.send(t)}validateAppendRequest(e){if(e.recipientDeviceId!==this.deviceId)throw new o(400,"invalid_input","recipient_device_id does not match inbox route");if(e.envelope.recipientDeviceId!==this.deviceId)throw new o(400,"invalid_input","envelope recipient_device_id does not match inbox route");if(!e.envelope.messageId||!e.envelope.conversationId||!e.envelope.senderUserId)throw new o(400,"invalid_input","append request is missing required envelope fields");let t=!!e.envelope.inlineCiphertext,i=(e.envelope.storageRefs?.length??0)>0;if(!t&&!i)throw new o(400,"invalid_input","envelope must include inline_ciphertext or storage_refs")}requestIdForSender(e){return`request:${e}`}messageRequestKey(e){return`${Ue}${e}`}messageRequestIndexKey(){return`${Ue}index`}async addMessageRequestIndex(e){let t=await this.state.get(this.messageRequestIndexKey())??[];t.includes(e)||(t.push(e),t.sort(),await this.state.put(this.messageRequestIndexKey(),t))}async deleteMessageRequest(e,t){let i=await this.state.get(this.messageRequestKey(e));await this.state.delete(this.messageRequestKey(e));let n=await this.state.get(this.messageRequestIndexKey())??[];await this.state.put(this.messageRequestIndexKey(),n.filter(s=>s!==e)),i&&this.publish({event:"message_request_changed",deviceId:this.deviceId,senderUserId:e,requestId:i.requestId,change:t})}async findMessageRequest(e){let i=(await this.listMessageRequests()).find(n=>n.requestId===e);return i?await this.state.get(this.messageRequestKey(i.senderUserId))??null:null}toMessageRequestItem(e){let t=this.groupInviteMetadata(e);return{requestId:e.requestId,recipientDeviceId:e.recipientDeviceId,senderUserId:e.senderUserId,senderBundleShareUrl:e.senderBundleShareUrl,senderBundleHash:e.senderBundleHash,senderDisplayName:e.senderDisplayName,firstSeenAt:e.firstSeenAt,lastSeenAt:e.lastSeenAt,messageCount:e.messageCount,lastMessageId:e.lastMessageId,lastConversationId:e.lastConversationId,requestKind:t?"group_invite":"direct",groupId:t?.groupId,groupTitle:t?.title}}groupInviteMetadata(e){for(let t=e.pendingRequests.length-1;t>=0;t-=1){let i=e.pendingRequests[t];if(i.envelope.messageType!=="control_group_welcome_pickup")continue;let n=i.envelope.inlineCiphertext;if(!n)return null;try{let s=JSON.parse(atob(n));if(s.groupId&&s.title)return s}catch{return null}}return null}};var W=class{storage;constructor(e){this.storage=e}async get(e){return await this.storage.get(e)??void 0}async put(e,t){await this.storage.put(e,t)}async delete(e){await this.storage.delete(e)}async list(e){return this.storage.list(e)}async setAlarm(e){await this.storage.setAlarm(e)}},K=class{bucket;constructor(e){this.bucket=e}async putJson(e,t){await this.bucket.put(e,JSON.stringify(t))}async getJson(e){let t=await this.bucket.get(e);return t?await t.json():null}async putBytes(e,t){await this.bucket.put(e,t)}async getBytes(e){let t=await this.bucket.get(e);return t?t.arrayBuffer():null}async delete(e){await this.bucket.delete(e)}};function He(r){if(!r||typeof r!="object"||Array.isArray(r))return r;let e=r;return e.version!==void 0?r:{version:"0.1",...e}}function R(r,e=200){return new Response(JSON.stringify(He(r)),{status:e,headers:{"content-type":"application/json"}})}var ze=globalThis.DurableObject??class{constructor(r,e){}};async function Fe(r,e){let t=e.now??Date.now(),i=new URL(r.url),n=new C(e.deviceId,e.state,e.spillStore,e.sessions,{headSeq:0,ackedSeq:0,retentionDays:e.retentionDays,maxInlineBytes:e.maxInlineBytes,rateLimitPerMinute:e.rateLimitPerMinute,rateLimitPerHour:e.rateLimitPerHour});try{if(i.pathname.endsWith("/subscribe")){if(r.headers.get("Upgrade")?.toLowerCase()!=="websocket")throw new o(400,"invalid_input","subscribe requires websocket upgrade");if(!e.onUpgrade)throw new o(500,"temporary_unavailable","websocket upgrade handler is unavailable");return e.onUpgrade()}if(i.pathname.endsWith("/message-requests")&&r.method==="GET")return R({requests:await n.listMessageRequests()});let s=i.pathname.match(/\/message-requests\/([^/]+)\/(accept|reject)$/);if(s&&r.method==="POST"){let a=decodeURIComponent(s[1]),g=s[2]==="accept"?await n.acceptMessageRequest(a,t):await n.rejectMessageRequest(a,t);return R(g)}if(i.pathname.endsWith("/allowlist")&&r.method==="GET")return R(await n.getAllowlist(t));if(i.pathname.endsWith("/allowlist")&&r.method==="PUT"){let a=await r.json(),c=await n.replaceAllowlist(a.allowedSenderUserIds??[],a.rejectedSenderUserIds??[],t);return R(c)}if(i.pathname.endsWith("/messages")&&r.method==="POST"){let a=await r.json(),c=await n.appendEnvelope(a,t);return R(c)}if(i.pathname.endsWith("/messages")&&r.method==="GET"){let a=Number(i.searchParams.get("fromSeq")??"1"),c=Number(i.searchParams.get("limit")??"100"),g=await n.fetchMessages({deviceId:e.deviceId,fromSeq:a,limit:c});return R({toSeq:g.toSeq,records:g.records})}if(i.pathname.endsWith("/ack")&&r.method==="POST"){let a=await r.json(),c=await n.ack(a);return R({accepted:c.accepted,ackSeq:c.ackSeq})}if(i.pathname.endsWith("/head")&&r.method==="GET"){let a=await n.getHead();return R(a)}return R({error:"not_found"},404)}catch(s){if(s instanceof o)return R({error:s.code,message:s.message},s.status);let c=s.message??"internal error";return R({error:"temporary_unavailable",message:c},500)}}var ue=class extends ze{sessions=new Map;stateRef;envRef;constructor(e,t){super(e,t),this.stateRef=e,this.envRef=t}async fetch(e){let i=new URL(e.url).pathname.match(/\/v1\/inbox\/([^/]+)\//),n=decodeURIComponent(i?.[1]??"");return Fe(e,{deviceId:n,state:new W(this.stateRef.storage),spillStore:new K(this.envRef.TAPCHAT_STORAGE),sessions:Array.from(this.sessions.values()).map(s=>({send(a){s.send(a)}})),maxInlineBytes:Number(this.envRef.MAX_INLINE_BYTES??"4096"),retentionDays:Number(this.envRef.RETENTION_DAYS??"30"),rateLimitPerMinute:Number(this.envRef.RATE_LIMIT_PER_MINUTE??"60"),rateLimitPerHour:Number(this.envRef.RATE_LIMIT_PER_HOUR??"600"),onUpgrade:()=>{let s=new WebSocketPair,a=s[0],c=s[1];c.accept();let g=crypto.randomUUID(),m=new pe(c);return this.sessions.set(g,m),queueMicrotask(()=>{m.markReady()}),c.addEventListener("close",()=>{this.sessions.delete(g)}),new Response(null,{status:101,webSocket:a})}})}async alarm(){await new C("",new W(this.stateRef.storage),new K(this.envRef.TAPCHAT_STORAGE),[],{headSeq:0,ackedSeq:0,retentionDays:Number(this.envRef.RETENTION_DAYS??"30"),maxInlineBytes:Number(this.envRef.MAX_INLINE_BYTES??"4096"),rateLimitPerMinute:Number(this.envRef.RATE_LIMIT_PER_MINUTE??"60"),rateLimitPerHour:Number(this.envRef.RATE_LIMIT_PER_HOUR??"600")}).cleanExpiredRecords(Date.now())}},pe=class{socket;ready=!1;queuedPayloads=[];constructor(e){this.socket=e}send(e){if(!this.ready){this.queuedPayloads.push(e);return}this.dispatch(e)}markReady(){if(!this.ready)for(this.ready=!0;this.queuedPayloads.length>0;){let e=this.queuedPayloads.shift();if(e===void 0)break;this.dispatch(e)}}dispatch(e){setTimeout(()=>{this.socket.send(e)},0)}};function x(r){return r.replace(/[^a-zA-Z0-9:_-]/g,"_")}var H=class{store;baseUrl;constructor(e,t){this.store=e,this.baseUrl=t}identityBundleKey(e){return`shared-state/${x(e)}/identity_bundle.json`}deviceListKey(e){return`shared-state/${x(e)}/device_list.json`}deviceStatusKey(e){return`shared-state/${x(e)}/device_status.json`}keyPackageRefsKey(e,t){return`keypackages/${x(e)}/${x(t)}/refs.json`}keyPackageObjectKey(e,t,i){return`keypackages/${x(e)}/${x(t)}/${x(i)}.bin`}identityBundleUrl(e){return`${this.baseUrl}/v1/shared-state/${encodeURIComponent(e)}/identity-bundle`}deviceStatusUrl(e){return`${this.baseUrl}/v1/shared-state/${encodeURIComponent(e)}/device-status`}keyPackageRefsUrl(e,t){return`${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(e)}/${encodeURIComponent(t)}`}keyPackageObjectUrl(e,t,i){return`${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(e)}/${encodeURIComponent(t)}/${encodeURIComponent(i)}`}async getIdentityBundle(e){return this.store.getJson(this.identityBundleKey(e))}async putIdentityBundle(e,t){if(t.userId!==e)throw new o(400,"invalid_input","identity bundle userId does not match request path");let i={...t,identityBundleRef:this.identityBundleUrl(e),deviceStatusRef:t.deviceStatusRef??this.deviceStatusUrl(e),devices:t.devices.map(n=>({...n,keypackageRef:{...n.keypackageRef,userId:e,deviceId:n.deviceId,ref:n.keypackageRef.ref}}))};await this.store.putJson(this.identityBundleKey(e),i),await this.store.putJson(this.deviceListKey(e),this.buildDeviceListDocument(i))}async getDeviceList(e){return this.store.getJson(this.deviceListKey(e))}async getDeviceStatus(e){return this.store.getJson(this.deviceStatusKey(e))}async putDeviceStatus(e,t){if(t.userId!==e)throw new o(400,"invalid_input","device status userId does not match request path");for(let i of t.devices)if(i.userId!==e)throw new o(400,"invalid_input","device status entry userId does not match request path");await this.store.putJson(this.deviceStatusKey(e),t)}async getKeyPackageRefs(e,t){return this.store.getJson(this.keyPackageRefsKey(e,t))}async putKeyPackageRefs(e,t,i){if(i.userId!==e||i.deviceId!==t)throw new o(400,"invalid_input","keypackage refs scope does not match request path");for(let n of i.refs)if(!n.ref||!n.ref.startsWith(this.keyPackageRefsUrl(e,t)))throw new o(400,"invalid_input","keypackage ref must be a concrete object URL");await this.store.putJson(this.keyPackageRefsKey(e,t),i)}async putKeyPackageObject(e,t,i,n){await this.store.putBytes(this.keyPackageObjectKey(e,t,i),n,{"content-type":"application/octet-stream"})}async getKeyPackageObject(e,t,i){return this.store.getBytes(this.keyPackageObjectKey(e,t,i))}buildDeviceListDocument(e){return{version:e.version,userId:e.userId,updatedAt:e.updatedAt,devices:e.devices.map(t=>({deviceId:t.deviceId,status:t.status}))}}};var Xe=25*1024*1024,Ve=255,Ye=255;function E(r){return r.replace(/[^a-zA-Z0-9:_-]/g,"_")}function le(r,e){if(!r||r.trim().length===0)throw new o(400,"invalid_input",`${e} is required`);return r}function Qe(r){if(r.trim().length===0||r.length>Ve||/[\r\n]/.test(r))throw new o(400,"invalid_input","mime type is invalid")}function Ze(r){if(r!==void 0&&(r.trim().length===0||r.length>Ye||/[\/\\\0\r\n]/.test(r)))throw new o(400,"invalid_input","file name is invalid")}var z=class{store;baseUrl;secret;constructor(e,t,i){this.store=e,this.baseUrl=t,this.secret=i}async prepareUpload(e,t,i){let n=le(e.taskId,"taskId"),s=le(e.conversationId,"conversationId"),a=le(e.messageId,"messageId");if(Qe(e.mimeType),Ze(e.fileName),!Number.isSafeInteger(e.sizeBytes)||e.sizeBytes<=0||e.sizeBytes>Xe)throw new o(400,"invalid_input","sizeBytes is outside supported limits");let c=e.storageScope??(e.groupId?"group":"direct");if(c!=="direct"&&c!=="group")throw new o(400,"invalid_input","storageScope is invalid");if(c==="group"&&(!e.groupId||e.groupId.trim().length===0))throw new o(400,"invalid_input","groupId is required for group storage");let g=["blob",E(t.userId),E(t.deviceId),c,c==="group"?E(e.groupId):"direct",E(s),`${E(a)}-${E(n)}`].join("/"),m=i+900*1e3,f=await q(this.secret,{action:"upload",blobKey:g,sizeBytes:e.sizeBytes,expiresAt:m}),p=await q(this.secret,{action:"download",blobKey:g,expiresAt:m});return{blobRef:g,uploadTarget:`${this.baseUrl}/v1/storage/upload/${encodeURIComponent(g)}?token=${encodeURIComponent(f)}`,uploadHeaders:{"content-type":e.mimeType},downloadTarget:`${this.baseUrl}/v1/storage/blob/${encodeURIComponent(g)}?token=${encodeURIComponent(p)}`,expiresAt:m}}async uploadBlob(e,t,i,n,s){let a=await this.verifyToken(t,s);if(a.action!=="upload"||a.blobKey!==e)throw new o(403,"invalid_capability","upload token is not valid for this blob");if(!Number.isSafeInteger(a.sizeBytes)||i.byteLength!==a.sizeBytes)throw new o(400,"invalid_input","upload body size does not match prepared size");await this.store.putBytes(e,i,n)}async fetchBlob(e,t,i){let n=await this.verifyToken(t,i);if(n.action!=="download"||n.blobKey!==e)throw new o(403,"invalid_capability","download token is not valid for this blob");let s=await this.store.getBytes(e);if(!s)throw new o(404,"blob_not_found","blob does not exist");return s}async putJson(e,t){await this.store.putJson(e,t)}async getJson(e){return this.store.getJson(e)}async delete(e){await this.store.delete(e)}async verifyToken(e,t){try{return await _(this.secret,e,t)}catch(i){let n=i instanceof Error?i.message:"invalid sharing token";throw n.includes("expired")?new o(403,"capability_expired",n):new o(403,"invalid_capability",n)}}};function me(r,e){return`welcome-pickup/${r}/${e}.json`}var F=class{store;constructor(e){this.store=e}async put(e,t){if(this.validateDescriptor(e.descriptor,t),!e.welcomeB64?.trim())throw new o(400,"invalid_input","welcome_b64 must not be empty");return await this.store.putJson(me(e.descriptor.groupId,e.descriptor.deviceId),{descriptor:e.descriptor,welcomeB64:e.welcomeB64,manifest:e.manifest,storedAt:t}),{accepted:!0}}async fetch(e,t){this.validateDescriptor(e,t);let i=await this.store.getJson(me(e.groupId,e.deviceId));if(!i)throw new o(404,"not_found","welcome pickup not found");if(i.descriptor.capability!==e.capability)throw new o(403,"invalid_capability","welcome pickup capability does not match stored descriptor");if(i.descriptor.expiresAt<=t)throw await this.store.delete(me(e.groupId,e.deviceId)),new o(403,"capability_expired","welcome pickup capability is expired");return{welcomeB64:i.welcomeB64,manifest:i.manifest}}validateDescriptor(e,t){if(!e.groupId||!e.deviceId||!e.endpoint||!e.capability)throw new o(400,"invalid_input","welcome pickup descriptor is missing required fields");if(e.expiresAt<=t)throw new o(403,"capability_expired","welcome pickup capability is expired")}};function et(r){if(!r||typeof r!="object"||Array.isArray(r))return r;let e=r;return e.version!==void 0?r:{version:"0.1",...e}}function h(r,e=200){return new Response(JSON.stringify(et(r)),{status:e,headers:{"content-type":"application/json"}})}function X(r,e){return new Request(r.url,{method:r.method,headers:new Headers(r.headers),body:e})}var M=class{bucket;constructor(e){this.bucket=e}async putJson(e,t){await this.bucket.put(e,JSON.stringify(t))}async getJson(e){let t=await this.bucket.get(e);return t?await t.json():null}async putBytes(e,t,i){await this.bucket.put(e,t,i?{httpMetadata:i}:void 0)}async getBytes(e){let t=await this.bucket.get(e);return t?t.arrayBuffer():null}async delete(e){await this.bucket.delete(e)}};function P(r,e){return e.PUBLIC_BASE_URL?.trim().replace(/\/+$/,"")??new URL(r.url).origin}function w(r){return r.SHARING_TOKEN_SECRET??"replace-me"}function tt(r){return r.BOOTSTRAP_TOKEN_SECRET??r.SHARING_TOKEN_SECRET??"replace-me"}function it(){return["inbox_read","inbox_ack","inbox_subscribe","inbox_manage","storage_prepare_upload","shared_state_write","keypackage_write"]}async function rt(r,e,t,i){let n=i+864e5,s=it();return{scheme:"bearer",token:await q(w(r),{version:"0.1",service:"device_runtime",userId:e,deviceId:t,scopes:s,expiresAt:n}),expiresAt:n,userId:e,deviceId:t,scopes:s}}function Be(r,e){return{version:"0.1",region:e.DEPLOYMENT_REGION??"local",inboxHttpEndpoint:P(r,e),inboxWebsocketEndpoint:`${P(r,e).replace(/^http/i,"ws")}/v1/inbox/{deviceId}/subscribe`,storageBaseInfo:{baseUrl:P(r,e),bucketHint:"tapchat-storage"},runtimeConfig:{supportedRealtimeKinds:["websocket"],identityBundleRef:`${P(r,e)}/v1/shared-state/{userId}/identity-bundle`,deviceStatusRef:`${P(r,e)}/v1/shared-state/{userId}/device-status`,keypackageRefBase:`${P(r,e)}/v1/shared-state/keypackages`,maxInlineBytes:Number(e.MAX_INLINE_BYTES??"4096"),features:["generic_sync","attachment_v1","message_requests","allowlist","rate_limit","group_outbox_mvp","welcome_pickup_mvp"]}}}async function Oe(r,e,t,i,n){try{if((await U(r,w(e),"shared_state_write",n)).userId!==t)throw new o(403,"invalid_capability","device runtime token scope does not match request path");return}catch(s){if(!(s instanceof o)||s.code==="capability_expired")throw s}await Ge(r,w(e),t,"",i,n)}async function Ce(r,e){let t=new URL(r.url),i=new z(new M(e.TAPCHAT_STORAGE),P(r,e),w(e)),n=new H(new M(e.TAPCHAT_STORAGE),P(r,e)),s=new F(new M(e.TAPCHAT_STORAGE)),a=Date.now();try{if(r.method==="GET"&&t.pathname==="/v1/deployment-bundle")return h(Be(r,e));let c=t.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);if(c&&r.method==="GET"){let d=decodeURIComponent(c[1]),u=await _(w(e),d,a);if(u.service!=="contact_share"||!u.userId||!u.shareId)throw new o(403,"invalid_capability","invalid contact share token");let l=await n.getIdentityBundle(u.userId);return!l||l.bundleShareId!==u.shareId?h({error:"not_found",message:"contact share not found"},404):h(l)}if(r.method==="POST"&&t.pathname==="/v1/bootstrap/device"){let d=await r.json();if(d.version!=="0.1")throw new o(400,"unsupported_version","bootstrap request version is not supported");await Ae(r,tt(e),d.userId,d.deviceId,a);let u={...Be(r,e),deviceRuntimeAuth:await rt(e,d.userId,d.deviceId,a),expectedUserId:d.userId,expectedDeviceId:d.deviceId};return h(u)}let g=t.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);if(g){let d=decodeURIComponent(g[1]),u=g[2],l=e.INBOX.idFromName(d),v=e.INBOX.get(l);if(r.method==="POST"&&u==="messages"){let k=await r.text(),A=JSON.parse(k);return Se(r,d,A,a),await v.fetch(X(r,k))}else r.method==="GET"&&(u==="messages"||u==="head")?await B(r,w(e),d,"inbox_read",a):r.method==="POST"&&u==="ack"?await B(r,w(e),d,"inbox_ack",a):u==="subscribe"?await B(r,w(e),d,"inbox_subscribe",a):(u==="allowlist"||u==="message-requests"||u.startsWith("message-requests/"))&&await B(r,w(e),d,"inbox_manage",a);return v.fetch(r)}let m=t.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head|seal|subscribe)$/);if(m){let d=decodeURIComponent(m[1]),u=m[2],l=e.GROUP_OUTBOX.idFromName(d),v=e.GROUP_OUTBOX.get(l);if(r.method==="POST"&&u==="messages"){let k=await r.text(),A=JSON.parse(k);return Pe(r,d,A,a),await v.fetch(X(r,k))}else r.method==="POST"&&u==="seal"?S(r,d,T(r),a,"seal_group",["owner"]):r.method==="GET"&&(u==="messages"||u==="head")?xe(r,d,T(r),a):u==="subscribe"&&S(r,d,T(r),a,"subscribe");return v.fetch(r)}let f=t.pathname.match(/^\/v1\/group-invite\/([^/]+)\/([^/]+)$/);if(f&&r.method==="GET"){let d=decodeURIComponent(f[1]),u=e.GROUP_OUTBOX.idFromName(d);return e.GROUP_OUTBOX.get(u).fetch(r)}let p=t.pathname.match(/^\/v1\/group-invite\/([^/]+)$/);if(p&&r.method==="GET"){let d;try{d=await _(w(e),decodeURIComponent(p[1]),a)}catch(l){let v=l instanceof Error?l.message:"invalid group invite token";throw new o((v.includes("expired"),403),v.includes("expired")?"capability_expired":"invalid_capability",v)}if(d.service!=="group_invite"||!d.groupId||!d.inviteId)throw new o(403,"invalid_capability","group invite token is malformed");let u=e.GROUP_OUTBOX.idFromName(d.groupId);return e.GROUP_OUTBOX.get(u).fetch(r)}let b=t.pathname.match(/^\/v1\/groups\/([^/]+)\/invites(?:\/([^/]+)\/revoke)?$/);if(b&&r.method==="POST"){let d=decodeURIComponent(b[1]),u=await r.text(),l=JSON.parse(u);S(r,d,l.capability,a,"manage_invites");let v=e.GROUP_OUTBOX.idFromName(d);return await e.GROUP_OUTBOX.get(v).fetch(X(r,u))}let D=t.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests$/);if(D){let d=decodeURIComponent(D[1]);if(r.method==="POST"){let l=r.headers.get("Authorization")?.replace(/^Bearer\s+/i,"").trim();if(!l)throw new o(401,"invalid_capability","missing group invite bearer token");let v;try{v=await _(w(e),l,a)}catch(k){let A=k instanceof Error?k.message:"invalid group invite token";throw new o((A.includes("expired"),403),A.includes("expired")?"capability_expired":"invalid_capability",A)}if(v.service!=="group_invite"||v.groupId!==d)throw new o(403,"invalid_capability","group invite token scope does not match request")}else r.method==="GET"&&S(r,d,T(r),a,"approve_join");let u=e.GROUP_OUTBOX.idFromName(d);return e.GROUP_OUTBOX.get(u).fetch(r)}let ge=t.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/decision$/);if(ge&&r.method==="POST"){let d=decodeURIComponent(ge[1]),u=await r.text(),l=JSON.parse(u);S(r,d,l.capability,a,"approve_join");let v=e.GROUP_OUTBOX.idFromName(d);return await e.GROUP_OUTBOX.get(v).fetch(X(r,u))}let ve=t.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)$/);if(ve&&r.method==="GET"){let d=decodeURIComponent(ve[1]),u=e.GROUP_OUTBOX.idFromName(d);return e.GROUP_OUTBOX.get(u).fetch(r)}let V=t.pathname.match(/^\/v1\/groups\/([^/]+)\/welcome-pickup\/([^/]+)$/);if(V){let d=decodeURIComponent(V[1]),u=decodeURIComponent(V[2]);if(r.method==="PUT"){let l=await r.json();return Q(r,d,u,l.descriptor,a),h(await s.put(l,a))}if(r.method==="GET"){let l=r.headers.get("X-Tapchat-Welcome-Pickup");if(!l)throw new o(401,"invalid_capability","missing X-Tapchat-Welcome-Pickup header");let v;try{v=JSON.parse(l)}catch{throw new o(400,"invalid_capability","X-Tapchat-Welcome-Pickup is not valid JSON")}return Q(r,d,u,v,a),h(await s.fetch(v,a))}}let he=t.pathname.match(/^\/v1\/shared-state\/([^/]+)\/identity-bundle$/);if(he){let d=decodeURIComponent(he[1]);if(r.method==="GET"){let u=await n.getIdentityBundle(d);return u?h(u):h({error:"not_found",message:"identity bundle not found"},404)}if(r.method==="PUT"){await Oe(r,e,d,"identity_bundle",a);let u=await r.json();await n.putIdentityBundle(d,u);let l=await n.getIdentityBundle(d);return h(l)}}let fe=t.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-status$/);if(fe){let d=decodeURIComponent(fe[1]);if(r.method==="GET"){let u=await n.getDeviceStatus(d);return u?h(u):h({error:"not_found",message:"device status not found"},404)}if(r.method==="PUT"){await Oe(r,e,d,"device_status",a);let u=await r.json();await n.putDeviceStatus(d,u);let l=await n.getDeviceStatus(d);return h(l)}}let be=t.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-list$/);if(be&&r.method==="GET"){let d=decodeURIComponent(be[1]),u=await n.getDeviceList(d);return u?h(u):h({error:"not_found",message:"device list not found"},404)}let Y=t.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);if(Y){let d=decodeURIComponent(Y[1]),u=decodeURIComponent(Y[2]);if(r.method==="GET"){let l=await n.getKeyPackageRefs(d,u);return l?h(l):h({error:"not_found",message:"keypackage refs not found"},404)}if(r.method==="PUT"){await ee(r,w(e),d,u,void 0,a);let l=await r.json();await n.putKeyPackageRefs(d,u,l);let v=await n.getKeyPackageRefs(d,u);return h(v)}}let j=t.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);if(j){let d=decodeURIComponent(j[1]),u=decodeURIComponent(j[2]),l=decodeURIComponent(j[3]);if(r.method==="GET"){let v=await n.getKeyPackageObject(d,u,l);return v?new Response(v,{status:200,headers:{"content-type":"application/octet-stream"}}):h({error:"not_found",message:"keypackage not found"},404)}if(r.method==="PUT")return await ee(r,w(e),d,u,l,a),await n.putKeyPackageObject(d,u,l,await r.arrayBuffer()),new Response(null,{status:204})}if(r.method==="POST"&&t.pathname==="/v1/storage/prepare-upload"){let d=await U(r,w(e),"storage_prepare_upload",a),u=await r.json(),l=await i.prepareUpload(u,{userId:d.userId,deviceId:d.deviceId},a);return h(l)}let ye=t.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);if(r.method==="PUT"&&ye){let d=decodeURIComponent(ye[1]),u=t.searchParams.get("token");if(!u)throw new o(401,"invalid_capability","missing upload token");let l=r.headers.get("content-type")??"application/octet-stream";return await i.uploadBlob(d,u,await r.arrayBuffer(),{"content-type":l},a),new Response(null,{status:204})}let we=t.pathname.match(/^\/v1\/storage\/blob\/(.+)$/);if(r.method==="GET"&&we){let d=decodeURIComponent(we[1]),u=t.searchParams.get("token");if(!u)throw new o(401,"invalid_capability","missing download token");let l=await i.fetchBlob(d,u,a);return new Response(l,{status:200,headers:{"content-type":"application/octet-stream"}})}return h({error:"not_found",message:"route not found"},404)}catch(c){if(c instanceof o)return h({error:c.code,message:c.message},c.status);let m=c.message??"internal error";return h({error:"temporary_unavailable",message:m},500)}}var $t={async fetch(r,e){return Ce(r,e)}};export{se as GroupOutboxDurableObject,ue as InboxDurableObject,$t as default};
+// src/types/contracts.ts
+var CURRENT_MODEL_VERSION = "0.1";
+
+// src/storage/sharing.ts
+var encoder = new TextEncoder();
+function toBase64Url(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function fromBase64Url(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+  const binary = atob(padded);
+  const output = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    output[i] = binary.charCodeAt(i);
+  }
+  return output;
+}
+async function importSecret(secret) {
+  return crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+async function signSharingPayload(secret, payload) {
+  const encodedPayload = encoder.encode(JSON.stringify(payload));
+  const key = await importSecret(secret);
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, encodedPayload));
+  return `${toBase64Url(encodedPayload)}.${toBase64Url(signature)}`;
+}
+async function verifySharingPayload(secret, token, now) {
+  const [payloadPart, signaturePart] = token.split(".");
+  if (!payloadPart || !signaturePart) {
+    throw new Error("invalid sharing token");
+  }
+  const payloadBytes = fromBase64Url(payloadPart);
+  const signatureBytes = fromBase64Url(signaturePart);
+  const key = await importSecret(secret);
+  const payloadBuffer = payloadBytes.buffer.slice(
+    payloadBytes.byteOffset,
+    payloadBytes.byteOffset + payloadBytes.byteLength
+  );
+  const signatureBuffer = signatureBytes.buffer.slice(
+    signatureBytes.byteOffset,
+    signatureBytes.byteOffset + signatureBytes.byteLength
+  );
+  const valid = await crypto.subtle.verify("HMAC", key, signatureBuffer, payloadBuffer);
+  if (!valid) {
+    throw new Error("invalid sharing token");
+  }
+  const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
+  if (payload.expiresAt !== void 0 && payload.expiresAt <= now) {
+    throw new Error("sharing token expired");
+  }
+  return payload;
+}
+
+// src/auth/capability.ts
+var HttpError = class extends Error {
+  status;
+  code;
+  constructor(status, code, message) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+};
+function getBearerToken(request) {
+  const header = request.headers.get("Authorization")?.trim();
+  if (!header) {
+    throw new HttpError(401, "invalid_capability", "missing Authorization header");
+  }
+  if (!header.startsWith("Bearer ")) {
+    throw new HttpError(401, "invalid_capability", "Authorization header must use Bearer token");
+  }
+  const token = header.slice("Bearer ".length).trim();
+  if (!token) {
+    throw new HttpError(401, "invalid_capability", "Bearer token must not be empty");
+  }
+  return token;
+}
+function validateAppendAuthorization(request, deviceId, body, now) {
+  const signature = getBearerToken(request);
+  const capabilityHeader = request.headers.get("X-Tapchat-Capability");
+  if (!capabilityHeader) {
+    throw new HttpError(401, "invalid_capability", "missing X-Tapchat-Capability header");
+  }
+  let capability;
+  try {
+    capability = JSON.parse(capabilityHeader);
+  } catch {
+    throw new HttpError(400, "invalid_capability", "X-Tapchat-Capability is not valid JSON");
+  }
+  if (body.version !== CURRENT_MODEL_VERSION || capability.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "append capability version is not supported");
+  }
+  if (capability.signature !== signature) {
+    throw new HttpError(403, "invalid_capability", "capability signature does not match bearer token");
+  }
+  if (capability.service !== "inbox") {
+    throw new HttpError(403, "invalid_capability", "capability service must be inbox");
+  }
+  if (!capability.operations.includes("append")) {
+    throw new HttpError(403, "invalid_capability", "capability does not grant append");
+  }
+  if (capability.targetDeviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "capability target device does not match request path");
+  }
+  const requestUrl = new URL(request.url);
+  if (capability.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
+    throw new HttpError(403, "invalid_capability", "capability endpoint does not match request path");
+  }
+  if (capability.expiresAt <= now) {
+    throw new HttpError(403, "capability_expired", "append capability is expired");
+  }
+  if (body.recipientDeviceId !== deviceId || body.envelope.recipientDeviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "recipient device does not match target inbox");
+  }
+  if (capability.conversationScope?.length && !capability.conversationScope.includes(body.envelope.conversationId)) {
+    throw new HttpError(403, "invalid_capability", "conversation is outside capability scope");
+  }
+  const size = new TextEncoder().encode(JSON.stringify(body.envelope)).byteLength;
+  if (capability.constraints?.maxBytes !== void 0 && size > capability.constraints.maxBytes) {
+    throw new HttpError(413, "payload_too_large", "envelope exceeds capability size limit");
+  }
+}
+function readGroupCapabilityHeader(request) {
+  const capabilityHeader = request.headers.get("X-Tapchat-Group-Capability");
+  if (!capabilityHeader) {
+    throw new HttpError(401, "invalid_capability", "missing X-Tapchat-Group-Capability header");
+  }
+  try {
+    return JSON.parse(capabilityHeader);
+  } catch {
+    throw new HttpError(400, "invalid_capability", "X-Tapchat-Group-Capability is not valid JSON");
+  }
+}
+function validateGroupReadAuthorization(request, groupId, capability, now) {
+  if (!capability) {
+    throw new HttpError(401, "invalid_capability", "missing group capability");
+  }
+  validateGroupCapabilityBase(request, groupId, capability, now);
+  if (!capability.operations.includes("read")) {
+    throw new HttpError(403, "invalid_capability", "group capability does not grant read");
+  }
+}
+function validateGroupOperationAuthorization(request, groupId, capability, now, operation, allowedRoles = ["owner", "admin"]) {
+  validateGroupCapabilityBase(request, groupId, capability, now);
+  if (!capability.operations.includes(operation)) {
+    throw new HttpError(403, "invalid_capability", `group capability does not grant ${operation}`);
+  }
+  if (!allowedRoles.includes(capability.role)) {
+    throw new HttpError(403, "invalid_capability", `group role cannot use ${operation}`);
+  }
+}
+function validateGroupAppendAuthorization(request, groupId, body, now) {
+  const capability = body.capability;
+  if (!capability) {
+    throw new HttpError(401, "invalid_capability", "missing group capability");
+  }
+  validateGroupCapabilityBase(request, groupId, capability, now);
+  if (body.groupId !== groupId || body.envelope.groupId !== groupId) {
+    throw new HttpError(403, "invalid_capability", "group capability scope does not match request group");
+  }
+  for (const required of requiredGroupAppendOperations(body.envelope.messageType)) {
+    if (!capability.operations.includes(required)) {
+      throw new HttpError(403, "invalid_capability", `group capability does not grant ${required}`);
+    }
+  }
+  for (const role of allowedGroupAppendRoles(body.envelope.messageType)) {
+    if (capability.role === role) {
+      return;
+    }
+  }
+  throw new HttpError(403, "invalid_capability", `group role cannot append ${body.envelope.messageType}`);
+}
+function validateWelcomePickupAuthorization(request, groupId, deviceId, descriptor, now) {
+  const token = getBearerToken(request);
+  if (descriptor.groupId !== groupId || descriptor.deviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "welcome pickup descriptor scope does not match request path");
+  }
+  const requestUrl = new URL(request.url);
+  if (descriptor.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
+    throw new HttpError(403, "invalid_capability", "welcome pickup endpoint does not match request path");
+  }
+  if (descriptor.expiresAt <= now) {
+    throw new HttpError(403, "capability_expired", "welcome pickup capability is expired");
+  }
+  if (descriptor.capability !== token) {
+    throw new HttpError(403, "invalid_capability", "welcome pickup capability does not match bearer token");
+  }
+}
+function validateGroupCapabilityBase(request, groupId, capability, now) {
+  const signature = getBearerToken(request);
+  if (capability.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "group capability version is not supported");
+  }
+  if (capability.signature !== signature) {
+    throw new HttpError(403, "invalid_capability", "group capability signature does not match bearer token");
+  }
+  if (capability.service !== "group_outbox") {
+    throw new HttpError(403, "invalid_capability", "group capability service must be group_outbox");
+  }
+  if (capability.groupId !== groupId) {
+    throw new HttpError(403, "invalid_capability", "group capability groupId does not match request path");
+  }
+  if (capability.expiresAt <= now) {
+    throw new HttpError(403, "capability_expired", "group capability is expired");
+  }
+}
+function requiredGroupAppendOperations(messageType) {
+  switch (messageType) {
+    case "mls_application":
+      return ["append_application"];
+    case "mls_commit":
+    case "control_group_membership_changed":
+      return ["append_membership"];
+    case "control_group_metadata_updated":
+      return ["update_group_metadata"];
+    case "control_group_join_approved":
+    case "control_group_join_rejected":
+      return ["approve_join"];
+    case "control_group_leave_requested":
+    case "control_group_join_requested":
+    case "control_conversation_needs_rebuild":
+      return ["append_control"];
+    default:
+      return ["append_control"];
+  }
+}
+function allowedGroupAppendRoles(messageType) {
+  switch (messageType) {
+    case "mls_commit":
+    case "control_group_membership_changed":
+    case "control_group_metadata_updated":
+    case "control_group_join_approved":
+    case "control_group_join_rejected":
+      return ["owner", "admin"];
+    default:
+      return ["owner", "admin", "member"];
+  }
+}
+async function verifySignedToken(secret, request, now) {
+  const token = getBearerToken(request);
+  try {
+    return await verifySharingPayload(secret, token, now);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid signed token";
+    if (message.includes("expired")) {
+      throw new HttpError(403, "capability_expired", message);
+    }
+    throw new HttpError(403, "invalid_capability", message);
+  }
+}
+async function verifyDeviceRuntimeToken(request, secret, now) {
+  const token = await verifySignedToken(secret, request, now);
+  if (token.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "device runtime token version is not supported");
+  }
+  if (token.service !== "device_runtime") {
+    throw new HttpError(403, "invalid_capability", "token service must be device_runtime");
+  }
+  if (!token.userId || !token.deviceId || !token.scopes.length) {
+    throw new HttpError(403, "invalid_capability", "device runtime token is malformed");
+  }
+  return token;
+}
+async function validateBootstrapAuthorization(request, secret, userId, deviceId, now) {
+  const token = await verifySignedToken(secret, request, now);
+  if (token.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "bootstrap token version is not supported");
+  }
+  if (token.service !== "bootstrap") {
+    throw new HttpError(403, "invalid_capability", "token service must be bootstrap");
+  }
+  if (token.userId !== userId || token.deviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "bootstrap token scope does not match request");
+  }
+  if (!token.operations.includes("issue_device_bundle")) {
+    throw new HttpError(403, "invalid_capability", "bootstrap token does not grant device bundle issuance");
+  }
+  return token;
+}
+async function validateAnyDeviceRuntimeAuthorization(request, secret, scope, now) {
+  const token = await verifyDeviceRuntimeToken(request, secret, now);
+  if (!token.scopes.includes(scope)) {
+    throw new HttpError(403, "invalid_capability", `device runtime token does not grant ${scope}`);
+  }
+  return token;
+}
+async function validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, scope, now) {
+  const token = await validateAnyDeviceRuntimeAuthorization(request, secret, scope, now);
+  if (token.userId !== userId || token.deviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+  }
+  return token;
+}
+async function validateDeviceRuntimeAuthorizationForDevice(request, secret, deviceId, scope, now) {
+  const token = await validateAnyDeviceRuntimeAuthorization(request, secret, scope, now);
+  if (token.deviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+  }
+  return token;
+}
+async function validateSharedStateWriteAuthorization(request, secret, userId, deviceId, objectKind, now) {
+  try {
+    return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "shared_state_write", now);
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+      throw error;
+    }
+  }
+  const token = await verifySignedToken(secret, request, now);
+  if (token.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "shared-state token version is not supported");
+  }
+  if (token.service !== "shared_state") {
+    throw new HttpError(403, "invalid_capability", "token service must be shared_state");
+  }
+  if (token.userId !== userId) {
+    throw new HttpError(403, "invalid_capability", "token userId does not match request path");
+  }
+  if (!token.objectKinds.includes(objectKind)) {
+    throw new HttpError(403, "invalid_capability", "token does not grant this shared-state object kind");
+  }
+  return token;
+}
+async function validateKeyPackageWriteAuthorization(request, secret, userId, deviceId, keyPackageId, now) {
+  try {
+    return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+      throw error;
+    }
+  }
+  const token = await verifySignedToken(secret, request, now);
+  if (token.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "keypackage token version is not supported");
+  }
+  if (token.service !== "keypackages") {
+    throw new HttpError(403, "invalid_capability", "token service must be keypackages");
+  }
+  if (token.userId !== userId || token.deviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "token scope does not match request path");
+  }
+  if (token.keyPackageId && token.keyPackageId !== keyPackageId) {
+    throw new HttpError(403, "invalid_capability", "token keyPackageId does not match request path");
+  }
+  return token;
+}
+
+// src/group-outbox/service.ts
+var META_KEY = "meta";
+var IDEMPOTENCY_PREFIX = "idempotency:";
+var RECORD_PREFIX = "record:";
+var INVITE_PREFIX = "invite:";
+var JOIN_REQUEST_PREFIX = "join-request:";
+var GroupOutboxService = class {
+  groupId;
+  state;
+  spillStore;
+  defaults;
+  sessions;
+  constructor(groupId, state, spillStore, defaults, sessions = []) {
+    this.groupId = groupId;
+    this.state = state;
+    this.spillStore = spillStore;
+    this.defaults = defaults;
+    this.sessions = sessions;
+  }
+  async appendEnvelope(input, now) {
+    await this.rejectIfSealed();
+    this.validateAppendRequest(input);
+    const existingSeq = await this.state.get(`${IDEMPOTENCY_PREFIX}${input.envelope.messageId}`);
+    if (existingSeq !== void 0) {
+      return { accepted: true, seq: existingSeq };
+    }
+    const meta = await this.getMeta();
+    if (input.expectedPreviousRosterVersion !== void 0) {
+      const storedRosterVersion = meta.currentRosterVersion ?? 0;
+      if (input.expectedPreviousRosterVersion !== storedRosterVersion) {
+        throw new HttpError(
+          409,
+          "roster_version_conflict",
+          `expected previous roster version ${input.expectedPreviousRosterVersion} but current is ${storedRosterVersion}`
+        );
+      }
+    }
+    if (input.expectedPreviousCommitMessageId !== void 0) {
+      const storedCommitMessageId = meta.lastCommitMessageId ?? "";
+      if (input.expectedPreviousCommitMessageId !== storedCommitMessageId) {
+        throw new HttpError(
+          409,
+          "roster_version_conflict",
+          `expected previous commit message id does not match current`
+        );
+      }
+    }
+    const seq = meta.headSeq + 1;
+    const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1e3;
+    const record = {
+      seq,
+      groupId: this.groupId,
+      messageId: input.envelope.messageId,
+      receivedAt: now,
+      expiresAt,
+      state: "available",
+      envelope: input.envelope
+    };
+    const serialized = JSON.stringify(record);
+    const storageKey = `${RECORD_PREFIX}${seq}`;
+    if (new TextEncoder().encode(serialized).byteLength <= meta.maxInlineBytes && input.envelope.inlineCiphertext) {
+      await this.state.put(storageKey, {
+        seq,
+        groupId: record.groupId,
+        messageId: record.messageId,
+        receivedAt: record.receivedAt,
+        expiresAt,
+        state: record.state,
+        inlineRecord: record
+      });
+    } else {
+      const payloadRef = `group-outbox-payload/${this.groupId}/${seq}.json`;
+      await this.spillStore.putJson(payloadRef, record);
+      await this.state.put(storageKey, {
+        seq,
+        groupId: record.groupId,
+        messageId: record.messageId,
+        receivedAt: record.receivedAt,
+        expiresAt,
+        state: record.state,
+        payloadRef
+      });
+    }
+    let nextMeta = { ...meta, headSeq: seq };
+    const proof = input.envelope.membershipProof;
+    if (proof && proof.type === "membership_signature") {
+      if (typeof proof.newRosterVersion === "number") {
+        nextMeta.currentRosterVersion = proof.newRosterVersion;
+      }
+      if (typeof proof.commitMessageId === "string" && proof.commitMessageId.length > 0) {
+        nextMeta.lastCommitMessageId = proof.commitMessageId;
+      }
+    }
+    await this.state.put(`${IDEMPOTENCY_PREFIX}${record.messageId}`, seq);
+    await this.state.put(META_KEY, nextMeta);
+    await this.state.setAlarm(expiresAt);
+    this.publish({ event: "group_head_updated", groupId: this.groupId, seq });
+    this.publish({ event: "group_outbox_record_available", groupId: this.groupId, seq, record });
+    return { accepted: true, seq };
+  }
+  async fetchOutbox(input) {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group outbox route");
+    }
+    if (input.limit <= 0) {
+      throw new HttpError(400, "invalid_input", "limit must be greater than zero");
+    }
+    const meta = await this.getMeta();
+    const records = [];
+    const upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
+    for (let seq = input.fromSeq; seq <= upper; seq += 1) {
+      const index = await this.state.get(`${RECORD_PREFIX}${seq}`);
+      if (!index) {
+        continue;
+      }
+      if (index.inlineRecord) {
+        records.push(index.inlineRecord);
+        continue;
+      }
+      if (!index.payloadRef) {
+        throw new HttpError(500, "temporary_unavailable", "group record payload reference is missing");
+      }
+      const record = await this.spillStore.getJson(index.payloadRef);
+      if (record) {
+        records.push(record);
+      }
+    }
+    return {
+      toSeq: records.length > 0 ? records[records.length - 1].seq : meta.headSeq,
+      records
+    };
+  }
+  async getHead() {
+    const meta = await this.getMeta();
+    return {
+      headSeq: meta.headSeq,
+      currentRosterVersion: meta.currentRosterVersion,
+      lastCommitMessageId: meta.lastCommitMessageId
+    };
+  }
+  async createInvite(input, inviteUrl, token, now) {
+    if (input.groupId !== this.groupId || input.document.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group invite route");
+    }
+    await this.rejectIfSealed();
+    this.validateInviteDocument(input.document, now);
+    const key = `${INVITE_PREFIX}${input.document.inviteId}`;
+    const existing = await this.state.get(key);
+    if (existing) {
+      if (existing.document.signature !== input.document.signature) {
+        throw new HttpError(409, "conflict", "invite id already exists with a different document");
+      }
+      return { inviteUrl: existing.inviteUrl, invite: existing.document };
+    }
+    const stored = {
+      inviteUrl,
+      token,
+      document: { ...input.document, signature: token },
+      uses: 0,
+      maxUses: input.maxUses ?? input.document.maxUses
+    };
+    await this.state.put(key, stored);
+    await this.state.setAlarm(input.document.expiresAt);
+    return { inviteUrl, invite: stored.document };
+  }
+  async fetchInvite(payload, now) {
+    if (payload.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "invite token group does not match route");
+    }
+    const stored = await this.loadUsableInvite(payload.inviteId, now);
+    if (stored.token !== stored.document.signature) {
+      throw new HttpError(403, "invalid_capability", "invite signature is invalid");
+    }
+    return { invite: stored.document };
+  }
+  async fetchInviteById(inviteId, now) {
+    const stored = await this.loadUsableInvite(inviteId, now);
+    if (stored.token !== stored.document.signature) {
+      throw new HttpError(403, "invalid_capability", "invite signature is invalid");
+    }
+    return { invite: stored.document };
+  }
+  async revokeInvite(input, now) {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group invite route");
+    }
+    await this.rejectIfSealed();
+    const key = `${INVITE_PREFIX}${input.inviteId}`;
+    const stored = await this.state.get(key);
+    if (!stored) {
+      throw new HttpError(404, "not_found", "invite not found");
+    }
+    await this.state.put(key, { ...stored, revokedAt: now });
+    return { accepted: true, inviteId: input.inviteId };
+  }
+  async submitJoinRequest(input, payload, now) {
+    if (payload.groupId !== this.groupId || input.request.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "join request group does not match route");
+    }
+    await this.rejectIfSealed();
+    if (payload.inviteId !== input.request.inviteId) {
+      throw new HttpError(403, "invalid_capability", "join request invite does not match bearer token");
+    }
+    const invite = await this.loadUsableInvite(payload.inviteId, now);
+    if (invite.document.joinPolicy === "closed") {
+      throw new HttpError(403, "invalid_invite", "invite does not allow link join requests");
+    }
+    this.validateJoinRequest(input.request, now);
+    const key = `${JOIN_REQUEST_PREFIX}${input.request.requestId}`;
+    const existing = await this.state.get(key);
+    if (existing) {
+      if (JSON.stringify(existing.request) !== JSON.stringify(input.request)) {
+        throw new HttpError(409, "conflict", "join request id already exists with different content");
+      }
+      return {
+        accepted: true,
+        request: existing.request,
+        autoApprove: existing.request.autoApprove
+      };
+    }
+    const request = {
+      ...input.request,
+      status: "pending",
+      autoApprove: invite.document.joinPolicy === "open_by_invite"
+    };
+    await this.state.put(key, { request });
+    await this.state.put(`${INVITE_PREFIX}${payload.inviteId}`, {
+      ...invite,
+      uses: invite.uses + 1
+    });
+    this.publish({
+      event: "group_join_request_available",
+      groupId: this.groupId,
+      requestId: request.requestId
+    });
+    return { accepted: true, request, autoApprove: request.autoApprove };
+  }
+  async listJoinRequests() {
+    const result = await this.state.list({ prefix: JOIN_REQUEST_PREFIX });
+    const requests = Array.from(result.values()).map((stored) => stored.request).filter((request) => request.groupId === this.groupId && request.status === "pending").sort((a, b) => a.requestedAt - b.requestedAt || a.requestId.localeCompare(b.requestId));
+    return { requests };
+  }
+  async getJoinRequestStatus(requestId, requestCapability) {
+    const stored = await this.state.get(`${JOIN_REQUEST_PREFIX}${requestId}`);
+    if (!stored || stored.request.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "join request not found");
+    }
+    if (stored.request.requestCapability !== requestCapability) {
+      throw new HttpError(403, "invalid_capability", "join request capability does not match bearer token");
+    }
+    if (stored.request.status !== "approved") {
+      return { request: stored.request };
+    }
+    return {
+      request: stored.request,
+      welcomePickup: stored.welcomePickup,
+      manifest: stored.manifest,
+      startCursor: stored.startCursor
+    };
+  }
+  async decideJoinRequest(input) {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group join route");
+    }
+    await this.rejectIfSealed();
+    const key = `${JOIN_REQUEST_PREFIX}${input.requestId}`;
+    const stored = await this.state.get(key);
+    if (!stored || stored.request.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "join request not found");
+    }
+    if (stored.request.status !== "pending") {
+      throw new HttpError(409, "conflict", "join request is already terminal");
+    }
+    if (input.decision === "approve" && (!input.welcomePickup || !input.manifest || !input.startCursor)) {
+      throw new HttpError(400, "invalid_input", "approved join request requires welcome pickup, manifest, and start cursor");
+    }
+    if (input.decision === "reject" && (input.welcomePickup || input.manifest || input.startCursor)) {
+      throw new HttpError(400, "invalid_input", "rejected join request must not include welcome pickup, manifest, or start cursor");
+    }
+    const request = {
+      ...stored.request,
+      status: input.decision === "approve" ? "approved" : "rejected"
+    };
+    const updated = {
+      request,
+      welcomePickup: input.decision === "approve" ? input.welcomePickup : void 0,
+      manifest: input.decision === "approve" ? input.manifest : void 0,
+      startCursor: input.decision === "approve" ? input.startCursor : void 0,
+      reason: input.decision === "reject" ? input.reason : void 0
+    };
+    await this.state.put(key, updated);
+    return { accepted: true, request };
+  }
+  async getMeta() {
+    return await this.state.get(META_KEY) ?? this.defaults;
+  }
+  /**
+   * Idempotent seal of the group outbox. The very first caller flips
+   * `sealed = true` and records `sealedAt = now`; subsequent callers are
+   * rejected with HTTP 409 `already_sealed` regardless of their
+   * capability (PROTOCOL_GROUP_CN.md §10.4 — seals are irreversible).
+   *
+   * Callers must already have authenticated owner-signed
+   * `seal_group` capability at the transport layer; this method only
+   * enforces the storage-side invariant.
+   */
+  async sealOutbox(now) {
+    const meta = await this.getMeta();
+    if (meta.sealed === true) {
+      throw new HttpError(409, "already_sealed", "group outbox is already sealed");
+    }
+    const nextMeta = { ...meta, sealed: true, sealedAt: now };
+    await this.state.put(META_KEY, nextMeta);
+    return { sealed: true, sealedAt: now, wasAlreadySealed: false };
+  }
+  async getSealStatus() {
+    const meta = await this.getMeta();
+    return { sealed: meta.sealed === true, sealedAt: meta.sealedAt ?? 0 };
+  }
+  /**
+   * Reject any append-type flow on a sealed outbox with the canonical
+   * `403 group_sealed` response. Reads (fetch / head / subscribe-replay)
+   * are explicitly allowed to continue, so only write paths call this.
+   */
+  async rejectIfSealed() {
+    const meta = await this.getMeta();
+    if (meta.sealed === true) {
+      throw new HttpError(403, "group_sealed", "group outbox is sealed and cannot accept new writes");
+    }
+  }
+  validateAppendRequest(input) {
+    if (input.groupId !== this.groupId || input.envelope.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group outbox route");
+    }
+    this.validateEnvelope(input.envelope);
+  }
+  async loadUsableInvite(inviteId, now) {
+    const stored = await this.state.get(`${INVITE_PREFIX}${inviteId}`);
+    if (!stored || stored.document.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "invite not found");
+    }
+    if (stored.revokedAt !== void 0) {
+      throw new HttpError(403, "invalid_invite", "invite is revoked");
+    }
+    if (stored.document.expiresAt <= now) {
+      throw new HttpError(403, "capability_expired", "invite is expired");
+    }
+    if (stored.maxUses !== void 0 && stored.uses >= stored.maxUses) {
+      throw new HttpError(403, "invalid_invite", "invite max uses exceeded");
+    }
+    return stored;
+  }
+  validateInviteDocument(document, now) {
+    if (!document.groupId || !document.inviteId || !document.title || !document.inviterUserId || !document.inviterDeviceId || !document.ownerUserId || !document.joinRequestEndpoint || !document.signature) {
+      throw new HttpError(400, "invalid_input", "invite document is missing required fields");
+    }
+    if (document.expiresAt <= now) {
+      throw new HttpError(400, "invalid_input", "invite must not already be expired");
+    }
+  }
+  validateJoinRequest(request, now) {
+    if (!request.requestId || !request.groupId || !request.inviteId || !request.joinerUserId || !request.joinerDeviceId || !request.joinerContactShareUrl || !request.requestCapability || !request.signature) {
+      throw new HttpError(400, "invalid_input", "join request is missing required fields");
+    }
+    if (request.requestedAt > now + 5 * 60 * 1e3) {
+      throw new HttpError(400, "invalid_input", "join request timestamp is too far in the future");
+    }
+  }
+  validateEnvelope(envelope) {
+    if (!envelope.messageId || !envelope.groupId || !envelope.conversationId || !envelope.senderUserId || !envelope.senderDeviceId) {
+      throw new HttpError(400, "invalid_input", "group envelope is missing required fields");
+    }
+    if (!envelope.senderProof?.type || !envelope.senderProof.value) {
+      throw new HttpError(400, "invalid_input", "group envelope sender proof is required");
+    }
+    const hasInline = Boolean(envelope.inlineCiphertext);
+    const hasStorageRefs = (envelope.storageRefs?.length ?? 0) > 0;
+    if (!hasInline && !hasStorageRefs) {
+      throw new HttpError(400, "invalid_input", "group envelope must include inline_ciphertext or storage_refs");
+    }
+  }
+  publish(event) {
+    const payload = JSON.stringify(event);
+    for (const session of this.sessions) {
+      session.send(payload);
+    }
+  }
+};
+
+// src/group-outbox/durable.ts
+var DurableObjectStorageAdapter = class {
+  storage;
+  constructor(storage) {
+    this.storage = storage;
+  }
+  async get(key) {
+    return await this.storage.get(key) ?? void 0;
+  }
+  async put(key, value) {
+    await this.storage.put(key, value);
+  }
+  async delete(key) {
+    await this.storage.delete(key);
+  }
+  async list(options) {
+    return this.storage.list(options);
+  }
+  async setAlarm(epochMillis) {
+    await this.storage.setAlarm(epochMillis);
+  }
+};
+var R2JsonBlobStore = class {
+  bucket;
+  constructor(bucket) {
+    this.bucket = bucket;
+  }
+  async putJson(key, value) {
+    await this.bucket.put(key, JSON.stringify(value));
+  }
+  async getJson(key) {
+    const object = await this.bucket.get(key);
+    if (!object) {
+      return null;
+    }
+    return await object.json();
+  }
+  async putBytes(key, value) {
+    await this.bucket.put(key, value);
+  }
+  async getBytes(key) {
+    const object = await this.bucket.get(key);
+    if (!object) {
+      return null;
+    }
+    return object.arrayBuffer();
+  }
+  async delete(key) {
+    await this.bucket.delete(key);
+  }
+};
+function versionedBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return body;
+  }
+  const record = body;
+  if (record.version !== void 0) {
+    return body;
+  }
+  return {
+    version: "0.1",
+    ...record
+  };
+}
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(versionedBody(body)), {
+    status,
+    headers: {
+      "content-type": "application/json"
+    }
+  });
+}
+var DurableObjectBase = globalThis.DurableObject ?? class {
+  constructor(_state, _env) {
+  }
+};
+async function handleGroupOutboxDurableRequest(request, deps) {
+  const now = deps.now ?? Date.now();
+  const url = new URL(request.url);
+  const service = new GroupOutboxService(deps.groupId, deps.state, deps.spillStore, {
+    headSeq: 0,
+    retentionDays: deps.retentionDays,
+    maxInlineBytes: deps.maxInlineBytes
+  }, deps.sessions);
+  try {
+    if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
+      validateGroupOperationAuthorization(
+        request,
+        deps.groupId,
+        readGroupCapabilityHeader(request),
+        now,
+        "subscribe",
+        ["owner", "admin", "member"]
+      );
+      return deps.onUpgrade();
+    }
+    if (url.pathname.endsWith("/messages") && request.method === "POST") {
+      const body = await request.json();
+      return jsonResponse(await service.appendEnvelope(body, now));
+    }
+    if (url.pathname.endsWith("/messages") && request.method === "GET") {
+      const fromSeq = Number(url.searchParams.get("fromSeq") ?? "1");
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      const capability = JSON.parse(request.headers.get("X-Tapchat-Group-Capability") ?? "{}");
+      return jsonResponse(await service.fetchOutbox({
+        groupId: deps.groupId,
+        fromSeq,
+        limit,
+        capability
+      }));
+    }
+    if (url.pathname.endsWith("/head") && request.method === "GET") {
+      return jsonResponse(await service.getHead());
+    }
+    if (url.pathname.endsWith("/outbox/seal") && request.method === "POST") {
+      const capability = readGroupCapabilityHeader(request);
+      validateGroupOperationAuthorization(request, deps.groupId, capability, now, "seal_group", [
+        "owner"
+      ]);
+      return jsonResponse(await service.sealOutbox(now));
+    }
+    if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "POST") {
+      const body = await request.json();
+      const token = await signSharingPayload(deps.sharingSecret, {
+        version: body.document.version,
+        service: "group_invite",
+        groupId: deps.groupId,
+        inviteId: body.document.inviteId,
+        inviterUserId: body.document.inviterUserId,
+        inviterDeviceId: body.document.inviterDeviceId,
+        joinPolicy: body.document.joinPolicy,
+        expiresAt: body.document.expiresAt,
+        maxUses: body.maxUses ?? body.document.maxUses
+      });
+      return jsonResponse(
+        await service.createInvite(
+          body,
+          `${url.origin}/v1/group-invite/${encodeURIComponent(deps.groupId)}/${encodeURIComponent(body.document.inviteId)}`,
+          token,
+          now
+        )
+      );
+    }
+    const shortInviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
+    if (shortInviteFetchMatch && request.method === "GET") {
+      const routeGroupId = decodeURIComponent(shortInviteFetchMatch[1]);
+      if (routeGroupId !== deps.groupId) {
+        throw new HttpError(400, "invalid_input", "group invite route does not match durable object");
+      }
+      return jsonResponse(await service.fetchInviteById(decodeURIComponent(shortInviteFetchMatch[2]), now));
+    }
+    const inviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
+    if (inviteFetchMatch && request.method === "GET") {
+      const payload = await verifyInviteToken(deps.sharingSecret, decodeURIComponent(inviteFetchMatch[1]), now);
+      return jsonResponse(await service.fetchInvite(payload, now));
+    }
+    const revokeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);
+    if (revokeMatch && request.method === "POST") {
+      const body = await request.json();
+      return jsonResponse(
+        await service.revokeInvite(
+          {
+            version: body.version,
+            groupId: deps.groupId,
+            inviteId: decodeURIComponent(revokeMatch[1]),
+            capability: body.capability
+          },
+          now
+        )
+      );
+    }
+    const joinCollectionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests$/);
+    if (joinCollectionMatch && request.method === "POST") {
+      const token = getBearerToken(request);
+      const payload = await verifyInviteToken(deps.sharingSecret, token, now);
+      const body = await request.json();
+      return jsonResponse(await service.submitJoinRequest({ ...body, inviteToken: token }, payload, now));
+    }
+    if (joinCollectionMatch && request.method === "GET") {
+      return jsonResponse(await service.listJoinRequests());
+    }
+    const joinStatusMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)$/);
+    if (joinStatusMatch && request.method === "GET") {
+      return jsonResponse(await service.getJoinRequestStatus(decodeURIComponent(joinStatusMatch[1]), getBearerToken(request)));
+    }
+    const decisionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/decision$/);
+    if (decisionMatch && request.method === "POST") {
+      const body = await request.json();
+      return jsonResponse(
+        await service.decideJoinRequest({
+          ...body,
+          groupId: deps.groupId,
+          requestId: decodeURIComponent(decisionMatch[1])
+        })
+      );
+    }
+    return jsonResponse({ error: "not_found" }, 404);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return jsonResponse({ error: error.code, message: error.message }, error.status);
+    }
+    const runtimeError = error;
+    const message = runtimeError.message ?? "internal error";
+    return jsonResponse({ error: "temporary_unavailable", message }, 500);
+  }
+}
+async function verifyInviteToken(secret, token, now) {
+  try {
+    const payload = await verifySharingPayload(secret, token, now);
+    if (payload.version !== "0.1" || payload.service !== "group_invite" || !payload.groupId || !payload.inviteId) {
+      throw new Error("malformed group invite token");
+    }
+    return payload;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid group invite token";
+    if (message.includes("expired")) {
+      throw new HttpError(403, "capability_expired", message);
+    }
+    throw new HttpError(403, "invalid_capability", message);
+  }
+}
+async function groupIdFromGroupOutboxRequestUrl(url, sharingSecret, now) {
+  const groupMatch = url.pathname.match(/\/v1\/groups\/([^/]+)\//);
+  let groupId = decodeURIComponent(groupMatch?.[1] ?? "");
+  if (!groupId) {
+    const shortInviteMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
+    if (shortInviteMatch) {
+      groupId = decodeURIComponent(shortInviteMatch[1]);
+    }
+  }
+  if (!groupId) {
+    const inviteMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
+    if (inviteMatch) {
+      const payload = await verifyInviteToken(
+        sharingSecret,
+        decodeURIComponent(inviteMatch[1]),
+        now
+      );
+      groupId = payload.groupId;
+    }
+  }
+  return groupId;
+}
+var GroupOutboxDurableObject = class extends DurableObjectBase {
+  sessions = /* @__PURE__ */ new Map();
+  stateRef;
+  envRef;
+  constructor(state, env) {
+    super(state, env);
+    this.stateRef = state;
+    this.envRef = env;
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    const sharingSecret = this.envRef.SHARING_TOKEN_SECRET ?? "replace-me";
+    const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
+    return handleGroupOutboxDurableRequest(request, {
+      groupId,
+      state: new DurableObjectStorageAdapter(this.stateRef.storage),
+      spillStore: new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
+      sessions: Array.from(this.sessions.values()).map(
+        (session) => ({
+          send(payload) {
+            session.send(payload);
+          }
+        })
+      ),
+      maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
+      retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
+      sharingSecret: this.envRef.SHARING_TOKEN_SECRET ?? "replace-me",
+      onUpgrade: () => {
+        const pair = new WebSocketPair();
+        const client = pair[0];
+        const server = pair[1];
+        server.accept();
+        const sessionId = crypto.randomUUID();
+        const session = new ManagedSession(server);
+        this.sessions.set(sessionId, session);
+        queueMicrotask(() => {
+          session.markReady();
+        });
+        server.addEventListener("close", () => {
+          this.sessions.delete(sessionId);
+        });
+        return new Response(null, {
+          status: 101,
+          webSocket: client
+        });
+      }
+    });
+  }
+  // Cloudflare's runtime requires any durable object that calls `setAlarm()`
+  // to expose a matching `alarm()` handler. We currently rely on alarms as a
+  // best-effort cleanup hook for expired invites and old outbox records; the
+  // service itself is responsible for deleting stale entries at read/write
+  // time, so the alarm body is intentionally a no-op for now.
+  async alarm() {
+  }
+};
+var ManagedSession = class {
+  socket;
+  ready = false;
+  queuedPayloads = [];
+  constructor(socket) {
+    this.socket = socket;
+  }
+  send(payload) {
+    if (!this.ready) {
+      this.queuedPayloads.push(payload);
+      return;
+    }
+    this.dispatch(payload);
+  }
+  markReady() {
+    if (this.ready) {
+      return;
+    }
+    this.ready = true;
+    while (this.queuedPayloads.length > 0) {
+      const payload = this.queuedPayloads.shift();
+      if (payload === void 0) {
+        break;
+      }
+      this.dispatch(payload);
+    }
+  }
+  dispatch(payload) {
+    setTimeout(() => {
+      this.socket.send(payload);
+    }, 0);
+  }
+};
+
+// src/inbox/service.ts
+var META_KEY2 = "meta";
+var IDEMPOTENCY_PREFIX2 = "idempotency:";
+var APPEND_RESULT_PREFIX = "append-result:";
+var RECORD_PREFIX2 = "record:";
+var ALLOWLIST_KEY = "allowlist";
+var MESSAGE_REQUEST_PREFIX = "message-request:";
+var RATE_LIMIT_PREFIX = "rate-limit:";
+var InboxService = class {
+  deviceId;
+  state;
+  spillStore;
+  sessions;
+  defaults;
+  constructor(deviceId, state, spillStore, sessions, defaults) {
+    this.deviceId = deviceId;
+    this.state = state;
+    this.spillStore = spillStore;
+    this.sessions = sessions;
+    this.defaults = defaults;
+  }
+  async appendEnvelope(input, now) {
+    this.validateAppendRequest(input);
+    const existingResult = await this.state.get(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`);
+    if (existingResult) {
+      return existingResult;
+    }
+    await this.enforceRateLimit(input.envelope.senderUserId, now);
+    const allowlist = await this.getAllowlist(now);
+    if (allowlist.rejectedSenderUserIds.includes(input.envelope.senderUserId)) {
+      const rejected = {
+        accepted: true,
+        seq: 0,
+        deliveredTo: "rejected",
+        queuedAsRequest: false
+      };
+      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, rejected);
+      return rejected;
+    }
+    if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
+      const delivered = await this.deliverEnvelope(input, now);
+      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, delivered);
+      return delivered;
+    }
+    const request = await this.queueMessageRequest(input, now);
+    await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
+    return request;
+  }
+  async fetchMessages(input) {
+    if (input.deviceId !== this.deviceId) {
+      throw new HttpError(400, "invalid_input", "device_id does not match inbox route");
+    }
+    if (input.limit <= 0) {
+      throw new HttpError(400, "invalid_input", "limit must be greater than zero");
+    }
+    const meta = await this.getMeta();
+    const records = [];
+    const upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
+    for (let seq = input.fromSeq; seq <= upper; seq += 1) {
+      const index = await this.state.get(`${RECORD_PREFIX2}${seq}`);
+      if (!index) {
+        continue;
+      }
+      if (index.inlineRecord) {
+        records.push(index.inlineRecord);
+        continue;
+      }
+      if (!index.payloadRef) {
+        throw new HttpError(500, "temporary_unavailable", "record payload reference is missing");
+      }
+      const record = await this.spillStore.getJson(index.payloadRef);
+      if (!record) {
+        continue;
+      }
+      records.push(record);
+    }
+    return {
+      toSeq: records.length > 0 ? records[records.length - 1].seq : meta.headSeq,
+      records
+    };
+  }
+  async ack(input) {
+    if (input.ack.deviceId !== this.deviceId) {
+      throw new HttpError(400, "invalid_input", "ack device_id does not match inbox route");
+    }
+    const meta = await this.getMeta();
+    if (input.ack.ackSeq < meta.ackedSeq) {
+      throw new HttpError(409, "invalid_ack", "ack_seq must not move backwards");
+    }
+    const ackSeq = Math.max(meta.ackedSeq, input.ack.ackSeq);
+    await this.state.put(META_KEY2, { ...meta, ackedSeq: ackSeq });
+    await this.state.setAlarm(Date.now());
+    return { accepted: true, ackSeq };
+  }
+  async getHead() {
+    const meta = await this.getMeta();
+    return { headSeq: meta.headSeq };
+  }
+  async getAllowlist(now = Date.now()) {
+    return await this.state.get(ALLOWLIST_KEY) ?? {
+      version: "0.1",
+      deviceId: this.deviceId,
+      updatedAt: now,
+      allowedSenderUserIds: [],
+      rejectedSenderUserIds: []
+    };
+  }
+  async replaceAllowlist(allowedSenderUserIds, rejectedSenderUserIds, now) {
+    const document = {
+      version: "0.1",
+      deviceId: this.deviceId,
+      updatedAt: now,
+      allowedSenderUserIds: Array.from(new Set(allowedSenderUserIds)).sort(),
+      rejectedSenderUserIds: Array.from(new Set(rejectedSenderUserIds.filter((userId) => !allowedSenderUserIds.includes(userId)))).sort()
+    };
+    await this.state.put(ALLOWLIST_KEY, document);
+    return document;
+  }
+  async listMessageRequests() {
+    const requests = await this.state.get(this.messageRequestIndexKey());
+    if (!requests?.length) {
+      return [];
+    }
+    const items = [];
+    for (const senderUserId of requests) {
+      const entry = await this.state.get(this.messageRequestKey(senderUserId));
+      if (!entry) {
+        continue;
+      }
+      items.push(this.toMessageRequestItem(entry));
+    }
+    items.sort((left, right) => left.firstSeenAt - right.firstSeenAt || left.senderUserId.localeCompare(right.senderUserId));
+    return items;
+  }
+  async acceptMessageRequest(requestId, now) {
+    const entry = await this.findMessageRequest(requestId);
+    if (!entry) {
+      throw new HttpError(404, "not_found", "message request not found");
+    }
+    const allowlist = await this.getAllowlist(now);
+    await this.replaceAllowlist(
+      [...allowlist.allowedSenderUserIds, entry.senderUserId],
+      allowlist.rejectedSenderUserIds.filter((userId) => userId !== entry.senderUserId),
+      now
+    );
+    let promotedCount = 0;
+    for (const request of entry.pendingRequests) {
+      const delivered = await this.deliverEnvelope(request, now);
+      await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
+      promotedCount += delivered.seq === void 0 ? 0 : 1;
+    }
+    await this.deleteMessageRequest(entry.senderUserId, "accepted");
+    return {
+      accepted: true,
+      requestId: entry.requestId,
+      senderUserId: entry.senderUserId,
+      senderBundleShareUrl: entry.senderBundleShareUrl,
+      senderBundleHash: entry.senderBundleHash,
+      senderDisplayName: entry.senderDisplayName,
+      promotedCount
+    };
+  }
+  async rejectMessageRequest(requestId, now) {
+    const entry = await this.findMessageRequest(requestId);
+    if (!entry) {
+      throw new HttpError(404, "not_found", "message request not found");
+    }
+    const allowlist = await this.getAllowlist(now);
+    await this.replaceAllowlist(
+      allowlist.allowedSenderUserIds.filter((userId) => userId !== entry.senderUserId),
+      [...allowlist.rejectedSenderUserIds, entry.senderUserId],
+      now
+    );
+    await this.deleteMessageRequest(entry.senderUserId, "rejected");
+    return {
+      accepted: true,
+      requestId: entry.requestId,
+      senderUserId: entry.senderUserId,
+      senderBundleShareUrl: entry.senderBundleShareUrl,
+      senderBundleHash: entry.senderBundleHash,
+      senderDisplayName: entry.senderDisplayName,
+      promotedCount: 0
+    };
+  }
+  async cleanExpiredRecords(now) {
+    const meta = await this.getMeta();
+    for (let seq = 1; seq <= meta.ackedSeq; seq += 1) {
+      const key = `${RECORD_PREFIX2}${seq}`;
+      const index = await this.state.get(key);
+      if (!index || index.expiresAt === void 0 || index.expiresAt > now) {
+        continue;
+      }
+      if (index.payloadRef) {
+        await this.spillStore.delete(index.payloadRef);
+      }
+      await this.state.delete(key);
+      await this.state.delete(`${IDEMPOTENCY_PREFIX2}${index.messageId}`);
+    }
+  }
+  async getMeta() {
+    return await this.state.get(META_KEY2) ?? this.defaults;
+  }
+  async deliverEnvelope(input, now) {
+    const meta = await this.getMeta();
+    const existingSeq = await this.state.get(`${IDEMPOTENCY_PREFIX2}${input.envelope.messageId}`);
+    if (existingSeq !== void 0) {
+      return { accepted: true, seq: existingSeq, deliveredTo: "inbox" };
+    }
+    const seq = meta.headSeq + 1;
+    const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1e3;
+    const record = {
+      seq,
+      recipientDeviceId: this.deviceId,
+      messageId: input.envelope.messageId,
+      receivedAt: now,
+      expiresAt,
+      state: "available",
+      envelope: input.envelope
+    };
+    const serialized = JSON.stringify(record);
+    const storageKey = `${RECORD_PREFIX2}${seq}`;
+    if (new TextEncoder().encode(serialized).byteLength <= meta.maxInlineBytes && input.envelope.inlineCiphertext) {
+      const inlineIndex = {
+        seq,
+        messageId: record.messageId,
+        recipientDeviceId: record.recipientDeviceId,
+        receivedAt: record.receivedAt,
+        expiresAt,
+        state: record.state,
+        inlineRecord: record
+      };
+      await this.state.put(storageKey, inlineIndex);
+    } else {
+      const payloadRef = `inbox-payload/${this.deviceId}/${seq}.json`;
+      await this.spillStore.putJson(payloadRef, record);
+      const indexed = {
+        seq,
+        messageId: record.messageId,
+        recipientDeviceId: record.recipientDeviceId,
+        receivedAt: record.receivedAt,
+        expiresAt,
+        state: record.state,
+        payloadRef
+      };
+      await this.state.put(storageKey, indexed);
+    }
+    await this.state.put(`${IDEMPOTENCY_PREFIX2}${record.messageId}`, seq);
+    await this.state.put(META_KEY2, { ...meta, headSeq: seq });
+    await this.state.setAlarm(expiresAt);
+    this.publish({
+      event: "head_updated",
+      deviceId: this.deviceId,
+      seq
+    });
+    this.publish({
+      event: "inbox_record_available",
+      deviceId: this.deviceId,
+      seq,
+      record
+    });
+    return { accepted: true, seq, deliveredTo: "inbox" };
+  }
+  async queueMessageRequest(input, now) {
+    const senderUserId = input.envelope.senderUserId;
+    const key = this.messageRequestKey(senderUserId);
+    const requestId = this.requestIdForSender(senderUserId);
+    const existing = await this.state.get(key);
+    const entry = existing ?? {
+      requestId,
+      recipientDeviceId: this.deviceId,
+      senderUserId,
+      senderBundleShareUrl: input.senderBundleShareUrl,
+      senderBundleHash: input.senderBundleHash,
+      senderDisplayName: input.senderDisplayName,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      messageCount: 0,
+      lastMessageId: input.envelope.messageId,
+      lastConversationId: input.envelope.conversationId,
+      pendingRequests: []
+    };
+    entry.senderBundleShareUrl ??= input.senderBundleShareUrl;
+    entry.senderBundleHash ??= input.senderBundleHash;
+    entry.senderDisplayName ??= input.senderDisplayName;
+    entry.lastSeenAt = now;
+    entry.messageCount += 1;
+    entry.lastMessageId = input.envelope.messageId;
+    entry.lastConversationId = input.envelope.conversationId;
+    entry.pendingRequests.push(input);
+    await this.state.put(key, entry);
+    await this.addMessageRequestIndex(senderUserId);
+    this.publish({
+      event: "message_request_changed",
+      deviceId: this.deviceId,
+      senderUserId,
+      requestId,
+      change: "queued"
+    });
+    return {
+      accepted: true,
+      seq: 0,
+      deliveredTo: "message_request",
+      queuedAsRequest: true,
+      requestId
+    };
+  }
+  async enforceRateLimit(senderUserId, now) {
+    const meta = await this.getMeta();
+    const minuteLimit = meta.rateLimitPerMinute;
+    const hourLimit = meta.rateLimitPerHour;
+    if (minuteLimit <= 0 && hourLimit <= 0) {
+      return;
+    }
+    const key = `${RATE_LIMIT_PREFIX}${senderUserId}`;
+    const minuteWindowStart = Math.floor(now / 6e4) * 6e4;
+    const hourWindowStart = Math.floor(now / 36e5) * 36e5;
+    const state = await this.state.get(key) ?? {
+      minuteWindowStart,
+      minuteCount: 0,
+      hourWindowStart,
+      hourCount: 0
+    };
+    if (state.minuteWindowStart !== minuteWindowStart) {
+      state.minuteWindowStart = minuteWindowStart;
+      state.minuteCount = 0;
+    }
+    if (state.hourWindowStart !== hourWindowStart) {
+      state.hourWindowStart = hourWindowStart;
+      state.hourCount = 0;
+    }
+    if (minuteLimit > 0 && state.minuteCount >= minuteLimit) {
+      throw new HttpError(429, "rate_limited", "append rate limit exceeded for minute window");
+    }
+    if (hourLimit > 0 && state.hourCount >= hourLimit) {
+      throw new HttpError(429, "rate_limited", "append rate limit exceeded for hour window");
+    }
+    state.minuteCount += 1;
+    state.hourCount += 1;
+    await this.state.put(key, state);
+  }
+  publish(event) {
+    const payload = JSON.stringify(event);
+    for (const session of this.sessions) {
+      session.send(payload);
+    }
+  }
+  validateAppendRequest(input) {
+    if (input.recipientDeviceId !== this.deviceId) {
+      throw new HttpError(400, "invalid_input", "recipient_device_id does not match inbox route");
+    }
+    if (input.envelope.recipientDeviceId !== this.deviceId) {
+      throw new HttpError(400, "invalid_input", "envelope recipient_device_id does not match inbox route");
+    }
+    if (!input.envelope.messageId || !input.envelope.conversationId || !input.envelope.senderUserId) {
+      throw new HttpError(400, "invalid_input", "append request is missing required envelope fields");
+    }
+    const hasInline = Boolean(input.envelope.inlineCiphertext);
+    const hasStorageRefs = (input.envelope.storageRefs?.length ?? 0) > 0;
+    if (!hasInline && !hasStorageRefs) {
+      throw new HttpError(400, "invalid_input", "envelope must include inline_ciphertext or storage_refs");
+    }
+  }
+  requestIdForSender(senderUserId) {
+    return `request:${senderUserId}`;
+  }
+  messageRequestKey(senderUserId) {
+    return `${MESSAGE_REQUEST_PREFIX}${senderUserId}`;
+  }
+  messageRequestIndexKey() {
+    return `${MESSAGE_REQUEST_PREFIX}index`;
+  }
+  async addMessageRequestIndex(senderUserId) {
+    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    if (!index.includes(senderUserId)) {
+      index.push(senderUserId);
+      index.sort();
+      await this.state.put(this.messageRequestIndexKey(), index);
+    }
+  }
+  async deleteMessageRequest(senderUserId, change) {
+    const existing = await this.state.get(this.messageRequestKey(senderUserId));
+    await this.state.delete(this.messageRequestKey(senderUserId));
+    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    await this.state.put(
+      this.messageRequestIndexKey(),
+      index.filter((entry) => entry !== senderUserId)
+    );
+    if (existing) {
+      this.publish({
+        event: "message_request_changed",
+        deviceId: this.deviceId,
+        senderUserId,
+        requestId: existing.requestId,
+        change
+      });
+    }
+  }
+  async findMessageRequest(requestId) {
+    const requests = await this.listMessageRequests();
+    const match = requests.find((request) => request.requestId === requestId);
+    if (!match) {
+      return null;
+    }
+    return await this.state.get(this.messageRequestKey(match.senderUserId)) ?? null;
+  }
+  toMessageRequestItem(entry) {
+    const groupInvite = this.groupInviteMetadata(entry);
+    return {
+      requestId: entry.requestId,
+      recipientDeviceId: entry.recipientDeviceId,
+      senderUserId: entry.senderUserId,
+      senderBundleShareUrl: entry.senderBundleShareUrl,
+      senderBundleHash: entry.senderBundleHash,
+      senderDisplayName: entry.senderDisplayName,
+      firstSeenAt: entry.firstSeenAt,
+      lastSeenAt: entry.lastSeenAt,
+      messageCount: entry.messageCount,
+      lastMessageId: entry.lastMessageId,
+      lastConversationId: entry.lastConversationId,
+      requestKind: groupInvite ? "group_invite" : "direct",
+      groupId: groupInvite?.groupId,
+      groupTitle: groupInvite?.title
+    };
+  }
+  groupInviteMetadata(entry) {
+    for (let index = entry.pendingRequests.length - 1; index >= 0; index -= 1) {
+      const request = entry.pendingRequests[index];
+      if (request.envelope.messageType !== "control_group_welcome_pickup") {
+        continue;
+      }
+      const encoded = request.envelope.inlineCiphertext;
+      if (!encoded) {
+        return null;
+      }
+      try {
+        const payload = JSON.parse(atob(encoded));
+        if (payload.groupId && payload.title) {
+          return payload;
+        }
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+};
+
+// src/inbox/durable.ts
+var DurableObjectStorageAdapter2 = class {
+  storage;
+  constructor(storage) {
+    this.storage = storage;
+  }
+  async get(key) {
+    return await this.storage.get(key) ?? void 0;
+  }
+  async put(key, value) {
+    await this.storage.put(key, value);
+  }
+  async delete(key) {
+    await this.storage.delete(key);
+  }
+  async list(options) {
+    return this.storage.list(options);
+  }
+  async setAlarm(epochMillis) {
+    await this.storage.setAlarm(epochMillis);
+  }
+};
+var R2JsonBlobStore2 = class {
+  bucket;
+  constructor(bucket) {
+    this.bucket = bucket;
+  }
+  async putJson(key, value) {
+    await this.bucket.put(key, JSON.stringify(value));
+  }
+  async getJson(key) {
+    const object = await this.bucket.get(key);
+    if (!object) {
+      return null;
+    }
+    return await object.json();
+  }
+  async putBytes(key, value) {
+    await this.bucket.put(key, value);
+  }
+  async getBytes(key) {
+    const object = await this.bucket.get(key);
+    if (!object) {
+      return null;
+    }
+    return object.arrayBuffer();
+  }
+  async delete(key) {
+    await this.bucket.delete(key);
+  }
+};
+function versionedBody2(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return body;
+  }
+  const record = body;
+  if (record.version !== void 0) {
+    return body;
+  }
+  return {
+    version: "0.1",
+    ...record
+  };
+}
+function jsonResponse2(body, status = 200) {
+  return new Response(JSON.stringify(versionedBody2(body)), {
+    status,
+    headers: {
+      "content-type": "application/json"
+    }
+  });
+}
+var DurableObjectBase2 = globalThis.DurableObject ?? class {
+  constructor(_state, _env) {
+  }
+};
+async function handleInboxDurableRequest(request, deps) {
+  const now = deps.now ?? Date.now();
+  const url = new URL(request.url);
+  const service = new InboxService(deps.deviceId, deps.state, deps.spillStore, deps.sessions, {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: deps.retentionDays,
+    maxInlineBytes: deps.maxInlineBytes,
+    rateLimitPerMinute: deps.rateLimitPerMinute,
+    rateLimitPerHour: deps.rateLimitPerHour
+  });
+  try {
+    if (url.pathname.endsWith("/subscribe")) {
+      if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        throw new HttpError(400, "invalid_input", "subscribe requires websocket upgrade");
+      }
+      if (!deps.onUpgrade) {
+        throw new HttpError(500, "temporary_unavailable", "websocket upgrade handler is unavailable");
+      }
+      return deps.onUpgrade();
+    }
+    if (url.pathname.endsWith("/message-requests") && request.method === "GET") {
+      return jsonResponse2({ requests: await service.listMessageRequests() });
+    }
+    const requestActionMatch = url.pathname.match(/\/message-requests\/([^/]+)\/(accept|reject)$/);
+    if (requestActionMatch && request.method === "POST") {
+      const requestId = decodeURIComponent(requestActionMatch[1]);
+      const action = requestActionMatch[2];
+      const result = action === "accept" ? await service.acceptMessageRequest(requestId, now) : await service.rejectMessageRequest(requestId, now);
+      return jsonResponse2(result);
+    }
+    if (url.pathname.endsWith("/allowlist") && request.method === "GET") {
+      return jsonResponse2(await service.getAllowlist(now));
+    }
+    if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
+      const body = await request.json();
+      const result = await service.replaceAllowlist(
+        body.allowedSenderUserIds ?? [],
+        body.rejectedSenderUserIds ?? [],
+        now
+      );
+      return jsonResponse2(result);
+    }
+    if (url.pathname.endsWith("/messages") && request.method === "POST") {
+      const body = await request.json();
+      const result = await service.appendEnvelope(body, now);
+      return jsonResponse2(result);
+    }
+    if (url.pathname.endsWith("/messages") && request.method === "GET") {
+      const fromSeq = Number(url.searchParams.get("fromSeq") ?? "1");
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      const result = await service.fetchMessages({
+        deviceId: deps.deviceId,
+        fromSeq,
+        limit
+      });
+      return jsonResponse2({
+        toSeq: result.toSeq,
+        records: result.records
+      });
+    }
+    if (url.pathname.endsWith("/ack") && request.method === "POST") {
+      const body = await request.json();
+      const result = await service.ack(body);
+      return jsonResponse2({
+        accepted: result.accepted,
+        ackSeq: result.ackSeq
+      });
+    }
+    if (url.pathname.endsWith("/head") && request.method === "GET") {
+      const result = await service.getHead();
+      return jsonResponse2(result);
+    }
+    return jsonResponse2({ error: "not_found" }, 404);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return jsonResponse2({ error: error.code, message: error.message }, error.status);
+    }
+    const runtimeError = error;
+    const message = runtimeError.message ?? "internal error";
+    return jsonResponse2({ error: "temporary_unavailable", message }, 500);
+  }
+}
+var InboxDurableObject = class extends DurableObjectBase2 {
+  sessions = /* @__PURE__ */ new Map();
+  stateRef;
+  envRef;
+  constructor(state, env) {
+    super(state, env);
+    this.stateRef = state;
+    this.envRef = env;
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
+    const deviceId = decodeURIComponent(match?.[1] ?? "");
+    return handleInboxDurableRequest(request, {
+      deviceId,
+      state: new DurableObjectStorageAdapter2(this.stateRef.storage),
+      spillStore: new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
+      sessions: Array.from(this.sessions.values()).map(
+        (session) => ({
+          send(payload) {
+            session.send(payload);
+          }
+        })
+      ),
+      maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
+      retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
+      rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
+      rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+      onUpgrade: () => {
+        const pair = new WebSocketPair();
+        const client = pair[0];
+        const server = pair[1];
+        server.accept();
+        const sessionId = crypto.randomUUID();
+        const session = new ManagedSession2(server);
+        this.sessions.set(sessionId, session);
+        queueMicrotask(() => {
+          session.markReady();
+        });
+        server.addEventListener("close", () => {
+          this.sessions.delete(sessionId);
+        });
+        return new Response(null, {
+          status: 101,
+          webSocket: client
+        });
+      }
+    });
+  }
+  async alarm() {
+    const service = new InboxService(
+      "",
+      new DurableObjectStorageAdapter2(this.stateRef.storage),
+      new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
+      [],
+      {
+        headSeq: 0,
+        ackedSeq: 0,
+        retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
+        maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
+        rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
+        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600")
+      }
+    );
+    await service.cleanExpiredRecords(Date.now());
+  }
+};
+var ManagedSession2 = class {
+  socket;
+  ready = false;
+  queuedPayloads = [];
+  constructor(socket) {
+    this.socket = socket;
+  }
+  send(payload) {
+    if (!this.ready) {
+      this.queuedPayloads.push(payload);
+      return;
+    }
+    this.dispatch(payload);
+  }
+  markReady() {
+    if (this.ready) {
+      return;
+    }
+    this.ready = true;
+    while (this.queuedPayloads.length > 0) {
+      const payload = this.queuedPayloads.shift();
+      if (payload === void 0) {
+        break;
+      }
+      this.dispatch(payload);
+    }
+  }
+  dispatch(payload) {
+    setTimeout(() => {
+      this.socket.send(payload);
+    }, 0);
+  }
+};
+
+// src/storage/shared-state.ts
+function sanitizeSegment(value) {
+  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
+}
+var SharedStateService = class {
+  store;
+  baseUrl;
+  constructor(store, baseUrl2) {
+    this.store = store;
+    this.baseUrl = baseUrl2;
+  }
+  identityBundleKey(userId) {
+    return `shared-state/${sanitizeSegment(userId)}/identity_bundle.json`;
+  }
+  deviceListKey(userId) {
+    return `shared-state/${sanitizeSegment(userId)}/device_list.json`;
+  }
+  deviceStatusKey(userId) {
+    return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
+  }
+  keyPackageRefsKey(userId, deviceId) {
+    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/refs.json`;
+  }
+  keyPackageObjectKey(userId, deviceId, keyPackageId) {
+    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/${sanitizeSegment(keyPackageId)}.bin`;
+  }
+  identityBundleUrl(userId) {
+    return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
+  }
+  deviceStatusUrl(userId) {
+    return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/device-status`;
+  }
+  keyPackageRefsUrl(userId, deviceId) {
+    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}`;
+  }
+  keyPackageObjectUrl(userId, deviceId, keyPackageId) {
+    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/${encodeURIComponent(keyPackageId)}`;
+  }
+  async getIdentityBundle(userId) {
+    return this.store.getJson(this.identityBundleKey(userId));
+  }
+  async putIdentityBundle(userId, bundle) {
+    if (bundle.userId !== userId) {
+      throw new HttpError(400, "invalid_input", "identity bundle userId does not match request path");
+    }
+    const normalized = {
+      ...bundle,
+      identityBundleRef: this.identityBundleUrl(userId),
+      deviceStatusRef: bundle.deviceStatusRef ?? this.deviceStatusUrl(userId),
+      devices: bundle.devices.map((device) => ({
+        ...device,
+        keypackageRef: {
+          ...device.keypackageRef,
+          userId,
+          deviceId: device.deviceId,
+          ref: device.keypackageRef.ref
+        }
+      }))
+    };
+    await this.store.putJson(this.identityBundleKey(userId), normalized);
+    await this.store.putJson(this.deviceListKey(userId), this.buildDeviceListDocument(normalized));
+  }
+  async getDeviceList(userId) {
+    return this.store.getJson(this.deviceListKey(userId));
+  }
+  async getDeviceStatus(userId) {
+    return this.store.getJson(this.deviceStatusKey(userId));
+  }
+  async putDeviceStatus(userId, document) {
+    if (document.userId !== userId) {
+      throw new HttpError(400, "invalid_input", "device status userId does not match request path");
+    }
+    for (const device of document.devices) {
+      if (device.userId !== userId) {
+        throw new HttpError(400, "invalid_input", "device status entry userId does not match request path");
+      }
+    }
+    await this.store.putJson(this.deviceStatusKey(userId), document);
+  }
+  async getKeyPackageRefs(userId, deviceId) {
+    return this.store.getJson(this.keyPackageRefsKey(userId, deviceId));
+  }
+  async putKeyPackageRefs(userId, deviceId, document) {
+    if (document.userId !== userId || document.deviceId !== deviceId) {
+      throw new HttpError(400, "invalid_input", "keypackage refs scope does not match request path");
+    }
+    for (const entry of document.refs) {
+      if (!entry.ref || !entry.ref.startsWith(this.keyPackageRefsUrl(userId, deviceId))) {
+        throw new HttpError(400, "invalid_input", "keypackage ref must be a concrete object URL");
+      }
+    }
+    await this.store.putJson(this.keyPackageRefsKey(userId, deviceId), document);
+  }
+  async putKeyPackageObject(userId, deviceId, keyPackageId, body) {
+    await this.store.putBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId), body, {
+      "content-type": "application/octet-stream"
+    });
+  }
+  async getKeyPackageObject(userId, deviceId, keyPackageId) {
+    return this.store.getBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId));
+  }
+  buildDeviceListDocument(bundle) {
+    return {
+      version: bundle.version,
+      userId: bundle.userId,
+      updatedAt: bundle.updatedAt,
+      devices: bundle.devices.map((device) => ({
+        deviceId: device.deviceId,
+        status: device.status
+      }))
+    };
+  }
+};
+
+// src/storage/service.ts
+var MAX_BLOB_BYTES = 25 * 1024 * 1024;
+var MAX_MIME_TYPE_LENGTH = 255;
+var MAX_FILE_NAME_BYTES = 255;
+function sanitizeSegment2(value) {
+  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
+}
+function requireNonEmpty(value, field) {
+  if (!value || value.trim().length === 0) {
+    throw new HttpError(400, "invalid_input", `${field} is required`);
+  }
+  return value;
+}
+function validateMimeType(mimeType) {
+  if (mimeType.trim().length === 0 || mimeType.length > MAX_MIME_TYPE_LENGTH || /[\r\n]/.test(mimeType)) {
+    throw new HttpError(400, "invalid_input", "mime type is invalid");
+  }
+}
+function validateFileName(fileName) {
+  if (fileName === void 0) {
+    return;
+  }
+  if (fileName.trim().length === 0 || fileName.length > MAX_FILE_NAME_BYTES || /[\/\\\0\r\n]/.test(fileName)) {
+    throw new HttpError(400, "invalid_input", "file name is invalid");
+  }
+}
+var StorageService = class {
+  store;
+  baseUrl;
+  secret;
+  constructor(store, baseUrl2, secret) {
+    this.store = store;
+    this.baseUrl = baseUrl2;
+    this.secret = secret;
+  }
+  async prepareUpload(input, owner, now) {
+    const taskId = requireNonEmpty(input.taskId, "taskId");
+    const conversationId = requireNonEmpty(input.conversationId, "conversationId");
+    const messageId = requireNonEmpty(input.messageId, "messageId");
+    validateMimeType(input.mimeType);
+    validateFileName(input.fileName);
+    if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_BLOB_BYTES) {
+      throw new HttpError(400, "invalid_input", "sizeBytes is outside supported limits");
+    }
+    const storageScope = input.storageScope ?? (input.groupId ? "group" : "direct");
+    if (storageScope !== "direct" && storageScope !== "group") {
+      throw new HttpError(400, "invalid_input", "storageScope is invalid");
+    }
+    if (storageScope === "group" && (!input.groupId || input.groupId.trim().length === 0)) {
+      throw new HttpError(400, "invalid_input", "groupId is required for group storage");
+    }
+    const blobKey = [
+      "blob",
+      sanitizeSegment2(owner.userId),
+      sanitizeSegment2(owner.deviceId),
+      storageScope,
+      storageScope === "group" ? sanitizeSegment2(input.groupId) : "direct",
+      sanitizeSegment2(conversationId),
+      `${sanitizeSegment2(messageId)}-${sanitizeSegment2(taskId)}`
+    ].join("/");
+    const expiresAt = now + 15 * 60 * 1e3;
+    const uploadToken = await signSharingPayload(this.secret, {
+      action: "upload",
+      blobKey,
+      sizeBytes: input.sizeBytes,
+      expiresAt
+    });
+    const downloadToken = await signSharingPayload(this.secret, {
+      action: "download",
+      blobKey,
+      expiresAt
+    });
+    return {
+      blobRef: blobKey,
+      uploadTarget: `${this.baseUrl}/v1/storage/upload/${encodeURIComponent(blobKey)}?token=${encodeURIComponent(uploadToken)}`,
+      uploadHeaders: {
+        "content-type": input.mimeType
+      },
+      downloadTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}?token=${encodeURIComponent(downloadToken)}`,
+      expiresAt
+    };
+  }
+  async uploadBlob(blobKey, token, body, metadata, now) {
+    const payload = await this.verifyToken(token, now);
+    if (payload.action !== "upload" || payload.blobKey !== blobKey) {
+      throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
+    }
+    if (!Number.isSafeInteger(payload.sizeBytes) || body.byteLength !== payload.sizeBytes) {
+      throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
+    }
+    await this.store.putBytes(blobKey, body, metadata);
+  }
+  async fetchBlob(blobKey, token, now) {
+    const payload = await this.verifyToken(token, now);
+    if (payload.action !== "download" || payload.blobKey !== blobKey) {
+      throw new HttpError(403, "invalid_capability", "download token is not valid for this blob");
+    }
+    const object = await this.store.getBytes(blobKey);
+    if (!object) {
+      throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    return object;
+  }
+  async putJson(key, value) {
+    await this.store.putJson(key, value);
+  }
+  async getJson(key) {
+    return this.store.getJson(key);
+  }
+  async delete(key) {
+    await this.store.delete(key);
+  }
+  async verifyToken(token, now) {
+    try {
+      return await verifySharingPayload(this.secret, token, now);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "invalid sharing token";
+      if (message.includes("expired")) {
+        throw new HttpError(403, "capability_expired", message);
+      }
+      throw new HttpError(403, "invalid_capability", message);
+    }
+  }
+};
+
+// src/welcome-pickup/service.ts
+function pickupKey(groupId, deviceId) {
+  return `welcome-pickup/${groupId}/${deviceId}.json`;
+}
+var WelcomePickupService = class {
+  store;
+  constructor(store) {
+    this.store = store;
+  }
+  async put(request, now) {
+    this.validateDescriptor(request.descriptor, now);
+    if (!request.welcomeB64?.trim()) {
+      throw new HttpError(400, "invalid_input", "welcome_b64 must not be empty");
+    }
+    await this.store.putJson(pickupKey(request.descriptor.groupId, request.descriptor.deviceId), {
+      descriptor: request.descriptor,
+      welcomeB64: request.welcomeB64,
+      manifest: request.manifest,
+      storedAt: now
+    });
+    return { accepted: true };
+  }
+  async fetch(descriptor, now) {
+    this.validateDescriptor(descriptor, now);
+    const stored = await this.store.getJson(pickupKey(descriptor.groupId, descriptor.deviceId));
+    if (!stored) {
+      throw new HttpError(404, "not_found", "welcome pickup not found");
+    }
+    if (stored.descriptor.capability !== descriptor.capability) {
+      throw new HttpError(403, "invalid_capability", "welcome pickup capability does not match stored descriptor");
+    }
+    if (stored.descriptor.expiresAt <= now) {
+      await this.store.delete(pickupKey(descriptor.groupId, descriptor.deviceId));
+      throw new HttpError(403, "capability_expired", "welcome pickup capability is expired");
+    }
+    return { welcomeB64: stored.welcomeB64, manifest: stored.manifest };
+  }
+  validateDescriptor(descriptor, now) {
+    if (!descriptor.groupId || !descriptor.deviceId || !descriptor.endpoint || !descriptor.capability) {
+      throw new HttpError(400, "invalid_input", "welcome pickup descriptor is missing required fields");
+    }
+    if (descriptor.expiresAt <= now) {
+      throw new HttpError(403, "capability_expired", "welcome pickup capability is expired");
+    }
+  }
+};
+
+// src/routes/http.ts
+function versionedBody3(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return body;
+  }
+  const record = body;
+  if (record.version !== void 0) {
+    return body;
+  }
+  return {
+    version: CURRENT_MODEL_VERSION,
+    ...record
+  };
+}
+function jsonResponse3(body, status = 200) {
+  return new Response(JSON.stringify(versionedBody3(body)), {
+    status,
+    headers: {
+      "content-type": "application/json"
+    }
+  });
+}
+function forwardRequestWithBody(request, body) {
+  return new Request(request.url, {
+    method: request.method,
+    headers: new Headers(request.headers),
+    body
+  });
+}
+var R2JsonBlobStore3 = class {
+  bucket;
+  constructor(bucket) {
+    this.bucket = bucket;
+  }
+  async putJson(key, value) {
+    await this.bucket.put(key, JSON.stringify(value));
+  }
+  async getJson(key) {
+    const object = await this.bucket.get(key);
+    if (!object) {
+      return null;
+    }
+    return await object.json();
+  }
+  async putBytes(key, value, metadata) {
+    await this.bucket.put(key, value, metadata ? { httpMetadata: metadata } : void 0);
+  }
+  async getBytes(key) {
+    const object = await this.bucket.get(key);
+    if (!object) {
+      return null;
+    }
+    return object.arrayBuffer();
+  }
+  async delete(key) {
+    await this.bucket.delete(key);
+  }
+};
+function baseUrl(request, env) {
+  return env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, "") ?? new URL(request.url).origin;
+}
+function sharedStateSecret(env) {
+  return env.SHARING_TOKEN_SECRET ?? "replace-me";
+}
+function bootstrapSecret(env) {
+  return env.BOOTSTRAP_TOKEN_SECRET ?? env.SHARING_TOKEN_SECRET ?? "replace-me";
+}
+function runtimeScopes() {
+  return [
+    "inbox_read",
+    "inbox_ack",
+    "inbox_subscribe",
+    "inbox_manage",
+    "storage_prepare_upload",
+    "shared_state_write",
+    "keypackage_write"
+  ];
+}
+async function issueDeviceRuntimeAuth(env, userId, deviceId, now) {
+  const expiresAt = now + 24 * 60 * 60 * 1e3;
+  const scopes = runtimeScopes();
+  const token = await signSharingPayload(sharedStateSecret(env), {
+    version: CURRENT_MODEL_VERSION,
+    service: "device_runtime",
+    userId,
+    deviceId,
+    scopes,
+    expiresAt
+  });
+  return {
+    scheme: "bearer",
+    token,
+    expiresAt,
+    userId,
+    deviceId,
+    scopes
+  };
+}
+function publicDeploymentBundle(request, env) {
+  return {
+    version: CURRENT_MODEL_VERSION,
+    region: env.DEPLOYMENT_REGION ?? "local",
+    inboxHttpEndpoint: baseUrl(request, env),
+    inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
+    storageBaseInfo: {
+      baseUrl: baseUrl(request, env),
+      bucketHint: "tapchat-storage"
+    },
+    runtimeConfig: {
+      supportedRealtimeKinds: ["websocket"],
+      identityBundleRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/identity-bundle`,
+      deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
+      keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
+      maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
+      features: [
+        "generic_sync",
+        "attachment_v1",
+        "message_requests",
+        "allowlist",
+        "rate_limit",
+        "group_outbox_mvp",
+        "welcome_pickup_mvp",
+        "short_group_invite",
+        "group_member_subscribe"
+      ]
+    }
+  };
+}
+async function authorizeSharedStateWrite(request, env, userId, objectKind, now) {
+  try {
+    const auth = await validateAnyDeviceRuntimeAuthorization(request, sharedStateSecret(env), "shared_state_write", now);
+    if (auth.userId !== userId) {
+      throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+    }
+    return;
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+      throw error;
+    }
+  }
+  await validateSharedStateWriteAuthorization(request, sharedStateSecret(env), userId, "", objectKind, now);
+}
+async function handleRequest(request, env) {
+  const url = new URL(request.url);
+  const store = new StorageService(
+    new R2JsonBlobStore3(env.TAPCHAT_STORAGE),
+    baseUrl(request, env),
+    sharedStateSecret(env)
+  );
+  const sharedState = new SharedStateService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE), baseUrl(request, env));
+  const welcomePickup = new WelcomePickupService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE));
+  const now = Date.now();
+  try {
+    if (request.method === "GET" && url.pathname === "/v1/deployment-bundle") {
+      return jsonResponse3(publicDeploymentBundle(request, env));
+    }
+    const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
+    if (contactShareMatch && request.method === "GET") {
+      const token = decodeURIComponent(contactShareMatch[1]);
+      const payload = await verifySharingPayload(sharedStateSecret(env), token, now);
+      if (payload.service !== "contact_share" || !payload.userId || !payload.shareId) {
+        throw new HttpError(403, "invalid_capability", "invalid contact share token");
+      }
+      const bundle = await sharedState.getIdentityBundle(payload.userId);
+      if (!bundle || bundle.bundleShareId !== payload.shareId) {
+        return jsonResponse3({ error: "not_found", message: "contact share not found" }, 404);
+      }
+      return jsonResponse3(bundle);
+    }
+    if (request.method === "POST" && url.pathname === "/v1/bootstrap/device") {
+      const body = await request.json();
+      if (body.version !== CURRENT_MODEL_VERSION) {
+        throw new HttpError(400, "unsupported_version", "bootstrap request version is not supported");
+      }
+      await validateBootstrapAuthorization(request, bootstrapSecret(env), body.userId, body.deviceId, now);
+      const bundle = {
+        ...publicDeploymentBundle(request, env),
+        deviceRuntimeAuth: await issueDeviceRuntimeAuth(env, body.userId, body.deviceId, now),
+        expectedUserId: body.userId,
+        expectedDeviceId: body.deviceId
+      };
+      return jsonResponse3(bundle);
+    }
+    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
+    if (inboxMatch) {
+      const deviceId = decodeURIComponent(inboxMatch[1]);
+      const operation = inboxMatch[2];
+      const objectId = env.INBOX.idFromName(deviceId);
+      const stub = env.INBOX.get(objectId);
+      if (request.method === "POST" && operation === "messages") {
+        const bodyText = await request.text();
+        const body = JSON.parse(bodyText);
+        validateAppendAuthorization(request, deviceId, body, now);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+      } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
+        await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_read", now);
+      } else if (request.method === "POST" && operation === "ack") {
+        await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_ack", now);
+      } else if (operation === "subscribe") {
+        await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_subscribe", now);
+      } else if (operation === "allowlist" || operation === "message-requests" || operation.startsWith("message-requests/")) {
+        await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_manage", now);
+      }
+      return stub.fetch(request);
+    }
+    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head|seal|subscribe)$/);
+    if (groupOutboxMatch) {
+      const groupId = decodeURIComponent(groupOutboxMatch[1]);
+      const operation = groupOutboxMatch[2];
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      const stub = env.GROUP_OUTBOX.get(objectId);
+      if (request.method === "POST" && operation === "messages") {
+        const bodyText = await request.text();
+        const body = JSON.parse(bodyText);
+        validateGroupAppendAuthorization(request, groupId, body, now);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+      } else if (request.method === "POST" && operation === "seal") {
+        validateGroupOperationAuthorization(
+          request,
+          groupId,
+          readGroupCapabilityHeader(request),
+          now,
+          "seal_group",
+          ["owner"]
+        );
+      } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
+        validateGroupReadAuthorization(request, groupId, readGroupCapabilityHeader(request), now);
+      } else if (operation === "subscribe") {
+        validateGroupOperationAuthorization(
+          request,
+          groupId,
+          readGroupCapabilityHeader(request),
+          now,
+          "subscribe",
+          ["owner", "admin", "member"]
+        );
+      }
+      return stub.fetch(request);
+    }
+    const shortPublicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
+    if (shortPublicInviteMatch && request.method === "GET") {
+      const groupId = decodeURIComponent(shortPublicInviteMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+    const publicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)$/);
+    if (publicInviteMatch && request.method === "GET") {
+      let payload;
+      try {
+        payload = await verifySharingPayload(
+          sharedStateSecret(env),
+          decodeURIComponent(publicInviteMatch[1]),
+          now
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "invalid group invite token";
+        throw new HttpError(message.includes("expired") ? 403 : 403, message.includes("expired") ? "capability_expired" : "invalid_capability", message);
+      }
+      if (payload.service !== "group_invite" || !payload.groupId || !payload.inviteId) {
+        throw new HttpError(403, "invalid_capability", "group invite token is malformed");
+      }
+      const objectId = env.GROUP_OUTBOX.idFromName(payload.groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+    const groupInviteMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/invites(?:\/([^/]+)\/revoke)?$/);
+    if (groupInviteMatch && request.method === "POST") {
+      const groupId = decodeURIComponent(groupInviteMatch[1]);
+      const bodyText = await request.text();
+      const body = JSON.parse(bodyText);
+      validateGroupOperationAuthorization(request, groupId, body.capability, now, "manage_invites");
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+    }
+    const joinCollectionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests$/);
+    if (joinCollectionMatch) {
+      const groupId = decodeURIComponent(joinCollectionMatch[1]);
+      if (request.method === "POST") {
+        const token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim();
+        if (!token) {
+          throw new HttpError(401, "invalid_capability", "missing group invite bearer token");
+        }
+        let payload;
+        try {
+          payload = await verifySharingPayload(sharedStateSecret(env), token, now);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "invalid group invite token";
+          throw new HttpError(
+            message.includes("expired") ? 403 : 403,
+            message.includes("expired") ? "capability_expired" : "invalid_capability",
+            message
+          );
+        }
+        if (payload.service !== "group_invite" || payload.groupId !== groupId) {
+          throw new HttpError(403, "invalid_capability", "group invite token scope does not match request");
+        }
+      } else if (request.method === "GET") {
+        validateGroupOperationAuthorization(request, groupId, readGroupCapabilityHeader(request), now, "approve_join");
+      }
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+    const joinDecisionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/decision$/);
+    if (joinDecisionMatch && request.method === "POST") {
+      const groupId = decodeURIComponent(joinDecisionMatch[1]);
+      const bodyText = await request.text();
+      const body = JSON.parse(bodyText);
+      validateGroupOperationAuthorization(request, groupId, body.capability, now, "approve_join");
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+    }
+    const joinStatusMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)$/);
+    if (joinStatusMatch && request.method === "GET") {
+      const groupId = decodeURIComponent(joinStatusMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+    const welcomePickupMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/welcome-pickup\/([^/]+)$/);
+    if (welcomePickupMatch) {
+      const groupId = decodeURIComponent(welcomePickupMatch[1]);
+      const deviceId = decodeURIComponent(welcomePickupMatch[2]);
+      if (request.method === "PUT") {
+        const body = await request.json();
+        validateWelcomePickupAuthorization(request, groupId, deviceId, body.descriptor, now);
+        return jsonResponse3(await welcomePickup.put(body, now));
+      }
+      if (request.method === "GET") {
+        const encoded = request.headers.get("X-Tapchat-Welcome-Pickup");
+        if (!encoded) {
+          throw new HttpError(401, "invalid_capability", "missing X-Tapchat-Welcome-Pickup header");
+        }
+        let descriptor;
+        try {
+          descriptor = JSON.parse(encoded);
+        } catch {
+          throw new HttpError(400, "invalid_capability", "X-Tapchat-Welcome-Pickup is not valid JSON");
+        }
+        validateWelcomePickupAuthorization(request, groupId, deviceId, descriptor, now);
+        return jsonResponse3(await welcomePickup.fetch(descriptor, now));
+      }
+    }
+    const identityBundleMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/identity-bundle$/);
+    if (identityBundleMatch) {
+      const userId = decodeURIComponent(identityBundleMatch[1]);
+      if (request.method === "GET") {
+        const bundle = await sharedState.getIdentityBundle(userId);
+        if (!bundle) {
+          return jsonResponse3({ error: "not_found", message: "identity bundle not found" }, 404);
+        }
+        return jsonResponse3(bundle);
+      }
+      if (request.method === "PUT") {
+        await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
+        const body = await request.json();
+        await sharedState.putIdentityBundle(userId, body);
+        const saved = await sharedState.getIdentityBundle(userId);
+        return jsonResponse3(saved);
+      }
+    }
+    const deviceStatusMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-status$/);
+    if (deviceStatusMatch) {
+      const userId = decodeURIComponent(deviceStatusMatch[1]);
+      if (request.method === "GET") {
+        const document = await sharedState.getDeviceStatus(userId);
+        if (!document) {
+          return jsonResponse3({ error: "not_found", message: "device status not found" }, 404);
+        }
+        return jsonResponse3(document);
+      }
+      if (request.method === "PUT") {
+        await authorizeSharedStateWrite(request, env, userId, "device_status", now);
+        const body = await request.json();
+        await sharedState.putDeviceStatus(userId, body);
+        const saved = await sharedState.getDeviceStatus(userId);
+        return jsonResponse3(saved);
+      }
+    }
+    const deviceListMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-list$/);
+    if (deviceListMatch && request.method === "GET") {
+      const userId = decodeURIComponent(deviceListMatch[1]);
+      const document = await sharedState.getDeviceList(userId);
+      if (!document) {
+        return jsonResponse3({ error: "not_found", message: "device list not found" }, 404);
+      }
+      return jsonResponse3(document);
+    }
+    const keyPackageRefsMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);
+    if (keyPackageRefsMatch) {
+      const userId = decodeURIComponent(keyPackageRefsMatch[1]);
+      const deviceId = decodeURIComponent(keyPackageRefsMatch[2]);
+      if (request.method === "GET") {
+        const document = await sharedState.getKeyPackageRefs(userId, deviceId);
+        if (!document) {
+          return jsonResponse3({ error: "not_found", message: "keypackage refs not found" }, 404);
+        }
+        return jsonResponse3(document);
+      }
+      if (request.method === "PUT") {
+        await validateKeyPackageWriteAuthorization(request, sharedStateSecret(env), userId, deviceId, void 0, now);
+        const body = await request.json();
+        await sharedState.putKeyPackageRefs(userId, deviceId, body);
+        const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
+        return jsonResponse3(saved);
+      }
+    }
+    const keyPackageObjectMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);
+    if (keyPackageObjectMatch) {
+      const userId = decodeURIComponent(keyPackageObjectMatch[1]);
+      const deviceId = decodeURIComponent(keyPackageObjectMatch[2]);
+      const keyPackageId = decodeURIComponent(keyPackageObjectMatch[3]);
+      if (request.method === "GET") {
+        const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
+        if (!payload) {
+          return jsonResponse3({ error: "not_found", message: "keypackage not found" }, 404);
+        }
+        return new Response(payload, {
+          status: 200,
+          headers: {
+            "content-type": "application/octet-stream"
+          }
+        });
+      }
+      if (request.method === "PUT") {
+        await validateKeyPackageWriteAuthorization(request, sharedStateSecret(env), userId, deviceId, keyPackageId, now);
+        await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
+        return new Response(null, { status: 204 });
+      }
+    }
+    if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
+      const auth = await validateAnyDeviceRuntimeAuthorization(request, sharedStateSecret(env), "storage_prepare_upload", now);
+      const body = await request.json();
+      const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
+      return jsonResponse3(result);
+    }
+    const uploadMatch = url.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);
+    if (request.method === "PUT" && uploadMatch) {
+      const blobKey = decodeURIComponent(uploadMatch[1]);
+      const token = url.searchParams.get("token");
+      if (!token) {
+        throw new HttpError(401, "invalid_capability", "missing upload token");
+      }
+      const contentType = request.headers.get("content-type") ?? "application/octet-stream";
+      await store.uploadBlob(blobKey, token, await request.arrayBuffer(), { "content-type": contentType }, now);
+      return new Response(null, { status: 204 });
+    }
+    const blobMatch = url.pathname.match(/^\/v1\/storage\/blob\/(.+)$/);
+    if (request.method === "GET" && blobMatch) {
+      const blobKey = decodeURIComponent(blobMatch[1]);
+      const token = url.searchParams.get("token");
+      if (!token) {
+        throw new HttpError(401, "invalid_capability", "missing download token");
+      }
+      const payload = await store.fetchBlob(blobKey, token, now);
+      return new Response(payload, {
+        status: 200,
+        headers: {
+          "content-type": "application/octet-stream"
+        }
+      });
+    }
+    return jsonResponse3({ error: "not_found", message: "route not found" }, 404);
+  } catch (error) {
+    if (error instanceof HttpError) {
+      return jsonResponse3({ error: error.code, message: error.message }, error.status);
+    }
+    const runtimeError = error;
+    const message = runtimeError.message ?? "internal error";
+    return jsonResponse3({ error: "temporary_unavailable", message }, 500);
+  }
+}
+
+// src/index.ts
+var index_default = {
+  async fetch(request, env) {
+    return handleRequest(request, env);
+  }
+};
+export {
+  GroupOutboxDurableObject,
+  InboxDurableObject,
+  index_default as default
+};

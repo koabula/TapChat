@@ -111,6 +111,12 @@ pub enum WsServerEvent {
         seq: u64,
         record: Option<serde_json::Value>,
     },
+    GroupJoinRequestAvailable {
+        #[serde(rename = "groupId")]
+        group_id: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
 }
 
 impl RealtimeManager {
@@ -855,6 +861,7 @@ impl RealtimeManager {
                                     WsServerEvent::MessageRequestChanged { .. } => {}
                                     WsServerEvent::GroupHeadUpdated { .. } => {}
                                     WsServerEvent::GroupOutboxRecordAvailable { .. } => {}
+                                    WsServerEvent::GroupJoinRequestAvailable { .. } => {}
                                 }
 
                                 // Emit to frontend
@@ -984,6 +991,7 @@ impl WsServerEvent {
             WsServerEvent::MessageRequestChanged { .. } => "message_request_changed",
             WsServerEvent::GroupHeadUpdated { .. } => "group_head_updated",
             WsServerEvent::GroupOutboxRecordAvailable { .. } => "group_outbox_record_available",
+            WsServerEvent::GroupJoinRequestAvailable { .. } => "group_join_request_available",
         }
         .to_string()
     }
@@ -1014,6 +1022,12 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
             group_id, seq, ..
         } => {
             format!("group_id={group_id} type=group_outbox_record_available seq={seq}")
+        }
+        WsServerEvent::GroupJoinRequestAvailable {
+            group_id,
+            request_id,
+        } => {
+            format!("group_id={group_id} type=group_join_request_available request_id={request_id}")
         }
     }
 }

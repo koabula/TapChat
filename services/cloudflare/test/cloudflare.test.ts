@@ -1168,6 +1168,46 @@ test("group outbox enforces operation and role permissions", async () => {
   assert.equal(metadataDenied.status, 403);
 });
 
+test("group outbox subscribe allows members with subscribe operation only", async () => {
+  const memberSubscribe = sampleGroupCapability("group:project", ["read", "subscribe"], "member");
+  const response = await handleGroupOutboxDurableRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/subscribe", {
+      headers: groupHeaders(memberSubscribe)
+    }),
+    {
+      groupId: "group:project",
+      state: new MemoryState(),
+      spillStore: new MemoryR2Store(),
+      maxInlineBytes: 128,
+      retentionDays: 30,
+      sharingSecret: "secret",
+      sessions: [],
+      now: 1_000,
+      onUpgrade: () => new Response(null, { status: 200 })
+    }
+  );
+  assert.equal(response.status, 200);
+
+  const memberMissingSubscribe = sampleGroupCapability("group:project", ["read"], "member");
+  const denied = await handleGroupOutboxDurableRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/subscribe", {
+      headers: groupHeaders(memberMissingSubscribe)
+    }),
+    {
+      groupId: "group:project",
+      state: new MemoryState(),
+      spillStore: new MemoryR2Store(),
+      maxInlineBytes: 128,
+      retentionDays: 30,
+      sharingSecret: "secret",
+      sessions: [],
+      now: 1_000,
+      onUpgrade: () => new Response(null, { status: 200 })
+    }
+  );
+  assert.equal(denied.status, 403);
+});
+
 test("group join decision rejects server-generated approval artifacts on reject", async () => {
   const state = new MemoryState();
   const spillStore = new MemoryR2Store();

@@ -353,6 +353,7 @@ export interface RealtimeEventPayload {
     | "group_disconnected"
     | "group_head_updated"
     | "group_outbox_record_available"
+    | "group_join_request_available"
     | "group_error";
   data?: string;
 }

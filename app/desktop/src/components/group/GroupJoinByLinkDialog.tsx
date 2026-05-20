@@ -45,6 +45,7 @@ export default function GroupJoinByLinkDialog({
   const [inviteUrl, setInviteUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [pending, setPending] = useState<SubmitGroupJoinRequestResult | null>(null);
+  const [submittedHost, setSubmittedHost] = useState<string | null>(null);
   const [status, setStatus] = useState<
     "idle" | "pending" | "approved" | "rejected" | "error"
   >("idle");
@@ -65,6 +66,7 @@ export default function GroupJoinByLinkDialog({
       setInviteUrl("");
       setSubmitting(false);
       setPending(null);
+      setSubmittedHost(null);
       setStatus("idle");
       setError(null);
     }
@@ -79,11 +81,13 @@ export default function GroupJoinByLinkDialog({
     }
     setSubmitting(true);
     setError(null);
+    setSubmittedHost(null);
     stopPolling();
 
     try {
       const result = await submitGroupJoinRequest(trimmed);
       setPending(result);
+      setSubmittedHost(inviteHost(trimmed));
       if (result.status === "approved") {
         setStatus("approved");
         handleApproved(result.group_id);
@@ -190,13 +194,20 @@ export default function GroupJoinByLinkDialog({
           </label>
 
           {status === "pending" && (
-            <div className="flex items-center gap-2 p-3 rounded-lg bg-surface-elevated text-sm text-secondary-color">
+            <div className="flex items-start gap-2 p-3 rounded-lg bg-surface-elevated text-sm text-secondary-color">
               <Loader size={14} className="animate-spin" />
-              <span>
-                Waiting for approval… you can close this dialog and
-                check back later. The request remains pending
-                server-side.
-              </span>
+              <div>
+                <div>
+                  Waiting for approval… you can close this dialog and
+                  check back later. The request remains pending
+                  server-side.
+                </div>
+                {submittedHost && (
+                  <div className="text-xs text-muted-color mt-1">
+                    Runtime: {submittedHost}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -256,4 +267,12 @@ export default function GroupJoinByLinkDialog({
       </div>
     </div>
   );
+}
+
+function inviteHost(value: string): string | null {
+  try {
+    return new URL(value).host || null;
+  } catch {
+    return null;
+  }
 }

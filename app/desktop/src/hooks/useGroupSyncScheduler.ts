@@ -169,7 +169,8 @@ export function useGroupSyncScheduler() {
           .catch((err) => markSyncFailed(payload.device_id, String(err)));
       } else if (
         payload.event_type === "group_head_updated" ||
-        payload.event_type === "group_outbox_record_available"
+        payload.event_type === "group_outbox_record_available" ||
+        payload.event_type === "group_join_request_available"
       ) {
         syncGroupOutbox(payload.device_id, "realtime")
           .then(() => markSynced(payload.device_id))

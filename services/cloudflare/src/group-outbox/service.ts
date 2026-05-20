@@ -361,6 +361,11 @@ export class GroupOutboxService {
       ...invite,
       uses: invite.uses + 1
     });
+    this.publish({
+      event: "group_join_request_available",
+      groupId: this.groupId,
+      requestId: request.requestId
+    });
     return { accepted: true, request, autoApprove: request.autoApprove };
   }
 

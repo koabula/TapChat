@@ -222,6 +222,9 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
       const byId = new Map(
         snapshots.map((summary) => [summary.conversation_id, summary]),
       );
+      const existingIds = new Set(
+        state.conversations.map((conversation) => conversation.conversation_id),
+      );
       const conversations = state.conversations.map((conversation) => {
         const group = byId.get(conversation.conversation_id);
         if (!group) {
@@ -243,7 +246,32 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           state: group.conversation_state,
         };
       });
-      return { conversations };
+      const missingGroups: Conversation[] = snapshots
+        .filter((group) => !existingIds.has(group.conversation_id))
+        .map((group) => ({
+          conversation_id: group.conversation_id,
+          peer_user_id: group.group_id,
+          state: group.conversation_state,
+          display_name: group.title,
+          last_message: group.last_message_preview ?? group.title,
+          last_message_time: null,
+          message_count: group.message_count,
+          last_activity_key: [
+            group.conversation_id,
+            String(group.message_count ?? 0),
+            group.last_message_preview?.trim() ?? group.title,
+          ].join("|"),
+          unread_count: 0,
+          has_unread: false,
+          kind: "group" as const,
+          title: group.title,
+          group_id: group.group_id,
+          member_count: group.member_count,
+          group_role: group.local_role,
+          group_cursor: null,
+          dissolved_at: group.dissolved_at,
+        }));
+      return { conversations: [...conversations, ...missingGroups] };
     }),
   setActiveConversation: (id) =>
     set((state) => ({

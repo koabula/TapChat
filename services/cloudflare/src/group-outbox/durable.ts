@@ -130,6 +130,14 @@ export async function handleGroupOutboxDurableRequest(
 
   try {
     if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
+      validateGroupOperationAuthorization(
+        request,
+        deps.groupId,
+        readGroupCapabilityHeader(request),
+        now,
+        "subscribe",
+        ["owner", "admin", "member"]
+      );
       return deps.onUpgrade();
     }
 

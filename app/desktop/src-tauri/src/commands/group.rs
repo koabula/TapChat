@@ -148,7 +148,7 @@ impl From<&PersistedGroupInvite> for GroupInviteView {
         Self {
             group_id: invite.group_id.clone(),
             invite_id: invite.invite_id.clone(),
-            invite_url: invite.invite_url.clone(),
+            invite_url: canonical_group_invite_url(invite),
             join_policy: invite.document.join_policy,
             expires_at: invite.document.expires_at,
             max_uses: invite.document.max_uses,
@@ -156,6 +156,22 @@ impl From<&PersistedGroupInvite> for GroupInviteView {
             created_at: invite.document.created_at,
         }
     }
+}
+
+fn canonical_group_invite_url(invite: &PersistedGroupInvite) -> String {
+    let Ok(parsed) = url::Url::parse(&invite.invite_url) else {
+        return invite.invite_url.clone();
+    };
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        return invite.invite_url.clone();
+    }
+    let origin = origin.trim_end_matches('/');
+    format!(
+        "{origin}/v1/group-invite/{}/{}",
+        urlencoding::encode(&invite.group_id),
+        urlencoding::encode(&invite.invite_id)
+    )
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -279,6 +295,10 @@ fn application_message_count(messages: &[tapchat_core::conversation::StoredMessa
 }
 
 fn notification_error_from_output(output: &CoreOutput, fallback: &str) -> String {
+    notification_message_from_output(output).unwrap_or_else(|| fallback.to_string())
+}
+
+fn notification_message_from_output(output: &CoreOutput) -> Option<String> {
     output
         .effects
         .iter()
@@ -287,7 +307,6 @@ fn notification_error_from_output(output: &CoreOutput, fallback: &str) -> String
             CoreEffect::EmitUserNotification { notification } => Some(notification.message.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -924,9 +943,9 @@ pub async fn create_group_invite_link(
         .ok_or_else(|| "core did not persist the new invite".to_string())?;
 
     Ok(CreateGroupInviteLinkResult {
-        group_id: invite.group_id,
-        invite_id: invite.invite_id,
-        invite_url: invite.invite_url,
+        group_id: invite.group_id.clone(),
+        invite_id: invite.invite_id.clone(),
+        invite_url: canonical_group_invite_url(&invite),
         expires_at: invite.document.expires_at,
         max_uses: invite.document.max_uses,
         join_policy: invite.document.join_policy,
@@ -1028,6 +1047,16 @@ pub async fn submit_group_join_request(
         }
     };
 
+    log::info!(
+        "submit_group_join_request: starting url_kind={} url={}",
+        if is_welcome_pickup {
+            "welcome_pickup"
+        } else {
+            "group_invite"
+        },
+        trimmed
+    );
+
     let output = drive_core_with_handle(&app, CoreInput::Command(command))
         .await
         .map_err(|e| e.to_string())?;
@@ -1058,6 +1087,16 @@ pub async fn submit_group_join_request(
         });
     }
 
+    if output.view_model.is_none() || notification_message_from_output(&output).is_some() {
+        let detail = notification_error_from_output(&output, "core did not return a join request");
+        log::warn!(
+            "submit_group_join_request: failed url_kind=group_invite url={} detail={}",
+            trimmed,
+            detail
+        );
+        return Err(detail);
+    }
+
     let request = if let Some(request) = output
         .view_model
         .as_ref()
@@ -1078,6 +1117,12 @@ pub async fn submit_group_join_request(
                 notification_error_from_output(&output, "core did not return a join request")
             })?
     };
+    log::info!(
+        "submit_group_join_request: submitted group_id={} request_id={} status={:?}",
+        request.group_id,
+        request.request_id,
+        request.status
+    );
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,
         group_id: request.group_id,

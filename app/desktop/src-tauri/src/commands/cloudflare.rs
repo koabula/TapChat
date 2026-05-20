@@ -67,7 +67,13 @@ pub struct CloudflareRuntimeStatus {
 }
 
 const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] =
-    &["group_outbox_mvp", "welcome_pickup_mvp", "message_requests"];
+    &[
+        "group_outbox_mvp",
+        "welcome_pickup_mvp",
+        "message_requests",
+        "short_group_invite",
+        "group_member_subscribe",
+    ];
 
 fn status_from_features(
     bound: bool,
@@ -78,8 +84,16 @@ fn status_from_features(
     let supports_group_outbox = features.iter().any(|feature| feature == "group_outbox_mvp");
     let supports_welcome_pickup = features.iter().any(|feature| feature == "welcome_pickup_mvp");
     let has_message_requests = features.iter().any(|feature| feature == "message_requests");
-    let needs_upgrade =
-        bound && !(supports_group_outbox && supports_welcome_pickup && has_message_requests);
+    let has_short_group_invite = features.iter().any(|feature| feature == "short_group_invite");
+    let has_group_member_subscribe = features
+        .iter()
+        .any(|feature| feature == "group_member_subscribe");
+    let needs_upgrade = bound
+        && !(supports_group_outbox
+            && supports_welcome_pickup
+            && has_message_requests
+            && has_short_group_invite
+            && has_group_member_subscribe);
     CloudflareRuntimeStatus {
         bound,
         endpoint,
@@ -199,6 +213,8 @@ mod tests {
                 "message_requests".into(),
                 "group_outbox_mvp".into(),
                 "welcome_pickup_mvp".into(),
+                "short_group_invite".into(),
+                "group_member_subscribe".into(),
             ],
             None,
         );
