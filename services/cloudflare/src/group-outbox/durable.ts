@@ -275,6 +275,33 @@ async function verifyInviteToken(secret: string, token: string, now: number): Pr
   }
 }
 
+export async function groupIdFromGroupOutboxRequestUrl(
+  url: URL,
+  sharingSecret: string,
+  now: number
+): Promise<string> {
+  const groupMatch = url.pathname.match(/\/v1\/groups\/([^/]+)\//);
+  let groupId = decodeURIComponent(groupMatch?.[1] ?? "");
+  if (!groupId) {
+    const shortInviteMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
+    if (shortInviteMatch) {
+      groupId = decodeURIComponent(shortInviteMatch[1]);
+    }
+  }
+  if (!groupId) {
+    const inviteMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
+    if (inviteMatch) {
+      const payload = await verifyInviteToken(
+        sharingSecret,
+        decodeURIComponent(inviteMatch[1]),
+        now
+      );
+      groupId = payload.groupId;
+    }
+  }
+  return groupId;
+}
+
 export class GroupOutboxDurableObject extends DurableObjectBase {
   private readonly sessions = new Map<string, ManagedSession>();
   private readonly stateRef: DurableObjectState;
@@ -288,19 +315,8 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const groupMatch = url.pathname.match(/\/v1\/groups\/([^/]+)\//);
-    let groupId = decodeURIComponent(groupMatch?.[1] ?? "");
-    if (!groupId) {
-      const inviteMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
-      if (inviteMatch) {
-        const payload = await verifyInviteToken(
-          this.envRef.SHARING_TOKEN_SECRET ?? "replace-me",
-          decodeURIComponent(inviteMatch[1]),
-          Date.now()
-        );
-        groupId = payload.groupId;
-      }
-    }
+    const sharingSecret = this.envRef.SHARING_TOKEN_SECRET ?? "replace-me";
+    const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
 
     return handleGroupOutboxDurableRequest(request, {
       groupId,

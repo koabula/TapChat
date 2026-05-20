@@ -34,7 +34,7 @@ use tapchat_core::model::{
     GroupMemberStatus, GroupMessageType, GroupRole, StorageRef, WelcomePickupDescriptor,
 };
 use tapchat_core::persistence::PersistedGroupInvite;
-use tapchat_core::{CoreCommand, CoreOutput};
+use tapchat_core::{CoreCommand, CoreEffect, CoreOutput};
 
 use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
@@ -276,6 +276,18 @@ fn application_message_count(messages: &[tapchat_core::conversation::StoredMessa
             )
         })
         .count()
+}
+
+fn notification_error_from_output(output: &CoreOutput, fallback: &str) -> String {
+    output
+        .effects
+        .iter()
+        .rev()
+        .find_map(|effect| match effect {
+            CoreEffect::EmitUserNotification { notification } => Some(notification.message.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,7 +1074,9 @@ pub async fn submit_group_join_request(
             .group_join_requests
             .last()
             .map(|persisted| persisted.request.clone())
-            .ok_or_else(|| "core did not return a join request".to_string())?
+            .ok_or_else(|| {
+                notification_error_from_output(&output, "core did not return a join request")
+            })?
     };
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,
@@ -2012,7 +2026,9 @@ pub async fn submit_group_join_request_impl(
             .group_join_requests
             .last()
             .map(|persisted| persisted.request.clone())
-            .ok_or_else(|| "core did not return a join request".to_string())?
+            .ok_or_else(|| {
+                notification_error_from_output(&output, "core did not return a join request")
+            })?
     };
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,

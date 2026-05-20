@@ -5,6 +5,7 @@ use std::time::Instant;
 use tauri::webview::WebviewWindowBuilder;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
 
+use tapchat_core::ffi_api::CoreViewModel;
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
 use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
@@ -262,7 +263,7 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
     let state = app.state::<AppState>();
     let app_arc = Arc::new(app.clone());
 
-    let output = {
+    let mut output = {
         let mut inner = state.inner.write().await;
         // Set app handle on ports for progress events
         inner.ports.set_app_handle(app_arc.clone());
@@ -293,7 +294,9 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
             execute_platform_effect(&mut inner.ports, effect).await?
         };
         for event in events {
-            Box::pin(drive_core_with_handle(app, CoreInput::Event(event))).await?;
+            let event_output =
+                Box::pin(drive_core_with_handle(app, CoreInput::Event(event))).await?;
+            merge_core_outputs(&mut output, event_output);
         }
     }
 
@@ -323,7 +326,7 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
 /// semantics — is identical.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn drive_core_without_handle(state: &AppState, input: CoreInput) -> Result<CoreOutput> {
-    let output = {
+    let mut output = {
         let mut inner = state.inner.write().await;
         match input {
             CoreInput::Command(cmd) => inner.engine.handle_command(cmd)?,
@@ -340,11 +343,54 @@ pub async fn drive_core_without_handle(state: &AppState, input: CoreInput) -> Re
             execute_platform_effect(&mut inner.ports, effect).await?
         };
         for event in events {
-            Box::pin(drive_core_without_handle(state, CoreInput::Event(event))).await?;
+            let event_output =
+                Box::pin(drive_core_without_handle(state, CoreInput::Event(event))).await?;
+            merge_core_outputs(&mut output, event_output);
         }
     }
 
     Ok(output)
+}
+
+fn merge_core_outputs(base: &mut CoreOutput, mut next: CoreOutput) {
+    base.state_update.conversations_changed |= next.state_update.conversations_changed;
+    base.state_update.messages_changed |= next.state_update.messages_changed;
+    base.state_update.contacts_changed |= next.state_update.contacts_changed;
+    base.state_update.checkpoints_changed |= next.state_update.checkpoints_changed;
+    base.state_update
+        .system_statuses_changed
+        .append(&mut next.state_update.system_statuses_changed);
+    base.effects.append(&mut next.effects);
+
+    match (&mut base.view_model, next.view_model) {
+        (Some(base_vm), Some(next_vm)) => merge_view_models(base_vm, next_vm),
+        (None, Some(next_vm)) => base.view_model = Some(next_vm),
+        _ => {}
+    }
+}
+
+fn merge_view_models(base: &mut CoreViewModel, mut next: CoreViewModel) {
+    base.conversations.append(&mut next.conversations);
+    base.messages.append(&mut next.messages);
+    base.contacts.append(&mut next.contacts);
+    base.banners.append(&mut next.banners);
+    base.message_requests.append(&mut next.message_requests);
+    if next.allowlist.is_some() {
+        base.allowlist = next.allowlist;
+    }
+    if next.message_request_action.is_some() {
+        base.message_request_action = next.message_request_action;
+    }
+    if next.append_result.is_some() {
+        base.append_result = next.append_result;
+    }
+    base.group_invites.append(&mut next.group_invites);
+    base.group_join_requests
+        .append(&mut next.group_join_requests);
+    base.welcome_pickups.append(&mut next.welcome_pickups);
+    if next.group_sync_results.is_some() {
+        base.group_sync_results = next.group_sync_results;
+    }
 }
 
 /// Transition from onboarding to active session.

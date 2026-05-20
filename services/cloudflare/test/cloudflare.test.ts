@@ -44,7 +44,7 @@ class TestWebSocketPair {
 
 const { handleRequest } = await import("../src/routes/http");
 const { handleInboxDurableRequest } = await import("../src/inbox/durable");
-const { handleGroupOutboxDurableRequest } = await import("../src/group-outbox/durable");
+const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl } = await import("../src/group-outbox/durable");
 const { InboxService } = await import("../src/inbox/service");
 
 class MemoryState implements DurableObjectStorageLike {
@@ -1697,4 +1697,28 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
   assert.equal(headResp.status, 200);
   const headBody = (await headResp.json()) as { headSeq: number };
   assert.equal(headBody.headSeq, 1);
+});
+
+test("group outbox durable recovers group id from short invite URL", async () => {
+  const shortInviteUrl = new URL("https://example.com/v1/group-invite/group%3Aproject/invite%3A123");
+  assert.equal(
+    await groupIdFromGroupOutboxRequestUrl(shortInviteUrl, "secret", Date.now()),
+    "group:project"
+  );
+
+  const token = await signSharingPayload("secret", {
+    version: CURRENT_MODEL_VERSION,
+    service: "group_invite",
+    groupId: "group:token",
+    inviteId: "invite:token",
+    inviterUserId: "user:alice",
+    inviterDeviceId: "device:alice",
+    joinPolicy: "approval_required",
+    expiresAt: Date.now() + 60_000
+  });
+  const tokenInviteUrl = new URL(`https://example.com/v1/group-invite/${encodeURIComponent(token)}`);
+  assert.equal(
+    await groupIdFromGroupOutboxRequestUrl(tokenInviteUrl, "secret", Date.now()),
+    "group:token"
+  );
 });

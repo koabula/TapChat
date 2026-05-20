@@ -692,7 +692,9 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupInviteFetchFailed {
                         invite_url: fetch.invite_url,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(format!(
+                            "group invite fetch failed with status {status}: {body}"
+                        )),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -730,7 +732,9 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
                         invite_url: submit.invite_token,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(format!(
+                            "group join request submit failed with status {status}: {body}"
+                        )),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
