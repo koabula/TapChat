@@ -342,7 +342,18 @@ export interface SessionStatus {
 // Realtime WebSocket event payload
 export interface RealtimeEventPayload {
   device_id: string;
-  event_type: "connected" | "disconnected" | "head_updated" | "inbox_record_available" | "message_request_changed" | "error";
+  event_type:
+    | "connected"
+    | "disconnected"
+    | "head_updated"
+    | "inbox_record_available"
+    | "message_request_changed"
+    | "error"
+    | "group_connected"
+    | "group_disconnected"
+    | "group_head_updated"
+    | "group_outbox_record_available"
+    | "group_error";
   data?: string;
 }
 

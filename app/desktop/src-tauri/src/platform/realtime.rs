@@ -10,6 +10,7 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 
+use tapchat_core::cli::util::to_camel_case_json_string;
 use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::transport_contract::{GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest};
 
@@ -427,10 +428,8 @@ impl RealtimeManager {
                 },
             );
 
-            if let Some(mut old_session) = old {
+            if let Some(old_session) = old {
                 stale_stop_tx = Some(old_session.stop_tx.clone());
-                old_session.stale = true;
-                sessions.insert(group_id.clone(), old_session);
             } else {
                 stale_stop_tx = None;
             }
@@ -456,8 +455,12 @@ impl RealtimeManager {
         log::info!("RealtimeManager: built group ws_url={}", ws_url);
 
         // Create request with group capability header
-        let capability_json = serde_json::to_string(&subscription.capability)
-            .map_err(|e| anyhow::anyhow!("serialize group capability: {e}"))?;
+        let capability_json = to_camel_case_json_string(
+            &serde_json::to_string(&subscription.capability)
+                .map_err(|e| anyhow::anyhow!("serialize group capability: {e}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("serialize group capability camelCase: {e}"))?;
+        let bearer = format!("Bearer {}", subscription.capability.signature);
 
         let request = Request::builder()
             .uri(&ws_url)
@@ -470,6 +473,7 @@ impl RealtimeManager {
                 tokio_tungstenite::tungstenite::handshake::client::generate_key(),
             )
             .header("Sec-WebSocket-Version", "13")
+            .header("Authorization", bearer)
             .header("X-Tapchat-Group-Capability", &capability_json)
             .body(())
             .context("build group websocket request")?;
@@ -492,6 +496,13 @@ impl RealtimeManager {
                         group_id,
                         detail
                     );
+                    if let Some(app) = &self.app_handle {
+                        let _ = app.emit("realtime-event", RealtimeEventPayload {
+                            device_id: group_id.clone(),
+                            event_type: "group_error".to_string(),
+                            data: Some(detail.clone()),
+                        });
+                    }
                     return Ok(vec![CoreEvent::GroupWebSocketDisconnected {
                         group_id,
                         error: Some(detail),
@@ -509,6 +520,14 @@ impl RealtimeManager {
                     session.connected_at = Some(Instant::now());
                 }
             }
+        }
+
+        if let Some(app) = &self.app_handle {
+            let _ = app.emit("realtime-event", RealtimeEventPayload {
+                device_id: group_id.clone(),
+                event_type: "group_connected".to_string(),
+                data: None,
+            });
         }
 
         // Spawn read loop with group-specific semantics
@@ -530,6 +549,17 @@ impl RealtimeManager {
         Ok(vec![CoreEvent::GroupWebSocketConnected { group_id }])
     }
 
+    pub async fn close_group_connection(&self, group_id: &str) -> Result<Vec<CoreEvent>> {
+        let stop_tx = {
+            let mut sessions = self.group_sessions.write().await;
+            sessions.remove(group_id).map(|session| session.stop_tx)
+        };
+        if let Some(tx) = stop_tx {
+            let _ = tx.send(()).await;
+        }
+        Ok(Vec::new())
+    }
+
     async fn group_read_loop(
         ws_stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
         sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
@@ -548,7 +578,7 @@ impl RealtimeManager {
                         let sessions_guard = sessions.read().await;
                         match sessions_guard.get(&group_id) {
                             Some(session) => session.connection_id == connection_id && !session.stale,
-                            None => true,
+                            None => false,
                         }
                     };
                     if should_emit {

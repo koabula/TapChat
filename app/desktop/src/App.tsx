@@ -28,6 +28,7 @@ import { UpdateNotification } from "./hooks/useAutoUpdate";
 import { useSessionStore } from "./store/session";
 import { useMessageRequestsStore } from "./store/requests";
 import { useCoreUpdate } from "./hooks/useCoreUpdate";
+import { useGroupSyncScheduler } from "./hooks/useGroupSyncScheduler";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
 
@@ -71,6 +72,7 @@ function AppInner() {
 
   // Connect to core-update events
   useCoreUpdate();
+  useGroupSyncScheduler();
 
   // Register global keyboard shortcuts (only when active - requires Router context)
   useGlobalShortcuts();

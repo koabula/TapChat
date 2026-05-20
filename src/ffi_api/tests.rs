@@ -1212,6 +1212,86 @@ mod tests {
     }
 
     #[test]
+    fn apply_group_realtime_plan_opens_only_selected_groups_and_closes_removed_groups() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|u| HarnessUser {
+            name: u.name,
+            bundle: u.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+        let (group_id, _conversation_id) =
+            harness.create_group(&mut alice, "Project", vec![bob.bundle.user_id.clone()]);
+
+        let started = alice
+            .engine
+            .handle_event(CoreEvent::AppStarted)
+            .expect("app started");
+        assert!(
+            !started
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CoreEffect::OpenGroupRealtimeConnection { .. })),
+            "AppStarted must not open every group websocket without a UI plan"
+        );
+
+        let planned = alice
+            .engine
+            .handle_command(CoreCommand::ApplyGroupRealtimePlan {
+                websocket_group_ids: vec![group_id.clone()],
+            })
+            .expect("apply realtime plan");
+        assert!(planned.effects.iter().any(|effect| {
+            matches!(effect, CoreEffect::OpenGroupRealtimeConnection { subscription }
+                if subscription.group_id == group_id)
+        }));
+
+        alice
+            .engine
+            .handle_event(CoreEvent::GroupWebSocketConnected {
+                group_id: group_id.clone(),
+            })
+            .expect("group websocket connected");
+        let closed = alice
+            .engine
+            .handle_command(CoreCommand::ApplyGroupRealtimePlan {
+                websocket_group_ids: vec![],
+            })
+            .expect("clear realtime plan");
+        assert!(closed.effects.iter().any(|effect| {
+            matches!(effect, CoreEffect::CloseGroupRealtimeConnection { group_id: closed_id }
+                if closed_id == &group_id)
+        }));
+    }
+
+    #[test]
+    fn group_websocket_disconnect_schedules_group_sync_fallback() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|u| HarnessUser {
+            name: u.name,
+            bundle: u.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+        let (group_id, _conversation_id) =
+            harness.create_group(&mut alice, "Project", vec![bob.bundle.user_id.clone()]);
+
+        let output = alice
+            .engine
+            .handle_event(CoreEvent::GroupWebSocketDisconnected {
+                group_id: group_id.clone(),
+                error: Some("network".into()),
+            })
+            .expect("group websocket disconnected");
+        assert!(output.effects.iter().any(|effect| {
+            matches!(effect, CoreEffect::ScheduleTimer { timer }
+                if timer.timer_id == format!("group_sync:{group_id}"))
+        }));
+    }
+
+    #[test]
     fn group_recovery_restores_pending_group_seal() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");

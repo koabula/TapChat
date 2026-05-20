@@ -89,6 +89,9 @@ pub enum CoreCommand {
         group_id: String,
         reason: Option<String>,
     },
+    ApplyGroupRealtimePlan {
+        websocket_group_ids: Vec<String>,
+    },
     SendGroupTextMessage {
         conversation_id: String,
         plaintext: String,
@@ -557,6 +560,9 @@ pub enum CoreEffect {
     },
     OpenGroupRealtimeConnection {
         subscription: GroupRealtimeSubscriptionRequest,
+    },
+    CloseGroupRealtimeConnection {
+        group_id: String,
     },
     CloseRealtimeConnection {
         device_id: String,

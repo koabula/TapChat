@@ -996,6 +996,10 @@ impl RealtimePort for DesktopPlatformPorts {
     ) -> Result<Vec<CoreEvent>> {
         self.realtime.open_group_connection(subscription).await
     }
+
+    async fn close_group_realtime(&mut self, group_id: String) -> Result<Vec<CoreEvent>> {
+        self.realtime.close_group_connection(&group_id).await
+    }
 }
 
 // --- BlobIoPort ---

@@ -1,6 +1,8 @@
 import { useNavigate, useParams } from "react-router";
 import { Users } from "lucide-react";
+import GroupSyncIndicator from "@/components/group/GroupSyncIndicator";
 import { useConversationsStore } from "@/store/conversations";
+import { useGroupSyncStore } from "@/store/groupSync";
 
 interface ConversationListProps {
   searchQuery?: string;
@@ -10,6 +12,7 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
   const navigate = useNavigate();
   const { id: activeId } = useParams();
   const { conversations } = useConversationsStore();
+  const statuses = useGroupSyncStore((s) => s.statuses);
 
   // Filter conversations based on search query
   const filteredConversations = conversations.filter((conv) => {
@@ -130,6 +133,9 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
                     <span className="badge text-[10px] uppercase tracking-wide">
                       {conv.group_role}
                     </span>
+                  )}
+                  {isGroup && conv.group_id && !dissolved && (
+                    <GroupSyncIndicator status={statuses[conv.group_id]} compact />
                   )}
                   {conv.has_unread && (
                     <span

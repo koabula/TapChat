@@ -224,6 +224,7 @@ pub fn run() {
             commands::group::list_group_conversations,
             commands::group::get_group_snapshot,
             commands::group::get_group_messages,
+            commands::group::apply_group_realtime_plan,
             commands::group::create_group_conversation,
             commands::group::send_group_text_message,
             commands::group::sync_group_outbox,
@@ -296,6 +297,8 @@ pub fn run() {
             commands::attachment_settings::get_attachment_settings,
             commands::attachment_settings::set_attachment_settings,
             commands::attachment_settings::get_attachment_cache_dir,
+            commands::group_sync_settings::get_group_sync_settings,
+            commands::group_sync_settings::set_group_sync_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running TapChat");

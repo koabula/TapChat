@@ -153,6 +153,10 @@ pub trait RealtimePort {
     ) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("group realtime is not implemented by this platform")
     }
+
+    async fn close_group_realtime(&mut self, _group_id: String) -> Result<Vec<CoreEvent>> {
+        Ok(Vec::new())
+    }
 }
 
 pub trait BlobIoPort {
@@ -212,6 +216,9 @@ where
         CoreEffect::PublishSharedState { publish } => ports.publish_shared_state(publish).await,
         CoreEffect::OpenGroupRealtimeConnection { subscription } => {
             ports.open_group_realtime(subscription).await
+        }
+        CoreEffect::CloseGroupRealtimeConnection { group_id } => {
+            ports.close_group_realtime(group_id).await
         }
         CoreEffect::AppendGroupEnvelope { append } => ports.append_group_envelope(append).await,
         CoreEffect::FetchGroupOutbox { fetch } => ports.fetch_group_outbox(fetch).await,

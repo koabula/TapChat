@@ -639,6 +639,9 @@ impl CoreEngine {
             CoreCommand::SyncGroupOutbox { group_id, reason } => {
                 self.sync_group_outbox(group_id, reason)
             }
+            CoreCommand::ApplyGroupRealtimePlan {
+                websocket_group_ids,
+            } => self.apply_group_realtime_plan(websocket_group_ids),
             CoreCommand::SendGroupTextMessage {
                 conversation_id,
                 plaintext,
@@ -4538,16 +4541,29 @@ impl CoreEngine {
             .device_identity
             .device_id
             .clone();
-        let mut output = self.sync_inbox(device_id)?;
-        let group_effects = self.start_group_realtime()?;
-        output.effects.extend(group_effects);
+        let output = self.sync_inbox(device_id)?;
         self.merge_with_transport_flush(output)
     }
 
-    fn start_group_realtime(&mut self) -> CoreResult<Vec<CoreEffect>> {
+    fn apply_group_realtime_plan(
+        &mut self,
+        websocket_group_ids: Vec<String>,
+    ) -> CoreResult<CoreOutput> {
+        let desired: BTreeSet<String> = websocket_group_ids.into_iter().collect();
         let mut effects = Vec::new();
-        let group_ids: Vec<String> = self.state.group_states.keys().cloned().collect();
-        for group_id in group_ids {
+        let existing: Vec<String> = self.state.group_realtime_sessions.keys().cloned().collect();
+        for group_id in existing {
+            if desired.contains(&group_id) {
+                continue;
+            }
+            if let Some(session) = self.state.group_realtime_sessions.get_mut(&group_id) {
+                session.connected = false;
+                session.needs_reconnect = false;
+            }
+            effects.push(CoreEffect::CloseGroupRealtimeConnection { group_id });
+        }
+
+        for group_id in desired {
             let group_state = match self.state.group_states.get(&group_id) {
                 Some(state) => state.clone(),
                 None => continue,
@@ -4584,7 +4600,14 @@ impl CoreEngine {
                 },
             });
         }
-        Ok(effects)
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: None,
+        })
     }
 
     fn handle_websocket_connected(&mut self, device_id: String) -> CoreResult<CoreOutput> {

@@ -8,6 +8,7 @@ import {
   RefreshCw,
   Settings,
   Shield,
+  Star,
   UsersRound,
   Zap,
 } from "lucide-react";
@@ -15,15 +16,18 @@ import {
 import GroupJoinByLinkDialog from "@/components/group/GroupJoinByLinkDialog";
 import GroupMemberDrawer from "@/components/group/GroupMemberDrawer";
 import DissolveConfirmDialog from "@/components/group/DissolveConfirmDialog";
+import GroupSyncIndicator from "@/components/group/GroupSyncIndicator";
 import GroupCreateDialog from "@/pages/groups/GroupCreateDialog";
 import {
   getGroupSnapshot,
   listGroupConversations,
+  setGroupSyncSettings,
   type GroupConversationSummary,
   type GroupSnapshotView,
 } from "@/lib/tauri";
 import { useConversationsStore } from "@/store/conversations";
 import { useGroupsStore } from "@/store/groups";
+import { useGroupSyncStore } from "@/store/groupSync";
 import { useSessionStore } from "@/store/session";
 
 export default function GroupsPage() {
@@ -34,6 +38,9 @@ export default function GroupsPage() {
   );
   const setGroupSnapshot = useGroupsStore((s) => s.setSnapshot);
   const snapshots = useGroupsStore((s) => s.snapshots);
+  const syncSettings = useGroupSyncStore((s) => s.settings);
+  const setSyncSettings = useGroupSyncStore((s) => s.setSettings);
+  const syncStatuses = useGroupSyncStore((s) => s.statuses);
 
   const [groups, setGroups] = useState<GroupConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -43,6 +50,7 @@ export default function GroupsPage() {
   const [joinOpen, setJoinOpen] = useState(false);
   const [memberDrawerGroupId, setMemberDrawerGroupId] = useState<string | null>(null);
   const [dissolveGroup, setDissolveGroup] = useState<GroupSnapshotView | null>(null);
+  const [savingSyncSettings, setSavingSyncSettings] = useState(false);
 
   const sortedGroups = useMemo(
     () =>
@@ -114,6 +122,31 @@ export default function GroupsPage() {
     }
   };
 
+  const updateSyncSettings = async (patch: Partial<typeof syncSettings>) => {
+    const next = { ...syncSettings, ...patch };
+    setSyncSettings(next);
+    setSavingSyncSettings(true);
+    try {
+      const saved = await setGroupSyncSettings(next);
+      setSyncSettings(saved);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setSyncSettings(syncSettings);
+    } finally {
+      setSavingSyncSettings(false);
+    }
+  };
+
+  const toggleImportant = (groupId: string) => {
+    const important = new Set(syncSettings.important_group_ids);
+    if (important.has(groupId)) {
+      important.delete(groupId);
+    } else {
+      important.add(groupId);
+    }
+    void updateSyncSettings({ important_group_ids: Array.from(important) });
+  };
+
   return (
     <div className="flex-1 min-h-0 overflow-y-auto bg-base">
       <header className="border-b border-default bg-surface p-4">
@@ -154,6 +187,63 @@ export default function GroupsPage() {
           </div>
         )}
 
+        <section className="mb-4 rounded-lg border border-default bg-surface p-4">
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex min-w-40 flex-col gap-1 text-xs text-muted-color">
+              Sync mode
+              <select
+                className="rounded-md border border-default bg-base px-2 py-1 text-sm text-primary-color"
+                value={syncSettings.mode}
+                disabled={savingSyncSettings}
+                onChange={(event) =>
+                  void updateSyncSettings({
+                    mode: event.target.value as typeof syncSettings.mode,
+                  })
+                }
+              >
+                <option value="auto">Auto</option>
+                <option value="polling">Polling</option>
+                <option value="manual">Manual</option>
+              </select>
+            </label>
+            <label className="flex w-36 flex-col gap-1 text-xs text-muted-color">
+              Max live groups
+              <input
+                className="rounded-md border border-default bg-base px-2 py-1 text-sm text-primary-color"
+                type="number"
+                min={0}
+                max={50}
+                value={syncSettings.max_websocket_groups}
+                disabled={savingSyncSettings || syncSettings.mode !== "auto"}
+                onChange={(event) =>
+                  void updateSyncSettings({
+                    max_websocket_groups: Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <label className="flex w-36 flex-col gap-1 text-xs text-muted-color">
+              Poll minutes
+              <input
+                className="rounded-md border border-default bg-base px-2 py-1 text-sm text-primary-color"
+                type="number"
+                min={1}
+                max={1440}
+                value={syncSettings.poll_interval_minutes}
+                disabled={savingSyncSettings || syncSettings.mode === "manual"}
+                onChange={(event) =>
+                  void updateSyncSettings({
+                    poll_interval_minutes: Number(event.target.value),
+                  })
+                }
+              />
+            </label>
+            <span className="text-xs text-muted-color">
+              {savingSyncSettings ? "Saving..." : "Profile-local group sync settings"}
+            </span>
+          </div>
+        </section>
+
         {loading ? (
           <div className="flex items-center justify-center py-16 text-muted-color">
             <Loader size={24} className="animate-spin" />
@@ -175,6 +265,7 @@ export default function GroupsPage() {
                   .length ?? group.member_count;
               const isOwner = localRole === "owner";
               const canLeave = localRole != null && localRole !== "owner" && !dissolved;
+              const important = syncSettings.important_group_ids.includes(group.group_id);
 
               return (
                 <section
@@ -197,6 +288,9 @@ export default function GroupsPage() {
                             dissolved
                           </span>
                         )}
+                        {!dissolved && (
+                          <GroupSyncIndicator status={syncStatuses[group.group_id]} />
+                        )}
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-color">
                         <span>{activeMembers} members</span>
@@ -210,6 +304,15 @@ export default function GroupsPage() {
                     </div>
 
                     <div className="flex flex-wrap items-center justify-end gap-2">
+                      <button
+                        className={`btn btn-secondary text-xs ${important ? "status-warning" : ""}`}
+                        onClick={() => toggleImportant(group.group_id)}
+                        disabled={savingSyncSettings}
+                        title={important ? "Important group" : "Prioritize realtime"}
+                      >
+                        <Star size={14} fill={important ? "currentColor" : "none"} />
+                        Important
+                      </button>
                       <button
                         className="btn btn-secondary text-xs"
                         onClick={() => openChat(group.conversation_id)}

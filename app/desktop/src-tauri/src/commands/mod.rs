@@ -4,6 +4,7 @@ pub mod cloudflare_rest;
 pub mod contact;
 pub mod conversation;
 pub mod group;
+pub mod group_sync_settings;
 pub mod identity;
 pub mod message;
 pub mod profile;

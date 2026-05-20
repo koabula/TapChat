@@ -183,6 +183,22 @@ impl From<&GroupJoinRequest> for GroupJoinRequestView {
     }
 }
 
+#[tauri::command]
+pub async fn apply_group_realtime_plan(
+    app: AppHandle,
+    websocket_group_ids: Vec<String>,
+) -> Result<(), String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ApplyGroupRealtimePlan {
+            websocket_group_ids,
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------

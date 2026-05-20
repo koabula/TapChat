@@ -247,6 +247,25 @@ export async function getAttachmentCacheDir(): Promise<string> {
   return invoke("get_attachment_cache_dir");
 }
 
+export type GroupSyncMode = "auto" | "polling" | "manual";
+
+export interface GroupSyncSettings {
+  mode: GroupSyncMode;
+  max_websocket_groups: number;
+  poll_interval_minutes: number;
+  important_group_ids: string[];
+}
+
+export async function getGroupSyncSettings(): Promise<GroupSyncSettings> {
+  return invoke("get_group_sync_settings");
+}
+
+export async function setGroupSyncSettings(
+  settings: GroupSyncSettings,
+): Promise<GroupSyncSettings> {
+  return invoke("set_group_sync_settings", { settings });
+}
+
 // Debug mode for performance timing tests
 export async function setDebugMode(enabled: boolean): Promise<void> {
   return invoke("set_debug_mode", { enabled });
@@ -469,6 +488,12 @@ export async function syncGroupOutbox(
   reason?: string,
 ): Promise<SyncGroupOutboxResult> {
   return invoke("sync_group_outbox", { groupId, reason });
+}
+
+export async function applyGroupRealtimePlan(
+  websocketGroupIds: string[],
+): Promise<void> {
+  return invoke("apply_group_realtime_plan", { websocketGroupIds });
 }
 
 // Invite lifecycle -----------------------------------------------------------

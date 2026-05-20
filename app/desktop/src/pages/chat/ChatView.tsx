@@ -2,15 +2,17 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import { useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { MessageCircle, Search, Loader, EllipsisVertical, Users, UserX } from "lucide-react";
+import { MessageCircle, Search, Loader, EllipsisVertical, Users, UserX, RefreshCw } from "lucide-react";
 
 import MessageInput from "@/components/MessageInput";
 import AttachmentPreview from "@/components/AttachmentPreview";
 import GroupMemberDrawer from "@/components/group/GroupMemberDrawer";
+import GroupSyncIndicator from "@/components/group/GroupSyncIndicator";
 import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
 import { useSessionStore } from "@/store/session";
 import { useGroupsStore } from "@/store/groups";
+import { useGroupSyncStore } from "@/store/groupSync";
 import {
   cloudflareDeploy,
   cloudflareLogin,
@@ -40,6 +42,7 @@ export default function ChatView() {
   const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [transportBusy, setTransportBusy] = useState(false);
   const [transportError, setTransportError] = useState<string | null>(null);
+  const [manualSyncBusy, setManualSyncBusy] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -60,6 +63,12 @@ export default function ChatView() {
     () => conversations.find((c) => c.conversation_id === conversationId),
     [conversationId, conversations],
   );
+  const groupSyncStatus = useGroupSyncStore((s) =>
+    activeConversation?.group_id ? s.statuses[activeConversation.group_id] : undefined,
+  );
+  const markGroupOpened = useGroupSyncStore((s) => s.markGroupOpened);
+  const markGroupSynced = useGroupSyncStore((s) => s.markSynced);
+  const markGroupSyncFailed = useGroupSyncStore((s) => s.markSyncFailed);
 
   const isGroup = activeConversation?.kind === "group";
   const dissolved = isGroup && activeConversation?.dissolved_at != null;
@@ -162,8 +171,10 @@ export default function ChatView() {
       }
       setRuntimeStatus(await cloudflareStatus());
       await syncGroupOutbox(activeConversation.group_id, "runtime_upgraded");
+      markGroupSynced(activeConversation.group_id);
       await refreshCurrentGroupSnapshot();
     } catch (err) {
+      markGroupSyncFailed(activeConversation.group_id, String(err));
       setTransportError(err instanceof Error ? err.message : String(err));
     } finally {
       setTransportBusy(false);
@@ -176,12 +187,36 @@ export default function ChatView() {
     setTransportError(null);
     try {
       await syncGroupOutbox(activeConversation.group_id, "manual_retry");
+      markGroupSynced(activeConversation.group_id);
       await refreshCurrentGroupSnapshot();
       setRuntimeStatus(await cloudflareStatus());
     } catch (err) {
+      markGroupSyncFailed(activeConversation.group_id, String(err));
       setTransportError(err instanceof Error ? err.message : String(err));
     } finally {
       setTransportBusy(false);
+    }
+  };
+
+  const syncCurrentGroup = async (reason: string, showBusy = false) => {
+    const groupId = activeConversation?.group_id;
+    if (!groupId) return;
+    if (showBusy) {
+      setManualSyncBusy(true);
+      setTransportError(null);
+    }
+    try {
+      await syncGroupOutbox(groupId, reason);
+      markGroupSynced(groupId);
+      await refreshCurrentGroupSnapshot();
+      await refreshMessages();
+    } catch (err) {
+      markGroupSyncFailed(groupId, String(err));
+      if (showBusy) {
+        setTransportError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (showBusy) setManualSyncBusy(false);
     }
   };
 
@@ -201,10 +236,14 @@ export default function ChatView() {
   useEffect(() => {
     if (isGroup && activeConversation?.group_id) {
       setActiveGroupId(activeConversation.group_id);
+      markGroupOpened(activeConversation.group_id);
+      void syncCurrentGroup("view_opened").catch((err) => {
+        console.debug(`[ChatView] group view sync failed: ${String(err)}`);
+      });
       return () => setActiveGroupId(null);
     }
     return;
-  }, [isGroup, activeConversation?.group_id, setActiveGroupId]);
+  }, [isGroup, activeConversation?.group_id, markGroupOpened, setActiveGroupId]);
 
   useEffect(() => {
     if (!conversationId) return;
@@ -536,7 +575,7 @@ export default function ChatView() {
                   <span className="text-red-500">Dissolved</span>
                 ) : (
                   <>
-                    <span className="w-1.5 h-1.5 rounded-full status-success animate-pulse" />
+                    <GroupSyncIndicator status={groupSyncStatus} compact />
                     {activeConversation?.member_count ?? 0} members · End-to-end encrypted
                   </>
                 )}
@@ -555,6 +594,16 @@ export default function ChatView() {
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {isGroup && (
+            <button
+              className="btn btn-ghost px-2 transition-fast"
+              title="Sync group messages"
+              onClick={() => void syncCurrentGroup("manual", true)}
+              disabled={manualSyncBusy}
+            >
+              <RefreshCw size={18} className={manualSyncBusy ? "animate-spin" : ""} />
+            </button>
+          )}
           {isGroup && (
             <button
               className="btn btn-ghost px-2 transition-fast"

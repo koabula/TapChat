@@ -116,7 +116,7 @@ export default function GroupMemberDrawer({
     id: string,
     command: () => Promise<unknown>,
     options: { refreshOnSuccess?: boolean } = {},
-  ) => {
+  ): Promise<boolean> => {
     const { refreshOnSuccess = true } = options;
     setBusy(id);
     setError(null);
@@ -126,8 +126,10 @@ export default function GroupMemberDrawer({
         const fresh = await getGroupSnapshot(groupId);
         setSnapshot(fresh);
       }
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      return false;
     } finally {
       setBusy(null);
     }
@@ -159,10 +161,12 @@ export default function GroupMemberDrawer({
     void runCommand(
       "leave",
       () => leaveGroup(groupId),
-      { refreshOnSuccess: false },
-    ).then(() => {
-      navigate("/chat");
-      onClose();
+      { refreshOnSuccess: true },
+    ).then((ok) => {
+      if (ok) {
+        navigate("/groups");
+        onClose();
+      }
     });
   };
 
