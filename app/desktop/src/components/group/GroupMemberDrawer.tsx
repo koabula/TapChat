@@ -109,14 +109,8 @@ export default function GroupMemberDrawer({
   }, [snapshot, localRole, localUserId]);
 
   const canDissolve = useMemo(() => {
-    if (!snapshot) return false;
-    return canPerform("dissolve", {
-      manifest: snapshot.manifest,
-      localRole,
-      localUserId,
-      dissolvedAt: snapshot.dissolved_at ?? null,
-    });
-  }, [snapshot, localRole, localUserId]);
+    return snapshot != null && localRole === "owner" && !dissolved;
+  }, [snapshot, localRole, dissolved]);
 
   const runCommand = async (
     id: string,

@@ -636,7 +636,9 @@ impl CoreEngine {
                 title,
                 member_user_ids,
             } => self.create_group_conversation(title, member_user_ids),
-            CoreCommand::SyncGroupOutbox { group_id, .. } => self.sync_group_outbox(group_id),
+            CoreCommand::SyncGroupOutbox { group_id, reason } => {
+                self.sync_group_outbox(group_id, reason)
+            }
             CoreCommand::SendGroupTextMessage {
                 conversation_id,
                 plaintext,
@@ -2119,6 +2121,12 @@ impl CoreEngine {
         for welcome in artifacts.welcomes {
             let descriptor =
                 self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            log::info!(
+                "create_group_conversation: prepared welcome pickup group_id={} recipient_device_id={} endpoint={}",
+                group_id,
+                welcome.recipient_device_id,
+                descriptor.endpoint
+            );
             transport_effects.push(CoreEffect::PutWelcomePickup {
                 put: PutWelcomePickupRequest {
                     descriptor: descriptor.clone(),
@@ -2152,10 +2160,24 @@ impl CoreEngine {
                     MessageType::ControlGroupWelcomePickup,
                     STANDARD.encode(invite_payload),
                 )?;
+                log::info!(
+                    "create_group_conversation: enqueue group welcome control group_id={} invitee_user_id={} recipient_device_id={} direct_conversation_id={} message_id={}",
+                    group_id,
+                    invitee_user_id,
+                    welcome.recipient_device_id,
+                    direct_conversation_id,
+                    envelope.message_id
+                );
                 persist_ops.push(PersistOp::SaveOutgoingEnvelope {
                     message_id: envelope.message_id.clone(),
                 });
                 self.enqueue_envelopes(invitee_user_id.clone(), vec![envelope]);
+            } else {
+                log::warn!(
+                    "create_group_conversation: missing invitee user mapping for welcome recipient_device_id={} group_id={}",
+                    welcome.recipient_device_id,
+                    group_id
+                );
             }
         }
         let mut effects = vec![persist_effect(&self.state, persist_ops)];
@@ -2250,20 +2272,32 @@ impl CoreEngine {
         })
     }
 
-    fn sync_group_outbox(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+    fn sync_group_outbox(
+        &mut self,
+        group_id: String,
+        reason: Option<String>,
+    ) -> CoreResult<CoreOutput> {
         let state = self
             .state
             .group_states
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
+        let should_retry_pending = reason.as_deref().is_some_and(|reason| {
+            matches!(reason, "runtime_upgraded" | "manual_retry" | "retry_pending")
+        });
+        let retry_reset_message_ids = if should_retry_pending {
+            self.reset_pending_group_outbox_for_retry(&group_id)
+        } else {
+            Vec::new()
+        };
         // Check head first so we only fetch when there is a real gap.
         // This avoids a wasteful fetch round-trip when the cursor is already
         // caught up — each group on every AppForegrounded / AppStarted fires
         // sync_group_outbox, and without the pre-check each one would issue
         // an HTTP fetch regardless of whether new records exist.
         self.state.pending_sync_group_head.insert(group_id.clone());
-        Ok(CoreOutput {
+        let sync_output = CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
                 system_statuses_changed: vec![SystemStatus::SyncInProgress],
@@ -2276,7 +2310,31 @@ impl CoreEngine {
                 },
             }],
             view_model: None,
-        })
+        };
+        if retry_reset_message_ids.is_empty() {
+            return Ok(sync_output);
+        }
+        let persist_retry_reset = persist_effect(
+            &self.state,
+            retry_reset_message_ids
+                .into_iter()
+                .map(|message_id| PersistOp::SaveOutgoingGroupEnvelope { message_id })
+                .collect(),
+        );
+        let retry_output = merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    messages_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_retry_reset],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        );
+        Ok(merge_outputs(retry_output, sync_output))
     }
 
     fn request_join_group(&mut self, invite_url: String) -> CoreResult<CoreOutput> {
@@ -4818,7 +4876,7 @@ impl CoreEngine {
             return self.sync_inbox(device_id.to_string());
         }
         if let Some(group_id) = timer_id.strip_prefix("group_sync:") {
-            return self.sync_group_outbox(group_id.to_string());
+            return self.sync_group_outbox(group_id.to_string(), None);
         }
         if let Some(user_id) = timer_id.strip_prefix("refresh_identity:") {
             let has_pending_recovery = self
@@ -6726,6 +6784,18 @@ impl CoreEngine {
         })
     }
 
+    fn reset_pending_group_outbox_for_retry(&mut self, group_id: &str) -> Vec<String> {
+        let mut reset_message_ids = Vec::new();
+        for item in &mut self.state.pending_group_outbox {
+            if item.envelope.group_id == group_id {
+                item.in_flight = false;
+                item.retries = 0;
+                reset_message_ids.push(item.envelope.message_id.clone());
+            }
+        }
+        reset_message_ids
+    }
+
     fn flush_pending_acks(&mut self) -> CoreResult<CoreOutput> {
         let keys: Vec<String> = self.state.pending_acks.keys().cloned().collect();
         let mut effects = Vec::new();
@@ -7111,7 +7181,7 @@ impl CoreEngine {
                                 }],
                                 view_model: None,
                             },
-                            self.sync_group_outbox(group_id.clone())?,
+                            self.sync_group_outbox(group_id.clone(), None)?,
                         ));
                     }
                 }
@@ -7990,6 +8060,11 @@ impl CoreEngine {
                     _ => {
                         ackable = true;
                         if record.envelope.message_type == MessageType::ControlGroupWelcomePickup {
+                            log::info!(
+                                "handle_inbox_records: received group welcome control message_id={} conversation_id={}",
+                                record.message_id,
+                                conversation_id
+                            );
                             let payload_b64 =
                                 record.envelope.inline_ciphertext.as_deref().ok_or_else(|| {
                                     CoreError::invalid_input(
@@ -8020,12 +8095,23 @@ impl CoreEngine {
                                 }
                             }
                             if !self.state.group_states.contains_key(&invite.group_id) {
+                                log::info!(
+                                    "handle_inbox_records: fetching welcome pickup group_id={} device_id={} endpoint={}",
+                                    invite.group_id,
+                                    invite.welcome_pickup_descriptor.device_id,
+                                    invite.welcome_pickup_descriptor.endpoint
+                                );
                                 output.effects.push(CoreEffect::FetchWelcomePickup {
                                     fetch: FetchWelcomePickupRequest {
                                         descriptor: invite.welcome_pickup_descriptor,
                                         headers: BTreeMap::new(),
                                     },
                                 });
+                            } else {
+                                log::info!(
+                                    "handle_inbox_records: group welcome control ignored because group already exists group_id={}",
+                                    invite.group_id
+                                );
                             }
                         }
                         if apply_effect.identity_refresh_needed {
@@ -10348,6 +10434,11 @@ impl CoreEngine {
         welcome_b64: String,
         manifest: Option<GroupManifest>,
     ) -> CoreResult<CoreOutput> {
+        log::info!(
+            "handle_welcome_pickup_fetched: applying welcome pickup group_id={} device_id={}",
+            descriptor.group_id,
+            descriptor.device_id
+        );
         if !self.state.group_states.contains_key(&descriptor.group_id) {
             let manifest = manifest.ok_or_else(|| {
                 CoreError::invalid_input("welcome pickup result is missing group manifest")
@@ -10430,6 +10521,16 @@ impl CoreEngine {
                     pending_membership_transition: None,
                 },
             );
+            log::info!(
+                "handle_welcome_pickup_fetched: imported group shell group_id={} conversation_id={} local_role={:?}",
+                descriptor.group_id,
+                self.state
+                    .group_states
+                    .get(&descriptor.group_id)
+                    .map(|state| state.conversation_id.as_str())
+                    .unwrap_or("<missing>"),
+                local_role
+            );
         }
         let group_state = self
             .state
@@ -10460,6 +10561,11 @@ impl CoreEngine {
         self.state
             .mls_summaries
             .insert(group_state.conversation_id.clone(), summary);
+        log::info!(
+            "handle_welcome_pickup_fetched: group imported group_id={} conversation_id={} epoch_ready=true",
+            group_state.group_id,
+            group_state.conversation_id
+        );
         // The welcome established a cryptographically valid group state at
         // the MLS epoch where the approver added this device. Any outbox
         // records that predate that epoch cannot be decrypted by us and

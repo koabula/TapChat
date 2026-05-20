@@ -215,6 +215,7 @@ class FakeGroupOutboxStub implements DurableObjectStub {
       maxInlineBytes: this.env.maxInlineBytes,
       retentionDays: this.env.retentionDays,
       sharingSecret: this.env.sharingSecret,
+      sessions: [],
       now: 1_000
     });
   }
@@ -1215,6 +1216,7 @@ test("group join decision rejects server-generated approval artifacts on reject"
       maxInlineBytes: 128,
       retentionDays: 30,
       sharingSecret: "secret",
+      sessions: [],
       now: 1_000
     }
   );

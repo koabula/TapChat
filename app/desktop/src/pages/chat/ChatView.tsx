@@ -2,11 +2,12 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import { useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { MessageCircle, Search, Loader, EllipsisVertical, Users, UserX } from "lucide-react";
+import { MessageCircle, Search, Loader, EllipsisVertical, Users, UserX, Zap } from "lucide-react";
 
 import MessageInput from "@/components/MessageInput";
 import AttachmentPreview from "@/components/AttachmentPreview";
 import GroupMemberDrawer from "@/components/group/GroupMemberDrawer";
+import DissolveConfirmDialog from "@/components/group/DissolveConfirmDialog";
 import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
 import { useSessionStore } from "@/store/session";
@@ -40,6 +41,7 @@ export default function ChatView() {
   const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [transportBusy, setTransportBusy] = useState(false);
   const [transportError, setTransportError] = useState<string | null>(null);
+  const [dissolveOpen, setDissolveOpen] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -63,6 +65,7 @@ export default function ChatView() {
 
   const isGroup = activeConversation?.kind === "group";
   const dissolved = isGroup && activeConversation?.dissolved_at != null;
+  const isOwner = isGroup && groupSnapshot?.local_role === "owner";
 
   // Determine the local user's current status in this group so we can
   // fail-closed the composer when they have been removed / left /
@@ -134,6 +137,13 @@ export default function ChatView() {
     const fresh = await getGroupSnapshot(activeConversation.group_id);
     setGroupSnapshot(fresh);
   };
+
+  useEffect(() => {
+    if (!isGroup || !activeConversation?.group_id) return;
+    void refreshCurrentGroupSnapshot().catch((err) => {
+      console.debug(`[ChatView] group snapshot refresh failed: ${String(err)}`);
+    });
+  }, [isGroup, activeConversation?.group_id]);
 
   const handleUpgradeRuntime = async () => {
     if (!activeConversation?.group_id) return;
@@ -557,6 +567,15 @@ export default function ChatView() {
               <Users size={18} />
             </button>
           )}
+          {isOwner && !dissolved && (
+            <button
+              className="btn btn-ghost px-2 transition-fast text-red-500"
+              title="Dissolve group"
+              onClick={() => setDissolveOpen(true)}
+            >
+              <Zap size={18} />
+            </button>
+          )}
           {!isGroup && (
             <button className="btn btn-ghost px-2 transition-fast" title="Search messages">
               <Search size={18} />
@@ -626,7 +645,7 @@ export default function ChatView() {
                   onClick={handleSyncGroupTransport}
                   disabled={transportBusy}
                 >
-                  {transportBusy ? "Syncing..." : "Sync group transport"}
+                  {transportBusy ? "Retrying..." : "Retry group transport"}
                 </button>
               )}
               {transportError && (
@@ -649,6 +668,18 @@ export default function ChatView() {
           groupId={activeConversation.group_id}
           localUserId={localUserId}
           onClose={() => setMemberDrawerOpen(false)}
+        />
+      )}
+      {isGroup && activeConversation?.group_id && groupSnapshot && (
+        <DissolveConfirmDialog
+          open={dissolveOpen}
+          groupId={activeConversation.group_id}
+          groupTitle={groupSnapshot.manifest.title}
+          onClose={() => setDissolveOpen(false)}
+          onDissolved={async () => {
+            setDissolveOpen(false);
+            await refreshCurrentGroupSnapshot();
+          }}
         />
       )}
     </div>

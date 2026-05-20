@@ -488,6 +488,12 @@ impl TransportPort for DesktopPlatformPorts {
     }
 
     async fn put_welcome_pickup(&mut self, put: PutWelcomePickupRequest) -> Result<Vec<CoreEvent>> {
+        log::info!(
+            "[TransportPort] put_welcome_pickup group_id={} device_id={} endpoint={}",
+            put.descriptor.group_id,
+            put.descriptor.device_id,
+            put.descriptor.endpoint
+        );
         let response = self
             .client
             .put(&put.descriptor.endpoint)
@@ -503,6 +509,12 @@ impl TransportPort for DesktopPlatformPorts {
             Ok(response) => {
                 let status = response.status().as_u16();
                 if !(200..300).contains(&status) {
+                    log::warn!(
+                        "[TransportPort] put_welcome_pickup failed group_id={} device_id={} status={}",
+                        put.descriptor.group_id,
+                        put.descriptor.device_id,
+                        status
+                    );
                     return Ok(vec![CoreEvent::WelcomePickupPutFailed {
                         descriptor: put.descriptor,
                         retryable: status >= 500,
@@ -511,6 +523,11 @@ impl TransportPort for DesktopPlatformPorts {
                 }
                 let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
                 let _result: PutWelcomePickupResult = serde_json::from_str(&body)?;
+                log::info!(
+                    "[TransportPort] put_welcome_pickup accepted group_id={} device_id={}",
+                    put.descriptor.group_id,
+                    put.descriptor.device_id
+                );
                 Ok(vec![CoreEvent::WelcomePickupPut {
                     descriptor: put.descriptor,
                 }])
@@ -527,6 +544,12 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         fetch: FetchWelcomePickupRequest,
     ) -> Result<Vec<CoreEvent>> {
+        log::info!(
+            "[TransportPort] fetch_welcome_pickup group_id={} device_id={} endpoint={}",
+            fetch.descriptor.group_id,
+            fetch.descriptor.device_id,
+            fetch.descriptor.endpoint
+        );
         let response = self
             .client
             .get(&fetch.descriptor.endpoint)
@@ -545,6 +568,12 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    log::warn!(
+                        "[TransportPort] fetch_welcome_pickup failed group_id={} device_id={} status={}",
+                        fetch.descriptor.group_id,
+                        fetch.descriptor.device_id,
+                        status
+                    );
                     return Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                         descriptor: fetch.descriptor,
                         retryable: status >= 500,
@@ -553,6 +582,12 @@ impl TransportPort for DesktopPlatformPorts {
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchWelcomePickupResult = serde_json::from_str(&body)?;
+                log::info!(
+                    "[TransportPort] fetch_welcome_pickup accepted group_id={} device_id={} manifest_present={}",
+                    fetch.descriptor.group_id,
+                    fetch.descriptor.device_id,
+                    result.manifest.is_some()
+                );
                 Ok(vec![CoreEvent::WelcomePickupFetched {
                     descriptor: fetch.descriptor,
                     welcome_b64: result.welcome_b64,

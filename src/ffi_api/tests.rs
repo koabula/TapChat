@@ -4,7 +4,7 @@ mod tests {
         AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
     };
     use crate::ffi_api::engine;
-    use crate::ffi_api::types::{RecoveryContext, RecoveryReason};
+    use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput,
         FfiApiModule, RealtimeEvent,
@@ -1161,6 +1161,54 @@ mod tests {
         assert!(resumed.effects.iter().any(|effect| {
             matches!(effect, CoreEffect::AppendGroupEnvelope { append } if append.group_id == group_id)
         }));
+    }
+
+    #[test]
+    fn manual_group_outbox_sync_retries_exhausted_pending_appends() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|u| HarnessUser {
+            name: u.name,
+            bundle: u.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+        let (group_id, conversation_id) =
+            harness.create_group(&mut alice, "Project", vec![bob.bundle.user_id.clone()]);
+
+        alice
+            .engine
+            .handle_command(CoreCommand::SendGroupTextMessage {
+                conversation_id,
+                plaintext: "retry after runtime upgrade".into(),
+            })
+            .expect("send pending group text");
+
+        for item in &mut alice.engine.state.pending_group_outbox {
+            if item.envelope.group_id == group_id {
+                item.in_flight = true;
+                item.retries = MAX_TRANSPORT_RETRIES;
+            }
+        }
+
+        let output = alice
+            .engine
+            .handle_command(CoreCommand::SyncGroupOutbox {
+                group_id: group_id.clone(),
+                reason: Some("manual_retry".into()),
+            })
+            .expect("manual retry group outbox");
+
+        assert!(output.effects.iter().any(|effect| {
+            matches!(effect, CoreEffect::AppendGroupEnvelope { append } if append.group_id == group_id)
+        }));
+        assert!(alice
+            .engine
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| item.envelope.group_id == group_id)
+            .all(|item| item.in_flight && item.retries == 0));
     }
 
     #[test]
@@ -4380,6 +4428,7 @@ mod tests {
                     }
                     CoreEffect::PersistState { .. }
                     | CoreEffect::EmitUserNotification { .. }
+                    | CoreEffect::ExecuteHttpRequest { .. }
                     | CoreEffect::ScheduleTimer { .. } => CoreOutput::default(),
                     other => panic!("unhandled harness effect: {other:?}"),
                 };

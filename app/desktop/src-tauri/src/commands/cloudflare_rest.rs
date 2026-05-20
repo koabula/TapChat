@@ -4,12 +4,14 @@
 //! bypassing the need for wrangler CLI. It uses the OAuth tokens obtained
 //! from our minimal login implementation.
 
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 
 /// Cloudflare API base URL
 const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+const WORKER_COMPATIBILITY_DATE: &str = "2026-03-30";
 
 /// OAuth login result from login.mjs
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +120,89 @@ struct CloudflareErrorDetail {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerMigrationPlan {
+    FreshV2,
+    UpgradeGroupOutbox,
+    None,
+}
+
+fn worker_migration_metadata(plan: WorkerMigrationPlan) -> Option<Value> {
+    match plan {
+        WorkerMigrationPlan::FreshV2 => Some(serde_json::json!({
+            "tag": "v2",
+            "new_sqlite_classes": ["InboxDurableObject", "GroupOutboxDurableObject"],
+        })),
+        WorkerMigrationPlan::UpgradeGroupOutbox => Some(serde_json::json!({
+            "tag": "v2",
+            "new_sqlite_classes": ["GroupOutboxDurableObject"],
+        })),
+        WorkerMigrationPlan::None => None,
+    }
+}
+
+fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan) -> Value {
+    let mut metadata = serde_json::json!({
+        "main_module": "worker.js",
+        "compatibility_date": WORKER_COMPATIBILITY_DATE,
+        "compatibility_flags": ["nodejs_compat_v2"],
+        "bindings": [
+            {
+                "type": "durable_object_namespace",
+                "name": "INBOX",
+                "class_name": "InboxDurableObject",
+            },
+            {
+                "type": "durable_object_namespace",
+                "name": "GROUP_OUTBOX",
+                "class_name": "GroupOutboxDurableObject",
+            },
+            {
+                "type": "r2_bucket",
+                "name": "TAPCHAT_STORAGE",
+                "bucket_name": config.bucket_name,
+            },
+            {
+                "type": "plain_text",
+                "name": "DEPLOYMENT_REGION",
+                "text": config.deployment_region,
+            },
+            {
+                "type": "plain_text",
+                "name": "MAX_INLINE_BYTES",
+                "text": config.max_inline_bytes.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "RETENTION_DAYS",
+                "text": config.retention_days.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "RATE_LIMIT_PER_MINUTE",
+                "text": config.rate_limit_per_minute.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "RATE_LIMIT_PER_HOUR",
+                "text": config.rate_limit_per_hour.to_string(),
+            },
+        ],
+    });
+
+    if let Some(migration) = worker_migration_metadata(plan) {
+        metadata["migrations"] = migration;
+    }
+
+    metadata
+}
+
+fn is_duplicate_sqlite_class_migration_error(message: &str, class_name: &str) -> bool {
+    message.contains(class_name)
+        && message.contains("Cannot apply new-sqlite-class migration")
+        && message.contains("already depended on by existing Durable Objects")
+}
+
 /// Create R2 bucket via REST API
 pub async fn create_r2_bucket(
     client: &Client,
@@ -180,55 +265,9 @@ pub async fn upload_worker_script(
     worker_name: &str,
     worker_script: &str,
     config: &WorkerDeployConfig,
+    migration_plan: WorkerMigrationPlan,
 ) -> Result<(), String> {
-    // Build metadata for bindings
-    let metadata = serde_json::json!({
-        "main_module": "worker.js",
-        "compatibility_date": "2024-01-01",
-        "compatibility_flags": ["nodejs_compat_v2"],
-        "bindings": [
-            {
-                "type": "durable_object_namespace",
-                "name": "INBOX",
-                "class_name": "InboxDurableObject",
-            },
-            {
-                "type": "r2_bucket",
-                "name": "TAPCHAT_STORAGE",
-                "bucket_name": config.bucket_name,
-            },
-            {
-                "type": "plain_text",
-                "name": "DEPLOYMENT_REGION",
-                "text": config.deployment_region,
-            },
-            {
-                "type": "plain_text",
-                "name": "MAX_INLINE_BYTES",
-                "text": config.max_inline_bytes.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "RETENTION_DAYS",
-                "text": config.retention_days.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "RATE_LIMIT_PER_MINUTE",
-                "text": config.rate_limit_per_minute.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "RATE_LIMIT_PER_HOUR",
-                "text": config.rate_limit_per_hour.to_string(),
-            },
-        ],
-        "migrations": {
-            "tag": "v1",
-            "new_sqlite_classes": ["InboxDurableObject"],
-        },
-    });
-
+    let metadata = build_worker_metadata(config, migration_plan);
     // Build multipart form data
     // Cloudflare expects: metadata (JSON) + script (JS file named 'worker.js')
     let form = reqwest::multipart::Form::new()
@@ -280,10 +319,70 @@ pub async fn upload_worker_script(
             .and_then(|e| e.message.clone())
             .unwrap_or_else(|| format!("HTTP {}", status));
 
-        return Err(format!("Failed to upload worker: {}", error_msg));
+        return Err(format!("Failed to upload worker: {error_msg}"));
     }
 
     Ok(())
+}
+
+async fn upload_worker_script_with_migration_retry(
+    client: &Client,
+    api_token: &str,
+    account_id: &str,
+    worker_name: &str,
+    worker_script: &str,
+    config: &WorkerDeployConfig,
+    worker_exists: bool,
+) -> Result<(), String> {
+    let migration_plan = if worker_exists {
+        WorkerMigrationPlan::UpgradeGroupOutbox
+    } else {
+        WorkerMigrationPlan::FreshV2
+    };
+
+    match upload_worker_script(
+        client,
+        api_token,
+        account_id,
+        worker_name,
+        worker_script,
+        config,
+        migration_plan,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error)
+            if migration_plan == WorkerMigrationPlan::UpgradeGroupOutbox
+                && is_duplicate_sqlite_class_migration_error(
+                    &error,
+                    "GroupOutboxDurableObject",
+                ) =>
+        {
+            eprintln!(
+                "GroupOutboxDurableObject migration already exists; retrying worker upload without migrations"
+            );
+            upload_worker_script(
+                client,
+                api_token,
+                account_id,
+                worker_name,
+                worker_script,
+                config,
+                WorkerMigrationPlan::None,
+            )
+            .await
+        }
+        Err(error)
+            if migration_plan == WorkerMigrationPlan::FreshV2
+                && is_duplicate_sqlite_class_migration_error(&error, "InboxDurableObject") =>
+        {
+            Err(format!(
+                "{error}. The Cloudflare account already has InboxDurableObject state for this worker name; retry Upgrade Cloudflare runtime so TapChat can apply only the group outbox migration."
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Write secret to Worker via REST API
@@ -411,7 +510,18 @@ pub async fn check_worker_exists(
         .await
         .map_err(|e| format!("Worker check request failed: {}", e))?;
 
-    Ok(response.status().is_success())
+    let status = response.status();
+    if status.is_success() {
+        return Ok(true);
+    }
+    if status == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+
+    let error_body = response.text().await.unwrap_or_default();
+    Err(format!(
+        "Worker check failed before upload: HTTP {status} - {error_body}"
+    ))
 }
 
 /// Get Worker deployment info (account's workers.dev subdomain)
@@ -564,13 +674,17 @@ pub async fn deploy_via_rest_api(
         progress_percent: 40,
     });
 
-    upload_worker_script(
+    let worker_exists =
+        check_worker_exists(&client, api_token, account_id, &config.worker_name).await?;
+
+    upload_worker_script_with_migration_retry(
         &client,
         api_token,
         account_id,
         &config.worker_name,
         worker_script,
         config,
+        worker_exists,
     )
     .await?;
 
@@ -736,4 +850,90 @@ pub async fn get_accounts(api_token: &str) -> Result<Vec<AccountInfo>, String> {
         .unwrap_or_default();
 
     Ok(accounts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_worker_metadata, is_duplicate_sqlite_class_migration_error, WorkerDeployConfig,
+        WorkerMigrationPlan, WORKER_COMPATIBILITY_DATE,
+    };
+
+    fn deploy_config() -> WorkerDeployConfig {
+        WorkerDeployConfig {
+            worker_name: "tapchat-test".into(),
+            public_base_url: None,
+            deployment_region: "test".into(),
+            bucket_name: "tapchat-storage".into(),
+            preview_bucket_name: "tapchat-storage-preview".into(),
+            sharing_token_secret: "sharing".into(),
+            bootstrap_token_secret: "bootstrap".into(),
+            max_inline_bytes: 4096,
+            retention_days: 30,
+            rate_limit_per_minute: 60,
+            rate_limit_per_hour: 600,
+        }
+    }
+
+    #[test]
+    fn fresh_worker_metadata_includes_v2_group_runtime() {
+        let metadata = build_worker_metadata(&deploy_config(), WorkerMigrationPlan::FreshV2);
+        assert_eq!(
+            metadata["compatibility_date"].as_str(),
+            Some(WORKER_COMPATIBILITY_DATE)
+        );
+
+        let bindings = metadata["bindings"].as_array().expect("bindings");
+        assert!(bindings.iter().any(|binding| {
+            binding["name"] == "INBOX" && binding["class_name"] == "InboxDurableObject"
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding["name"] == "GROUP_OUTBOX"
+                && binding["class_name"] == "GroupOutboxDurableObject"
+        }));
+
+        let classes = metadata["migrations"]["new_sqlite_classes"]
+            .as_array()
+            .expect("new sqlite classes");
+        assert!(classes.iter().any(|class| class == "InboxDurableObject"));
+        assert!(classes
+            .iter()
+            .any(|class| class == "GroupOutboxDurableObject"));
+        assert_eq!(metadata["migrations"]["tag"].as_str(), Some("v2"));
+    }
+
+    #[test]
+    fn upgrade_worker_metadata_does_not_recreate_inbox_class() {
+        let metadata =
+            build_worker_metadata(&deploy_config(), WorkerMigrationPlan::UpgradeGroupOutbox);
+        let classes = metadata["migrations"]["new_sqlite_classes"]
+            .as_array()
+            .expect("new sqlite classes");
+        assert!(!classes.iter().any(|class| class == "InboxDurableObject"));
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].as_str(), Some("GroupOutboxDurableObject"));
+    }
+
+    #[test]
+    fn no_migration_plan_keeps_bindings_without_migration_payload() {
+        let metadata = build_worker_metadata(&deploy_config(), WorkerMigrationPlan::None);
+        assert!(metadata.get("migrations").is_none());
+        let bindings = metadata["bindings"].as_array().expect("bindings");
+        assert!(bindings
+            .iter()
+            .any(|binding| binding["name"] == "GROUP_OUTBOX"));
+    }
+
+    #[test]
+    fn duplicate_sqlite_class_error_detection_is_class_specific() {
+        let error = "Failed to upload worker: Cannot apply new-sqlite-class migration to class 'InboxDurableObject' that is already depended on by existing Durable Objects";
+        assert!(is_duplicate_sqlite_class_migration_error(
+            error,
+            "InboxDurableObject"
+        ));
+        assert!(!is_duplicate_sqlite_class_migration_error(
+            error,
+            "GroupOutboxDurableObject"
+        ));
+    }
 }

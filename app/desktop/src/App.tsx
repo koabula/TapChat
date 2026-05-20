@@ -11,6 +11,7 @@ import Complete from "./pages/onboarding/Complete";
 
 import ChatLayout from "./pages/chat/ChatLayout";
 import ChatView from "./pages/chat/ChatView";
+import GroupsPage from "./pages/groups/GroupsPage";
 
 import ContactList from "./pages/contacts/ContactList";
 import ContactDetail from "./pages/contacts/ContactDetail";
@@ -128,6 +129,7 @@ function AppInner() {
             <Route path="/" element={<ChatLayout />}>
               <Route index element={<ChatView />} />
               <Route path="chat/:id" element={<ChatView />} />
+              <Route path="groups" element={<GroupsPage />} />
             </Route>
             <Route path="/contacts" element={<ContactList />} />
             <Route path="/contacts/:id" element={<ContactDetail />} />

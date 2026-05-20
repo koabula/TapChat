@@ -307,13 +307,13 @@ function WelcomePickupSharing({
     <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
       <div className="p-4 space-y-3 flex-1 overflow-y-auto">
         <p className="text-primary-color text-sm font-medium">
-          Invites sent. Invitees will see this group in Message Requests after
-          their inbox syncs.
+          Group created. Existing contacts will receive an encrypted group
+          invitation through your direct chat and import it automatically.
         </p>
         <p className="text-secondary-color text-sm">
-          Share each welcome pickup URL with the matching device. The
-          invitee imports the group by opening the URL in TapChat. These
-          links expire — copy them before closing this dialog.
+          If a contact does not see the group after syncing, share the
+          matching welcome pickup URL as a fallback. The invitee imports
+          the group by opening the URL in TapChat.
         </p>
         {result.welcome_pickups.length === 0 ? (
           <div className="text-center py-6 text-muted-color text-sm">
