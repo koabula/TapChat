@@ -300,6 +300,14 @@ export class GroupOutboxService {
     return { invite: stored.document };
   }
 
+  async fetchInviteById(inviteId: string, now: number): Promise<FetchGroupInviteResult> {
+    const stored = await this.loadUsableInvite(inviteId, now);
+    if (stored.token !== stored.document.signature) {
+      throw new HttpError(403, "invalid_capability", "invite signature is invalid");
+    }
+    return { invite: stored.document };
+  }
+
   async revokeInvite(input: RevokeGroupInviteRequest, now: number): Promise<RevokeGroupInviteResult> {
     if (input.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "group_id does not match group invite route");

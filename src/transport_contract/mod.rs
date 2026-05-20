@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 
 use crate::model::{
     Ack, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupInviteDocument,
-    GroupJoinRequest, GroupManifest, GroupOutboxRecord, IdentityBundle,
-    InboxRecord, WelcomePickupDescriptor,
+    GroupJoinRequest, GroupManifest, GroupOutboxRecord, IdentityBundle, InboxRecord,
+    WelcomePickupDescriptor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +282,7 @@ pub struct FetchGroupInviteResult {
 pub struct SubmitGroupJoinRequest {
     pub version: String,
     pub invite_token: String,
+    pub join_request_endpoint: String,
     pub request: GroupJoinRequest,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,

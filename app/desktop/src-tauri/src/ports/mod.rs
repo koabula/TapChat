@@ -29,13 +29,12 @@ use tapchat_core::transport_contract::{
     FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
     FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
     FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult,
-    GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult, ListGroupJoinRequestsRequest,
-    ListGroupJoinRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
-    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
-    GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest,
-    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
-    SubmitGroupJoinResult,
+    GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult, GroupRealtimeSubscriptionRequest,
+    ListGroupJoinRequestsRequest, ListGroupJoinRequestsResult, MessageRequestActionRequest,
+    PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, RevokeGroupInviteResult, SealGroupOutboxRequest,
+    SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -715,14 +714,9 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         submit: SubmitGroupJoinRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let base = self.inbox_base_url().await?;
         let response = self
             .client
-            .post(format!(
-                "{}/v1/groups/{}/join-requests",
-                base.trim_end_matches('/'),
-                submit.request.group_id
-            ))
+            .post(&submit.join_request_endpoint)
             .header("Authorization", format!("Bearer {}", submit.invite_token))
             .header("Content-Type", "application/json")
             .body(to_camel_case_json_string(&serde_json::to_string(&submit)?)?)

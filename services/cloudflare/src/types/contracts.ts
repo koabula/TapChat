@@ -352,6 +352,7 @@ export interface FetchGroupInviteResult {
 export interface SubmitGroupJoinRequest {
   version: string;
   inviteToken: string;
+  joinRequestEndpoint?: string;
   request: GroupJoinRequest;
 }
 

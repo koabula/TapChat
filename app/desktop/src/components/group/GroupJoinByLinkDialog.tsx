@@ -18,7 +18,7 @@ interface GroupJoinByLinkDialogProps {
  * Paste-an-invite-URL dialog for new joiners.
  *
  * Flow (requirements R8):
- *   1. User pastes either a `https://.../v1/group-invite/<token>` URL
+ *   1. User pastes either a `https://.../v1/group-invite/...` URL
  *      (owner/admin invite link) or a `tapchat://welcome-pickup/<b64>`
  *      URL (direct welcome pickup). The Tauri command dispatches the
  *      right `CoreCommand` based on the prefix.
@@ -177,7 +177,7 @@ export default function GroupJoinByLinkDialog({
         <div className="p-4 space-y-3">
           <label className="block">
             <span className="text-sm text-secondary-color">
-              Paste an invite link or welcome pickup URL
+              Paste an invite link or device welcome fallback URL
             </span>
             <textarea
               className="input mt-1 font-mono text-xs"

@@ -34,7 +34,7 @@ use tapchat_core::model::{
     GroupMemberStatus, GroupMessageType, GroupRole, StorageRef, WelcomePickupDescriptor,
 };
 use tapchat_core::persistence::PersistedGroupInvite;
-use tapchat_core::CoreCommand;
+use tapchat_core::{CoreCommand, CoreOutput};
 
 use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
@@ -538,6 +538,28 @@ pub async fn create_group_conversation(
         return Err(message);
     }
 
+    for member_user_id in &members {
+        log::info!(
+            "create_group_conversation: refreshing contact identity before group welcome user_id={}",
+            member_user_id
+        );
+        drive_core_with_handle(
+            &app,
+            CoreInput::Command(CoreCommand::RefreshIdentityState {
+                user_id: member_user_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "create_group_conversation: contact identity refresh preflight failed user_id={} error={}",
+                member_user_id,
+                error
+            );
+            CoreOutput::default()
+        });
+    }
+
     let output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::CreateGroupConversation {
@@ -764,6 +786,28 @@ pub async fn invite_to_group(
         .collect();
     if invitees.is_empty() {
         return Err("at least one invitee user id is required".into());
+    }
+
+    for invitee_user_id in &invitees {
+        log::info!(
+            "invite_to_group: refreshing contact identity before group welcome user_id={}",
+            invitee_user_id
+        );
+        drive_core_with_handle(
+            &app,
+            CoreInput::Command(CoreCommand::RefreshIdentityState {
+                user_id: invitee_user_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "invite_to_group: contact identity refresh preflight failed user_id={} error={}",
+                invitee_user_id,
+                error
+            );
+            CoreOutput::default()
+        });
     }
 
     let output = drive_core_with_handle(
@@ -1556,6 +1600,17 @@ pub async fn create_group_conversation_impl(
         return Err(message);
     }
 
+    for member_user_id in &members {
+        drive_core_without_handle(
+            state,
+            CoreInput::Command(CoreCommand::RefreshIdentityState {
+                user_id: member_user_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| CoreOutput::default());
+    }
+
     let output = drive_core_without_handle(
         state,
         CoreInput::Command(CoreCommand::CreateGroupConversation {
@@ -1743,6 +1798,17 @@ pub async fn invite_to_group_impl(
         .collect();
     if invitees.is_empty() {
         return Err("at least one invitee user id is required".into());
+    }
+
+    for invitee_user_id in &invitees {
+        drive_core_without_handle(
+            state,
+            CoreInput::Command(CoreCommand::RefreshIdentityState {
+                user_id: invitee_user_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| CoreOutput::default());
     }
 
     let output = drive_core_without_handle(

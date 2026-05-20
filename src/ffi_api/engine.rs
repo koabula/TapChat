@@ -1051,7 +1051,10 @@ impl CoreEngine {
                     }),
                 })
             }
-            CoreEvent::GroupInviteFetched { invite_url, invite } => {
+            CoreEvent::GroupInviteFetched {
+                invite_url: _,
+                invite,
+            } => {
                 let local = self
                     .state
                     .local_identity
@@ -1103,17 +1106,13 @@ impl CoreEngine {
                         group_id: invite.group_id.clone(),
                         request_id: request_id.clone(),
                         request: request.clone(),
+                        join_request_endpoint: Some(invite.join_request_endpoint.clone()),
                         welcome_pickup: None,
                         manifest: None,
                         start_cursor: None,
                     },
                 );
-                let invite_token = invite_url
-                    .rsplit('/')
-                    .next()
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| CoreError::invalid_input("invite URL does not contain token"))?
-                    .to_string();
+                let invite_token = invite.signature.clone();
                 Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         system_statuses_changed: vec![SystemStatus::SyncInProgress],
@@ -1130,6 +1129,7 @@ impl CoreEngine {
                             submit: SubmitGroupJoinRequest {
                                 version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                                 invite_token,
+                                join_request_endpoint: invite.join_request_endpoint.clone(),
                                 request: request.clone(),
                                 headers: BTreeMap::new(),
                             },
@@ -1142,12 +1142,18 @@ impl CoreEngine {
                 })
             }
             CoreEvent::GroupJoinRequestSubmitted { request } => {
+                let join_request_endpoint = self
+                    .state
+                    .group_join_requests
+                    .get(&request.request_id)
+                    .and_then(|stored| stored.join_request_endpoint.clone());
                 self.state.group_join_requests.insert(
                     request.request_id.clone(),
                     PersistedGroupJoinRequest {
                         group_id: request.group_id.clone(),
                         request_id: request.request_id.clone(),
                         request: request.clone(),
+                        join_request_endpoint,
                         welcome_pickup: None,
                         manifest: None,
                         start_cursor: None,
@@ -1170,12 +1176,15 @@ impl CoreEngine {
             CoreEvent::GroupJoinRequestsListed { group_id, requests } => {
                 let mut effects = Vec::new();
                 for request in &requests {
+                    let previous = self.state.group_join_requests.get(&request.request_id);
                     self.state.group_join_requests.insert(
                         request.request_id.clone(),
                         PersistedGroupJoinRequest {
                             group_id: request.group_id.clone(),
                             request_id: request.request_id.clone(),
                             request: request.clone(),
+                            join_request_endpoint: previous
+                                .and_then(|stored| stored.join_request_endpoint.clone()),
                             welcome_pickup: None,
                             manifest: None,
                             start_cursor: None,
@@ -1221,12 +1230,15 @@ impl CoreEngine {
                 manifest,
                 start_cursor,
             } => {
+                let previous = self.state.group_join_requests.get(&request.request_id);
                 self.state.group_join_requests.insert(
                     request.request_id.clone(),
                     PersistedGroupJoinRequest {
                         group_id: request.group_id.clone(),
                         request_id: request.request_id.clone(),
                         request: request.clone(),
+                        join_request_endpoint: previous
+                            .and_then(|stored| stored.join_request_endpoint.clone()),
                         welcome_pickup: welcome_pickup.clone(),
                         manifest,
                         start_cursor,
@@ -2137,10 +2149,8 @@ impl CoreEngine {
             });
             if let Some(invitee_user_id) = invitee_user_by_device.get(&welcome.recipient_device_id)
             {
-                let direct_conversation_id = direct_conversation_id(
-                    &local_identity.user_identity.user_id,
-                    invitee_user_id,
-                );
+                let direct_conversation_id =
+                    direct_conversation_id(&local_identity.user_identity.user_id, invitee_user_id);
                 let invite = GroupWelcomePickupControl {
                     version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                     group_id: group_id.clone(),
@@ -2284,7 +2294,10 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
         let should_retry_pending = reason.as_deref().is_some_and(|reason| {
-            matches!(reason, "runtime_upgraded" | "manual_retry" | "retry_pending")
+            matches!(
+                reason,
+                "runtime_upgraded" | "manual_retry" | "retry_pending"
+            )
         });
         let retry_reset_message_ids = if should_retry_pending {
             self.reset_pending_group_outbox_for_retry(&group_id)
@@ -2553,12 +2566,20 @@ impl CoreEngine {
                 "group join request id does not belong to this group",
             ));
         }
-        let base = self.deployment_http_base()?;
+        let endpoint = if let Some(endpoint) = stored.join_request_endpoint.clone() {
+            endpoint
+        } else {
+            let base = self.deployment_http_base()?;
+            format!(
+                "{}/v1/groups/{}/join-requests",
+                base.trim_end_matches('/'),
+                stored.request.group_id
+            )
+        };
         let endpoint = format!(
-            "{}/v1/groups/{}/join-requests/{}",
-            base.trim_end_matches('/'),
-            stored.request.group_id,
-            stored.request.request_id,
+            "{}/{}",
+            endpoint.trim_end_matches('/'),
+            stored.request.request_id
         );
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
@@ -8065,8 +8086,11 @@ impl CoreEngine {
                                 record.message_id,
                                 conversation_id
                             );
-                            let payload_b64 =
-                                record.envelope.inline_ciphertext.as_deref().ok_or_else(|| {
+                            let payload_b64 = record
+                                .envelope
+                                .inline_ciphertext
+                                .as_deref()
+                                .ok_or_else(|| {
                                     CoreError::invalid_input(
                                         "group welcome pickup control is missing payload",
                                     )
@@ -10439,6 +10463,7 @@ impl CoreEngine {
             descriptor.group_id,
             descriptor.device_id
         );
+        let mut imported_shell: Option<(String, String)> = None;
         if !self.state.group_states.contains_key(&descriptor.group_id) {
             let manifest = manifest.ok_or_else(|| {
                 CoreError::invalid_input("welcome pickup result is missing group manifest")
@@ -10462,6 +10487,8 @@ impl CoreEngine {
                     "local user is not an active member of the group manifest",
                 ));
             }
+            let imported_group_id = manifest.group_id.clone();
+            let imported_conversation_id = manifest.conversation_id.clone();
             self.state.conversations.insert(
                 manifest.conversation_id.clone(),
                 LocalConversationState {
@@ -10521,6 +10548,7 @@ impl CoreEngine {
                     pending_membership_transition: None,
                 },
             );
+            imported_shell = Some((imported_group_id, imported_conversation_id));
             log::info!(
                 "handle_welcome_pickup_fetched: imported group shell group_id={} conversation_id={} local_role={:?}",
                 descriptor.group_id,
@@ -10548,9 +10576,64 @@ impl CoreEngine {
                 &group_state.manifest.signer_device_id,
                 MessageType::MlsWelcome,
                 &welcome_b64,
-            )?;
+            );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some((group_id, conversation_id)) = imported_shell {
+                    self.state.group_states.remove(&group_id);
+                    self.state.group_cursors.remove(&group_id);
+                    self.state.conversations.remove(&conversation_id);
+                }
+                let message = format!(
+                    "failed to import group welcome for {}: {}. The welcome may target an expired device key package; ask the inviter to refresh the contact and invite again.",
+                    descriptor.group_id, error
+                );
+                log::warn!(
+                    "handle_welcome_pickup_fetched: welcome import failed group_id={} device_id={} error={}",
+                    descriptor.group_id,
+                    descriptor.device_id,
+                    error
+                );
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        conversations_changed: true,
+                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message,
+                        },
+                    }],
+                    view_model: None,
+                });
+            }
+        };
         if !matches!(result, IngestResult::AppliedWelcome { .. }) {
-            return Err(CoreError::invalid_state("welcome pickup did not apply"));
+            if let Some((group_id, conversation_id)) = imported_shell {
+                self.state.group_states.remove(&group_id);
+                self.state.group_cursors.remove(&group_id);
+                self.state.conversations.remove(&conversation_id);
+            }
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: format!(
+                            "failed to import group welcome for {}: welcome pickup did not apply",
+                            descriptor.group_id
+                        ),
+                    },
+                }],
+                view_model: None,
+            });
         }
         let summary = self
             .state

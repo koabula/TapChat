@@ -181,11 +181,20 @@ export async function handleGroupOutboxDurableRequest(
       return jsonResponse(
         await service.createInvite(
           body,
-          `${url.origin}/v1/group-invite/${encodeURIComponent(token)}`,
+          `${url.origin}/v1/group-invite/${encodeURIComponent(deps.groupId)}/${encodeURIComponent(body.document.inviteId)}`,
           token,
           now
         )
       );
+    }
+
+    const shortInviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
+    if (shortInviteFetchMatch && request.method === "GET") {
+      const routeGroupId = decodeURIComponent(shortInviteFetchMatch[1]);
+      if (routeGroupId !== deps.groupId) {
+        throw new HttpError(400, "invalid_input", "group invite route does not match durable object");
+      }
+      return jsonResponse(await service.fetchInviteById(decodeURIComponent(shortInviteFetchMatch[2]), now));
     }
 
     const inviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);

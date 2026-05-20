@@ -125,6 +125,8 @@ pub struct PersistedGroupJoinRequest {
     pub request_id: String,
     pub request: GroupJoinRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_request_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome_pickup: Option<WelcomePickupDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<GroupManifest>,

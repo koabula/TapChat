@@ -1509,8 +1509,11 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
     env
   );
   assert.equal(inviteResp.status, 200);
-  const inviteBody = (await inviteResp.json()) as { inviteUrl: string };
-  const inviteToken = decodeURIComponent(inviteBody.inviteUrl.split("/").pop() ?? "");
+  const inviteBody = (await inviteResp.json()) as { inviteUrl: string; invite: { signature: string } };
+  assert.match(inviteBody.inviteUrl, /\/v1\/group-invite\/group%3Aproject\/invite%3Apre-seal$/);
+  const shortInviteFetch = await handleRequest(new Request(inviteBody.inviteUrl), env);
+  assert.equal(shortInviteFetch.status, 200);
+  const inviteToken = inviteBody.invite.signature;
 
   const preSealJoin = {
     version: CURRENT_MODEL_VERSION,

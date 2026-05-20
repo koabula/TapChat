@@ -308,12 +308,12 @@ function WelcomePickupSharing({
       <div className="p-4 space-y-3 flex-1 overflow-y-auto">
         <p className="text-primary-color text-sm font-medium">
           Group created. Existing contacts will receive an encrypted group
-          invitation through your direct chat and import it automatically.
+          welcome through your direct chat and import it automatically.
         </p>
         <p className="text-secondary-color text-sm">
           If a contact does not see the group after syncing, share the
-          matching welcome pickup URL as a fallback. The invitee imports
-          the group by opening the URL in TapChat.
+          matching device welcome fallback URL. It is device-specific and
+          different from a reusable invite link.
         </p>
         {result.welcome_pickups.length === 0 ? (
           <div className="text-center py-6 text-muted-color text-sm">

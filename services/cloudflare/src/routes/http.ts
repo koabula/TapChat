@@ -310,6 +310,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return stub.fetch(request);
     }
 
+    const shortPublicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
+    if (shortPublicInviteMatch && request.method === "GET") {
+      const groupId = decodeURIComponent(shortPublicInviteMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+
     const publicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)$/);
     if (publicInviteMatch && request.method === "GET") {
       let payload: GroupInviteTokenPayload;

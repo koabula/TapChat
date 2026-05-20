@@ -1491,20 +1491,10 @@ impl TransportPort for CoreDriver {
         &mut self,
         submit: SubmitGroupJoinRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let base = self
-            .engine
-            .refresh_snapshot()
-            .deployment
-            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
-            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
         let response = self
             .runtime
             .client
-            .post(format!(
-                "{}/v1/groups/{}/join-requests",
-                base.trim_end_matches('/'),
-                submit.request.group_id
-            ))
+            .post(&submit.join_request_endpoint)
             .header("Authorization", format!("Bearer {}", submit.invite_token))
             .header("Content-Type", "application/json")
             .body(to_camel_case_json_string(&serde_json::to_string(&submit)?)?)
