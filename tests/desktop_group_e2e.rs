@@ -39,14 +39,16 @@ use common::{
 };
 use reqwest::StatusCode;
 use serde_json::Value;
+use tapchat_core::ffi_api::RealtimeEvent;
 use tapchat_core::model::{DeploymentBundle, IdentityBundle};
+use tapchat_core::CoreEvent;
 use tapchat_desktop_lib::test_support::{
     approve_group_join_impl, build_test_app_state_for_profile, create_group_conversation_impl,
     create_group_invite_link_impl, dissolve_group_impl, download_attachment_impl,
-    get_group_messages_impl, get_group_snapshot_impl, leave_group_impl,
+    drive_core_without_handle, get_group_messages_impl, get_group_snapshot_impl, leave_group_impl,
     list_group_conversations_impl, remove_group_member_impl, send_attachment_impl,
     send_group_text_message_impl, set_group_admin_impl, submit_group_join_request_impl,
-    sync_group_outbox_impl, transfer_group_ownership_impl, update_group_metadata_impl,
+    sync_group_outbox_impl, transfer_group_ownership_impl, update_group_metadata_impl, CoreInput,
     GroupMessageView,
 };
 use tapchat_desktop_lib::AppState;
@@ -425,6 +427,19 @@ fn desktop_group_dana_post_approval_send_sync_regression() -> Result<()> {
         .context("build tokio runtime for desktop_group_dana_post_approval_send_sync_regression")?;
 
     rt.block_on(run_dana_post_approval_send_sync_regression(&ctx))?;
+    Ok(())
+}
+
+#[test]
+fn desktop_group_realtime_event_drives_owner_message_sync_regression() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-realtime-owner-sync")?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for desktop_group_realtime_event_drives_owner_message_sync_regression")?;
+
+    rt.block_on(run_realtime_event_drives_owner_message_sync(&ctx))?;
     Ok(())
 }
 
@@ -818,6 +833,65 @@ async fn run_dana_post_approval_send_sync_regression(ctx: &QuartetContext) -> Re
             "{label} did not receive dana's focused regression text"
         );
     }
+
+    Ok(())
+}
+
+async fn run_realtime_event_drives_owner_message_sync(ctx: &QuartetContext) -> Result<()> {
+    let (alice, bob, _carol, group_id, conversation_id) =
+        create_three_user_group(ctx, "Desktop Realtime Owner Sync").await?;
+
+    let before_snapshot = get_group_snapshot_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob snapshot before realtime sync: {e}"))?;
+    let before_cursor = before_snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+
+    send_group_text_message_impl(
+        &alice.state,
+        conversation_id.clone(),
+        "owner realtime delivery".into(),
+    )
+    .await
+    .map_err(|e| anyhow!("alice send owner realtime delivery: {e}"))?;
+
+    drive_core_without_handle(
+        &bob.state,
+        CoreInput::Event(CoreEvent::GroupRealtimeEventReceived {
+            group_id: group_id.clone(),
+            event: RealtimeEvent::GroupOutboxRecordAvailable {
+                group_id: group_id.clone(),
+                seq: before_cursor.saturating_add(1),
+                record: None,
+            },
+        }),
+    )
+    .await
+    .map_err(|e| anyhow!("bob realtime event drive: {e}"))?;
+
+    let messages = get_group_messages_impl(&bob.state, conversation_id)
+        .await
+        .map_err(|e| anyhow!("bob messages after realtime event: {e}"))?;
+    assert!(
+        has_bubble_with_plaintext(&messages, "owner realtime delivery"),
+        "bob should receive owner text through realtime-driven core sync"
+    );
+
+    let after_snapshot = get_group_snapshot_impl(&bob.state, group_id)
+        .await
+        .map_err(|e| anyhow!("bob snapshot after realtime sync: {e}"))?;
+    let after_cursor = after_snapshot
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    assert!(
+        after_cursor > before_cursor,
+        "bob cursor should advance after realtime-driven sync; before={before_cursor} after={after_cursor}"
+    );
 
     Ok(())
 }

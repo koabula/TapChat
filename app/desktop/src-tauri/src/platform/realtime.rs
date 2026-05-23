@@ -11,10 +11,13 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 
 use tapchat_core::cli::util::to_camel_case_json_string;
-use tapchat_core::ffi_api::CoreEvent;
-use tapchat_core::transport_contract::{GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest};
+use tapchat_core::ffi_api::{CoreEvent, RealtimeEvent};
+use tapchat_core::transport_contract::{
+    GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest,
+};
 
 use crate::commands::session::set_ws_connection_snapshot;
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::profile::ProfileManagerInner;
 use crate::state::AppState;
 use crate::timetest;
@@ -406,9 +409,7 @@ impl RealtimeManager {
                         "RealtimeManager: reusing active or connecting group session for group_id={}",
                         group_id
                     );
-                    return Ok(vec![CoreEvent::GroupWebSocketConnected {
-                        group_id,
-                    }]);
+                    return Ok(vec![CoreEvent::GroupWebSocketConnected { group_id }]);
                 }
             }
         }
@@ -485,36 +486,38 @@ impl RealtimeManager {
             .context("build group websocket request")?;
 
         // Connect
-        let (ws_stream, _) =
-            match connect_async_tls_with_config(request, None, false, None).await {
-                Ok(result) => result,
-                Err(error) => {
-                    let mut sessions = self.group_sessions.write().await;
-                    if sessions
-                        .get(&group_id)
-                        .is_some_and(|session| session.connection_id == connection_id)
-                    {
-                        sessions.remove(&group_id);
-                    }
-                    let detail = format!("group websocket connect: {}", error);
-                    log::warn!(
-                        "RealtimeManager: group websocket connect failed group_id={} error={}",
-                        group_id,
-                        detail
-                    );
-                    if let Some(app) = &self.app_handle {
-                        let _ = app.emit("realtime-event", RealtimeEventPayload {
+        let (ws_stream, _) = match connect_async_tls_with_config(request, None, false, None).await {
+            Ok(result) => result,
+            Err(error) => {
+                let mut sessions = self.group_sessions.write().await;
+                if sessions
+                    .get(&group_id)
+                    .is_some_and(|session| session.connection_id == connection_id)
+                {
+                    sessions.remove(&group_id);
+                }
+                let detail = format!("group websocket connect: {}", error);
+                log::warn!(
+                    "RealtimeManager: group websocket connect failed group_id={} error={}",
+                    group_id,
+                    detail
+                );
+                if let Some(app) = &self.app_handle {
+                    let _ = app.emit(
+                        "realtime-event",
+                        RealtimeEventPayload {
                             device_id: group_id.clone(),
                             event_type: "group_error".to_string(),
                             data: Some(detail.clone()),
-                        });
-                    }
-                    return Ok(vec![CoreEvent::GroupWebSocketDisconnected {
-                        group_id,
-                        error: Some(detail),
-                    }]);
+                        },
+                    );
                 }
-            };
+                return Ok(vec![CoreEvent::GroupWebSocketDisconnected {
+                    group_id,
+                    error: Some(detail),
+                }]);
+            }
+        };
 
         // Mark connected
         {
@@ -529,11 +532,14 @@ impl RealtimeManager {
         }
 
         if let Some(app) = &self.app_handle {
-            let _ = app.emit("realtime-event", RealtimeEventPayload {
-                device_id: group_id.clone(),
-                event_type: "group_connected".to_string(),
-                data: None,
-            });
+            let _ = app.emit(
+                "realtime-event",
+                RealtimeEventPayload {
+                    device_id: group_id.clone(),
+                    event_type: "group_connected".to_string(),
+                    data: None,
+                },
+            );
         }
 
         // Spawn read loop with group-specific semantics
@@ -626,6 +632,27 @@ impl RealtimeManager {
                                         device_id: group_id.clone(),
                                         event_type: event.event_type_name(),
                                         data: Some(text.to_string()),
+                                    });
+                                }
+                                if let (Some(app), Some(core_event)) = (
+                                    app_handle.as_ref(),
+                                    group_core_event_from_ws_event(&group_id, &event),
+                                ) {
+                                    let app = app.clone();
+                                    std::thread::spawn(move || {
+                                        tauri::async_runtime::handle().block_on(async move {
+                                            if let Err(error) = Box::pin(drive_core_with_handle(
+                                                app.as_ref(),
+                                                CoreInput::Event(core_event),
+                                            ))
+                                            .await
+                                            {
+                                                log::warn!(
+                                                    "RealtimeManager: failed to drive core from group realtime event: {}",
+                                                    error
+                                                );
+                                            }
+                                        });
                                     });
                                 }
                             } else {
@@ -997,6 +1024,36 @@ impl WsServerEvent {
     }
 }
 
+fn group_core_event_from_ws_event(
+    subscribed_group_id: &str,
+    event: &WsServerEvent,
+) -> Option<CoreEvent> {
+    match event {
+        WsServerEvent::GroupHeadUpdated { group_id, seq } if group_id == subscribed_group_id => {
+            Some(CoreEvent::GroupRealtimeEventReceived {
+                group_id: group_id.clone(),
+                event: RealtimeEvent::GroupHeadUpdated {
+                    group_id: group_id.clone(),
+                    seq: *seq,
+                },
+            })
+        }
+        WsServerEvent::GroupOutboxRecordAvailable { group_id, seq, .. }
+            if group_id == subscribed_group_id =>
+        {
+            Some(CoreEvent::GroupRealtimeEventReceived {
+                group_id: group_id.clone(),
+                event: RealtimeEvent::GroupOutboxRecordAvailable {
+                    group_id: group_id.clone(),
+                    seq: *seq,
+                    record: None,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
 fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
     match event {
         WsServerEvent::HeadUpdated { seq, .. } => {
@@ -1082,5 +1139,64 @@ mod tests {
         assert!(!summary.contains("inlineCiphertext"));
         assert!(!summary.contains("senderProof"));
         assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn group_head_ws_event_maps_to_core_realtime_event() {
+        let event = WsServerEvent::GroupHeadUpdated {
+            group_id: "group:alpha".into(),
+            seq: 42,
+        };
+
+        let mapped = group_core_event_from_ws_event("group:alpha", &event);
+
+        assert!(matches!(
+            mapped,
+            Some(CoreEvent::GroupRealtimeEventReceived {
+                group_id,
+                event: RealtimeEvent::GroupHeadUpdated {
+                    group_id: event_group_id,
+                    seq: 42
+                }
+            }) if group_id == "group:alpha" && event_group_id == "group:alpha"
+        ));
+    }
+
+    #[test]
+    fn group_record_ws_event_maps_to_fetch_backfill_core_event() {
+        let event = WsServerEvent::GroupOutboxRecordAvailable {
+            group_id: "group:alpha".into(),
+            seq: 43,
+            record: Some(serde_json::json!({"messageId": "ignored"})),
+        };
+
+        let mapped = group_core_event_from_ws_event("group:alpha", &event);
+
+        assert!(matches!(
+            mapped,
+            Some(CoreEvent::GroupRealtimeEventReceived {
+                group_id,
+                event: RealtimeEvent::GroupOutboxRecordAvailable {
+                    group_id: event_group_id,
+                    seq: 43,
+                    record: None
+                }
+            }) if group_id == "group:alpha" && event_group_id == "group:alpha"
+        ));
+    }
+
+    #[test]
+    fn non_matching_or_non_group_outbox_ws_events_do_not_drive_core() {
+        let mismatched = WsServerEvent::GroupHeadUpdated {
+            group_id: "group:other".into(),
+            seq: 1,
+        };
+        let inbox = WsServerEvent::HeadUpdated {
+            device_id: "device:local".into(),
+            seq: 1,
+        };
+
+        assert!(group_core_event_from_ws_event("group:alpha", &mismatched).is_none());
+        assert!(group_core_event_from_ws_event("group:alpha", &inbox).is_none());
     }
 }

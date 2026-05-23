@@ -2523,9 +2523,7 @@ impl CoreEngine {
             .state
             .pending_welcome_pickups
             .values()
-            .filter(|pickup| {
-                !self.state.group_states.contains_key(&pickup.group_id)
-            })
+            .filter(|pickup| !self.state.group_states.contains_key(&pickup.group_id))
             .cloned()
             .collect();
         if pending.is_empty() {
@@ -9066,6 +9064,11 @@ impl CoreEngine {
         // welcome-pickup join fast-forward path), fetch the actual records
         // rather than skipping ahead.
         if self.state.pending_sync_group_head.remove(&group_id) {
+            log::info!(
+                "handle_group_outbox_head_fetched: sync head group_id={} head_seq={}",
+                group_id,
+                head_seq
+            );
             let cursor = self
                 .state
                 .group_cursors
@@ -9079,6 +9082,12 @@ impl CoreEngine {
             let from_seq = cursor.last_fetched_seq.saturating_add(1).max(1);
             if head_seq < from_seq {
                 // Already caught up — nothing to fetch.
+                log::info!(
+                    "handle_group_outbox_head_fetched: already caught up group_id={} head_seq={} cursor={}",
+                    group_id,
+                    head_seq,
+                    cursor.last_fetched_seq
+                );
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         checkpoints_changed: true,
@@ -9126,6 +9135,12 @@ impl CoreEngine {
             if head_seq <= cursor.last_fetched_seq {
                 return Ok(CoreOutput::default());
             }
+            log::info!(
+                "handle_group_outbox_head_fetched: welcome fast-forward group_id={} from_seq={} to_seq={}",
+                group_id,
+                cursor.last_fetched_seq,
+                head_seq
+            );
             cursor.last_fetched_seq = head_seq;
             cursor.updated_at = current_unix_millis(self.state.message_nonce);
             Ok(CoreOutput {
@@ -9158,6 +9173,7 @@ impl CoreEngine {
             .clone();
         let conversation_id = group_state.conversation_id.clone();
         records.sort_by_key(|record| record.seq);
+        let record_count = records.len();
         let mut messages = Vec::new();
         for record in records {
             record.validate()?;
@@ -9401,6 +9417,13 @@ impl CoreEngine {
                 last_fetched_seq: to_seq,
                 updated_at: now,
             },
+        );
+        log::info!(
+            "handle_group_outbox_records: applied group_id={} records={} messages={} cursor={}",
+            group_id,
+            record_count,
+            messages.len(),
+            to_seq
         );
         let target_head = self.state.group_sync_target_head.get(&group_id).copied();
         let mut output = CoreOutput {

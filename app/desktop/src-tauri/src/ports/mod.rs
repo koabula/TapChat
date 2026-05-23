@@ -192,6 +192,59 @@ impl DesktopPlatformPorts {
             .map(|state| state.manifest.outbox.endpoint)
             .ok_or_else(|| anyhow::anyhow!("group outbox endpoint is missing"))
     }
+
+    async fn group_outbox_messages_url(
+        &self,
+        group_id: &str,
+        from_seq: u64,
+        limit: u64,
+    ) -> Result<url::Url> {
+        let endpoint = self.group_outbox_endpoint(group_id).await?;
+        group_outbox_messages_url_from_endpoint(&endpoint, from_seq, limit)
+    }
+
+    async fn group_outbox_sibling_url(&self, group_id: &str, sibling: &str) -> Result<url::Url> {
+        let endpoint = self.group_outbox_endpoint(group_id).await?;
+        group_outbox_sibling_url_from_endpoint(&endpoint, sibling)
+    }
+}
+
+fn parse_group_outbox_messages_endpoint(endpoint: &str) -> Result<url::Url> {
+    let url = url::Url::parse(endpoint).context("parse group outbox endpoint")?;
+    if !url.path().ends_with("/outbox/messages") {
+        anyhow::bail!("group outbox endpoint must end with /outbox/messages");
+    }
+    Ok(url)
+}
+
+fn group_outbox_messages_url_from_endpoint(
+    endpoint: &str,
+    from_seq: u64,
+    limit: u64,
+) -> Result<url::Url> {
+    let mut url = parse_group_outbox_messages_endpoint(endpoint)?;
+    url.set_query(None);
+    url.set_fragment(None);
+    url.query_pairs_mut()
+        .append_pair("fromSeq", &from_seq.to_string())
+        .append_pair("limit", &limit.to_string());
+    Ok(url)
+}
+
+fn group_outbox_sibling_url_from_endpoint(endpoint: &str, sibling: &str) -> Result<url::Url> {
+    match sibling {
+        "head" | "seal" => {}
+        _ => anyhow::bail!("unsupported group outbox sibling endpoint: {sibling}"),
+    }
+    let mut url = parse_group_outbox_messages_endpoint(endpoint)?;
+    let base_path = url
+        .path()
+        .strip_suffix("/outbox/messages")
+        .ok_or_else(|| anyhow::anyhow!("group outbox endpoint must end with /outbox/messages"))?;
+    url.set_path(&format!("{base_path}/outbox/{sibling}"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
 }
 
 fn summarize_share_url(url: Option<&str>) -> String {
@@ -207,6 +260,11 @@ fn summarize_share_url(url: Option<&str>) -> String {
         return format!("{host}/v1/contact-share/<redacted>");
     }
     format!("{host}{path}")
+}
+
+fn summarize_endpoint_url(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    format!("{host}{}", url.path())
 }
 
 // --- TransportPort ---
@@ -381,13 +439,16 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         fetch: FetchGroupOutboxRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let base = self.inbox_base_url().await?;
-        let url = format!(
-            "{}/v1/groups/{}/outbox/messages?fromSeq={}&limit={}",
-            base.trim_end_matches('/'),
+        let url = self
+            .group_outbox_messages_url(&fetch.group_id, fetch.from_seq, fetch.limit)
+            .await?;
+        let endpoint = summarize_endpoint_url(&url);
+        log::info!(
+            "[TransportPort] fetch_group_outbox start group_id={} from_seq={} limit={} endpoint={}",
             fetch.group_id,
             fetch.from_seq,
-            fetch.limit
+            fetch.limit,
+            endpoint
         );
         let request = self
             .client
@@ -405,6 +466,13 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    log::warn!(
+                        "[TransportPort] fetch_group_outbox failed group_id={} from_seq={} endpoint={} status={}",
+                        fetch.group_id,
+                        fetch.from_seq,
+                        endpoint,
+                        status
+                    );
                     return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                         group_id: fetch.group_id,
                         retryable: status >= 500,
@@ -413,17 +481,34 @@ impl TransportPort for DesktopPlatformPorts {
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupOutboxResult = serde_json::from_str(&body)?;
+                log::info!(
+                    "[TransportPort] fetch_group_outbox accepted group_id={} from_seq={} endpoint={} to_seq={} records={}",
+                    fetch.group_id,
+                    fetch.from_seq,
+                    endpoint,
+                    result.to_seq,
+                    result.records.len()
+                );
                 Ok(vec![CoreEvent::GroupOutboxFetched {
                     group_id: fetch.group_id,
                     records: result.records,
                     to_seq: result.to_seq,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
-                group_id: fetch.group_id,
-                retryable: true,
-                detail: Some(error.to_string()),
-            }]),
+            Err(error) => {
+                log::warn!(
+                    "[TransportPort] fetch_group_outbox request failed group_id={} from_seq={} endpoint={} error={}",
+                    fetch.group_id,
+                    fetch.from_seq,
+                    endpoint,
+                    error
+                );
+                Ok(vec![CoreEvent::GroupOutboxFetchFailed {
+                    group_id: fetch.group_id,
+                    retryable: true,
+                    detail: Some(error.to_string()),
+                }])
+            }
         }
     }
 
@@ -431,11 +516,12 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         get: GetGroupOutboxHeadRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let base = self.inbox_base_url().await?;
-        let url = format!(
-            "{}/v1/groups/{}/outbox/head",
-            base.trim_end_matches('/'),
-            get.group_id
+        let url = self.group_outbox_sibling_url(&get.group_id, "head").await?;
+        let endpoint = summarize_endpoint_url(&url);
+        log::info!(
+            "[TransportPort] get_group_outbox_head start group_id={} endpoint={}",
+            get.group_id,
+            endpoint
         );
         let response = match self
             .client
@@ -453,6 +539,12 @@ impl TransportPort for DesktopPlatformPorts {
         {
             Ok(response) => response,
             Err(error) => {
+                log::warn!(
+                    "[TransportPort] get_group_outbox_head request failed group_id={} endpoint={} error={}",
+                    get.group_id,
+                    endpoint,
+                    error
+                );
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
                     retryable: true,
@@ -463,6 +555,12 @@ impl TransportPort for DesktopPlatformPorts {
         let status = response.status().as_u16();
         let body_text = response.text().await.unwrap_or_default();
         if !(200..300).contains(&status) {
+            log::warn!(
+                "[TransportPort] get_group_outbox_head failed group_id={} endpoint={} status={}",
+                get.group_id,
+                endpoint,
+                status
+            );
             return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id: get.group_id,
                 retryable: status >= 500,
@@ -473,6 +571,12 @@ impl TransportPort for DesktopPlatformPorts {
         let result: GetGroupOutboxHeadResult = match serde_json::from_str(&body) {
             Ok(result) => result,
             Err(error) => {
+                log::warn!(
+                    "[TransportPort] get_group_outbox_head decode failed group_id={} endpoint={} error={}",
+                    get.group_id,
+                    endpoint,
+                    error
+                );
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
                     retryable: false,
@@ -480,6 +584,12 @@ impl TransportPort for DesktopPlatformPorts {
                 }]);
             }
         };
+        log::info!(
+            "[TransportPort] get_group_outbox_head accepted group_id={} endpoint={} head_seq={}",
+            get.group_id,
+            endpoint,
+            result.head_seq
+        );
         Ok(vec![CoreEvent::GroupOutboxHeadFetched {
             group_id: get.group_id,
             head_seq: result.head_seq,
@@ -867,12 +977,9 @@ impl TransportPort for DesktopPlatformPorts {
     }
 
     async fn seal_group_outbox(&mut self, seal: SealGroupOutboxRequest) -> Result<Vec<CoreEvent>> {
-        let base = self.inbox_base_url().await?;
-        let url = format!(
-            "{}/v1/groups/{}/outbox/seal",
-            base.trim_end_matches('/'),
-            seal.group_id
-        );
+        let url = self
+            .group_outbox_sibling_url(&seal.group_id, "seal")
+            .await?;
         let response = match self
             .client
             .post(url)
@@ -1187,5 +1294,55 @@ mod tests {
         ));
         assert_eq!(summary, "example.com/v1/contact-share/<redacted>");
         assert!(!summary.contains("secret-token-value"));
+    }
+
+    #[test]
+    fn group_outbox_messages_url_uses_manifest_endpoint_host_and_replaces_query() {
+        let url = group_outbox_messages_url_from_endpoint(
+            "https://owner.example/v1/groups/group:test/outbox/messages?old=1#fragment",
+            7,
+            50,
+        )
+        .expect("messages url");
+
+        assert_eq!(url.host_str(), Some("owner.example"));
+        assert_eq!(url.path(), "/v1/groups/group:test/outbox/messages");
+        assert_eq!(url.query(), Some("fromSeq=7&limit=50"));
+        assert_eq!(url.fragment(), None);
+        assert!(!url.as_str().contains("old=1"));
+    }
+
+    #[test]
+    fn group_outbox_sibling_url_uses_manifest_endpoint_host() {
+        let head = group_outbox_sibling_url_from_endpoint(
+            "https://owner.example/v1/groups/group:test/outbox/messages?old=1#fragment",
+            "head",
+        )
+        .expect("head url");
+        assert_eq!(head.host_str(), Some("owner.example"));
+        assert_eq!(head.path(), "/v1/groups/group:test/outbox/head");
+        assert_eq!(head.query(), None);
+        assert_eq!(head.fragment(), None);
+
+        let seal = group_outbox_sibling_url_from_endpoint(
+            "https://owner.example/v1/groups/group:test/outbox/messages",
+            "seal",
+        )
+        .expect("seal url");
+        assert_eq!(seal.host_str(), Some("owner.example"));
+        assert_eq!(seal.path(), "/v1/groups/group:test/outbox/seal");
+    }
+
+    #[test]
+    fn group_outbox_endpoint_must_be_messages_endpoint() {
+        let error = group_outbox_sibling_url_from_endpoint(
+            "https://owner.example/v1/groups/group:test/outbox/head",
+            "head",
+        )
+        .expect_err("invalid outbox endpoint should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("group outbox endpoint must end with /outbox/messages"));
     }
 }

@@ -1002,6 +1002,69 @@ mod tests {
     }
 
     #[test]
+    fn group_realtime_event_fetches_outbox_and_advances_cursor() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|u| HarnessUser {
+            name: u.name,
+            bundle: u.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+
+        let (group_id, conversation_id) = harness.create_group(
+            &mut alice,
+            "Realtime Project",
+            vec![bob.bundle.user_id.clone()],
+        );
+        harness.import_welcome(&mut bob, &group_id);
+        let cursor_before_message = group_cursor(&bob, &group_id);
+
+        harness.send_text(&mut alice, &conversation_id, "from realtime owner");
+        let head = harness.outboxes[&group_id].last().expect("outbox head").seq;
+        assert!(head > cursor_before_message);
+
+        let output = bob
+            .engine
+            .handle_event(CoreEvent::GroupRealtimeEventReceived {
+                group_id: group_id.clone(),
+                event: RealtimeEvent::GroupOutboxRecordAvailable {
+                    group_id: group_id.clone(),
+                    seq: head,
+                    record: None,
+                },
+            })
+            .expect("group realtime event");
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchGroupOutbox { fetch }
+                if fetch.group_id == group_id
+                    && fetch.from_seq == cursor_before_message.saturating_add(1)
+        )));
+        harness.drain(&mut bob, output);
+
+        assert!(group_plaintexts(&bob, &conversation_id)
+            .iter()
+            .any(|text| text == "from realtime owner"));
+        assert_eq!(group_cursor(&bob, &group_id), head);
+
+        let caught_up = bob
+            .engine
+            .handle_event(CoreEvent::GroupRealtimeEventReceived {
+                group_id: group_id.clone(),
+                event: RealtimeEvent::GroupHeadUpdated {
+                    group_id: group_id.clone(),
+                    seq: head,
+                },
+            })
+            .expect("caught-up group realtime event");
+        assert!(!caught_up
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchGroupOutbox { .. })));
+    }
+
+    #[test]
     fn group_attachment_e2e_uses_storage_refs_and_downloads_plaintext() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
