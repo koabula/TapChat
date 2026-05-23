@@ -10,6 +10,7 @@ import { useGroupsStore } from "../store/groups";
 import {
   getGroupSnapshot,
   listGroupConversations,
+  retryPendingWelcomePickups,
   type GroupConversationSummary,
 } from "../lib/tauri";
 
@@ -179,6 +180,7 @@ export function useCoreUpdate() {
       // sync on every session start without requiring the ChatView
       // component to refetch on mount.
       await refreshGroupsFromBackend();
+      await retryPendingWelcomePickups();
 
       const requestsResult = await invoke<{
         view_model?: { message_requests?: MessageRequestItem[] };

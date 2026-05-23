@@ -85,6 +85,11 @@ export default function ChatView() {
   }, [isGroup, groupSnapshot, localUserId]);
   const pendingGroupSetup =
     isGroup && (groupSnapshot?.pending_outbox_count ?? 0) > 0;
+  const pendingJoinRequests =
+    isGroup
+      ? groupSnapshot?.join_requests.filter((request) => request.status === "pending")
+          .length ?? 0
+      : 0;
   const composerDisabled =
     dissolved ||
     pendingGroupSetup ||
@@ -582,6 +587,11 @@ export default function ChatView() {
                 {!dissolved && activeConversation?.group_role && activeConversation.group_role !== "member" && (
                   <span className="ml-2 badge text-[10px] uppercase tracking-wide">
                     {activeConversation.group_role}
+                  </span>
+                )}
+                {!dissolved && pendingJoinRequests > 0 && (
+                  <span className="ml-2 badge bg-yellow-500/10 text-[10px] uppercase text-yellow-500">
+                    {pendingJoinRequests} pending
                   </span>
                 )}
               </>

@@ -14,6 +14,10 @@ use crate::model::{
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{PrepareBlobUploadResult, SealGroupOutboxRequest};
 
+fn pending_welcome_pickup_key(group_id: &str, device_id: &str) -> String {
+    format!("{group_id}::{device_id}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedLocalIdentity {
     pub state: LocalIdentityState,
@@ -142,6 +146,21 @@ pub struct PersistedPendingGroupJoinApproval {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedPendingWelcomePickup {
+    pub group_id: String,
+    pub device_id: String,
+    pub descriptor: WelcomePickupDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter_user_id: Option<String>,
+    #[serde(default)]
+    pub retries: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedPendingAck {
     pub device_id: String,
     pub ack: Ack,
@@ -263,6 +282,8 @@ pub struct CorePersistenceSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_group_join_approvals: Vec<PersistedPendingGroupJoinApproval>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_welcome_pickups: Vec<PersistedPendingWelcomePickup>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_acks: Vec<PersistedPendingAck>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_blob_transfers: Vec<PersistedPendingBlobTransfer>,
@@ -311,6 +332,8 @@ pub enum PersistOp {
     DeleteGroupJoinRequest { request_id: String },
     SavePendingGroupJoinApproval { request_id: String },
     DeletePendingGroupJoinApproval { request_id: String },
+    SavePendingWelcomePickup { group_id: String, device_id: String },
+    DeletePendingWelcomePickup { group_id: String, device_id: String },
     SavePendingAck { device_id: String },
     DeletePendingAck { device_id: String },
     SavePendingBlobTransfer { task_id: String },
@@ -386,6 +409,7 @@ pub struct InMemoryPersistence {
     group_invites: BTreeMap<String, PersistedGroupInvite>,
     group_join_requests: BTreeMap<String, PersistedGroupJoinRequest>,
     pending_group_join_approvals: BTreeMap<String, PersistedPendingGroupJoinApproval>,
+    pending_welcome_pickups: BTreeMap<String, PersistedPendingWelcomePickup>,
     pending_group_seal: BTreeMap<String, SealGroupOutboxRequest>,
     pending_acks: BTreeMap<String, PersistedPendingAck>,
     pending_blob_transfers: BTreeMap<String, PersistedPendingBlobTransfer>,
@@ -471,6 +495,17 @@ impl InMemoryPersistence {
             .cloned()
             .map(|approval| (approval.request_id.clone(), approval))
             .collect();
+        self.pending_welcome_pickups = snapshot
+            .pending_welcome_pickups
+            .iter()
+            .cloned()
+            .map(|pickup| {
+                (
+                    pending_welcome_pickup_key(&pickup.group_id, &pickup.device_id),
+                    pickup,
+                )
+            })
+            .collect();
         self.pending_acks = snapshot
             .pending_acks
             .iter()
@@ -529,6 +564,7 @@ impl InMemoryPersistence {
                 .values()
                 .cloned()
                 .collect(),
+            pending_welcome_pickups: self.pending_welcome_pickups.values().cloned().collect(),
             pending_group_seal: self.pending_group_seal.values().cloned().collect(),
             pending_acks: self.pending_acks.values().cloned().collect(),
             pending_blob_transfers: self.pending_blob_transfers.values().cloned().collect(),
@@ -817,6 +853,21 @@ mod tests {
             group_invites: vec![],
             group_join_requests: vec![],
             pending_group_join_approvals: vec![],
+            pending_welcome_pickups: vec![PersistedPendingWelcomePickup {
+                group_id: "group:one".into(),
+                device_id: identity.device_identity.device_id.clone(),
+                descriptor: WelcomePickupDescriptor {
+                    group_id: "group:one".into(),
+                    device_id: identity.device_identity.device_id.clone(),
+                    endpoint: "https://example.com/welcome".into(),
+                    capability: "capability".into(),
+                    expires_at: 999,
+                },
+                title: Some("Test group".into()),
+                inviter_user_id: Some("user:bob".into()),
+                retries: 1,
+                last_error: Some("timeout".into()),
+            }],
             pending_acks: vec![PersistedPendingAck {
                 device_id: identity.device_identity.device_id.clone(),
                 ack: Ack {
@@ -884,6 +935,7 @@ mod tests {
 
         assert_eq!(loaded.local_identity, snapshot.local_identity);
         assert_eq!(loaded.pending_outbox.len(), 1);
+        assert_eq!(loaded.pending_welcome_pickups.len(), 1);
         assert_eq!(loaded.pending_blob_transfers.len(), 1);
         assert!(loaded.mls_state_persistence_blocked);
     }
@@ -1008,6 +1060,7 @@ mod tests {
             group_invites: vec![],
             group_join_requests: vec![],
             pending_group_join_approvals: vec![],
+            pending_welcome_pickups: vec![],
             pending_acks: vec![],
             pending_blob_transfers: vec![],
             recovery_contexts: vec![],

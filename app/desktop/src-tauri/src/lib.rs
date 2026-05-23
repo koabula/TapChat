@@ -234,6 +234,8 @@ pub fn run() {
             commands::group::list_group_invites,
             commands::group::submit_group_join_request,
             commands::group::list_group_join_requests,
+            commands::group::process_group_join_requests,
+            commands::group::retry_pending_welcome_pickups,
             commands::group::get_group_join_request_status,
             commands::group::approve_group_join,
             commands::group::reject_group_join,

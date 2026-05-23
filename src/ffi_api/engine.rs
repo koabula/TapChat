@@ -28,8 +28,9 @@ use crate::persistence::{
     PersistedGroupRealtimeSession, PersistedGroupState, PersistedLocalIdentity, PersistedMlsState,
     PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope, PersistedPendingAck,
     PersistedPendingBlobTransfer, PersistedPendingGroupMembershipTransition,
-    PersistedRealtimeSession, PersistedRecoveryContext, PersistedRecoveryEscalationReason,
-    PersistedRecoveryPhase, PersistedRecoveryReason, PersistedSyncState,
+    PersistedPendingWelcomePickup, PersistedRealtimeSession, PersistedRecoveryContext,
+    PersistedRecoveryEscalationReason, PersistedRecoveryPhase, PersistedRecoveryReason,
+    PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
@@ -60,6 +61,7 @@ const MAX_ATTACHMENT_FILE_NAME_LEN: usize = 255;
 /// Increased from 100 to reduce round-trips when many messages accumulated
 /// while the member was offline.
 const GROUP_OUTBOX_FETCH_LIMIT: u64 = 1000;
+const WELCOME_PICKUP_RETRY_TIMER_PREFIX: &str = "retry_welcome_pickup:";
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
@@ -103,6 +105,10 @@ struct GroupWelcomePickupControl {
     inviter_user_id: String,
     #[serde(alias = "welcome_pickup_descriptor")]
     welcome_pickup_descriptor: WelcomePickupDescriptor,
+}
+
+fn pending_welcome_pickup_key(group_id: &str, device_id: &str) -> String {
+    format!("{group_id}::{device_id}")
 }
 
 fn validate_attachment_descriptor(descriptor: &AttachmentDescriptor) -> CoreResult<()> {
@@ -526,6 +532,17 @@ impl CoreEngine {
             .as_ref()
             .and_then(|deployment| deployment.local_bundle.as_ref())
             .and_then(|bundle| bundle.display_name.clone());
+        let pending_welcome_pickups = snapshot
+            .pending_welcome_pickups
+            .iter()
+            .cloned()
+            .map(|pickup| {
+                (
+                    pending_welcome_pickup_key(&pickup.group_id, &pickup.device_id),
+                    pickup,
+                )
+            })
+            .collect();
         let mut engine = Self {
             state: CoreState {
                 local_identity,
@@ -546,6 +563,7 @@ impl CoreEngine {
                 group_invites,
                 group_join_requests,
                 pending_group_join_approvals,
+                pending_welcome_pickups,
                 pending_group_seal,
                 pending_acks,
                 pending_blob_uploads,
@@ -666,6 +684,7 @@ impl CoreEngine {
                 group_id,
                 request_id,
             } => self.get_group_join_request_status(group_id, request_id),
+            CoreCommand::RetryPendingWelcomePickups => self.retry_pending_welcome_pickups(),
             CoreCommand::ApproveGroupJoin {
                 group_id,
                 request_id,
@@ -989,25 +1008,9 @@ impl CoreEngine {
             } => self.handle_welcome_pickup_fetched(descriptor, welcome_b64, manifest),
             CoreEvent::WelcomePickupFetchFailed {
                 descriptor,
-                retryable: _,
+                retryable,
                 detail,
-            } => Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![CoreEffect::EmitUserNotification {
-                    notification: UserNotificationEffect {
-                        status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail
-                            .map(|detail| format!("welcome pickup fetch failed: {detail}"))
-                            .unwrap_or_else(|| {
-                                format!("welcome pickup fetch failed for {}", descriptor.device_id)
-                            }),
-                    },
-                }],
-                view_model: None,
-            }),
+            } => self.handle_welcome_pickup_fetch_failed(descriptor, retryable, detail),
             CoreEvent::WelcomePickupPut { .. } => Ok(CoreOutput::default()),
             CoreEvent::WelcomePickupPutFailed {
                 descriptor,
@@ -1304,19 +1307,58 @@ impl CoreEngine {
                     view_model: None,
                 })
             }
-            CoreEvent::GroupJoinDecisionApplied { request } => Ok(CoreOutput {
-                state_update: CoreStateUpdate::default(),
-                effects: vec![CoreEffect::EmitUserNotification {
-                    notification: UserNotificationEffect {
-                        status: SystemStatus::SyncInProgress,
-                        message: format!("group join request {} decided", request.request_id),
+            CoreEvent::GroupJoinDecisionApplied { request } => {
+                let previous = self
+                    .state
+                    .group_join_requests
+                    .get(&request.request_id)
+                    .cloned();
+                self.state.group_join_requests.insert(
+                    request.request_id.clone(),
+                    PersistedGroupJoinRequest {
+                        group_id: request.group_id.clone(),
+                        request_id: request.request_id.clone(),
+                        request: request.clone(),
+                        join_request_endpoint: previous
+                            .as_ref()
+                            .and_then(|stored| stored.join_request_endpoint.clone()),
+                        welcome_pickup: previous
+                            .as_ref()
+                            .and_then(|stored| stored.welcome_pickup.clone()),
+                        manifest: previous.as_ref().and_then(|stored| stored.manifest.clone()),
+                        start_cursor: previous
+                            .as_ref()
+                            .and_then(|stored| stored.start_cursor.clone()),
                     },
-                }],
-                view_model: Some(CoreViewModel {
-                    group_join_requests: vec![request],
-                    ..CoreViewModel::default()
-                }),
-            }),
+                );
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        conversations_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![
+                        persist_effect(
+                            &self.state,
+                            vec![PersistOp::SaveGroupJoinRequest {
+                                request_id: request.request_id.clone(),
+                            }],
+                        ),
+                        CoreEffect::EmitUserNotification {
+                            notification: UserNotificationEffect {
+                                status: SystemStatus::SyncInProgress,
+                                message: format!(
+                                    "group join request {} decided",
+                                    request.request_id
+                                ),
+                            },
+                        },
+                    ],
+                    view_model: Some(CoreViewModel {
+                        group_join_requests: vec![request],
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
             CoreEvent::GroupOutboxSealed {
                 group_id,
                 sealed_at,
@@ -1593,6 +1635,32 @@ impl CoreEngine {
             effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
             view_model: None,
         })
+    }
+
+    fn rotate_local_key_package_after_welcome(&mut self) -> CoreResult<Vec<CoreEffect>> {
+        let package = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .rotate_key_package(0)?;
+        self.state.published_key_package = Some(package);
+        let updated_at = {
+            let identity = self
+                .state
+                .local_identity
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            identity.device_status.updated_at = identity.device_status.updated_at.saturating_add(1);
+            identity.device_status.updated_at
+        };
+        self.refresh_local_bundle_with_updated_at(updated_at)?;
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
+        )];
+        effects.extend(self.local_shared_state_publish_effects()?);
+        Ok(effects)
     }
 
     fn apply_local_device_status_update(
@@ -2377,17 +2445,106 @@ impl CoreEngine {
                 ))
             })?;
         descriptor.validate()?;
+        self.stage_welcome_pickup(descriptor.group_id.clone(), descriptor, None, None, true)
+    }
+
+    fn stage_welcome_pickup(
+        &mut self,
+        group_id: String,
+        descriptor: WelcomePickupDescriptor,
+        title: Option<String>,
+        inviter_user_id: Option<String>,
+        reset_error: bool,
+    ) -> CoreResult<CoreOutput> {
+        descriptor.validate()?;
+        if self.state.group_states.contains_key(&group_id) {
+            self.state
+                .pending_welcome_pickups
+                .remove(&pending_welcome_pickup_key(
+                    &group_id,
+                    &descriptor.device_id,
+                ));
+            return Ok(CoreOutput::default());
+        }
+        let key = pending_welcome_pickup_key(&group_id, &descriptor.device_id);
+        let mut pending = self
+            .state
+            .pending_welcome_pickups
+            .get(&key)
+            .cloned()
+            .unwrap_or(PersistedPendingWelcomePickup {
+                group_id: group_id.clone(),
+                device_id: descriptor.device_id.clone(),
+                descriptor: descriptor.clone(),
+                title: title.clone(),
+                inviter_user_id: inviter_user_id.clone(),
+                retries: 0,
+                last_error: None,
+            });
+        pending.group_id = group_id.clone();
+        pending.device_id = descriptor.device_id.clone();
+        pending.descriptor = descriptor.clone();
+        if pending.title.is_none() {
+            pending.title = title;
+        }
+        if pending.inviter_user_id.is_none() {
+            pending.inviter_user_id = inviter_user_id;
+        }
+        if reset_error {
+            pending.last_error = None;
+        }
+        self.state.pending_welcome_pickups.insert(key, pending);
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 system_statuses_changed: vec![SystemStatus::SyncInProgress],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![CoreEffect::FetchWelcomePickup {
-                fetch: FetchWelcomePickupRequest {
-                    descriptor,
-                    headers: BTreeMap::new(),
+            effects: vec![
+                persist_effect(
+                    &self.state,
+                    vec![PersistOp::SavePendingWelcomePickup {
+                        group_id: group_id.clone(),
+                        device_id: descriptor.device_id.clone(),
+                    }],
+                ),
+                CoreEffect::FetchWelcomePickup {
+                    fetch: FetchWelcomePickupRequest {
+                        descriptor,
+                        headers: BTreeMap::new(),
+                    },
                 },
-            }],
+            ],
+            view_model: None,
+        })
+    }
+
+    fn retry_pending_welcome_pickups(&mut self) -> CoreResult<CoreOutput> {
+        let pending: Vec<PersistedPendingWelcomePickup> = self
+            .state
+            .pending_welcome_pickups
+            .values()
+            .filter(|pickup| {
+                !self.state.group_states.contains_key(&pickup.group_id)
+            })
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return Ok(CoreOutput::default());
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: pending
+                .into_iter()
+                .map(|pickup| CoreEffect::FetchWelcomePickup {
+                    fetch: FetchWelcomePickupRequest {
+                        descriptor: pickup.descriptor,
+                        headers: BTreeMap::new(),
+                    },
+                })
+                .collect(),
             view_model: None,
         })
     }
@@ -2628,6 +2785,44 @@ impl CoreEngine {
                 "join request is not pending for this group",
             ));
         }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let manifest_already_contains_user = group_state.manifest.members.iter().any(|member| {
+            member.user_id == join.joiner_user_id && member.status == GroupMemberStatus::Active
+        });
+        let manifest_already_contains_device =
+            group_state.manifest.member_devices.iter().any(|device| {
+                device.user_id == join.joiner_user_id
+                    && device.device_id == join.joiner_device_id
+                    && device.status == GroupMemberStatus::Active
+            });
+        let mls_already_contains_device = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .and_then(|adapter| {
+                adapter
+                    .member_device_ids_for_user(&group_state.conversation_id, &join.joiner_user_id)
+                    .ok()
+            })
+            .map(|devices| {
+                devices
+                    .iter()
+                    .any(|device_id| device_id == &join.joiner_device_id)
+            })
+            .unwrap_or(false);
+        if manifest_already_contains_user
+            || manifest_already_contains_device
+            || mls_already_contains_device
+        {
+            return Err(CoreError::invalid_state(
+                "already_member: joiner device is already in this group; ask the joiner to retry the initial group invite import or create a new group",
+            ));
+        }
         let contact = self
             .state
             .contacts
@@ -2643,12 +2838,6 @@ impl CoreEngine {
                 "joiner has no active key packages",
             ));
         }
-        let group_state = self
-            .state
-            .group_states
-            .get(&group_id)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
         let adapter = self
             .state
             .mls_adapter
@@ -4541,7 +4730,10 @@ impl CoreEngine {
             .device_identity
             .device_id
             .clone();
-        let output = self.sync_inbox(device_id)?;
+        let output = merge_outputs(
+            self.sync_inbox(device_id)?,
+            self.retry_pending_welcome_pickups()?,
+        );
         self.merge_with_transport_flush(output)
     }
 
@@ -4977,6 +5169,28 @@ impl CoreEngine {
                 task.in_flight = false;
             }
             return self.flush_pending_transport();
+        }
+        if let Some(key) = timer_id.strip_prefix(WELCOME_PICKUP_RETRY_TIMER_PREFIX) {
+            if let Some(pending) = self.state.pending_welcome_pickups.get(key).cloned() {
+                if self.state.group_states.contains_key(&pending.group_id)
+                    || pending.retries >= MAX_TRANSPORT_RETRIES
+                {
+                    return Ok(CoreOutput::default());
+                }
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![CoreEffect::FetchWelcomePickup {
+                        fetch: FetchWelcomePickupRequest {
+                            descriptor: pending.descriptor,
+                            headers: BTreeMap::new(),
+                        },
+                    }],
+                    view_model: None,
+                });
+            }
         }
         Ok(CoreOutput::default())
     }
@@ -8058,6 +8272,10 @@ impl CoreEngine {
                                         .insert(conversation_id.clone(), summary);
                                 }
                                 self.clear_recovery_context_as_healthy(&conversation_id);
+                                output
+                                    .effects
+                                    .extend(self.rotate_local_key_package_after_welcome()?);
+                                output.state_update.contacts_changed = true;
                                 ackable = true;
                             }
                             IngestResult::PendingRetry => {
@@ -8148,12 +8366,16 @@ impl CoreEngine {
                                     invite.welcome_pickup_descriptor.device_id,
                                     invite.welcome_pickup_descriptor.endpoint
                                 );
-                                output.effects.push(CoreEffect::FetchWelcomePickup {
-                                    fetch: FetchWelcomePickupRequest {
-                                        descriptor: invite.welcome_pickup_descriptor,
-                                        headers: BTreeMap::new(),
-                                    },
-                                });
+                                output = merge_outputs(
+                                    output,
+                                    self.stage_welcome_pickup(
+                                        invite.group_id.clone(),
+                                        invite.welcome_pickup_descriptor,
+                                        Some(invite.title),
+                                        Some(invite.inviter_user_id),
+                                        true,
+                                    )?,
+                                );
                             } else {
                                 log::info!(
                                     "handle_inbox_records: group welcome control ignored because group already exists group_id={}",
@@ -10475,6 +10697,56 @@ impl CoreEngine {
         })
     }
 
+    fn handle_welcome_pickup_fetch_failed(
+        &mut self,
+        descriptor: WelcomePickupDescriptor,
+        retryable: bool,
+        detail: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let key = pending_welcome_pickup_key(&descriptor.group_id, &descriptor.device_id);
+        let message = detail
+            .clone()
+            .map(|detail| format!("welcome pickup fetch failed: {detail}"))
+            .unwrap_or_else(|| format!("welcome pickup fetch failed for {}", descriptor.device_id));
+        let mut effects = Vec::new();
+        let mut persist_ops = Vec::new();
+
+        if let Some(pending) = self.state.pending_welcome_pickups.get_mut(&key) {
+            pending.retries = pending.retries.saturating_add(1);
+            pending.last_error = Some(message.clone());
+            persist_ops.push(PersistOp::SavePendingWelcomePickup {
+                group_id: descriptor.group_id.clone(),
+                device_id: descriptor.device_id.clone(),
+            });
+            if retryable && pending.retries < MAX_TRANSPORT_RETRIES {
+                effects.push(CoreEffect::ScheduleTimer {
+                    timer: TimerEffect {
+                        timer_id: format!("{WELCOME_PICKUP_RETRY_TIMER_PREFIX}{key}"),
+                        delay_ms: 0,
+                    },
+                });
+            }
+        }
+        if !persist_ops.is_empty() {
+            effects.insert(0, persist_effect(&self.state, persist_ops));
+        }
+        effects.push(CoreEffect::EmitUserNotification {
+            notification: UserNotificationEffect {
+                status: SystemStatus::TemporaryNetworkFailure,
+                message,
+            },
+        });
+
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: None,
+        })
+    }
+
     fn handle_welcome_pickup_fetched(
         &mut self,
         descriptor: WelcomePickupDescriptor,
@@ -10667,11 +10939,18 @@ impl CoreEngine {
         self.state
             .mls_summaries
             .insert(group_state.conversation_id.clone(), summary);
+        let post_welcome_effects = self.rotate_local_key_package_after_welcome()?;
         log::info!(
             "handle_welcome_pickup_fetched: group imported group_id={} conversation_id={} epoch_ready=true",
             group_state.group_id,
             group_state.conversation_id
         );
+        let pending_key = pending_welcome_pickup_key(&descriptor.group_id, &descriptor.device_id);
+        let had_pending = self
+            .state
+            .pending_welcome_pickups
+            .remove(&pending_key)
+            .is_some();
         // The welcome established a cryptographically valid group state at
         // the MLS epoch where the approver added this device. Any outbox
         // records that predate that epoch cannot be decrypted by us and
@@ -10687,31 +10966,46 @@ impl CoreEngine {
                 capability: self.group_capability_for_state(&group_state)?,
             },
         };
+        let mut effects = vec![
+            persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveConversation {
+                        conversation_id: group_state.conversation_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: group_state.conversation_id.clone(),
+                    },
+                    PersistOp::SaveGroupState {
+                        group_id: group_state.group_id.clone(),
+                    },
+                    PersistOp::SaveGroupCursor {
+                        group_id: group_state.group_id.clone(),
+                    },
+                ],
+            ),
+            head_request,
+        ];
+        if had_pending {
+            effects.insert(
+                0,
+                persist_effect(
+                    &self.state,
+                    vec![PersistOp::DeletePendingWelcomePickup {
+                        group_id: descriptor.group_id.clone(),
+                        device_id: descriptor.device_id.clone(),
+                    }],
+                ),
+            );
+        }
+        effects.extend(post_welcome_effects);
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
+                contacts_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects: vec![
-                persist_effect(
-                    &self.state,
-                    vec![
-                        PersistOp::SaveConversation {
-                            conversation_id: group_state.conversation_id.clone(),
-                        },
-                        PersistOp::SaveMlsState {
-                            conversation_id: group_state.conversation_id.clone(),
-                        },
-                        PersistOp::SaveGroupState {
-                            group_id: group_state.group_id.clone(),
-                        },
-                        PersistOp::SaveGroupCursor {
-                            group_id: group_state.group_id.clone(),
-                        },
-                    ],
-                ),
-                head_request,
-            ],
+            effects,
             view_model: Some(CoreViewModel {
                 conversations: vec![self.conversation_summary(&group_state.conversation_id)?],
                 ..CoreViewModel::default()
@@ -11002,6 +11296,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .values()
             .cloned()
             .collect(),
+        pending_welcome_pickups: state.pending_welcome_pickups.values().cloned().collect(),
         pending_acks: state
             .pending_acks
             .iter()

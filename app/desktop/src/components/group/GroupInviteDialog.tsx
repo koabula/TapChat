@@ -4,10 +4,13 @@ import { Copy, Check, X, AlertCircle, Link2, Trash2 } from "lucide-react";
 
 import {
   createGroupInviteLink,
+  getGroupSnapshot,
   listGroupInvites,
   revokeGroupInviteLink,
   type GroupInviteView,
 } from "@/lib/tauri";
+import { blockedInviteCreationReason } from "@/lib/groupInvitePolicy";
+import type { GroupJoinPolicy } from "@/lib/types";
 
 interface GroupInviteDialogProps {
   open: boolean;
@@ -44,6 +47,7 @@ export default function GroupInviteDialog({
   const [copyError, setCopyError] = useState<string | null>(null);
   const [invites, setInvites] = useState<GroupInviteView[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [joinPolicy, setJoinPolicy] = useState<GroupJoinPolicy | null>(null);
   // Fallback selection target when the Tauri clipboard rejects the
   // write (R7.6): we still keep the focus on the url text and select
   // its contents so the user can Ctrl+C manually.
@@ -56,9 +60,25 @@ export default function GroupInviteDialog({
       setCopiedId(null);
       setHoursValid(24);
       setMaxUses("");
-      void refreshInvites();
+      void refreshDialogState();
     }
   }, [open]);
+
+  const refreshDialogState = async () => {
+    await Promise.all([refreshInvites(), refreshJoinPolicy()]);
+  };
+
+  const refreshJoinPolicy = async (): Promise<GroupJoinPolicy | null> => {
+    try {
+      const snapshot = await getGroupSnapshot(groupId);
+      const policy = snapshot.manifest.join_policy;
+      setJoinPolicy(policy);
+      return policy;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  };
 
   const refreshInvites = async () => {
     try {
@@ -86,6 +106,12 @@ export default function GroupInviteDialog({
     setCreating(true);
     setError(null);
     try {
+      const latestPolicy = await refreshJoinPolicy();
+      const blockedReason = blockedInviteCreationReason(latestPolicy);
+      if (blockedReason) {
+        setError(blockedReason);
+        return;
+      }
       const expiresAt = Date.now() + hoursValid * 3600_000;
       await createGroupInviteLink(groupId, expiresAt, parsedMaxUses);
       await refreshInvites();
@@ -182,10 +208,18 @@ export default function GroupInviteDialog({
                 />
               </label>
             </div>
+            {joinPolicy === "closed" && (
+              <div className="flex items-start gap-2 rounded-lg bg-yellow-500/10 p-3 text-sm text-yellow-500">
+                <AlertCircle size={16} className="shrink-0 mt-0.5" />
+                <div>
+                  {blockedInviteCreationReason(joinPolicy)}
+                </div>
+              </div>
+            )}
             <button
               className="btn btn-primary"
               onClick={handleCreate}
-              disabled={creating}
+              disabled={creating || joinPolicy === "closed"}
             >
               {creating ? "Creating..." : "Create invite"}
             </button>

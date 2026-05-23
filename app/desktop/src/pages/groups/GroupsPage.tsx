@@ -260,6 +260,9 @@ export default function GroupsPage() {
               const localRole = snapshot?.local_role ?? group.local_role;
               const dissolved = group.dissolved_at != null || snapshot?.dissolved_at != null;
               const pending = snapshot?.pending_outbox_count ?? 0;
+              const pendingJoinRequests =
+                snapshot?.join_requests.filter((request) => request.status === "pending")
+                  .length ?? 0;
               const activeMembers =
                 snapshot?.manifest.members.filter((member) => member.status === "active")
                   .length ?? group.member_count;
@@ -286,6 +289,12 @@ export default function GroupsPage() {
                         {dissolved && (
                           <span className="badge bg-red-500/10 text-[10px] uppercase text-red-500">
                             dissolved
+                          </span>
+                        )}
+                        {pendingJoinRequests > 0 && (
+                          <span className="badge bg-yellow-500/10 text-[10px] uppercase text-yellow-500">
+                            {pendingJoinRequests} join request
+                            {pendingJoinRequests === 1 ? "" : "s"}
                           </span>
                         )}
                         {!dissolved && (

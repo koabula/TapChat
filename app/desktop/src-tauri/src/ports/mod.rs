@@ -593,11 +593,19 @@ impl TransportPort for DesktopPlatformPorts {
                     manifest: result.manifest,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::WelcomePickupFetchFailed {
-                descriptor: fetch.descriptor,
-                retryable: true,
-                detail: Some(error.to_string()),
-            }]),
+            Err(error) => {
+                log::warn!(
+                    "[TransportPort] fetch_welcome_pickup transport error group_id={} device_id={} error={}",
+                    fetch.descriptor.group_id,
+                    fetch.descriptor.device_id,
+                    error
+                );
+                Ok(vec![CoreEvent::WelcomePickupFetchFailed {
+                    descriptor: fetch.descriptor,
+                    retryable: true,
+                    detail: Some(error.to_string()),
+                }])
+            }
         }
     }
 

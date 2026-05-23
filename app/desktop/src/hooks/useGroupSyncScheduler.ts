@@ -3,7 +3,9 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   applyGroupRealtimePlan,
+  getGroupSnapshot,
   getGroupSyncSettings,
+  processGroupJoinRequests,
   syncGroupOutbox,
 } from "@/lib/tauri";
 import {
@@ -36,6 +38,7 @@ export function useGroupSyncScheduler() {
   const markSynced = useGroupSyncStore((s) => s.markSynced);
   const markSyncFailed = useGroupSyncStore((s) => s.markSyncFailed);
   const clear = useGroupSyncStore((s) => s.clear);
+  const setGroupSnapshot = useGroupsStore((s) => s.setSnapshot);
   const timersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   const groupIds = useMemo(
@@ -167,10 +170,18 @@ export function useGroupSyncScheduler() {
         syncGroupOutbox(payload.device_id, "realtime_error")
           .then(() => markSynced(payload.device_id))
           .catch((err) => markSyncFailed(payload.device_id, String(err)));
+      } else if (payload.event_type === "group_join_request_available") {
+        processGroupJoinRequests(payload.device_id)
+          .then(() => syncGroupOutbox(payload.device_id, "realtime"))
+          .then(() => getGroupSnapshot(payload.device_id))
+          .then((snapshot) => {
+            setGroupSnapshot(snapshot);
+            markSynced(payload.device_id);
+          })
+          .catch((err) => markSyncFailed(payload.device_id, String(err)));
       } else if (
         payload.event_type === "group_head_updated" ||
-        payload.event_type === "group_outbox_record_available" ||
-        payload.event_type === "group_join_request_available"
+        payload.event_type === "group_outbox_record_available"
       ) {
         syncGroupOutbox(payload.device_id, "realtime")
           .then(() => markSynced(payload.device_id))
@@ -180,7 +191,13 @@ export function useGroupSyncScheduler() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [markConnected, markDisconnected, markSyncFailed, markSynced]);
+  }, [
+    markConnected,
+    markDisconnected,
+    markSyncFailed,
+    markSynced,
+    setGroupSnapshot,
+  ]);
 
   useEffect(() => {
     const unlisten = listen<void>("engine-reloaded", () => {

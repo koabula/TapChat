@@ -19,9 +19,9 @@ mod tests {
         InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
         WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
-    use crate::persistence::{CorePersistenceSnapshot, PersistOp};
+    use crate::persistence::{CorePersistenceSnapshot, PersistOp, PersistedPendingWelcomePickup};
     use crate::transport_contract::{
-        GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult,
+        GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +72,106 @@ mod tests {
             let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize command");
             assert_eq!(decoded, command);
         }
+    }
+
+    #[test]
+    fn retry_pending_welcome_pickups_command_round_trips_json() {
+        let command = CoreCommand::RetryPendingWelcomePickups;
+        let json = serde_json::to_string(&command).expect("serialize command");
+        let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize command");
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
+    fn retry_pending_welcome_pickups_reissues_staged_fetch() {
+        let mut engine = CoreEngine::new();
+        let descriptor = WelcomePickupDescriptor {
+            group_id: "group:pending".into(),
+            device_id: "device:alice:phone".into(),
+            endpoint: "https://example.test/welcome".into(),
+            capability: "cap".into(),
+            expires_at: 999,
+        };
+        engine.state.pending_welcome_pickups.insert(
+            "group:pending::device:alice:phone".into(),
+            PersistedPendingWelcomePickup {
+                group_id: descriptor.group_id.clone(),
+                device_id: descriptor.device_id.clone(),
+                descriptor: descriptor.clone(),
+                title: Some("Pending".into()),
+                inviter_user_id: Some("user:bob".into()),
+                retries: 0,
+                last_error: None,
+            },
+        );
+
+        let output = engine
+            .handle_command(CoreCommand::RetryPendingWelcomePickups)
+            .expect("retry pending welcome pickups");
+
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchWelcomePickup { fetch } if fetch.descriptor == descriptor
+        )));
+    }
+
+    #[test]
+    fn welcome_pickup_fetch_failure_keeps_pending_for_retry() {
+        let mut engine = CoreEngine::new();
+        let descriptor = WelcomePickupDescriptor {
+            group_id: "group:pending".into(),
+            device_id: "device:alice:phone".into(),
+            endpoint: "https://example.test/welcome".into(),
+            capability: "cap".into(),
+            expires_at: 999,
+        };
+        let key = "group:pending::device:alice:phone".to_string();
+        engine.state.pending_welcome_pickups.insert(
+            key.clone(),
+            PersistedPendingWelcomePickup {
+                group_id: descriptor.group_id.clone(),
+                device_id: descriptor.device_id.clone(),
+                descriptor: descriptor.clone(),
+                title: Some("Pending".into()),
+                inviter_user_id: Some("user:bob".into()),
+                retries: 0,
+                last_error: None,
+            },
+        );
+
+        let output = engine
+            .handle_event(CoreEvent::WelcomePickupFetchFailed {
+                descriptor,
+                retryable: true,
+                detail: Some("timeout".into()),
+            })
+            .expect("welcome pickup failure");
+
+        let pending = engine
+            .state
+            .pending_welcome_pickups
+            .get(&key)
+            .expect("pending welcome pickup remains");
+        assert_eq!(pending.retries, 1);
+        assert!(pending
+            .last_error
+            .as_deref()
+            .unwrap_or("")
+            .contains("timeout"));
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ScheduleTimer { timer }
+                if timer.timer_id == format!("retry_welcome_pickup:{key}")
+        )));
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::PersistState { persist }
+                if persist.ops.iter().any(|op| matches!(
+                    op,
+                    PersistOp::SavePendingWelcomePickup { group_id, device_id }
+                        if group_id == "group:pending" && device_id == "device:alice:phone"
+                ))
+        )));
     }
 
     #[test]
@@ -324,8 +424,7 @@ mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .filter(|item| item.envelope.message_type
-                    == MessageType::ControlGroupWelcomePickup)
+                .filter(|item| item.envelope.message_type == MessageType::ControlGroupWelcomePickup)
                 .count(),
             2
         );
@@ -3661,6 +3760,120 @@ mod tests {
     }
 
     #[test]
+    fn direct_welcome_rotates_and_persists_new_key_package() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let bob_user_id = bob_bundle.user_id.clone();
+        let before = local_key_package_ref(&bob);
+
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        create_direct_conversation(&mut alice, bob_user_id);
+        let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+
+        let after = local_key_package_ref(&bob);
+        assert_ne!(
+            before, after,
+            "welcome import must publish a fresh KeyPackage"
+        );
+
+        let snapshot = extract_snapshot(&output);
+        let deployment = snapshot.deployment.expect("persisted deployment");
+        assert_eq!(
+            deployment
+                .published_key_package
+                .expect("persisted published key package")
+                .key_package_ref,
+            after
+        );
+        assert_eq!(
+            deployment
+                .local_bundle
+                .expect("persisted local bundle")
+                .devices[0]
+                .keypackage_ref
+                .object_ref,
+            after
+        );
+        assert!(
+            publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle),
+            "rotated identity bundle should be republished after welcome"
+        );
+    }
+
+    #[test]
+    fn group_invite_after_direct_welcome_uses_rotated_key_package() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+
+        create_direct_conversation(&mut alice.engine, bob.bundle.user_id.clone());
+        let bob_device_id = bob.bundle.devices[0].device_id.clone();
+        deliver_pending_outbox_to_device(&mut bob.engine, &alice.engine, &bob_device_id);
+        bob.bundle = bob
+            .engine
+            .local_bundle()
+            .expect("rotated bob bundle")
+            .clone();
+        alice
+            .engine
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob.bundle.clone(),
+            })
+            .expect("alice refreshes bob identity");
+
+        let mut harness = GroupHarness::with_bundles(&[HarnessUser {
+            name: bob.name,
+            bundle: bob.bundle.clone(),
+            engine: CoreEngine::new(),
+        }]);
+        let (group_id, _) =
+            harness.create_group(&mut alice, "After Direct", vec![bob.bundle.user_id.clone()]);
+
+        harness.import_welcome(&mut bob, &group_id);
+        assert!(
+            bob.engine.state.group_states.contains_key(&group_id),
+            "bob should import the group welcome generated from the rotated KeyPackage"
+        );
+    }
+
+    #[test]
+    fn group_welcome_rotates_key_package_for_subsequent_group_invite() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[HarnessUser {
+            name: bob.name,
+            bundle: bob.bundle.clone(),
+            engine: CoreEngine::new(),
+        }]);
+
+        let before = local_key_package_ref(&bob.engine);
+        let (first_group_id, _) =
+            harness.create_group(&mut alice, "First", vec![bob.bundle.user_id.clone()]);
+        harness.import_welcome(&mut bob, &first_group_id);
+        let after_first = local_key_package_ref(&bob.engine);
+        assert_ne!(before, after_first);
+
+        alice
+            .engine
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob.bundle.clone(),
+            })
+            .expect("alice refreshes bob identity after first group welcome");
+        let (second_group_id, _) =
+            harness.create_group(&mut alice, "Second", vec![bob.bundle.user_id.clone()]);
+        harness.import_welcome(&mut bob, &second_group_id);
+
+        assert!(
+            bob.engine.state.group_states.contains_key(&second_group_id),
+            "bob should import a second group welcome after group welcome rotation"
+        );
+    }
+
+    #[test]
     fn apply_local_device_status_update_updates_local_bundle_status() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
@@ -4442,6 +4655,17 @@ mod tests {
                             })
                             .expect("identity bundle fetched")
                     }
+                    CoreEffect::PublishSharedState { publish } => {
+                        if publish.document_kind == SharedStateDocumentKind::IdentityBundle {
+                            let bundle: IdentityBundle = serde_json::from_str(&publish.body)
+                                .expect("published identity bundle");
+                            self.bundles.insert(bundle.user_id.clone(), bundle.clone());
+                            if bundle.user_id == user.bundle.user_id {
+                                user.bundle = bundle;
+                            }
+                        }
+                        CoreOutput::default()
+                    }
                     CoreEffect::ReadAttachmentBytes { read } => {
                         let bytes = std::fs::read(&read.attachment_id).expect("attachment bytes");
                         user.engine
@@ -4884,6 +5108,23 @@ mod tests {
         engine
     }
 
+    fn local_engine(mnemonic: &str, device_name: &str) -> CoreEngine {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(mnemonic.into()),
+                device_name: Some(device_name.into()),
+                display_name: None,
+            })
+            .expect("identity");
+        engine
+    }
+
     fn create_direct_conversation(engine: &mut CoreEngine, peer_user_id: String) -> String {
         engine
             .handle_command(CoreCommand::CreateConversation {
@@ -4896,6 +5137,52 @@ mod tests {
             .conversations[0]
             .conversation_id
             .clone()
+    }
+
+    fn local_key_package_ref(engine: &CoreEngine) -> String {
+        engine
+            .state
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .keypackage_ref
+            .object_ref
+            .clone()
+    }
+
+    fn deliver_pending_outbox_to_device(
+        recipient: &mut CoreEngine,
+        sender: &CoreEngine,
+        device_id: &str,
+    ) -> CoreOutput {
+        let records = sender
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| item.envelope.recipient_device_id == device_id)
+            .enumerate()
+            .map(|(index, item)| InboxRecord {
+                seq: index as u64 + 1,
+                recipient_device_id: item.envelope.recipient_device_id.clone(),
+                message_id: item.envelope.message_id.clone(),
+                received_at: index as u64 + 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: item.envelope.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !records.is_empty(),
+            "sender has no pending records for {device_id}"
+        );
+        recipient
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: device_id.to_string(),
+                to_seq: records.len() as u64,
+                records,
+            })
+            .expect("recipient inbox records fetched")
     }
 
     fn sample_identity_bundle(mnemonic: &str, device_name: &str) -> IdentityBundle {

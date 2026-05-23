@@ -91,6 +91,13 @@ export default function GroupJoinApprovalPanel({
     setError(null);
     try {
       const result = await approveGroupJoin(groupId, request.request_id);
+      if (result.status === "already_member") {
+        setError(
+          "该设备已经在群成员列表中，请让对方重试初始群邀请导入或重建新群。",
+        );
+        await refresh();
+        return;
+      }
       setApprovedPickups(result.welcome_pickups);
       await refresh();
       try {

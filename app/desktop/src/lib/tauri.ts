@@ -288,6 +288,7 @@ export async function getDebugMode(): Promise<boolean> {
 import type {
   GroupCursor,
   GroupJoinPolicy,
+  GroupMemberStatus,
   GroupMemberInvitePolicy,
   GroupManifest,
   GroupRole,
@@ -432,7 +433,16 @@ export interface GroupJoinStatusView {
 export interface ApproveGroupJoinResult {
   group_id: string;
   request_id: string;
+  status: "approved" | "already_member" | "failed" | string;
   welcome_pickups: WelcomePickupShareable[];
+}
+
+export interface ProcessGroupJoinRequestsResult {
+  group_id: string;
+  processed: number;
+  approved: number;
+  already_member: number;
+  failed: number;
 }
 
 export interface UpdateGroupMetadataResult {
@@ -451,6 +461,110 @@ export interface DissolveGroupResult {
   pending_group_outbox: number;
 }
 
+type WireObject = Record<string, unknown>;
+
+function pick<T>(value: WireObject, snake: string, camel: string): T {
+  return (value[snake] ?? value[camel]) as T;
+}
+
+export function normalizeGroupManifest(manifest: unknown): GroupManifest {
+  const wire = manifest as WireObject;
+  return {
+    ...wire,
+    group_id: pick<string>(wire, "group_id", "groupId"),
+    conversation_id: pick<string>(wire, "conversation_id", "conversationId"),
+    owner_user_id: pick<string>(wire, "owner_user_id", "ownerUserId"),
+    admins: (wire.admins ?? []) as string[],
+    members: ((wire.members ?? []) as WireObject[]).map((member) => ({
+      ...member,
+      user_id: pick<string>(member, "user_id", "userId"),
+      role: member.role as GroupRole,
+      status: member.status as GroupMemberStatus,
+    })),
+    join_policy: pick<GroupJoinPolicy>(wire, "join_policy", "joinPolicy"),
+    member_invite_policy: pick<GroupMemberInvitePolicy>(
+      wire,
+      "member_invite_policy",
+      "memberInvitePolicy",
+    ),
+    roster_version: pick<number>(wire, "roster_version", "rosterVersion"),
+    mls_epoch_hint: pick<number>(wire, "mls_epoch_hint", "mlsEpochHint"),
+    last_commit_message_id:
+      (wire.last_commit_message_id ?? wire.lastCommitMessageId) as string | undefined,
+    outbox: wire.outbox as GroupManifest["outbox"],
+    updated_at: pick<number>(wire, "updated_at", "updatedAt"),
+    signer_user_id: pick<string>(wire, "signer_user_id", "signerUserId"),
+    signer_device_id: pick<string>(wire, "signer_device_id", "signerDeviceId"),
+    signature: wire.signature as string,
+    version: wire.version as string,
+    title: wire.title as string,
+  };
+}
+
+function normalizeGroupCursor(cursor: unknown): GroupCursor | null {
+  if (!cursor) return null;
+  const wire = cursor as WireObject;
+  return {
+    ...wire,
+    group_id: pick<string>(wire, "group_id", "groupId"),
+    last_fetched_seq: pick<number>(wire, "last_fetched_seq", "lastFetchedSeq"),
+    updated_at: pick<number>(wire, "updated_at", "updatedAt"),
+  } as GroupCursor;
+}
+
+export function normalizeGroupInvite(invite: unknown): GroupInviteView {
+  const wire = invite as WireObject;
+  return {
+    group_id: pick<string>(wire, "group_id", "groupId"),
+    invite_id: pick<string>(wire, "invite_id", "inviteId"),
+    invite_url: pick<string>(wire, "invite_url", "inviteUrl"),
+    join_policy: pick<GroupJoinPolicy>(wire, "join_policy", "joinPolicy"),
+    expires_at: pick<number>(wire, "expires_at", "expiresAt"),
+    max_uses: (wire.max_uses ?? wire.maxUses ?? null) as number | null,
+    inviter_user_id: pick<string>(wire, "inviter_user_id", "inviterUserId"),
+    created_at: pick<number>(wire, "created_at", "createdAt"),
+  };
+}
+
+export function normalizeGroupJoinRequest(request: unknown): GroupJoinRequestView {
+  const wire = request as WireObject;
+  return {
+    request_id: pick<string>(wire, "request_id", "requestId"),
+    group_id: pick<string>(wire, "group_id", "groupId"),
+    joiner_user_id: pick<string>(wire, "joiner_user_id", "joinerUserId"),
+    joiner_device_id: pick<string>(wire, "joiner_device_id", "joinerDeviceId"),
+    requested_at: pick<number>(wire, "requested_at", "requestedAt"),
+    status: wire.status as GroupJoinRequestView["status"],
+    invite_id: pick<string>(wire, "invite_id", "inviteId"),
+  };
+}
+
+export function normalizeGroupSnapshot(snapshot: unknown): GroupSnapshotView {
+  const wire = snapshot as WireObject;
+  return {
+    group_id: pick<string>(wire, "group_id", "groupId"),
+    conversation_id: pick<string>(wire, "conversation_id", "conversationId"),
+    manifest: normalizeGroupManifest(wire.manifest),
+    local_role: (wire.local_role ?? wire.localRole ?? null) as GroupRole | null,
+    cursor: normalizeGroupCursor(wire.cursor),
+    invites: ((wire.invites ?? []) as unknown[]).map(normalizeGroupInvite),
+    join_requests: ((wire.join_requests ?? wire.joinRequests ?? []) as unknown[]).map(
+      normalizeGroupJoinRequest,
+    ),
+    pending_outbox_count: pick<number>(
+      wire,
+      "pending_outbox_count",
+      "pendingOutboxCount",
+    ),
+    dissolved_at: (wire.dissolved_at ?? wire.dissolvedAt ?? null) as number | null,
+    conversation_state: pick<GroupSnapshotView["conversation_state"]>(
+      wire,
+      "conversation_state",
+      "conversationState",
+    ),
+  };
+}
+
 // Read-only projections ------------------------------------------------------
 
 export async function listGroupConversations(): Promise<GroupConversationSummary[]> {
@@ -458,7 +572,7 @@ export async function listGroupConversations(): Promise<GroupConversationSummary
 }
 
 export async function getGroupSnapshot(groupId: string): Promise<GroupSnapshotView> {
-  return invoke("get_group_snapshot", { groupId });
+  return normalizeGroupSnapshot(await invoke("get_group_snapshot", { groupId }));
 }
 
 export async function getGroupMessages(
@@ -521,7 +635,8 @@ export async function revokeGroupInviteLink(
 }
 
 export async function listGroupInvites(groupId: string): Promise<GroupInviteView[]> {
-  return invoke("list_group_invites", { groupId });
+  const rows = await invoke<unknown[]>("list_group_invites", { groupId });
+  return rows.map(normalizeGroupInvite);
 }
 
 // Join flow ------------------------------------------------------------------
@@ -535,7 +650,8 @@ export async function submitGroupJoinRequest(
 export async function listGroupJoinRequests(
   groupId: string,
 ): Promise<GroupJoinRequestView[]> {
-  return invoke("list_group_join_requests", { groupId });
+  const rows = await invoke<unknown[]>("list_group_join_requests", { groupId });
+  return rows.map(normalizeGroupJoinRequest);
 }
 
 export async function getGroupJoinRequestStatus(
@@ -550,6 +666,16 @@ export async function approveGroupJoin(
   requestId: string,
 ): Promise<ApproveGroupJoinResult> {
   return invoke("approve_group_join", { groupId, requestId });
+}
+
+export async function processGroupJoinRequests(
+  groupId: string,
+): Promise<ProcessGroupJoinRequestsResult> {
+  return invoke("process_group_join_requests", { groupId });
+}
+
+export async function retryPendingWelcomePickups(): Promise<void> {
+  return invoke("retry_pending_welcome_pickups");
 }
 
 export async function rejectGroupJoin(

@@ -81,13 +81,22 @@ export default function GroupSettingsPanel({
 
   useEffect(() => {
     if (!open) return;
+    setError(null);
+    setSavedAt(null);
+    void getGroupSnapshot(groupId)
+      .then(setSnapshot)
+      .catch((err) => {
+        setError(err instanceof Error ? err.message : String(err));
+      });
+  }, [open, groupId, setSnapshot]);
+
+  useEffect(() => {
+    if (!open) return;
     if (manifest) {
       setTitle(manifest.title);
       setJoinPolicy(manifest.join_policy);
       setMemberInvitePolicy(manifest.member_invite_policy);
     }
-    setError(null);
-    setSavedAt(null);
   }, [open, manifest]);
 
   const dirty = useMemo(() => {

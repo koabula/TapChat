@@ -1052,19 +1052,21 @@ pub async fn message_request_accept(
 ) -> Result<MessageRequestActionView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
-    let result =
-        accept_message_request_with_bundle_import(&mut profile, &mut driver, request_id).await?;
-    let sender_user_id = result.sender_user_id.clone();
-    let had_conversation_before = driver
+    let conversation_peer_ids_before = driver
         .latest_snapshot()
         .as_ref()
         .map(|snapshot| {
             snapshot
                 .conversations
                 .iter()
-                .any(|conversation| conversation.state.peer_user_id == sender_user_id)
+                .map(|conversation| conversation.state.peer_user_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
         })
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let result =
+        accept_message_request_with_bundle_import(&mut profile, &mut driver, request_id).await?;
+    let sender_user_id = result.sender_user_id.clone();
+    let had_conversation_before = conversation_peer_ids_before.contains(&sender_user_id);
 
     let contact_bundle = driver.contact_bundle(&sender_user_id).ok_or_else(|| {
         anyhow!("accepted request for {sender_user_id}, but the contact was not persisted")

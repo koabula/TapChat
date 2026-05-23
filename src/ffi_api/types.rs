@@ -13,7 +13,7 @@ use crate::model::{
 };
 use crate::persistence::{
     CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedGroupInvite,
-    PersistedGroupJoinRequest, PersistedPendingGroupJoinApproval,
+    PersistedGroupJoinRequest, PersistedPendingGroupJoinApproval, PersistedPendingWelcomePickup,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
@@ -130,6 +130,7 @@ pub enum CoreCommand {
     RequestJoinGroup {
         invite_url: String,
     },
+    RetryPendingWelcomePickups,
     ApproveGroupJoin {
         group_id: String,
         request_id: String,
@@ -899,6 +900,7 @@ pub(crate) struct CoreState {
     pub(crate) group_invites: BTreeMap<String, PersistedGroupInvite>,
     pub(crate) group_join_requests: BTreeMap<String, PersistedGroupJoinRequest>,
     pub(crate) pending_group_join_approvals: BTreeMap<String, PersistedPendingGroupJoinApproval>,
+    pub(crate) pending_welcome_pickups: BTreeMap<String, PersistedPendingWelcomePickup>,
     /// In-memory staging for owner-signed `SealGroupOutbox` requests.
     ///
     /// Keyed by `group_id`. An entry is inserted when
@@ -1066,6 +1068,7 @@ impl Default for CoreState {
             group_invites: BTreeMap::new(),
             group_join_requests: BTreeMap::new(),
             pending_group_join_approvals: BTreeMap::new(),
+            pending_welcome_pickups: BTreeMap::new(),
             pending_group_seal: BTreeMap::new(),
             pending_acks: BTreeMap::new(),
             pending_blob_uploads: BTreeMap::new(),

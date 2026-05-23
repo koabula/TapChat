@@ -199,6 +199,30 @@ impl From<&GroupJoinRequest> for GroupJoinRequestView {
     }
 }
 
+fn dedupe_pending_join_request_views<'a>(
+    requests: impl IntoIterator<Item = &'a GroupJoinRequest>,
+) -> Vec<GroupJoinRequestView> {
+    let mut seen_pending_devices = BTreeSet::new();
+    let mut views = Vec::new();
+    for request in requests {
+        let is_pending = matches!(
+            request.status,
+            tapchat_core::model::GroupJoinRequestStatus::Pending
+        );
+        if is_pending
+            && !seen_pending_devices.insert((
+                request.group_id.clone(),
+                request.joiner_user_id.clone(),
+                request.joiner_device_id.clone(),
+            ))
+        {
+            continue;
+        }
+        views.push(GroupJoinRequestView::from(request));
+    }
+    views
+}
+
 #[tauri::command]
 pub async fn apply_group_realtime_plan(
     app: AppHandle,
@@ -299,14 +323,10 @@ fn notification_error_from_output(output: &CoreOutput, fallback: &str) -> String
 }
 
 fn notification_message_from_output(output: &CoreOutput) -> Option<String> {
-    output
-        .effects
-        .iter()
-        .rev()
-        .find_map(|effect| match effect {
-            CoreEffect::EmitUserNotification { notification } => Some(notification.message.clone()),
-            _ => None,
-        })
+    output.effects.iter().rev().find_map(|effect| match effect {
+        CoreEffect::EmitUserNotification { notification } => Some(notification.message.clone()),
+        _ => None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -411,12 +431,13 @@ pub async fn get_group_snapshot_impl(
         .map(GroupInviteView::from)
         .collect();
 
-    let join_requests: Vec<GroupJoinRequestView> = snapshot
-        .group_join_requests
-        .iter()
-        .filter(|persisted| persisted.group_id == group_id)
-        .map(|persisted| GroupJoinRequestView::from(&persisted.request))
-        .collect();
+    let join_requests = dedupe_pending_join_request_views(
+        snapshot
+            .group_join_requests
+            .iter()
+            .filter(|persisted| persisted.group_id == group_id)
+            .map(|persisted| &persisted.request),
+    );
 
     let pending_outbox_count = snapshot
         .pending_group_outbox
@@ -1150,11 +1171,11 @@ pub async fn list_group_join_requests(
     let requests = output
         .view_model
         .map(|vm| {
-            vm.group_join_requests
-                .iter()
-                .filter(|request| request.group_id == group_id)
-                .map(GroupJoinRequestView::from)
-                .collect::<Vec<_>>()
+            dedupe_pending_join_request_views(
+                vm.group_join_requests
+                    .iter()
+                    .filter(|request| request.group_id == group_id),
+            )
         })
         .unwrap_or_default();
     Ok(requests)
@@ -1225,6 +1246,7 @@ pub async fn get_group_join_request_status(
 pub struct ApproveGroupJoinResult {
     pub group_id: String,
     pub request_id: String,
+    pub status: String,
     pub welcome_pickups: Vec<WelcomePickupShareable>,
 }
 
@@ -1250,7 +1272,7 @@ pub async fn approve_group_join(
     .await
     .map_err(|e| e.to_string())?;
 
-    let output = drive_core_with_handle(
+    let output = match drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ApproveGroupJoin {
             group_id: group_id.clone(),
@@ -1258,7 +1280,21 @@ pub async fn approve_group_join(
         }),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let detail = error.to_string();
+            if detail.contains("already_member") {
+                return Ok(ApproveGroupJoinResult {
+                    group_id,
+                    request_id,
+                    status: "already_member".into(),
+                    welcome_pickups: Vec::new(),
+                });
+            }
+            return Err(detail);
+        }
+    };
 
     let welcome_pickups: Vec<WelcomePickupShareable> = output
         .view_model
@@ -1274,8 +1310,129 @@ pub async fn approve_group_join(
     Ok(ApproveGroupJoinResult {
         group_id,
         request_id,
+        status: "approved".into(),
         welcome_pickups,
     })
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessGroupJoinRequestsResult {
+    pub group_id: String,
+    pub processed: usize,
+    pub approved: usize,
+    pub already_member: usize,
+    pub failed: usize,
+}
+
+#[tauri::command]
+pub async fn process_group_join_requests(
+    app: AppHandle,
+    group_id: String,
+) -> Result<ProcessGroupJoinRequestsResult, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ListGroupJoinRequests {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let inner = state.inner.read().await;
+        inner.engine.refresh_snapshot()
+    };
+    let Some(group) = snapshot
+        .group_states
+        .iter()
+        .find(|state| state.group_id == group_id)
+        .cloned()
+    else {
+        return Err(format!("group '{group_id}' not found in local snapshot"));
+    };
+    let role = group.local_role.unwrap_or(GroupRole::Member);
+    if !matches!(role, GroupRole::Owner | GroupRole::Admin)
+        || group.manifest.join_policy != GroupJoinPolicy::OpenByInvite
+    {
+        return Ok(ProcessGroupJoinRequestsResult {
+            group_id,
+            processed: 0,
+            approved: 0,
+            already_member: 0,
+            failed: 0,
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    let candidates: Vec<_> = snapshot
+        .group_join_requests
+        .iter()
+        .filter(|persisted| persisted.group_id == group_id)
+        .filter(|persisted| {
+            matches!(
+                persisted.request.status,
+                tapchat_core::model::GroupJoinRequestStatus::Pending
+            ) && persisted.request.auto_approve.unwrap_or(false)
+        })
+        .filter(|persisted| {
+            seen.insert((
+                persisted.request.joiner_user_id.clone(),
+                persisted.request.joiner_device_id.clone(),
+            ))
+        })
+        .map(|persisted| persisted.request_id.clone())
+        .collect();
+
+    let mut result = ProcessGroupJoinRequestsResult {
+        group_id: group_id.clone(),
+        processed: candidates.len(),
+        approved: 0,
+        already_member: 0,
+        failed: 0,
+    };
+    for request_id in candidates {
+        match drive_core_with_handle(
+            &app,
+            CoreInput::Command(CoreCommand::ApproveGroupJoin {
+                group_id: group_id.clone(),
+                request_id,
+            }),
+        )
+        .await
+        {
+            Ok(_) => result.approved += 1,
+            Err(error) => {
+                let detail = error.to_string();
+                if detail.contains("already_member") {
+                    result.already_member += 1;
+                } else {
+                    result.failed += 1;
+                    log::warn!(
+                        "process_group_join_requests: auto-approve failed group_id={} detail={}",
+                        group_id,
+                        detail
+                    );
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn retry_pending_welcome_pickups(app: AppHandle) -> Result<(), String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::RetryPendingWelcomePickups),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2185,7 +2342,7 @@ pub async fn approve_group_join_impl(
     .await
     .map_err(|e| e.to_string())?;
 
-    let output = drive_core_without_handle(
+    let output = match drive_core_without_handle(
         state,
         CoreInput::Command(CoreCommand::ApproveGroupJoin {
             group_id: group_id.clone(),
@@ -2193,7 +2350,21 @@ pub async fn approve_group_join_impl(
         }),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let detail = error.to_string();
+            if detail.contains("already_member") {
+                return Ok(ApproveGroupJoinResult {
+                    group_id,
+                    request_id,
+                    status: "already_member".into(),
+                    welcome_pickups: Vec::new(),
+                });
+            }
+            return Err(detail);
+        }
+    };
 
     let welcome_pickups: Vec<WelcomePickupShareable> = output
         .view_model
@@ -2209,6 +2380,7 @@ pub async fn approve_group_join_impl(
     Ok(ApproveGroupJoinResult {
         group_id,
         request_id,
+        status: "approved".into(),
         welcome_pickups,
     })
 }
