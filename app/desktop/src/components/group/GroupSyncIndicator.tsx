@@ -11,7 +11,12 @@ function labelFor(status: GroupSyncStatus | undefined): string {
   if (status.expectedWebsocket && !status.connected) {
     return status.lastError
       ? `Realtime disconnected: ${status.lastError}`
-      : "Realtime disconnected, polling fallback active";
+      : status.lastSyncedAt
+        ? `Realtime fallback polling, last synced ${new Date(status.lastSyncedAt).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}`
+        : "Realtime connecting";
   }
   if (status.mode === "polling") {
     return status.lastSyncedAt
@@ -29,11 +34,25 @@ export default function GroupSyncIndicator({ status, compact = false }: GroupSyn
   const cls =
     lamp === "websocket_live"
       ? "bg-green-500 animate-pulse"
+      : lamp === "websocket_connecting"
+        ? "bg-yellow-500 animate-pulse"
       : lamp === "polling_ok"
         ? "bg-green-500"
+        : lamp === "polling_fallback"
+          ? "bg-yellow-500"
         : lamp === "websocket_error"
           ? "bg-red-500 animate-pulse"
           : "bg-surface-elevated";
+  const modeLabel =
+    lamp === "websocket_live"
+      ? "Live"
+      : lamp === "websocket_connecting"
+        ? "Connecting"
+        : lamp === "polling_fallback"
+          ? "Fallback"
+          : status?.mode === "polling"
+            ? "Polling"
+            : status?.mode ?? "Idle";
 
   return (
     <span
@@ -42,7 +61,7 @@ export default function GroupSyncIndicator({ status, compact = false }: GroupSyn
       aria-label={labelFor(status)}
     >
       <span className={`h-2 w-2 rounded-full ${cls}`} />
-      {!compact && <span>{status?.mode === "websocket" ? "Live" : status?.mode ?? "Idle"}</span>}
+      {!compact && <span>{modeLabel}</span>}
     </span>
   );
 }

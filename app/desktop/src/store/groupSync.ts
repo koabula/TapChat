@@ -1,7 +1,13 @@
 import { create } from "zustand";
 import type { GroupSyncSettings } from "@/lib/tauri";
 
-export type GroupSyncLamp = "websocket_live" | "polling_ok" | "websocket_error" | "idle";
+export type GroupSyncLamp =
+  | "websocket_live"
+  | "websocket_connecting"
+  | "polling_ok"
+  | "polling_fallback"
+  | "websocket_error"
+  | "idle";
 
 export interface GroupSyncStatus {
   mode: "websocket" | "polling" | "manual";
@@ -38,6 +44,7 @@ export const DEFAULT_GROUP_SYNC_SETTINGS: GroupSyncSettings = {
   max_websocket_groups: 5,
   poll_interval_minutes: 5,
   important_group_ids: [],
+  recent_group_ids: [],
 };
 
 function defaultStatus(): GroupSyncStatus {
@@ -56,12 +63,26 @@ export const useGroupSyncStore = create<GroupSyncState>((set) => ({
   recentGroupIds: [],
   websocketGroupIds: [],
   statuses: {},
-  setSettings: (settings) => set({ settings }),
+  setSettings: (settings) =>
+    set({
+      settings,
+      recentGroupIds: settings.recent_group_ids ?? [],
+    }),
   setLoaded: (loaded) => set({ loaded }),
   markGroupOpened: (groupId) =>
-    set((state) => ({
-      recentGroupIds: [groupId, ...state.recentGroupIds.filter((id) => id !== groupId)].slice(0, 50),
-    })),
+    set((state) => {
+      const recentGroupIds = [
+        groupId,
+        ...state.recentGroupIds.filter((id) => id !== groupId),
+      ].slice(0, 50);
+      return {
+        recentGroupIds,
+        settings: {
+          ...state.settings,
+          recent_group_ids: recentGroupIds,
+        },
+      };
+    }),
   setWebsocketPlan: (groupIds) =>
     set((state) => {
       const planned = new Set(groupIds);
@@ -160,7 +181,10 @@ export const useGroupSyncStore = create<GroupSyncState>((set) => ({
 export function groupSyncLamp(status: GroupSyncStatus | undefined): GroupSyncLamp {
   if (!status) return "idle";
   if (status.expectedWebsocket) {
-    return status.connected ? "websocket_live" : "websocket_error";
+    if (status.connected) return "websocket_live";
+    if (status.lastError) return "websocket_error";
+    if (status.lastSyncedAt != null) return "polling_fallback";
+    return "websocket_connecting";
   }
   if (status.mode === "polling" && status.lastSyncedAt != null && !status.lastError) {
     return "polling_ok";

@@ -87,6 +87,8 @@ pub struct GroupSnapshotView {
 pub enum GroupMessageView {
     Bubble {
         message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sender_user_id: Option<String>,
         sender_device_id: String,
         created_at: u64,
         plaintext: Option<String>,
@@ -501,6 +503,19 @@ pub async fn get_group_messages_impl(
         .iter()
         .find(|c| c.conversation_id == conversation_id)
         .ok_or_else(|| format!("conversation '{conversation_id}' not found"))?;
+    let device_user_ids: BTreeMap<&str, &str> = snapshot
+        .group_states
+        .iter()
+        .find(|group| group.conversation_id == conversation_id)
+        .map(|group| {
+            group
+                .manifest
+                .member_devices
+                .iter()
+                .map(|device| (device.device_id.as_str(), device.user_id.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut out = Vec::with_capacity(conversation.state.messages.len());
     for message in &conversation.state.messages {
@@ -508,13 +523,11 @@ pub async fn get_group_messages_impl(
             tapchat_core::model::MessageType::MlsApplication => {
                 out.push(GroupMessageView::Bubble {
                     message_id: message.message_id.clone(),
-                    // The sender's user_id is not stored on the
-                    // StoredMessage directly. The desktop UI resolves
-                    // it by cross-referencing `sender_device_id`
-                    // against the manifest's member list (deriving the
-                    // owning user_id for each device), which is cheap
-                    // at render time and keeps the core's log format
-                    // unchanged.
+                    sender_user_id: message.sender_user_id.clone().or_else(|| {
+                        device_user_ids
+                            .get(message.sender_device_id.as_str())
+                            .map(|user_id| (*user_id).to_string())
+                    }),
                     sender_device_id: message.sender_device_id.clone(),
                     created_at: message.created_at,
                     plaintext: message.plaintext.clone(),

@@ -86,6 +86,12 @@ export interface GroupMember {
   status: GroupMemberStatus;
 }
 
+export interface GroupMemberDevice {
+  user_id: string;
+  device_id: string;
+  status: "active" | "revoked" | "pending" | string;
+}
+
 export interface GroupOutboxDescriptor {
   endpoint: string;
   subscribe_endpoint?: string;
@@ -99,6 +105,7 @@ export interface GroupManifest {
   owner_user_id: string;
   admins: string[];
   members: GroupMember[];
+  member_devices: GroupMemberDevice[];
   join_policy: GroupJoinPolicy;
   member_invite_policy: GroupMemberInvitePolicy;
   roster_version: number;

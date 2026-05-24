@@ -28,6 +28,10 @@ describe("group snapshot normalizer", () => {
           { userId: "user:alice", role: "owner", status: "active" },
           { userId: "user:bob", role: "member", status: "active" },
         ],
+        memberDevices: [
+          { userId: "user:alice", deviceId: "device:alice:phone", status: "active" },
+          { userId: "user:bob", deviceId: "device:bob:phone", status: "active" },
+        ],
         joinPolicy: "approval_required",
         memberInvitePolicy: "request_owner_approval",
         rosterVersion: 2,
@@ -49,6 +53,10 @@ describe("group snapshot normalizer", () => {
     expect(snapshot.manifest.members.map((member) => member.user_id)).toEqual([
       "user:alice",
       "user:bob",
+    ]);
+    expect(snapshot.manifest.member_devices.map((device) => device.device_id)).toEqual([
+      "device:alice:phone",
+      "device:bob:phone",
     ]);
     expect(snapshot.manifest.join_policy).toBe("approval_required");
     expect(snapshot.manifest.member_invite_policy).toBe("request_owner_approval");

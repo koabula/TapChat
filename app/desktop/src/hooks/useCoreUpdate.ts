@@ -51,6 +51,8 @@ export function useCoreUpdate() {
   const setContacts = useContactsStore((s) => s.setContacts);
   const sessionState = useSessionStore((s) => s.sessionState);
   const setDeviceId = useSessionStore((s) => s.setDeviceId);
+  const setUserId = useSessionStore((s) => s.setUserId);
+  const setDisplayName = useSessionStore((s) => s.setDisplayName);
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const setGroupSnapshot = useGroupsStore((s) => s.setSnapshot);
   const removeGroupSnapshot = useGroupsStore((s) => s.removeSnapshot);
@@ -193,7 +195,15 @@ export function useCoreUpdate() {
       }
 
       try {
-        const identity = await invoke<{ device_id?: string } | null>("get_identity_info");
+        const identity = await invoke<{
+          user_id?: string;
+          device_id?: string;
+          display_name?: string | null;
+        } | null>("get_identity_info");
+        if (identity?.user_id) {
+          setUserId(identity.user_id);
+        }
+        setDisplayName(identity?.display_name ?? null);
         if (identity?.device_id) {
           setDeviceId(identity.device_id);
         }
@@ -209,6 +219,9 @@ export function useCoreUpdate() {
     console.debug("[useCoreUpdate] clearing stores");
     setConversations([], { replace: true });
     setContacts([]);
+    setDeviceId(null);
+    setUserId(null);
+    setDisplayName(null);
     clearGroups();
     useConversationsStore.getState().setActiveConversation(null);
     // Clear any in-flight group-snapshot refreshes so a lingering
@@ -305,6 +318,8 @@ export function useCoreUpdate() {
     setConversations,
     setContacts,
     setDeviceId,
+    setUserId,
+    setDisplayName,
     setRequests,
     setGroupSnapshot,
     removeGroupSnapshot,

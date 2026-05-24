@@ -13,6 +13,9 @@ import {
 } from "@/lib/tauri";
 import type { RealtimeEventPayload } from "@/lib/types";
 import { useGroupsStore } from "@/store/groups";
+import { useContactsStore } from "@/store/contacts";
+import { useSessionStore } from "@/store/session";
+import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
 
 interface GroupJoinApprovalPanelProps {
   open: boolean;
@@ -41,6 +44,9 @@ export default function GroupJoinApprovalPanel({
 }: GroupJoinApprovalPanelProps) {
   const snapshot = useGroupsStore((s) => s.snapshots[groupId] ?? null);
   const setSnapshot = useGroupsStore((s) => s.setSnapshot);
+  const contacts = useContactsStore((s) => s.contacts);
+  const localUserId = useSessionStore((s) => s.userId);
+  const localDisplayName = useSessionStore((s) => s.displayName);
 
   const [requests, setRequests] = useState<GroupJoinRequestView[]>([]);
   const [loading, setLoading] = useState(false);
@@ -140,6 +146,12 @@ export default function GroupJoinApprovalPanel({
 
   const localRole = snapshot?.local_role ?? null;
   const privileged = localRole === "owner" || localRole === "admin";
+  const resolveGroupName = buildGroupNameResolver({
+    manifest: snapshot?.manifest ?? null,
+    contacts,
+    localUserId,
+    localDisplayName,
+  });
 
   return (
     <div
@@ -190,7 +202,10 @@ export default function GroupJoinApprovalPanel({
                 <div className="flex items-start justify-between gap-2 mb-2">
                   <div className="min-w-0">
                     <div className="text-primary-color font-medium truncate">
-                      {request.joiner_user_id}
+                      {resolveGroupName({
+                        userId: request.joiner_user_id,
+                        deviceId: request.joiner_device_id,
+                      })}
                     </div>
                     <div className="text-xs text-muted-color truncate">
                       Device {request.joiner_device_id} · {new Date(request.requested_at).toLocaleString()}

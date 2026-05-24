@@ -16,6 +16,8 @@ import {
 } from "lucide-react";
 
 import { useGroupsStore } from "@/store/groups";
+import { useContactsStore } from "@/store/contacts";
+import { useSessionStore } from "@/store/session";
 import {
   getGroupSnapshot,
   leaveGroup,
@@ -25,6 +27,7 @@ import {
 } from "@/lib/tauri";
 import type { GroupMember, GroupRole } from "@/lib/types";
 import { canPerform } from "@/lib/groupPermissions";
+import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
 import DissolveConfirmDialog from "./DissolveConfirmDialog";
 import GroupInviteDialog from "./GroupInviteDialog";
 import GroupJoinApprovalPanel from "./GroupJoinApprovalPanel";
@@ -56,6 +59,8 @@ export default function GroupMemberDrawer({
   const navigate = useNavigate();
   const snapshot = useGroupsStore((s) => s.snapshots[groupId] ?? null);
   const setSnapshot = useGroupsStore((s) => s.setSnapshot);
+  const contacts = useContactsStore((s) => s.contacts);
+  const localDisplayName = useSessionStore((s) => s.displayName);
 
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -94,6 +99,16 @@ export default function GroupMemberDrawer({
   const dissolved = snapshot?.dissolved_at != null;
 
   const members = useMemo(() => snapshot?.manifest.members ?? [], [snapshot]);
+  const resolveGroupName = useMemo(
+    () =>
+      buildGroupNameResolver({
+        manifest: snapshot?.manifest ?? null,
+        contacts,
+        localUserId,
+        localDisplayName,
+      }),
+    [contacts, localDisplayName, localUserId, snapshot?.manifest],
+  );
   const activeMembers = useMemo(
     () => members.filter((m) => m.status === "active"),
     [members],
@@ -144,8 +159,9 @@ export default function GroupMemberDrawer({
     );
 
   const handleTransfer = (member: GroupMember) => {
+    const memberName = resolveGroupName({ userId: member.user_id });
     const confirm = window.confirm(
-      `Transfer ownership to ${member.user_id}? You will become an admin. This cannot be undone from this dialog.`,
+      `Transfer ownership to ${memberName}? You will become an admin. This cannot be undone from this dialog.`,
     );
     if (!confirm) return;
     void runCommand(`transfer:${member.user_id}`, () =>
@@ -245,6 +261,7 @@ export default function GroupMemberDrawer({
             onRemove={handleRemove}
             onToggleAdmin={handleToggleAdmin}
             onTransfer={handleTransfer}
+            resolveName={resolveGroupName}
           />
         )}
 
@@ -330,6 +347,7 @@ interface MemberListProps {
   onRemove: (member: GroupMember) => void;
   onToggleAdmin: (member: GroupMember) => void;
   onTransfer: (member: GroupMember) => void;
+  resolveName: (input: { userId?: string | null; deviceId?: string | null }) => string;
 }
 
 function MemberList({
@@ -341,6 +359,7 @@ function MemberList({
   onRemove,
   onToggleAdmin,
   onTransfer,
+  resolveName,
 }: MemberListProps) {
   const sorted = [...members].sort((a, b) => {
     // Owner → admin → member; within a role sort by user_id.
@@ -366,6 +385,7 @@ function MemberList({
       owner_user_id: "",
       admins: [],
       members,
+      member_devices: [],
       join_policy: "closed",
       member_invite_policy: "owner_admin_only",
       roster_version: 0,
@@ -404,6 +424,7 @@ function MemberList({
         const canRemove = canPerform("remove_member", gateCtx);
         const canToggleAdmin = canPerform("set_admin", gateCtx);
         const canTransfer = canPerform("transfer_ownership", gateCtx);
+        const memberName = resolveName({ userId: member.user_id });
 
         return (
           <li
@@ -421,7 +442,7 @@ function MemberList({
                   {member.role === "admin" && (
                     <Shield size={14} className="text-sky-500" aria-label="Admin" />
                   )}
-                  <span className="truncate">{member.user_id}</span>
+                  <span className="truncate" title={member.user_id}>{memberName}</span>
                   {isSelf && <span className="text-xs text-muted-color">(you)</span>}
                 </div>
                 <div className="text-xs text-muted-color uppercase tracking-wide">

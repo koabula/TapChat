@@ -4,6 +4,7 @@ export interface GroupPlanInput {
   groupIds: string[];
   currentGroupId: string | null;
   recentGroupIds: string[];
+  activeGroupIds?: string[];
   settings: GroupSyncSettings;
 }
 
@@ -23,6 +24,7 @@ export function chooseWebsocketGroups(input: GroupPlanInput): string[] {
   take(input.currentGroupId);
   input.settings.important_group_ids.forEach(take);
   input.recentGroupIds.forEach(take);
+  input.activeGroupIds?.forEach(take);
 
   return selected;
 }

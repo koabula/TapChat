@@ -23,6 +23,8 @@ pub struct GroupSyncSettings {
     pub poll_interval_minutes: u16,
     #[serde(default)]
     pub important_group_ids: Vec<String>,
+    #[serde(default)]
+    pub recent_group_ids: Vec<String>,
 }
 
 impl Default for GroupSyncSettings {
@@ -32,6 +34,7 @@ impl Default for GroupSyncSettings {
             max_websocket_groups: default_max_websocket_groups(),
             poll_interval_minutes: default_poll_interval_minutes(),
             important_group_ids: Vec::new(),
+            recent_group_ids: Vec::new(),
         }
     }
 }
@@ -57,6 +60,14 @@ fn normalize_settings(mut settings: GroupSyncSettings) -> GroupSyncSettings {
         .into_iter()
         .map(|group_id| group_id.trim().to_string())
         .filter(|group_id| !group_id.is_empty() && seen.insert(group_id.clone()))
+        .collect();
+    seen.clear();
+    settings.recent_group_ids = settings
+        .recent_group_ids
+        .into_iter()
+        .map(|group_id| group_id.trim().to_string())
+        .filter(|group_id| !group_id.is_empty() && seen.insert(group_id.clone()))
+        .take(50)
         .collect();
     settings
 }
@@ -130,6 +141,12 @@ mod tests {
                 "group-a".into(),
                 "group-b".into(),
             ],
+            recent_group_ids: vec![
+                "group-c".into(),
+                "group-c".into(),
+                " ".into(),
+                "group-d".into(),
+            ],
         });
 
         assert_eq!(settings.max_websocket_groups, 50);
@@ -137,6 +154,10 @@ mod tests {
         assert_eq!(
             settings.important_group_ids,
             vec!["group-a".to_string(), "group-b".to_string()]
+        );
+        assert_eq!(
+            settings.recent_group_ids,
+            vec!["group-c".to_string(), "group-d".to_string()]
         );
     }
 }

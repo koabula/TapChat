@@ -12,6 +12,7 @@ const settings: GroupSyncSettings = {
   max_websocket_groups: 3,
   poll_interval_minutes: 5,
   important_group_ids: ["g3", "g2"],
+  recent_group_ids: [],
 };
 
 describe("groupSyncPlanner", () => {
@@ -24,6 +25,18 @@ describe("groupSyncPlanner", () => {
         settings,
       }),
     ).toEqual(["g4", "g3", "g2"]);
+  });
+
+  it("uses active groups after current, important, and persisted recent groups", () => {
+    expect(
+      chooseWebsocketGroups({
+        groupIds: ["g1", "g2", "g3", "g4", "g5"],
+        currentGroupId: null,
+        recentGroupIds: ["g4"],
+        activeGroupIds: ["g5", "g1"],
+        settings: { ...settings, max_websocket_groups: 4 },
+      }),
+    ).toEqual(["g3", "g2", "g4", "g5"]);
   });
 
   it("disables websocket groups outside auto mode or when budget is zero", () => {

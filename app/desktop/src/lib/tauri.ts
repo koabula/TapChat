@@ -254,6 +254,7 @@ export interface GroupSyncSettings {
   max_websocket_groups: number;
   poll_interval_minutes: number;
   important_group_ids: string[];
+  recent_group_ids: string[];
 }
 
 export async function getGroupSyncSettings(): Promise<GroupSyncSettings> {
@@ -356,6 +357,7 @@ export type GroupMessageView =
   | {
       kind: "bubble";
       message_id: string;
+      sender_user_id?: string | null;
       sender_device_id: string;
       created_at: number;
       plaintext: string | null;
@@ -481,6 +483,14 @@ export function normalizeGroupManifest(manifest: unknown): GroupManifest {
       role: member.role as GroupRole,
       status: member.status as GroupMemberStatus,
     })),
+    member_devices: ((wire.member_devices ?? wire.memberDevices ?? []) as WireObject[]).map(
+      (device) => ({
+        ...device,
+        user_id: pick<string>(device, "user_id", "userId"),
+        device_id: pick<string>(device, "device_id", "deviceId"),
+        status: (device.status ?? "active") as string,
+      }),
+    ),
     join_policy: pick<GroupJoinPolicy>(wire, "join_policy", "joinPolicy"),
     member_invite_policy: pick<GroupMemberInvitePolicy>(
       wire,

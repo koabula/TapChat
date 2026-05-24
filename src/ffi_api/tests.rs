@@ -2286,6 +2286,7 @@ mod tests {
                 },
                 messages: vec![crate::conversation::StoredMessage {
                     message_id: "msg:download".into(),
+                    sender_user_id: None,
                     sender_device_id: "device:sender".into(),
                     recipient_device_id: "device:recipient".into(),
                     message_type: MessageType::MlsApplication,
@@ -3568,6 +3569,7 @@ mod tests {
                 },
                 messages: vec![crate::conversation::StoredMessage {
                     message_id: "msg:download".into(),
+                    sender_user_id: None,
                     sender_device_id: "device:sender".into(),
                     recipient_device_id: "device:recipient".into(),
                     message_type: MessageType::MlsApplication,

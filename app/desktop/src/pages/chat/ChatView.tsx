@@ -24,10 +24,12 @@ import {
   type GroupMessageView,
 } from "@/lib/tauri";
 import type { Message, CoreUpdateEvent, CloudflareStatus } from "@/lib/types";
+import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
 
 interface SendMessageResult {
   message_id: string;
   conversation_id: string;
+  sender_user_id?: string;
   sender_device_id: string;
   plaintext: string;
   created_at: number;
@@ -50,7 +52,7 @@ export default function ChatView() {
 
   const { contacts } = useContactsStore();
   const { conversations, setActiveConversation } = useConversationsStore();
-  const { deviceId } = useSessionStore();
+  const { deviceId, displayName: localDisplayName } = useSessionStore();
   const groupSnapshot = useGroupsStore((s) =>
     s.snapshots[
       conversations.find((c) => c.conversation_id === conversationId)?.group_id ?? ""
@@ -77,6 +79,16 @@ export default function ChatView() {
   // fail-closed the composer when they have been removed / left /
   // dissolved the group (R15.1 / R15.2 / R15.3).
   const localUserId = useSessionStore((s) => s.userId) ?? "";
+  const resolveGroupName = useMemo(
+    () =>
+      buildGroupNameResolver({
+        manifest: groupSnapshot?.manifest ?? null,
+        contacts,
+        localUserId,
+        localDisplayName,
+      }),
+    [contacts, groupSnapshot?.manifest, localDisplayName, localUserId],
+  );
   const localMember = useMemo(() => {
     if (!isGroup || !groupSnapshot) return null;
     return (
@@ -397,7 +409,9 @@ export default function ChatView() {
           </div>
         );
       }
-      const sent = message.sender_device_id === (deviceId ?? "");
+      const sent =
+        message.sender_user_id === localUserId ||
+        message.sender_device_id === (deviceId ?? "");
       return (
         <div
           key={message.message_id}
@@ -417,12 +431,16 @@ export default function ChatView() {
     const bubbleCls = `bubble ${sent ? "bubble-sent" : "bubble-received"} animate-fade-in-up`;
     const refs = message.storage_refs ?? [];
     const hasAttachment = message.has_attachment || refs.length > 0;
+    const senderName = resolveGroupName({
+      userId: message.sender_user_id,
+      deviceId: message.sender_device_id,
+    });
     if (!hasAttachment) {
       return (
         <div className={bubbleCls}>
           {!sent && (
             <span className="block text-xs text-muted-color mb-1 truncate">
-              {message.sender_device_id}
+              {senderName}
             </span>
           )}
           <span className="block whitespace-pre-wrap break-words overflow-hidden">
@@ -440,7 +458,7 @@ export default function ChatView() {
       <div className={bubbleCls}>
         {!sent && (
           <span className="block text-xs text-muted-color mb-1 truncate">
-            {message.sender_device_id}
+            {senderName}
           </span>
         )}
         <div className="flex flex-col gap-2">

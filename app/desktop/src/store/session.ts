@@ -6,11 +6,13 @@ interface SessionState {
   syncInFlight: boolean;
   deviceId: string | null;
   userId: string | null;
+  displayName: string | null;
   setSessionState: (state: string) => void;
   setWsConnected: (connected: boolean) => void;
   setSyncInFlight: (syncInFlight: boolean) => void;
   setDeviceId: (deviceId: string | null) => void;
   setUserId: (userId: string | null) => void;
+  setDisplayName: (displayName: string | null) => void;
 }
 
 export const useSessionStore = create<SessionState>((set) => ({
@@ -19,9 +21,11 @@ export const useSessionStore = create<SessionState>((set) => ({
   syncInFlight: false,
   deviceId: null,
   userId: null,
+  displayName: null,
   setSessionState: (state) => set({ sessionState: state }),
   setWsConnected: (connected) => set({ wsConnected: connected }),
   setSyncInFlight: (syncInFlight) => set({ syncInFlight }),
   setDeviceId: (deviceId) => set({ deviceId }),
   setUserId: (userId) => set({ userId }),
+  setDisplayName: (displayName) => set({ displayName }),
 }));

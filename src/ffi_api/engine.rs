@@ -8811,6 +8811,7 @@ impl CoreEngine {
                     if !conv.messages.iter().any(|m| m.message_id == message_id) {
                         conv.messages.push(crate::conversation::StoredMessage {
                             message_id: message_id.to_string(),
+                            sender_user_id: Some(env.sender_user_id.clone()),
                             sender_device_id: env.sender_device_id.clone(),
                             recipient_device_id: env.recipient_device_id.clone(),
                             message_type: env.message_type,
@@ -9495,6 +9496,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         state.messages.push(crate::conversation::StoredMessage {
             message_id: record.message_id.clone(),
+            sender_user_id: Some(record.envelope.sender_user_id.clone()),
             sender_device_id: record.envelope.sender_device_id.clone(),
             recipient_device_id: String::new(),
             message_type,
