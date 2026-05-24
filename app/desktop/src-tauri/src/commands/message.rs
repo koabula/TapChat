@@ -22,6 +22,13 @@ pub struct SendMessageResult {
     pub created_at: u64,
 }
 
+fn normalize_direct_send_error(error: &str) -> String {
+    if error.contains("peer contact is missing") {
+        return "Peer identity is missing for this chat. Accept the message request again or re-add the contact before sending.".into();
+    }
+    error.to_string()
+}
+
 #[tauri::command]
 pub async fn send_text(
     app: tauri::AppHandle,
@@ -45,7 +52,7 @@ pub async fn send_text(
         }),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| normalize_direct_send_error(&e.to_string()))?;
 
     // Extract message_id from output
     let message_id = output
@@ -106,7 +113,7 @@ pub async fn send_attachment(
         }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| normalize_direct_send_error(&e.to_string()))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -132,7 +139,7 @@ pub async fn send_attachment_impl(
         }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| normalize_direct_send_error(&e.to_string()))
 }
 
 #[tauri::command]

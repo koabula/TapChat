@@ -5,7 +5,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
-import { useMessageRequestsStore } from "../store/requests";
+import {
+  filterMessageRequestsForSession,
+  useMessageRequestsStore,
+} from "../store/requests";
 import { useGroupsStore } from "../store/groups";
 import {
   getGroupSnapshot,
@@ -27,6 +30,7 @@ function mapContacts(contacts: ContactSummary[]) {
     display_name: contact.display_name ?? null,
     device_count: contact.device_count,
     last_refresh: null,
+    relationship_status: contact.relationship_status ?? "available",
   }));
 }
 
@@ -184,16 +188,8 @@ export function useCoreUpdate() {
       await refreshGroupsFromBackend();
       await retryPendingWelcomePickups();
 
-      const requestsResult = await invoke<{
-        view_model?: { message_requests?: MessageRequestItem[] };
-      }>("list_message_requests");
-      if (requestsResult.view_model?.message_requests) {
-        setRequests(requestsResult.view_model.message_requests);
-        console.debug(
-          `[useCoreUpdate] loaded message_requests=${requestsResult.view_model.message_requests.length}`,
-        );
-      }
-
+      let currentUserId = useSessionStore.getState().userId;
+      let currentDeviceId = useSessionStore.getState().deviceId;
       try {
         const identity = await invoke<{
           user_id?: string;
@@ -201,14 +197,31 @@ export function useCoreUpdate() {
           display_name?: string | null;
         } | null>("get_identity_info");
         if (identity?.user_id) {
+          currentUserId = identity.user_id;
           setUserId(identity.user_id);
         }
         setDisplayName(identity?.display_name ?? null);
         if (identity?.device_id) {
+          currentDeviceId = identity.device_id;
           setDeviceId(identity.device_id);
         }
       } catch (err) {
         console.error(`[useCoreUpdate] failed to get identity info: ${String(err)}`);
+      }
+
+      const requestsResult = await invoke<{
+        view_model?: { message_requests?: MessageRequestItem[] };
+      }>("list_message_requests");
+      if (requestsResult.view_model?.message_requests) {
+        const filtered = filterMessageRequestsForSession(
+          requestsResult.view_model.message_requests,
+          currentDeviceId,
+          currentUserId,
+        );
+        setRequests(filtered);
+        console.debug(
+          `[useCoreUpdate] loaded message_requests=${filtered.length}`,
+        );
       }
     } catch (err) {
       console.error(`[useCoreUpdate] failed to fetch data: ${String(err)}`);
@@ -222,6 +235,7 @@ export function useCoreUpdate() {
     setDeviceId(null);
     setUserId(null);
     setDisplayName(null);
+    setRequests([]);
     clearGroups();
     useConversationsStore.getState().setActiveConversation(null);
     // Clear any in-flight group-snapshot refreshes so a lingering
@@ -295,9 +309,15 @@ export function useCoreUpdate() {
       }
 
       if (view_model?.message_requests) {
-        setRequests(view_model.message_requests);
+        const { deviceId, userId } = useSessionStore.getState();
+        const filtered = filterMessageRequestsForSession(
+          view_model.message_requests,
+          deviceId,
+          userId,
+        );
+        setRequests(filtered);
         console.debug(
-          `[useCoreUpdate] message_requests=${view_model.message_requests.length}`,
+          `[useCoreUpdate] message_requests=${filtered.length}`,
         );
       }
     });

@@ -221,10 +221,31 @@ export interface Message {
 }
 
 // Contacts - matches backend ContactSummary
+export type ContactRelationshipStatus =
+  | "available"
+  | "pending_outbound"
+  | "rejected"
+  | string;
+
 export interface ContactSummary {
   user_id: string;
   device_count: number;
   display_name?: string | null;
+  relationship_status: ContactRelationshipStatus;
+}
+
+export interface ContactLinkPreview {
+  user_id: string;
+  device_count: number;
+  display_name?: string | null;
+  link: string;
+}
+
+export interface StartDirectChatResult {
+  user_id: string;
+  conversation_id: string;
+  relationship_status: ContactRelationshipStatus;
+  contact: ContactSummary;
 }
 
 // Message Requests
@@ -344,6 +365,8 @@ export interface SessionStatus {
   state: string;
   device_id?: string;
   ws_connected: boolean;
+  profile_path?: string | null;
+  error?: string | null;
 }
 
 // Realtime WebSocket event payload

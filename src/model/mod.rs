@@ -642,7 +642,11 @@ pub struct GroupManifest {
     pub owner_user_id: String,
     pub admins: Vec<String>,
     pub members: Vec<GroupMember>,
-    #[serde(default, alias = "member_devices", skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        alias = "member_devices",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub member_devices: Vec<GroupMemberDevice>,
     #[serde(alias = "join_policy")]
     pub join_policy: GroupJoinPolicy,
@@ -687,7 +691,11 @@ impl Validate for GroupManifest {
         }
         for device in &self.member_devices {
             device.validate()?;
-            if !self.members.iter().any(|member| member.user_id == device.user_id) {
+            if !self
+                .members
+                .iter()
+                .any(|member| member.user_id == device.user_id)
+            {
                 return Err(CoreError::invalid_input(
                     "group member device user_id must exist in members",
                 ));

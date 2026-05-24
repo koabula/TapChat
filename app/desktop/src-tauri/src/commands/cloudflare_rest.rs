@@ -888,8 +888,7 @@ mod tests {
             binding["name"] == "INBOX" && binding["class_name"] == "InboxDurableObject"
         }));
         assert!(bindings.iter().any(|binding| {
-            binding["name"] == "GROUP_OUTBOX"
-                && binding["class_name"] == "GroupOutboxDurableObject"
+            binding["name"] == "GROUP_OUTBOX" && binding["class_name"] == "GroupOutboxDurableObject"
         }));
 
         let classes = metadata["migrations"]["new_sqlite_classes"]

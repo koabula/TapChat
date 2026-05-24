@@ -3,16 +3,29 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use keyring::{credential::CredentialPersistence, default};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::model::{DeploymentBundle, IdentityBundle};
 use crate::persistence::{decode_snapshot, encode_snapshot, CorePersistenceSnapshot};
+use crate::profile_crypto::{
+    build_os_keychain_wrapper, build_passphrase_wrapper, decrypt_snapshot,
+    default_encryption_metadata, encrypt_snapshot, generate_pdek, generate_wrap_key,
+    unwrap_with_key, unwrap_with_passphrase, validate_encryption_metadata,
+    ProfileEncryptionMetadata, ProfileKeyWrapperKind, LEGACY_SNAPSHOT_FILE_NAME,
+    OS_KEYCHAIN_SERVICE, PDEK_LEN, SNAPSHOT_FILE_NAME,
+};
 
 use super::util::to_snake_case_json_string;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileMetadata {
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_id: String,
     pub root_dir: PathBuf,
     pub bundles_dir: PathBuf,
     pub inbox_attachments_dir: PathBuf,
@@ -26,6 +39,8 @@ pub struct ProfileMetadata {
     pub device_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_bundle_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<ProfileEncryptionMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -82,14 +97,95 @@ pub struct ProfileRegistry {
 pub struct Profile {
     root: PathBuf,
     meta: ProfileMetadata,
+    pdek: Zeroizing<[u8; PDEK_LEN]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileInitOptions {
+    pub passphrase: Option<String>,
+    pub use_keychain: bool,
+}
+
+impl Default for ProfileInitOptions {
+    fn default() -> Self {
+        Self {
+            passphrase: None,
+            use_keychain: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProfileOpenOptions {
+    pub passphrase: Option<String>,
 }
 
 impl Profile {
     pub fn init(name: &str, root: impl AsRef<Path>) -> Result<Self> {
+        Self::init_with_options(
+            name,
+            root,
+            ProfileInitOptions {
+                passphrase: None,
+                use_keychain: true,
+            },
+        )
+    }
+
+    pub fn init_with_options(
+        name: &str,
+        root: impl AsRef<Path>,
+        options: ProfileInitOptions,
+    ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).context("create profile root")?;
+        if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
+            bail!(
+                "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
+                root.display()
+            );
+        }
+        let profile_id = format!("profile:{}", Uuid::new_v4());
+        let pdek = generate_pdek();
+        let mut wrappers = Vec::new();
+
+        if options.use_keychain {
+            let wrapper_id = format!("wrapper:{}", Uuid::new_v4());
+            let os_kek = generate_wrap_key();
+            match store_os_kek(&profile_id, &wrapper_id, &*os_kek) {
+                Ok(()) => wrappers.push(
+                    build_os_keychain_wrapper(&profile_id, &wrapper_id, &*os_kek, &*pdek)
+                        .map_err(anyhow::Error::from)?,
+                ),
+                Err(error) if options.passphrase.is_some() => {
+                    log::warn!("OS keychain unavailable for profile {profile_id}: {error}");
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        "OS keychain is unavailable; provide a passphrase to create this profile"
+                    });
+                }
+            }
+        }
+
+        if let Some(passphrase) = options.passphrase.as_deref() {
+            if passphrase.is_empty() {
+                bail!("profile passphrase must not be empty");
+            }
+            let wrapper_id = format!("wrapper:{}", Uuid::new_v4());
+            wrappers.push(
+                build_passphrase_wrapper(&profile_id, &wrapper_id, passphrase, &*pdek)
+                    .map_err(anyhow::Error::from)?,
+            );
+        }
+
+        if wrappers.is_empty() {
+            bail!("profile encryption requires at least one key wrapper");
+        }
+
         let meta = ProfileMetadata {
             name: name.to_string(),
+            profile_id: profile_id.clone(),
             bundles_dir: root.join("bundles"),
             inbox_attachments_dir: root.join("attachments"),
             outbox_attachments_dir: root.join("attachments"),
@@ -99,8 +195,9 @@ impl Profile {
             user_id: None,
             device_id: None,
             deployment_bundle_path: None,
+            encryption: Some(default_encryption_metadata(wrappers)),
         };
-        let profile = Self { root, meta };
+        let profile = Self { root, meta, pdek };
         profile.ensure_layout()?;
         profile.save_metadata()?;
         if !profile.snapshot_path().exists() {
@@ -111,6 +208,17 @@ impl Profile {
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(root, ProfileOpenOptions::default())
+    }
+
+    pub fn open_with_passphrase(
+        root: impl AsRef<Path>,
+        passphrase: Option<String>,
+    ) -> Result<Self> {
+        Self::open_with_options(root, ProfileOpenOptions { passphrase })
+    }
+
+    pub fn open_with_options(root: impl AsRef<Path>, options: ProfileOpenOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let meta_path = root.join("profile.json");
         if !meta_path.exists() {
@@ -125,7 +233,25 @@ impl Profile {
             meta.inbox_attachments_dir = meta.attachments_dir.clone();
             meta.outbox_attachments_dir = meta.attachments_dir.clone();
         }
-        Ok(Self { root, meta })
+        if meta.profile_id.is_empty() || meta.encryption.is_none() {
+            if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
+                bail!(
+                    "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
+                    root.display()
+                );
+            }
+            bail!("profile metadata is missing encryption settings");
+        }
+        let env_passphrase = if options.passphrase.is_none() {
+            env::var("TAPCHAT_PROFILE_PASSPHRASE").ok()
+        } else {
+            None
+        };
+        let pdek = unlock_profile_pdek(
+            &meta,
+            options.passphrase.as_deref().or(env_passphrase.as_deref()),
+        )?;
+        Ok(Self { root, meta, pdek })
     }
 
     pub fn metadata(&self) -> &ProfileMetadata {
@@ -158,7 +284,7 @@ impl Profile {
     }
 
     pub fn snapshot_path(&self) -> PathBuf {
-        self.root.join("snapshot.json")
+        self.root.join(SNAPSHOT_FILE_NAME)
     }
 
     pub fn runtime_meta_path(&self) -> PathBuf {
@@ -167,15 +293,30 @@ impl Profile {
 
     pub fn load_snapshot(&self) -> Result<CorePersistenceSnapshot> {
         let path = self.snapshot_path();
+        let legacy_path = self.root.join(LEGACY_SNAPSHOT_FILE_NAME);
+        if legacy_path.exists() && !path.exists() {
+            bail!(
+                "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
+                legacy_path.display()
+            );
+        }
         if !path.exists() {
             return Ok(CorePersistenceSnapshot::default());
         }
-        decode_snapshot(&fs::read(&path).context("read snapshot")?).map_err(anyhow::Error::from)
+        let plaintext = decrypt_snapshot(
+            &self.meta.profile_id,
+            &*self.pdek,
+            &fs::read(&path).context("read encrypted snapshot")?,
+        )
+        .map_err(anyhow::Error::from)?;
+        decode_snapshot(&plaintext).map_err(anyhow::Error::from)
     }
 
     pub fn save_snapshot(&self, snapshot: &CorePersistenceSnapshot) -> Result<()> {
         let encoded = encode_snapshot(snapshot).map_err(anyhow::Error::from)?;
-        write_atomic(&self.snapshot_path(), &encoded)
+        let encrypted = encrypt_snapshot(&self.meta.profile_id, &*self.pdek, &encoded)
+            .map_err(anyhow::Error::from)?;
+        write_atomic(&self.snapshot_path(), &encrypted)
     }
 
     pub fn save_deployment_bundle(&mut self, bundle: &DeploymentBundle) -> Result<PathBuf> {
@@ -386,6 +527,133 @@ fn normalize_json(raw: &str) -> Result<String> {
     }
 }
 
+fn unlock_profile_pdek(
+    meta: &ProfileMetadata,
+    passphrase: Option<&str>,
+) -> Result<Zeroizing<[u8; PDEK_LEN]>> {
+    let encryption = meta
+        .encryption
+        .as_ref()
+        .ok_or_else(|| anyhow!("profile metadata is missing encryption settings"))?;
+    validate_encryption_metadata(encryption).map_err(anyhow::Error::from)?;
+
+    let mut errors = Vec::new();
+    for wrapper in encryption
+        .wrappers
+        .iter()
+        .filter(|wrapper| wrapper.kind == ProfileKeyWrapperKind::OsKeychain)
+    {
+        match load_os_kek(wrapper).and_then(|key| {
+            unwrap_with_key(&meta.profile_id, wrapper, &key).map_err(anyhow::Error::from)
+        }) {
+            Ok(pdek) => return Ok(pdek),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+
+    if let Some(passphrase) = passphrase {
+        for wrapper in encryption
+            .wrappers
+            .iter()
+            .filter(|wrapper| wrapper.kind == ProfileKeyWrapperKind::PassphraseArgon2id)
+        {
+            match unwrap_with_passphrase(&meta.profile_id, wrapper, passphrase)
+                .map_err(anyhow::Error::from)
+            {
+                Ok(pdek) => return Ok(pdek),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+    }
+
+    if passphrase.is_none()
+        && encryption
+            .wrappers
+            .iter()
+            .any(|wrapper| wrapper.kind == ProfileKeyWrapperKind::PassphraseArgon2id)
+    {
+        bail!(
+            "profile is encrypted and requires a passphrase because OS keychain unlock failed: {}",
+            errors.join("; ")
+        );
+    }
+
+    bail!(
+        "failed to unlock encrypted profile{}",
+        if errors.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", errors.join("; "))
+        }
+    )
+}
+
+fn store_os_kek(profile_id: &str, wrapper_id: &str, key: &[u8]) -> Result<()> {
+    ensure_persistent_os_keychain()?;
+    let account = crate::profile_crypto::generate_keychain_account(profile_id, wrapper_id);
+    let entry = keyring::Entry::new(OS_KEYCHAIN_SERVICE, &account)
+        .with_context(|| format!("create OS keychain entry for {account}"))?;
+    entry
+        .set_password(&STANDARD.encode(key))
+        .with_context(|| format!("store OS keychain entry for {account}"))?;
+    let stored = entry
+        .get_password()
+        .with_context(|| format!("verify OS keychain entry for {account}"))?;
+    let stored = STANDARD
+        .decode(stored)
+        .context("decode OS keychain verification secret")?;
+    if stored != key {
+        bail!("OS keychain verification failed for {account}");
+    }
+    Ok(())
+}
+
+fn ensure_persistent_os_keychain() -> Result<()> {
+    let persistence = default::default_credential_builder().persistence();
+    if !matches!(persistence, CredentialPersistence::UntilDelete) {
+        bail!(
+            "OS keychain backend is not persistent ({})",
+            credential_persistence_label(&persistence)
+        );
+    }
+    Ok(())
+}
+
+fn credential_persistence_label(persistence: &CredentialPersistence) -> &'static str {
+    match persistence {
+        CredentialPersistence::EntryOnly => "entry-only",
+        CredentialPersistence::ProcessOnly => "process-only",
+        CredentialPersistence::UntilReboot => "until-reboot",
+        CredentialPersistence::UntilDelete => "until-delete",
+        _ => "unknown",
+    }
+}
+
+fn load_os_kek(
+    wrapper: &crate::profile_crypto::ProfileKeyWrapperMetadata,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let service = wrapper
+        .keychain_service
+        .as_deref()
+        .unwrap_or(OS_KEYCHAIN_SERVICE);
+    let account = wrapper
+        .keychain_account
+        .as_deref()
+        .ok_or_else(|| anyhow!("OS keychain wrapper is missing account"))?;
+    let entry = keyring::Entry::new(service, account)
+        .with_context(|| format!("create OS keychain entry for {account}"))?;
+    let encoded = entry
+        .get_password()
+        .with_context(|| format!("read OS keychain entry for {account}"))?;
+    let key = STANDARD
+        .decode(encoded)
+        .context("decode OS keychain secret")?;
+    if key.len() != PDEK_LEN {
+        bail!("OS keychain secret has invalid length");
+    }
+    Ok(Zeroizing::new(key))
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -402,7 +670,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Profile, ProfileRegistry};
+    use super::{Profile, ProfileInitOptions, ProfileRegistry};
     use crate::persistence::CorePersistenceSnapshot;
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -422,8 +690,17 @@ mod tests {
                 dir.path().join("config").join("profiles.json"),
             );
         }
-        let profile = Profile::init("alice", dir.path()).expect("init profile");
+        let profile = Profile::init_with_options(
+            "alice",
+            dir.path(),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
         assert!(profile.snapshot_path().exists());
+        assert!(!dir.path().join("snapshot.json").exists());
         assert!(profile.metadata().bundles_dir.exists());
         let snapshot = profile.load_snapshot().expect("load snapshot");
         assert_eq!(snapshot, CorePersistenceSnapshot::default());
@@ -445,7 +722,15 @@ mod tests {
                 dir.path().join("config").join("profiles.json"),
             );
         }
-        let mut profile = Profile::init("alice", dir.path().join("alice")).expect("init profile");
+        let mut profile = Profile::init_with_options(
+            "alice",
+            dir.path().join("alice"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
         profile
             .update_identity(Some("user:alice".into()), Some("device:alice:phone".into()))
             .expect("update identity");
@@ -456,5 +741,79 @@ mod tests {
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
         }
+    }
+
+    #[test]
+    fn encrypted_snapshot_does_not_contain_plaintext_marker() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                dir.path().join("config").join("profiles.json"),
+            );
+        }
+        let profile = Profile::init_with_options(
+            "alice",
+            dir.path().join("alice"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        let mut snapshot = CorePersistenceSnapshot::default();
+        snapshot
+            .realtime_sessions
+            .push(crate::persistence::PersistedRealtimeSession {
+                device_id: "visible-marker".into(),
+                last_known_seq: 42,
+                needs_reconnect: true,
+            });
+        profile.save_snapshot(&snapshot).expect("save snapshot");
+
+        let bytes = std::fs::read(profile.snapshot_path()).expect("read encrypted snapshot");
+        assert!(!bytes
+            .windows("visible-marker".len())
+            .any(|window| window == b"visible-marker"));
+
+        let reopened =
+            Profile::open_with_passphrase(dir.path().join("alice"), Some("test-passphrase".into()))
+                .expect("open profile");
+        assert_eq!(reopened.load_snapshot().expect("load"), snapshot);
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+    }
+
+    #[test]
+    fn plaintext_snapshot_without_encrypted_snapshot_is_rejected() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("legacy");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(
+            root.join("profile.json"),
+            serde_json::json!({
+                "name": "legacy",
+                "root_dir": root,
+                "bundles_dir": root.join("bundles"),
+                "inbox_attachments_dir": root.join("attachments"),
+                "outbox_attachments_dir": root.join("attachments"),
+                "attachments_dir": root.join("attachments"),
+                "runtime_dir": root.join("runtime")
+            })
+            .to_string(),
+        )
+        .expect("write profile");
+        std::fs::write(root.join("snapshot.json"), b"{}").expect("write legacy snapshot");
+
+        let error = match Profile::open(&root) {
+            Ok(_) => panic!("legacy profile should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("insecure plaintext snapshot.json"));
     }
 }

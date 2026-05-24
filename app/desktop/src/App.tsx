@@ -26,7 +26,10 @@ import SystemBanner from "./components/SystemBanner";
 import { UpdateNotification } from "./hooks/useAutoUpdate";
 
 import { useSessionStore } from "./store/session";
-import { useMessageRequestsStore } from "./store/requests";
+import {
+  filterMessageRequestsForSession,
+  useMessageRequestsStore,
+} from "./store/requests";
 import { useCoreUpdate } from "./hooks/useCoreUpdate";
 import { useGroupSyncScheduler } from "./hooks/useGroupSyncScheduler";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -36,7 +39,7 @@ import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
 import type { MessageRequestItem } from "./store/requests";
 
 function summarizeSessionStatus(status: SessionStatus): string {
-  return `state=${status.state} ws_connected=${status.ws_connected} device_id=${status.device_id ?? "none"}`;
+  return `state=${status.state} ws_connected=${status.ws_connected} device_id=${status.device_id ?? "none"} error=${status.error ?? "none"}`;
 }
 
 function summarizeRealtimeEvent(event: RealtimeEventPayload): string {
@@ -68,7 +71,10 @@ function isRuntimeAuthError(detail: string | undefined | null): boolean {
  * Hooks that use useNavigate() must be called here, inside BrowserRouter.
  */
 function AppInner() {
-  const { sessionState } = useSessionStore();
+  const { sessionState, unlockError } = useSessionStore();
+  const [unlockPassphrase, setUnlockPassphrase] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+  const [unlockSubmitError, setUnlockSubmitError] = useState<string | null>(null);
 
   // Connect to core-update events
   useCoreUpdate();
@@ -97,6 +103,55 @@ function AppInner() {
               Preparing your workspace
             </div>
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (sessionState === "locked") {
+    const handleUnlock = async () => {
+      setUnlocking(true);
+      setUnlockSubmitError(null);
+      try {
+        await invoke("unlock_active_profile", { passphrase: unlockPassphrase });
+      } catch (err) {
+        setUnlockSubmitError(String(err));
+      } finally {
+        setUnlocking(false);
+      }
+    };
+
+    return (
+      <div className="flex h-full min-h-0 items-center justify-center bg-base p-8">
+        <div className="w-full max-w-sm space-y-4">
+          <div>
+            <h1 className="text-xl font-semibold text-primary-color">Profile locked</h1>
+            <p className="mt-2 text-sm text-secondary-color">
+              {unlockError ?? "TapChat could not unlock the active profile."}
+            </p>
+          </div>
+          <input
+            className="input"
+            type="password"
+            placeholder="Profile passphrase"
+            value={unlockPassphrase}
+            onChange={(event) => setUnlockPassphrase(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && unlockPassphrase && !unlocking) {
+                void handleUnlock();
+              }
+            }}
+          />
+          {unlockSubmitError && (
+            <div className="status-error text-sm">{unlockSubmitError}</div>
+          )}
+          <button
+            className="btn btn-primary w-full"
+            disabled={unlocking || !unlockPassphrase}
+            onClick={handleUnlock}
+          >
+            {unlocking ? "Unlocking..." : "Unlock"}
+          </button>
         </div>
       </div>
     );
@@ -148,7 +203,7 @@ function AppInner() {
 }
 
 function App() {
-  const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight } = useSessionStore();
+  const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight, setUnlockError } = useSessionStore();
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [statusResolved, setStatusResolved] = useState(false);
   const isProfileSwitchingRef = useRef(false);
@@ -160,10 +215,21 @@ function App() {
     const mountedAt = performance.now();
 
     const refreshMessageRequests = async () => {
+      const before = useSessionStore.getState();
       const result = await invoke<{ view_model?: { message_requests?: MessageRequestItem[] } }>("list_message_requests");
+      const after = useSessionStore.getState();
+      if (before.deviceId !== after.deviceId || before.userId !== after.userId) {
+        console.debug("[App] discarded message request refresh after session changed");
+        return;
+      }
       if (result.view_model?.message_requests) {
-        setRequests(result.view_model.message_requests);
-        console.debug(`[App] message requests refreshed count=${result.view_model.message_requests.length}`);
+        const filtered = filterMessageRequestsForSession(
+          result.view_model.message_requests,
+          after.deviceId,
+          after.userId,
+        );
+        setRequests(filtered);
+        console.debug(`[App] message requests refreshed count=${filtered.length}`);
       }
     };
 
@@ -216,6 +282,7 @@ function App() {
     const unlistenSessionStatus = listen<SessionStatus>("session-status", (event) => {
       console.debug(`[App] session-status ${summarizeSessionStatus(event.payload)}`);
       setSessionState(event.payload.state);
+      setUnlockError(event.payload.error ?? null);
       setWsConnected(event.payload.ws_connected);
       if (event.payload.device_id) {
         setDeviceId(event.payload.device_id);
@@ -227,6 +294,7 @@ function App() {
       console.debug("[App] profile-switch-start");
       isProfileSwitchingRef.current = true;
       setWsConnected(false);
+      setRequests([]);
     });
 
     const unlistenProfileSwitchComplete = listen<void>("profile-switch-complete", () => {
@@ -273,6 +341,15 @@ function App() {
           }
           break;
         case "message_request_changed":
+          if (
+            useSessionStore.getState().deviceId &&
+            event.payload.device_id !== useSessionStore.getState().deviceId
+          ) {
+            console.debug(
+              `[App] ignored stale message_request_changed for device_id=${event.payload.device_id}`,
+            );
+            break;
+          }
           // Refresh message requests from backend
           refreshMessageRequests()
             .catch((err) => {
@@ -307,6 +384,7 @@ function App() {
         );
         console.debug(`[App] initial session-status ${summarizeSessionStatus(status)}`);
         setSessionState(status.state);
+        setUnlockError(status.error ?? null);
         setWsConnected(status.ws_connected);
         if (status.device_id) {
           setDeviceId(status.device_id);
@@ -327,7 +405,7 @@ function App() {
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight]);
+  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight, setUnlockError]);
 
   return (
     <BrowserRouter>

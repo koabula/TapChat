@@ -2495,11 +2495,7 @@ async fn extended_offline_catches_up_multiple_messages_in_order() -> Result<()> 
     ctx.bob.close_realtime(&ctx.bob_device_id).await?;
     let _ = ctx.bob.take_scheduled_timers();
 
-    let sequence: &[&str] = &[
-        "offline text A",
-        "offline text B",
-        "offline text C",
-    ];
+    let sequence: &[&str] = &["offline text A", "offline text B", "offline text C"];
 
     for (idx, plaintext) in sequence.iter().enumerate() {
         ctx.alice
@@ -2668,9 +2664,13 @@ async fn offline_then_reconnect_converges_without_duplicates() -> Result<()> {
         .get_head(&ctx.bob_auth, &ctx.bob_device_id)
         .await?
         .head_seq;
-    let new_records =
-        fetch_inbox_records_since(&ctx.runtime, &ctx.bob_auth, &ctx.bob_device_id, before_reconnect_head + 1)
-            .await?;
+    let new_records = fetch_inbox_records_since(
+        &ctx.runtime,
+        &ctx.bob_auth,
+        &ctx.bob_device_id,
+        before_reconnect_head + 1,
+    )
+    .await?;
     let new_record = new_records
         .last()
         .cloned()

@@ -22,6 +22,9 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
     let registry_path = temp_root
         .path()
         .join("desktop-message-request.profiles.json");
+    unsafe {
+        std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
+    }
     let alice_profile = temp_root.path().join("alice");
     let bob_profile = temp_root.path().join("bob");
 

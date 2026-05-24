@@ -19,7 +19,10 @@ mod tests {
         InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
         WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
-    use crate::persistence::{CorePersistenceSnapshot, PersistOp, PersistedPendingWelcomePickup};
+    use crate::persistence::{
+        ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp,
+        PersistedPendingWelcomePickup,
+    };
     use crate::transport_contract::{
         GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
     };
@@ -2021,6 +2024,74 @@ mod tests {
     }
 
     #[test]
+    fn delete_contact_then_reimport_same_peer_allows_direct_recreate() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "pending before delete".into(),
+            })
+            .expect("queue pending message");
+        assert!(!alice.state.pending_outbox.is_empty());
+
+        alice
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: bob_bundle.user_id.clone(),
+            })
+            .expect("delete contact");
+        assert!(!alice.state.conversations.contains_key(&conversation_id));
+        assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
+        assert!(alice.state.pending_outbox.is_empty());
+        let snapshot = alice.refresh_snapshot();
+        assert!(!snapshot
+            .conversations
+            .iter()
+            .any(|conversation| conversation.conversation_id == conversation_id));
+        assert!(!snapshot
+            .mls_states
+            .iter()
+            .any(|state| state.conversation_id == conversation_id));
+        assert!(snapshot.pending_outbox.is_empty());
+
+        let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: refreshed_bob_bundle.clone(),
+            })
+            .expect("reimport contact");
+        let recreated =
+            create_direct_conversation(&mut alice, refreshed_bob_bundle.user_id.clone());
+        assert_eq!(recreated, conversation_id);
+        assert!(alice.mls_summary(&conversation_id).is_some());
+    }
+
+    #[test]
+    fn delete_contact_cleans_mls_even_when_conversation_row_is_missing() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice.state.conversations.remove(&conversation_id);
+
+        alice
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: bob_bundle.user_id.clone(),
+            })
+            .expect("delete contact");
+
+        let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: refreshed_bob_bundle.clone(),
+            })
+            .expect("reimport contact");
+        let recreated =
+            create_direct_conversation(&mut alice, refreshed_bob_bundle.user_id.clone());
+        assert_eq!(recreated, conversation_id);
+    }
+
+    #[test]
     fn realtime_head_updated_triggers_fetch() {
         let mut engine = CoreEngine::new();
         engine
@@ -2769,6 +2840,16 @@ mod tests {
             append_result.request_id.as_deref(),
             Some("request:user:bob")
         );
+        assert!(output.state_update.contacts_changed);
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .relationship_status,
+            ContactRelationshipStatus::PendingOutbound
+        );
     }
 
     #[test]
@@ -2825,12 +2906,28 @@ mod tests {
             append_result.delivered_to,
             crate::transport_contract::AppendDeliveryDisposition::Rejected
         );
+        assert!(output.state_update.contacts_changed);
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .relationship_status,
+            ContactRelationshipStatus::Rejected
+        );
     }
 
     #[test]
     fn append_inbox_result_exposes_structured_append_result() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .relationship_status = ContactRelationshipStatus::PendingOutbound;
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -2858,6 +2955,98 @@ mod tests {
         assert_eq!(
             append_result.delivered_to,
             crate::transport_contract::AppendDeliveryDisposition::Inbox
+        );
+        assert!(output.state_update.contacts_changed);
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
+    }
+
+    #[test]
+    fn import_identity_bundle_with_relationship_status_sets_pending_for_new_contact() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+
+        let output = alice
+            .handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle: bob_bundle.clone(),
+                relationship_status: ContactRelationshipStatus::PendingOutbound,
+            })
+            .expect("import with explicit relationship");
+
+        assert!(output.state_update.contacts_changed);
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .relationship_status,
+            ContactRelationshipStatus::PendingOutbound
+        );
+    }
+
+    #[test]
+    fn import_identity_bundle_with_relationship_status_does_not_downgrade_available() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle: bob_bundle.clone(),
+                relationship_status: ContactRelationshipStatus::Available,
+            })
+            .expect("available import");
+
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle: bob_bundle.clone(),
+                relationship_status: ContactRelationshipStatus::PendingOutbound,
+            })
+            .expect("pending import");
+
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
+    }
+
+    #[test]
+    fn import_identity_bundle_with_relationship_status_can_promote_pending_to_available() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle: bob_bundle.clone(),
+                relationship_status: ContactRelationshipStatus::PendingOutbound,
+            })
+            .expect("pending import");
+
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle: bob_bundle.clone(),
+                relationship_status: ContactRelationshipStatus::Available,
+            })
+            .expect("available import");
+
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
         );
     }
 

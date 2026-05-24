@@ -33,6 +33,20 @@ pub struct PersistedDeployment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactRelationshipStatus {
+    Available,
+    PendingOutbound,
+    Rejected,
+}
+
+impl Default for ContactRelationshipStatus {
+    fn default() -> Self {
+        Self::Available
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedContact {
     pub user_id: String,
     pub bundle: IdentityBundle,
@@ -40,6 +54,8 @@ pub struct PersistedContact {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_name: Option<String>,
+    #[serde(default)]
+    pub relationship_status: ContactRelationshipStatus,
     #[serde(default)]
     pub added_at: u64,
 }
@@ -798,6 +814,7 @@ mod tests {
                 },
                 display_name: None,
                 original_name: None,
+                relationship_status: ContactRelationshipStatus::Available,
                 added_at: 0,
             }],
             conversations: vec![PersistedConversation {
@@ -1047,6 +1064,7 @@ mod tests {
                 },
                 display_name: None,
                 original_name: None,
+                relationship_status: ContactRelationshipStatus::Available,
                 added_at: 0,
             }],
             conversations: vec![],

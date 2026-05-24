@@ -2,10 +2,25 @@ import { useState, useEffect } from "react";
 import { useNavigate, useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
-interface ContactSummary {
-  user_id: string;
-  display_name: string | null;
-  device_count: number;
+import type { ContactRelationshipStatus, ContactSummary } from "@/lib/types";
+
+function relationshipCopy(status: ContactRelationshipStatus | undefined) {
+  switch (status) {
+    case "pending_outbound":
+      return {
+        label: "Pending request",
+        detail: "This contact has not accepted your message request yet.",
+        chatLabel: "Request pending",
+      };
+    case "rejected":
+      return {
+        label: "Rejected",
+        detail: "This contact rejected the latest message request.",
+        chatLabel: "Request rejected",
+      };
+    default:
+      return null;
+  }
 }
 
 export default function ContactDetail() {
@@ -16,6 +31,8 @@ export default function ContactDetail() {
   const [editingDisplayName, setEditingDisplayName] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [saving, setSaving] = useState(false);
+  const relationshipInfo = relationshipCopy(contact?.relationship_status);
+  const chatDisabled = Boolean(relationshipInfo);
 
   // Delete contact state
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -195,6 +212,16 @@ export default function ContactDetail() {
               <label className="text-muted-color text-xs block mb-1">Devices</label>
               <span className="text-primary-color">{contact?.device_count || 1} device(s)</span>
             </div>
+
+            {relationshipInfo && (
+              <div className="card">
+                <label className="text-muted-color text-xs block mb-1">Status</label>
+                <span className="text-primary-color">{relationshipInfo.label}</span>
+                <p className="text-muted-color text-sm mt-1">
+                  {relationshipInfo.detail}
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Actions */}
@@ -202,8 +229,9 @@ export default function ContactDetail() {
             <button
               className="btn btn-primary w-full"
               onClick={handleStartChat}
+              disabled={chatDisabled}
             >
-              Chat
+              {relationshipInfo?.chatLabel ?? "Chat"}
             </button>
 
             {/* Delete contact button */}

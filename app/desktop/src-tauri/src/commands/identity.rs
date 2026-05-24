@@ -34,6 +34,7 @@ pub struct CreateIdentityResult {
 pub async fn init_onboarding_profile(
     state: State<'_, AppState>,
     profile_name: String,
+    passphrase: Option<String>,
 ) -> Result<ProfileSummary, String> {
     // Use default path: APPDATA/TapChat/profiles/{profile_name}
     let data_dir = dirs::data_dir().ok_or_else(|| {
@@ -53,7 +54,7 @@ pub async fn init_onboarding_profile(
     // Create profile
     let summary = {
         let pm = &state.inner.read().await.profile_manager;
-        pm.create_profile(&profile_name, path.clone())
+        pm.create_profile(&profile_name, path.clone(), passphrase)
             .await
             .map_err(|e| {
                 log::error!("Failed to create profile at {:?}: {}", path, e);
@@ -98,7 +99,7 @@ pub async fn create_or_load_identity(
                 .read()
                 .await
                 .profile_manager
-                .create_profile("default", default_path.clone())
+                .create_profile("default", default_path.clone(), None)
                 .await
                 .map_err(|e| e.to_string())?;
 

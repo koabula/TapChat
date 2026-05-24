@@ -1,6 +1,7 @@
 use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
+use tapchat_core::persistence::ContactRelationshipStatus;
 use tapchat_core::transport_contract::MessageRequestAction;
-use tapchat_core::{CoreCommand, CoreEngine, CoreOutput, CoreStateUpdate};
+use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
@@ -39,6 +40,7 @@ pub async fn act_on_message_request(
     state: State<'_, AppState>,
     request_id: String,
     action: String,
+    sender_bundle_share_url: Option<String>,
 ) -> Result<MessageRequestActionOutput, String> {
     let action_enum = match action.as_str() {
         "accept" => MessageRequestAction::Accept,
@@ -46,63 +48,120 @@ pub async fn act_on_message_request(
         _ => return Err("Invalid action: must be 'accept' or 'reject'".into()),
     };
 
-    // Get profile path from state
-    let profile_path = {
-        let inner = state.inner.read().await;
-        inner.profile_path.clone()
-    };
-
     match action_enum {
         MessageRequestAction::Accept => {
             ensure_fresh_device_runtime_auth_for_state(state.inner())
                 .await
                 .map_err(|error| error.to_string())?;
-            // Accept through the desktop helper so we import the sender bundle
-            // and sync promoted inbox records before the UI navigates.
-            let profile_path = profile_path.ok_or("Profile path not set")?;
-
-            let result =
-                tapchat_core::desktop_app::message_request_accept(profile_path, &request_id)
+            let sender_bundle_share_url = match sender_bundle_share_url {
+                Some(url) if !url.trim().is_empty() => url,
+                _ => {
+                    let output = drive_core_with_handle(
+                        &app,
+                        CoreInput::Command(CoreCommand::ListMessageRequests),
+                    )
                     .await
                     .map_err(|e| e.to_string())?;
+                    output
+                        .view_model
+                        .and_then(|vm| {
+                            vm.message_requests
+                                .into_iter()
+                                .find(|request| request.request_id == request_id)
+                        })
+                        .and_then(|request| request.sender_bundle_share_url)
+                        .ok_or_else(|| {
+                            "sender bundle share url is missing; cannot safely accept this request"
+                                .to_string()
+                        })?
+                }
+            };
 
-            // Reload engine from profile to sync memory state with disk
-            {
-                let mut inner = state.inner.write().await;
+            let sender_bundle = tapchat_core::contact_workflows::fetch_identity_bundle_from_url(
+                &sender_bundle_share_url,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let imported_sender_user_id = sender_bundle.user_id.clone();
 
-                // Load fresh snapshot from disk via ProfileManager
-                let snapshot = inner
-                    .profile_manager
-                    .load_snapshot()
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let output = drive_core_with_handle(
+                &app,
+                CoreInput::Command(CoreCommand::ActOnMessageRequest {
+                    request_id: request_id.clone(),
+                    action: MessageRequestAction::Accept,
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
-                // Reinitialize engine from updated snapshot
-                inner.engine = CoreEngine::from_restored_state(snapshot);
+            let action_summary = output
+                .view_model
+                .as_ref()
+                .and_then(|vm| vm.message_request_action.clone())
+                .ok_or("Message request action result not returned")?;
+            let sender_user_id = if action_summary.sender_user_id.is_empty() {
+                imported_sender_user_id
+            } else {
+                action_summary.sender_user_id.clone()
+            };
 
-                log::info!(
-                    "[act_on_message_request] Reloaded engine: {} conversations, {} contacts",
-                    inner.engine.refresh_snapshot().conversations.len(),
-                    inner.engine.refresh_snapshot().contacts.len()
+            if action_summary.accepted {
+                drive_core_with_handle(
+                    &app,
+                    CoreInput::Command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                        bundle: sender_bundle,
+                        relationship_status: ContactRelationshipStatus::Available,
+                    }),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+
+            let (contact_available, conversation_id) = {
+                let inner = state.inner.read().await;
+                let snapshot = inner.engine.refresh_snapshot();
+                let contact_available = snapshot.contacts.iter().any(|contact| {
+                    contact.user_id == sender_user_id
+                        && contact.relationship_status == ContactRelationshipStatus::Available
+                });
+                let conversation_id = snapshot
+                    .conversations
+                    .iter()
+                    .find(|conversation| conversation.state.peer_user_id == sender_user_id)
+                    .map(|conversation| conversation.conversation_id.clone());
+                (contact_available, conversation_id)
+            };
+
+            if action_summary.accepted && !contact_available {
+                return Err(format!(
+                    "accepted request but sender contact was not available for {sender_user_id}"
+                ));
+            }
+
+            if action_summary.accepted && conversation_id.is_none() {
+                log::warn!(
+                    "[act_on_message_request] accepted request {} from {} but no conversation is available yet",
+                    request_id,
+                    sender_user_id
                 );
             }
 
-            // Emit core-update to refresh frontend state
             let _ = app.emit(
                 "core-update",
                 CoreOutput {
                     state_update: CoreStateUpdate {
                         contacts_changed: true,
-                        conversations_changed: result.conversation_available,
+                        conversations_changed: conversation_id.is_some(),
+                        messages_changed: true,
                         ..CoreStateUpdate::default()
                     },
                     effects: vec![],
                     view_model: Some(CoreViewModel {
                         message_request_action: Some(MessageRequestActionSummary {
-                            accepted: result.accepted,
-                            request_id: result.request_id.clone(),
-                            sender_user_id: result.sender_user_id.clone(),
-                            promoted_count: result.promoted_count,
+                            accepted: action_summary.accepted,
+                            request_id: action_summary.request_id.clone(),
+                            sender_user_id: sender_user_id.clone(),
+                            promoted_count: action_summary.promoted_count,
                             action: MessageRequestAction::Accept,
                         }),
                         ..CoreViewModel::default()
@@ -111,14 +170,14 @@ pub async fn act_on_message_request(
             );
 
             Ok(MessageRequestActionOutput {
-                accepted: result.accepted,
-                request_id: result.request_id,
-                sender_user_id: result.sender_user_id,
+                accepted: action_summary.accepted,
+                request_id: action_summary.request_id,
+                sender_user_id,
                 action: "accept".to_string(),
-                contact_available: result.contact_available,
-                conversation_available: result.conversation_available,
-                auto_created_conversation: result.auto_created_conversation,
-                conversation_id: result.conversation_id,
+                contact_available,
+                conversation_available: conversation_id.is_some(),
+                auto_created_conversation: false,
+                conversation_id,
             })
         }
         MessageRequestAction::Reject => {

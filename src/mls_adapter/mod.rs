@@ -199,8 +199,14 @@ impl MlsAdapter {
                 "peer_devices_with_keypackages must not be empty",
             ));
         }
+        if self.groups.contains_key(conversation_id) {
+            return Err(CoreError::invalid_state(
+                "conversation MLS state already exists",
+            ));
+        }
 
         let group_id = GroupId::from_slice(conversation_id.as_bytes());
+        self.delete_stale_persisted_group(&group_id)?;
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
             .build();
@@ -452,6 +458,20 @@ impl MlsAdapter {
         }
     }
 
+    fn delete_stale_persisted_group(&mut self, group_id: &GroupId) -> CoreResult<bool> {
+        let Some(mut group) =
+            MlsGroup::load(self.provider.storage(), group_id).map_err(|error| {
+                CoreError::invalid_state(format!("failed to load stale MLS group state: {error}"))
+            })?
+        else {
+            return Ok(false);
+        };
+        group.delete(self.provider.storage()).map_err(|error| {
+            CoreError::invalid_state(format!("failed to delete stale MLS group state: {error}"))
+        })?;
+        Ok(true)
+    }
+
     pub fn has_conversation(&self, conversation_id: &str) -> bool {
         self.groups.contains_key(conversation_id)
     }
@@ -495,11 +515,18 @@ impl MlsAdapter {
     /// This removes the group state from memory and should be followed by
     /// persistence deletion of the serialized state.
     pub fn delete_group(&mut self, conversation_id: &str) -> CoreResult<()> {
-        if !self.groups.contains_key(conversation_id) {
-            // Group doesn't exist, nothing to delete
+        if let Some(mut state) = self.groups.remove(conversation_id) {
+            state
+                .group
+                .delete(self.provider.storage())
+                .map_err(|error| {
+                    CoreError::invalid_state(format!("failed to delete MLS group state: {error}"))
+                })?;
             return Ok(());
         }
-        self.groups.remove(conversation_id);
+
+        let group_id = GroupId::from_slice(conversation_id.as_bytes());
+        self.delete_stale_persisted_group(&group_id)?;
         Ok(())
     }
 
@@ -1011,6 +1038,46 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn delete_group_allows_recreating_same_conversation_id() {
+        let alice_identity =
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
+
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
+        let first_bob_package =
+            MlsAdapter::generate_key_package(&bob_identity, 0).expect("first bob package");
+        alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: first_bob_package.key_package_b64,
+                }],
+            )
+            .expect("create conversation");
+
+        alice_adapter
+            .delete_group("conv:alice:bob")
+            .expect("delete group");
+        let second_bob_package =
+            MlsAdapter::generate_key_package(&bob_identity, 1).expect("second bob package");
+        alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: second_bob_package.key_package_b64,
+                }],
+            )
+            .expect("recreate conversation");
     }
 
     #[test]

@@ -52,6 +52,13 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
   const [copyError, setCopyError] = useState<string | null>(null);
   const [runtimeUpgradeRequired, setRuntimeUpgradeRequired] = useState(false);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const availableContacts = useMemo(
+    () =>
+      contacts.filter(
+        (contact) => (contact.relationship_status ?? "available") === "available",
+      ),
+    [contacts],
+  );
 
   // Reset the modal each time it opens so stale state does not leak
   // across invocations.
@@ -90,9 +97,15 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
     setSubmitting(true);
     setError(null);
     try {
+      const availableContactIds = new Set(
+        availableContacts.map((contact) => contact.user_id),
+      );
+      const inviteeIds = Array.from(selectedIds).filter((userId) =>
+        availableContactIds.has(userId),
+      );
       const result = await createGroupConversation(
         title.trim(),
-        Array.from(selectedIds),
+        inviteeIds,
       );
       setCreated(result);
     } catch (err) {
@@ -215,13 +228,13 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
                     {selectedIds.size} selected
                   </span>
                 </div>
-                {contacts.length === 0 ? (
+                {availableContacts.length === 0 ? (
                   <div className="text-center py-6 text-muted-color text-sm">
                     Add contacts first to create a group.
                   </div>
                 ) : (
                   <ul className="space-y-1 max-h-64 overflow-y-auto">
-                    {contacts.map((contact) => {
+                    {availableContacts.map((contact) => {
                       const checked = selectedIds.has(contact.user_id);
                       return (
                         <li key={contact.user_id}>

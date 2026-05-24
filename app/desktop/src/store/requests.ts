@@ -24,6 +24,30 @@ interface MessageRequestsState {
   removeRequest: (request_id: string) => void;
 }
 
+export function isMessageRequestForSession(
+  request: MessageRequestItem,
+  deviceId: string | null | undefined,
+  userId: string | null | undefined,
+): boolean {
+  if (deviceId && request.recipient_device_id !== deviceId) {
+    return false;
+  }
+  if (userId && request.sender_user_id === userId) {
+    return false;
+  }
+  return true;
+}
+
+export function filterMessageRequestsForSession(
+  requests: MessageRequestItem[],
+  deviceId: string | null | undefined,
+  userId: string | null | undefined,
+): MessageRequestItem[] {
+  return requests.filter((request) =>
+    isMessageRequestForSession(request, deviceId, userId),
+  );
+}
+
 export const useMessageRequestsStore = create<MessageRequestsState>((set) => ({
   requests: [],
   setRequests: (requests) => set({ requests }),

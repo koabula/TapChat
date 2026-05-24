@@ -4,13 +4,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::RwLock;
 
+use tapchat_core::cli::profile::Profile;
 use tapchat_core::ffi_api::PersistStateEffect;
-use tapchat_core::persistence::{encode_snapshot, CorePersistenceSnapshot, PersistOp};
+use tapchat_core::persistence::{CorePersistenceSnapshot, PersistOp};
 
 use crate::platform::profile::ProfileManagerInner;
 
 /// Persistence implementation for desktop app.
-/// Stores state in the active profile's snapshot.json file.
+/// Stores state in the active profile's encrypted snapshot file.
 #[derive(Clone)]
 pub struct DesktopPersistence {
     profile_inner: Arc<RwLock<ProfileManagerInner>>,
@@ -95,15 +96,9 @@ impl DesktopPersistence {
 #[allow(dead_code)]
 pub fn persist_state_sync(effect: &PersistStateEffect, profile_path: Option<&PathBuf>) {
     if let Some(path) = profile_path {
-        let snapshot_path = path.join("snapshot.json");
-
         if let Some(ref snapshot) = effect.snapshot {
-            if let Ok(encoded) = encode_snapshot(snapshot) {
-                // Write atomically
-                let tmp = snapshot_path.with_extension("tmp");
-                if std::fs::write(&tmp, &encoded).is_ok() {
-                    let _ = std::fs::rename(&tmp, &snapshot_path);
-                }
+            if let Ok(profile) = Profile::open(path) {
+                let _ = profile.save_snapshot(snapshot);
             }
         }
     }

@@ -66,14 +66,13 @@ pub struct CloudflareRuntimeStatus {
     pub last_error: Option<String>,
 }
 
-const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] =
-    &[
-        "group_outbox_mvp",
-        "welcome_pickup_mvp",
-        "message_requests",
-        "short_group_invite",
-        "group_member_subscribe",
-    ];
+const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
+    "group_outbox_mvp",
+    "welcome_pickup_mvp",
+    "message_requests",
+    "short_group_invite",
+    "group_member_subscribe",
+];
 
 fn status_from_features(
     bound: bool,
@@ -82,9 +81,13 @@ fn status_from_features(
     last_error: Option<String>,
 ) -> CloudflareRuntimeStatus {
     let supports_group_outbox = features.iter().any(|feature| feature == "group_outbox_mvp");
-    let supports_welcome_pickup = features.iter().any(|feature| feature == "welcome_pickup_mvp");
+    let supports_welcome_pickup = features
+        .iter()
+        .any(|feature| feature == "welcome_pickup_mvp");
     let has_message_requests = features.iter().any(|feature| feature == "message_requests");
-    let has_short_group_invite = features.iter().any(|feature| feature == "short_group_invite");
+    let has_short_group_invite = features
+        .iter()
+        .any(|feature| feature == "short_group_invite");
     let has_group_member_subscribe = features
         .iter()
         .any(|feature| feature == "group_member_subscribe");
@@ -134,17 +137,16 @@ pub async fn runtime_status_for_deployment(
                     true,
                     Some(endpoint),
                     local_features,
-                    Some(format!("deployment bundle check returned HTTP {status}: {body}")),
+                    Some(format!(
+                        "deployment bundle check returned HTTP {status}: {body}"
+                    )),
                 );
             }
             let normalized = to_snake_case_json_string(&body).unwrap_or(body);
             match serde_json::from_str::<DeploymentBundle>(&normalized) {
-                Ok(bundle) => status_from_features(
-                    true,
-                    Some(endpoint),
-                    bundle.runtime_config.features,
-                    None,
-                ),
+                Ok(bundle) => {
+                    status_from_features(true, Some(endpoint), bundle.runtime_config.features, None)
+                }
                 Err(error) => status_from_features(
                     true,
                     Some(endpoint),

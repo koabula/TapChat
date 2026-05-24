@@ -200,7 +200,19 @@ export default function Settings() {
   const handleSwitchProfile = async (path: string) => {
     setSwitchingProfile(path);
     try {
-      await activateProfile(path);
+      try {
+        await activateProfile(path);
+      } catch (err) {
+        const errorMsg = String(err);
+        if (!errorMsg.toLowerCase().includes("passphrase")) {
+          throw err;
+        }
+        const passphrase = window.prompt("Enter the profile passphrase");
+        if (!passphrase) {
+          throw err;
+        }
+        await activateProfile(path, passphrase);
+      }
       // Do NOT reload data here - wait for engine-reloaded event
       // which will trigger useCoreUpdate to fetch new data
       // The profile-switch-complete event signals that the switch is done

@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use tapchat_core::cli::profile::Profile;
 use tapchat_core::identity::{IdentityManager, LocalIdentityState};
 use tapchat_core::model::{
     CapabilityOperation, CapabilityService, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth,
@@ -4224,7 +4225,12 @@ fn apply_default_cli_test_env(command: &mut Command) -> Result<()> {
     if let Some(parent) = registry_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    command.env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path);
+    command
+        .env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path)
+        .env(
+            "TAPCHAT_PROFILE_PASSPHRASE",
+            "tapchat-cli-e2e-profile-passphrase",
+        );
     Ok(())
 }
 
@@ -4257,14 +4263,14 @@ fn conversation_exists(profile: &Path, conversation_id: &str) -> Result<bool> {
 }
 
 fn corrupt_first_mls_state(profile: &Path) -> Result<()> {
-    let snapshot_path = profile.join("snapshot.json");
-    let mut snapshot: Value = read_json_file(&snapshot_path)?;
-    let states = snapshot["snapshot"]["mls_states"]
-        .as_array_mut()
-        .context("snapshot mls_states missing")?;
-    let first = states.first_mut().context("missing persisted mls state")?;
-    first["serialized_group_state"] = Value::String("{broken".into());
-    fs::write(snapshot_path, serde_json::to_vec_pretty(&snapshot)?)?;
+    let profile = Profile::open(profile)?;
+    let mut snapshot = profile.load_snapshot()?;
+    let first = snapshot
+        .mls_states
+        .first_mut()
+        .context("missing persisted mls state")?;
+    first.serialized_group_state = Some("{broken".into());
+    profile.save_snapshot(&snapshot)?;
     Ok(())
 }
 

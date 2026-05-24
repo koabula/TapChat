@@ -1,3 +1,4 @@
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -25,7 +26,7 @@ use super::args::{
     SyncCommand, SyncSubcommand,
 };
 use super::driver::CoreDriver;
-use super::profile::{Profile, ProfileRegistry, RuntimeMetadata};
+use super::profile::{Profile, ProfileInitOptions, ProfileRegistry, RuntimeMetadata};
 use super::runtime::{
     bootstrap_device_bundle, deploy_cloudflare_runtime, derive_cloudflare_defaults,
     prompt_cloudflare_overrides, resolve_cloudflare_config, resolve_service_root,
@@ -62,8 +63,31 @@ impl CliApp {
 
     async fn run_profile(&self, command: ProfileCommand) -> Result<()> {
         match command.command {
-            ProfileSubcommand::Init { name, root } => {
-                let profile = Profile::init(&name, &root)?;
+            ProfileSubcommand::Init {
+                name,
+                root,
+                passphrase_stdin,
+                no_keychain,
+            } => {
+                let passphrase = if passphrase_stdin {
+                    let mut passphrase = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut passphrase)
+                        .context("read passphrase from stdin")?;
+                    Some(passphrase.trim_end_matches(['\r', '\n']).to_string())
+                } else if let Ok(passphrase) = std::env::var("TAPCHAT_PROFILE_PASSPHRASE") {
+                    Some(passphrase)
+                } else {
+                    None
+                };
+                let profile = Profile::init_with_options(
+                    &name,
+                    &root,
+                    ProfileInitOptions {
+                        passphrase,
+                        use_keychain: !no_keychain,
+                    },
+                )?;
                 self.print_value(profile.metadata())
             }
             ProfileSubcommand::Show { profile } => {
@@ -201,10 +225,7 @@ impl CliApp {
                     "mnemonic": identity.mnemonic,
                 }))
             }
-            DeviceSubcommand::SyncGroups {
-                profile,
-                device_id,
-            } => {
+            DeviceSubcommand::SyncGroups { profile, device_id } => {
                 let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
                 driver

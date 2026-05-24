@@ -101,6 +101,8 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
     let inner_lock: Arc<RwLock<ProfileManagerInner>> = Arc::new(RwLock::new(ProfileManagerInner {
         registry,
         active_profile: Some(profile),
+        locked_profile_path: None,
+        unlock_error: None,
     }));
     let profile_manager = ProfileManager::from_inner(inner_lock.clone());
 

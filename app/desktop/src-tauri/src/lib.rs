@@ -253,6 +253,8 @@ pub fn run() {
             commands::message::cache_attachment,
             commands::message::get_attachment_preview,
             // Contacts
+            commands::contact::preview_contact_link,
+            commands::contact::start_direct_chat_from_link,
             commands::contact::import_contact_by_link,
             commands::contact::list_contacts,
             commands::contact::refresh_contact,
@@ -263,6 +265,7 @@ pub fn run() {
             commands::profile::create_profile,
             commands::profile::start_new_profile_onboarding,
             commands::profile::activate_profile,
+            commands::profile::unlock_active_profile,
             commands::profile::delete_profile,
             commands::profile::reload_engine,
             // Message Requests

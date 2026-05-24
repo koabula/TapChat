@@ -5,6 +5,7 @@ import type {
   IdentityInfo,
   ConversationSummary,
   ContactSummary,
+  ContactLinkPreview,
   Message,
   PreflightResult,
   CloudflareStatus,
@@ -12,6 +13,7 @@ import type {
   CoreUpdateEvent,
   CloudflareProgressEvent,
   ProfileSummary,
+  StartDirectChatResult,
 } from "./types";
 
 // Re-export Tauri primitives
@@ -48,8 +50,12 @@ export async function listProfiles(): Promise<ProfileSummary[]> {
   return invoke("list_profiles");
 }
 
-export async function activateProfile(path: string): Promise<void> {
-  return invoke("activate_profile", { path });
+export async function activateProfile(path: string, passphrase?: string): Promise<void> {
+  return invoke("activate_profile", { path, passphrase });
+}
+
+export async function unlockActiveProfile(passphrase: string): Promise<void> {
+  return invoke("unlock_active_profile", { passphrase });
 }
 
 export async function deleteProfile(path: string): Promise<void> {
@@ -60,8 +66,11 @@ export async function startNewProfileOnboarding(): Promise<void> {
   return invoke("start_new_profile_onboarding");
 }
 
-export async function initOnboardingProfile(profileName: string): Promise<ProfileSummary> {
-  return invoke("init_onboarding_profile", { profileName });
+export async function initOnboardingProfile(
+  profileName: string,
+  passphrase?: string
+): Promise<ProfileSummary> {
+  return invoke("init_onboarding_profile", { profileName, passphrase });
 }
 
 // Conversations
@@ -116,6 +125,18 @@ export async function downloadAttachment(
 }
 
 // Contacts
+export async function previewContactLink(
+  shareLink: string
+): Promise<ContactLinkPreview> {
+  return invoke("preview_contact_link", { shareLink });
+}
+
+export async function startDirectChatFromLink(
+  shareLink: string
+): Promise<StartDirectChatResult> {
+  return invoke("start_direct_chat_from_link", { shareLink });
+}
+
 export async function importContactByLink(shareLink: string): Promise<void> {
   return invoke("import_contact_by_link", { shareLink });
 }
@@ -139,9 +160,14 @@ export async function listMessageRequests(): Promise<CoreOutput> {
 
 export async function actOnMessageRequest(
   requestId: string,
-  action: "accept" | "reject"
+  action: "accept" | "reject",
+  senderBundleShareUrl?: string
 ): Promise<CoreOutput> {
-  return invoke("act_on_message_request", { requestId, action });
+  return invoke("act_on_message_request", {
+    requestId,
+    action,
+    senderBundleShareUrl,
+  });
 }
 
 // Allowlist

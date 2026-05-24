@@ -5,7 +5,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use tapchat_core::cli::profile::{Profile, ProfileMetadata, ProfileRegistry, RuntimeMetadata};
+use tapchat_core::cli::profile::{
+    Profile, ProfileInitOptions, ProfileMetadata, ProfileRegistry, RuntimeMetadata,
+};
 use tapchat_core::persistence::CorePersistenceSnapshot;
 
 /// Desktop profile manager - wraps CLI ProfileRegistry and provides
@@ -17,6 +19,8 @@ pub struct ProfileManager {
 pub struct ProfileManagerInner {
     pub registry: ProfileRegistry,
     pub active_profile: Option<Profile>,
+    pub locked_profile_path: Option<PathBuf>,
+    pub unlock_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,20 +44,22 @@ pub struct SessionStartupCheck {
     pub has_runtime_binding: bool,
     pub needs_onboarding: bool,
     pub profile_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock_error: Option<String>,
 }
 
 impl ProfileManager {
     pub fn new() -> Self {
         let registry = ProfileRegistry::load().unwrap_or_default();
-        let active_profile = registry
-            .active_profile
-            .as_ref()
-            .and_then(|path| Profile::open(path).ok());
+        let (active_profile, locked_profile_path, unlock_error) =
+            load_registry_active_profile(&registry);
 
         Self {
             inner: Arc::new(RwLock::new(ProfileManagerInner {
                 registry,
                 active_profile,
+                locked_profile_path,
+                unlock_error,
             })),
         }
     }
@@ -64,11 +70,25 @@ impl ProfileManager {
         let registry = ProfileRegistry::load().unwrap_or_default();
 
         // Find profile by name in registry
-        let profile = registry
+        let selected_path = registry
             .profiles
             .iter()
             .find(|entry| entry.name == name)
-            .and_then(|entry| Profile::open(&entry.root_dir).ok());
+            .map(|entry| entry.root_dir.clone());
+        let (profile, locked_profile_path, unlock_error) = match selected_path {
+            Some(path) => match Profile::open(&path) {
+                Ok(profile) => (Some(profile), None, None),
+                Err(error) => {
+                    log::error!(
+                        "Failed to unlock profile '{}' at {}: {error:#}",
+                        name,
+                        path.display()
+                    );
+                    (None, Some(path), Some(error.to_string()))
+                }
+            },
+            None => (None, None, None),
+        };
 
         if profile.is_none() {
             log::warn!(
@@ -87,6 +107,8 @@ impl ProfileManager {
             inner: Arc::new(RwLock::new(ProfileManagerInner {
                 registry,
                 active_profile: profile,
+                locked_profile_path,
+                unlock_error,
             })),
         }
     }
@@ -107,6 +129,8 @@ impl ProfileManager {
 
         let has_active_profile = inner.active_profile.is_some();
         let profile = inner.active_profile.as_ref();
+        let locked_profile_path = inner.locked_profile_path.clone();
+        let unlock_error = inner.unlock_error.clone();
 
         let has_identity = profile
             .map(|p| p.metadata().user_id.is_some() && p.metadata().device_id.is_some())
@@ -121,14 +145,17 @@ impl ProfileManager {
             })
             .unwrap_or(false);
 
-        let needs_onboarding = !has_active_profile || !has_identity;
+        let needs_onboarding = unlock_error.is_none() && (!has_active_profile || !has_identity);
 
         SessionStartupCheck {
             has_active_profile,
             has_identity,
             has_runtime_binding,
             needs_onboarding,
-            profile_path: profile.map(|p| p.root().to_path_buf()),
+            profile_path: profile
+                .map(|p| p.root().to_path_buf())
+                .or(locked_profile_path),
+            unlock_error,
         }
     }
 
@@ -176,27 +203,35 @@ impl ProfileManager {
     }
 
     /// Create a new profile.
-    pub async fn create_profile(&self, name: &str, root: PathBuf) -> Result<ProfileSummary> {
+    pub async fn create_profile(
+        &self,
+        name: &str,
+        root: PathBuf,
+        passphrase: Option<String>,
+    ) -> Result<ProfileSummary> {
         let mut inner = self.inner.write().await;
 
         // Profile::init calls sync_registry_entry which saves registry to disk.
         // We need to reload the registry from disk to sync our in-memory state.
-        let profile = Profile::init(name, &root)?;
+        let profile = Profile::init_with_options(
+            name,
+            &root,
+            ProfileInitOptions {
+                passphrase,
+                use_keychain: true,
+            },
+        )?;
 
         // Reload registry to get the entry that was just saved by sync_registry_entry
         inner.registry = tapchat_core::cli::profile::ProfileRegistry::load()
             .map_err(|e| anyhow!("Failed to reload registry after profile init: {}", e))?;
 
-        // Set this profile as active if no active profile exists
-        let is_active = if inner.registry.active_profile.is_none() {
-            inner.registry.active_profile = Some(root.clone());
-            inner.active_profile = Some(profile);
-            inner.registry.save()?;
-            true
-        } else {
-            inner.active_profile = Some(profile);
-            inner.registry.active_profile.as_ref() == Some(&root)
-        };
+        inner.registry.active_profile = Some(root.clone());
+        inner.active_profile = Some(profile);
+        inner.locked_profile_path = None;
+        inner.unlock_error = None;
+        inner.registry.save()?;
+        let is_active = true;
 
         let entry = inner.active_profile.as_ref().unwrap().metadata();
 
@@ -211,10 +246,12 @@ impl ProfileManager {
     }
 
     /// Activate an existing profile.
-    pub async fn activate_profile(&self, path: &PathBuf) -> Result<()> {
+    pub async fn activate_profile(&self, path: &PathBuf, passphrase: Option<String>) -> Result<()> {
         let mut inner = self.inner.write().await;
         inner.registry.set_active(path)?;
-        inner.active_profile = Some(Profile::open(path)?);
+        inner.active_profile = Some(Profile::open_with_passphrase(path, passphrase)?);
+        inner.locked_profile_path = None;
+        inner.unlock_error = None;
         inner.registry.save()?;
         Ok(())
     }
@@ -322,6 +359,24 @@ impl ProfileManager {
         self.get_runtime_metadata()
             .await
             .and_then(|r| r.websocket_base_url)
+    }
+}
+
+fn load_registry_active_profile(
+    registry: &ProfileRegistry,
+) -> (Option<Profile>, Option<PathBuf>, Option<String>) {
+    let Some(path) = registry.active_profile.as_ref() else {
+        return (None, None, None);
+    };
+    match Profile::open(path) {
+        Ok(profile) => (Some(profile), None, None),
+        Err(error) => {
+            log::error!(
+                "Failed to unlock active profile at {}: {error:#}",
+                path.display()
+            );
+            (None, Some(path.clone()), Some(error.to_string()))
+        }
     }
 }
 

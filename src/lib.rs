@@ -12,6 +12,7 @@ pub mod mls_adapter;
 pub mod model;
 pub mod persistence;
 pub mod platform_ports;
+pub mod profile_crypto;
 pub mod sync_engine;
 pub mod transport_contract;
 

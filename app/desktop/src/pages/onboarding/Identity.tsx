@@ -22,6 +22,8 @@ export default function Identity() {
   const isRecover = searchParams.get("mode") === "recover";
 
   const [profileName, setProfileName] = useState("default");
+  const [profilePassphrase, setProfilePassphrase] = useState("");
+  const [confirmProfilePassphrase, setConfirmProfilePassphrase] = useState("");
   const [deviceName, setDeviceName] = useState("My Laptop");
   const [mnemonic, setMnemonic] = useState("");
   const [loading, setLoading] = useState(false);
@@ -33,11 +35,23 @@ export default function Identity() {
     setError(null);
 
     try {
+      const trimmedPassphrase = profilePassphrase.trim();
+      if (trimmedPassphrase || confirmProfilePassphrase.trim()) {
+        if (trimmedPassphrase.length < 12) {
+          setError("Profile passphrase must be at least 12 characters.");
+          return;
+        }
+        if (trimmedPassphrase !== confirmProfilePassphrase.trim()) {
+          setError("Profile passphrases do not match.");
+          return;
+        }
+      }
       console.debug(`[OnboardingIdentity] Initializing profile profileName=${profileName}`);
 
       // Initialize profile first
       const result = await invoke<ProfileSummary>("init_onboarding_profile", {
         profileName,
+        passphrase: trimmedPassphrase || null,
       });
 
       console.debug(
@@ -115,6 +129,28 @@ export default function Identity() {
                   placeholder="default"
                   value={profileName}
                   onChange={(e) => setProfileName(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="text-sm text-muted-color mb-1 block">Profile passphrase</label>
+                <input
+                  className="input"
+                  placeholder="Optional"
+                  type="password"
+                  value={profilePassphrase}
+                  onChange={(e) => setProfilePassphrase(e.target.value)}
+                />
+              </div>
+
+              <div>
+                <label className="text-sm text-muted-color mb-1 block">Confirm passphrase</label>
+                <input
+                  className="input"
+                  placeholder="Optional"
+                  type="password"
+                  value={confirmProfilePassphrase}
+                  onChange={(e) => setConfirmProfilePassphrase(e.target.value)}
                 />
               </div>
 

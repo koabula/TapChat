@@ -42,6 +42,10 @@ pub enum ProfileSubcommand {
         name: String,
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        passphrase_stdin: bool,
+        #[arg(long)]
+        no_keychain: bool,
     },
     Show {
         #[arg(long)]

@@ -45,6 +45,45 @@ pub async fn on_app_ready(app: &AppHandle) {
 
     log::info!("Session startup check: {:?}", startup_check);
 
+    if let Some(unlock_error) = startup_check.unlock_error.clone() {
+        log::warn!(
+            "Active profile is locked or failed to unlock: {}",
+            unlock_error
+        );
+        {
+            let mut inner = state.inner.write().await;
+            inner.session = SessionState::Locked {
+                profile_path: startup_check.profile_path.clone(),
+                error: unlock_error.clone(),
+            };
+            inner.profile_path = startup_check.profile_path.clone();
+            inner.startup_phase = StartupPhase::Ready;
+        }
+        set_ws_connection_snapshot(&state, None, false).await;
+        let _ = app.emit(
+            "session-status",
+            SessionStatus {
+                state: "locked".to_string(),
+                device_id: None,
+                ws_connected: false,
+                profile_path: startup_check
+                    .profile_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                error: Some(unlock_error),
+            },
+        );
+        if let Some(main_window) = app.get_webview_window("main") {
+            main_window.show().expect("failed to show main window");
+            let _ = main_window.set_focus();
+        }
+        log::info!(
+            "on_app_ready: total startup path completed in {}ms",
+            startup_started_at.elapsed().as_millis()
+        );
+        return;
+    }
+
     // Update state based on startup check
     let needs_onboarding = startup_check.needs_onboarding;
 
@@ -434,6 +473,8 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
             state: "active".to_string(),
             device_id: Some(device_id),
             ws_connected: false,
+            profile_path: None,
+            error: None,
         },
     );
 

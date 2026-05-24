@@ -42,6 +42,12 @@ pub fn workspace_root() -> PathBuf {
 /// (which matches on `.tmp-desktop-e2e-*` / `.tmp-cli-e2e-*`
 /// prefixes) can sweep them up.
 pub fn repo_temp_dir(suffix: &str) -> Result<TempDir> {
+    unsafe {
+        std::env::set_var(
+            "TAPCHAT_PROFILE_PASSPHRASE",
+            "tapchat-desktop-e2e-profile-passphrase",
+        );
+    }
     Builder::new()
         .prefix(&format!(".tmp-desktop-e2e-{suffix}-"))
         .tempdir_in(workspace_root())
@@ -64,7 +70,12 @@ where
         .current_dir(workspace_root())
         .arg("--output")
         .arg("json")
-        .env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path);
+        .env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path)
+        .env(
+            "TAPCHAT_PROFILE_PASSPHRASE",
+            std::env::var("TAPCHAT_PROFILE_PASSPHRASE")
+                .unwrap_or_else(|_| "tapchat-desktop-e2e-profile-passphrase".into()),
+        );
     for arg in args {
         command.arg(arg.as_ref());
     }

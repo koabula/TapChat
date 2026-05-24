@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Check, Clipboard } from "lucide-react";
+import type { ContactLinkPreview } from "@/lib/types";
 
 export default function Complete() {
   const navigate = useNavigate();
@@ -11,6 +12,8 @@ export default function Complete() {
   const [copied, setCopied] = useState(false);
   const [contactLink, setContactLink] = useState("");
   const [addingContact, setAddingContact] = useState(false);
+  const [contactPreview, setContactPreview] = useState<ContactLinkPreview | null>(null);
+  const [chatStarted, setChatStarted] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -39,9 +42,30 @@ export default function Complete() {
     setAddingContact(true);
     setError(null);
     try {
-      await invoke("import_contact_by_link", { shareLink: contactLink });
+      const preview = await invoke<ContactLinkPreview>("preview_contact_link", {
+        shareLink: contactLink,
+      });
+      setContactPreview(preview);
+      setChatStarted(false);
+    } catch (err) {
+      setError(String(err));
+      setContactPreview(null);
+    } finally {
+      setAddingContact(false);
+    }
+  };
+
+  const handleStartContactChat = async () => {
+    const link = contactPreview?.link || contactLink.trim();
+    if (!link) return;
+
+    setAddingContact(true);
+    setError(null);
+    try {
+      await invoke("start_direct_chat_from_link", { shareLink: link });
       setContactLink("");
-      // Optionally show success message
+      setContactPreview(null);
+      setChatStarted(true);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -109,7 +133,12 @@ export default function Complete() {
             className="input flex-1"
             placeholder="Paste a share link..."
             value={contactLink}
-            onChange={(e) => setContactLink(e.target.value)}
+            onChange={(e) => {
+              setContactLink(e.target.value);
+              setContactPreview(null);
+              setChatStarted(false);
+              setError(null);
+            }}
             disabled={addingContact || starting}
           />
           <button
@@ -117,9 +146,40 @@ export default function Complete() {
             onClick={handleAddContact}
             disabled={addingContact || starting || !contactLink.trim()}
           >
-            {addingContact ? "Adding..." : "Add"}
+            {addingContact ? "Checking..." : "Add"}
           </button>
         </div>
+
+        {contactPreview && (
+          <div className="card mb-4 max-w-sm w-full animate-fade-in">
+            <div className="flex items-center gap-3">
+              <div className="avatar">
+                <span>{(contactPreview.display_name || contactPreview.user_id)[0]}</span>
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="text-primary-color truncate">
+                  {contactPreview.display_name || contactPreview.user_id}
+                </div>
+                <div className="text-muted-color text-xs truncate">
+                  {contactPreview.user_id} · {contactPreview.device_count} devices
+                </div>
+              </div>
+              <button
+                className="btn btn-primary px-3"
+                onClick={handleStartContactChat}
+                disabled={addingContact || starting}
+              >
+                Chat
+              </button>
+            </div>
+          </div>
+        )}
+
+        {chatStarted && (
+          <div className="text-secondary-color text-sm mb-4 animate-fade-in">
+            Request sent
+          </div>
+        )}
 
         {/* Error display */}
         {error && (

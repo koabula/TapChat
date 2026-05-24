@@ -1,10 +1,13 @@
 import { create } from "zustand";
 
+import type { ContactRelationshipStatus } from "@/lib/types";
+
 interface Contact {
   user_id: string;
   display_name: string | null;
   device_count: number;
   last_refresh: number | null;
+  relationship_status: ContactRelationshipStatus;
 }
 
 interface ContactsState {

@@ -13,6 +13,10 @@ pub struct SessionStatus {
     pub state: String,
     pub device_id: Option<String>,
     pub ws_connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub async fn set_ws_connection_snapshot(
@@ -46,6 +50,8 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             state: "bootstrapping".into(),
             device_id: None,
             ws_connected: false,
+            profile_path: None,
+            error: None,
         };
     }
 
@@ -54,21 +60,39 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             state: "active".into(),
             device_id: Some(device_id),
             ws_connected: ws_snapshot.ws_connected,
+            profile_path: None,
+            error: None,
         },
         SessionState::Onboarding { step } => SessionStatus {
             state: format!("onboarding:{:?}", step).to_lowercase(),
             device_id: None,
             ws_connected: ws_snapshot.ws_connected,
+            profile_path: None,
+            error: None,
+        },
+        SessionState::Locked {
+            profile_path,
+            error,
+        } => SessionStatus {
+            state: "locked".into(),
+            device_id: ws_snapshot.last_known_device_id,
+            ws_connected: false,
+            profile_path: profile_path.map(|path| path.to_string_lossy().to_string()),
+            error: Some(error),
         },
         SessionState::Uninitialized => SessionStatus {
             state: "uninitialized".into(),
             device_id: ws_snapshot.last_known_device_id,
             ws_connected: ws_snapshot.ws_connected,
+            profile_path: None,
+            error: None,
         },
         SessionState::Quitting => SessionStatus {
             state: "quitting".into(),
             device_id: ws_snapshot.last_known_device_id,
             ws_connected: ws_snapshot.ws_connected,
+            profile_path: None,
+            error: None,
         },
     }
 }
@@ -179,6 +203,8 @@ pub async fn stop_realtime_session(
             state: "active".into(),
             device_id: Some(device_id),
             ws_connected: false,
+            profile_path: None,
+            error: None,
         },
     );
 

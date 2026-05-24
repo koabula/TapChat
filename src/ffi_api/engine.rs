@@ -23,14 +23,14 @@ use crate::model::{
     WelcomePickupDescriptor,
 };
 use crate::persistence::{
-    CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
-    PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
-    PersistedGroupRealtimeSession, PersistedGroupState, PersistedLocalIdentity, PersistedMlsState,
-    PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope, PersistedPendingAck,
-    PersistedPendingBlobTransfer, PersistedPendingGroupMembershipTransition,
-    PersistedPendingWelcomePickup, PersistedRealtimeSession, PersistedRecoveryContext,
-    PersistedRecoveryEscalationReason, PersistedRecoveryPhase, PersistedRecoveryReason,
-    PersistedSyncState,
+    ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
+    PersistedConversation, PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite,
+    PersistedGroupJoinRequest, PersistedGroupRealtimeSession, PersistedGroupState,
+    PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
+    PersistedPendingGroupMembershipTransition, PersistedPendingWelcomePickup,
+    PersistedRealtimeSession, PersistedRecoveryContext, PersistedRecoveryEscalationReason,
+    PersistedRecoveryPhase, PersistedRecoveryReason, PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
@@ -274,6 +274,7 @@ impl CoreEngine {
                     bundle: contact.bundle,
                     display_name: contact.display_name,
                     original_name: contact.original_name,
+                    relationship_status: contact.relationship_status,
                     added_at: contact.added_at,
                 },
             );
@@ -643,6 +644,10 @@ impl CoreEngine {
             } => self.create_or_load_identity(mnemonic, device_name, display_name),
             CoreCommand::ImportDeploymentBundle { bundle } => self.import_deployment_bundle(bundle),
             CoreCommand::ImportIdentityBundle { bundle } => self.import_identity_bundle(bundle),
+            CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle,
+                relationship_status,
+            } => self.import_identity_bundle_with_relationship_status(bundle, relationship_status),
             CoreCommand::ApplyIdentityBundleUpdate { bundle } => {
                 self.apply_identity_bundle_update(bundle)
             }
@@ -1400,6 +1405,20 @@ impl CoreEngine {
     }
 
     fn import_identity_bundle(&mut self, bundle: IdentityBundle) -> CoreResult<CoreOutput> {
+        let relationship_status = self
+            .state
+            .contacts
+            .get(&bundle.user_id)
+            .map(|c| c.relationship_status.clone())
+            .unwrap_or_default();
+        self.import_identity_bundle_with_relationship_status(bundle, relationship_status)
+    }
+
+    fn import_identity_bundle_with_relationship_status(
+        &mut self,
+        bundle: IdentityBundle,
+        relationship_status: ContactRelationshipStatus,
+    ) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
         let user_id = bundle.user_id.clone();
         let original_name = bundle.display_name.clone();
@@ -1411,12 +1430,26 @@ impl CoreEngine {
             .contacts
             .get(&user_id)
             .and_then(|c| c.display_name.clone());
+        let existing_relationship_status = self
+            .state
+            .contacts
+            .get(&user_id)
+            .map(|c| c.relationship_status.clone());
+        let relationship_status =
+            match (existing_relationship_status.as_ref(), &relationship_status) {
+                (
+                    Some(ContactRelationshipStatus::Available),
+                    ContactRelationshipStatus::PendingOutbound,
+                ) => ContactRelationshipStatus::Available,
+                _ => relationship_status,
+            };
 
         let persisted_contact = PersistedContact {
             user_id: user_id.clone(),
             bundle,
             display_name: existing_display_name,
             original_name,
+            relationship_status,
             added_at: now,
         };
 
@@ -1457,12 +1490,16 @@ impl CoreEngine {
         let added_at = existing
             .map(|c| c.added_at)
             .unwrap_or_else(|| current_timestamp_hint(self.state.outbox.len()));
+        let relationship_status = existing
+            .map(|c| c.relationship_status.clone())
+            .unwrap_or_default();
 
         let persisted_contact = PersistedContact {
             user_id: user_id.clone(),
             bundle,
             display_name,
             original_name,
+            relationship_status,
             added_at,
         };
 
@@ -1555,6 +1592,7 @@ impl CoreEngine {
                     user_id,
                     display_name,
                     device_count: 1,
+                    relationship_status: ContactRelationshipStatus::Available,
                 }],
                 banners: vec![SystemBanner {
                     status: SystemStatus::IdentityRefreshNeeded,
@@ -1608,6 +1646,7 @@ impl CoreEngine {
                     user_id,
                     display_name: None,
                     device_count: 1,
+                    relationship_status: ContactRelationshipStatus::Available,
                 }],
                 banners: vec![SystemBanner {
                     status: SystemStatus::IdentityRefreshNeeded,
@@ -6694,6 +6733,7 @@ impl CoreEngine {
                         .unwrap_or_default(),
                     display_name,
                     device_count: 1,
+                    relationship_status: ContactRelationshipStatus::Available,
                 }],
                 ..CoreViewModel::default()
             }),
@@ -6734,15 +6774,46 @@ impl CoreEngine {
                     .state
                     .contacts
                     .iter()
-                    .map(|(uid, c)| ContactSummary {
-                        user_id: uid.clone(),
-                        display_name: c.display_name.clone().or(c.original_name.clone()),
-                        device_count: c.bundle.devices.len(),
-                    })
+                    .map(|(uid, c)| self.contact_summary(uid, c))
                     .collect(),
                 ..CoreViewModel::default()
             }),
         })
+    }
+
+    fn contact_summary(&self, user_id: &str, contact: &PersistedContact) -> ContactSummary {
+        ContactSummary {
+            user_id: user_id.to_string(),
+            display_name: contact
+                .display_name
+                .clone()
+                .or(contact.original_name.clone()),
+            device_count: contact.bundle.devices.len(),
+            relationship_status: contact.relationship_status.clone(),
+        }
+    }
+
+    fn set_contact_relationship_status(
+        &mut self,
+        user_id: &str,
+        status: ContactRelationshipStatus,
+    ) -> bool {
+        let Some(contact) = self.state.contacts.get_mut(user_id) else {
+            return false;
+        };
+        if contact.relationship_status == status {
+            return false;
+        }
+        contact.relationship_status = status;
+        true
+    }
+
+    fn contact_summaries(&self) -> Vec<ContactSummary> {
+        self.state
+            .contacts
+            .iter()
+            .map(|(uid, c)| self.contact_summary(uid, c))
+            .collect()
     }
 
     fn delete_contact(&mut self, user_id: String) -> CoreResult<CoreOutput> {
@@ -6755,13 +6826,24 @@ impl CoreEngine {
         self.state.contacts.remove(&user_id);
 
         // Remove any conversations with this peer
-        let conversation_ids_to_remove: Vec<String> = self
+        let mut conversation_ids_to_remove: Vec<String> = self
             .state
             .conversations
             .iter()
             .filter(|(_, conv)| conv.peer_user_id == user_id)
             .map(|(id, _)| id.clone())
             .collect();
+        if let Some(local_user_id) = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.user_identity.user_id.as_str())
+        {
+            let direct_id = direct_conversation_id(local_user_id, &user_id);
+            if !conversation_ids_to_remove.contains(&direct_id) {
+                conversation_ids_to_remove.push(direct_id);
+            }
+        }
 
         // Collect persistence operations
         let mut persist_ops: Vec<PersistOp> = vec![PersistOp::DeleteContact {
@@ -6769,10 +6851,68 @@ impl CoreEngine {
         }];
 
         for conv_id in &conversation_ids_to_remove {
+            let conversation_message_ids = self
+                .state
+                .conversations
+                .get(conv_id)
+                .map(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .map(|message| message.message_id.clone())
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+
             // Remove from state
             self.state.conversations.remove(conv_id);
             self.state.mls_summaries.remove(conv_id);
             self.state.recovery_contexts.remove(conv_id);
+            let removed_outbox_message_ids: Vec<String> = self
+                .state
+                .pending_outbox
+                .iter()
+                .filter(|item| item.envelope.conversation_id == conv_id.as_str())
+                .map(|item| item.envelope.message_id.clone())
+                .collect();
+            self.state
+                .pending_outbox
+                .retain(|item| item.envelope.conversation_id != conv_id.as_str());
+            let removed_blob_task_ids: Vec<String> = self
+                .state
+                .pending_blob_uploads
+                .iter()
+                .filter(|(_, task)| task.conversation_id == conv_id.as_str())
+                .map(|(task_id, _)| task_id.clone())
+                .chain(
+                    self.state
+                        .pending_blob_downloads
+                        .iter()
+                        .filter(|(_, task)| task.conversation_id == conv_id.as_str())
+                        .map(|(task_id, _)| task_id.clone()),
+                )
+                .collect();
+            self.state
+                .pending_blob_uploads
+                .retain(|_, task| task.conversation_id != conv_id.as_str());
+            self.state
+                .pending_blob_downloads
+                .retain(|_, task| task.conversation_id != conv_id.as_str());
+            let removed_ack_device_ids: Vec<String> = self
+                .state
+                .pending_acks
+                .iter()
+                .filter(|(_, ack)| {
+                    ack.ack
+                        .acked_message_ids
+                        .iter()
+                        .any(|message_id| conversation_message_ids.contains(message_id))
+                })
+                .map(|(device_id, _)| device_id.clone())
+                .collect();
+            for device_id in &removed_ack_device_ids {
+                self.state.pending_acks.remove(device_id);
+            }
 
             // Remove MLS group from adapter
             if let Some(ref mut mls_adapter) = self.state.mls_adapter {
@@ -6789,6 +6929,21 @@ impl CoreEngine {
             persist_ops.push(PersistOp::DeleteRecoveryContext {
                 conversation_id: conv_id.clone(),
             });
+            persist_ops.extend(
+                removed_outbox_message_ids
+                    .into_iter()
+                    .map(|message_id| PersistOp::DeleteOutgoingEnvelope { message_id }),
+            );
+            persist_ops.extend(
+                removed_blob_task_ids
+                    .into_iter()
+                    .map(|task_id| PersistOp::DeletePendingBlobTransfer { task_id }),
+            );
+            persist_ops.extend(
+                removed_ack_device_ids
+                    .into_iter()
+                    .map(|device_id| PersistOp::DeletePendingAck { device_id }),
+            );
         }
 
         Ok(CoreOutput {
@@ -6799,16 +6954,7 @@ impl CoreEngine {
             },
             effects: vec![persist_effect(&self.state, persist_ops)],
             view_model: Some(CoreViewModel {
-                contacts: self
-                    .state
-                    .contacts
-                    .iter()
-                    .map(|(uid, c)| ContactSummary {
-                        user_id: uid.clone(),
-                        display_name: c.display_name.clone().or(c.original_name.clone()),
-                        device_count: c.bundle.devices.len(),
-                    })
-                    .collect(),
+                contacts: self.contact_summaries(),
                 ..CoreViewModel::default()
             }),
         })
@@ -7360,7 +7506,10 @@ impl CoreEngine {
                 })?;
                 self.handle_inbox_records(device_id, response.records, response.to_seq)
             }
-            PendingRequest::AppendEnvelope { message_id, .. } => {
+            PendingRequest::AppendEnvelope {
+                message_id,
+                peer_user_id,
+            } => {
                 let result: AppendEnvelopeResult = serde_json::from_str(
                     body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"),
                 )
@@ -7376,8 +7525,23 @@ impl CoreEngine {
                 self.state
                     .pending_outbox
                     .retain(|item| item.envelope.message_id != message_id);
+                let mut persist_ops = vec![PersistOp::DeleteOutgoingEnvelope {
+                    message_id: message_id.clone(),
+                }];
+                if self.state.contacts.contains_key(&peer_user_id) {
+                    persist_ops.push(PersistOp::SaveContact {
+                        user_id: peer_user_id,
+                    });
+                }
                 Ok(merge_outputs(
-                    request_output,
+                    merge_outputs(
+                        request_output,
+                        CoreOutput {
+                            state_update: CoreStateUpdate::default(),
+                            effects: vec![persist_effect(&self.state, persist_ops)],
+                            view_model: None,
+                        },
+                    ),
                     self.flush_pending_transport()?,
                 ))
             }
@@ -8800,6 +8964,18 @@ impl CoreEngine {
             request_id: result.request_id.clone(),
             seq: Some(result.seq),
         };
+        let relationship_status = match result.delivered_to {
+            AppendDeliveryDisposition::Inbox => ContactRelationshipStatus::Available,
+            AppendDeliveryDisposition::MessageRequest => ContactRelationshipStatus::PendingOutbound,
+            AppendDeliveryDisposition::Rejected => ContactRelationshipStatus::Rejected,
+        };
+        let contact_changed =
+            self.set_contact_relationship_status(&peer_user_id, relationship_status);
+        let contacts = if contact_changed {
+            self.contact_summaries()
+        } else {
+            Vec::new()
+        };
 
         // When message is delivered to inbox, store it in conversation.messages
         // This ensures the message is preserved even after pending_outbox is cleared
@@ -8847,11 +9023,13 @@ impl CoreEngine {
                     state_update: CoreStateUpdate {
                         messages_changed,
                         conversations_changed: messages_changed,
+                        contacts_changed: contact_changed,
                         ..CoreStateUpdate::default()
                     },
                     effects: vec![],
                     view_model: Some(CoreViewModel {
                         append_result: Some(append_result),
+                        contacts,
                         ..CoreViewModel::default()
                     }),
                 };
@@ -8870,6 +9048,7 @@ impl CoreEngine {
         CoreOutput {
             state_update: CoreStateUpdate {
                 system_statuses_changed: vec![status],
+                contacts_changed: contact_changed,
                 ..CoreStateUpdate::default()
             },
             effects: vec![CoreEffect::EmitUserNotification {
@@ -8877,6 +9056,7 @@ impl CoreEngine {
             }],
             view_model: Some(CoreViewModel {
                 append_result: Some(append_result),
+                contacts,
                 banners: vec![SystemBanner {
                     status,
                     message: banner,

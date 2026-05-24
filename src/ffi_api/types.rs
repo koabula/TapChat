@@ -12,8 +12,9 @@ use crate::model::{
     MlsStateStatus, MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::persistence::{
-    CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedGroupInvite,
-    PersistedGroupJoinRequest, PersistedPendingGroupJoinApproval, PersistedPendingWelcomePickup,
+    ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
+    PersistedGroupInvite, PersistedGroupJoinRequest, PersistedPendingGroupJoinApproval,
+    PersistedPendingWelcomePickup,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
@@ -52,6 +53,10 @@ pub enum CoreCommand {
     },
     ImportIdentityBundle {
         bundle: IdentityBundle,
+    },
+    ImportIdentityBundleWithRelationshipStatus {
+        bundle: IdentityBundle,
+        relationship_status: ContactRelationshipStatus,
     },
     ApplyIdentityBundleUpdate {
         bundle: IdentityBundle,
@@ -717,6 +722,8 @@ pub struct ContactSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     pub device_count: usize,
+    #[serde(default)]
+    pub relationship_status: ContactRelationshipStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

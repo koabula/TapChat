@@ -5,7 +5,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listGroupConversations } from "@/lib/tauri";
 import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
-import { useMessageRequestsStore } from "@/store/requests";
+import { useSessionStore } from "@/store/session";
+import {
+  filterMessageRequestsForSession,
+  isMessageRequestForSession,
+  useMessageRequestsStore,
+} from "@/store/requests";
 
 import type {
   ContactSummary,
@@ -18,6 +23,8 @@ export default function MessageRequests() {
   const navigate = useNavigate();
   const requests = useMessageRequestsStore((s) => s.requests);
   const removeRequest = useMessageRequestsStore((s) => s.removeRequest);
+  const deviceId = useSessionStore((s) => s.deviceId);
+  const userId = useSessionStore((s) => s.userId);
   const mergeConversationSnapshot = useConversationsStore(
     (s) => s.mergeConversationSnapshot,
   );
@@ -36,7 +43,13 @@ export default function MessageRequests() {
         view_model?: { message_requests?: MessageRequestItem[] };
       }>("list_message_requests");
       if (result.view_model?.message_requests) {
-        useMessageRequestsStore.getState().setRequests(result.view_model.message_requests);
+        useMessageRequestsStore.getState().setRequests(
+          filterMessageRequestsForSession(
+            result.view_model.message_requests,
+            useSessionStore.getState().deviceId,
+            useSessionStore.getState().userId,
+          ),
+        );
       }
     } catch (err) {
       console.error(`[MessageRequests] Failed to load message requests: ${String(err)}`);
@@ -58,11 +71,20 @@ export default function MessageRequests() {
     action: "accept" | "reject",
   ) => {
     const requestId = request.request_id;
+    if (!isMessageRequestForSession(request, deviceId, userId)) {
+      console.warn(
+        `[MessageRequests] Dropping stale request requestId=${requestId} recipient=${request.recipient_device_id} sender=${request.sender_user_id}`,
+      );
+      removeRequest(requestId);
+      void loadFromBackend();
+      return;
+    }
     setActing(requestId);
     try {
       const result = await invoke<MessageRequestActionOutput>("act_on_message_request", {
         requestId,
         action,
+        senderBundleShareUrl: request.sender_bundle_share_url,
       });
       removeRequest(requestId);
 
@@ -88,6 +110,7 @@ export default function MessageRequests() {
             contacts.map((contact) => ({
               user_id: contact.user_id,
               display_name: contact.display_name ?? null,
+              relationship_status: contact.relationship_status ?? "available",
             })),
             { markUnread: false, replace: true },
           );
@@ -99,6 +122,7 @@ export default function MessageRequests() {
               display_name: contact.display_name ?? null,
               device_count: contact.device_count,
               last_refresh: null,
+              relationship_status: contact.relationship_status ?? "available",
             })),
           );
           console.debug(`[MessageRequests] Refreshed contacts count=${contacts.length}`);
@@ -119,6 +143,12 @@ export default function MessageRequests() {
       }
     } catch (err) {
       console.error(`[MessageRequests] Failed to ${action} request ${requestId}: ${String(err)}`);
+      if (
+        String(err).includes("message request not found") ||
+        String(err).includes("not_found")
+      ) {
+        removeRequest(requestId);
+      }
       void loadFromBackend();
     } finally {
       setActing(null);
@@ -182,7 +212,7 @@ export default function MessageRequests() {
                     onClick={() => handleAction(req, "accept")}
                     disabled={acting === req.request_id}
                   >
-                    Accept
+                    {acting === req.request_id ? "Accepting..." : "Accept"}
                   </button>
                   <button
                     className="btn btn-secondary"

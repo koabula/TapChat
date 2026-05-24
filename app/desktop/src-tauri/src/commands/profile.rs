@@ -32,6 +32,7 @@ pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileSumm
 pub async fn create_profile(
     state: State<'_, AppState>,
     name: String,
+    passphrase: Option<String>,
 ) -> Result<ProfileSummary, String> {
     // Use default path: APPDATA/TapChat/profiles/{name}
     let data_dir =
@@ -46,7 +47,7 @@ pub async fn create_profile(
         return Err(format!("Profile '{}' already exists", name));
     }
 
-    pm.create_profile(&name, path.clone())
+    pm.create_profile(&name, path.clone(), passphrase)
         .await
         .map_err(|e| e.to_string())
 }
@@ -80,6 +81,8 @@ pub async fn start_new_profile_onboarding(
             state: "onboarding:welcome".to_string(),
             device_id: None,
             ws_connected: false,
+            profile_path: None,
+            error: None,
         },
     );
 
@@ -91,13 +94,14 @@ pub async fn activate_profile(
     app: AppHandle,
     state: State<'_, AppState>,
     path: PathBuf,
+    passphrase: Option<String>,
 ) -> Result<(), String> {
     log::info!("activate_profile: activating profile at {}", path.display());
 
     // Activate the profile
     {
         let pm = &state.inner.read().await.profile_manager;
-        pm.activate_profile(&path)
+        pm.activate_profile(&path, passphrase)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -107,6 +111,30 @@ pub async fn activate_profile(
 
     log::info!("activate_profile: completed successfully");
     Ok(())
+}
+
+#[tauri::command]
+pub async fn unlock_active_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    passphrase: String,
+) -> Result<(), String> {
+    let path = {
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        pm_inner
+            .registry
+            .current()
+            .map(|entry| entry.root_dir.clone())
+            .map_err(|e| e.to_string())?
+    };
+    {
+        let pm = &state.inner.read().await.profile_manager;
+        pm.activate_profile(&path, Some(passphrase))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    reload_engine_from_profile(&app, &state).await
 }
 
 #[tauri::command]
@@ -249,6 +277,8 @@ async fn reload_engine_from_profile(
             state: "active".to_string(),
             device_id: Some(device_id.clone()),
             ws_connected: false,
+            profile_path: None,
+            error: None,
         },
     );
 

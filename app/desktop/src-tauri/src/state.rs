@@ -40,8 +40,16 @@ pub struct AppStateInner {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionState {
     Uninitialized,
-    Onboarding { step: OnboardingStep },
-    Active { device_id: String },
+    Onboarding {
+        step: OnboardingStep,
+    },
+    Active {
+        device_id: String,
+    },
+    Locked {
+        profile_path: Option<PathBuf>,
+        error: String,
+    },
     Quitting,
 }
 
