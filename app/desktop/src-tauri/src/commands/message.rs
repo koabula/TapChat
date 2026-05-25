@@ -6,6 +6,9 @@ use tapchat_core::attachment_crypto::{decrypt_blob, AttachmentPayloadMetadata};
 use tapchat_core::ffi_api::AttachmentDescriptor;
 use tapchat_core::{CoreCommand, CoreOutput};
 
+const ATTACHMENT_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+const ATTACHMENT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 #[cfg(any(test, feature = "test-support"))]
 use crate::lifecycle::drive_core_without_handle;
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
@@ -194,41 +197,11 @@ pub async fn download_attachment_to_default_path(
     mime_type: Option<String>,
 ) -> Result<String, String> {
     ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
-
-    let attachments_dir = {
-        let state = app.state::<AppState>();
-        let inner = state.inner.read().await;
-        inner.ports.persistence.attachments_dir().await
-    }
-    .ok_or_else(|| "no attachments directory configured".to_string())?;
-
-    std::fs::create_dir_all(&attachments_dir)
-        .map_err(|e| format!("failed to create attachments directory: {e}"))?;
-
-    let destination = unique_download_path(
-        &attachments_dir,
-        file_name.as_deref(),
-        mime_type.as_deref(),
-        &reference,
-    );
-
-    drive_core_with_handle(
-        &app,
-        CoreInput::Command(CoreCommand::DownloadAttachment {
-            conversation_id,
-            message_id,
-            reference,
-            destination: destination.to_string_lossy().to_string(),
-        }),
-    )
-    .await
-    .map_err(|e| normalize_attachment_error(&e.to_string()))?;
-
-    if destination.exists() {
-        Ok(destination.to_string_lossy().to_string())
-    } else {
-        Err("Attachment link expired".to_string())
-    }
+    let _ = file_name;
+    let _ = mime_type;
+    let preview_path =
+        ensure_attachment_cached(&app, conversation_id, message_id, reference).await?;
+    Ok(preview_path.to_string_lossy().to_string())
 }
 
 /// Download an attachment into the profile-local attachment cache.
@@ -276,6 +249,37 @@ pub async fn get_attachment_preview(
     Ok(thumbnail)
 }
 
+#[tauri::command]
+pub async fn clear_attachment_cache(app: tauri::AppHandle) -> Result<(), String> {
+    let attachments_dir = {
+        let state = app.state::<AppState>();
+        let inner = state.inner.read().await;
+        inner.ports.persistence.attachments_dir().await
+    }
+    .ok_or_else(|| "no attachments directory configured".to_string())?;
+
+    let cache_dir = attachments_dir.join("attachment-cache");
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir)
+            .map_err(|e| format!("failed to clear attachment cache: {e}"))?;
+    }
+    let preview_root = preview_temp_root(&attachments_dir);
+    if preview_root.exists() {
+        std::fs::remove_dir_all(&preview_root)
+            .map_err(|e| format!("failed to clear attachment previews: {e}"))?;
+    }
+
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    if let Some(profile) = pm.active_profile.as_ref() {
+        profile
+            .clear_attachment_cache_entries()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 async fn ensure_attachment_cached(
     app: &tauri::AppHandle,
     conversation_id: String,
@@ -289,30 +293,61 @@ async fn ensure_attachment_cached(
     }
     .ok_or_else(|| "no attachments directory configured".to_string())?;
 
-    let (relative_path, file_path) = resolve_attachment_cache_path(&attachments_dir, &reference);
-    if file_path.exists() {
-        log::debug!("cache_attachment: cache hit at {}", file_path.display());
-        return Ok(file_path);
+    cleanup_temp_attachment_previews(&attachments_dir);
+    cleanup_encrypted_attachment_cache(app, &attachments_dir).await?;
+
+    let cache_id = attachment_cache_id(&reference);
+    let (relative_path, encrypted_path) =
+        resolve_encrypted_attachment_cache_path(&attachments_dir, &cache_id);
+    if encrypted_path.exists() {
+        log::debug!(
+            "cache_attachment: encrypted cache hit at {}",
+            encrypted_path.display()
+        );
+        return materialize_preview_from_encrypted_cache(
+            app,
+            &attachments_dir,
+            &cache_id,
+            &encrypted_path,
+            &conversation_id,
+            &message_id,
+        )
+        .await;
     }
 
     if let Some((metadata, downloaded_blob_b64)) =
         attachment_metadata_and_downloaded_blob(app, &conversation_id, &message_id).await?
     {
-        if materialize_cached_attachment_from_snapshot(&metadata, &downloaded_blob_b64, &file_path)?
+        if materialize_encrypted_cache_from_snapshot(
+            app,
+            &metadata,
+            &downloaded_blob_b64,
+            &cache_id,
+            &encrypted_path,
+        )
+        .await?
         {
             log::info!(
-                "cache_attachment: materialized cache from snapshot at {}",
-                file_path.display()
+                "cache_attachment: materialized encrypted cache from snapshot at {}",
+                encrypted_path.display()
             );
-            return Ok(file_path);
+            return materialize_preview_from_encrypted_cache(
+                app,
+                &attachments_dir,
+                &cache_id,
+                &encrypted_path,
+                &conversation_id,
+                &message_id,
+            )
+            .await;
         }
     }
 
     drive_core_with_handle(
         app,
         CoreInput::Command(CoreCommand::DownloadAttachment {
-            conversation_id,
-            message_id,
+            conversation_id: conversation_id.clone(),
+            message_id: message_id.clone(),
             reference,
             destination: relative_path.to_string_lossy().to_string(),
         }),
@@ -320,31 +355,55 @@ async fn ensure_attachment_cached(
     .await
     .map_err(|e| normalize_attachment_error(&e.to_string()))?;
 
-    if file_path.exists() {
-        log::info!(
-            "cache_attachment: downloaded attachment to {}",
-            file_path.display()
-        );
-        Ok(file_path)
-    } else {
-        Err("Attachment link expired".to_string())
+    let Some((metadata, downloaded_blob_b64)) =
+        attachment_metadata_and_downloaded_blob(app, &conversation_id, &message_id).await?
+    else {
+        return Err("Attachment link expired".to_string());
+    };
+    if !materialize_encrypted_cache_from_snapshot(
+        app,
+        &metadata,
+        &downloaded_blob_b64,
+        &cache_id,
+        &encrypted_path,
+    )
+    .await?
+    {
+        return Err("Attachment link expired".to_string());
     }
+    log::info!(
+        "cache_attachment: downloaded attachment to encrypted cache {}",
+        encrypted_path.display()
+    );
+    materialize_preview_from_encrypted_cache(
+        app,
+        &attachments_dir,
+        &cache_id,
+        &encrypted_path,
+        &conversation_id,
+        &message_id,
+    )
+    .await
 }
 
-fn resolve_attachment_cache_path(
+fn resolve_encrypted_attachment_cache_path(
     attachments_dir: &std::path::Path,
-    reference: &str,
+    cache_id: &str,
 ) -> (std::path::PathBuf, std::path::PathBuf) {
-    let relative_path = cache_relative_path(reference);
+    let relative_path = encrypted_cache_relative_path(cache_id);
     let file_path = attachments_dir.join(&relative_path);
     (relative_path, file_path)
 }
 
-fn cache_relative_path(reference: &str) -> std::path::PathBuf {
+fn attachment_cache_id(reference: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(reference.as_bytes());
     let digest = hasher.finalize();
-    std::path::PathBuf::from("attachment-cache").join(format!("{digest:x}"))
+    format!("{digest:x}")
+}
+
+fn encrypted_cache_relative_path(cache_id: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("attachment-cache").join(format!("{cache_id}.enc"))
 }
 
 async fn attachment_metadata_and_downloaded_blob(
@@ -352,6 +411,39 @@ async fn attachment_metadata_and_downloaded_blob(
     conversation_id: &str,
     message_id: &str,
 ) -> Result<Option<(AttachmentPayloadMetadata, String)>, String> {
+    let Some(metadata) =
+        attachment_metadata_from_snapshot(app, conversation_id, message_id).await?
+    else {
+        log::debug!("cache_attachment: metadata missing for message {message_id}");
+        return Err("Attachment metadata missing".to_string());
+    };
+
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let snapshot = inner.engine.refresh_snapshot();
+
+    let message = snapshot
+        .conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == conversation_id)
+        .and_then(|conversation| {
+            conversation
+                .state
+                .messages
+                .iter()
+                .find(|message| message.message_id == message_id)
+        });
+
+    Ok(message
+        .and_then(|message| message.downloaded_blob_b64.clone())
+        .map(|downloaded_blob_b64| (metadata, downloaded_blob_b64)))
+}
+
+async fn attachment_metadata_from_snapshot(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Option<AttachmentPayloadMetadata>, String> {
     let state = app.state::<AppState>();
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
@@ -383,21 +475,15 @@ async fn attachment_metadata_and_downloaded_blob(
                     serde_json::from_str::<AttachmentPayloadMetadata>(plaintext).ok()
                 })
         });
-
-    let Some(metadata) = metadata else {
-        log::debug!("cache_attachment: metadata missing for message {message_id}");
-        return Err("Attachment metadata missing".to_string());
-    };
-
-    Ok(message
-        .and_then(|message| message.downloaded_blob_b64.clone())
-        .map(|downloaded_blob_b64| (metadata, downloaded_blob_b64)))
+    Ok(metadata)
 }
 
-fn materialize_cached_attachment_from_snapshot(
+async fn materialize_encrypted_cache_from_snapshot(
+    app: &tauri::AppHandle,
     metadata: &AttachmentPayloadMetadata,
     downloaded_blob_b64: &str,
-    file_path: &std::path::Path,
+    cache_id: &str,
+    encrypted_path: &std::path::Path,
 ) -> Result<bool, String> {
     if downloaded_blob_b64.is_empty() {
         return Ok(false);
@@ -407,13 +493,229 @@ fn materialize_cached_attachment_from_snapshot(
         .map_err(|_| "Attachment cache is corrupt".to_string())?;
     let plaintext = decrypt_blob(&ciphertext, &metadata.encryption)
         .map_err(|e| normalize_attachment_error(&e.to_string()))?;
-    if let Some(parent) = file_path.parent() {
+    let encrypted = encrypt_attachment_cache_bytes(app, cache_id, &plaintext).await?;
+    if let Some(parent) = encrypted_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create attachment cache directory: {e}"))?;
     }
-    std::fs::write(file_path, plaintext)
+    write_atomic_sync(encrypted_path, &encrypted)
         .map_err(|e| format!("failed to write attachment cache: {e}"))?;
+    remember_attachment_cache_entry(app, cache_id, encrypted_path, metadata).await?;
     Ok(true)
+}
+
+async fn materialize_preview_from_encrypted_cache(
+    app: &tauri::AppHandle,
+    attachments_dir: &std::path::Path,
+    cache_id: &str,
+    encrypted_path: &std::path::Path,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    let metadata = attachment_metadata_from_snapshot(app, conversation_id, message_id)
+        .await?
+        .ok_or_else(|| "Attachment metadata missing".to_string())?;
+    let encrypted = std::fs::read(encrypted_path)
+        .map_err(|e| format!("failed to read attachment cache: {e}"))?;
+    let plaintext = decrypt_attachment_cache_bytes(app, cache_id, &encrypted).await?;
+    let preview_path = preview_temp_path(attachments_dir, cache_id, &metadata);
+    if let Some(parent) = preview_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create attachment preview directory: {e}"))?;
+    }
+    write_atomic_sync(&preview_path, &plaintext)
+        .map_err(|e| format!("failed to write attachment preview: {e}"))?;
+    Ok(preview_path)
+}
+
+async fn encrypt_attachment_cache_bytes(
+    app: &tauri::AppHandle,
+    cache_id: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile".to_string())?;
+    profile
+        .encrypt_profile_document(&attachment_cache_document_kind(cache_id), plaintext)
+        .map_err(|e| e.to_string())
+}
+
+async fn decrypt_attachment_cache_bytes(
+    app: &tauri::AppHandle,
+    cache_id: &str,
+    encrypted: &[u8],
+) -> Result<Vec<u8>, String> {
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile".to_string())?;
+    profile
+        .decrypt_profile_document(&attachment_cache_document_kind(cache_id), encrypted)
+        .map_err(|e| e.to_string())
+}
+
+async fn remember_attachment_cache_entry(
+    app: &tauri::AppHandle,
+    cache_id: &str,
+    encrypted_path: &std::path::Path,
+    metadata: &AttachmentPayloadMetadata,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile".to_string())?;
+    profile
+        .save_attachment_cache_entry(&tapchat_core::cli::profile::AttachmentCacheEntry {
+            cache_id: cache_id.to_string(),
+            relative_path: encrypted_cache_relative_path(cache_id),
+            mime_type: Some(metadata.mime_type.clone()),
+            size_bytes: Some(metadata.size_bytes),
+            updated_at_ms: now_ms(),
+        })
+        .map_err(|e| e.to_string())?;
+    if !encrypted_path.exists() {
+        return Err("Attachment cache write did not complete".to_string());
+    }
+    Ok(())
+}
+
+fn attachment_cache_document_kind(cache_id: &str) -> String {
+    format!("attachment-cache/{cache_id}")
+}
+
+fn preview_temp_path(
+    attachments_dir: &std::path::Path,
+    cache_id: &str,
+    metadata: &AttachmentPayloadMetadata,
+) -> std::path::PathBuf {
+    preview_temp_root(attachments_dir).join(format!(
+        "{}{}",
+        cache_id,
+        extension_from_mime(&metadata.mime_type)
+    ))
+}
+
+fn preview_temp_root(attachments_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(attachments_dir.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let namespace = format!("{digest:x}").chars().take(16).collect::<String>();
+    std::env::temp_dir()
+        .join("tapchat")
+        .join("attachment-previews")
+        .join(namespace)
+}
+
+fn cleanup_temp_attachment_previews(attachments_dir: &std::path::Path) {
+    const PREVIEW_TTL_SECS: u64 = 6 * 60 * 60;
+    let root = preview_temp_root(attachments_dir);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .map(|age| age.as_secs() > PREVIEW_TTL_SECS)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn cleanup_encrypted_attachment_cache(
+    app: &tauri::AppHandle,
+    attachments_dir: &std::path::Path,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    let Some(profile) = pm.active_profile.as_ref() else {
+        return Ok(());
+    };
+    let mut entries = profile
+        .load_attachment_cache_entries()
+        .map_err(|e| e.to_string())?;
+    let now = now_ms();
+    let ttl_ms = ATTACHMENT_CACHE_TTL_SECS.saturating_mul(1000);
+
+    entries.retain(|entry| {
+        if !is_safe_relative_path(&entry.relative_path) {
+            let _ = profile.delete_attachment_cache_entry(&entry.cache_id);
+            return false;
+        }
+        let path = attachments_dir.join(&entry.relative_path);
+        let expired = now.saturating_sub(entry.updated_at_ms) > ttl_ms;
+        if expired || !path.exists() {
+            let _ = std::fs::remove_file(path);
+            let _ = profile.delete_attachment_cache_entry(&entry.cache_id);
+            return false;
+        }
+        true
+    });
+
+    entries.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    let mut total = 0_u64;
+    for entry in entries {
+        total = total.saturating_add(entry.size_bytes.unwrap_or_default());
+        if total <= ATTACHMENT_CACHE_MAX_BYTES {
+            continue;
+        }
+        if is_safe_relative_path(&entry.relative_path) {
+            let _ = std::fs::remove_file(attachments_dir.join(&entry.relative_path));
+        }
+        let _ = profile.delete_attachment_cache_entry(&entry.cache_id);
+    }
+    Ok(())
+}
+
+fn is_safe_relative_path(path: &std::path::Path) -> bool {
+    !path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_)
+                | std::path::Component::RootDir
+                | std::path::Component::ParentDir
+        )
+    })
+}
+
+fn write_atomic_sync(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(tmp, path)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn ensure_attachment_metadata(
@@ -475,60 +777,6 @@ fn normalize_attachment_error(error: &str) -> String {
     }
 }
 
-fn unique_download_path(
-    attachments_dir: &std::path::Path,
-    file_name: Option<&str>,
-    mime_type: Option<&str>,
-    reference: &str,
-) -> std::path::PathBuf {
-    let fallback_name = format!(
-        "attachment{}",
-        extension_from_mime(mime_type.unwrap_or_default())
-    );
-    let safe_name = sanitize_file_name(file_name.unwrap_or(&fallback_name));
-    let candidate = attachments_dir.join(&safe_name);
-    if !candidate.exists() {
-        return candidate;
-    }
-
-    let short_hash = short_reference_hash(reference);
-    let path = std::path::Path::new(&safe_name);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("attachment");
-    let extension = path.extension().and_then(|value| value.to_str());
-    let hashed_name = match extension {
-        Some(extension) if !extension.is_empty() => format!("{stem}-{short_hash}.{extension}"),
-        _ => format!("{stem}-{short_hash}"),
-    };
-    attachments_dir.join(hashed_name)
-}
-
-fn short_reference_hash(reference: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(reference.as_bytes());
-    let digest = hasher.finalize();
-    format!("{digest:x}").chars().take(8).collect()
-}
-
-fn sanitize_file_name(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| match ch {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            ch if ch.is_control() => '_',
-            ch => ch,
-        })
-        .collect();
-    let trimmed = sanitized.trim().trim_matches('.');
-    if trimmed.is_empty() {
-        "attachment".to_string()
-    } else {
-        trimmed.chars().take(120).collect()
-    }
-}
-
 fn extension_from_mime(mime_type: &str) -> &'static str {
     match mime_type {
         "image/jpeg" => ".jpg",
@@ -570,9 +818,10 @@ async fn generate_thumbnail(path: &std::path::Path) -> anyhow::Result<Option<Str
 mod tests {
     use super::*;
     use tapchat_core::attachment_crypto::encrypt_blob;
+    use tapchat_core::cli::profile::{Profile, ProfileInitOptions};
 
     #[test]
-    fn cache_attachment_materializes_from_downloaded_blob_without_network() {
+    fn encrypted_attachment_cache_round_trips_without_plaintext_at_rest() {
         let plaintext = b"cached attachment plaintext";
         let encrypted = encrypt_blob(plaintext).expect("encrypt attachment");
         let metadata = AttachmentPayloadMetadata {
@@ -584,17 +833,43 @@ mod tests {
         let downloaded_blob_b64 = BASE64.encode(encrypted.ciphertext);
         let temp_dir =
             std::env::temp_dir().join(format!("tapchat-cache-test-{}", uuid::Uuid::new_v4()));
-        let file_path = temp_dir.join("attachment-cache").join("cached");
-
-        let materialized = materialize_cached_attachment_from_snapshot(
-            &metadata,
-            &downloaded_blob_b64,
-            &file_path,
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                temp_dir.join("config").join("profiles.json"),
+            );
+        }
+        let profile = Profile::init_with_options(
+            "alice",
+            temp_dir.join("profile"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
         )
-        .expect("materialize cache");
+        .expect("init profile");
+        let cache_id = "cache-test";
+        let blob_ciphertext = BASE64
+            .decode(downloaded_blob_b64)
+            .expect("decode downloaded blob");
+        let decrypted = decrypt_blob(&blob_ciphertext, &metadata.encryption).expect("decrypt blob");
+        let encrypted_cache = profile
+            .encrypt_profile_document(&attachment_cache_document_kind(cache_id), &decrypted)
+            .expect("encrypt cache");
+        let cache_path = temp_dir.join("attachment-cache").join("cached.enc");
+        write_atomic_sync(&cache_path, &encrypted_cache).expect("write encrypted cache");
 
-        assert!(materialized);
-        assert_eq!(std::fs::read(&file_path).expect("read cache"), plaintext);
+        let bytes = std::fs::read(&cache_path).expect("read cache");
+        assert!(!bytes
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
+        let round_trip = profile
+            .decrypt_profile_document(&attachment_cache_document_kind(cache_id), &bytes)
+            .expect("decrypt cache");
+        assert_eq!(round_trip, plaintext);
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

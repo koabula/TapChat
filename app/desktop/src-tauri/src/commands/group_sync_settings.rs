@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use tauri::State;
 
 use crate::state::AppState;
+use tapchat_core::cli::profile::Profile;
+
+const GROUP_SYNC_SETTINGS_KEY: &str = "desktop.group_sync_settings";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,24 +79,40 @@ fn settings_path(profile_root: &PathBuf) -> PathBuf {
     profile_root.join("group_sync_settings.json")
 }
 
-fn load_settings(profile_root: &PathBuf) -> GroupSyncSettings {
-    let path = settings_path(profile_root);
-    if path.exists() {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .map(normalize_settings)
-            .unwrap_or_default()
-    } else {
-        GroupSyncSettings::default()
+fn load_settings(profile: &Profile) -> GroupSyncSettings {
+    match profile.load_private_setting::<GroupSyncSettings>(GROUP_SYNC_SETTINGS_KEY) {
+        Ok(Some(settings)) => normalize_settings(settings),
+        _ => migrate_legacy_settings(profile).unwrap_or_default(),
     }
 }
 
-fn save_settings(profile_root: &PathBuf, settings: &GroupSyncSettings) -> Result<(), String> {
-    let path = settings_path(profile_root);
+fn save_settings(profile: &Profile, settings: &GroupSyncSettings) -> Result<(), String> {
     let normalized = normalize_settings(settings.clone());
-    let json = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    profile
+        .save_private_setting(GROUP_SYNC_SETTINGS_KEY, &normalized)
+        .map_err(|e| e.to_string())?;
+    let legacy_path = settings_path(&profile.root().to_path_buf());
+    if legacy_path.exists() {
+        std::fs::remove_file(&legacy_path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_settings(profile: &Profile) -> Result<GroupSyncSettings, String> {
+    let path = settings_path(&profile.root().to_path_buf());
+    if !path.exists() {
+        return Ok(GroupSyncSettings::default());
+    }
+    let settings = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(normalize_settings)
+        .unwrap_or_default();
+    profile
+        .save_private_setting(GROUP_SYNC_SETTINGS_KEY, &settings)
+        .map_err(|e| e.to_string())?;
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -103,7 +122,7 @@ pub async fn get_group_sync_settings(
     let inner = state.inner.read().await;
     let pm = inner.profile_manager.inner.read().await;
     match &pm.active_profile {
-        Some(profile) => Ok(load_settings(&profile.root().to_path_buf())),
+        Some(profile) => Ok(load_settings(profile)),
         None => Ok(GroupSyncSettings::default()),
     }
 }
@@ -118,7 +137,7 @@ pub async fn set_group_sync_settings(
     match &pm.active_profile {
         Some(profile) => {
             let normalized = normalize_settings(settings);
-            save_settings(&profile.root().to_path_buf(), &normalized)?;
+            save_settings(profile, &normalized)?;
             Ok(normalized)
         }
         None => Err("No active profile".into()),

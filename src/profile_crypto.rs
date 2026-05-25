@@ -14,6 +14,7 @@ use crate::error::{CoreError, CoreResult};
 
 pub const PROFILE_ENCRYPTION_VERSION: u32 = 1;
 pub const SNAPSHOT_FILE_NAME: &str = "snapshot.enc";
+pub const PRIVATE_STATE_FILE_NAME: &str = "private.enc";
 pub const LEGACY_SNAPSHOT_FILE_NAME: &str = "snapshot.json";
 pub const SNAPSHOT_ALGORITHM: &str = "xchacha20poly1305";
 pub const SNAPSHOT_KDF: &str = "hkdf-sha256";
@@ -23,6 +24,7 @@ pub const PDEK_LEN: usize = 32;
 pub const WRAP_KEY_LEN: usize = 32;
 const XNONCE_LEN: usize = 24;
 const SNAPSHOT_KDF_INFO: &[u8] = b"tapchat/profile/snapshot/v1";
+const PROFILE_DOCUMENT_KDF_PREFIX: &[u8] = b"tapchat/profile/document/v1/";
 const APP_ID: &str = "tapchat";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +231,66 @@ pub fn decrypt_snapshot(profile_id: &str, pdek: &[u8], bytes: &[u8]) -> CoreResu
     )
 }
 
+pub fn encrypt_profile_document(
+    profile_id: &str,
+    pdek: &[u8],
+    document_kind: &str,
+    plaintext: &[u8],
+) -> CoreResult<Vec<u8>> {
+    let key = derive_profile_document_key(profile_id, pdek, document_kind)?;
+    let encrypted = encrypt_aead(
+        &*key,
+        plaintext,
+        profile_document_aad(profile_id, document_kind)?,
+    )?;
+    let envelope = EncryptedSnapshotEnvelope {
+        version: PROFILE_ENCRYPTION_VERSION,
+        algorithm: SNAPSHOT_ALGORITHM.into(),
+        kdf: SNAPSHOT_KDF.into(),
+        nonce_b64: encrypted.nonce_b64,
+        ciphertext_b64: encrypted.ciphertext_b64,
+    };
+    serde_json::to_vec_pretty(&envelope).map_err(|error| {
+        CoreError::invalid_state(format!("failed to serialize encrypted document: {error}"))
+    })
+}
+
+pub fn decrypt_profile_document(
+    profile_id: &str,
+    pdek: &[u8],
+    document_kind: &str,
+    bytes: &[u8],
+) -> CoreResult<Vec<u8>> {
+    let envelope: EncryptedSnapshotEnvelope = serde_json::from_slice(bytes).map_err(|error| {
+        CoreError::invalid_input(format!("failed to decode encrypted document: {error}"))
+    })?;
+    if envelope.version != PROFILE_ENCRYPTION_VERSION {
+        return Err(CoreError::unsupported(format!(
+            "unsupported encrypted document version {}",
+            envelope.version
+        )));
+    }
+    if envelope.algorithm != SNAPSHOT_ALGORITHM {
+        return Err(CoreError::unsupported(format!(
+            "unsupported encrypted document algorithm {}",
+            envelope.algorithm
+        )));
+    }
+    if envelope.kdf != SNAPSHOT_KDF {
+        return Err(CoreError::unsupported(format!(
+            "unsupported encrypted document kdf {}",
+            envelope.kdf
+        )));
+    }
+    let key = derive_profile_document_key(profile_id, pdek, document_kind)?;
+    decrypt_aead(
+        &*key,
+        &envelope.nonce_b64,
+        &envelope.ciphertext_b64,
+        profile_document_aad(profile_id, document_kind)?,
+    )
+}
+
 pub fn validate_encryption_metadata(metadata: &ProfileEncryptionMetadata) -> CoreResult<()> {
     if metadata.version != PROFILE_ENCRYPTION_VERSION {
         return Err(CoreError::unsupported(format!(
@@ -307,6 +369,22 @@ fn derive_snapshot_key(profile_id: &str, pdek: &[u8]) -> CoreResult<Zeroizing<[u
     Ok(key)
 }
 
+pub fn derive_profile_document_key(
+    profile_id: &str,
+    pdek: &[u8],
+    document_kind: &str,
+) -> CoreResult<Zeroizing<[u8; WRAP_KEY_LEN]>> {
+    validate_document_kind(document_kind)?;
+    let hk = Hkdf::<Sha256>::new(Some(profile_id.as_bytes()), pdek);
+    let mut info = Vec::with_capacity(PROFILE_DOCUMENT_KDF_PREFIX.len() + document_kind.len());
+    info.extend_from_slice(PROFILE_DOCUMENT_KDF_PREFIX);
+    info.extend_from_slice(document_kind.as_bytes());
+    let mut key = Zeroizing::new([0_u8; WRAP_KEY_LEN]);
+    hk.expand(&info, &mut *key)
+        .map_err(|_| CoreError::invalid_state("failed to derive profile document key"))?;
+    Ok(key)
+}
+
 struct AeadBlob {
     nonce_b64: String,
     ciphertext_b64: String,
@@ -382,6 +460,27 @@ fn snapshot_aad(profile_id: &str) -> Vec<u8> {
     format!("{APP_ID}|{profile_id}|snapshot|v{PROFILE_ENCRYPTION_VERSION}").into_bytes()
 }
 
+fn profile_document_aad(profile_id: &str, document_kind: &str) -> CoreResult<Vec<u8>> {
+    validate_document_kind(document_kind)?;
+    Ok(
+        format!("{APP_ID}|{profile_id}|{document_kind}|document|v{PROFILE_ENCRYPTION_VERSION}")
+            .into_bytes(),
+    )
+}
+
+fn validate_document_kind(document_kind: &str) -> CoreResult<()> {
+    if document_kind.is_empty()
+        || document_kind.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'/'))
+        })
+    {
+        return Err(CoreError::invalid_input(
+            "profile document kind must be non-empty ascii label",
+        ));
+    }
+    Ok(())
+}
+
 fn wrapper_aad(profile_id: &str, wrapper_id: &str, kind: &str) -> Vec<u8> {
     format!("{APP_ID}|{profile_id}|{wrapper_id}|{kind}|pdek-wrap|v{PROFILE_ENCRYPTION_VERSION}")
         .into_bytes()
@@ -427,6 +526,26 @@ mod tests {
 
         let decrypted = decrypt_snapshot(profile_id, &*pdek, &encrypted).expect("decrypt");
         assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn profile_documents_use_independent_aad() {
+        let profile_id = "profile:test";
+        let pdek = generate_pdek();
+        let encrypted =
+            encrypt_profile_document(profile_id, &*pdek, "private-state", b"visible-marker")
+                .expect("encrypt");
+        assert!(!encrypted
+            .windows("visible-marker".len())
+            .any(|window| window == b"visible-marker"));
+
+        let decrypted = decrypt_profile_document(profile_id, &*pdek, "private-state", &encrypted)
+            .expect("decrypt");
+        assert_eq!(decrypted, b"visible-marker");
+
+        let error = decrypt_profile_document(profile_id, &*pdek, "other-state", &encrypted)
+            .expect_err("document aad mismatch");
+        assert_eq!(error.code(), "invalid_input");
     }
 
     #[test]

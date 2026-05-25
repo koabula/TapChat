@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use tapchat_core::cli::profile::Profile;
 use tapchat_core::ffi_api::PersistStateEffect;
-use tapchat_core::persistence::{CorePersistenceSnapshot, PersistOp};
+use tapchat_core::persistence::CorePersistenceSnapshot;
 
 use crate::platform::profile::ProfileManagerInner;
 
@@ -42,25 +42,13 @@ impl DesktopPersistence {
 
     /// Handle PersistState effect from CoreEngine.
     pub async fn persist(&self, effect: PersistStateEffect) -> Result<()> {
-        // Handle individual ops first (incremental updates)
-        for op in &effect.ops {
-            self.handle_persist_op(op).await?;
+        let pm = self.profile_inner.read().await;
+        if let Some(ref profile) = pm.active_profile {
+            profile.persist_state(&effect)?;
+        } else {
+            log::warn!("persist called but no active_profile set!");
         }
-
-        // If there's a full snapshot, save it
-        if let Some(ref snapshot) = effect.snapshot {
-            self.save_snapshot(snapshot).await?;
-        }
-
         Ok(())
-    }
-
-    async fn handle_persist_op(&self, op: &PersistOp) -> Result<()> {
-        match op {
-            // Most persist ops are handled via the snapshot mechanism
-            // The incremental ops are mostly for future optimization
-            _ => Ok(()),
-        }
     }
 
     /// Save a full snapshot to the profile.
@@ -96,10 +84,8 @@ impl DesktopPersistence {
 #[allow(dead_code)]
 pub fn persist_state_sync(effect: &PersistStateEffect, profile_path: Option<&PathBuf>) {
     if let Some(path) = profile_path {
-        if let Some(ref snapshot) = effect.snapshot {
-            if let Ok(profile) = Profile::open(path) {
-                let _ = profile.save_snapshot(snapshot);
-            }
+        if let Ok(profile) = Profile::open(path) {
+            let _ = profile.persist_state(effect);
         }
     }
 }

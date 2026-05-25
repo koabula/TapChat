@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,15 +6,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use keyring::{credential::CredentialPersistence, default};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::model::{DeploymentBundle, IdentityBundle};
-use crate::persistence::{decode_snapshot, encode_snapshot, CorePersistenceSnapshot};
+use crate::ffi_api::PersistStateEffect;
+use crate::local_store::{
+    active_store, migrate_snapshot_to_state_db, PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
+};
+use crate::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
+use crate::persistence::CorePersistenceSnapshot;
 use crate::profile_crypto::{
-    build_os_keychain_wrapper, build_passphrase_wrapper, decrypt_snapshot,
-    default_encryption_metadata, encrypt_snapshot, generate_pdek, generate_wrap_key,
+    build_os_keychain_wrapper, build_passphrase_wrapper,
+    decrypt_profile_document as decrypt_profile_document_bytes, default_encryption_metadata,
+    encrypt_profile_document as encrypt_profile_document_bytes, generate_pdek, generate_wrap_key,
     unwrap_with_key, unwrap_with_passphrase, validate_encryption_metadata,
     ProfileEncryptionMetadata, ProfileKeyWrapperKind, LEGACY_SNAPSHOT_FILE_NAME,
     OS_KEYCHAIN_SERVICE, PDEK_LEN, SNAPSHOT_FILE_NAME,
@@ -75,6 +83,50 @@ pub struct RuntimeMetadata {
     pub preview_bucket_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_deployed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilePrivateState {
+    pub version: u32,
+    #[serde(default)]
+    pub runtime_secrets: RuntimeSecrets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_runtime_auth: Option<DeviceRuntimeAuth>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attachment_cache: BTreeMap<String, AttachmentCacheEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeSecrets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_secret: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AttachmentCacheEntry {
+    pub cache_id: String,
+    pub relative_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    pub updated_at_ms: u64,
+}
+
+impl Default for ProfilePrivateState {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            runtime_secrets: RuntimeSecrets::default(),
+            deployment_runtime_auth: None,
+            settings: BTreeMap::new(),
+            attachment_cache: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +255,7 @@ impl Profile {
         if !profile.snapshot_path().exists() {
             profile.save_snapshot(&CorePersistenceSnapshot::default())?;
         }
+        profile.ensure_local_store_migrated()?;
         profile.sync_registry_entry()?;
         Ok(profile)
     }
@@ -251,7 +304,11 @@ impl Profile {
             &meta,
             options.passphrase.as_deref().or(env_passphrase.as_deref()),
         )?;
-        Ok(Self { root, meta, pdek })
+        let profile = Self { root, meta, pdek };
+        profile.ensure_layout()?;
+        profile.ensure_local_store_migrated()?;
+        profile.scrub_legacy_plaintext_state()?;
+        Ok(profile)
     }
 
     pub fn metadata(&self) -> &ProfileMetadata {
@@ -287,41 +344,35 @@ impl Profile {
         self.root.join(SNAPSHOT_FILE_NAME)
     }
 
+    pub fn state_db_path(&self) -> PathBuf {
+        self.root.join(STATE_DB_FILE_NAME)
+    }
+
     pub fn runtime_meta_path(&self) -> PathBuf {
         self.meta.runtime_dir.join("runtime.json")
     }
 
     pub fn load_snapshot(&self) -> Result<CorePersistenceSnapshot> {
-        let path = self.snapshot_path();
-        let legacy_path = self.root.join(LEGACY_SNAPSHOT_FILE_NAME);
-        if legacy_path.exists() && !path.exists() {
-            bail!(
-                "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
-                legacy_path.display()
-            );
-        }
-        if !path.exists() {
-            return Ok(CorePersistenceSnapshot::default());
-        }
-        let plaintext = decrypt_snapshot(
-            &self.meta.profile_id,
-            &*self.pdek,
-            &fs::read(&path).context("read encrypted snapshot")?,
-        )
-        .map_err(anyhow::Error::from)?;
-        decode_snapshot(&plaintext).map_err(anyhow::Error::from)
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek).load_snapshot()
     }
 
     pub fn save_snapshot(&self, snapshot: &CorePersistenceSnapshot) -> Result<()> {
-        let encoded = encode_snapshot(snapshot).map_err(anyhow::Error::from)?;
-        let encrypted = encrypt_snapshot(&self.meta.profile_id, &*self.pdek, &encoded)
-            .map_err(anyhow::Error::from)?;
-        write_atomic(&self.snapshot_path(), &encrypted)
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek).save_snapshot(snapshot)
+    }
+
+    pub fn persist_state(&self, persist: &PersistStateEffect) -> Result<()> {
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek).persist_state(persist)
     }
 
     pub fn save_deployment_bundle(&mut self, bundle: &DeploymentBundle) -> Result<PathBuf> {
         let path = self.meta.bundles_dir.join("deployment_bundle.json");
-        let bytes = serde_json::to_vec_pretty(bundle)?;
+        let mut private = self.load_private_state()?;
+        private.deployment_runtime_auth = bundle.device_runtime_auth.clone();
+        self.save_private_state(&private)?;
+
+        let mut public_bundle = bundle.clone();
+        public_bundle.device_runtime_auth = None;
+        let bytes = serde_json::to_vec_pretty(&public_bundle)?;
         write_atomic(&path, &bytes)?;
         self.set_deployment_bundle_path(path.clone())?;
         Ok(path)
@@ -344,6 +395,27 @@ impl Profile {
         Ok(serde_json::from_str(&normalized).context("decode deployment bundle")?)
     }
 
+    pub fn load_deployment_bundle(&self) -> Result<Option<DeploymentBundle>> {
+        let Some(path) = self.meta.deployment_bundle_path.as_ref() else {
+            return Ok(None);
+        };
+        let mut bundle = Self::load_deployment_bundle_file(path)?;
+        if bundle.device_runtime_auth.is_some() {
+            let mut private = self.load_private_state()?;
+            private.deployment_runtime_auth = bundle.device_runtime_auth.clone();
+            self.save_private_state(&private)?;
+            bundle.device_runtime_auth = private.deployment_runtime_auth;
+            let mut public_bundle = bundle.clone();
+            public_bundle.device_runtime_auth = None;
+            write_atomic(path, &serde_json::to_vec_pretty(&public_bundle)?)?;
+            return Ok(Some(bundle));
+        }
+        if let Some(auth) = self.load_private_state()?.deployment_runtime_auth {
+            bundle.device_runtime_auth = Some(auth);
+        }
+        Ok(Some(bundle))
+    }
+
     pub fn load_identity_bundle_file(path: impl AsRef<Path>) -> Result<IdentityBundle> {
         let raw = fs::read_to_string(path).context("read identity bundle")?;
         let normalized = normalize_json(&raw)?;
@@ -352,18 +424,41 @@ impl Profile {
 
     pub fn load_runtime_metadata(&self) -> Result<RuntimeMetadata> {
         let path = self.runtime_meta_path();
-        if !path.exists() {
-            return Ok(RuntimeMetadata::default());
+        let mut runtime = if path.exists() {
+            serde_json::from_slice(&fs::read(&path).context("read runtime metadata")?)?
+        } else {
+            RuntimeMetadata::default()
+        };
+        let mut private = self.load_private_state()?;
+        let had_plaintext_secrets =
+            runtime.bootstrap_secret.is_some() || runtime.sharing_secret.is_some();
+        if runtime.bootstrap_secret.is_some() {
+            private.runtime_secrets.bootstrap_secret = runtime.bootstrap_secret.take();
         }
-        Ok(serde_json::from_slice(
-            &fs::read(path).context("read runtime metadata")?,
-        )?)
+        if runtime.sharing_secret.is_some() {
+            private.runtime_secrets.sharing_secret = runtime.sharing_secret.take();
+        }
+        if had_plaintext_secrets {
+            self.save_private_state(&private)?;
+            write_atomic(&path, &serde_json::to_vec_pretty(&runtime)?)?;
+        }
+        runtime.bootstrap_secret = private.runtime_secrets.bootstrap_secret;
+        runtime.sharing_secret = private.runtime_secrets.sharing_secret;
+        Ok(runtime)
     }
 
     pub fn save_runtime_metadata(&self, runtime: &RuntimeMetadata) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private.runtime_secrets.bootstrap_secret = runtime.bootstrap_secret.clone();
+        private.runtime_secrets.sharing_secret = runtime.sharing_secret.clone();
+        self.save_private_state(&private)?;
+
+        let mut public_runtime = runtime.clone();
+        public_runtime.bootstrap_secret = None;
+        public_runtime.sharing_secret = None;
         write_atomic(
             &self.runtime_meta_path(),
-            &serde_json::to_vec_pretty(runtime)?,
+            &serde_json::to_vec_pretty(&public_runtime)?,
         )
     }
 
@@ -372,7 +467,107 @@ impl Profile {
         if path.exists() {
             fs::remove_file(path).context("remove runtime metadata")?;
         }
+        let mut private = self.load_private_state()?;
+        private.runtime_secrets = RuntimeSecrets::default();
+        self.save_private_state(&private)?;
         Ok(())
+    }
+
+    pub fn load_private_setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let private = self.load_private_state()?;
+        private
+            .settings
+            .get(key)
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn save_private_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private
+            .settings
+            .insert(key.to_string(), serde_json::to_value(value)?);
+        self.save_private_state(&private)
+    }
+
+    pub fn load_private_state(&self) -> Result<ProfilePrivateState> {
+        let Some(bytes) = active_store(&self.root, &self.meta.profile_id, &*self.pdek)
+            .load_document(PRIVATE_STATE_DOCUMENT_KIND)?
+        else {
+            return Ok(ProfilePrivateState::default());
+        };
+        Ok(serde_json::from_slice(&bytes).context("decode private profile state")?)
+    }
+
+    pub fn save_private_state(&self, private: &ProfilePrivateState) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(private)?;
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek)
+            .save_document(PRIVATE_STATE_DOCUMENT_KIND, &bytes)
+    }
+
+    pub fn load_attachment_cache_entries(&self) -> Result<Vec<AttachmentCacheEntry>> {
+        let store = active_store(&self.root, &self.meta.profile_id, &*self.pdek);
+        let mut entries = store
+            .load_attachment_cache_entries()?
+            .into_iter()
+            .map(|bytes| serde_json::from_slice::<AttachmentCacheEntry>(&bytes))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if entries.is_empty() {
+            let mut private = self.load_private_state()?;
+            entries = private.attachment_cache.values().cloned().collect();
+            if !entries.is_empty() && self.state_db_path().exists() {
+                for entry in &entries {
+                    let bytes = serde_json::to_vec(entry)?;
+                    store.save_attachment_cache_entry(
+                        &entry.cache_id,
+                        &bytes,
+                        entry.mime_type.as_deref(),
+                        entry.size_bytes,
+                    )?;
+                }
+                private.attachment_cache.clear();
+                self.save_private_state(&private)?;
+            }
+        }
+        Ok(entries)
+    }
+
+    pub fn save_attachment_cache_entry(&self, entry: &AttachmentCacheEntry) -> Result<()> {
+        let bytes = serde_json::to_vec(entry)?;
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek).save_attachment_cache_entry(
+            &entry.cache_id,
+            &bytes,
+            entry.mime_type.as_deref(),
+            entry.size_bytes,
+        )
+    }
+
+    pub fn delete_attachment_cache_entry(&self, cache_id: &str) -> Result<()> {
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek)
+            .delete_attachment_cache_entry(cache_id)
+    }
+
+    pub fn clear_attachment_cache_entries(&self) -> Result<()> {
+        active_store(&self.root, &self.meta.profile_id, &*self.pdek)
+            .clear_attachment_cache_entries()?;
+        let mut private = self.load_private_state()?;
+        if !private.attachment_cache.is_empty() {
+            private.attachment_cache.clear();
+            self.save_private_state(&private)?;
+        }
+        Ok(())
+    }
+
+    pub fn encrypt_profile_document(&self, document_kind: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        encrypt_profile_document_bytes(&self.meta.profile_id, &*self.pdek, document_kind, bytes)
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn decrypt_profile_document(&self, document_kind: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        decrypt_profile_document_bytes(&self.meta.profile_id, &*self.pdek, document_kind, bytes)
+            .map_err(anyhow::Error::from)
     }
 
     fn ensure_layout(&self) -> Result<()> {
@@ -387,6 +582,18 @@ impl Profile {
             &self.root.join("profile.json"),
             &serde_json::to_vec_pretty(&self.meta)?,
         )
+    }
+
+    fn ensure_local_store_migrated(&self) -> Result<()> {
+        migrate_snapshot_to_state_db(&self.root, &self.meta.profile_id, &*self.pdek)
+    }
+
+    fn scrub_legacy_plaintext_state(&self) -> Result<()> {
+        let _ = self.load_runtime_metadata()?;
+        if self.meta.deployment_bundle_path.is_some() {
+            let _ = self.load_deployment_bundle()?;
+        }
+        Ok(())
     }
 
     pub fn sync_registry_entry(&self) -> Result<()> {
@@ -670,7 +877,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Profile, ProfileInitOptions, ProfileRegistry};
+    use keyring::{credential::CredentialPersistence, default};
+
+    use super::{Profile, ProfileInitOptions, ProfileRegistry, RuntimeMetadata};
     use crate::persistence::CorePersistenceSnapshot;
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -700,6 +909,7 @@ mod tests {
         )
         .expect("init profile");
         assert!(profile.snapshot_path().exists());
+        assert!(profile.state_db_path().exists());
         assert!(!dir.path().join("snapshot.json").exists());
         assert!(profile.metadata().bundles_dir.exists());
         let snapshot = profile.load_snapshot().expect("load snapshot");
@@ -781,8 +991,179 @@ mod tests {
             Profile::open_with_passphrase(dir.path().join("alice"), Some("test-passphrase".into()))
                 .expect("open profile");
         assert_eq!(reopened.load_snapshot().expect("load"), snapshot);
+        let state_db = std::fs::read(reopened.state_db_path()).expect("read state db");
+        assert!(!state_db
+            .windows("visible-marker".len())
+            .any(|window| window == b"visible-marker"));
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+    }
+
+    #[test]
+    fn runtime_metadata_secrets_are_stored_in_private_state() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                dir.path().join("config").join("profiles.json"),
+            );
+        }
+        let profile = Profile::init_with_options(
+            "alice",
+            dir.path().join("alice"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        profile
+            .save_runtime_metadata(&RuntimeMetadata {
+                base_url: Some("https://example.test".into()),
+                bootstrap_secret: Some("bootstrap-visible-marker".into()),
+                sharing_secret: Some("sharing-visible-marker".into()),
+                ..RuntimeMetadata::default()
+            })
+            .expect("save runtime");
+
+        let runtime_json =
+            std::fs::read_to_string(profile.runtime_meta_path()).expect("read runtime metadata");
+        assert!(runtime_json.contains("https://example.test"));
+        assert!(!runtime_json.contains("bootstrap-visible-marker"));
+        assert!(!runtime_json.contains("sharing-visible-marker"));
+        let loaded = profile.load_runtime_metadata().expect("load runtime");
+        assert_eq!(
+            loaded.bootstrap_secret.as_deref(),
+            Some("bootstrap-visible-marker")
+        );
+        assert_eq!(
+            loaded.sharing_secret.as_deref(),
+            Some("sharing-visible-marker")
+        );
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+    }
+
+    #[test]
+    fn deployment_bundle_file_strips_runtime_auth_token() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                dir.path().join("config").join("profiles.json"),
+            );
+        }
+        let mut profile = Profile::init_with_options(
+            "alice",
+            dir.path().join("alice"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        let bundle = crate::model::DeploymentBundle {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            region: "test".into(),
+            inbox_http_endpoint: "https://inbox.test".into(),
+            inbox_websocket_endpoint: "wss://inbox.test".into(),
+            storage_base_info: crate::model::StorageBaseInfo {
+                base_url: Some("https://storage.test".into()),
+                bucket_hint: Some("bucket".into()),
+            },
+            runtime_config: crate::model::RuntimeConfig::default(),
+            device_runtime_auth: Some(crate::model::DeviceRuntimeAuth {
+                scheme: "bearer".into(),
+                token: "runtime-token-visible-marker".into(),
+                expires_at: 42,
+                user_id: "user:alice".into(),
+                device_id: "device:alice".into(),
+                scopes: vec!["inbox:append".into()],
+            }),
+            expected_user_id: None,
+            expected_device_id: None,
+        };
+        let path = profile
+            .save_deployment_bundle(&bundle)
+            .expect("save deployment");
+        let public_json = std::fs::read_to_string(path).expect("read deployment");
+        assert!(!public_json.contains("runtime-token-visible-marker"));
+        assert!(!public_json.contains("device_runtime_auth"));
+        let loaded = profile
+            .load_deployment_bundle()
+            .expect("load deployment")
+            .expect("deployment present");
+        assert_eq!(
+            loaded
+                .device_runtime_auth
+                .as_ref()
+                .map(|auth| auth.token.as_str()),
+            Some("runtime-token-visible-marker")
+        );
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+    }
+
+    #[test]
+    fn attachment_cache_index_is_stored_in_state_db() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                dir.path().join("config").join("profiles.json"),
+            );
+        }
+        let profile = Profile::init_with_options(
+            "alice",
+            dir.path().join("alice"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        profile
+            .save_attachment_cache_entry(&super::AttachmentCacheEntry {
+                cache_id: "cache-marker".into(),
+                relative_path: std::path::PathBuf::from("attachment-cache/cache-marker.enc"),
+                mime_type: Some("application/octet-stream".into()),
+                size_bytes: Some(42),
+                updated_at_ms: 7,
+            })
+            .expect("save cache entry");
+
+        let entries = profile
+            .load_attachment_cache_entries()
+            .expect("load cache entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cache_id, "cache-marker");
+        assert!(profile
+            .load_private_state()
+            .expect("private state")
+            .attachment_cache
+            .is_empty());
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+    }
+
+    #[test]
+    fn default_keyring_backend_is_persistent_on_supported_targets() {
+        if cfg!(any(
+            target_os = "windows",
+            target_os = "macos",
+            target_os = "linux"
+        )) {
+            assert!(matches!(
+                default::default_credential_builder().persistence(),
+                CredentialPersistence::UntilDelete
+            ));
         }
     }
 

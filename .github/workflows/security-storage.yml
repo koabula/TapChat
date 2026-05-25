@@ -1,0 +1,49 @@
+name: Security Storage
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  RUST_MIN_STACK: "67108864"
+
+jobs:
+  cargo-security-storage:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Windows Perl for vendored SQLCipher OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install strawberryperl -y
+
+      - name: Install Linux Secret Service runtime
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 gnome-keyring libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Test profile security storage
+        if: runner.os != 'Linux'
+        run: |
+          cargo test -q --lib profile_crypto
+          cargo test -q --lib local_store
+          cargo test -q --lib cli::profile
+
+      - name: Test profile security storage with Secret Service
+        if: runner.os == 'Linux'
+        run: |
+          dbus-run-session -- sh -c 'echo "" | gnome-keyring-daemon --unlock >/tmp/keyring.log 2>&1 || true; cargo test -q --lib profile_crypto; cargo test -q --lib local_store; cargo test -q --lib cli::profile'

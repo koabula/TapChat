@@ -252,6 +252,7 @@ pub fn run() {
             commands::message::download_attachment_to_default_path,
             commands::message::cache_attachment,
             commands::message::get_attachment_preview,
+            commands::message::clear_attachment_cache,
             // Contacts
             commands::contact::preview_contact_link,
             commands::contact::start_direct_chat_from_link,
@@ -278,6 +279,7 @@ pub fn run() {
             // Cloudflare
             commands::cloudflare::cloudflare_preflight,
             commands::cloudflare::cloudflare_login,
+            commands::cloudflare::cloudflare_import_legacy_wrangler_token,
             commands::cloudflare::cloudflare_deploy,
             commands::cloudflare::cloudflare_status,
             // Session

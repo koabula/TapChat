@@ -14,6 +14,7 @@ use tapchat_core::model::{
     CapabilityOperation, CapabilityService, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth,
     Envelope, IdentityBundle, InboxAppendCapability, MessageType, SenderProof,
 };
+use tapchat_core::persistence::{CorePersistenceSnapshot, SNAPSHOT_FORMAT_VERSION};
 use tapchat_core::transport_contract::AppendEnvelopeRequest;
 use tapchat_transport_adapter::{
     CloudflareRuntimeHandle, CloudflareRuntimeOptions, RuntimeMessageRequest,
@@ -2135,7 +2136,7 @@ fn cli_device_revoke_remote_target_updates_published_bundle() -> Result<()> {
         .iter()
         .any(|device| device.device_id == laptop.laptop_device_id));
 
-    let mut snapshot: Value = read_json_file(&ctx.bob_profile.join("snapshot.json"))?;
+    let mut snapshot = load_profile_snapshot_value(&ctx.bob_profile)?;
     snapshot["snapshot"]["deployment"]["local_bundle"] = serde_json::to_value(&merged_identity)?;
     // `IdentityBundle` serializes with `rename_all = "camelCase"`, so the patched snapshot
     // here stores `deviceId`, not `device_id`. Downstream CLI commands (e.g. `contact show`)
@@ -2148,10 +2149,7 @@ fn cli_device_revoke_remote_target_updates_published_bundle() -> Result<()> {
             .iter()
             .any(|device| device["deviceId"].as_str() == Some(laptop.laptop_device_id.as_str()))
     );
-    fs::write(
-        ctx.bob_profile.join("snapshot.json"),
-        serde_json::to_vec_pretty(&snapshot)?,
-    )?;
+    save_profile_snapshot_value(&ctx.bob_profile, snapshot)?;
 
     let revoked = run_cli_json([
         "device",
@@ -2640,7 +2638,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         Some("Healthy")
     );
 
-    let snapshot: Value = read_json_file(&ctx.bob_profile.join("snapshot.json"))?;
+    let snapshot = load_profile_snapshot_value(&ctx.bob_profile)?;
     let conversations = snapshot["snapshot"]["conversations"]
         .as_array()
         .context("snapshot conversations missing")?;
@@ -2793,7 +2791,7 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
         &ctx.conversation_id
     )?);
 
-    let alice_snapshot_before = read_json_file::<Value>(&ctx.alice_profile.join("snapshot.json"))?;
+    let alice_snapshot_before = load_profile_snapshot_value(&ctx.alice_profile)?;
     let alice_sync_before = snapshot_sync_state(&alice_snapshot_before, &ctx.alice_device_id)?;
     let before_restart_acked = required_u64(alice_sync_before, "last_acked_seq")?;
 
@@ -2817,7 +2815,7 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
         None,
     )?;
 
-    let alice_snapshot_after = read_json_file::<Value>(&ctx.alice_profile.join("snapshot.json"))?;
+    let alice_snapshot_after = load_profile_snapshot_value(&ctx.alice_profile)?;
     let alice_sync_after = snapshot_sync_state(&alice_snapshot_after, &ctx.alice_device_id)?;
     let after_restart_acked = required_u64(alice_sync_after, "last_acked_seq")?;
     assert!(after_restart_acked >= before_restart_acked);
@@ -2863,7 +2861,7 @@ fn cli_recovery_restart_e2e_work() -> Result<()> {
         &ctx.conversation_id
     )?);
 
-    let alice_snapshot_final = read_json_file::<Value>(&ctx.alice_profile.join("snapshot.json"))?;
+    let alice_snapshot_final = load_profile_snapshot_value(&ctx.alice_profile)?;
     let alice_sync_final = snapshot_sync_state(&alice_snapshot_final, &ctx.alice_device_id)?;
     let final_acked = required_u64(alice_sync_final, "last_acked_seq")?;
     assert!(final_acked >= after_restart_acked);
@@ -5656,9 +5654,8 @@ fn merge_identity_bundles(
     signer_profile: &Path,
     bundles: &[IdentityBundle],
 ) -> Result<IdentityBundle> {
-    let local_identity: LocalIdentityState = snapshot_local_identity(&read_json_file::<Value>(
-        &signer_profile.join("snapshot.json"),
-    )?)?;
+    let local_identity: LocalIdentityState =
+        snapshot_local_identity(&load_profile_snapshot_value(signer_profile)?)?;
     let deployment = concrete_deployment_bundle(deployment, &local_identity.user_identity.user_id);
     let mut devices = Vec::new();
     for bundle in bundles {
@@ -5689,6 +5686,23 @@ fn snapshot_local_identity(snapshot: &Value) -> Result<LocalIdentityState> {
         .context("decode local identity from snapshot")
 }
 
+fn load_profile_snapshot_value(profile: &Path) -> Result<Value> {
+    let profile = Profile::open(profile)?;
+    let snapshot = profile.load_snapshot()?;
+    Ok(serde_json::json!({
+        "format_version": SNAPSHOT_FORMAT_VERSION,
+        "snapshot": snapshot,
+    }))
+}
+
+fn save_profile_snapshot_value(profile: &Path, value: Value) -> Result<()> {
+    let snapshot: CorePersistenceSnapshot =
+        serde_json::from_value(value["snapshot"].clone()).context("decode patched snapshot")?;
+    let profile = Profile::open(profile)?;
+    profile.save_snapshot(&snapshot)?;
+    Ok(())
+}
+
 fn snapshot_sync_state<'a>(snapshot: &'a Value, device_id: &str) -> Result<&'a Value> {
     snapshot["snapshot"]["sync_states"]
         .as_array()
@@ -5700,7 +5714,7 @@ fn snapshot_sync_state<'a>(snapshot: &'a Value, device_id: &str) -> Result<&'a V
 }
 
 fn snapshot_has_recovery_context(profile: &Path, conversation_id: &str) -> Result<bool> {
-    let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
+    let snapshot = load_profile_snapshot_value(profile)?;
     Ok(snapshot["snapshot"]["recovery_contexts"]
         .as_array()
         .map(|rows| {
@@ -5711,7 +5725,7 @@ fn snapshot_has_recovery_context(profile: &Path, conversation_id: &str) -> Resul
 }
 
 fn snapshot_recovery_context(profile: &Path, conversation_id: &str) -> Result<Option<Value>> {
-    let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
+    let snapshot = load_profile_snapshot_value(profile)?;
     Ok(snapshot["snapshot"]["recovery_contexts"]
         .as_array()
         .and_then(|rows| {
@@ -5722,7 +5736,7 @@ fn snapshot_recovery_context(profile: &Path, conversation_id: &str) -> Result<Op
 }
 
 fn snapshot_has_conversation(profile: &Path, conversation_id: &str) -> Result<bool> {
-    let snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
+    let snapshot = load_profile_snapshot_value(profile)?;
     Ok(snapshot["snapshot"]["conversations"]
         .as_array()
         .map(|rows| {
@@ -5733,18 +5747,14 @@ fn snapshot_has_conversation(profile: &Path, conversation_id: &str) -> Result<bo
 }
 
 fn patch_profile_local_bundle(profile: &Path, bundle: &IdentityBundle) -> Result<()> {
-    let mut snapshot: Value = read_json_file(&profile.join("snapshot.json"))?;
+    let mut snapshot = load_profile_snapshot_value(profile)?;
     snapshot["snapshot"]["deployment"]["local_bundle"] = serde_json::to_value(bundle)?;
-    fs::write(
-        profile.join("snapshot.json"),
-        serde_json::to_vec_pretty(&snapshot)?,
-    )?;
+    save_profile_snapshot_value(profile, snapshot)?;
     Ok(())
 }
 
 fn patch_contact_identity_bundle_ref(profile: &Path, user_id: &str, reference: &str) -> Result<()> {
-    let path = profile.join("snapshot.json");
-    let mut snapshot: Value = read_json_file(&path)?;
+    let mut snapshot = load_profile_snapshot_value(profile)?;
     let contacts = snapshot["snapshot"]["contacts"]
         .as_array_mut()
         .context("snapshot contacts missing")?;
@@ -5762,7 +5772,7 @@ fn patch_contact_identity_bundle_ref(profile: &Path, user_id: &str, reference: &
             Value::String(reference.to_string()),
         );
     }
-    fs::write(path, serde_json::to_vec_pretty(&snapshot)?)?;
+    save_profile_snapshot_value(profile, snapshot)?;
     Ok(())
 }
 

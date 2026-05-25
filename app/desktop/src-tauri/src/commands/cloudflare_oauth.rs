@@ -148,15 +148,16 @@ pub fn load_access_token() -> Result<String> {
 }
 
 fn load_token() -> Result<StoredCloudflareToken> {
-    match load_keychain_token() {
-        Ok(token) => Ok(token),
-        Err(keychain_error) => match load_wrangler_token() {
-            Ok(token) => Ok(token),
-            Err(wrangler_error) => Err(anyhow!(
-                "Cloudflare OAuth token not found in OS keychain or legacy Wrangler config (keychain: {keychain_error}; wrangler: {wrangler_error})"
-            )),
-        },
-    }
+    load_keychain_token().map_err(|keychain_error| {
+        anyhow!(
+            "Cloudflare OAuth token not found in OS keychain. Use the explicit legacy Wrangler import command if you want to migrate an old plaintext token: {keychain_error}"
+        )
+    })
+}
+
+pub fn import_legacy_wrangler_token() -> Result<()> {
+    let token = load_wrangler_token()?;
+    store_token(&token)
 }
 
 fn load_keychain_token() -> Result<StoredCloudflareToken> {

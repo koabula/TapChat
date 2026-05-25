@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use tapchat_core::cli::profile::{Profile, RuntimeMetadata};
+use tapchat_core::cli::profile::RuntimeMetadata;
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
 use tapchat_core::cli::util::to_snake_case_json_string;
 use tapchat_core::model::DeploymentBundle;
@@ -333,8 +333,8 @@ pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, Str
     // Check if embedded runtime is available
     let embedded_available = resolve_embedded_runtime_root(app_ref).is_some();
 
-    // Rust OAuth/whoami; falls back to legacy Wrangler token reading, but never
-    // launches Node.
+    // Rust OAuth/whoami uses only the OS keychain at runtime. Legacy Wrangler
+    // plaintext tokens require an explicit import command before deployment.
     let whoami_result = crate::commands::cloudflare_oauth::whoami().await;
     let token_stored = whoami_result.is_ok();
     let (authenticated, account, auth_error) = match whoami_result {
@@ -412,6 +412,22 @@ pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
         account_id: login_result.account_id,
         account_name: login_result.account_name,
         error: None,
+    })
+}
+
+#[tauri::command]
+pub async fn cloudflare_import_legacy_wrangler_token() -> Result<LoginResult, String> {
+    crate::commands::cloudflare_oauth::import_legacy_wrangler_token()
+        .map_err(|error| error.to_string())?;
+    let whoami = crate::commands::cloudflare_oauth::whoami()
+        .await
+        .map_err(|error| error.to_string())?;
+    let account = whoami.accounts.first();
+    Ok(LoginResult {
+        success: whoami.authenticated && account.is_some(),
+        account_id: account.map(|account| account.account_id.clone()),
+        account_name: account.map(|account| account.account_name.clone()),
+        error: whoami.error,
     })
 }
 
@@ -762,15 +778,12 @@ async fn persist_runtime_writeback(
         let reloaded_runtime = profile
             .load_runtime_metadata()
             .map_err(|e| format!("writeback_incomplete: reload runtime metadata failed: {e}"))?;
-        let bundle_path = profile
-            .metadata()
-            .deployment_bundle_path
-            .clone()
-            .ok_or_else(|| {
-                "writeback_incomplete: profile metadata missing deployment_bundle_path".to_string()
-            })?;
-        let reloaded_bundle = Profile::load_deployment_bundle_file(bundle_path)
+        let reloaded_bundle = profile
+            .load_deployment_bundle()
             .map_err(|e| format!("writeback_incomplete: reload deployment bundle failed: {e}"))?;
+        let reloaded_bundle = reloaded_bundle.ok_or_else(|| {
+            "writeback_incomplete: profile metadata missing deployment_bundle_path".to_string()
+        })?;
         let snapshot_endpoint = reloaded_snapshot
             .deployment
             .as_ref()
@@ -859,9 +872,7 @@ async fn cloudflare_status_impl(
         let runtime = profile.load_runtime_metadata().map_err(|e| e.to_string())?;
         let snapshot = profile.load_snapshot().map_err(|e| e.to_string())?;
         let bundle_path = profile.metadata().deployment_bundle_path.clone();
-        let bundle_file = bundle_path
-            .as_ref()
-            .and_then(|path| Profile::load_deployment_bundle_file(path).ok());
+        let bundle_file = profile.load_deployment_bundle().ok().flatten();
         (runtime, snapshot.deployment, bundle_file, bundle_path)
     };
 

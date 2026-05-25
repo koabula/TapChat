@@ -1099,6 +1099,8 @@ mod tests {
         let manager = RealtimeManager::new(Arc::new(RwLock::new(ProfileManagerInner {
             registry: ProfileRegistry::default(),
             active_profile: None,
+            locked_profile_path: None,
+            unlock_error: None,
         })));
 
         let first = manager

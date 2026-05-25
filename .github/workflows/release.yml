@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  RUST_MIN_STACK: 67108864
+
 jobs:
   build:
     strategy:
@@ -18,15 +21,19 @@ jobs:
           - platform: linux
             runner: ubuntu-latest
             target: ''
+            build_args: ''
           - platform: windows
             runner: windows-latest
             target: ''
+            build_args: ''
           - platform: macos-intel
             runner: macos-latest
             target: x86_64-apple-darwin
+            build_args: '--target x86_64-apple-darwin'
           - platform: macos-arm
             runner: macos-latest
             target: aarch64-apple-darwin
+            build_args: '--target aarch64-apple-darwin'
 
     runs-on: ${{ matrix.runner }}
 
@@ -39,11 +46,16 @@ jobs:
         with:
           node-version: 20
 
+      - name: Install Windows SQLCipher/OpenSSL build dependencies
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: choco install strawberryperl -y
+
       - name: Install Linux dependencies
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 gnome-keyring libdbus-1-dev
 
       - name: Bundle Linux Node.js runtime
         if: matrix.platform == 'linux'
@@ -116,6 +128,6 @@ jobs:
           releaseBody: 'See assets below for platform-specific installers.'
           releaseDraft: false
           prerelease: false
-          args: ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
+          args: ${{ matrix.build_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

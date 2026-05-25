@@ -237,6 +237,13 @@ pub async fn write_downloaded_attachment(
 
     // Use destination_id as an opaque platform destination. Absolute paths are
     // user-selected save paths; relative ids are written under attachments_dir.
+    if is_encrypted_cache_destination(&write.destination_id) {
+        log::debug!(
+            "write_downloaded_attachment: deferred encrypted cache materialization for {}",
+            write.destination_id
+        );
+        return Ok(Vec::new());
+    }
     let file_path = dir.join(&write.destination_id);
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)
@@ -257,4 +264,17 @@ pub async fn write_downloaded_attachment(
     // Core doesn't have a specific "AttachmentWritten" event, we'll use BlobTransferFailed with success
     // Actually, let's return an empty vec since this is a completion side-effect
     Ok(Vec::new())
+}
+
+fn is_encrypted_cache_destination(destination_id: &str) -> bool {
+    let path = std::path::Path::new(destination_id);
+    !path.is_absolute()
+        && path
+            .components()
+            .next()
+            .and_then(|component| match component {
+                std::path::Component::Normal(value) => value.to_str(),
+                _ => None,
+            })
+            .is_some_and(|first| first == "attachment-cache")
 }

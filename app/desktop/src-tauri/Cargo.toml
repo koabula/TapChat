@@ -61,6 +61,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 hmac = "0.12"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
-keyring = { version = "3", default-features = false, features = ["windows-native"] }
 open = "5"
 rand = "0.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent"] }

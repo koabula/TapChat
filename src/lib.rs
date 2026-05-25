@@ -7,6 +7,7 @@ pub mod desktop_app;
 pub mod error;
 pub mod ffi_api;
 pub mod identity;
+pub mod local_store;
 pub mod logging;
 pub mod mls_adapter;
 pub mod model;
