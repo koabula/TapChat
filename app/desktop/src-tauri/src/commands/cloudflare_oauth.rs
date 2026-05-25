@@ -19,7 +19,7 @@ const CLIENT_ID: &str = "54d11594-84e4-41aa-b438-e81b8fa78ee7";
 const REDIRECT_PORT: u16 = 8976;
 const REDIRECT_PATH: &str = "/oauth/callback";
 const TOKEN_URL: &str = "https://dash.cloudflare.com/oauth2/token";
-const AUTH_URL: &str = "https://dash.cloudflare.com/oauth2/authorize";
+const AUTH_URL: &str = "https://dash.cloudflare.com/oauth2/auth";
 const TOKEN_SERVICE: &str = "TapChat Cloudflare OAuth";
 const TOKEN_ACCOUNT: &str = "default";
 const SCOPES: &str = "account:read user:read workers:write workers_kv:write workers_scripts:write workers_tail:read d1:write offline_access";
@@ -76,6 +76,7 @@ pub async fn login() -> Result<OAuthTokens> {
     let code_verifier = generate_code_verifier();
     let code_challenge = generate_code_challenge(&code_verifier);
     let redirect_uri = redirect_uri();
+    let state = uuid::Uuid::new_v4().to_string();
 
     let mut auth_url = url::Url::parse(AUTH_URL)?;
     auth_url
@@ -84,7 +85,7 @@ pub async fn login() -> Result<OAuthTokens> {
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("scope", SCOPES)
-        .append_pair("state", &uuid::Uuid::new_v4().to_string())
+        .append_pair("state", &state)
         .append_pair("code_challenge", &code_challenge)
         .append_pair("code_challenge_method", "S256");
 
@@ -97,7 +98,7 @@ pub async fn login() -> Result<OAuthTokens> {
 
     let code = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        wait_for_oauth_code(listener),
+        wait_for_oauth_code(listener, &state),
     )
     .await
     .map_err(|_| anyhow!("OAuth timeout: no response within 120 seconds"))??;
@@ -303,7 +304,7 @@ async fn exchange_code_for_token(
         .context("decode Cloudflare token exchange response")
 }
 
-async fn wait_for_oauth_code(listener: TcpListener) -> Result<String> {
+async fn wait_for_oauth_code(listener: TcpListener, expected_state: &str) -> Result<String> {
     let (mut stream, addr) = listener.accept().await.context("accept OAuth callback")?;
     validate_loopback(addr)?;
     let mut buffer = vec![0u8; 8192];
@@ -322,21 +323,17 @@ async fn wait_for_oauth_code(listener: TcpListener) -> Result<String> {
         .ok_or_else(|| anyhow!("invalid OAuth callback request line"))?;
     let url = url::Url::parse(&format!("http://127.0.0.1:{REDIRECT_PORT}{path}"))
         .context("parse OAuth callback URL")?;
-    if url.path() != REDIRECT_PATH {
-        write_http_response(&mut stream, 404, "Not found").await?;
-        bail!("unexpected OAuth callback path {}", url.path());
-    }
-    if let Some(error) = url
-        .query_pairs()
-        .find_map(|(key, value)| (key == "error").then(|| value.into_owned()))
-    {
-        write_http_response(&mut stream, 400, "Authorization failed").await?;
-        bail!("Cloudflare OAuth error: {error}");
-    }
-    let code = url
-        .query_pairs()
-        .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
-        .ok_or_else(|| anyhow!("OAuth callback missing authorization code"))?;
+    let code = match oauth_code_from_callback_url(&url, expected_state) {
+        Ok(code) => code,
+        Err(error) => {
+            if url.path() == REDIRECT_PATH {
+                write_http_response(&mut stream, 400, "Authorization failed").await?;
+            } else {
+                write_http_response(&mut stream, 404, "Not found").await?;
+            }
+            return Err(error);
+        }
+    };
     write_http_response(
         &mut stream,
         200,
@@ -344,6 +341,28 @@ async fn wait_for_oauth_code(listener: TcpListener) -> Result<String> {
     )
     .await?;
     Ok(code)
+}
+
+fn oauth_code_from_callback_url(url: &url::Url, expected_state: &str) -> Result<String> {
+    if url.path() != REDIRECT_PATH {
+        bail!("unexpected OAuth callback path {}", url.path());
+    }
+    if let Some(error) = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "error").then(|| value.into_owned()))
+    {
+        bail!("Cloudflare OAuth error: {error}");
+    }
+    let state = url
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .ok_or_else(|| anyhow!("OAuth callback missing state"))?;
+    if state != expected_state {
+        bail!("OAuth callback state mismatch");
+    }
+    url.query_pairs()
+        .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+        .ok_or_else(|| anyhow!("OAuth callback missing authorization code"))
 }
 
 fn validate_loopback(addr: SocketAddr) -> Result<()> {
@@ -380,7 +399,7 @@ async fn write_http_response(
 }
 
 fn redirect_uri() -> String {
-    format!("http://127.0.0.1:{REDIRECT_PORT}{REDIRECT_PATH}")
+    format!("http://localhost:{REDIRECT_PORT}{REDIRECT_PATH}")
 }
 
 fn generate_code_verifier() -> String {
@@ -391,4 +410,40 @@ fn generate_code_verifier() -> String {
 
 fn generate_code_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redirect_uri_matches_cloudflare_registered_wrangler_callback() {
+        assert_eq!(redirect_uri(), "http://localhost:8976/oauth/callback");
+    }
+
+    #[test]
+    fn oauth_callback_requires_matching_state() {
+        let url =
+            url::Url::parse("http://localhost:8976/oauth/callback?code=abc123&state=actual-state")
+                .expect("valid callback url");
+
+        let error = oauth_code_from_callback_url(&url, "expected-state")
+            .expect_err("state mismatch must fail")
+            .to_string();
+
+        assert!(error.contains("state mismatch"));
+    }
+
+    #[test]
+    fn oauth_callback_extracts_authorization_code() {
+        let url = url::Url::parse(
+            "http://localhost:8976/oauth/callback?code=abc123&state=expected-state",
+        )
+        .expect("valid callback url");
+
+        let code = oauth_code_from_callback_url(&url, "expected-state")
+            .expect("matching callback should return authorization code");
+
+        assert_eq!(code, "abc123");
+    }
 }
