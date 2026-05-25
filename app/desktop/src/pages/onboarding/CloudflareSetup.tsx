@@ -114,6 +114,7 @@ export default function CloudflareSetup() {
       const result = await invoke<DeployResult>("cloudflare_deploy");
       if (result.success) {
         setDeployResult(result);
+        setDeploying(false);
       } else {
         setError(result.error || "Deployment failed.");
         setDeploying(false);

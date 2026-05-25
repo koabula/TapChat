@@ -60,6 +60,13 @@ pub async fn start_new_profile_onboarding(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    {
+        let inner = state.inner.read().await;
+        if let Err(e) = inner.ports.realtime.close_all_silent().await {
+            log::warn!("Failed to close realtime before onboarding: {}", e);
+        }
+    }
+
     // Set session state to Onboarding Welcome
     {
         let mut inner = state.inner.write().await;

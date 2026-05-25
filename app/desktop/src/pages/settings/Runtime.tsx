@@ -12,6 +12,9 @@ interface RuntimeStatus {
   supports_welcome_pickup: boolean;
   needs_upgrade: boolean;
   last_error: string | null;
+  state: string;
+  action: string | null;
+  details: string | null;
 }
 
 interface AccountInfo {
@@ -77,9 +80,13 @@ export default function Runtime() {
         }
       }
     });
+    const unlistenRuntime = listen<RuntimeStatus>("runtime-status-changed", (event) => {
+      setStatus(event.payload);
+    });
 
     return () => {
       unlisten.then((fn) => fn());
+      unlistenRuntime.then((fn) => fn());
     };
   }, []);
 
@@ -133,6 +140,7 @@ export default function Runtime() {
       }
     } catch (err) {
       setError(String(err));
+    } finally {
       setDeploying(false);
     }
   };
@@ -177,6 +185,11 @@ export default function Runtime() {
 
               {status?.bound && (
                 <div className="mt-3 space-y-2 text-sm">
+                  {status.state !== "ready" && (
+                    <div className="rounded bg-yellow-500/10 px-3 py-2 text-yellow-500">
+                      {runtimeStateMessage(status)}
+                    </div>
+                  )}
                   <CapabilityRow
                     label="Group outbox"
                     ok={status.supports_group_outbox}
@@ -326,7 +339,7 @@ export default function Runtime() {
             {/* Redeploy option */}
             {status?.bound && !status.needs_upgrade && !deploying && (
               <button className="btn btn-secondary w-full transition-fast" onClick={handleDeploy}>
-                Update / Redeploy
+                {status.state === "ready" ? "Update / Redeploy" : runtimeActionLabel(status)}
               </button>
             )}
 
@@ -344,6 +357,41 @@ export default function Runtime() {
       </div>
     </div>
   );
+}
+
+function runtimeStateMessage(status: RuntimeStatus): string {
+  if (status.details) return status.details;
+  if (status.last_error) return status.last_error;
+  switch (status.state) {
+    case "missing":
+      return "Cloudflare runtime is not deployed.";
+    case "writeback_incomplete":
+    case "incomplete":
+      return "Cloudflare runtime setup is incomplete.";
+    case "unreachable":
+      return "Cloudflare runtime is unreachable.";
+    case "outdated":
+      return "Cloudflare runtime needs an upgrade.";
+    case "auth_expired":
+      return "Cloudflare runtime authorization needs refresh.";
+    default:
+      return "Cloudflare runtime needs attention.";
+  }
+}
+
+function runtimeActionLabel(status: RuntimeStatus): string {
+  switch (status.action) {
+    case "upgrade":
+      return "Upgrade Runtime";
+    case "retry_writeback":
+      return "Repair Runtime";
+    case "refresh_auth":
+      return "Refresh Runtime Auth";
+    case "redeploy":
+      return "Redeploy Runtime";
+    default:
+      return "Update / Redeploy";
+  }
 }
 
 function CapabilityRow({ label, ok }: { label: string; ok: boolean }) {

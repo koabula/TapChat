@@ -1,26 +1,31 @@
 //! Cloudflare deployment commands for Desktop App
 //!
-//! Uses embedded minimal wrangler for OAuth login and REST API for deployment.
+//! Uses Rust Cloudflare OAuth and REST API deployment.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use tapchat_core::cli::profile::RuntimeMetadata;
+use tapchat_core::cli::profile::{Profile, RuntimeMetadata};
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
 use tapchat_core::cli::util::to_snake_case_json_string;
 use tapchat_core::model::DeploymentBundle;
 use tapchat_core::persistence::PersistedDeployment;
-use tapchat_core::CoreCommand;
+use tapchat_core::{CoreCommand, CoreEvent};
 
 use crate::commands::cloudflare_rest::{
-    self, DeployPhase, DeployProgress, DeployResult, OAuthTokens, WhoamiResult, WorkerDeployConfig,
+    self, DeployPhase, DeployProgress, DeployResult, WorkerDeployConfig,
 };
+use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
+use crate::state::SessionState;
 use crate::timetest;
+
+static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Preflight check result
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +69,9 @@ pub struct CloudflareRuntimeStatus {
     pub supports_welcome_pickup: bool,
     pub needs_upgrade: bool,
     pub last_error: Option<String>,
+    pub state: String,
+    pub action: Option<String>,
+    pub details: Option<String>,
 }
 
 const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
@@ -97,6 +105,27 @@ fn status_from_features(
             && has_message_requests
             && has_short_group_invite
             && has_group_member_subscribe);
+    let (state, action, details) = if !bound {
+        (
+            "missing".to_string(),
+            Some("deploy".to_string()),
+            Some("Cloudflare runtime is not deployed.".to_string()),
+        )
+    } else if last_error.is_some() {
+        (
+            "unreachable".to_string(),
+            Some("redeploy".to_string()),
+            last_error.clone(),
+        )
+    } else if needs_upgrade {
+        (
+            "outdated".to_string(),
+            Some("upgrade".to_string()),
+            Some("Cloudflare runtime is missing required features.".to_string()),
+        )
+    } else {
+        ("ready".to_string(), None, None)
+    };
     CloudflareRuntimeStatus {
         bound,
         endpoint,
@@ -105,7 +134,26 @@ fn status_from_features(
         supports_welcome_pickup,
         needs_upgrade,
         last_error,
+        state,
+        action,
+        details,
     }
+}
+
+fn runtime_status(
+    state: &str,
+    action: Option<&str>,
+    bound: bool,
+    endpoint: Option<String>,
+    features: Vec<String>,
+    last_error: Option<String>,
+    details: Option<String>,
+) -> CloudflareRuntimeStatus {
+    let mut status = status_from_features(bound, endpoint, features, last_error);
+    status.state = state.to_string();
+    status.action = action.map(str::to_string);
+    status.details = details;
+    status
 }
 
 pub async fn runtime_status_for_deployment(
@@ -277,72 +325,6 @@ fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathB
     None
 }
 
-/// Resolve embedded Node.js binary.
-///
-/// Looks for `embedded/node/node` (macOS/Linux) or `embedded/node/node.exe` (Windows).
-fn resolve_embedded_node(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
-    let runtime_root = resolve_embedded_runtime_root(app_handle)?;
-    let node_name = if cfg!(windows) { "node.exe" } else { "node" };
-    let node_path = runtime_root.join("node").join(node_name);
-    if node_path.exists() {
-        return Some(node_path);
-    }
-    None
-}
-
-/// Run embedded wrangler script (login.mjs or whoami.mjs)
-async fn run_wrangler_script(
-    app_handle: Option<&AppHandle>,
-    script_name: &str,
-) -> Result<String, String> {
-    let runtime_root = resolve_embedded_runtime_root(app_handle)
-        .ok_or_else(|| "Embedded runtime not found. Please reinstall TapChat.")?;
-
-    let script_path = runtime_root.join("wrangler").join(script_name);
-
-    if !script_path.exists() {
-        return Err(format!(
-            "Script {} not found in embedded runtime",
-            script_name
-        ));
-    }
-
-    // Get Node.js path — prefer embedded, fall back to system "node"
-    let node_path = resolve_embedded_node(app_handle).unwrap_or_else(|| PathBuf::from("node"));
-
-    // Run script
-    let output = tokio::process::Command::new(&node_path)
-        .arg(&script_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run {}: {}", script_name, e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(format!("{} failed: {}", script_name, stderr.trim()));
-    }
-
-    Ok(stdout)
-}
-
-/// Parse JSON output from wrangler scripts
-fn parse_wrangler_output<T: serde::de::DeserializeOwned>(output: &str) -> Result<T, String> {
-    // Output may have multiple JSON lines, we want the last one (final result)
-    let json_lines = output
-        .lines()
-        .filter(|line| line.trim().starts_with('{'))
-        .collect::<Vec<_>>();
-
-    let json = json_lines
-        .last()
-        .ok_or_else(|| "No JSON output found".to_string())?;
-
-    serde_json::from_str(json)
-        .map_err(|e| format!("Failed to parse JSON output: {} (input: {})", e, json))
-}
-
 /// Check preflight status
 #[tauri::command]
 pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, String> {
@@ -351,29 +333,21 @@ pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, Str
     // Check if embedded runtime is available
     let embedded_available = resolve_embedded_runtime_root(app_ref).is_some();
 
-    // Run whoami to check authentication
-    let whoami_result = run_wrangler_script(app_ref, "whoami.mjs").await;
-
-    // Determine token_stored before matching
+    // Rust OAuth/whoami; falls back to legacy Wrangler token reading, but never
+    // launches Node.
+    let whoami_result = crate::commands::cloudflare_oauth::whoami().await;
     let token_stored = whoami_result.is_ok();
-
-    let (authenticated, account) = match whoami_result {
-        Ok(output) => {
-            let whoami: WhoamiResult = parse_wrangler_output(&output)?;
-
-            if whoami.authenticated {
-                let account = whoami.accounts.first().map(|a| AccountInfo {
-                    account_id: a.account_id.clone(),
-                    account_name: a.account_name.clone(),
-                    email: whoami.email.clone(),
-                });
-
-                (true, account)
-            } else {
-                (false, None)
-            }
+    let (authenticated, account, auth_error) = match whoami_result {
+        Ok(whoami) if whoami.authenticated => {
+            let account = whoami.accounts.first().map(|a| AccountInfo {
+                account_id: a.account_id.clone(),
+                account_name: a.account_name.clone(),
+                email: whoami.email.clone(),
+            });
+            (account.is_some(), account, None)
         }
-        Err(_) => (false, None),
+        Ok(whoami) => (false, None, whoami.error),
+        Err(error) => (false, None, Some(error.to_string())),
     };
 
     // Determine if ready
@@ -381,7 +355,9 @@ pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, Str
     let error = if !embedded_available {
         Some("Embedded runtime not found. Please reinstall TapChat.".into())
     } else if !authenticated {
-        Some("Not logged in to Cloudflare. Click 'Connect Cloudflare' to authorize.".into())
+        Some(auth_error.unwrap_or_else(|| {
+            "Not logged in to Cloudflare. Click 'Connect Cloudflare' to authorize.".into()
+        }))
     } else {
         None
     };
@@ -399,8 +375,6 @@ pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, Str
 /// Perform OAuth login
 #[tauri::command]
 pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
-    let app_ref = Some(&app);
-
     // Emit progress
     let _ = app.emit(
         "cloudflare-progress",
@@ -411,11 +385,9 @@ pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
         },
     );
 
-    // Run login script
-    let login_output = run_wrangler_script(app_ref, "login.mjs").await?;
-
-    // Parse result
-    let login_result: OAuthTokens = parse_wrangler_output(&login_output)?;
+    let login_result = crate::commands::cloudflare_oauth::login()
+        .await
+        .map_err(|error| error.to_string())?;
 
     if !login_result.success {
         return Ok(LoginResult {
@@ -449,6 +421,21 @@ pub async fn cloudflare_deploy(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<DeployResult, String> {
+    if CLOUDFLARE_DEPLOY_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(DeployResult {
+            success: false,
+            worker_name: "".into(),
+            worker_url: "".into(),
+            error: Some("Cloudflare deployment already in progress.".into()),
+            account_id: None,
+            bucket_name: None,
+            preview_bucket_name: None,
+        });
+    }
+    let _deploy_guard = DeployProgressGuard;
     let deploy_start = std::time::Instant::now();
     let abs_start = crate::ts_ms();
     timetest!("deploy_begin ts={}", abs_start);
@@ -484,7 +471,7 @@ pub async fn cloudflare_deploy(
 
     drop(inner);
 
-    // Run whoami to get OAuth token
+    // Run Rust whoami to get OAuth token/account without launching Node.
     let _ = app.emit(
         "cloudflare-progress",
         DeployProgress {
@@ -494,8 +481,9 @@ pub async fn cloudflare_deploy(
         },
     );
 
-    let whoami_output = run_wrangler_script(Some(&app), "whoami.mjs").await?;
-    let whoami: WhoamiResult = parse_wrangler_output(&whoami_output)?;
+    let whoami = crate::commands::cloudflare_oauth::whoami()
+        .await
+        .map_err(|error| error.to_string())?;
 
     if !whoami.authenticated {
         return Ok(DeployResult {
@@ -515,8 +503,8 @@ pub async fn cloudflare_deploy(
         .or_else(|| whoami.accounts.first().map(|a| a.account_id.clone()))
         .ok_or_else(|| "No Cloudflare account found".to_string())?;
 
-    // Load OAuth token from stored location (wrangler config)
-    let api_token = load_oauth_token()?;
+    let api_token = crate::commands::cloudflare_oauth::load_access_token()
+        .map_err(|error| error.to_string())?;
 
     // Load embedded Worker script
     let runtime_root = resolve_embedded_runtime_root(Some(&app))
@@ -524,17 +512,43 @@ pub async fn cloudflare_deploy(
 
     let worker_script = cloudflare_rest::load_embedded_worker_script(&runtime_root)?;
 
-    // Generate deployment config
+    // Generate deployment config. Redeploy/upgrade reuses existing runtime
+    // names and secrets so the same Worker/storage remain authoritative.
     let defaults = derive_cloudflare_defaults(&profile_name, &user_id, &device_id);
+    let existing_runtime = {
+        let inner = state.inner.read().await;
+        inner.profile_manager.get_runtime_metadata().await
+    };
 
     let config = WorkerDeployConfig {
-        worker_name: defaults.worker_name,
-        public_base_url: Some(defaults.public_base_url).filter(|s| !s.is_empty()),
-        deployment_region: defaults.deployment_region,
-        bucket_name: defaults.bucket_name,
-        preview_bucket_name: defaults.preview_bucket_name,
-        sharing_token_secret: defaults.sharing_token_secret,
-        bootstrap_token_secret: defaults.bootstrap_token_secret,
+        worker_name: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_name.clone())
+            .unwrap_or(defaults.worker_name),
+        public_base_url: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.public_base_url.clone().or(runtime.base_url.clone()))
+            .or_else(|| Some(defaults.public_base_url).filter(|s| !s.is_empty())),
+        deployment_region: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.deployment_region.clone())
+            .unwrap_or(defaults.deployment_region),
+        bucket_name: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.bucket_name.clone())
+            .unwrap_or(defaults.bucket_name),
+        preview_bucket_name: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.preview_bucket_name.clone())
+            .unwrap_or(defaults.preview_bucket_name),
+        sharing_token_secret: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.sharing_secret.clone())
+            .unwrap_or(defaults.sharing_token_secret),
+        bootstrap_token_secret: existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.bootstrap_secret.clone())
+            .unwrap_or(defaults.bootstrap_token_secret),
         max_inline_bytes: 4096,
         retention_days: 30,
         rate_limit_per_minute: 60,
@@ -618,6 +632,17 @@ pub async fn cloudflare_deploy(
     .await
     .map_err(|e| format!("Import deployment failed: {}", e))?;
 
+    let deployment_bundle = {
+        let inner = state.inner.read().await;
+        inner
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .as_ref()
+            .map(|deployment| deployment.deployment_bundle.clone())
+            .ok_or_else(|| "Import deployment did not update engine snapshot".to_string())?
+    };
+
     let pending_group_ids = {
         let inner = state.inner.read().await;
         inner
@@ -642,9 +667,9 @@ pub async fn cloudflare_deploy(
         .map_err(|e| format!("Retry pending group outbox failed: {}", e))?;
     }
 
-    // Save runtime metadata
+    // Save runtime metadata and deployment bundle, then verify all runtime
+    // persistence surfaces agree.
     {
-        let inner = state.inner.read().await;
         let service_root = resolve_embedded_runtime_root(Some(&app));
 
         let runtime = RuntimeMetadata {
@@ -667,14 +692,10 @@ pub async fn cloudflare_deploy(
             deployment_region: Some(config.deployment_region.clone()),
             bucket_name: Some(config.bucket_name.clone()),
             preview_bucket_name: Some(config.preview_bucket_name.clone()),
-            last_deployed_at: None,
+            last_deployed_at: Some(chrono::Utc::now().to_rfc3339()),
         };
 
-        inner
-            .profile_manager
-            .save_runtime_metadata(&runtime)
-            .await
-            .map_err(|e| format!("Save runtime metadata failed: {}", e))?;
+        persist_runtime_writeback(&state, &deployment_bundle, &runtime, &result.worker_url).await?;
     }
 
     let _ = app.emit(
@@ -694,48 +715,120 @@ pub async fn cloudflare_deploy(
         abs_start + ((elapsed_secs * 1000.0) as u128)
     );
 
+    restart_runtime_session_after_deploy(&app, &state, &device_id).await;
+
     Ok(result)
 }
 
-/// Load OAuth token from wrangler config file
-fn load_oauth_token() -> Result<String, String> {
-    use std::fs;
+struct DeployProgressGuard;
 
-    let config_file = dirs::home_dir()
-        .ok_or_else(|| "Cannot determine home directory".to_string())?
-        .join(".wrangler")
-        .join("config")
-        .join("default.toml");
-
-    if !config_file.exists() {
-        return Err("OAuth token not found. Please login first.".into());
+impl Drop for DeployProgressGuard {
+    fn drop(&mut self) {
+        CLOUDFLARE_DEPLOY_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
+}
 
-    let content = fs::read_to_string(&config_file)
-        .map_err(|e| format!("Failed to read token file: {}", e))?;
+async fn persist_runtime_writeback(
+    state: &State<'_, AppState>,
+    deployment_bundle: &DeploymentBundle,
+    runtime: &RuntimeMetadata,
+    expected_worker_url: &str,
+) -> Result<(), String> {
+    let snapshot = {
+        let inner = state.inner.read().await;
+        inner.engine.refresh_snapshot()
+    };
 
-    // Parse simple TOML format: oauth_token = "..."
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("oauth_token") {
-            // Extract value between quotes
-            let start = trimmed
-                .find('"')
-                .ok_or_else(|| "Invalid token format".to_string())?;
-            let end = trimmed
-                .rfind('"')
-                .ok_or_else(|| "Invalid token format".to_string())?;
+    {
+        let inner = state.inner.read().await;
+        let mut pm_inner = inner.profile_manager.inner.write().await;
+        let profile = pm_inner
+            .active_profile
+            .as_mut()
+            .ok_or_else(|| "writeback_incomplete: active profile is missing".to_string())?;
+        profile
+            .save_snapshot(&snapshot)
+            .map_err(|e| format!("writeback_incomplete: save snapshot failed: {e}"))?;
+        profile
+            .save_deployment_bundle(deployment_bundle)
+            .map_err(|e| format!("writeback_incomplete: save deployment bundle failed: {e}"))?;
+        profile
+            .save_runtime_metadata(runtime)
+            .map_err(|e| format!("writeback_incomplete: save runtime metadata failed: {e}"))?;
 
-            if start < end {
-                let token = trimmed[start + 1..end].to_string();
-                if !token.is_empty() {
-                    return Ok(token);
-                }
-            }
+        let reloaded_snapshot = profile
+            .load_snapshot()
+            .map_err(|e| format!("writeback_incomplete: reload snapshot failed: {e}"))?;
+        let reloaded_runtime = profile
+            .load_runtime_metadata()
+            .map_err(|e| format!("writeback_incomplete: reload runtime metadata failed: {e}"))?;
+        let bundle_path = profile
+            .metadata()
+            .deployment_bundle_path
+            .clone()
+            .ok_or_else(|| {
+                "writeback_incomplete: profile metadata missing deployment_bundle_path".to_string()
+            })?;
+        let reloaded_bundle = Profile::load_deployment_bundle_file(bundle_path)
+            .map_err(|e| format!("writeback_incomplete: reload deployment bundle failed: {e}"))?;
+        let snapshot_endpoint = reloaded_snapshot
+            .deployment
+            .as_ref()
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone())
+            .ok_or_else(|| "writeback_incomplete: snapshot missing deployment".to_string())?;
+        let runtime_endpoint = reloaded_runtime
+            .public_base_url
+            .clone()
+            .or(reloaded_runtime.base_url.clone())
+            .ok_or_else(|| "writeback_incomplete: runtime metadata missing endpoint".to_string())?;
+        if snapshot_endpoint != expected_worker_url
+            || runtime_endpoint != expected_worker_url
+            || reloaded_bundle.inbox_http_endpoint != expected_worker_url
+        {
+            return Err(format!(
+                "writeback_incomplete: endpoint mismatch snapshot={snapshot_endpoint} runtime={runtime_endpoint} bundle={} expected={expected_worker_url}",
+                reloaded_bundle.inbox_http_endpoint
+            ));
         }
     }
 
-    Err("OAuth token not found in config file".into())
+    Ok(())
+}
+
+async fn restart_runtime_session_after_deploy(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    device_id: &str,
+) {
+    {
+        let inner = state.inner.read().await;
+        if let Err(error) = inner.ports.realtime.close_all_silent().await {
+            log::warn!("cloudflare_deploy: failed to close old realtime sessions: {error}");
+        }
+    }
+    set_ws_connection_snapshot(state, Some(device_id.to_string()), false).await;
+    {
+        let mut inner = state.inner.write().await;
+        inner.session = SessionState::Active {
+            device_id: device_id.to_string(),
+        };
+    }
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "active".into(),
+            device_id: Some(device_id.to_string()),
+            ws_connected: false,
+            profile_path: None,
+            error: None,
+        },
+    );
+    if let Ok(status) = cloudflare_status_impl(state).await {
+        let _ = app.emit("runtime-status-changed", status);
+    }
+    if let Err(error) = drive_core_with_handle(app, CoreInput::Event(CoreEvent::AppStarted)).await {
+        log::warn!("cloudflare_deploy: runtime deployed but AppStarted failed: {error}");
+    }
 }
 
 /// Check deployment status
@@ -743,10 +836,100 @@ fn load_oauth_token() -> Result<String, String> {
 pub async fn cloudflare_status(
     state: State<'_, AppState>,
 ) -> Result<CloudflareRuntimeStatus, String> {
-    let inner = state.inner.read().await;
+    cloudflare_status_impl(&state).await
+}
 
-    let deployment = inner.engine.refresh_snapshot().deployment;
-    drop(inner);
+async fn cloudflare_status_impl(
+    state: &State<'_, AppState>,
+) -> Result<CloudflareRuntimeStatus, String> {
+    let (runtime, snapshot_deployment, bundle_file, metadata_bundle_path) = {
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        let Some(profile) = pm_inner.active_profile.as_ref() else {
+            return Ok(runtime_status(
+                "missing",
+                Some("deploy"),
+                false,
+                None,
+                Vec::new(),
+                None,
+                Some("No active profile is loaded.".into()),
+            ));
+        };
+        let runtime = profile.load_runtime_metadata().map_err(|e| e.to_string())?;
+        let snapshot = profile.load_snapshot().map_err(|e| e.to_string())?;
+        let bundle_path = profile.metadata().deployment_bundle_path.clone();
+        let bundle_file = bundle_path
+            .as_ref()
+            .and_then(|path| Profile::load_deployment_bundle_file(path).ok());
+        (runtime, snapshot.deployment, bundle_file, bundle_path)
+    };
 
-    Ok(runtime_status_for_deployment(deployment).await)
+    let endpoint = runtime.public_base_url.clone().or(runtime.base_url.clone());
+    if endpoint.is_none() && snapshot_deployment.is_none() && bundle_file.is_none() {
+        return Ok(runtime_status(
+            "missing",
+            Some("deploy"),
+            false,
+            None,
+            Vec::new(),
+            None,
+            Some("Cloudflare runtime is not deployed.".into()),
+        ));
+    }
+
+    let Some(deployment) = snapshot_deployment else {
+        return Ok(runtime_status(
+            "writeback_incomplete",
+            Some("retry_writeback"),
+            endpoint.is_some(),
+            endpoint,
+            bundle_file
+                .map(|bundle| bundle.runtime_config.features)
+                .unwrap_or_default(),
+            None,
+            Some("Runtime metadata exists, but the encrypted snapshot is missing the deployment bundle.".into()),
+        ));
+    };
+
+    let snapshot_endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
+    let endpoint = endpoint.unwrap_or_else(|| snapshot_endpoint.clone());
+    let bundle_endpoint = bundle_file
+        .as_ref()
+        .map(|bundle| bundle.inbox_http_endpoint.clone());
+    if metadata_bundle_path.is_none()
+        || bundle_endpoint.as_deref() != Some(snapshot_endpoint.as_str())
+        || endpoint != snapshot_endpoint
+    {
+        return Ok(runtime_status(
+            "writeback_incomplete",
+            Some("retry_writeback"),
+            true,
+            Some(endpoint),
+            deployment.deployment_bundle.runtime_config.features.clone(),
+            None,
+            Some(
+                "Runtime metadata, deployment bundle file, and snapshot are not consistent.".into(),
+            ),
+        ));
+    }
+
+    let mut status = runtime_status_for_deployment(Some(deployment.clone())).await;
+    if status.state == "ready" && device_runtime_auth_expired(&deployment) {
+        status.state = "auth_expired".into();
+        status.action = Some("refresh_auth".into());
+        status.details = Some("Device runtime authorization is missing or expired.".into());
+    }
+    Ok(status)
+}
+
+fn device_runtime_auth_expired(deployment: &PersistedDeployment) -> bool {
+    let Some(auth) = deployment.deployment_bundle.device_runtime_auth.as_ref() else {
+        return true;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    auth.expires_at <= now
 }

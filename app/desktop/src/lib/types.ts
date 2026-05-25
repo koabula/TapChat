@@ -337,10 +337,16 @@ export type RecoveryEscalationReason =
 
 // Cloudflare
 export interface PreflightResult {
-  wrangler_installed: boolean;
-  wrangler_logged_in: boolean;
+  authenticated: boolean;
+  token_stored: boolean;
+  embedded_available: boolean;
   ready: boolean;
-  error?: string;
+  error?: string | null;
+  account?: {
+    account_id: string;
+    account_name: string;
+    email?: string | null;
+  } | null;
 }
 
 export interface CloudflareProgressEvent {
@@ -358,6 +364,25 @@ export interface CloudflareStatus {
   supports_welcome_pickup: boolean;
   needs_upgrade: boolean;
   last_error?: string | null;
+  state:
+    | "ready"
+    | "missing"
+    | "incomplete"
+    | "unreachable"
+    | "outdated"
+    | "auth_expired"
+    | "writeback_incomplete"
+    | string;
+  action?:
+    | "connect_cloudflare"
+    | "deploy"
+    | "redeploy"
+    | "upgrade"
+    | "retry_writeback"
+    | "refresh_auth"
+    | null
+    | string;
+  details?: string | null;
 }
 
 // Session

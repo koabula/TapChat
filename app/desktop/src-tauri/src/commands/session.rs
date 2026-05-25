@@ -111,6 +111,16 @@ async fn run_gated_sync(
     };
 
     {
+        let inner = state.inner.read().await;
+        if inner.engine.refresh_snapshot().deployment.is_none() {
+            return Err(
+                "runtime_missing: Cloudflare runtime is not configured. Open Settings > Runtime to deploy or repair it."
+                    .into(),
+            );
+        }
+    }
+
+    {
         let mut gate = state.sync_gate.lock().await;
         if gate.in_flight {
             gate.pending = true;

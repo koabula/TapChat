@@ -1,5 +1,6 @@
 pub mod attachment_settings;
 pub mod cloudflare;
+pub mod cloudflare_oauth;
 pub mod cloudflare_rest;
 pub mod contact;
 pub mod conversation;

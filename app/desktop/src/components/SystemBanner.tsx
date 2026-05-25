@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { useNavigate } from "react-router";
 import {
   RefreshCw,
   AlertTriangle,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 
 import type {
+  CloudflareStatus,
   CoreUpdateEvent,
   RealtimeEventPayload,
   SystemBanner as SystemBannerItem,
@@ -53,7 +55,9 @@ function visibleBanners(banners: SystemBannerItem[] | undefined): SystemBannerIt
  * Appears at the top of the main chat layout when there are user-visible banners.
  */
 export default function SystemBanner() {
+  const navigate = useNavigate();
   const [banners, setBanners] = useState<SystemBannerItem[]>([]);
+  const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -69,18 +73,55 @@ export default function SystemBanner() {
     };
   }, [dismissed]);
 
+  useEffect(() => {
+    const refreshRuntime = () => {
+      invoke<CloudflareStatus>("cloudflare_status")
+        .then(setRuntimeStatus)
+        .catch((err) => {
+          console.debug(`[SystemBanner] cloudflare_status failed: ${String(err)}`);
+        });
+    };
+    refreshRuntime();
+    const unlisten = listen<CloudflareStatus>("runtime-status-changed", (event) => {
+      setRuntimeStatus(event.payload);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   const handleDismiss = (banner: SystemBannerItem) => {
     const key = bannerKey(banner);
     setDismissed((prev) => new Set([...prev, key]));
     setBanners((prev) => prev.filter((item) => bannerKey(item) !== key));
   };
 
-  if (banners.length === 0) {
+  const runtimeBanner = runtimeBannerForStatus(runtimeStatus);
+
+  if (banners.length === 0 && !runtimeBanner) {
     return null;
   }
 
   return (
     <div className="fixed top-0 left-0 right-0 z-50 flex flex-col gap-1 p-2">
+      {runtimeBanner && (
+        <div className="flex items-center justify-between rounded-lg bg-aurora.orange px-3 py-2 text-polar.1 shadow-lg">
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={18} />
+            <span className="text-sm font-medium">{runtimeBanner.message}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {runtimeBanner.actionLabel && (
+              <button
+                className="rounded bg-polar.1/20 px-2 py-1 text-xs font-medium hover:bg-polar.1/30"
+                onClick={() => navigate("/settings/runtime")}
+              >
+                {runtimeBanner.actionLabel}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       {banners.map((banner) => (
         <div
           key={bannerKey(banner)}
@@ -100,6 +141,48 @@ export default function SystemBanner() {
       ))}
     </div>
   );
+}
+
+function runtimeBannerForStatus(status: CloudflareStatus | null): {
+  message: string;
+  actionLabel?: string;
+} | null {
+  if (!status || status.state === "ready") {
+    return null;
+  }
+  switch (status.state) {
+    case "missing":
+      return {
+        message: "Cloudflare runtime is not deployed.",
+        actionLabel: "Deploy",
+      };
+    case "incomplete":
+    case "writeback_incomplete":
+      return {
+        message: status.details || "Cloudflare runtime setup is incomplete.",
+        actionLabel: "Repair",
+      };
+    case "outdated":
+      return {
+        message: "Cloudflare runtime needs an upgrade.",
+        actionLabel: "Upgrade",
+      };
+    case "unreachable":
+      return {
+        message: status.last_error || "Cloudflare runtime is unreachable.",
+        actionLabel: "Redeploy",
+      };
+    case "auth_expired":
+      return {
+        message: "Cloudflare runtime authorization needs refresh.",
+        actionLabel: "Refresh",
+      };
+    default:
+      return {
+        message: status.details || status.last_error || "Cloudflare runtime needs attention.",
+        actionLabel: "Open",
+      };
+  }
 }
 
 /**

@@ -158,6 +158,14 @@ function AppInner() {
   }
 
   const isOnboarding = sessionState.startsWith("onboarding") || sessionState === "uninitialized";
+  const onboardingDefaultRoute =
+    sessionState === "onboarding:cloudflaresetup"
+      ? "/onboarding/cloudflare"
+      : sessionState === "onboarding:backupmnemonic"
+        ? "/onboarding/backup"
+        : sessionState === "onboarding:createidentity" || sessionState === "onboarding:recoveridentity"
+          ? "/onboarding/identity"
+          : "/onboarding";
 
   return (
     <>
@@ -176,7 +184,7 @@ function AppInner() {
             <Route path="/onboarding/backup" element={<BackupMnemonic />} />
             <Route path="/onboarding/cloudflare" element={<CloudflareSetup />} />
             <Route path="/onboarding/complete" element={<Complete />} />
-            <Route path="*" element={<Navigate to="/onboarding" replace />} />
+            <Route path="*" element={<Navigate to={onboardingDefaultRoute} replace />} />
           </>
         )}
 

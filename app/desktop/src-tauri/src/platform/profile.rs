@@ -138,14 +138,20 @@ impl ProfileManager {
 
         let has_runtime_binding = profile
             .map(|p| {
-                // Check if runtime metadata exists and has base_url
-                p.load_runtime_metadata()
-                    .map(|r| r.base_url.is_some())
-                    .unwrap_or(false)
+                let runtime_bound = p
+                    .load_runtime_metadata()
+                    .map(|r| r.base_url.is_some() || r.public_base_url.is_some())
+                    .unwrap_or(false);
+                let snapshot_bound = p
+                    .load_snapshot()
+                    .map(|snapshot| snapshot.deployment.is_some())
+                    .unwrap_or(false);
+                runtime_bound && snapshot_bound
             })
             .unwrap_or(false);
 
-        let needs_onboarding = unlock_error.is_none() && (!has_active_profile || !has_identity);
+        let needs_onboarding = unlock_error.is_none()
+            && (!has_active_profile || !has_identity || !has_runtime_binding);
 
         SessionStartupCheck {
             has_active_profile,
