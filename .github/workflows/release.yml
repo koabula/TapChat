@@ -131,6 +131,8 @@ jobs:
             build_args: '--target aarch64-apple-darwin'
 
     runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - uses: actions/checkout@v4
