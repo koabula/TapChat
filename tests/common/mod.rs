@@ -23,6 +23,8 @@ use serde_json::Value;
 use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth};
 use tempfile::{Builder, TempDir};
 
+const DESKTOP_E2E_PROFILE_PASSPHRASE: &str = "Correct-Horse-42-Sunrise-Desktop-E2e";
+
 /// Locate the `tapchat` CLI binary that cargo builds before running
 /// integration tests.
 pub fn binary_path() -> PathBuf {
@@ -43,10 +45,7 @@ pub fn workspace_root() -> PathBuf {
 /// prefixes) can sweep them up.
 pub fn repo_temp_dir(suffix: &str) -> Result<TempDir> {
     unsafe {
-        std::env::set_var(
-            "TAPCHAT_PROFILE_PASSPHRASE",
-            "tapchat-desktop-e2e-profile-passphrase",
-        );
+        std::env::set_var("TAPCHAT_PROFILE_PASSPHRASE", DESKTOP_E2E_PROFILE_PASSPHRASE);
     }
     Builder::new()
         .prefix(&format!(".tmp-desktop-e2e-{suffix}-"))
@@ -74,7 +73,7 @@ where
         .env(
             "TAPCHAT_PROFILE_PASSPHRASE",
             std::env::var("TAPCHAT_PROFILE_PASSPHRASE")
-                .unwrap_or_else(|_| "tapchat-desktop-e2e-profile-passphrase".into()),
+                .unwrap_or_else(|_| DESKTOP_E2E_PROFILE_PASSPHRASE.into()),
         );
     for arg in args {
         command.arg(arg.as_ref());

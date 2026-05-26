@@ -190,26 +190,41 @@ impl CliApp {
             DeviceSubcommand::Create {
                 profile,
                 device_name,
+                display_name,
                 mnemonic_file,
             } => {
-                self.run_identity_command(profile, device_name, mnemonic_file, false)
+                self.run_identity_command(profile, device_name, display_name, mnemonic_file, false)
                     .await
             }
             DeviceSubcommand::Recover {
                 profile,
                 device_name,
+                display_name,
                 mnemonic_file,
             } => {
-                self.run_identity_command(profile, device_name, Some(mnemonic_file), false)
-                    .await
+                self.run_identity_command(
+                    profile,
+                    device_name,
+                    display_name,
+                    Some(mnemonic_file),
+                    false,
+                )
+                .await
             }
             DeviceSubcommand::Add {
                 profile,
                 device_name,
+                display_name,
                 mnemonic_file,
             } => {
-                self.run_identity_command(profile, device_name, Some(mnemonic_file), true)
-                    .await
+                self.run_identity_command(
+                    profile,
+                    device_name,
+                    display_name,
+                    Some(mnemonic_file),
+                    true,
+                )
+                .await
             }
             DeviceSubcommand::RotateKeyPackage { profile } => {
                 let mut profile = Profile::open(resolve_profile_path(profile)?)?;
@@ -1772,6 +1787,7 @@ impl CliApp {
         &self,
         profile_root: Option<PathBuf>,
         device_name: String,
+        display_name: Option<String>,
         mnemonic_file: Option<PathBuf>,
         additional: bool,
     ) -> Result<()> {
@@ -1785,12 +1801,13 @@ impl CliApp {
             CoreCommand::CreateAdditionalDeviceIdentity {
                 mnemonic,
                 device_name: Some(device_name),
+                display_name,
             }
         } else {
             CoreCommand::CreateOrLoadIdentity {
                 mnemonic,
                 device_name: Some(device_name),
-                display_name: None,
+                display_name,
             }
         };
         driver.run_command_until_idle(command).await?;
@@ -1801,6 +1818,7 @@ impl CliApp {
         self.print_value(&serde_json::json!({
             "user_id": identity.user_identity.user_id,
             "device_id": identity.device_identity.device_id,
+            "display_name": driver.local_display_name(),
             "mnemonic": identity.mnemonic,
         }))
     }

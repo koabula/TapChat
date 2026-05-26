@@ -21,6 +21,7 @@ import type {
   CoreUpdateEvent,
   ConversationSummary,
   ContactSummary,
+  LocalIdentitySummary,
   MessageRequestItem,
 } from "../lib/types";
 
@@ -36,6 +37,13 @@ function mapContacts(contacts: ContactSummary[]) {
 
 async function fetchConversationSnapshot(): Promise<ConversationSummary[]> {
   return invoke<ConversationSummary[]>("list_conversations");
+}
+
+export function applyIdentitySummaryToSession(identity: LocalIdentitySummary) {
+  const session = useSessionStore.getState();
+  session.setUserId(identity.user_id);
+  session.setDeviceId(identity.device_id);
+  session.setDisplayName(identity.display_name ?? null);
 }
 
 /**
@@ -255,10 +263,14 @@ export function useCoreUpdate() {
       const { state_update, view_model } = event.payload;
 
       console.debug(
-        `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
+        `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} identity_changed=${state_update.identity_changed ?? false} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
       );
 
       let nextContacts = useContactsStore.getState().contacts;
+
+      if (state_update.identity_changed && view_model?.identity) {
+        applyIdentitySummaryToSession(view_model.identity);
+      }
 
       if (state_update.contacts_changed && view_model?.contacts) {
         nextContacts = mapContacts(view_model.contacts);

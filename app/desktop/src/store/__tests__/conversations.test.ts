@@ -59,4 +59,26 @@ describe("conversation store snapshot merging", () => {
       .conversations.map((conversation) => conversation.conversation_id);
     expect(ids).toEqual(["conv:group", "conv:direct"]);
   });
+
+  test("authoritative contact snapshot clears stale direct display names", () => {
+    useConversationsStore
+      .getState()
+      .setConversations([baseConversation("bob")], { replace: true });
+
+    useConversationsStore.getState().mergeConversationSnapshot(
+      [
+        {
+          conversation_id: "bob",
+          peer_user_id: "user:bob",
+          state: "active",
+          kind: "direct",
+          message_count: 0,
+        },
+      ],
+      [{ user_id: "user:bob", display_name: null }],
+      { replace: true },
+    );
+
+    expect(useConversationsStore.getState().conversations[0].display_name).toBeNull();
+  });
 });

@@ -80,6 +80,7 @@ pub async fn create_or_load_identity(
     state: State<'_, AppState>,
     mnemonic: Option<String>,
     device_name: Option<String>,
+    display_name: Option<String>,
 ) -> Result<CreateIdentityResult, String> {
     // First ensure profile exists
     {
@@ -114,7 +115,7 @@ pub async fn create_or_load_identity(
         CoreInput::Command(CoreCommand::CreateOrLoadIdentity {
             mnemonic,
             device_name,
-            display_name: None,
+            display_name,
         }),
     )
     .await
@@ -177,7 +178,7 @@ pub async fn get_identity_info(state: State<'_, AppState>) -> Result<Option<Iden
             user_id: b.user_id.clone(),
             device_id: id.device_identity.device_id.clone(),
             mnemonic: id.mnemonic.clone(),
-            display_name: b.display_name.clone().or(local_display_name),
+            display_name: local_display_name,
         })),
         (Some(id), None) => Ok(Some(IdentityInfo {
             user_id: id.user_identity.user_id.clone(),

@@ -201,6 +201,7 @@ pub enum CoreCommand {
     CreateAdditionalDeviceIdentity {
         mnemonic: Option<String>,
         device_name: Option<String>,
+        display_name: Option<String>,
     },
     RotateLocalKeyPackage,
     ApplyLocalDeviceStatusUpdate {
@@ -677,6 +678,8 @@ pub struct CoreStateUpdate {
     #[serde(default)]
     pub contacts_changed: bool,
     #[serde(default)]
+    pub identity_changed: bool,
+    #[serde(default)]
     pub checkpoints_changed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub system_statuses_changed: Vec<SystemStatus>,
@@ -724,6 +727,14 @@ pub struct ContactSummary {
     pub device_count: usize,
     #[serde(default)]
     pub relationship_status: ContactRelationshipStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalIdentitySummary {
+    pub user_id: String,
+    pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -778,6 +789,8 @@ pub struct CoreViewModel {
     pub messages: Vec<MessageSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contacts: Vec<ContactSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<LocalIdentitySummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub banners: Vec<SystemBanner>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

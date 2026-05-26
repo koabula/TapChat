@@ -154,6 +154,10 @@ impl CoreDriver {
         self.engine.local_bundle()
     }
 
+    pub fn local_display_name(&self) -> Option<String> {
+        self.engine.local_display_name()
+    }
+
     pub fn contact_bundle(&self, user_id: &str) -> Option<&IdentityBundle> {
         self.engine.contact_bundle(user_id)
     }

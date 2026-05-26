@@ -44,6 +44,8 @@ pub struct ProfileSummary {
 pub struct IdentitySummaryView {
     pub user_id: String,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub device_status: String,
     pub profile_path: PathBuf,
     pub mnemonic: String,
@@ -1697,6 +1699,7 @@ fn identity_summary_from_profile(profile: &Profile) -> Result<Option<IdentitySum
     Ok(driver.local_identity().map(|identity| IdentitySummaryView {
         user_id: identity.user_identity.user_id.clone(),
         device_id: identity.device_identity.device_id.clone(),
+        display_name: driver.local_display_name(),
         device_status: format!("{:?}", identity.device_status.status).to_lowercase(),
         profile_path: profile.root().to_path_buf(),
         mnemonic: identity.mnemonic.clone(),
@@ -2017,6 +2020,7 @@ async fn run_identity_command(
         CoreCommand::CreateAdditionalDeviceIdentity {
             mnemonic,
             device_name: Some(device_name.to_string()),
+            display_name: None,
         }
     } else {
         CoreCommand::CreateOrLoadIdentity {
@@ -2033,6 +2037,7 @@ async fn run_identity_command(
     Ok(IdentitySummaryView {
         user_id: identity.user_identity.user_id.clone(),
         device_id: identity.device_identity.device_id.clone(),
+        display_name: driver.local_display_name(),
         device_status: format!("{:?}", identity.device_status.status).to_lowercase(),
         profile_path: profile.root().to_path_buf(),
         mnemonic: identity.mnemonic.clone(),

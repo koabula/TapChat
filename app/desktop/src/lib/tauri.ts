@@ -24,9 +24,10 @@ export { invoke, listen };
 // Identity
 export async function createOrLoadIdentity(
   mnemonic?: string,
-  deviceName?: string
+  deviceName?: string,
+  displayName?: string | null
 ): Promise<CoreOutput> {
-  return invoke("create_or_load_identity", { mnemonic, deviceName });
+  return invoke("create_or_load_identity", { mnemonic, deviceName, displayName });
 }
 
 export async function getIdentityInfo(): Promise<IdentityInfo | null> {
@@ -41,7 +42,7 @@ export async function rotateShareLink(): Promise<void> {
   return invoke("rotate_share_link");
 }
 
-export async function setLocalDisplayName(displayName: string | null): Promise<void> {
+export async function setLocalDisplayName(displayName: string | null): Promise<CoreOutput> {
   return invoke("set_local_display_name", { displayName });
 }
 

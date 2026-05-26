@@ -26,6 +26,7 @@ export default function Identity() {
   const [profilePassphrase, setProfilePassphrase] = useState("");
   const [confirmProfilePassphrase, setConfirmProfilePassphrase] = useState("");
   const [weakPassphraseAccepted, setWeakPassphraseAccepted] = useState(false);
+  const [displayName, setDisplayName] = useState("");
   const [deviceName, setDeviceName] = useState("My Laptop");
   const [mnemonic, setMnemonic] = useState("");
   const [loading, setLoading] = useState(false);
@@ -95,6 +96,7 @@ export default function Identity() {
       const result = await invoke<CreateIdentityResult>("create_or_load_identity", {
         mnemonic: isRecover ? mnemonic : null,
         deviceName,
+        displayName: displayName.trim() || null,
       });
 
       // Store mnemonic for backup step (only for new identity creation)
@@ -219,12 +221,12 @@ export default function Identity() {
         {step === "identity" && (
           <>
             <h2 className="text-xl font-semibold text-primary-color mb-2">
-              {isRecover ? "Recover Your Identity" : "Name Your Device"}
+              {isRecover ? "Recover Your Identity" : "Name Your Identity"}
             </h2>
 
             {!isRecover && (
               <p className="text-secondary-color text-center mb-6 max-w-md">
-                This name helps you identify this device when managing multiple devices.
+                Choose the public name contacts will see, then name this device for your own device list.
               </p>
             )}
 
@@ -243,6 +245,17 @@ export default function Identity() {
                   onChange={(e) => setMnemonic(e.target.value)}
                 />
               )}
+
+              <div>
+                <label className="text-sm text-muted-color mb-1 block">Display name</label>
+                <input
+                  className="input"
+                  placeholder="Alice"
+                  value={displayName}
+                  maxLength={64}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                />
+              </div>
 
               <div>
                 <label className="text-sm text-muted-color mb-1 block">Device name</label>

@@ -5899,6 +5899,7 @@ fn merge_identity_bundles(
         &deployment,
         devices,
         None,
+        None,
     )?)
 }
 

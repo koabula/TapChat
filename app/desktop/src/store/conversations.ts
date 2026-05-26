@@ -127,7 +127,7 @@ function mergeConversationState(
 
     return {
       ...conversation,
-      display_name: conversation.display_name ?? prior?.display_name ?? null,
+      display_name: conversation.display_name,
       last_message_time: conversation.last_message_time ?? prior?.last_message_time ?? null,
       unread_count:
         conversation.conversation_id === activeConversationId

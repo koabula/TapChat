@@ -92,6 +92,8 @@ pub enum DeviceSubcommand {
         #[arg(long)]
         device_name: String,
         #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
         mnemonic_file: Option<PathBuf>,
     },
     Recover {
@@ -100,6 +102,8 @@ pub enum DeviceSubcommand {
         #[arg(long)]
         device_name: String,
         #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
         mnemonic_file: PathBuf,
     },
     Add {
@@ -107,6 +111,8 @@ pub enum DeviceSubcommand {
         profile: Option<PathBuf>,
         #[arg(long)]
         device_name: String,
+        #[arg(long)]
+        display_name: Option<String>,
         #[arg(long)]
         mnemonic_file: PathBuf,
     },

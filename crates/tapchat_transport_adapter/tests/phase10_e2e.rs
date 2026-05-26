@@ -2014,6 +2014,7 @@ async fn setup_trio() -> Result<TrioContext> {
         .run_command_until_idle(CoreCommand::CreateAdditionalDeviceIdentity {
             mnemonic: Some(BOB_MNEMONIC.into()),
             device_name: Some("laptop".into()),
+            display_name: None,
         })
         .await?;
 
@@ -2146,6 +2147,7 @@ async fn publish_bob_bundle(
         &concrete_deployment_bundle(&ctx.bob_laptop_bundle, &ctx.bob_user_id),
         vec![phone_profile, laptop_profile],
         None,
+        None,
     )?;
     ctx.runtime
         .put_identity_bundle(&ctx.bob_laptop_auth, &merged)
@@ -2187,6 +2189,7 @@ fn publish_identity_bundle_with_devices(
         local_identity,
         deployment,
         devices,
+        None,
         None,
     )?)
 }

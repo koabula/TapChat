@@ -264,6 +264,7 @@ impl LocalStore for SqlCipherLocalStore<'_> {
 
         Ok(CorePersistenceSnapshot {
             message_nonce: load_meta_u64(&conn, "message_nonce")?.unwrap_or_default(),
+            local_display_name: load_meta_string(&conn, "local_display_name")?,
             local_identity: load_singleton(&conn, "identity", "local")?,
             deployment: load_singleton(&conn, "deployment", "active")?,
             contacts: load_table(&conn, "contacts")?,
@@ -760,6 +761,15 @@ fn save_snapshot_tables(tx: &Transaction<'_>, snapshot: &CorePersistenceSnapshot
 
 fn save_snapshot_meta(tx: &Transaction<'_>, snapshot: &CorePersistenceSnapshot) -> Result<()> {
     save_meta(tx, "message_nonce", snapshot.message_nonce.to_string())?;
+    match snapshot.local_display_name.as_ref() {
+        Some(display_name) => save_meta(tx, "local_display_name", display_name)?,
+        None => {
+            tx.execute(
+                "DELETE FROM state_meta WHERE key = ?1",
+                params!["local_display_name"],
+            )?;
+        }
+    }
     save_meta(
         tx,
         "mls_state_persistence_blocked",
@@ -1160,6 +1170,16 @@ fn load_meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
     value
         .map(|value| value.parse::<u64>().context("parse local store u64 meta"))
         .transpose()
+}
+
+fn load_meta_string(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM state_meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn load_meta_bool(conn: &Connection, key: &str) -> Result<Option<bool>> {

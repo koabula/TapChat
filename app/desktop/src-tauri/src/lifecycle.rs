@@ -317,6 +317,7 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
         || output.state_update.conversations_changed
         || output.state_update.messages_changed
         || output.state_update.contacts_changed
+        || output.state_update.identity_changed
         || output.state_update.checkpoints_changed
         || !output.state_update.system_statuses_changed.is_empty();
     if has_updates {

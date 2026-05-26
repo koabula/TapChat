@@ -186,9 +186,23 @@ export default function Settings() {
     setSavingDisplayName(true);
     try {
       const nameToSave = displayNameInput.trim() || null;
-      await setLocalDisplayName(nameToSave);
+      const output = await setLocalDisplayName(nameToSave);
+      const identityUpdate = output.view_model?.identity;
+      if (identityUpdate) {
+        setIdentity((current) =>
+          current
+            ? {
+                ...current,
+                user_id: identityUpdate.user_id,
+                device_id: identityUpdate.device_id,
+                display_name: identityUpdate.display_name ?? null,
+              }
+            : current,
+        );
+        setDisplayNameInput(identityUpdate.display_name ?? "");
+      }
       setEditingDisplayName(false);
-      loadIdentity();
+      void loadIdentity();
     } catch (err) {
       console.error(`[Settings] Failed to save display name: ${String(err)}`);
       alert(String(err));

@@ -215,6 +215,12 @@ impl IdentityManager {
         let signature = parse_signature(&bundle.signature)?;
         verifying_key
             .verify(identity_bundle_payload(bundle).as_bytes(), &signature)
+            .or_else(|_| {
+                verifying_key.verify(
+                    legacy_identity_bundle_payload(bundle).as_bytes(),
+                    &signature,
+                )
+            })
             .map_err(|_| CoreError::invalid_input("identity bundle signature mismatch"))?;
         for device in &bundle.devices {
             Self::verify_device_binding(&bundle.user_public_key, &device.binding)?;
@@ -255,6 +261,7 @@ impl IdentityManager {
             deployment,
             vec![device_profile],
             None,
+            None,
         )
     }
 
@@ -263,6 +270,7 @@ impl IdentityManager {
         deployment: &DeploymentBundle,
         devices: Vec<crate::model::DeviceContactProfile>,
         bundle_share_id: Option<String>,
+        display_name: Option<String>,
     ) -> CoreResult<IdentityBundle> {
         let encoded_user_id =
             urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
@@ -288,7 +296,7 @@ impl IdentityManager {
                 base_url: deployment.storage_base_info.base_url.clone(),
                 profile_ref: None,
             }),
-            display_name: None,
+            display_name,
             updated_at: local_identity.device_status.updated_at,
             signature: String::new(),
         };
@@ -384,10 +392,26 @@ fn derive_slip10_ed25519_key(seed: &[u8], path: &[u32]) -> CoreResult<[u8; 32]> 
 }
 
 pub fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
+    identity_bundle_payload_with_display_name(bundle, true)
+}
+
+pub fn legacy_identity_bundle_payload(bundle: &IdentityBundle) -> String {
+    identity_bundle_payload_with_display_name(bundle, false)
+}
+
+fn identity_bundle_payload_with_display_name(
+    bundle: &IdentityBundle,
+    include_display_name: bool,
+) -> String {
     let mut parts = vec![
         bundle.version.clone(),
         bundle.user_id.clone(),
         bundle.user_public_key.clone(),
+    ];
+    if include_display_name {
+        parts.push(bundle.display_name.clone().unwrap_or_default());
+    }
+    parts.extend([
         bundle.updated_at.to_string(),
         bundle.bundle_share_id.clone().unwrap_or_default(),
         bundle.identity_bundle_ref.clone().unwrap_or_default(),
@@ -402,7 +426,7 @@ pub fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
             .as_ref()
             .and_then(|profile| profile.profile_ref.clone())
             .unwrap_or_default(),
-    ];
+    ]);
     for device in &bundle.devices {
         parts.push(device.device_id.clone());
         parts.push(device.device_public_key.clone());

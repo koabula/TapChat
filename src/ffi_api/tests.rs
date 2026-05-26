@@ -27,6 +27,7 @@ mod tests {
         GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use ed25519_dalek::Signer;
     use std::collections::{BTreeMap, BTreeSet};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -39,6 +40,174 @@ mod tests {
     #[test]
     fn module_name_is_stable() {
         assert_eq!(FfiApiModule.name(), "ffi_api");
+    }
+
+    #[test]
+    fn local_display_name_survives_deployment_import_and_restore() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: Some(ALICE_MNEMONIC.into()),
+                device_name: Some("phone".into()),
+                display_name: Some(" Alice ".into()),
+            })
+            .expect("identity");
+        assert_eq!(engine.local_display_name().as_deref(), Some("Alice"));
+        assert!(engine.local_bundle().is_none());
+
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: sample_deployment(),
+            })
+            .expect("deployment");
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.display_name.as_deref()),
+            Some("Alice")
+        );
+        let snapshot = engine.refresh_snapshot();
+        assert_eq!(snapshot.local_display_name.as_deref(), Some("Alice"));
+
+        let restored = CoreEngine::from_restored_state(snapshot);
+        assert_eq!(restored.local_display_name().as_deref(), Some("Alice"));
+        assert_eq!(
+            restored
+                .local_bundle()
+                .and_then(|bundle| bundle.display_name.as_deref()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn set_local_display_name_updates_and_clears_persisted_identity_name() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let previous_updated_at = engine.local_bundle().expect("bundle").updated_at;
+
+        let output = engine
+            .handle_command(CoreCommand::SetLocalDisplayName {
+                display_name: Some("Alice Prime".into()),
+            })
+            .expect("set display name");
+        assert!(output.state_update.identity_changed);
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .and_then(|view| view.identity.as_ref())
+                .and_then(|identity| identity.display_name.as_deref()),
+            Some("Alice Prime")
+        );
+        assert_eq!(engine.local_display_name().as_deref(), Some("Alice Prime"));
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.display_name.as_deref()),
+            Some("Alice Prime")
+        );
+        assert!(
+            engine.local_bundle().expect("bundle").updated_at > previous_updated_at,
+            "display name update should advance bundle updated_at"
+        );
+
+        let restored = CoreEngine::from_restored_state(engine.refresh_snapshot());
+        assert_eq!(
+            restored.local_display_name().as_deref(),
+            Some("Alice Prime")
+        );
+
+        engine
+            .handle_command(CoreCommand::SetLocalDisplayName { display_name: None })
+            .expect("clear display name");
+        assert_eq!(engine.local_display_name(), None);
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.display_name.as_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn rotate_share_link_preserves_local_display_name() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        engine
+            .handle_command(CoreCommand::SetLocalDisplayName {
+                display_name: Some("Alice".into()),
+            })
+            .expect("set display name");
+
+        engine
+            .handle_command(CoreCommand::RotateContactShareLink)
+            .expect("rotate share link");
+
+        assert_eq!(engine.local_display_name().as_deref(), Some("Alice"));
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.display_name.as_deref()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn append_request_includes_sender_display_name() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::SetLocalDisplayName {
+                display_name: Some("Alice".into()),
+            })
+            .expect("set display name");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("import bob");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id);
+
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send text");
+
+        let append_body = output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ExecuteHttpRequest { request }
+                if request.method == crate::ffi_api::HttpMethod::Post =>
+            {
+                request.body.as_deref()
+            }
+            _ => None,
+        });
+        let body = append_body.expect("append request body");
+        let request: crate::transport_contract::AppendEnvelopeRequest =
+            serde_json::from_str(body).expect("append request json");
+        assert_eq!(request.sender_display_name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn identity_bundle_verification_accepts_legacy_display_name_signature() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let deployment = sample_deployment();
+        let package = MlsAdapter::generate_key_package(&identity, 0).expect("key package");
+        let mut bundle = IdentityManager::export_identity_bundle(
+            &identity,
+            &deployment,
+            package.key_package_ref,
+            package.expires_at,
+        )
+        .expect("bundle");
+        bundle.display_name = Some("Alice".into());
+        bundle.signature = String::new();
+        let signature = identity
+            .user_root_signing_key()
+            .sign(crate::identity::legacy_identity_bundle_payload(&bundle).as_bytes());
+        bundle.signature = crate::identity::encode_hex(&signature.to_bytes());
+
+        IdentityManager::verify_identity_bundle(&bundle).expect("legacy bundle verifies");
     }
 
     #[test]
@@ -3857,6 +4026,7 @@ mod tests {
             .handle_command(CoreCommand::CreateAdditionalDeviceIdentity {
                 mnemonic: Some(ALICE_MNEMONIC.into()),
                 device_name: Some("laptop".into()),
+                display_name: None,
             })
             .expect("additional device");
 
@@ -3886,6 +4056,7 @@ mod tests {
             .handle_command(CoreCommand::CreateAdditionalDeviceIdentity {
                 mnemonic: Some(BOB_MNEMONIC.into()),
                 device_name: Some("laptop".into()),
+                display_name: None,
             })
             .expect("additional device");
         let snapshot = extract_snapshot(&create_output);
@@ -3943,6 +4114,7 @@ mod tests {
             &laptop_identity,
             &sample_deployment(),
             vec![bob_phone_bundle.devices[0].clone(), laptop_profile.clone()],
+            None,
             None,
         )
         .expect("merged bundle");
@@ -4173,6 +4345,7 @@ mod tests {
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile.clone()],
             None,
+            None,
         )
         .expect("merged bundle");
 
@@ -4219,6 +4392,7 @@ mod tests {
             &bob_laptop,
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile.clone()],
+            None,
             None,
         )
         .expect("merged bundle");
@@ -4273,6 +4447,7 @@ mod tests {
             &deployment,
             vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
             None,
+            None,
         )
         .expect("active bundle");
 
@@ -4284,6 +4459,7 @@ mod tests {
             &bob_laptop,
             &deployment,
             vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
+            None,
             None,
         )
         .expect("revoked bundle");
@@ -4341,6 +4517,7 @@ mod tests {
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile],
             None,
+            None,
         )
         .expect("merged bundle");
 
@@ -4382,6 +4559,7 @@ mod tests {
             &bob_laptop,
             &sample_deployment(),
             vec![bob_phone_profile, bob_laptop_profile],
+            None,
             None,
         )
         .expect("merged bundle");

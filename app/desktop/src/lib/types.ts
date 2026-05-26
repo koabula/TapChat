@@ -11,6 +11,7 @@ export interface CoreStateUpdate {
   conversations_changed: boolean;
   messages_changed: boolean;
   contacts_changed: boolean;
+  identity_changed?: boolean;
   checkpoints_changed: boolean;
   system_statuses_changed: SystemStatus[];
 }
@@ -19,9 +20,16 @@ export interface CoreViewModel {
   conversations: ConversationSummary[];
   messages: MessageSummary[];
   contacts: ContactSummary[];
+  identity?: LocalIdentitySummary | null;
   banners: SystemBanner[];
   message_requests: MessageRequestItem[];
   allowlist?: AllowlistDocument;
+}
+
+export interface LocalIdentitySummary {
+  user_id: string;
+  device_id: string;
+  display_name?: string | null;
 }
 
 // Identity - matches backend IdentityInfo struct
@@ -29,7 +37,7 @@ export interface IdentityInfo {
   user_id: string;
   device_id: string;
   mnemonic: string;
-  display_name?: string;
+  display_name?: string | null;
 }
 
 // Profiles - matches backend ProfileSummary struct

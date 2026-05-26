@@ -270,6 +270,8 @@ pub struct CorePersistenceSnapshot {
     #[serde(default)]
     pub message_nonce: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_identity: Option<PersistedLocalIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment: Option<PersistedDeployment>,
@@ -412,6 +414,7 @@ pub trait SystemStateRepository {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InMemoryPersistence {
     message_nonce: u64,
+    local_display_name: Option<String>,
     local_identity: Option<PersistedLocalIdentity>,
     deployment: Option<PersistedDeployment>,
     contacts: BTreeMap<String, PersistedContact>,
@@ -437,6 +440,7 @@ pub struct InMemoryPersistence {
 impl InMemoryPersistence {
     pub fn save_snapshot(&mut self, snapshot: &CorePersistenceSnapshot) {
         self.message_nonce = snapshot.message_nonce;
+        self.local_display_name = snapshot.local_display_name.clone();
         self.local_identity = snapshot.local_identity.clone();
         self.deployment = snapshot.deployment.clone();
         self.contacts = snapshot
@@ -563,6 +567,7 @@ impl InMemoryPersistence {
     pub fn load_snapshot(&self) -> CorePersistenceSnapshot {
         CorePersistenceSnapshot {
             message_nonce: self.message_nonce,
+            local_display_name: self.local_display_name.clone(),
             local_identity: self.local_identity.clone(),
             deployment: self.deployment.clone(),
             contacts: self.contacts.values().cloned().collect(),
@@ -794,6 +799,7 @@ mod tests {
         .expect("conversation");
         let snapshot = CorePersistenceSnapshot {
             message_nonce: 7,
+            local_display_name: Some("Alice".into()),
             local_identity: Some(PersistedLocalIdentity {
                 state: identity.clone(),
             }),
@@ -951,6 +957,7 @@ mod tests {
         let loaded = repo.load_snapshot();
 
         assert_eq!(loaded.local_identity, snapshot.local_identity);
+        assert_eq!(loaded.local_display_name, Some("Alice".into()));
         assert_eq!(loaded.pending_outbox.len(), 1);
         assert_eq!(loaded.pending_welcome_pickups.len(), 1);
         assert_eq!(loaded.pending_blob_transfers.len(), 1);
@@ -995,6 +1002,7 @@ mod tests {
     fn snapshot_encode_decode_round_trips() {
         let snapshot = CorePersistenceSnapshot {
             message_nonce: 11,
+            local_display_name: Some("Alice".into()),
             local_identity: None,
             deployment: Some(PersistedDeployment {
                 deployment_bundle: DeploymentBundle {

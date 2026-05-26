@@ -35,4 +35,22 @@ describe("group display name resolver", () => {
 
     expect(resolve({ deviceId: "device:alice:phone" })).toBe("You");
   });
+
+  it("uses the current local display name and falls back after it is cleared", () => {
+    const named = buildGroupNameResolver({
+      manifest,
+      contacts: [],
+      localUserId: "user:alice",
+      localDisplayName: "Alice Prime",
+    });
+    const cleared = buildGroupNameResolver({
+      manifest,
+      contacts: [],
+      localUserId: "user:alice",
+      localDisplayName: "   ",
+    });
+
+    expect(named({ deviceId: "device:alice:phone" })).toBe("Alice Prime");
+    expect(cleared({ deviceId: "device:alice:phone" })).toBe("You");
+  });
 });
