@@ -61,6 +61,32 @@ jobs:
           RELEASE_TAG: ${{ steps.release-version.outputs.release_tag }}
         run: node scripts/check-release-version.mjs --tag "$RELEASE_TAG"
 
+      - name: Validate updater signing secrets
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_B64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_B64}" ]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY_B64 secret." >&2
+            exit 1
+          fi
+
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" ]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret." >&2
+            exit 1
+          fi
+
+          if ! printf '%s' "${TAURI_SIGNING_PRIVATE_KEY_B64}" | base64 --decode > /tmp/tauri-signing.key 2>/dev/null; then
+            echo "TAURI_SIGNING_PRIVATE_KEY_B64 is not valid base64." >&2
+            exit 1
+          fi
+
+          if ! grep -q "secret key" /tmp/tauri-signing.key; then
+            echo "Decoded updater signing key does not look like a Tauri/minisign private key." >&2
+            exit 1
+          fi
+
   build:
     needs: validate
     strategy:
@@ -171,6 +197,26 @@ jobs:
 
       - run: cd app/desktop && npm install
 
+      - name: Prepare Tauri updater signing key
+        id: tauri-signing-key
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_B64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_B64)) {
+            throw "Missing TAURI_SIGNING_PRIVATE_KEY_B64 secret."
+          }
+
+          try {
+            $keyBytes = [Convert]::FromBase64String($env:TAURI_SIGNING_PRIVATE_KEY_B64)
+          } catch {
+            throw "TAURI_SIGNING_PRIVATE_KEY_B64 is not valid base64."
+          }
+
+          $keyPath = Join-Path $env:RUNNER_TEMP "tauri-signing.key"
+          [IO.File]::WriteAllBytes($keyPath, $keyBytes)
+          "path=$keyPath" >> $env:GITHUB_OUTPUT
+
       - uses: tauri-apps/tauri-action@v0
         with:
           projectPath: app/desktop
@@ -182,5 +228,5 @@ jobs:
           args: ${{ matrix.build_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ steps.tauri-signing-key.outputs.path }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
