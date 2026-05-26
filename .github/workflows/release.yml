@@ -61,6 +61,10 @@ jobs:
           RELEASE_TAG: ${{ steps.release-version.outputs.release_tag }}
         run: node scripts/check-release-version.mjs --tag "$RELEASE_TAG"
 
+      - name: Install desktop dependencies for signing validation
+        working-directory: app/desktop
+        run: npm install
+
       - name: Validate updater signing secrets
         shell: bash
         env:
@@ -77,13 +81,17 @@ jobs:
             exit 1
           fi
 
-          if ! printf '%s' "${TAURI_SIGNING_PRIVATE_KEY_B64}" | base64 --decode > /tmp/tauri-signing.key 2>/dev/null; then
+          signing_key_path="${RUNNER_TEMP}/tauri-signing.key"
+          if ! printf '%s' "${TAURI_SIGNING_PRIVATE_KEY_B64}" | base64 --decode > "${signing_key_path}" 2>/dev/null; then
             echo "TAURI_SIGNING_PRIVATE_KEY_B64 is not valid base64." >&2
             exit 1
           fi
+          chmod 600 "${signing_key_path}"
 
-          if ! grep -q "secret key" /tmp/tauri-signing.key; then
-            echo "Decoded updater signing key does not look like a Tauri/minisign private key." >&2
+          printf 'TapChat updater signing validation\n' > "${RUNNER_TEMP}/tauri-signing-validation.txt"
+          cd app/desktop
+          if ! TAURI_SIGNING_PRIVATE_KEY_PATH="${signing_key_path}" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" npx tauri signer sign "${RUNNER_TEMP}/tauri-signing-validation.txt" >/dev/null; then
+            echo "Decoded updater signing key could not sign with Tauri CLI. Check the key and password secrets." >&2
             exit 1
           fi
 
