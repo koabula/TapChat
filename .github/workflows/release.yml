@@ -81,16 +81,28 @@ jobs:
             exit 1
           fi
 
-          signing_key_path="${RUNNER_TEMP}/tauri-signing.key"
-          if ! printf '%s' "${TAURI_SIGNING_PRIVATE_KEY_B64}" | base64 --decode > "${signing_key_path}" 2>/dev/null; then
+          if ! signing_key="$(printf '%s' "${TAURI_SIGNING_PRIVATE_KEY_B64}" | base64 --decode 2>/dev/null)"; then
             echo "TAURI_SIGNING_PRIVATE_KEY_B64 is not valid base64." >&2
             exit 1
           fi
+
+          if [ -z "${signing_key}" ]; then
+            echo "Decoded updater signing key is empty." >&2
+            exit 1
+          fi
+
+          escaped_signing_key="${signing_key//'%'/'%25'}"
+          escaped_signing_key="${escaped_signing_key//$'\r'/'%0D'}"
+          escaped_signing_key="${escaped_signing_key//$'\n'/'%0A'}"
+          echo "::add-mask::${escaped_signing_key}"
+
+          signing_key_path="${RUNNER_TEMP}/tauri-signing.key"
+          printf '%s' "${signing_key}" > "${signing_key_path}"
           chmod 600 "${signing_key_path}"
 
           printf 'TapChat updater signing validation\n' > "${RUNNER_TEMP}/tauri-signing-validation.txt"
           cd app/desktop
-          if ! TAURI_SIGNING_PRIVATE_KEY_PATH="${signing_key_path}" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" npx tauri signer sign "${RUNNER_TEMP}/tauri-signing-validation.txt" >/dev/null; then
+          if ! TAURI_SIGNING_PRIVATE_KEY="${signing_key}" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" npx tauri signer sign "${RUNNER_TEMP}/tauri-signing-validation.txt" >/dev/null; then
             echo "Decoded updater signing key could not sign with Tauri CLI. Check the key and password secrets." >&2
             exit 1
           fi
@@ -221,8 +233,22 @@ jobs:
             throw "TAURI_SIGNING_PRIVATE_KEY_B64 is not valid base64."
           }
 
+          $keyText = [Text.Encoding]::UTF8.GetString($keyBytes)
+          if ([string]::IsNullOrWhiteSpace($keyText)) {
+            throw "Decoded updater signing key is empty."
+          }
+
+          $escapedKeyText = $keyText.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+          Write-Output "::add-mask::$escapedKeyText"
+
           $keyPath = Join-Path $env:RUNNER_TEMP "tauri-signing.key"
           [IO.File]::WriteAllBytes($keyPath, $keyBytes)
+
+          $delimiter = "TAURI_SIGNING_PRIVATE_KEY_$([Guid]::NewGuid().ToString('N'))"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "TAURI_SIGNING_PRIVATE_KEY<<$delimiter"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value $keyText
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value $delimiter
+
           "path=$keyPath" >> $env:GITHUB_OUTPUT
 
       - uses: tauri-apps/tauri-action@v0
@@ -236,5 +262,4 @@ jobs:
           args: ${{ matrix.build_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ steps.tauri-signing-key.outputs.path }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
