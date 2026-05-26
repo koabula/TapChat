@@ -23,7 +23,6 @@ import Devices from "./pages/settings/Devices";
 import Runtime from "./pages/settings/Runtime";
 
 import SystemBanner from "./components/SystemBanner";
-import { UpdateNotification } from "./hooks/useAutoUpdate";
 
 import { useSessionStore } from "./store/session";
 import {
@@ -171,9 +170,6 @@ function AppInner() {
     <>
       {/* System banners for sync status and errors */}
       {!isOnboarding && <SystemBanner />}
-
-      {/* Update notification */}
-      {!isOnboarding && <UpdateNotification />}
 
       <Routes>
         {/* Onboarding routes - accessible only when not active */}

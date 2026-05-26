@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, for example 0.1.8'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -13,7 +18,51 @@ env:
   RUST_MIN_STACK: 67108864
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release-version.outputs.release_tag }}
+      release_version: ${{ steps.release-version.outputs.release_version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Resolve release version
+        id: release-version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            release_version="${INPUT_VERSION}"
+            release_version="${release_version#v}"
+          else
+            release_version="${GITHUB_REF_NAME#v}"
+          fi
+
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "${release_version}" =~ ${semver} ]]; then
+            echo "Invalid release version: ${release_version}" >&2
+            exit 1
+          fi
+
+          release_tag="v${release_version}"
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+          echo "release_version=${release_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate release version
+        env:
+          RELEASE_TAG: ${{ steps.release-version.outputs.release_tag }}
+        run: node scripts/check-release-version.mjs --tag "$RELEASE_TAG"
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +88,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -123,11 +174,13 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         with:
           projectPath: app/desktop
-          tagName: ${{ github.ref_name }}
-          releaseName: 'TapChat ${{ github.ref_name }}'
+          tagName: ${{ needs.validate.outputs.release_tag }}
+          releaseName: 'TapChat ${{ needs.validate.outputs.release_tag }}'
           releaseBody: 'See assets below for platform-specific installers.'
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.build_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

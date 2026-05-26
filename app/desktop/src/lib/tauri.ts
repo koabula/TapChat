@@ -14,6 +14,7 @@ import type {
   CloudflareProgressEvent,
   ProfileSummary,
   StartDirectChatResult,
+  AppMetadata,
 } from "./types";
 
 // Re-export Tauri primitives
@@ -217,6 +218,11 @@ export async function cloudflareStatus(): Promise<CloudflareStatus> {
 
 export const getCloudflareStatus = cloudflareStatus;
 export const deployCloudflare = cloudflareDeploy;
+
+// App metadata
+export async function getAppMetadata(): Promise<AppMetadata> {
+  return invoke("get_app_metadata");
+}
 
 // Session
 export async function startRealtimeSession(): Promise<void> {

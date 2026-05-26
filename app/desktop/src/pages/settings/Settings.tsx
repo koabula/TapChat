@@ -3,7 +3,8 @@ import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
-import { Monitor, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Code2, Download, ExternalLink, Monitor, RefreshCw, X } from "lucide-react";
+import { useManualUpdate } from "@/hooks/useAutoUpdate";
 
 import {
   getIdentityInfo,
@@ -20,12 +21,38 @@ import {
   getAllowlist,
   setDebugMode,
   getDebugMode,
+  getAppMetadata,
 } from "@/lib/tauri";
-import type { IdentityInfo, ProfileSummary, CloudflareStatus } from "@/lib/types";
+import type { AppMetadata, IdentityInfo, ProfileSummary, CloudflareStatus } from "@/lib/types";
+
+const DEVELOPER_MODE_SESSION_KEY = "tapchat:developerMode";
+const DEVELOPER_MODE_CLICK_TARGET = 5;
+
+function readSessionDeveloperMode(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.sessionStorage.getItem(DEVELOPER_MODE_SESSION_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeSessionDeveloperMode(enabled: boolean) {
+  try {
+    if (enabled) {
+      window.sessionStorage.setItem(DEVELOPER_MODE_SESSION_KEY, "true");
+    } else {
+      window.sessionStorage.removeItem(DEVELOPER_MODE_SESSION_KEY);
+    }
+  } catch {
+    // Developer mode is a convenience toggle; sessionStorage failure is non-fatal.
+  }
+}
 
 export default function Settings() {
   const navigate = useNavigate();
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
+  const [appMetadata, setAppMetadata] = useState<AppMetadata | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [showMnemonic, setShowMnemonic] = useState(false);
@@ -33,8 +60,12 @@ export default function Settings() {
   const [allowlist, setAllowlist] = useState<string[]>([]);
   const [darkMode, setDarkMode] = useState(false);
   const [debugMode, setDebugModeState] = useState(false);
+  const [developerMode, setDeveloperMode] = useState(readSessionDeveloperMode);
+  const [developerClickCount, setDeveloperClickCount] = useState(0);
+  const [showAboutDetails, setShowAboutDetails] = useState(false);
   const [copied, setCopied] = useState(false);
   const [switchingProfile, setSwitchingProfile] = useState<string | null>(null);
+  const update = useManualUpdate();
 
   // Display name editing state
   const [editingDisplayName, setEditingDisplayName] = useState(false);
@@ -51,10 +82,9 @@ export default function Settings() {
 
   useEffect(() => {
     loadIdentity();
+    loadAppMetadata();
     loadRuntimeStatus();
-    loadAllowlist();
     loadProfiles();
-    loadDebugMode();
 
     // Check system preference for dark mode
     const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -65,14 +95,23 @@ export default function Settings() {
       console.debug("[Settings] Engine reloaded, refreshing settings data");
       loadIdentity();
       loadRuntimeStatus();
-      loadAllowlist();
       loadProfiles();
+      if (readSessionDeveloperMode()) {
+        loadAllowlist();
+        loadDebugMode();
+      }
     });
 
     return () => {
       unlistenEngineReloaded.then((fn) => fn());
     };
   }, []);
+
+  useEffect(() => {
+    if (!developerMode) return;
+    loadAllowlist();
+    loadDebugMode();
+  }, [developerMode]);
 
   const loadIdentity = async () => {
     try {
@@ -81,6 +120,14 @@ export default function Settings() {
       setDisplayNameInput(result?.display_name || "");
     } catch (err) {
       console.error(`[Settings] Failed to get identity: ${String(err)}`);
+    }
+  };
+
+  const loadAppMetadata = async () => {
+    try {
+      setAppMetadata(await getAppMetadata());
+    } catch (err) {
+      console.error(`[Settings] Failed to get app metadata: ${String(err)}`);
     }
   };
 
@@ -130,6 +177,33 @@ export default function Settings() {
       await setDebugMode(next);
     } catch {
       setDebugModeState(!next); // revert
+    }
+  };
+
+  const handleVersionClick = () => {
+    if (developerMode) return;
+    setDeveloperClickCount((current) => {
+      const next = current + 1;
+      if (next >= DEVELOPER_MODE_CLICK_TARGET) {
+        setDeveloperMode(true);
+        writeSessionDeveloperMode(true);
+        return 0;
+      }
+      return next;
+    });
+  };
+
+  const handleDisableDeveloperMode = async () => {
+    setDeveloperMode(false);
+    writeSessionDeveloperMode(false);
+    setDeveloperClickCount(0);
+    if (debugMode) {
+      setDebugModeState(false);
+      try {
+        await setDebugMode(false);
+      } catch {
+        // Best-effort cleanup; developer mode visibility is independent of backend debug state.
+      }
     }
   };
 
@@ -280,6 +354,9 @@ export default function Settings() {
       setDeletingProfile(null);
     }
   };
+
+  const updateProgressPercent = Math.round(update.progress);
+  const remainingDeveloperClicks = DEVELOPER_MODE_CLICK_TARGET - developerClickCount;
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
@@ -539,48 +616,6 @@ export default function Settings() {
             </div>
           </section>
 
-          {/* Allowlist section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Allowlist</h2>
-
-            <div className="card space-y-2">
-              {allowlist.length === 0 && (
-                <p className="text-muted-color text-sm">
-                  No users in allowlist. Add users to automatically accept their messages.
-                </p>
-              )}
-
-              {allowlist.map((userId) => (
-                <div key={userId} className="flex items-center justify-between">
-                  <span className="text-primary-color truncate">{userId.slice(0, 20)}...</span>
-                  <button
-                    className="btn btn-ghost text-xs status-error"
-                    onClick={() => handleRemoveAllowlist(userId)}
-                  >
-                    <X size={14} />
-                  </button>
-                </div>
-              ))}
-
-              {/* Add new */}
-              <div className="flex items-center gap-2 mt-2 pt-2 border-t border-default">
-                <input
-                  className="input flex-1"
-                  placeholder="User ID"
-                  value={newAllowlistUser}
-                  onChange={(e) => setNewAllowlistUser(e.target.value)}
-                />
-                <button
-                  className="btn btn-primary"
-                  onClick={handleAddAllowlist}
-                  disabled={!newAllowlistUser.trim()}
-                >
-                  Add
-                </button>
-              </div>
-            </div>
-          </section>
-
           {/* Infrastructure section */}
           <section className="mb-6">
             <h2 className="text-lg font-medium text-primary-color mb-3">Infrastructure</h2>
@@ -649,51 +684,245 @@ export default function Settings() {
             </div>
           </section>
 
-          {/* Performance Testing — Debug Mode */}
+          {/* About section */}
           <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Performance Testing</h2>
+            <h2 className="text-lg font-medium text-primary-color mb-3">About</h2>
 
-            <div className="card">
-              <label className="flex items-center justify-between cursor-pointer">
-                <div className="flex-1">
-                  <span className="text-primary-color">Debug Mode</span>
-                  <p className="text-muted-color text-xs mt-0.5">
-                    When enabled, [TIMETEST] tagged log entries are emitted for measuring end-to-end latency, recovery, and deploy timing. Log entries are prefixed with "[TIMETEST]" for easy filtering.
+            <div className="card space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <button
+                  className="min-w-0 flex-1 text-left"
+                  onClick={handleVersionClick}
+                >
+                  <span className="text-muted-color text-xs block mb-1">Version</span>
+                  <span className="text-primary-color">
+                    {appMetadata?.app_version ?? "Loading..."}
+                  </span>
+                  {appMetadata?.git_tag && (
+                    <span className="text-muted-color text-xs ml-2">{appMetadata.git_tag}</span>
+                  )}
+                </button>
+                <button
+                  className="btn btn-ghost text-sm flex-shrink-0"
+                  onClick={() => setShowAboutDetails((value) => !value)}
+                  aria-expanded={showAboutDetails}
+                >
+                  {showAboutDetails ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  Details
+                </button>
+              </div>
+
+              {!developerMode && developerClickCount >= 3 && (
+                <p className="text-muted-color text-xs">
+                  {remainingDeveloperClicks} more tap{remainingDeveloperClicks === 1 ? "" : "s"} to enable developer mode.
+                </p>
+              )}
+
+              {showAboutDetails && (
+                <div className="pt-3 border-t border-subtle space-y-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div>
+                      <label className="text-muted-color text-xs block mb-1">Core</label>
+                      <span className="text-primary-color text-sm">
+                        {appMetadata?.core_version ?? "Unknown"}
+                      </span>
+                    </div>
+                    <div>
+                      <label className="text-muted-color text-xs block mb-1">Protocol</label>
+                      <span className="text-primary-color text-sm">
+                        {appMetadata?.protocol_version ?? "Unknown"}
+                      </span>
+                    </div>
+                    <div>
+                      <label className="text-muted-color text-xs block mb-1">Commit</label>
+                      <span className="text-primary-color text-sm">
+                        {appMetadata?.git_sha ?? "Unknown"}
+                      </span>
+                    </div>
+                    <div>
+                      <label className="text-muted-color text-xs block mb-1">Updates</label>
+                      <span className="text-primary-color text-sm">
+                        {appMetadata ? (appMetadata.update_endpoint_configured ? "Configured" : "Unavailable") : "Loading..."}
+                      </span>
+                    </div>
+                  </div>
+
+                  {appMetadata && !appMetadata.update_endpoint_configured && (
+                    <p className="status-warning text-xs">
+                      This build does not include an update endpoint.
+                    </p>
+                  )}
+
+                  <div className="pt-3 border-t border-subtle space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => void update.checkForUpdates()}
+                        disabled={update.checking || update.downloading || appMetadata?.update_endpoint_configured === false}
+                      >
+                        <RefreshCw size={14} />
+                        {update.checking ? "Checking..." : "Check for Updates"}
+                      </button>
+                      {update.updateAvailable && update.update && (
+                        <button
+                          className="btn btn-primary"
+                          onClick={() => void update.downloadAndInstall()}
+                          disabled={update.downloading || update.downloaded}
+                        >
+                          <Download size={14} />
+                          {update.downloading ? "Installing..." : "Install"}
+                        </button>
+                      )}
+                      {update.manualUpdateAvailable && update.manualRelease && (
+                        <button
+                          className="btn btn-primary"
+                          onClick={() => void update.openManualRelease()}
+                        >
+                          <ExternalLink size={14} />
+                          Open Release
+                        </button>
+                      )}
+                    </div>
+
+                    {update.checked &&
+                      !update.checking &&
+                      !update.updateAvailable &&
+                      !update.manualUpdateAvailable &&
+                      !update.error &&
+                      !update.warning && (
+                        <p className="status-success text-sm">TapChat is up to date.</p>
+                      )}
+                    {update.updateAvailable && update.update && (
+                      <p className="text-secondary-color text-sm">
+                        Version {update.update.version} is available.
+                      </p>
+                    )}
+                    {update.manualUpdateAvailable && update.manualRelease && (
+                      <p className="text-secondary-color text-sm">
+                        Version {update.manualRelease.version} is available on GitHub.
+                      </p>
+                    )}
+                    {update.downloading && (
+                      <div>
+                        <p className="text-xs text-muted-color mb-1">
+                          Downloading: {updateProgressPercent} percent
+                        </p>
+                        <div className="w-full bg-surface-elevated rounded h-2">
+                          <div
+                            className="bg-primary rounded h-2"
+                            style={{ width: `${updateProgressPercent}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    {update.downloaded && (
+                      <p className="status-success text-sm">Update installed. Restarting...</p>
+                    )}
+                    {update.warning && (
+                      <p className="status-warning text-sm">{update.warning}</p>
+                    )}
+                    {update.error && (
+                      <p className="status-error text-sm">{update.error}</p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+
+          {developerMode && (
+            <section className="mb-6">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <h2 className="text-lg font-medium text-primary-color">Developer</h2>
+                <button className="btn btn-ghost text-sm" onClick={() => void handleDisableDeveloperMode()}>
+                  Disable
+                </button>
+              </div>
+
+              <div className="card space-y-5">
+                <div className="flex items-center gap-2">
+                  <Code2 size={18} className="text-muted-color" />
+                  <span className="text-primary-color">Developer Mode</span>
+                  <span className="status-success text-xs">Enabled</span>
+                </div>
+
+                <div className="pt-4 border-t border-subtle space-y-2">
+                  <h3 className="font-medium text-primary-color">Allowlist</h3>
+                  {allowlist.length === 0 && (
+                    <p className="text-muted-color text-sm">
+                      No users in allowlist. Add users to automatically accept their messages.
+                    </p>
+                  )}
+
+                  {allowlist.map((userId) => (
+                    <div key={userId} className="flex items-center justify-between">
+                      <span className="text-primary-color truncate">{userId.slice(0, 20)}...</span>
+                      <button
+                        className="btn btn-ghost text-xs status-error"
+                        onClick={() => handleRemoveAllowlist(userId)}
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ))}
+
+                  <div className="flex items-center gap-2 pt-2">
+                    <input
+                      className="input flex-1"
+                      placeholder="User ID"
+                      value={newAllowlistUser}
+                      onChange={(e) => setNewAllowlistUser(e.target.value)}
+                    />
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleAddAllowlist}
+                      disabled={!newAllowlistUser.trim()}
+                    >
+                      Add
+                    </button>
+                  </div>
+                </div>
+
+                <div className="pt-4 border-t border-subtle">
+                  <h3 className="font-medium text-primary-color mb-3">Performance Testing</h3>
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <div className="flex-1">
+                      <span className="text-primary-color">Debug Mode</span>
+                      <p className="text-muted-color text-xs mt-0.5">
+                        Emits [TIMETEST] tagged log entries for measuring latency, recovery, and deploy timing.
+                      </p>
+                    </div>
+                    <button
+                      className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
+                        debugMode ? "bg-primary" : "bg-surface-elevated"
+                      }`}
+                      onClick={handleToggleDebugMode}
+                    >
+                      <span
+                        className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+                          debugMode ? "translate-x-5" : "translate-x-1"
+                        }`}
+                      />
+                    </button>
+                  </label>
+                </div>
+
+                <div className="pt-4 border-t border-subtle">
+                  <h3 className="font-medium status-error mb-3">Danger Zone</h3>
+                  <button
+                    className="btn btn-ghost w-full status-error opacity-50 cursor-not-allowed"
+                    disabled
+                    title="Feature not yet implemented"
+                  >
+                    Delete Identity (Not Yet Implemented)
+                  </button>
+                  <p className="text-muted-color text-xs mt-2 text-center">
+                    This feature will be available in a future update.
                   </p>
                 </div>
-                <button
-                  className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
-                    debugMode ? "bg-primary" : "bg-surface-elevated"
-                  }`}
-                  onClick={handleToggleDebugMode}
-                >
-                  <span
-                    className={`block w-5 h-5 rounded-full bg-white transition-transform ${
-                      debugMode ? "translate-x-5" : "translate-x-1"
-                    }`}
-                  />
-                </button>
-              </label>
-            </div>
-          </section>
-
-          {/* Danger zone */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium status-error mb-3">Danger Zone</h2>
-
-            <div className="card">
-              <button
-                className="btn btn-ghost w-full status-error opacity-50 cursor-not-allowed"
-                disabled
-                title="Feature not yet implemented"
-              >
-                Delete Identity (Not Yet Implemented)
-              </button>
-              <p className="text-muted-color text-xs mt-2 text-center">
-                This feature will be available in a future update
-              </p>
-            </div>
-          </section>
+              </div>
+            </section>
+          )}
         </div>
       </div>
     </div>

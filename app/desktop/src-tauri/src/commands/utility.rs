@@ -13,6 +13,34 @@ pub struct FileMetadata {
     pub mime_type: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AppMetadata {
+    pub app_version: &'static str,
+    pub core_version: &'static str,
+    pub protocol_version: &'static str,
+    pub git_sha: Option<&'static str>,
+    pub git_tag: Option<&'static str>,
+    pub update_endpoint_configured: bool,
+}
+
+/// Get build and protocol metadata for the Settings About panel.
+#[tauri::command]
+pub fn get_app_metadata() -> AppMetadata {
+    let git_sha = option_env!("TAPCHAT_GIT_SHA").filter(|value| !value.is_empty());
+    let git_tag = option_env!("TAPCHAT_GIT_TAG").filter(|value| !value.is_empty());
+    let update_endpoint_configured =
+        option_env!("TAPCHAT_UPDATER_ENDPOINT_CONFIGURED") == Some("true");
+
+    AppMetadata {
+        app_version: env!("CARGO_PKG_VERSION"),
+        core_version: tapchat_core::CORE_VERSION,
+        protocol_version: tapchat_core::model::CURRENT_MODEL_VERSION,
+        git_sha,
+        git_tag,
+        update_endpoint_configured,
+    }
+}
+
 /// Get file metadata (size and mime type from extension).
 #[tauri::command]
 pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {

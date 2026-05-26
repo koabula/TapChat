@@ -19,6 +19,8 @@ pub mod profile_crypto;
 pub mod sync_engine;
 pub mod transport_contract;
 
+pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use error::{CoreError, CoreResult};
 pub use ffi_api::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, CoreStateUpdate};
 pub use logging::{LogLevel, Logger, NoopLogger};

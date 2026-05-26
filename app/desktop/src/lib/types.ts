@@ -393,6 +393,15 @@ export interface CloudflareStatus {
   details?: string | null;
 }
 
+export interface AppMetadata {
+  app_version: string;
+  core_version: string;
+  protocol_version: string;
+  git_sha?: string | null;
+  git_tag?: string | null;
+  update_endpoint_configured: boolean;
+}
+
 // Session
 export interface SessionStatus {
   state: string;

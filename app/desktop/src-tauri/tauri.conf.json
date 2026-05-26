@@ -1,7 +1,7 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/nicegui/static/tauri-conf-schema.json",
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "TapChat",
-  "version": "0.1.0",
+  "version": "0.1.8",
   "identifier": "com.tapchat.desktop",
   "build": {
     "frontendDist": "../dist",
@@ -30,6 +30,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -44,7 +45,9 @@
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExOTAyMUI4NTBDM0U1QjAKUldTdzVjTlF1Q0dRb1VPeGZYQ3M1dC9kcEJ5S1hidHNFVFQrZVRzWks2RGQ3NEZWSGI0YkpTQVQK",
-      "endpoints": []
+      "endpoints": [
+        "https://github.com/koabula/TapChat/releases/latest/download/latest.json"
+      ]
     }
   }
 }

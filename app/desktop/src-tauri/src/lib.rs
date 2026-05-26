@@ -291,6 +291,7 @@ pub fn run() {
             lifecycle::complete_onboarding,
             lifecycle::set_onboarding_step,
             // Utility
+            commands::utility::get_app_metadata,
             commands::utility::open_file,
             commands::utility::path_exists,
             commands::utility::check_notification_permission,
