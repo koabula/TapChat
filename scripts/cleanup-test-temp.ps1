@@ -4,15 +4,36 @@ param(
 )
 
 $resolvedRoot = (Resolve-Path $RepoRoot).Path
+
+function Test-RootTempDirectoryName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return (
+        $Name -like ".tmp*" -or
+        $Name -like ".tmp-cli-e2e-*" -or
+        $Name -like ".tmp-desktop-e2e-*" -or
+        $Name -like ".cli-smoke*"
+    )
+}
+
+function Test-RootTempFileName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return ($Name -like ".cli-smoke*.ps1" -or $Name -like ".cli-smoke*.txt")
+}
+
+function Test-ServiceTempDirectoryName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return ($Name -like ".cli-smoke*")
+}
+
 $rootTmpDirs = Get-ChildItem -LiteralPath $resolvedRoot -Force -Directory |
-    Where-Object { $_.Name -like ".tmp*" -or $_.Name -like ".cli-smoke*" }
+    Where-Object { Test-RootTempDirectoryName -Name $_.Name }
 $rootTmpFiles = Get-ChildItem -LiteralPath $resolvedRoot -Force -File |
-    Where-Object { $_.Name -like ".cli-smoke*.ps1" -or $_.Name -like ".cli-smoke*.txt" }
+    Where-Object { Test-RootTempFileName -Name $_.Name }
 $serviceRoot = Join-Path $resolvedRoot "services\cloudflare"
 $serviceTmpDirs = @()
 if (Test-Path -LiteralPath $serviceRoot) {
     $serviceTmpDirs = Get-ChildItem -LiteralPath $serviceRoot -Force -Directory |
-        Where-Object { $_.Name -like ".cli-smoke*" }
+        Where-Object { Test-ServiceTempDirectoryName -Name $_.Name }
 }
 $wranglerTmpPath = Join-Path $resolvedRoot "services\cloudflare\.wrangler\tmp"
 

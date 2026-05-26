@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use fs2::FileExt;
 use keyring::{credential::CredentialPersistence, default};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,8 +16,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::ffi_api::PersistStateEffect;
+use crate::fs_util::write_atomic_unique;
 use crate::local_store::{
-    active_store, migrate_snapshot_to_state_db, PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
+    active_store, inspect_storage, migrate_snapshot_to_state_db, LocalStoreDiagnostics,
+    PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
 };
 use crate::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
 use crate::persistence::CorePersistenceSnapshot;
@@ -28,6 +33,9 @@ use crate::profile_crypto::{
 };
 
 use super::util::to_snake_case_json_string;
+
+const PROFILE_LOCK_FILE_NAME: &str = ".profile.lock";
+const PROFILE_LOCK_INFO_FILE_NAME: &str = ".profile.lock.info";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileMetadata {
@@ -150,6 +158,16 @@ pub struct Profile {
     root: PathBuf,
     meta: ProfileMetadata,
     pdek: Zeroizing<[u8; PDEK_LEN]>,
+    _lock: ProfileLockGuard,
+}
+
+struct InProcessProfileLock {
+    file: File,
+    ref_count: usize,
+}
+
+struct ProfileLockGuard {
+    root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +209,7 @@ impl Profile {
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).context("create profile root")?;
+        let profile_lock = ProfileLockGuard::acquire(&root)?;
         if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
             bail!(
                 "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
@@ -213,9 +232,7 @@ impl Profile {
                     log::warn!("OS keychain unavailable for profile {profile_id}: {error}");
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        "OS keychain is unavailable; provide a passphrase to create this profile"
-                    });
+                    return Err(error).with_context(keychain_unavailable_create_message);
                 }
             }
         }
@@ -249,7 +266,12 @@ impl Profile {
             deployment_bundle_path: None,
             encryption: Some(default_encryption_metadata(wrappers)),
         };
-        let profile = Self { root, meta, pdek };
+        let profile = Self {
+            root,
+            meta,
+            pdek,
+            _lock: profile_lock,
+        };
         profile.ensure_layout()?;
         profile.save_metadata()?;
         if !profile.snapshot_path().exists() {
@@ -277,6 +299,7 @@ impl Profile {
         if !meta_path.exists() {
             bail!("profile.json not found at {}", meta_path.display());
         }
+        let profile_lock = ProfileLockGuard::acquire(&root)?;
         let mut meta: ProfileMetadata =
             serde_json::from_slice(&fs::read(&meta_path).context("read profile metadata")?)
                 .context("decode profile metadata")?;
@@ -304,7 +327,12 @@ impl Profile {
             &meta,
             options.passphrase.as_deref().or(env_passphrase.as_deref()),
         )?;
-        let profile = Self { root, meta, pdek };
+        let profile = Self {
+            root,
+            meta,
+            pdek,
+            _lock: profile_lock,
+        };
         profile.ensure_layout()?;
         profile.ensure_local_store_migrated()?;
         profile.scrub_legacy_plaintext_state()?;
@@ -348,6 +376,10 @@ impl Profile {
         self.root.join(STATE_DB_FILE_NAME)
     }
 
+    pub fn storage_diagnostics(&self) -> Result<LocalStoreDiagnostics> {
+        inspect_storage(&self.root, &self.meta.profile_id, &*self.pdek)
+    }
+
     pub fn runtime_meta_path(&self) -> PathBuf {
         self.meta.runtime_dir.join("runtime.json")
     }
@@ -373,7 +405,7 @@ impl Profile {
         let mut public_bundle = bundle.clone();
         public_bundle.device_runtime_auth = None;
         let bytes = serde_json::to_vec_pretty(&public_bundle)?;
-        write_atomic(&path, &bytes)?;
+        write_atomic_unique(&path, &bytes)?;
         self.set_deployment_bundle_path(path.clone())?;
         Ok(path)
     }
@@ -385,7 +417,7 @@ impl Profile {
     ) -> Result<PathBuf> {
         let path = self.meta.bundles_dir.join(file_name);
         let bytes = serde_json::to_vec_pretty(bundle)?;
-        write_atomic(&path, &bytes)?;
+        write_atomic_unique(&path, &bytes)?;
         Ok(path)
     }
 
@@ -407,7 +439,7 @@ impl Profile {
             bundle.device_runtime_auth = private.deployment_runtime_auth;
             let mut public_bundle = bundle.clone();
             public_bundle.device_runtime_auth = None;
-            write_atomic(path, &serde_json::to_vec_pretty(&public_bundle)?)?;
+            write_atomic_unique(path, &serde_json::to_vec_pretty(&public_bundle)?)?;
             return Ok(Some(bundle));
         }
         if let Some(auth) = self.load_private_state()?.deployment_runtime_auth {
@@ -440,7 +472,7 @@ impl Profile {
         }
         if had_plaintext_secrets {
             self.save_private_state(&private)?;
-            write_atomic(&path, &serde_json::to_vec_pretty(&runtime)?)?;
+            write_atomic_unique(&path, &serde_json::to_vec_pretty(&runtime)?)?;
         }
         runtime.bootstrap_secret = private.runtime_secrets.bootstrap_secret;
         runtime.sharing_secret = private.runtime_secrets.sharing_secret;
@@ -456,7 +488,7 @@ impl Profile {
         let mut public_runtime = runtime.clone();
         public_runtime.bootstrap_secret = None;
         public_runtime.sharing_secret = None;
-        write_atomic(
+        write_atomic_unique(
             &self.runtime_meta_path(),
             &serde_json::to_vec_pretty(&public_runtime)?,
         )
@@ -578,7 +610,7 @@ impl Profile {
     }
 
     fn save_metadata(&self) -> Result<()> {
-        write_atomic(
+        write_atomic_unique(
             &self.root.join("profile.json"),
             &serde_json::to_vec_pretty(&self.meta)?,
         )
@@ -633,7 +665,7 @@ impl ProfileRegistry {
     }
 
     pub fn save(&self) -> Result<()> {
-        write_atomic(&profile_registry_path()?, &serde_json::to_vec_pretty(self)?)
+        write_atomic_unique(&profile_registry_path()?, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn upsert(&mut self, entry: ProfileRegistryEntry) {
@@ -710,6 +742,100 @@ impl ProfileRegistry {
     }
 }
 
+impl ProfileLockGuard {
+    fn acquire(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root)
+            .with_context(|| format!("create profile root {}", root.display()))?;
+        let canonical_root = fs::canonicalize(root)
+            .with_context(|| format!("canonicalize profile root {}", root.display()))?;
+        let locks = profile_locks();
+        let mut table = locks
+            .lock()
+            .map_err(|_| anyhow!("profile lock table is poisoned"))?;
+        if let Some(entry) = table.get_mut(&canonical_root) {
+            entry.ref_count += 1;
+            return Ok(Self {
+                root: canonical_root,
+            });
+        }
+
+        let lock_path = canonical_root.join(PROFILE_LOCK_FILE_NAME);
+        let lock_info_path = canonical_root.join(PROFILE_LOCK_INFO_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .with_context(|| format!("open profile lock {}", lock_path.display()))?;
+        if let Err(error) = file.try_lock_exclusive() {
+            let holder = read_profile_lock_pid(&lock_info_path)
+                .or_else(|| read_profile_lock_pid(&lock_path))
+                .map(|pid| format!(" lock holder pid={pid}."))
+                .unwrap_or_else(|| " lock holder pid=unknown.".into());
+            bail!(
+                "{}",
+                profile_lock_error_message(root, &holder, &error.to_string())
+            );
+        }
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "pid={}", std::process::id());
+        let _ = file.flush();
+        let _ = write_atomic_unique(
+            &lock_info_path,
+            format!("pid={}\n", std::process::id()).as_bytes(),
+        );
+        table.insert(
+            canonical_root.clone(),
+            InProcessProfileLock { file, ref_count: 1 },
+        );
+        Ok(Self {
+            root: canonical_root,
+        })
+    }
+}
+
+impl Drop for ProfileLockGuard {
+    fn drop(&mut self) {
+        let Some(locks) = PROFILE_LOCKS.get() else {
+            return;
+        };
+        let Ok(mut table) = locks.lock() else {
+            return;
+        };
+        if let Some(entry) = table.get_mut(&self.root) {
+            if entry.ref_count > 1 {
+                entry.ref_count -= 1;
+                return;
+            }
+        }
+        if let Some(entry) = table.remove(&self.root) {
+            let _ = FileExt::unlock(&entry.file);
+        }
+    }
+}
+
+static PROFILE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, InProcessProfileLock>>> = OnceLock::new();
+
+fn profile_locks() -> &'static Mutex<BTreeMap<PathBuf, InProcessProfileLock>> {
+    PROFILE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn read_profile_lock_pid(lock_path: &Path) -> Option<u32> {
+    let content = fs::read_to_string(lock_path).ok()?;
+    content.lines().find_map(|line| {
+        let value = line.strip_prefix("pid=")?;
+        value.trim().parse::<u32>().ok()
+    })
+}
+
+fn profile_lock_error_message(root: &Path, holder: &str, error: &str) -> String {
+    format!(
+        "profile {} is already in use by another TapChat process; close the other TapChat window or stop the other tapchat CLI before trying again.{} ({error})",
+        root.display(),
+        holder
+    )
+}
+
 pub fn profile_registry_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("TAPCHAT_PROFILE_REGISTRY_PATH") {
         return Ok(PathBuf::from(path));
@@ -780,8 +906,9 @@ fn unlock_profile_pdek(
             .any(|wrapper| wrapper.kind == ProfileKeyWrapperKind::PassphraseArgon2id)
     {
         bail!(
-            "profile is encrypted and requires a passphrase because OS keychain unlock failed: {}",
-            errors.join("; ")
+            "profile is encrypted and requires a passphrase because OS keychain unlock failed: {}. {}",
+            errors.join("; "),
+            keychain_unlock_hint()
         );
     }
 
@@ -826,6 +953,21 @@ fn ensure_persistent_os_keychain() -> Result<()> {
     Ok(())
 }
 
+fn keychain_unavailable_create_message() -> String {
+    format!(
+        "OS keychain is unavailable; provide a passphrase to create this profile, or create a passphrase-only profile with --no-keychain. {}",
+        keychain_unlock_hint()
+    )
+}
+
+fn keychain_unlock_hint() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Use --passphrase-stdin or TAPCHAT_PROFILE_PASSPHRASE for passphrase unlock; on Linux, a persistent Secret Service keyring over DBus is required for OS keychain unlock."
+    } else {
+        "Use --passphrase-stdin during profile init or TAPCHAT_PROFILE_PASSPHRASE when opening a passphrase-protected profile."
+    }
+}
+
 fn credential_persistence_label(persistence: &CredentialPersistence) -> &'static str {
     match persistence {
         CredentialPersistence::EntryOnly => "entry-only",
@@ -859,16 +1001,6 @@ fn load_os_kek(
         bail!("OS keychain secret has invalid length");
     }
     Ok(Zeroizing::new(key))
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -995,6 +1127,52 @@ mod tests {
         assert!(!state_db
             .windows("visible-marker".len())
             .any(|window| window == b"visible-marker"));
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+    }
+
+    #[test]
+    fn short_passphrase_profile_round_trips_and_rejects_wrong_passphrase() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                dir.path().join("config").join("profiles.json"),
+            );
+        }
+        let profile = Profile::init_with_options(
+            "short",
+            dir.path().join("short"),
+            ProfileInitOptions {
+                passphrase: Some("abc".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        let diagnostics = profile.storage_diagnostics().expect("storage diagnostics");
+        assert!(diagnostics.state_db_exists);
+        assert_eq!(diagnostics.schema_version, Some(1));
+        assert_eq!(diagnostics.migration_complete, Some(true));
+        drop(profile);
+
+        let reopened = Profile::open_with_passphrase(dir.path().join("short"), Some("abc".into()))
+            .expect("open with short passphrase");
+        assert_eq!(
+            reopened.load_snapshot().expect("load snapshot"),
+            CorePersistenceSnapshot::default()
+        );
+        drop(reopened);
+
+        let error =
+            match Profile::open_with_passphrase(dir.path().join("short"), Some("wrong".into())) {
+                Ok(_) => panic!("wrong passphrase should be rejected"),
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains("failed to unlock encrypted profile"));
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
         }
@@ -1196,5 +1374,27 @@ mod tests {
         assert!(error
             .to_string()
             .contains("insecure plaintext snapshot.json"));
+    }
+
+    #[test]
+    fn profile_lock_is_reentrant_in_process_and_released() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("locked");
+        std::fs::create_dir_all(&root).expect("create root");
+
+        let first = super::ProfileLockGuard::acquire(&root).expect("first lock");
+        let second = super::ProfileLockGuard::acquire(&root).expect("same process reentrant lock");
+        drop(first);
+        drop(second);
+        super::ProfileLockGuard::acquire(&root).expect("lock released");
+    }
+
+    #[test]
+    fn profile_lock_error_includes_pid_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let message =
+            super::profile_lock_error_message(dir.path(), " lock holder pid=12345.", "locked");
+        assert!(message.contains("already in use"));
+        assert!(message.contains("lock holder pid=12345"));
     }
 }

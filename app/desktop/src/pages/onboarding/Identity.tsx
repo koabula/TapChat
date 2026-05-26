@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
+import { evaluatePassphraseStrength } from "@/lib/passphraseStrength";
 
 interface ProfileSummary {
   name: string;
@@ -24,25 +25,39 @@ export default function Identity() {
   const [profileName, setProfileName] = useState("default");
   const [profilePassphrase, setProfilePassphrase] = useState("");
   const [confirmProfilePassphrase, setConfirmProfilePassphrase] = useState("");
+  const [weakPassphraseAccepted, setWeakPassphraseAccepted] = useState(false);
   const [deviceName, setDeviceName] = useState("My Laptop");
   const [mnemonic, setMnemonic] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [step, setStep] = useState<"profile" | "identity">(isRecover ? "identity" : "profile");
+  const passphraseStrength = evaluatePassphraseStrength(profilePassphrase, profileName);
+  const trimmedPassphrase = profilePassphrase.trim();
+  const trimmedConfirmPassphrase = confirmProfilePassphrase.trim();
+  const hasAnyPassphraseInput = Boolean(trimmedPassphrase || trimmedConfirmPassphrase);
+  const passphrasesMatch = !hasAnyPassphraseInput || trimmedPassphrase === trimmedConfirmPassphrase;
+  const mustConfirmWeakPassphrase =
+    Boolean(trimmedPassphrase) && passphraseStrength.requiresConfirmation;
+  const canContinueProfile =
+    !loading &&
+    Boolean(profileName.trim()) &&
+    passphrasesMatch &&
+    (!mustConfirmWeakPassphrase || weakPassphraseAccepted);
+  const passphraseStrengthWidth =
+    passphraseStrength.level === "empty" ? 0 : Math.max(passphraseStrength.score, 1) * 25;
 
   const handleInitProfile = async () => {
     setLoading(true);
     setError(null);
 
     try {
-      const trimmedPassphrase = profilePassphrase.trim();
-      if (trimmedPassphrase || confirmProfilePassphrase.trim()) {
-        if (trimmedPassphrase.length < 12) {
-          setError("Profile passphrase must be at least 12 characters.");
+      if (hasAnyPassphraseInput) {
+        if (trimmedPassphrase !== trimmedConfirmPassphrase) {
+          setError("Profile passphrases do not match.");
           return;
         }
-        if (trimmedPassphrase !== confirmProfilePassphrase.trim()) {
-          setError("Profile passphrases do not match.");
+        if (mustConfirmWeakPassphrase && !weakPassphraseAccepted) {
+          setError("Please confirm that you understand this passphrase is weak.");
           return;
         }
       }
@@ -128,7 +143,10 @@ export default function Identity() {
                   className="input"
                   placeholder="default"
                   value={profileName}
-                  onChange={(e) => setProfileName(e.target.value)}
+                  onChange={(e) => {
+                    setProfileName(e.target.value);
+                    setWeakPassphraseAccepted(false);
+                  }}
                 />
               </div>
 
@@ -139,8 +157,22 @@ export default function Identity() {
                   placeholder="Optional"
                   type="password"
                   value={profilePassphrase}
-                  onChange={(e) => setProfilePassphrase(e.target.value)}
+                  onChange={(e) => {
+                    setProfilePassphrase(e.target.value);
+                    setWeakPassphraseAccepted(false);
+                  }}
                 />
+                <div className="mt-2 space-y-1">
+                  <div className="h-1.5 rounded-full bg-surface-elevated overflow-hidden">
+                    <div
+                      className={`h-full transition-medium ${strengthBarClass(passphraseStrength.level)}`}
+                      style={{ width: `${passphraseStrengthWidth}%` }}
+                    />
+                  </div>
+                  <p className={`text-xs ${strengthTextClass(passphraseStrength.level)}`}>
+                    {passphraseStrength.label}: {passphraseStrength.message}
+                  </p>
+                </div>
               </div>
 
               <div>
@@ -152,7 +184,22 @@ export default function Identity() {
                   value={confirmProfilePassphrase}
                   onChange={(e) => setConfirmProfilePassphrase(e.target.value)}
                 />
+                {!passphrasesMatch && (
+                  <p className="status-error text-xs mt-1">Profile passphrases do not match.</p>
+                )}
               </div>
+
+              {mustConfirmWeakPassphrase && (
+                <label className="flex items-start gap-2 text-sm text-secondary-color">
+                  <input
+                    className="mt-1 accent-primary"
+                    type="checkbox"
+                    checked={weakPassphraseAccepted}
+                    onChange={(e) => setWeakPassphraseAccepted(e.target.checked)}
+                  />
+                  <span>I understand this is a weak passphrase and want to use it anyway.</span>
+                </label>
+              )}
 
               {error && (
                 <div className="status-error text-sm">{error}</div>
@@ -161,7 +208,7 @@ export default function Identity() {
               <button
                 className="btn btn-primary w-full"
                 onClick={handleInitProfile}
-                disabled={loading || !profileName.trim()}
+                disabled={!canContinueProfile}
               >
                 {loading ? "Creating..." : "Continue"}
               </button>
@@ -224,4 +271,31 @@ export default function Identity() {
       </div>
     </div>
   );
+}
+
+function strengthBarClass(level: ReturnType<typeof evaluatePassphraseStrength>["level"]): string {
+  switch (level) {
+    case "empty":
+      return "bg-surface-elevated";
+    case "very_weak":
+    case "weak":
+      return "bg-[var(--error)]";
+    case "fair":
+      return "bg-[var(--warning)]";
+    case "strong":
+      return "bg-[var(--success)]";
+  }
+}
+
+function strengthTextClass(level: ReturnType<typeof evaluatePassphraseStrength>["level"]): string {
+  switch (level) {
+    case "very_weak":
+    case "weak":
+      return "status-error";
+    case "fair":
+      return "status-warning";
+    case "empty":
+    case "strong":
+      return "text-muted-color";
+  }
 }

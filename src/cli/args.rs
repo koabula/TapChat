@@ -46,6 +46,8 @@ pub enum ProfileSubcommand {
         passphrase_stdin: bool,
         #[arg(long)]
         no_keychain: bool,
+        #[arg(long)]
+        allow_weak_passphrase: bool,
     },
     Show {
         #[arg(long)]
@@ -714,8 +716,40 @@ mod tests {
         assert!(matches!(cli.output, OutputFormat::Json));
         match cli.command {
             Command::Profile(ProfileCommand {
-                command: ProfileSubcommand::Init { name, .. },
-            }) => assert_eq!(name, "alice"),
+                command:
+                    ProfileSubcommand::Init {
+                        name,
+                        allow_weak_passphrase,
+                        ..
+                    },
+            }) => {
+                assert_eq!(name, "alice");
+                assert!(!allow_weak_passphrase);
+            }
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_profile_init_allow_weak_passphrase() {
+        let cli = Cli::parse_from([
+            "tapchat",
+            "profile",
+            "init",
+            "--name",
+            "alice",
+            "--root",
+            "state/alice",
+            "--allow-weak-passphrase",
+        ]);
+        match cli.command {
+            Command::Profile(ProfileCommand {
+                command:
+                    ProfileSubcommand::Init {
+                        allow_weak_passphrase,
+                        ..
+                    },
+            }) => assert!(allow_weak_passphrase),
             _ => panic!("unexpected command shape"),
         }
     }

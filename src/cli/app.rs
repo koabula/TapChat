@@ -12,6 +12,7 @@ use crate::contact_workflows::{
 };
 use crate::ffi_api::{AttachmentDescriptor, CoreCommand, CoreEvent};
 use crate::model::{ConversationKind, DeploymentBundle, DeviceStatusKind, Validate};
+use crate::passphrase_strength::evaluate_passphrase_strength;
 use crate::persistence::CorePersistenceSnapshot;
 use crate::transport_contract::{AllowlistDocument, GetHeadResult};
 
@@ -68,6 +69,7 @@ impl CliApp {
                 root,
                 passphrase_stdin,
                 no_keychain,
+                allow_weak_passphrase,
             } => {
                 let passphrase = if passphrase_stdin {
                     let mut passphrase = String::new();
@@ -80,6 +82,11 @@ impl CliApp {
                 } else {
                     None
                 };
+                enforce_profile_passphrase_policy(
+                    passphrase.as_deref(),
+                    &name,
+                    allow_weak_passphrase,
+                )?;
                 let profile = Profile::init_with_options(
                     &name,
                     &root,
@@ -93,9 +100,11 @@ impl CliApp {
             ProfileSubcommand::Show { profile } => {
                 let profile = Profile::open(resolve_profile_path(profile)?)?;
                 let runtime = profile.load_runtime_metadata()?;
+                let storage = profile.storage_diagnostics()?;
                 self.print_value(&serde_json::json!({
                     "profile": profile.metadata(),
                     "runtime": runtime,
+                    "storage": storage,
                 }))
             }
             ProfileSubcommand::ImportDeployment {
@@ -1873,6 +1882,28 @@ fn resolve_profile_path(profile: Option<PathBuf>) -> Result<PathBuf> {
         return Ok(profile);
     }
     Ok(ProfileRegistry::load()?.current()?.root_dir.clone())
+}
+
+fn enforce_profile_passphrase_policy(
+    passphrase: Option<&str>,
+    profile_name: &str,
+    allow_weak_passphrase: bool,
+) -> Result<()> {
+    let Some(passphrase) = passphrase else {
+        return Ok(());
+    };
+    if passphrase.is_empty() {
+        return Ok(());
+    }
+    let strength = evaluate_passphrase_strength(passphrase, Some(profile_name));
+    if strength.requires_confirmation && !allow_weak_passphrase {
+        bail!(
+            "weak profile passphrase rejected: {}. {} Re-run with --allow-weak-passphrase to use it anyway.",
+            strength.label,
+            strength.message
+        );
+    }
+    Ok(())
 }
 
 fn load_driver(profile: &Profile) -> Result<CoreDriver> {

@@ -9,6 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::conversation::StoredMessage;
 use crate::ffi_api::PersistStateEffect;
+use crate::fs_util::write_atomic_unique;
 use crate::persistence::{
     decode_snapshot, encode_snapshot, CorePersistenceSnapshot, PersistOp, PersistedContact,
     PersistedConversation, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
@@ -58,6 +59,21 @@ const JSON_TABLES: &[&str] = &[
     "group_realtime_sessions",
     "settings",
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalStoreDiagnostics {
+    pub state_db_exists: bool,
+    pub schema_version: Option<u32>,
+    pub migration_complete: Option<bool>,
+    pub encrypted_snapshot_exists: bool,
+    pub encrypted_snapshot_backup_exists: bool,
+    pub legacy_plaintext_snapshot_exists: bool,
+    pub private_enc_exists: bool,
+    pub state_db_size_bytes: Option<u64>,
+    pub encrypted_snapshot_size_bytes: Option<u64>,
+    pub encrypted_snapshot_backup_size_bytes: Option<u64>,
+    pub legacy_files_present: Vec<String>,
+}
 
 pub trait LocalStore {
     fn load_snapshot(&self) -> Result<CorePersistenceSnapshot>;
@@ -145,7 +161,7 @@ impl LocalStore for EncryptedSnapshotStore<'_> {
         let encoded = encode_snapshot(snapshot).map_err(anyhow::Error::from)?;
         let encrypted =
             encrypt_snapshot(self.profile_id, self.pdek, &encoded).map_err(anyhow::Error::from)?;
-        write_atomic(&self.snapshot_path(), &encrypted)
+        write_atomic_unique(&self.snapshot_path(), &encrypted)
     }
 
     fn persist_state(&self, persist: &PersistStateEffect) -> Result<()> {
@@ -174,7 +190,7 @@ impl LocalStore for EncryptedSnapshotStore<'_> {
         let path = self.document_path(kind)?;
         let encrypted = encrypt_profile_document(self.profile_id, self.pdek, kind, plaintext)
             .map_err(anyhow::Error::from)?;
-        write_atomic(&path, &encrypted)
+        write_atomic_unique(&path, &encrypted)
     }
 }
 
@@ -450,6 +466,79 @@ pub fn migrate_snapshot_to_state_db(root: &Path, profile_id: &str, pdek: &[u8]) 
         }
     }
     Ok(())
+}
+
+pub fn inspect_storage(
+    root: &Path,
+    profile_id: &str,
+    pdek: &[u8],
+) -> Result<LocalStoreDiagnostics> {
+    let db_path = root.join(STATE_DB_FILE_NAME);
+    let encrypted_snapshot_path = root.join(SNAPSHOT_FILE_NAME);
+    let encrypted_snapshot_backup_path = root.join(SNAPSHOT_DB_BACKUP_FILE_NAME);
+    let legacy_plaintext_snapshot_path = root.join(LEGACY_SNAPSHOT_FILE_NAME);
+    let private_enc_path = root.join(PRIVATE_STATE_FILE_NAME);
+    let legacy_plaintext_snapshot_exists = legacy_plaintext_snapshot_path.exists();
+    let private_enc_exists = private_enc_path.exists();
+    let mut legacy_files_present = Vec::new();
+    if legacy_plaintext_snapshot_exists {
+        legacy_files_present.push(LEGACY_SNAPSHOT_FILE_NAME.to_string());
+    }
+    if private_enc_exists {
+        legacy_files_present.push(PRIVATE_STATE_FILE_NAME.to_string());
+    }
+    let mut diagnostics = LocalStoreDiagnostics {
+        state_db_exists: db_path.exists(),
+        schema_version: None,
+        migration_complete: None,
+        encrypted_snapshot_exists: encrypted_snapshot_path.exists(),
+        encrypted_snapshot_backup_exists: encrypted_snapshot_backup_path.exists(),
+        legacy_plaintext_snapshot_exists,
+        private_enc_exists,
+        state_db_size_bytes: file_size_if_exists(&db_path)?,
+        encrypted_snapshot_size_bytes: file_size_if_exists(&encrypted_snapshot_path)?,
+        encrypted_snapshot_backup_size_bytes: file_size_if_exists(&encrypted_snapshot_backup_path)?,
+        legacy_files_present,
+    };
+
+    if diagnostics.state_db_exists {
+        let conn = open_sqlcipher_connection(&db_path, profile_id, pdek).with_context(|| {
+            format!(
+                "inspect encrypted state DB diagnostics for {}",
+                db_path.display()
+            )
+        })?;
+        let has_schema_meta = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta' LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if has_schema_meta {
+            diagnostics.schema_version = load_optional_schema_meta(&conn, SCHEMA_VERSION_KEY)?
+                .map(|value| {
+                    value
+                        .parse::<u32>()
+                        .context("parse local store schema version")
+                })
+                .transpose()?;
+            diagnostics.migration_complete =
+                load_optional_schema_meta(&conn, MIGRATION_COMPLETE_KEY)?
+                    .map(|value| value == "true");
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+fn file_size_if_exists(path: &Path) -> Result<Option<u64>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read metadata for {}", path.display())),
+    }
 }
 
 fn open_sqlcipher_connection(path: &Path, profile_id: &str, pdek: &[u8]) -> Result<Connection> {
@@ -1098,14 +1187,18 @@ fn load_schema_version(conn: &Connection) -> Result<u32> {
 }
 
 fn schema_migration_complete(conn: &Connection) -> Result<bool> {
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = ?1",
-            params![MIGRATION_COMPLETE_KEY],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let value = load_optional_schema_meta(conn, MIGRATION_COMPLETE_KEY)?;
     Ok(value.as_deref() == Some("true"))
+}
+
+fn load_optional_schema_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM schema_meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
 }
 
 fn mark_schema_migration_complete(store: &SqlCipherLocalStore<'_>) -> Result<()> {
@@ -1154,16 +1247,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,6 +1283,26 @@ mod tests {
         ensure_schema(&conn).expect("schema");
         assert!(schema_migration_complete(&conn).expect("marker"));
         assert_eq!(store.load_snapshot().expect("load"), snapshot);
+        let diagnostics =
+            inspect_storage(dir.path(), "profile:test", &*pdek).expect("inspect storage");
+        assert!(diagnostics.state_db_exists);
+        assert_eq!(diagnostics.schema_version, Some(SCHEMA_VERSION));
+        assert_eq!(diagnostics.migration_complete, Some(true));
+        assert!(diagnostics.encrypted_snapshot_exists);
+        assert!(diagnostics.encrypted_snapshot_backup_exists);
+        assert!(diagnostics.state_db_size_bytes.is_some_and(|size| size > 0));
+        assert!(diagnostics
+            .encrypted_snapshot_size_bytes
+            .is_some_and(|size| size > 0));
+        assert!(diagnostics
+            .encrypted_snapshot_backup_size_bytes
+            .is_some_and(|size| size > 0));
+        assert!(
+            diagnostics
+                .legacy_files_present
+                .contains(&PRIVATE_STATE_FILE_NAME.to_string())
+                || !diagnostics.private_enc_exists
+        );
     }
 
     #[test]

@@ -1,0 +1,72 @@
+[
+  {
+    "name": "empty passphrase uses keychain-only mode",
+    "passphrase": "   ",
+    "profile_name": null,
+    "level": "empty",
+    "requires_confirmation": false
+  },
+  {
+    "name": "short passphrase is very weak",
+    "passphrase": "abc",
+    "profile_name": null,
+    "level": "very_weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "common weak term is very weak",
+    "passphrase": "password123",
+    "profile_name": null,
+    "level": "very_weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "ascending sequence is very weak",
+    "passphrase": "abcdefg!",
+    "profile_name": null,
+    "level": "very_weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "descending sequence is very weak",
+    "passphrase": "zyxwv987",
+    "profile_name": null,
+    "level": "very_weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "single repeated character is very weak",
+    "passphrase": "aaaaaaaa",
+    "profile_name": null,
+    "level": "very_weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "profile name reuse is weak",
+    "passphrase": "alice-chat-key",
+    "profile_name": "alice",
+    "level": "weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "single character class is weak",
+    "passphrase": "quietmoon",
+    "profile_name": null,
+    "level": "weak",
+    "requires_confirmation": true
+  },
+  {
+    "name": "medium phrase is fair",
+    "passphrase": "paper moon",
+    "profile_name": null,
+    "level": "fair",
+    "requires_confirmation": false
+  },
+  {
+    "name": "long varied phrase is strong",
+    "passphrase": "correct-Horse-42-sunrise",
+    "profile_name": null,
+    "level": "strong",
+    "requires_confirmation": false
+  }
+]

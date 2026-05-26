@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -8,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
-use tapchat_core::cli::profile::Profile;
+use tapchat_core::cli::profile::{Profile, ProfileInitOptions};
 use tapchat_core::identity::{IdentityManager, LocalIdentityState};
 use tapchat_core::model::{
     CapabilityOperation, CapabilityService, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth,
@@ -28,6 +29,7 @@ const BOB_MNEMONIC: &str =
 const CAROL_MNEMONIC: &str =
     "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 const DANA_MNEMONIC: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+const CLI_E2E_PROFILE_PASSPHRASE: &str = "Correct-Horse-42-Sunrise-Cli-E2e";
 const ORCHESTRATED_CASE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[allow(dead_code)]
@@ -168,6 +170,145 @@ fn cli_runtime_local_start_stop_and_status_work() -> Result<()> {
     assert!(cleared["base_url"].is_null());
     assert!(cleared["websocket_base_url"].is_null());
     assert!(cleared["mode"].is_null());
+
+    Ok(())
+}
+
+#[test]
+fn cli_profile_weak_passphrase_requires_explicit_allow_flag() -> Result<()> {
+    let _guard = test_lock();
+    let temp_root = repo_temp_dir("weak-passphrase-rejected")?;
+    let registry_path = temp_root.path().join("profiles.json");
+    let profile_root = temp_root.path().join("weak");
+    let registry_env = registry_path.to_string_lossy().to_string();
+
+    let output = run_cli_output_with_env_and_stdin(
+        [("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str())],
+        [
+            "profile",
+            "init",
+            "--name",
+            "weak",
+            "--root",
+            &profile_root.to_string_lossy(),
+            "--no-keychain",
+            "--passphrase-stdin",
+        ],
+        "abc\n",
+    )?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("weak profile passphrase rejected"));
+    assert!(stderr.contains("--allow-weak-passphrase"));
+    assert!(!profile_root.join("profile.json").exists());
+
+    Ok(())
+}
+
+#[test]
+fn cli_profile_short_passphrase_stdin_shows_storage_diagnostics() -> Result<()> {
+    let _guard = test_lock();
+    let temp_root = repo_temp_dir("short-passphrase")?;
+    let registry_path = temp_root.path().join("profiles.json");
+    let profile_root = temp_root.path().join("short");
+    let registry_env = registry_path.to_string_lossy().to_string();
+
+    run_cli_json_with_env_and_stdin(
+        [
+            ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
+            ("TAPCHAT_PROFILE_PASSPHRASE", "abc"),
+        ],
+        [
+            "profile",
+            "init",
+            "--name",
+            "short",
+            "--root",
+            &profile_root.to_string_lossy(),
+            "--no-keychain",
+            "--passphrase-stdin",
+            "--allow-weak-passphrase",
+        ],
+        "abc\n",
+    )?;
+
+    let shown = run_cli_json_with_env(
+        [
+            ("TAPCHAT_PROFILE_REGISTRY_PATH", registry_env.as_str()),
+            ("TAPCHAT_PROFILE_PASSPHRASE", "abc"),
+        ],
+        [
+            "profile",
+            "show",
+            "--profile",
+            &profile_root.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(shown["profile"]["name"].as_str(), Some("short"));
+    assert_eq!(shown["storage"]["state_db_exists"], Value::Bool(true));
+    assert_eq!(shown["storage"]["schema_version"].as_u64(), Some(1));
+    assert_eq!(shown["storage"]["migration_complete"], Value::Bool(true));
+    assert_eq!(
+        shown["storage"]["encrypted_snapshot_exists"],
+        Value::Bool(true)
+    );
+    assert!(shown["storage"]["state_db_size_bytes"].as_u64().is_some());
+    assert!(shown["storage"]["encrypted_snapshot_size_bytes"]
+        .as_u64()
+        .is_some());
+    assert!(shown["storage"]["legacy_files_present"]
+        .as_array()
+        .is_some_and(|value| value.is_empty()));
+
+    Ok(())
+}
+
+#[test]
+fn cli_profile_lock_blocks_second_process() -> Result<()> {
+    let _guard = test_lock();
+    let temp_root = repo_temp_dir("profile-lock")?;
+    let registry_path = temp_root.path().join("profiles.json");
+    let profile_root = temp_root.path().join("locked");
+    unsafe {
+        std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
+    }
+    let held_profile = Profile::init_with_options(
+        "locked",
+        &profile_root,
+        ProfileInitOptions {
+            passphrase: Some(CLI_E2E_PROFILE_PASSPHRASE.into()),
+            use_keychain: false,
+        },
+    )?;
+
+    let failure = run_cli_output_with_env(
+        [("TAPCHAT_PROFILE_PASSPHRASE", CLI_E2E_PROFILE_PASSPHRASE)],
+        [
+            "profile",
+            "show",
+            "--profile",
+            &profile_root.to_string_lossy(),
+        ],
+    )?;
+    assert!(!failure.status.success());
+    let stderr = String::from_utf8_lossy(&failure.stderr);
+    assert!(stderr.contains("already in use"));
+    assert!(stderr.contains("lock holder pid="));
+
+    drop(held_profile);
+    let shown = run_cli_json_with_env(
+        [("TAPCHAT_PROFILE_PASSPHRASE", CLI_E2E_PROFILE_PASSPHRASE)],
+        [
+            "profile",
+            "show",
+            "--profile",
+            &profile_root.to_string_lossy(),
+        ],
+    )?;
+    assert_eq!(shown["profile"]["name"].as_str(), Some("locked"));
+    unsafe {
+        std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+    }
 
     Ok(())
 }
@@ -3958,6 +4099,8 @@ fn cleanup_test_temp_script_removes_cli_temp_artifacts() -> Result<()> {
     let _guard = test_lock();
     let workspace_root = workspace_root();
     let root_temp_dir = workspace_root.join(".cli-smoke-cleanup-generated");
+    let root_dot_tmp_dir = workspace_root.join(".tmp-cleanup-generated");
+    let root_non_temp_dir = workspace_root.join("cleanup-generated-keep");
     let root_temp_file_ps1 = workspace_root.join(".cli-smoke-cleanup-generated.ps1");
     let root_temp_file_txt = workspace_root.join(".cli-smoke-cleanup-generated.txt");
     let service_temp_dir = workspace_root
@@ -3972,9 +4115,13 @@ fn cleanup_test_temp_script_removes_cli_temp_artifacts() -> Result<()> {
     let wrangler_tmp_file = wrangler_tmp_dir.join("cleanup-generated.txt");
 
     fs::create_dir_all(&root_temp_dir)?;
+    fs::create_dir_all(&root_dot_tmp_dir)?;
+    fs::create_dir_all(&root_non_temp_dir)?;
     fs::create_dir_all(&service_temp_dir)?;
     fs::create_dir_all(&wrangler_tmp_dir)?;
     fs::write(root_temp_dir.join("marker.txt"), "cleanup")?;
+    fs::write(root_dot_tmp_dir.join("marker.txt"), "cleanup")?;
+    fs::write(root_non_temp_dir.join("marker.txt"), "keep")?;
     fs::write(&root_temp_file_ps1, "# cleanup")?;
     fs::write(&root_temp_file_txt, "cleanup")?;
     fs::write(service_temp_dir.join("marker.txt"), "cleanup")?;
@@ -3982,7 +4129,10 @@ fn cleanup_test_temp_script_removes_cli_temp_artifacts() -> Result<()> {
 
     let dry_run = run_cleanup_script(&workspace_root, true)?;
     assert!(dry_run.contains(".cli-smoke-cleanup-generated"));
+    assert!(dry_run.contains(".tmp-cleanup-generated"));
     assert!(root_temp_dir.exists());
+    assert!(root_dot_tmp_dir.exists());
+    assert!(root_non_temp_dir.exists());
     assert!(root_temp_file_ps1.exists());
     assert!(root_temp_file_txt.exists());
     assert!(service_temp_dir.exists());
@@ -3991,11 +4141,14 @@ fn cleanup_test_temp_script_removes_cli_temp_artifacts() -> Result<()> {
     let actual = run_cleanup_script(&workspace_root, false)?;
     assert!(actual.contains("Cleanup complete."));
     assert!(!root_temp_dir.exists());
+    assert!(!root_dot_tmp_dir.exists());
+    assert!(root_non_temp_dir.exists());
     assert!(!root_temp_file_ps1.exists());
     assert!(!root_temp_file_txt.exists());
     assert!(!service_temp_dir.exists());
     assert!(wrangler_tmp_dir.exists());
     assert!(!wrangler_tmp_file.exists());
+    fs::remove_dir_all(root_non_temp_dir)?;
 
     Ok(())
 }
@@ -4115,12 +4268,28 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    run_cli_output_with_env(std::iter::empty::<(&str, &str)>(), args)
+}
+
+fn run_cli_output_with_env<I, S, K, V>(
+    envs: impl IntoIterator<Item = (K, V)>,
+    args: I,
+) -> Result<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
     let mut command = Command::new(binary_path());
     command
         .current_dir(workspace_root())
         .arg("--output")
         .arg("json");
     apply_default_cli_test_env(&mut command)?;
+    for (key, value) in envs {
+        command.env(key.as_ref(), value.as_ref());
+    }
     for arg in args {
         command.arg(arg.as_ref());
     }
@@ -4203,6 +4372,73 @@ where
     })
 }
 
+fn run_cli_json_with_env_and_stdin<I, S, K, V>(
+    envs: impl IntoIterator<Item = (K, V)>,
+    args: I,
+    stdin: &str,
+) -> Result<Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let output = run_cli_output_with_env_and_stdin(envs, args, stdin)?;
+    if !output.status.success() {
+        bail!(
+            "tapchat command failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("decode cli stdout as utf-8")?;
+    serde_json::from_str(&stdout).map_err(|error| {
+        anyhow!(
+            "failed to parse cli json output: {error}\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn run_cli_output_with_env_and_stdin<I, S, K, V>(
+    envs: impl IntoIterator<Item = (K, V)>,
+    args: I,
+    stdin: &str,
+) -> Result<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut command = Command::new(binary_path());
+    command
+        .current_dir(workspace_root())
+        .arg("--output")
+        .arg("json")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_default_cli_test_env(&mut command)?;
+    for (key, value) in envs {
+        command.env(key.as_ref(), value.as_ref());
+    }
+    for arg in args {
+        command.arg(arg.as_ref());
+    }
+    let mut child = command.spawn().context("spawn tapchat cli")?;
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("tapchat stdin was not piped"))?;
+    child_stdin
+        .write_all(stdin.as_bytes())
+        .context("write tapchat stdin")?;
+    drop(child_stdin);
+    child.wait_with_output().context("run tapchat cli")
+}
+
 fn sync_once(profile: &Path) -> Result<Value> {
     run_cli_json(["sync", "once", "--profile", &profile.to_string_lossy()])
 }
@@ -4225,10 +4461,7 @@ fn apply_default_cli_test_env(command: &mut Command) -> Result<()> {
     }
     command
         .env("TAPCHAT_PROFILE_REGISTRY_PATH", registry_path)
-        .env(
-            "TAPCHAT_PROFILE_PASSPHRASE",
-            "tapchat-cli-e2e-profile-passphrase",
-        );
+        .env("TAPCHAT_PROFILE_PASSPHRASE", CLI_E2E_PROFILE_PASSPHRASE);
     Ok(())
 }
 

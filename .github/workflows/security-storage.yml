@@ -25,25 +25,22 @@ jobs:
         shell: pwsh
         run: choco install strawberryperl -y
 
-      - name: Install Linux Secret Service runtime
+      - name: Install Linux DBus development headers
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y dbus-x11 gnome-keyring libdbus-1-dev
+          sudo apt-get install -y libdbus-1-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Check workspace
         run: cargo check --workspace
 
-      - name: Test profile security storage
-        if: runner.os != 'Linux'
+      - name: Test passphrase-only profile security storage
         run: |
           cargo test -q --lib profile_crypto
           cargo test -q --lib local_store
           cargo test -q --lib cli::profile
-
-      - name: Test profile security storage with Secret Service
-        if: runner.os == 'Linux'
-        run: |
-          dbus-run-session -- sh -c 'echo "" | gnome-keyring-daemon --unlock >/tmp/keyring.log 2>&1 || true; cargo test -q --lib profile_crypto; cargo test -q --lib local_store; cargo test -q --lib cli::profile'
+          cargo test -q --test cli_e2e cli_profile_weak_passphrase_requires_explicit_allow_flag
+          cargo test -q --test cli_e2e cli_profile_short_passphrase_stdin_shows_storage_diagnostics
+          cargo test -q --test cli_e2e cli_profile_lock_blocks_second_process
