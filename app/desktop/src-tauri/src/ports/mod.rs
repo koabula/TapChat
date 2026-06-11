@@ -12,7 +12,6 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 use tapchat_core::ffi_api::{
     CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect, ReadAttachmentBytesEffect,
     UserNotificationEffect, WriteDownloadedAttachmentEffect,
@@ -35,6 +34,9 @@ use tapchat_core::transport_contract::{
     PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
     RevokeGroupInviteRequest, RevokeGroupInviteResult, SealGroupOutboxRequest,
     SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
+};
+use tapchat_core::transport_contract::json_case::{
+    to_camel_case_json_string, to_snake_case_json_string,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -72,7 +74,13 @@ impl DesktopPlatformPorts {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
-                .expect("build desktop transport HTTP client"),
+                .unwrap_or_else(|error| {
+                    log::warn!(
+                        "Failed to build timeout-configured desktop HTTP client: {}",
+                        error
+                    );
+                    reqwest::Client::new()
+                }),
             app_handle: None,
             current_conversation_id: None,
         }

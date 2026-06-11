@@ -30,7 +30,9 @@ use tokio::time::{Duration, Instant, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
-use crate::util::{to_camel_case_json_string, to_snake_case_json_string};
+use tapchat_core::transport_contract::json_case::{
+    to_camel_case_json_string, to_snake_case_json_string,
+};
 
 pub struct DriverRuntime {
     client: Client,

@@ -177,28 +177,28 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
-            // Build tray icon with menu
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .show_menu_on_left_click(true)
-                .on_menu_event(|app, event| {
-                    match event.id.as_ref() {
+            // Build tray icon with menu when the app bundle provides an icon.
+            if let Some(icon) = app.default_window_icon().cloned() {
+                let _tray = TrayIconBuilder::new()
+                    .icon(icon)
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
                         "show" => {
-                            // Show the main window
                             if let Some(window) = app.get_webview_window("main") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
                             }
                         }
                         "quit" => {
-                            // Set quitting state and exit
                             app.exit(0);
                         }
                         _ => {}
-                    }
-                })
-                .build(app)?;
+                    })
+                    .build(app)?;
+            } else {
+                log::warn!("Skipping tray icon setup because no default window icon is available");
+            }
 
             // Spawn app ready handler
             tauri::async_runtime::spawn(async move {
@@ -215,6 +215,8 @@ pub fn run() {
             commands::identity::get_share_link,
             commands::identity::rotate_share_link,
             commands::identity::update_device_status,
+            commands::identity::sync_groups_for_new_device,
+            commands::identity::sync_groups_for_removed_device,
             commands::identity::set_local_display_name,
             // Conversations
             commands::conversation::list_conversations,

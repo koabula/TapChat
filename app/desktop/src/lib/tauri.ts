@@ -47,6 +47,14 @@ export async function setLocalDisplayName(displayName: string | null): Promise<C
   return invoke("set_local_display_name", { displayName });
 }
 
+export async function syncGroupsForNewDevice(deviceId: string): Promise<CoreOutput> {
+  return invoke("sync_groups_for_new_device", { deviceId });
+}
+
+export async function syncGroupsForRemovedDevice(deviceId: string): Promise<CoreOutput> {
+  return invoke("sync_groups_for_removed_device", { deviceId });
+}
+
 // Profiles
 export async function listProfiles(): Promise<ProfileSummary[]> {
   return invoke("list_profiles");

@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use tapchat_core::model::DeviceStatusKind;
 use tapchat_core::{CoreCommand, CoreOutput};
 
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
 use crate::platform::profile::ProfileSummary;
 use crate::state::AppState;
 
@@ -238,15 +238,79 @@ pub async fn update_device_status(
         _ => return Err(format!("Invalid device status: {}", status)),
     };
 
-    drive_core_with_handle(
+    let mut output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::UpdateLocalDeviceStatus {
-            target_device_id,
-            status: device_status,
+            target_device_id: target_device_id.clone(),
+            status: device_status.clone(),
         }),
     )
     .await
+    .map_err(|e| e.to_string())?;
+
+    if let Some(command) =
+        group_sync_command_for_device_status(&app, &target_device_id, device_status).await
+    {
+        let sync_output = drive_core_with_handle(&app, CoreInput::Command(command))
+            .await
+            .map_err(|e| e.to_string())?;
+        merge_core_outputs(&mut output, sync_output);
+    }
+
+    Ok(output)
+}
+
+#[tauri::command]
+pub async fn sync_groups_for_new_device(
+    app: AppHandle,
+    device_id: String,
+) -> Result<CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::SyncGroupsForNewDevice { device_id }),
+    )
+    .await
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sync_groups_for_removed_device(
+    app: AppHandle,
+    device_id: String,
+) -> Result<CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::SyncGroupsForRemovedDevice { device_id }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn group_sync_command_for_device_status(
+    app: &AppHandle,
+    target_device_id: &str,
+    status: DeviceStatusKind,
+) -> Option<CoreCommand> {
+    let state = app.state::<AppState>();
+    let local_device_id = {
+        let inner = state.inner.read().await;
+        inner
+            .engine
+            .local_identity()
+            .map(|identity| identity.device_identity.device_id.clone())
+    };
+    if local_device_id.as_deref() == Some(target_device_id) {
+        return None;
+    }
+
+    match status {
+        DeviceStatusKind::Active => Some(CoreCommand::SyncGroupsForNewDevice {
+            device_id: target_device_id.to_string(),
+        }),
+        DeviceStatusKind::Revoked => Some(CoreCommand::SyncGroupsForRemovedDevice {
+            device_id: target_device_id.to_string(),
+        }),
+    }
 }
 
 #[tauri::command]

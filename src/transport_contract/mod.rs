@@ -1,3 +1,5 @@
+pub mod json_case;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

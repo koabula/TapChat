@@ -1,8 +1,13 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::Sha256;
+
+pub use crate::transport_contract::json_case::{
+    camel_to_snake_value, snake_to_camel_value, to_camel_case_json_string,
+    to_snake_case_json_string,
+};
 
 pub fn sign_hmac_token(secret: &str, payload: &Value) -> Result<String> {
     let payload_bytes = serde_json::to_vec(payload)?;
@@ -15,71 +20,6 @@ pub fn sign_hmac_token(secret: &str, payload: &Value) -> Result<String> {
         URL_SAFE_NO_PAD.encode(payload_bytes),
         URL_SAFE_NO_PAD.encode(signature)
     ))
-}
-
-pub fn to_camel_case_json_string(input: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(input)?;
-    Ok(serde_json::to_string(&snake_to_camel_value(value))?)
-}
-
-pub fn to_snake_case_json_string(input: &str) -> Result<String> {
-    let value: Value = serde_json::from_str(input)?;
-    Ok(serde_json::to_string(&camel_to_snake_value(value))?)
-}
-
-pub fn snake_to_camel_value(value: Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(snake_to_camel_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| (snake_to_camel(&key), snake_to_camel_value(value)))
-                .collect::<Map<String, Value>>(),
-        ),
-        other => other,
-    }
-}
-
-pub fn camel_to_snake_value(value: Value) -> Value {
-    match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(camel_to_snake_value).collect()),
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| (camel_to_snake(&key), camel_to_snake_value(value)))
-                .collect::<Map<String, Value>>(),
-        ),
-        other => other,
-    }
-}
-
-fn snake_to_camel(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut uppercase = false;
-    for ch in value.chars() {
-        if ch == '_' {
-            uppercase = true;
-        } else if uppercase {
-            output.extend(ch.to_uppercase());
-            uppercase = false;
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn camel_to_snake(value: &str) -> String {
-    let mut output = String::with_capacity(value.len() + 4);
-    for (index, ch) in value.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if index > 0 {
-                output.push('_');
-            }
-            output.push(ch.to_ascii_lowercase());
-        } else {
-            output.push(ch);
-        }
-    }
-    output
 }
 
 /// Best-effort extraction of the `error` or `code` field from a JSON body

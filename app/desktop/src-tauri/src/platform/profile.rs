@@ -239,7 +239,11 @@ impl ProfileManager {
         inner.registry.save()?;
         let is_active = true;
 
-        let entry = inner.active_profile.as_ref().unwrap().metadata();
+        let entry = inner
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| anyhow!("active profile missing after profile creation"))?
+            .metadata();
 
         Ok(ProfileSummary {
             name: entry.name.clone(),

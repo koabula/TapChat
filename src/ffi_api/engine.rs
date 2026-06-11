@@ -800,6 +800,9 @@ impl CoreEngine {
             CoreCommand::SyncGroupsForNewDevice { device_id } => {
                 self.sync_groups_for_new_device(device_id)
             }
+            CoreCommand::SyncGroupsForRemovedDevice { device_id } => {
+                self.sync_groups_for_removed_device(device_id)
+            }
         }
     }
 
@@ -6141,6 +6144,33 @@ impl CoreEngine {
                 "membership proof signer must match envelope sender",
             ));
         }
+        Self::verify_membership_proof_message_binding(envelope, proof)?;
+        self.verify_device_signature(
+            &proof.signer_user_id,
+            &proof.signer_device_id,
+            &Self::membership_proof_payload(proof),
+            &proof.signature,
+        )?;
+        if self.is_reflected_membership_proof(envelope, manifest, proof)? {
+            return Ok(proof.clone());
+        }
+        if proof.previous_roster_version != manifest.roster_version {
+            return Err(CoreError::invalid_input(
+                "membership proof previous roster_version does not match local manifest",
+            ));
+        }
+        if proof.previous_commit_message_id != manifest.last_commit_message_id {
+            return Err(CoreError::invalid_input(
+                "membership proof previous commit does not match local manifest",
+            ));
+        }
+        Ok(proof.clone())
+    }
+
+    fn verify_membership_proof_message_binding(
+        envelope: &GroupEnvelope,
+        proof: &GroupMembershipProof,
+    ) -> CoreResult<()> {
         match envelope.message_type {
             GroupMessageType::MlsCommit => {
                 if proof.commit_message_id != envelope.message_id {
@@ -6165,26 +6195,7 @@ impl CoreEngine {
             }
             _ => {}
         }
-        self.verify_device_signature(
-            &proof.signer_user_id,
-            &proof.signer_device_id,
-            &Self::membership_proof_payload(proof),
-            &proof.signature,
-        )?;
-        if self.is_reflected_membership_proof(envelope, manifest, proof)? {
-            return Ok(proof.clone());
-        }
-        if proof.previous_roster_version != manifest.roster_version {
-            return Err(CoreError::invalid_input(
-                "membership proof previous roster_version does not match local manifest",
-            ));
-        }
-        if proof.previous_commit_message_id != manifest.last_commit_message_id {
-            return Err(CoreError::invalid_input(
-                "membership proof previous commit does not match local manifest",
-            ));
-        }
-        Ok(proof.clone())
+        Ok(())
     }
 
     fn is_reflected_membership_proof(
@@ -10685,6 +10696,111 @@ impl CoreEngine {
         Ok(aggregate)
     }
 
+    /// Phase 8: remove a local device from every group the caller can
+    /// administer after that device has been revoked from the identity bundle.
+    fn sync_groups_for_removed_device(&mut self, device_id: String) -> CoreResult<CoreOutput> {
+        let local_user_id = self.local_identity_user_id()?;
+        let local_device_id = self.local_identity_device_id()?;
+        let device_id = device_id.trim().to_string();
+        if device_id.is_empty() {
+            return Err(CoreError::invalid_input("device_id must not be empty"));
+        }
+        if device_id == local_device_id {
+            return Err(CoreError::invalid_input(
+                "cannot remove the current device from all groups",
+            ));
+        }
+
+        let candidate_group_ids: Vec<String> = self
+            .state
+            .group_states
+            .values()
+            .filter(|state| {
+                matches!(state.local_role, Some(GroupRole::Owner | GroupRole::Admin))
+                    && state.dissolved_at.is_none()
+                    && state.manifest.member_devices.iter().any(|d| {
+                        d.user_id == local_user_id
+                            && d.device_id == device_id
+                            && d.status == GroupMemberStatus::Active
+                    })
+            })
+            .map(|state| state.group_id.clone())
+            .collect();
+
+        if candidate_group_ids.is_empty() {
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: vec![],
+                view_model: Some(CoreViewModel {
+                    group_sync_results: Some(GroupSyncResults {
+                        device_id: device_id.clone(),
+                        total_candidates: 0,
+                        succeeded: 0,
+                        skipped: 0,
+                        errors: vec![],
+                    }),
+                    ..CoreViewModel::default()
+                }),
+            });
+        }
+
+        let total_candidates = candidate_group_ids.len() as u64;
+        let mut succeeded = 0u64;
+        let mut skipped = 0u64;
+        let mut errors: Vec<GroupSyncError> = Vec::new();
+        let mut aggregate = CoreOutput::default();
+
+        for group_id in candidate_group_ids {
+            match self.remove_group_member_device(
+                group_id.clone(),
+                local_user_id.clone(),
+                device_id.clone(),
+            ) {
+                Ok(output) => {
+                    succeeded = succeeded.saturating_add(1);
+                    aggregate = merge_outputs(aggregate, output);
+                }
+                Err(err) => {
+                    let detail = err.to_string();
+                    if detail.contains("not an active member")
+                        || detail.contains("owner or admin")
+                        || detail.contains("dissolved")
+                        || detail.contains("does not belong to the local user")
+                        || detail.contains("cannot remove the last device")
+                    {
+                        skipped = skipped.saturating_add(1);
+                    } else {
+                        errors.push(GroupSyncError {
+                            group_id: group_id.clone(),
+                            error: detail,
+                        });
+                    }
+                }
+            }
+        }
+
+        aggregate.state_update = CoreStateUpdate {
+            conversations_changed: succeeded > 0 || aggregate.state_update.conversations_changed,
+            messages_changed: succeeded > 0 || aggregate.state_update.messages_changed,
+            ..aggregate.state_update
+        };
+        if !errors.is_empty() {
+            aggregate.state_update.system_statuses_changed =
+                vec![SystemStatus::TemporaryNetworkFailure];
+        }
+        aggregate.view_model = Some(CoreViewModel {
+            group_sync_results: Some(GroupSyncResults {
+                device_id,
+                total_candidates,
+                succeeded,
+                skipped,
+                errors,
+            }),
+            ..aggregate.view_model.unwrap_or_default()
+        });
+        Ok(aggregate)
+    }
+
     /// Handle `CoreEvent::GroupOutboxSealed` — step (d) of `DissolveGroup`.
     ///
     /// When the Cloudflare outbox acknowledges the seal request, transition
@@ -11628,4 +11744,236 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
         _ => {}
     }
     base
+}
+
+#[cfg(test)]
+mod group_membership_security_tests {
+    use super::CoreEngine;
+    use crate::ffi_api::CoreCommand;
+    use crate::model::{
+        GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest, GroupMember,
+        GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
+        GroupMessageType, GroupOutboxDescriptor, GroupRole, SenderProof, Validate,
+        CURRENT_MODEL_VERSION,
+    };
+
+    fn base_manifest() -> GroupManifest {
+        GroupManifest {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            group_id: "group:security".into(),
+            conversation_id: "conv:security".into(),
+            title: "Security".into(),
+            owner_user_id: "user:owner".into(),
+            admins: vec!["user:admin".into()],
+            members: vec![
+                GroupMember {
+                    user_id: "user:owner".into(),
+                    role: GroupRole::Owner,
+                    status: GroupMemberStatus::Active,
+                },
+                GroupMember {
+                    user_id: "user:admin".into(),
+                    role: GroupRole::Admin,
+                    status: GroupMemberStatus::Active,
+                },
+                GroupMember {
+                    user_id: "user:member".into(),
+                    role: GroupRole::Member,
+                    status: GroupMemberStatus::Active,
+                },
+            ],
+            member_devices: vec![
+                GroupMemberDevice {
+                    user_id: "user:owner".into(),
+                    device_id: "device:owner:desktop".into(),
+                    status: GroupMemberStatus::Active,
+                },
+                GroupMemberDevice {
+                    user_id: "user:admin".into(),
+                    device_id: "device:admin:desktop".into(),
+                    status: GroupMemberStatus::Active,
+                },
+                GroupMemberDevice {
+                    user_id: "user:member".into(),
+                    device_id: "device:member:desktop".into(),
+                    status: GroupMemberStatus::Active,
+                },
+            ],
+            join_policy: GroupJoinPolicy::ApprovalRequired,
+            member_invite_policy: GroupMemberInvitePolicy::OwnerAdminOnly,
+            roster_version: 4,
+            mls_epoch_hint: 9,
+            last_commit_message_id: Some("msg:commit:old".into()),
+            outbox: GroupOutboxDescriptor {
+                endpoint: "https://example.test/groups/security/outbox".into(),
+                subscribe_endpoint: None,
+            },
+            updated_at: 100,
+            signer_user_id: "user:owner".into(),
+            signer_device_id: "device:owner:desktop".into(),
+            signature: "manifest-sig".into(),
+        }
+    }
+
+    fn next_manifest(signer_user_id: &str, signer_device_id: &str) -> GroupManifest {
+        let mut manifest = base_manifest();
+        manifest.roster_version += 1;
+        manifest.mls_epoch_hint += 1;
+        manifest.updated_at += 1;
+        manifest.signer_user_id = signer_user_id.into();
+        manifest.signer_device_id = signer_device_id.into();
+        manifest.last_commit_message_id = Some("msg:commit:new".into());
+        manifest
+    }
+
+    fn proof() -> GroupMembershipProof {
+        GroupMembershipProof {
+            proof_type: "membership_signature".into(),
+            operation: "remove_device".into(),
+            signer_user_id: "user:admin".into(),
+            signer_device_id: "device:admin:desktop".into(),
+            previous_roster_version: 4,
+            new_roster_version: 5,
+            previous_commit_message_id: Some("msg:commit:old".into()),
+            commit_message_id: "msg:commit:new".into(),
+            control_message_id: "msg:control:new".into(),
+            new_manifest_sha256: "sha256:manifest".into(),
+            signature: "proof-sig".into(),
+        }
+    }
+
+    fn envelope(message_type: GroupMessageType, message_id: &str) -> GroupEnvelope {
+        GroupEnvelope {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            message_id: message_id.into(),
+            group_id: "group:security".into(),
+            conversation_id: "conv:security".into(),
+            sender_user_id: "user:admin".into(),
+            sender_device_id: "device:admin:desktop".into(),
+            created_at: 101,
+            message_type,
+            visibility: GroupEnvelopeVisibility::Visible,
+            inline_ciphertext: None,
+            storage_refs: vec![],
+            sender_proof: SenderProof {
+                proof_type: "signature".into(),
+                value: "sender-sig".into(),
+            },
+            membership_proof: Some(proof()),
+        }
+    }
+
+    #[test]
+    fn group_membership_manifest_transition_rejects_member_signer() {
+        let old = base_manifest();
+        let new = next_manifest("user:member", "device:member:desktop");
+
+        assert!(!CoreEngine::validate_manifest_transition(&old, &new));
+    }
+
+    #[test]
+    fn group_membership_manifest_transition_rejects_roster_rollback_or_skip() {
+        let old = base_manifest();
+        let mut rollback = next_manifest("user:admin", "device:admin:desktop");
+        rollback.roster_version = old.roster_version;
+        assert!(!CoreEngine::validate_manifest_transition(&old, &rollback));
+
+        let mut skip = next_manifest("user:admin", "device:admin:desktop");
+        skip.roster_version = old.roster_version + 2;
+        assert!(!CoreEngine::validate_manifest_transition(&old, &skip));
+    }
+
+    #[test]
+    fn group_membership_manifest_transition_rejects_invalid_owner_shape() {
+        let old = base_manifest();
+        let mut two_owners = next_manifest("user:owner", "device:owner:desktop");
+        two_owners.members[1].role = GroupRole::Owner;
+        assert!(!CoreEngine::validate_manifest_transition(&old, &two_owners));
+
+        let mut owner_id_mismatch = next_manifest("user:owner", "device:owner:desktop");
+        owner_id_mismatch.owner_user_id = "user:admin".into();
+        assert!(!CoreEngine::validate_manifest_transition(&old, &owner_id_mismatch));
+    }
+
+    #[test]
+    fn group_membership_proof_rejects_roster_skip() {
+        let mut stale = proof();
+        stale.new_roster_version = stale.previous_roster_version + 2;
+
+        assert!(stale.validate().is_err());
+    }
+
+    #[test]
+    fn group_membership_proof_binds_mls_commit_message_id() {
+        let commit = envelope(GroupMessageType::MlsCommit, "msg:commit:other");
+        let proof = commit.membership_proof.as_ref().expect("test proof");
+
+        assert!(CoreEngine::verify_membership_proof_message_binding(&commit, proof).is_err());
+    }
+
+    #[test]
+    fn group_membership_proof_binds_all_control_message_ids() {
+        for message_type in [
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupMessageType::ControlGroupMetadataUpdated,
+            GroupMessageType::ControlGroupDissolved,
+        ] {
+            let control = envelope(message_type, "msg:control:other");
+            let proof = control.membership_proof.as_ref().expect("test proof");
+            assert!(CoreEngine::verify_membership_proof_message_binding(&control, proof).is_err());
+        }
+    }
+
+    #[test]
+    fn sync_groups_for_removed_device_rejects_current_device() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: None,
+                device_name: Some("desktop".into()),
+                display_name: None,
+            })
+            .expect("create identity");
+        let current_device_id = engine
+            .local_identity()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+
+        let error = engine
+            .handle_command(CoreCommand::SyncGroupsForRemovedDevice {
+                device_id: current_device_id,
+            })
+            .expect_err("current device must be rejected");
+
+        assert!(error.to_string().contains("current device"));
+    }
+
+    #[test]
+    fn sync_groups_for_removed_device_reports_empty_batch() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: None,
+                device_name: Some("desktop".into()),
+                display_name: None,
+            })
+            .expect("create identity");
+
+        let output = engine
+            .handle_command(CoreCommand::SyncGroupsForRemovedDevice {
+                device_id: "device:alice:old-phone".into(),
+            })
+            .expect("empty batch succeeds");
+        let results = output
+            .view_model
+            .and_then(|view_model| view_model.group_sync_results)
+            .expect("group sync results");
+
+        assert_eq!(results.total_candidates, 0);
+        assert_eq!(results.succeeded, 0);
+        assert_eq!(results.skipped, 0);
+        assert!(results.errors.is_empty());
+    }
 }

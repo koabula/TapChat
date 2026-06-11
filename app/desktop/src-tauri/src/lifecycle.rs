@@ -74,7 +74,9 @@ pub async fn on_app_ready(app: &AppHandle) {
             },
         );
         if let Some(main_window) = app.get_webview_window("main") {
-            main_window.show().expect("failed to show main window");
+            if let Err(error) = main_window.show() {
+                log::error!("Failed to show main window: {}", error);
+            }
             let _ = main_window.set_focus();
         }
         log::info!(
@@ -101,14 +103,16 @@ pub async fn on_app_ready(app: &AppHandle) {
         set_ws_connection_snapshot(&state, None, false).await;
 
         // Open onboarding window
-        let _onboarding =
+        if let Err(error) =
             WebviewWindowBuilder::new(app, "onboarding", WebviewUrl::App("/onboarding".into()))
                 .title("TapChat Setup")
                 .inner_size(960.0, 640.0)
                 .resizable(false)
                 .center()
                 .build()
-                .expect("failed to create onboarding window");
+        {
+            log::error!("Failed to create onboarding window: {}", error);
+        }
     } else {
         log::info!("Session ready, loading snapshot and showing main window");
 
@@ -207,7 +211,9 @@ pub async fn on_app_ready(app: &AppHandle) {
         // Show main window (created hidden in tauri.conf.json)
         let show_window_started_at = Instant::now();
         if let Some(main_window) = app.get_webview_window("main") {
-            main_window.show().expect("failed to show main window");
+            if let Err(error) = main_window.show() {
+                log::error!("Failed to show main window: {}", error);
+            }
         }
         log::info!(
             "on_app_ready: main_window.show completed in {}ms",
@@ -392,7 +398,7 @@ pub async fn drive_core_without_handle(state: &AppState, input: CoreInput) -> Re
     Ok(output)
 }
 
-fn merge_core_outputs(base: &mut CoreOutput, mut next: CoreOutput) {
+pub(crate) fn merge_core_outputs(base: &mut CoreOutput, mut next: CoreOutput) {
     base.state_update.conversations_changed |= next.state_update.conversations_changed;
     base.state_update.messages_changed |= next.state_update.messages_changed;
     base.state_update.contacts_changed |= next.state_update.contacts_changed;

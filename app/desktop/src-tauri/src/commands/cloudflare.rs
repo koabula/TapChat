@@ -459,9 +459,7 @@ pub async fn cloudflare_deploy(
     let inner = state.inner.read().await;
 
     // Get identity info - identity must exist, but bundle is optional for first deployment
-    let identity = inner.engine.local_identity();
-
-    if identity.is_none() {
+    let Some(identity_ref) = inner.engine.local_identity() else {
         return Ok(DeployResult {
             success: false,
             worker_name: "".into(),
@@ -471,9 +469,7 @@ pub async fn cloudflare_deploy(
             bucket_name: None,
             preview_bucket_name: None,
         });
-    }
-
-    let identity_ref = identity.unwrap();
+    };
     let user_id = identity_ref.user_identity.user_id.clone();
     let device_id = identity_ref.device_identity.device_id.clone();
 

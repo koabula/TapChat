@@ -86,10 +86,7 @@ pub async fn send_text(
         conversation_id,
         sender_device_id,
         plaintext,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
+        created_at: crate::ts_ms().min(u64::MAX as u128) as u64,
     })
 }
 

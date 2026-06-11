@@ -165,6 +165,12 @@ pub enum CoreCommand {
     SyncGroupsForNewDevice {
         device_id: String,
     },
+    /// Phase 8: remove a revoked local device from every group the local
+    /// user administers. Mirrors `SyncGroupsForNewDevice` but issues MLS
+    /// removes for currently active group membership entries.
+    SyncGroupsForRemovedDevice {
+        device_id: String,
+    },
     TransferGroupOwnership {
         group_id: String,
         new_owner_user_id: String,
@@ -771,7 +777,7 @@ pub struct GroupSyncError {
     pub error: String,
 }
 
-/// Summary produced by `SyncGroupsForNewDevice`.
+/// Summary produced by group device batch sync commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSyncResults {
     pub device_id: String,
