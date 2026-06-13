@@ -38,9 +38,9 @@ export default {
         },
         // Aliases for convenience
         primary: {
-          DEFAULT: "#81A1C1", // frost.2
-          dark: "#5E81AC", // frost.3
-          light: "#88C0D0", // frost.1
+          DEFAULT: "rgb(var(--accent-primary-rgb) / <alpha-value>)",
+          dark: "rgb(var(--accent-hover-rgb) / <alpha-value>)",
+          light: "rgb(var(--accent-light-rgb) / <alpha-value>)",
         },
       },
       fontFamily: {

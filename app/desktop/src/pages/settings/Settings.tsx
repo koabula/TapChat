@@ -4,8 +4,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { ChevronDown, ChevronRight, Code2, Download, ExternalLink, Monitor, RefreshCw, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Code2, Download, ExternalLink, Monitor, RefreshCw, X } from "lucide-react";
 import { useManualUpdate } from "@/hooks/useAutoUpdate";
+import { THEME_OPTIONS, type ResolvedTheme } from "@/lib/theme";
+import { useThemeStore } from "@/store/theme";
 
 import {
   getIdentityInfo,
@@ -59,7 +61,6 @@ export default function Settings() {
   const [showMnemonic, setShowMnemonic] = useState(false);
   const [newAllowlistUser, setNewAllowlistUser] = useState("");
   const [allowlist, setAllowlist] = useState<string[]>([]);
-  const [darkMode, setDarkMode] = useState(false);
   const [debugMode, setDebugModeState] = useState(false);
   const [developerMode, setDeveloperMode] = useState(readSessionDeveloperMode);
   const [developerClickCount, setDeveloperClickCount] = useState(0);
@@ -80,16 +81,15 @@ export default function Settings() {
   // Delete profile state
   const [deletingProfile, setDeletingProfile] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<{ path: string; name: string } | null>(null);
+  const themePreference = useThemeStore((s) => s.preference);
+  const resolvedTheme = useThemeStore((s) => s.resolvedTheme);
+  const setThemePreference = useThemeStore((s) => s.setThemePreference);
 
   useEffect(() => {
     loadIdentity();
     loadAppMetadata();
     loadRuntimeStatus();
     loadProfiles();
-
-    // Check system preference for dark mode
-    const isDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
-    setDarkMode(isDark);
 
     // Listen for engine-reloaded event (profile switch) to reload all data
     const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {
@@ -206,12 +206,6 @@ export default function Settings() {
         // Best-effort cleanup; developer mode visibility is independent of backend debug state.
       }
     }
-  };
-
-  // Toggle dark mode
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-    document.documentElement.classList.toggle("dark", !darkMode);
   };
 
   const handleCopyShareLink = async () => {
@@ -357,6 +351,13 @@ export default function Settings() {
 
   const updateProgressPercent = Math.round(update.progress);
   const remainingDeveloperClicks = DEVELOPER_MODE_CLICK_TARGET - developerClickCount;
+  const followsSystemTheme = themePreference === "system";
+  const selectTheme = (theme: ResolvedTheme) => {
+    setThemePreference(theme);
+  };
+  const toggleFollowSystemTheme = () => {
+    setThemePreference(followsSystemTheme ? resolvedTheme : "system");
+  };
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
@@ -378,22 +379,90 @@ export default function Settings() {
           <section className="mb-6">
             <h2 className="text-lg font-medium text-primary-color mb-3">Appearance</h2>
 
-            <div className="card">
-              <label className="flex items-center justify-between cursor-pointer">
-                <span className="text-primary-color">Dark Mode</span>
+            <div className="card space-y-4">
+              <label className="flex items-center justify-between gap-4 cursor-pointer">
+                <div className="min-w-0">
+                  <span className="text-primary-color">Follow system</span>
+                  <p className="mt-0.5 text-xs text-muted-color">
+                    Uses Nord Light or Nord Dark based on your OS appearance.
+                  </p>
+                </div>
                 <button
-                  className={`w-12 h-6 rounded-full transition-colors ${
-                    darkMode ? "bg-primary" : "bg-surface-elevated"
+                  className={`h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
+                    followsSystemTheme ? "bg-primary" : "bg-surface-elevated"
                   }`}
-                  onClick={toggleDarkMode}
+                  role="switch"
+                  aria-checked={followsSystemTheme}
+                  onClick={toggleFollowSystemTheme}
                 >
                   <span
-                    className={`block w-5 h-5 rounded-full bg-white transition-transform ${
-                      darkMode ? "translate-x-6" : "translate-x-1"
+                    className={`block h-5 w-5 rounded-full bg-white transition-transform ${
+                      followsSystemTheme ? "translate-x-5" : "translate-x-1"
                     }`}
                   />
                 </button>
               </label>
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                {THEME_OPTIONS.map((theme) => {
+                  const selected = themePreference === theme.id;
+                  const activeViaSystem =
+                    followsSystemTheme && resolvedTheme === theme.id;
+                  return (
+                    <button
+                      key={theme.id}
+                      className={`rounded-lg border p-3 text-left transition-colors ${
+                        selected
+                          ? "border-primary bg-primary/10"
+                          : activeViaSystem
+                            ? "border-default bg-surface-elevated"
+                            : "border-subtle hover:border-default hover:bg-surface-elevated"
+                      }`}
+                      onClick={() => selectTheme(theme.id)}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-medium text-primary-color">
+                            {theme.label}
+                          </div>
+                          <div className="mt-0.5 text-xs text-muted-color">
+                            {theme.description}
+                          </div>
+                        </div>
+                        {(selected || activeViaSystem) && (
+                          <span
+                            className={`mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full ${
+                              selected ? "bg-primary" : "bg-surface text-muted-color"
+                            }`}
+                            style={
+                              selected
+                                ? { color: "var(--bubble-sent-text)" }
+                                : undefined
+                            }
+                            title={selected ? "Selected" : "Active from system"}
+                          >
+                            <Check size={13} />
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-3 flex items-center gap-1">
+                        <span
+                          className="h-5 flex-1 rounded border border-subtle"
+                          style={{ backgroundColor: theme.preview.base }}
+                        />
+                        <span
+                          className="h-5 flex-1 rounded border border-subtle"
+                          style={{ backgroundColor: theme.preview.surface }}
+                        />
+                        <span
+                          className="h-5 flex-1 rounded border border-subtle"
+                          style={{ backgroundColor: theme.preview.accent }}
+                        />
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </section>
 

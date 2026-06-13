@@ -34,6 +34,7 @@ import { useGroupSyncScheduler } from "./hooks/useGroupSyncScheduler";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
 import { waitForNonBootstrappingSessionStatus } from "./lib/sessionStartup";
+import { useThemeStore } from "./store/theme";
 
 import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
 import type { MessageRequestItem } from "./store/requests";
@@ -209,12 +210,26 @@ function AppInner({ startupError }: { startupError: string | null }) {
 
 function App() {
   const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight, setUnlockError } = useSessionStore();
+  const hydrateTheme = useThemeStore((s) => s.hydrateTheme);
+  const handleSystemThemeChanged = useThemeStore((s) => s.handleSystemThemeChanged);
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [statusResolved, setStatusResolved] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
   const isProfileSwitchingRef = useRef(false);
   const syncInFlightRef = useRef(false);
   const syncPendingRef = useRef(false);
+
+  useEffect(() => {
+    hydrateTheme();
+    if (typeof window.matchMedia !== "function") {
+      return;
+    }
+
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const listener = () => handleSystemThemeChanged();
+    media.addEventListener("change", listener);
+    return () => media.removeEventListener("change", listener);
+  }, [hydrateTheme, handleSystemThemeChanged]);
 
   // Subscribe to Tauri events on mount (these don't need Router context)
   useEffect(() => {
