@@ -38,13 +38,13 @@ export default function AttachmentCard({
 
   return (
     <div
-      className={`flex items-center gap-3 p-3 bg-surface/50 rounded-lg border border-subtle hover:border-default transition-colors group/file ${
+      className={`flex items-center gap-2.5 rounded-md border border-subtle bg-surface/30 px-3 py-2 transition-colors hover:border-default hover:bg-surface/60 group/file ${
         onClickPreview ? "cursor-pointer" : ""
       }`}
       onClick={onClickPreview ? handleClick : undefined}
     >
       {/* Icon */}
-      <div className="w-10 h-10 rounded-lg bg-surface-elevated flex items-center justify-center flex-shrink-0 shadow-sm">
+      <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md bg-surface-elevated">
         {icon}
       </div>
 

@@ -1,13 +1,30 @@
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router";
+import { useEffect, useMemo, useState } from "react";
+import type { ComponentType } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { Check, ChevronDown, ChevronRight, Code2, Download, ExternalLink, Monitor, RefreshCw, X } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Code2,
+  Download,
+  ExternalLink,
+  HardDrive,
+  Palette,
+  Paperclip,
+  RefreshCw,
+  Server,
+  UserRound,
+  X,
+} from "lucide-react";
+
 import { useManualUpdate } from "@/hooks/useAutoUpdate";
 import { THEME_OPTIONS, type ResolvedTheme } from "@/lib/theme";
 import { useThemeStore } from "@/store/theme";
+import Devices from "./Devices";
+import Runtime from "./Runtime";
 
 import {
   getIdentityInfo,
@@ -18,7 +35,6 @@ import {
   selectProfileForRestart,
   deleteProfile,
   startNewProfileOnboarding,
-  cloudflareStatus,
   addToAllowlist,
   removeFromAllowlist,
   getAllowlist,
@@ -26,7 +42,26 @@ import {
   getDebugMode,
   getAppMetadata,
 } from "@/lib/tauri";
-import type { AppMetadata, IdentityInfo, ProfileSummary, CloudflareStatus } from "@/lib/types";
+import type { AppMetadata, IdentityInfo, ProfileSummary } from "@/lib/types";
+
+export type SettingsSection =
+  | "account"
+  | "appearance"
+  | "devices"
+  | "runtime"
+  | "attachments"
+  | "developer";
+
+interface SettingsProps {
+  initialSection?: SettingsSection;
+}
+
+interface SettingsNavItem {
+  id: SettingsSection;
+  label: string;
+  description: string;
+  Icon: ComponentType<{ size?: number; className?: string }>;
+}
 
 const DEVELOPER_MODE_SESSION_KEY = "tapchat:developerMode";
 const DEVELOPER_MODE_CLICK_TARGET = 5;
@@ -52,11 +87,10 @@ function writeSessionDeveloperMode(enabled: boolean) {
   }
 }
 
-export default function Settings() {
-  const navigate = useNavigate();
+export default function Settings({ initialSection = "account" }: SettingsProps) {
+  const [activeSection, setActiveSection] = useState<SettingsSection>(initialSection);
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
   const [appMetadata, setAppMetadata] = useState<AppMetadata | null>(null);
-  const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [showMnemonic, setShowMnemonic] = useState(false);
   const [newAllowlistUser, setNewAllowlistUser] = useState("");
@@ -69,37 +103,34 @@ export default function Settings() {
   const [switchingProfile, setSwitchingProfile] = useState<string | null>(null);
   const update = useManualUpdate();
 
-  // Display name editing state
   const [editingDisplayName, setEditingDisplayName] = useState(false);
   const [displayNameInput, setDisplayNameInput] = useState("");
   const [savingDisplayName, setSavingDisplayName] = useState(false);
-
-  // New profile creation state - just show confirmation dialog
   const [showCreateConfirm, setShowCreateConfirm] = useState(false);
   const [startingOnboarding, setStartingOnboarding] = useState(false);
-
-  // Delete profile state
   const [deletingProfile, setDeletingProfile] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<{ path: string; name: string } | null>(null);
+
   const themePreference = useThemeStore((s) => s.preference);
   const resolvedTheme = useThemeStore((s) => s.resolvedTheme);
   const setThemePreference = useThemeStore((s) => s.setThemePreference);
 
   useEffect(() => {
-    loadIdentity();
-    loadAppMetadata();
-    loadRuntimeStatus();
-    loadProfiles();
+    setActiveSection(initialSection);
+  }, [initialSection]);
 
-    // Listen for engine-reloaded event (profile switch) to reload all data
+  useEffect(() => {
+    void loadIdentity();
+    void loadAppMetadata();
+    void loadProfiles();
+
     const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {
       console.debug("[Settings] Engine reloaded, refreshing settings data");
-      loadIdentity();
-      loadRuntimeStatus();
-      loadProfiles();
+      void loadIdentity();
+      void loadProfiles();
       if (readSessionDeveloperMode()) {
-        loadAllowlist();
-        loadDebugMode();
+        void loadAllowlist();
+        void loadDebugMode();
       }
     });
 
@@ -109,10 +140,34 @@ export default function Settings() {
   }, []);
 
   useEffect(() => {
-    if (!developerMode) return;
-    loadAllowlist();
-    loadDebugMode();
+    if (!developerMode) {
+      if (activeSection === "developer") {
+        setActiveSection("account");
+      }
+      return;
+    }
+    void loadAllowlist();
+    void loadDebugMode();
+  }, [activeSection, developerMode]);
+
+  const navItems = useMemo<SettingsNavItem[]>(() => {
+    const items: SettingsNavItem[] = [
+      { id: "account", label: "Account", description: "Identity and profiles", Icon: UserRound },
+      { id: "appearance", label: "Appearance", description: "Themes and color", Icon: Palette },
+      { id: "devices", label: "Devices", description: "Local device state", Icon: HardDrive },
+      { id: "runtime", label: "Runtime", description: "Cloudflare inbox/storage", Icon: Server },
+      { id: "attachments", label: "Attachments", description: "Media and downloads", Icon: Paperclip },
+    ];
+    if (developerMode) {
+      items.push({ id: "developer", label: "Developer", description: "Diagnostics and testing", Icon: Code2 });
+    }
+    return items;
   }, [developerMode]);
+
+  const activeItem = navItems.find((item) => item.id === activeSection) ?? navItems[0];
+  const followsSystemTheme = themePreference === "system";
+  const updateProgressPercent = Math.round(update.progress);
+  const remainingDeveloperClicks = DEVELOPER_MODE_CLICK_TARGET - developerClickCount;
 
   const loadIdentity = async () => {
     try {
@@ -132,19 +187,9 @@ export default function Settings() {
     }
   };
 
-  const loadRuntimeStatus = async () => {
-    try {
-      const result = await cloudflareStatus();
-      setRuntimeStatus(result);
-    } catch (err) {
-      console.error(`[Settings] Failed to get runtime status: ${String(err)}`);
-    }
-  };
-
   const loadProfiles = async () => {
     try {
-      const result = await listProfiles();
-      setProfiles(result);
+      setProfiles(await listProfiles());
     } catch (err) {
       console.error(`[Settings] Failed to load profiles: ${String(err)}`);
     }
@@ -163,21 +208,19 @@ export default function Settings() {
 
   const loadDebugMode = async () => {
     try {
-      const result = await getDebugMode();
-      setDebugModeState(result);
+      setDebugModeState(await getDebugMode());
     } catch {
       // debug mode toggle is best-effort
     }
   };
 
-  // Toggle debug mode for [TIMETEST] instrumentation
   const handleToggleDebugMode = async () => {
     const next = !debugMode;
     setDebugModeState(next);
     try {
       await setDebugMode(next);
     } catch {
-      setDebugModeState(!next); // revert
+      setDebugModeState(!next);
     }
   };
 
@@ -203,7 +246,7 @@ export default function Settings() {
       try {
         await setDebugMode(false);
       } catch {
-        // Best-effort cleanup; developer mode visibility is independent of backend debug state.
+        // Best-effort cleanup.
       }
     }
   };
@@ -221,12 +264,22 @@ export default function Settings() {
     }
   };
 
+  const handleRotateLink = async () => {
+    try {
+      await rotateShareLink();
+      alert("Share link rotated. Share the new link with your contacts.");
+    } catch (err) {
+      console.error(`[Settings] Failed to rotate share link: ${String(err)}`);
+      alert(String(err));
+    }
+  };
+
   const handleAddAllowlist = async () => {
     if (!newAllowlistUser.trim()) return;
     try {
       await addToAllowlist(newAllowlistUser);
       setNewAllowlistUser("");
-      loadAllowlist();
+      void loadAllowlist();
     } catch (err) {
       console.error(`[Settings] Failed to add allowlist entry: ${String(err)}`);
     }
@@ -235,19 +288,9 @@ export default function Settings() {
   const handleRemoveAllowlist = async (userId: string) => {
     try {
       await removeFromAllowlist(userId);
-      loadAllowlist();
+      void loadAllowlist();
     } catch (err) {
       console.error(`[Settings] Failed to remove allowlist entry: ${String(err)}`);
-    }
-  };
-
-  const handleRotateLink = async () => {
-    try {
-      await rotateShareLink();
-      alert("Share link rotated. Share the new link with your contacts.");
-    } catch (err) {
-      console.error(`[Settings] Failed to rotate share link: ${String(err)}`);
-      alert(String(err));
     }
   };
 
@@ -308,7 +351,7 @@ export default function Settings() {
         }
       }
     } finally {
-      loadProfiles();
+      void loadProfiles();
       setSwitchingProfile(null);
     }
   };
@@ -316,10 +359,8 @@ export default function Settings() {
   const handleStartNewProfileOnboarding = async () => {
     setStartingOnboarding(true);
     try {
-      // Start onboarding - does NOT create profile yet, will be created during onboarding
       await startNewProfileOnboarding();
       setShowCreateConfirm(false);
-      // The backend will emit session-status event which triggers frontend navigation
     } catch (err) {
       console.error(`[Settings] Failed to start onboarding: ${String(err)}`);
       alert(String(err));
@@ -328,8 +369,7 @@ export default function Settings() {
     }
   };
 
-  const handleDeleteProfile = async (path: string, name: string) => {
-    // Show confirmation dialog
+  const handleDeleteProfile = (path: string, name: string) => {
     setShowDeleteConfirm({ path, name });
   };
 
@@ -340,7 +380,7 @@ export default function Settings() {
     setShowDeleteConfirm(null);
     try {
       await deleteProfile(path);
-      loadProfiles();
+      void loadProfiles();
     } catch (err) {
       console.error(`[Settings] Failed to delete profile: ${String(err)}`);
       alert(String(err));
@@ -349,658 +389,565 @@ export default function Settings() {
     }
   };
 
-  const updateProgressPercent = Math.round(update.progress);
-  const remainingDeveloperClicks = DEVELOPER_MODE_CLICK_TARGET - developerClickCount;
-  const followsSystemTheme = themePreference === "system";
   const selectTheme = (theme: ResolvedTheme) => {
     setThemePreference(theme);
   };
+
   const toggleFollowSystemTheme = () => {
     setThemePreference(followsSystemTheme ? resolvedTheme : "system");
   };
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
-      <div className="mx-auto flex min-h-0 max-w-2xl flex-1 flex-col">
-        {/* Header */}
-        <header className="flex h-14 items-center border-b border-subtle px-4">
+      <aside className="w-56 shrink-0 border-r border-subtle bg-surface">
+        <div className="border-b border-subtle px-4 py-4">
           <h1 className="font-semibold text-primary-color">Settings</h1>
-        </header>
+          <p className="mt-1 text-xs text-muted-color">TapChat preferences</p>
+        </div>
+        <nav className="space-y-1 p-2">
+          {navItems.map((item) => {
+            const selected = activeSection === item.id;
+            return (
+              <button
+                key={item.id}
+                className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left transition-colors ${
+                  selected
+                    ? "bg-primary/10 text-primary-color"
+                    : "text-secondary-color hover:bg-surface-elevated hover:text-primary-color"
+                }`}
+                onClick={() => setActiveSection(item.id)}
+              >
+                <item.Icon size={17} />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">{item.label}</span>
+                  <span className="block truncate text-[11px] text-muted-color">
+                    {item.description}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </nav>
+      </aside>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto overscroll-contain p-4">
-          {/* Appearance section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Appearance</h2>
+      <main className="min-w-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="mx-auto w-full max-w-3xl px-6 py-5">
+          <div className="mb-5">
+            <h2 className="text-xl font-semibold text-primary-color">{activeItem.label}</h2>
+            <p className="mt-1 text-sm text-muted-color">{activeItem.description}</p>
+          </div>
+          {activeSection === "account" && renderAccountPanel()}
+          {activeSection === "appearance" && renderAppearancePanel()}
+          {activeSection === "devices" && <Devices embedded />}
+          {activeSection === "runtime" && <Runtime embedded />}
+          {activeSection === "attachments" && <AttachmentsSettings />}
+          {activeSection === "developer" && developerMode && renderDeveloperPanel()}
+        </div>
+      </main>
+    </div>
+  );
 
-            <div className="card space-y-4">
-              <label className="flex items-center justify-between gap-4 cursor-pointer">
-                <div className="min-w-0">
-                  <span className="text-primary-color">Follow system</span>
-                  <p className="mt-0.5 text-xs text-muted-color">
-                    Uses Nord Light or Nord Dark based on your OS appearance.
-                  </p>
-                </div>
-                <button
-                  className={`h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
-                    followsSystemTheme ? "bg-primary" : "bg-surface-elevated"
-                  }`}
-                  role="switch"
-                  aria-checked={followsSystemTheme}
-                  onClick={toggleFollowSystemTheme}
-                >
-                  <span
-                    className={`block h-5 w-5 rounded-full bg-white transition-transform ${
-                      followsSystemTheme ? "translate-x-5" : "translate-x-1"
-                    }`}
-                  />
-                </button>
-              </label>
+  function renderAppearancePanel() {
+    return (
+      <section className="card space-y-4">
+        <label className="flex cursor-pointer items-center justify-between gap-4">
+          <div className="min-w-0">
+            <span className="text-primary-color">Follow system</span>
+            <p className="mt-0.5 text-xs text-muted-color">
+              Uses Nord Light or Nord Dark based on your OS appearance.
+            </p>
+          </div>
+          <button
+            className={`h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
+              followsSystemTheme ? "bg-primary" : "bg-surface-elevated"
+            }`}
+            role="switch"
+            aria-checked={followsSystemTheme}
+            onClick={toggleFollowSystemTheme}
+          >
+            <span
+              className={`block h-5 w-5 rounded-full bg-white transition-transform ${
+                followsSystemTheme ? "translate-x-5" : "translate-x-1"
+              }`}
+            />
+          </button>
+        </label>
 
-              <div className="grid gap-2 sm:grid-cols-2">
-                {THEME_OPTIONS.map((theme) => {
-                  const selected = themePreference === theme.id;
-                  const activeViaSystem =
-                    followsSystemTheme && resolvedTheme === theme.id;
-                  return (
-                    <button
-                      key={theme.id}
-                      className={`rounded-lg border p-3 text-left transition-colors ${
-                        selected
-                          ? "border-primary bg-primary/10"
-                          : activeViaSystem
-                            ? "border-default bg-surface-elevated"
-                            : "border-subtle hover:border-default hover:bg-surface-elevated"
-                      }`}
-                      onClick={() => selectTheme(theme.id)}
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="min-w-0">
-                          <div className="font-medium text-primary-color">
-                            {theme.label}
-                          </div>
-                          <div className="mt-0.5 text-xs text-muted-color">
-                            {theme.description}
-                          </div>
-                        </div>
-                        {(selected || activeViaSystem) && (
-                          <span
-                            className={`mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full ${
-                              selected ? "bg-primary" : "bg-surface text-muted-color"
-                            }`}
-                            style={
-                              selected
-                                ? { color: "var(--bubble-sent-text)" }
-                                : undefined
-                            }
-                            title={selected ? "Selected" : "Active from system"}
-                          >
-                            <Check size={13} />
-                          </span>
-                        )}
-                      </div>
-                      <div className="mt-3 flex items-center gap-1">
-                        <span
-                          className="h-5 flex-1 rounded border border-subtle"
-                          style={{ backgroundColor: theme.preview.base }}
-                        />
-                        <span
-                          className="h-5 flex-1 rounded border border-subtle"
-                          style={{ backgroundColor: theme.preview.surface }}
-                        />
-                        <span
-                          className="h-5 flex-1 rounded border border-subtle"
-                          style={{ backgroundColor: theme.preview.accent }}
-                        />
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </section>
-
-          {/* Profiles section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Profiles</h2>
-
-            <div className="card space-y-2">
-              {profiles.length === 0 && (
-                <p className="text-muted-color text-sm">
-                  No profiles found. Create a profile during onboarding.
-                </p>
-              )}
-
-              {profiles.map((profile) => (
-                <div
-                  key={profile.path}
-                  className={`flex items-center justify-between p-2 rounded ${
-                    profile.is_active ? "bg-surface-elevated" : ""
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    <span className={`w-2 h-2 rounded-full ${
-                      profile.is_active ? "status-success" : "bg-surface-elevated"
-                    }`} />
-                    <div>
-                      <span className="text-primary-color font-medium">{profile.name}</span>
-                      {profile.user_id && (
-                        <span className="text-muted-color text-xs ml-2">
-                          ({profile.user_id.slice(0, 8)}...)
-                        </span>
-                      )}
-                      {profile.runtime_bound && (
-                        <span className="status-success text-xs ml-1">Connected</span>
-                      )}
+        <div className="grid gap-2 sm:grid-cols-2">
+          {THEME_OPTIONS.map((theme) => {
+            const selected = themePreference === theme.id;
+            const activeViaSystem = followsSystemTheme && resolvedTheme === theme.id;
+            return (
+              <button
+                key={theme.id}
+                className={`rounded-lg border p-3 text-left transition-colors ${
+                  selected
+                    ? "border-primary bg-primary/10"
+                    : activeViaSystem
+                      ? "border-default bg-surface-elevated"
+                      : "border-subtle hover:border-default hover:bg-surface-elevated"
+                }`}
+                onClick={() => selectTheme(theme.id)}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="font-medium text-primary-color">{theme.label}</div>
+                    <div className="mt-0.5 text-xs text-muted-color">
+                      {theme.description}
                     </div>
                   </div>
-                  <div className="flex items-center gap-1">
-                    {profile.is_active ? (
-                      <span className="text-xs text-muted-color">(Active)</span>
-                    ) : (
-                      <>
-                        <button
-                          className="btn btn-ghost text-sm"
-                          onClick={() => handleSwitchProfile(profile.path)}
-                          disabled={switchingProfile === profile.path}
-                        >
-                          {switchingProfile === profile.path ? "Restarting..." : "Switch"}
-                        </button>
-                        <button
-                          className="btn btn-ghost text-xs status-error"
-                          onClick={() => handleDeleteProfile(profile.path, profile.name)}
-                          disabled={deletingProfile === profile.path}
-                        >
-                          {deletingProfile === profile.path ? "..." : <X size={14} />}
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              ))}
-
-              {/* Delete confirmation dialog */}
-              {showDeleteConfirm && (
-                <div className="card mt-2 pt-2 border-t border-default">
-                  <p className="status-error mb-3">
-                    Delete profile "{showDeleteConfirm.name}"?
-                  </p>
-                  <p className="text-muted-color text-sm mb-3">
-                    This action cannot be undone. All data in this profile will be permanently deleted.
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <button
-                      className="btn btn-ghost status-error"
-                      onClick={confirmDeleteProfile}
-                      disabled={deletingProfile === showDeleteConfirm.path}
+                  {(selected || activeViaSystem) && (
+                    <span
+                      className={`mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full ${
+                        selected ? "bg-primary" : "bg-surface text-muted-color"
+                      }`}
+                      style={selected ? { color: "var(--bubble-sent-text)" } : undefined}
+                      title={selected ? "Selected" : "Active from system"}
                     >
-                      {deletingProfile === showDeleteConfirm.path ? "Deleting..." : "Yes, Delete"}
-                    </button>
-                    <button
-                      className="btn btn-ghost"
-                      onClick={() => setShowDeleteConfirm(null)}
-                      disabled={deletingProfile !== null}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* Create new profile - confirmation dialog */}
-              {showCreateConfirm ? (
-                <div className="card mt-2 pt-2 border-t border-default">
-                  <p className="text-primary-color mb-3">
-                    Create a new profile? You will be guided through the setup process.
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <button
-                      className="btn btn-primary"
-                      onClick={handleStartNewProfileOnboarding}
-                      disabled={startingOnboarding}
-                    >
-                      {startingOnboarding ? "Starting..." : "Yes, Start Setup"}
-                    </button>
-                    <button
-                      className="btn btn-ghost"
-                      onClick={() => setShowCreateConfirm(false)}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <button
-                  className="btn btn-secondary w-full mt-2"
-                  onClick={() => setShowCreateConfirm(true)}
-                >
-                  + Create New Profile
-                </button>
-              )}
-            </div>
-          </section>
-
-          {/* Profile section - User info */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Account</h2>
-
-            <div className="card space-y-3">
-              {/* Display Name */}
-              <div>
-                <label className="text-muted-color text-xs block mb-1">Display Name</label>
-                {editingDisplayName ? (
-                  <div className="flex items-center gap-2">
-                    <input
-                      className="input flex-1"
-                      value={displayNameInput}
-                      onChange={(e) => setDisplayNameInput(e.target.value)}
-                      placeholder="Enter your display name"
-                      maxLength={64}
-                    />
-                    <button
-                      className="btn btn-primary"
-                      onClick={handleSaveDisplayName}
-                      disabled={savingDisplayName}
-                    >
-                      {savingDisplayName ? "Saving..." : "Save"}
-                    </button>
-                    <button
-                      className="btn btn-ghost"
-                      onClick={() => {
-                        setEditingDisplayName(false);
-                        setDisplayNameInput(identity?.display_name || "");
-                      }}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2">
-                    <span className="text-primary-color">
-                      {identity?.display_name || "Not set"}
+                      <Check size={13} />
                     </span>
-                    <button
-                      className="btn btn-ghost text-sm"
-                      onClick={() => setEditingDisplayName(true)}
-                    >
-                      Edit
-                    </button>
+                  )}
+                </div>
+                <div className="mt-3 flex items-center gap-1">
+                  <span
+                    className="h-5 flex-1 rounded border border-subtle"
+                    style={{ backgroundColor: theme.preview.base }}
+                  />
+                  <span
+                    className="h-5 flex-1 rounded border border-subtle"
+                    style={{ backgroundColor: theme.preview.surface }}
+                  />
+                  <span
+                    className="h-5 flex-1 rounded border border-subtle"
+                    style={{ backgroundColor: theme.preview.accent }}
+                  />
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+    );
+  }
+
+  function renderAccountPanel() {
+    return (
+      <div className="space-y-4">
+        <section className="card space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="font-medium text-primary-color">Identity</h3>
+              <p className="text-xs text-muted-color">Local name and share link</p>
+            </div>
+            <button className="btn btn-secondary text-sm" onClick={handleCopyShareLink}>
+              {copied ? "Copied!" : "Copy Share Link"}
+            </button>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs text-muted-color">Display name</label>
+            {editingDisplayName ? (
+              <div className="flex items-center gap-2">
+                <input
+                  className="input flex-1"
+                  value={displayNameInput}
+                  onChange={(event) => setDisplayNameInput(event.target.value)}
+                  placeholder="Display name"
+                  maxLength={64}
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={handleSaveDisplayName}
+                  disabled={savingDisplayName}
+                >
+                  {savingDisplayName ? "Saving..." : "Save"}
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    setEditingDisplayName(false);
+                    setDisplayNameInput(identity?.display_name || "");
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-primary-color">
+                  {identity?.display_name || "No display name"}
+                </span>
+                <button className="btn btn-ghost text-sm" onClick={() => setEditingDisplayName(true)}>
+                  Edit
+                </button>
+              </div>
+            )}
+          </div>
+
+          <InfoRow label="User ID" value={identity?.user_id ?? "Loading..."} />
+          <InfoRow label="Device ID" value={identity?.device_id ?? "Loading..."} />
+          <div className="flex gap-2">
+            <button className="btn btn-ghost" onClick={handleRotateLink}>
+              Rotate Link
+            </button>
+          </div>
+        </section>
+
+        <section className="card space-y-2">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h3 className="font-medium text-primary-color">Profiles</h3>
+              <p className="text-xs text-muted-color">Switch or create local profiles</p>
+            </div>
+          </div>
+
+          {profiles.length === 0 && (
+            <p className="text-sm text-muted-color">No profiles found. Create a profile during onboarding.</p>
+          )}
+
+          {profiles.map((profile) => (
+            <div
+              key={profile.path}
+              className={`flex items-center justify-between rounded-md p-2 ${
+                profile.is_active ? "bg-surface-elevated" : ""
+              }`}
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      profile.is_active ? "status-success" : "bg-surface-elevated"
+                    }`}
+                  />
+                  <span className="font-medium text-primary-color">{profile.name}</span>
+                  {profile.runtime_bound && (
+                    <span className="text-xs status-success">Connected</span>
+                  )}
+                </div>
+                {profile.user_id && (
+                  <div className="truncate text-xs text-muted-color">
+                    {profile.user_id.slice(0, 16)}...
                   </div>
                 )}
               </div>
-
-              <div>
-                <label className="text-muted-color text-xs block mb-1">User ID</label>
-                <span className="text-primary-color truncate">
-                  {identity?.user_id || "Not set"}
-                </span>
-              </div>
-              <div>
-                <label className="text-muted-color text-xs block mb-1">Device</label>
-                <span className="text-primary-color">
-                  {identity?.device_id?.slice(0, 16) || "Not set"}...
-                </span>
-              </div>
-              <div className="flex items-center gap-2 mt-2">
-                <button className="btn btn-secondary" onClick={handleCopyShareLink}>
-                  {copied ? "Copied!" : "Copy Share Link"}
-                </button>
-                <button className="btn btn-ghost" onClick={handleRotateLink}>
-                  Rotate Link
-                </button>
+              <div className="flex items-center gap-1">
+                {profile.is_active ? (
+                  <span className="text-xs text-muted-color">Active</span>
+                ) : (
+                  <>
+                    <button
+                      className="btn btn-ghost text-sm"
+                      onClick={() => void handleSwitchProfile(profile.path)}
+                      disabled={switchingProfile === profile.path}
+                    >
+                      {switchingProfile === profile.path ? "Restarting..." : "Switch"}
+                    </button>
+                    <button
+                      className="btn btn-ghost text-xs status-error"
+                      onClick={() => handleDeleteProfile(profile.path, profile.name)}
+                      disabled={deletingProfile === profile.path}
+                    >
+                      {deletingProfile === profile.path ? "..." : <X size={14} />}
+                    </button>
+                  </>
+                )}
               </div>
             </div>
-          </section>
+          ))}
 
-          {/* Devices section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Devices</h2>
-
-            <div className="card">
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-2">
-                  <Monitor size={20} className="text-muted-color" />
-                  <span className="text-primary-color">This Device</span>
-                  <span className="status-success text-xs">Active</span>
-                </div>
-                <button
-                  className="btn btn-ghost text-sm"
-                  onClick={() => navigate("/settings/devices")}
-                >
-                  Manage →
-                </button>
-              </div>
-              <button
-                className="btn btn-secondary w-full"
-                onClick={() => navigate("/settings/devices")}
-              >
-                Manage Devices
-              </button>
-            </div>
-          </section>
-
-          {/* Infrastructure section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Infrastructure</h2>
-
-            <div className="card space-y-2">
+          {showDeleteConfirm && (
+            <div className="rounded-md border border-subtle bg-error/10 p-3">
+              <p className="mb-2 status-error">Delete profile "{showDeleteConfirm.name}"?</p>
+              <p className="mb-3 text-sm text-muted-color">
+                This action cannot be undone. All data in this profile will be permanently deleted.
+              </p>
               <div className="flex items-center gap-2">
-                <span className={`w-2 h-2 rounded-full ${runtimeStatus?.bound ? "status-success" : "status-error"}`} />
-                <span className="text-primary-color">
-                  {runtimeStatus?.bound ? "Connected" : "Not Deployed"}
-                </span>
+                <button
+                  className="btn btn-ghost status-error"
+                  onClick={() => void confirmDeleteProfile()}
+                  disabled={deletingProfile === showDeleteConfirm.path}
+                >
+                  {deletingProfile === showDeleteConfirm.path ? "Deleting..." : "Yes, Delete"}
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => setShowDeleteConfirm(null)}
+                  disabled={deletingProfile !== null}
+                >
+                  Cancel
+                </button>
               </div>
+            </div>
+          )}
 
-              {runtimeStatus?.endpoint && (
-                <div>
-                  <label className="text-muted-color text-xs block mb-1">Endpoint</label>
-                  <span className="text-primary-color text-sm truncate">{runtimeStatus.endpoint}</span>
-                </div>
-              )}
+          {showCreateConfirm ? (
+            <div className="rounded-md border border-subtle bg-surface-elevated p-3">
+              <p className="mb-3 text-primary-color">
+                Create a new profile? You will be guided through the setup process.
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn btn-primary"
+                  onClick={() => void handleStartNewProfileOnboarding()}
+                  disabled={startingOnboarding}
+                >
+                  {startingOnboarding ? "Starting..." : "Yes, Start Setup"}
+                </button>
+                <button className="btn btn-ghost" onClick={() => setShowCreateConfirm(false)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button className="btn btn-secondary w-full" onClick={() => setShowCreateConfirm(true)}>
+              Create New Profile
+            </button>
+          )}
+        </section>
 
-              <button
-                className="btn btn-secondary w-full mt-2"
-                onClick={() => navigate("/settings/runtime")}
-              >
-                Manage Runtime
+        <section className="card">
+          <h3 className="mb-3 font-medium text-primary-color">Recovery Phrase</h3>
+          {showMnemonic ? (
+            <div className="space-y-2">
+              <p className="status-warning text-sm">Keep this secret. Never share it.</p>
+              <div className="grid grid-cols-3 gap-1 rounded bg-surface-elevated p-2">
+                {identity?.mnemonic?.split(" ").map((word, index) => (
+                  <div key={index} className="flex items-center gap-1">
+                    <span className="text-xs text-muted-color">{index + 1}.</span>
+                    <span className="text-sm text-primary-color">{word}</span>
+                  </div>
+                ))}
+              </div>
+              <button className="btn btn-ghost w-full" onClick={() => setShowMnemonic(false)}>
+                Hide
               </button>
             </div>
-          </section>
+          ) : (
+            <button className="btn btn-secondary w-full" onClick={() => setShowMnemonic(true)}>
+              Show Recovery Phrase
+            </button>
+          )}
+        </section>
 
-          {/* Attachments section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Attachments</h2>
-            <AttachmentsSettings />
-          </section>
+        {renderAboutCard()}
+      </div>
+    );
+  }
 
-          {/* Recovery section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">Recovery Phrase</h2>
+  function renderAboutCard() {
+    return (
+      <section className="card space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <button className="min-w-0 flex-1 text-left" onClick={handleVersionClick}>
+            <span className="mb-1 block text-xs text-muted-color">Version</span>
+            <span className="text-primary-color">
+              {appMetadata?.app_version ?? "Loading..."}
+            </span>
+            {appMetadata?.git_tag && (
+              <span className="ml-2 text-xs text-muted-color">{appMetadata.git_tag}</span>
+            )}
+          </button>
+          <button
+            className="btn btn-ghost flex-shrink-0 text-sm"
+            onClick={() => setShowAboutDetails((value) => !value)}
+            aria-expanded={showAboutDetails}
+          >
+            {showAboutDetails ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Details
+          </button>
+        </div>
 
-            <div className="card">
-              {showMnemonic ? (
-                <div className="space-y-2">
-                  <p className="status-warning text-sm">Keep this secret! Never share it.</p>
-                  <div className="grid grid-cols-3 gap-1 bg-surface-elevated p-2 rounded">
-                    {identity?.mnemonic?.split(" ").map((word, i) => (
-                      <div key={i} className="flex items-center gap-1">
-                        <span className="text-muted-color text-xs">{i + 1}.</span>
-                        <span className="text-primary-color text-sm">{word}</span>
-                      </div>
-                    ))}
-                  </div>
-                  <button
-                    className="btn btn-ghost w-full"
-                    onClick={() => setShowMnemonic(false)}
-                  >
-                    Hide
-                  </button>
-                </div>
-              ) : (
-                <button
-                  className="btn btn-secondary w-full"
-                  onClick={() => setShowMnemonic(true)}
-                >
-                  Show Recovery Phrase
-                </button>
-              )}
+        {!developerMode && developerClickCount >= 3 && (
+          <p className="text-xs text-muted-color">
+            {remainingDeveloperClicks} more tap{remainingDeveloperClicks === 1 ? "" : "s"} to enable developer mode.
+          </p>
+        )}
+
+        {showAboutDetails && (
+          <div className="space-y-3 border-t border-subtle pt-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <InfoRow label="Core" value={appMetadata?.core_version ?? "Unknown"} />
+              <InfoRow label="Protocol" value={appMetadata?.protocol_version ?? "Unknown"} />
+              <InfoRow label="Commit" value={appMetadata?.git_sha ?? "Unknown"} />
+              <InfoRow
+                label="Updates"
+                value={appMetadata ? (appMetadata.update_endpoint_configured ? "Configured" : "Unavailable") : "Loading..."}
+              />
             </div>
-          </section>
 
-          {/* About section */}
-          <section className="mb-6">
-            <h2 className="text-lg font-medium text-primary-color mb-3">About</h2>
+            {appMetadata && !appMetadata.update_endpoint_configured && (
+              <p className="status-warning text-xs">This build does not include an update endpoint.</p>
+            )}
 
-            <div className="card space-y-3">
-              <div className="flex items-center justify-between gap-3">
+            <div className="space-y-2 border-t border-subtle pt-3">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
-                  className="min-w-0 flex-1 text-left"
-                  onClick={handleVersionClick}
+                  className="btn btn-secondary"
+                  onClick={() => void update.checkForUpdates()}
+                  disabled={update.checking || update.downloading || appMetadata?.update_endpoint_configured === false}
                 >
-                  <span className="text-muted-color text-xs block mb-1">Version</span>
-                  <span className="text-primary-color">
-                    {appMetadata?.app_version ?? "Loading..."}
-                  </span>
-                  {appMetadata?.git_tag && (
-                    <span className="text-muted-color text-xs ml-2">{appMetadata.git_tag}</span>
-                  )}
+                  <RefreshCw size={14} />
+                  {update.checking ? "Checking..." : "Check for Updates"}
                 </button>
-                <button
-                  className="btn btn-ghost text-sm flex-shrink-0"
-                  onClick={() => setShowAboutDetails((value) => !value)}
-                  aria-expanded={showAboutDetails}
-                >
-                  {showAboutDetails ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                  Details
-                </button>
+                {update.updateAvailable && update.update && (
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => void update.downloadAndInstall()}
+                    disabled={update.downloading || update.downloaded}
+                  >
+                    <Download size={14} />
+                    {update.downloading ? "Installing..." : "Install"}
+                  </button>
+                )}
+                {update.manualUpdateAvailable && update.manualRelease && (
+                  <button className="btn btn-primary" onClick={() => void update.openManualRelease()}>
+                    <ExternalLink size={14} />
+                    Open Release
+                  </button>
+                )}
               </div>
 
-              {!developerMode && developerClickCount >= 3 && (
-                <p className="text-muted-color text-xs">
-                  {remainingDeveloperClicks} more tap{remainingDeveloperClicks === 1 ? "" : "s"} to enable developer mode.
+              {update.checked &&
+                !update.checking &&
+                !update.updateAvailable &&
+                !update.manualUpdateAvailable &&
+                !update.error &&
+                !update.warning && (
+                  <p className="status-success text-sm">TapChat is up to date.</p>
+                )}
+              {update.updateAvailable && update.update && (
+                <p className="text-sm text-secondary-color">Version {update.update.version} is available.</p>
+              )}
+              {update.manualUpdateAvailable && update.manualRelease && (
+                <p className="text-sm text-secondary-color">
+                  Version {update.manualRelease.version} is available on GitHub.
                 </p>
               )}
-
-              {showAboutDetails && (
-                <div className="pt-3 border-t border-subtle space-y-3">
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div>
-                      <label className="text-muted-color text-xs block mb-1">Core</label>
-                      <span className="text-primary-color text-sm">
-                        {appMetadata?.core_version ?? "Unknown"}
-                      </span>
-                    </div>
-                    <div>
-                      <label className="text-muted-color text-xs block mb-1">Protocol</label>
-                      <span className="text-primary-color text-sm">
-                        {appMetadata?.protocol_version ?? "Unknown"}
-                      </span>
-                    </div>
-                    <div>
-                      <label className="text-muted-color text-xs block mb-1">Commit</label>
-                      <span className="text-primary-color text-sm">
-                        {appMetadata?.git_sha ?? "Unknown"}
-                      </span>
-                    </div>
-                    <div>
-                      <label className="text-muted-color text-xs block mb-1">Updates</label>
-                      <span className="text-primary-color text-sm">
-                        {appMetadata ? (appMetadata.update_endpoint_configured ? "Configured" : "Unavailable") : "Loading..."}
-                      </span>
-                    </div>
-                  </div>
-
-                  {appMetadata && !appMetadata.update_endpoint_configured && (
-                    <p className="status-warning text-xs">
-                      This build does not include an update endpoint.
-                    </p>
-                  )}
-
-                  <div className="pt-3 border-t border-subtle space-y-2">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        className="btn btn-secondary"
-                        onClick={() => void update.checkForUpdates()}
-                        disabled={update.checking || update.downloading || appMetadata?.update_endpoint_configured === false}
-                      >
-                        <RefreshCw size={14} />
-                        {update.checking ? "Checking..." : "Check for Updates"}
-                      </button>
-                      {update.updateAvailable && update.update && (
-                        <button
-                          className="btn btn-primary"
-                          onClick={() => void update.downloadAndInstall()}
-                          disabled={update.downloading || update.downloaded}
-                        >
-                          <Download size={14} />
-                          {update.downloading ? "Installing..." : "Install"}
-                        </button>
-                      )}
-                      {update.manualUpdateAvailable && update.manualRelease && (
-                        <button
-                          className="btn btn-primary"
-                          onClick={() => void update.openManualRelease()}
-                        >
-                          <ExternalLink size={14} />
-                          Open Release
-                        </button>
-                      )}
-                    </div>
-
-                    {update.checked &&
-                      !update.checking &&
-                      !update.updateAvailable &&
-                      !update.manualUpdateAvailable &&
-                      !update.error &&
-                      !update.warning && (
-                        <p className="status-success text-sm">TapChat is up to date.</p>
-                      )}
-                    {update.updateAvailable && update.update && (
-                      <p className="text-secondary-color text-sm">
-                        Version {update.update.version} is available.
-                      </p>
-                    )}
-                    {update.manualUpdateAvailable && update.manualRelease && (
-                      <p className="text-secondary-color text-sm">
-                        Version {update.manualRelease.version} is available on GitHub.
-                      </p>
-                    )}
-                    {update.downloading && (
-                      <div>
-                        <p className="text-xs text-muted-color mb-1">
-                          Downloading: {updateProgressPercent} percent
-                        </p>
-                        <div className="w-full bg-surface-elevated rounded h-2">
-                          <div
-                            className="bg-primary rounded h-2"
-                            style={{ width: `${updateProgressPercent}%` }}
-                          />
-                        </div>
-                      </div>
-                    )}
-                    {update.downloaded && (
-                      <p className="status-success text-sm">Update installed. Restarting...</p>
-                    )}
-                    {update.warning && (
-                      <p className="status-warning text-sm">{update.warning}</p>
-                    )}
-                    {update.error && (
-                      <p className="status-error text-sm">{update.error}</p>
-                    )}
+              {update.downloading && (
+                <div>
+                  <p className="mb-1 text-xs text-muted-color">
+                    Downloading: {updateProgressPercent} percent
+                  </p>
+                  <div className="h-2 w-full rounded bg-surface-elevated">
+                    <div className="h-2 rounded bg-primary" style={{ width: `${updateProgressPercent}%` }} />
                   </div>
                 </div>
               )}
+              {update.downloaded && <p className="status-success text-sm">Update installed. Restarting...</p>}
+              {update.warning && <p className="status-warning text-sm">{update.warning}</p>}
+              {update.error && <p className="status-error text-sm">{update.error}</p>}
             </div>
-          </section>
+          </div>
+        )}
+      </section>
+    );
+  }
 
-          {developerMode && (
-            <section className="mb-6">
-              <div className="mb-3 flex items-center justify-between gap-3">
-                <h2 className="text-lg font-medium text-primary-color">Developer</h2>
-                <button className="btn btn-ghost text-sm" onClick={() => void handleDisableDeveloperMode()}>
-                  Disable
-                </button>
-              </div>
-
-              <div className="card space-y-5">
-                <div className="flex items-center gap-2">
-                  <Code2 size={18} className="text-muted-color" />
-                  <span className="text-primary-color">Developer Mode</span>
-                  <span className="status-success text-xs">Enabled</span>
-                </div>
-
-                <div className="pt-4 border-t border-subtle space-y-2">
-                  <h3 className="font-medium text-primary-color">Allowlist</h3>
-                  {allowlist.length === 0 && (
-                    <p className="text-muted-color text-sm">
-                      No users in allowlist. Add users to automatically accept their messages.
-                    </p>
-                  )}
-
-                  {allowlist.map((userId) => (
-                    <div key={userId} className="flex items-center justify-between">
-                      <span className="text-primary-color truncate">{userId.slice(0, 20)}...</span>
-                      <button
-                        className="btn btn-ghost text-xs status-error"
-                        onClick={() => handleRemoveAllowlist(userId)}
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-                  ))}
-
-                  <div className="flex items-center gap-2 pt-2">
-                    <input
-                      className="input flex-1"
-                      placeholder="User ID"
-                      value={newAllowlistUser}
-                      onChange={(e) => setNewAllowlistUser(e.target.value)}
-                    />
-                    <button
-                      className="btn btn-primary"
-                      onClick={handleAddAllowlist}
-                      disabled={!newAllowlistUser.trim()}
-                    >
-                      Add
-                    </button>
-                  </div>
-                </div>
-
-                <div className="pt-4 border-t border-subtle">
-                  <h3 className="font-medium text-primary-color mb-3">Performance Testing</h3>
-                  <label className="flex items-center justify-between cursor-pointer">
-                    <div className="flex-1">
-                      <span className="text-primary-color">Debug Mode</span>
-                      <p className="text-muted-color text-xs mt-0.5">
-                        Emits [TIMETEST] tagged log entries for measuring latency, recovery, and deploy timing.
-                      </p>
-                    </div>
-                    <button
-                      className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
-                        debugMode ? "bg-primary" : "bg-surface-elevated"
-                      }`}
-                      onClick={handleToggleDebugMode}
-                    >
-                      <span
-                        className={`block w-5 h-5 rounded-full bg-white transition-transform ${
-                          debugMode ? "translate-x-5" : "translate-x-1"
-                        }`}
-                      />
-                    </button>
-                  </label>
-                </div>
-
-                <div className="pt-4 border-t border-subtle">
-                  <h3 className="font-medium status-error mb-3">Danger Zone</h3>
-                  <button
-                    className="btn btn-ghost w-full status-error opacity-50 cursor-not-allowed"
-                    disabled
-                    title="Feature not yet implemented"
-                  >
-                    Delete Identity (Not Yet Implemented)
-                  </button>
-                  <p className="text-muted-color text-xs mt-2 text-center">
-                    This feature will be available in a future update.
-                  </p>
-                </div>
-              </div>
-            </section>
-          )}
+  function renderDeveloperPanel() {
+    return (
+      <section className="card space-y-5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Code2 size={18} className="text-muted-color" />
+            <span className="text-primary-color">Developer Mode</span>
+            <span className="status-success text-xs">Enabled</span>
+          </div>
+          <button className="btn btn-ghost text-sm" onClick={() => void handleDisableDeveloperMode()}>
+            Disable
+          </button>
         </div>
-      </div>
+
+        <div className="space-y-2 border-t border-subtle pt-4">
+          <h3 className="font-medium text-primary-color">Allowlist</h3>
+          {allowlist.length === 0 && (
+            <p className="text-sm text-muted-color">
+              No users in allowlist. Add users to automatically accept their messages.
+            </p>
+          )}
+
+          {allowlist.map((userId) => (
+            <div key={userId} className="flex items-center justify-between">
+              <span className="truncate text-primary-color">{userId.slice(0, 20)}...</span>
+              <button className="btn btn-ghost text-xs status-error" onClick={() => handleRemoveAllowlist(userId)}>
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+
+          <div className="flex items-center gap-2 pt-2">
+            <input
+              className="input flex-1"
+              placeholder="User ID"
+              value={newAllowlistUser}
+              onChange={(event) => setNewAllowlistUser(event.target.value)}
+            />
+            <button className="btn btn-primary" onClick={handleAddAllowlist} disabled={!newAllowlistUser.trim()}>
+              Add
+            </button>
+          </div>
+        </div>
+
+        <div className="border-t border-subtle pt-4">
+          <h3 className="mb-3 font-medium text-primary-color">Performance Testing</h3>
+          <label className="flex cursor-pointer items-center justify-between">
+            <div className="flex-1">
+              <span className="text-primary-color">Debug Mode</span>
+              <p className="mt-0.5 text-xs text-muted-color">
+                Emits [TIMETEST] tagged log entries for measuring latency, recovery, and deploy timing.
+              </p>
+            </div>
+            <button
+              className={`ml-3 h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
+                debugMode ? "bg-primary" : "bg-surface-elevated"
+              }`}
+              onClick={handleToggleDebugMode}
+            >
+              <span
+                className={`block h-5 w-5 rounded-full bg-white transition-transform ${
+                  debugMode ? "translate-x-5" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+        </div>
+
+        <div className="border-t border-subtle pt-4">
+          <h3 className="mb-3 font-medium status-error">Danger Zone</h3>
+          <button
+            className="btn btn-ghost w-full cursor-not-allowed status-error opacity-50"
+            disabled
+            title="Feature not yet implemented"
+          >
+            Delete Identity (Not Yet Implemented)
+          </button>
+          <p className="mt-2 text-center text-xs text-muted-color">
+            This feature will be available in a future update.
+          </p>
+        </div>
+      </section>
+    );
+  }
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <label className="mb-1 block text-xs text-muted-color">{label}</label>
+      <span className="block truncate text-sm text-primary-color" title={value}>
+        {value}
+      </span>
     </div>
   );
 }
 
-/** Inline component for attachment settings, co-located with Settings page. */
 function AttachmentsSettings() {
   const [settings, setLocalSettings] = useState<{ auto_download_media: boolean; always_ask_save_path: boolean } | null>(null);
   const [cacheDir, setCacheDir] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    loadSettings();
-    loadCacheDir();
+    void loadSettings();
+    void loadCacheDir();
   }, []);
 
   const loadSettings = async () => {
@@ -1014,8 +961,7 @@ function AttachmentsSettings() {
 
   const loadCacheDir = async () => {
     try {
-      const dir = await invoke<string>("get_attachment_cache_dir");
-      setCacheDir(dir);
+      setCacheDir(await invoke<string>("get_attachment_cache_dir"));
     } catch {
       // not critical
     }
@@ -1030,7 +976,7 @@ function AttachmentsSettings() {
       await invoke("set_attachment_settings", { settings: next });
     } catch (err) {
       console.error("[Settings] Failed to save attachment settings:", err);
-      setLocalSettings(settings); // revert
+      setLocalSettings(settings);
     } finally {
       setSaving(false);
     }
@@ -1045,69 +991,70 @@ function AttachmentsSettings() {
       await invoke("set_attachment_settings", { settings: next });
     } catch (err) {
       console.error("[Settings] Failed to save attachment settings:", err);
-      setLocalSettings(settings); // revert
+      setLocalSettings(settings);
     } finally {
       setSaving(false);
     }
   };
 
   if (!settings) {
-    return <div className="card"><span className="text-muted-color text-sm">Loading...</span></div>;
+    return (
+      <div className="card">
+        <span className="text-sm text-muted-color">Loading...</span>
+      </div>
+    );
   }
 
   return (
     <div className="card space-y-4">
-      {/* Auto-download toggle */}
-      <label className="flex items-center justify-between cursor-pointer">
+      <label className="flex cursor-pointer items-center justify-between">
         <div className="flex-1">
           <span className="text-primary-color">Auto-download media</span>
-          <p className="text-muted-color text-xs mt-0.5">
-            Automatically download image, audio, and video attachments (≤10 MB) from trusted contacts
+          <p className="mt-0.5 text-xs text-muted-color">
+            Automatically download image, audio, and video attachments up to 10 MB from trusted contacts.
           </p>
         </div>
         <button
-          className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
+          className={`ml-3 h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
             settings.auto_download_media ? "bg-primary" : "bg-surface-elevated"
           }`}
           onClick={toggleAutoDownload}
           disabled={saving}
         >
           <span
-            className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+            className={`block h-5 w-5 rounded-full bg-white transition-transform ${
               settings.auto_download_media ? "translate-x-5" : "translate-x-1"
             }`}
           />
         </button>
       </label>
 
-      {/* Always ask save path toggle */}
-      <label className="flex items-center justify-between cursor-pointer">
+      <label className="flex cursor-pointer items-center justify-between">
         <div className="flex-1">
           <span className="text-primary-color">Always ask save path</span>
-          <p className="text-muted-color text-xs mt-0.5">
-            When enabled, you will be asked where to save each downloaded file
+          <p className="mt-0.5 text-xs text-muted-color">
+            When enabled, you will be asked where to save each downloaded file.
           </p>
         </div>
         <button
-          className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ml-3 ${
+          className={`ml-3 h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
             settings.always_ask_save_path ? "bg-primary" : "bg-surface-elevated"
           }`}
           onClick={toggleAlwaysAsk}
           disabled={saving}
         >
           <span
-            className={`block w-5 h-5 rounded-full bg-white transition-transform ${
+            className={`block h-5 w-5 rounded-full bg-white transition-transform ${
               settings.always_ask_save_path ? "translate-x-5" : "translate-x-1"
             }`}
           />
         </button>
       </label>
 
-      {/* Cache directory (read-only) */}
       {cacheDir && (
-        <div className="pt-3 border-t border-subtle">
-          <label className="text-muted-color text-xs block mb-1">Cache directory</label>
-          <span className="text-primary-color text-sm truncate block">{cacheDir}</span>
+        <div className="border-t border-subtle pt-3">
+          <label className="mb-1 block text-xs text-muted-color">Cache directory</label>
+          <span className="block truncate text-sm text-primary-color">{cacheDir}</span>
         </div>
       )}
     </div>

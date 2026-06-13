@@ -42,11 +42,11 @@ export default function ImageGrid({ items, onImageClick }: ImageGridProps) {
 }
 
 function getGridClass(count: number): string {
-  if (count === 1) return "grid grid-cols-1 max-w-[70%]";
-  if (count === 2) return "grid grid-cols-2 gap-1 max-w-[70%]";
-  if (count === 3) return "grid grid-cols-2 gap-1 max-w-[70%]";
-  if (count === 4) return "grid grid-cols-2 gap-1 max-w-[70%]";
-  return "grid grid-cols-3 gap-1 max-w-[85%]"; // 5+
+  if (count === 1) return "grid grid-cols-1 max-w-[22rem]";
+  if (count === 2) return "grid grid-cols-2 gap-1 max-w-[24rem]";
+  if (count === 3) return "grid grid-cols-2 gap-1 max-w-[24rem]";
+  if (count === 4) return "grid grid-cols-2 gap-1 max-w-[24rem]";
+  return "grid grid-cols-3 gap-1 max-w-[28rem]";
 }
 
 interface ImageGridCellProps {
@@ -114,8 +114,8 @@ function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
 
   return (
     <div
-      className={`relative cursor-pointer overflow-hidden rounded-lg bg-surface-elevated ${cellClass}`}
-      style={{ aspectRatio: "1" }}
+      className={`relative cursor-pointer overflow-hidden rounded-md bg-surface-elevated ${cellClass}`}
+      style={{ aspectRatio: item.mimeType.startsWith("image/") && !isLarge ? "1" : "4 / 3" }}
       onClick={onClick}
     >
       {loading && (
@@ -128,7 +128,7 @@ function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
         <img
           src={`data:image/jpeg;base64,${imageData}`}
           alt={item.fileName || `Image ${index + 1}`}
-          className="w-full h-full object-cover hover:scale-105 transition-transform duration-200"
+          className="w-full h-full object-cover transition-transform duration-200 hover:scale-[1.02]"
           onError={() => setFailed(true)}
         />
       )}
@@ -148,7 +148,7 @@ function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
       )}
 
       {/* Hover overlay */}
-      <div className="absolute inset-0 bg-black/0 hover:bg-black/20 transition-colors rounded-lg" />
+      <div className="absolute inset-0 rounded-md bg-black/0 transition-colors hover:bg-black/15" />
     </div>
   );
 }

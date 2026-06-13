@@ -19,8 +19,6 @@ import ContactDetail from "./pages/contacts/ContactDetail";
 import MessageRequests from "./pages/requests/MessageRequests";
 
 import Settings from "./pages/settings/Settings";
-import Devices from "./pages/settings/Devices";
-import Runtime from "./pages/settings/Runtime";
 
 import SystemBanner from "./components/SystemBanner";
 
@@ -197,8 +195,8 @@ function AppInner({ startupError }: { startupError: string | null }) {
               <Route path="contacts/:id" element={<ContactDetail />} />
               <Route path="requests" element={<MessageRequests />} />
               <Route path="settings" element={<Settings />} />
-              <Route path="settings/devices" element={<Devices />} />
-              <Route path="settings/runtime" element={<Runtime />} />
+              <Route path="settings/devices" element={<Settings initialSection="devices" />} />
+              <Route path="settings/runtime" element={<Settings initialSection="runtime" />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </>

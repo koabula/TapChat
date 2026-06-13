@@ -16,7 +16,11 @@ interface IdentityInfo {
   mnemonic: string;
 }
 
-export default function Devices() {
+interface DevicesProps {
+  embedded?: boolean;
+}
+
+export default function Devices({ embedded = false }: DevicesProps) {
   const navigate = useNavigate();
   const [devices, setDevices] = useState<Device[]>([]);
   const [identityInfo, setIdentityInfo] = useState<IdentityInfo | null>(null);
@@ -93,18 +97,8 @@ export default function Devices() {
     return new Date(timestamp).toLocaleDateString();
   };
 
-  return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-base">
-      {/* Header */}
-      <header className="flex items-center p-3 border-b border-default">
-        <button className="btn btn-ghost px-2" onClick={() => navigate("/settings")}>
-          ← Back
-        </button>
-        <h1 className="ml-2 text-lg font-medium text-primary-color">Device Management</h1>
-      </header>
-
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto overscroll-contain p-4">
+  const content = (
+    <>
         {loading && (
           <div className="text-center text-muted-color">Loading...</div>
         )}
@@ -201,6 +195,24 @@ export default function Devices() {
             </button>
           </>
         )}
+    </>
+  );
+
+  if (embedded) {
+    return <div className="space-y-4">{content}</div>;
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-base">
+      <header className="flex items-center p-3 border-b border-default">
+        <button className="btn btn-ghost px-2" onClick={() => navigate("/settings")}>
+          ← Back
+        </button>
+        <h1 className="ml-2 text-lg font-medium text-primary-color">Device Management</h1>
+      </header>
+
+      <div className="flex-1 overflow-y-auto overscroll-contain p-4">
+        {content}
       </div>
     </div>
   );

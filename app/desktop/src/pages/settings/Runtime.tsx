@@ -56,7 +56,11 @@ const PHASE_LABELS: Record<string, string> = {
   Failed: "Failed",
 };
 
-export default function Runtime() {
+interface RuntimeProps {
+  embedded?: boolean;
+}
+
+export default function Runtime({ embedded = false }: RuntimeProps) {
   const navigate = useNavigate();
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [preflight, setPreflight] = useState<PreflightResult | null>(null);
@@ -145,18 +149,8 @@ export default function Runtime() {
     }
   };
 
-  return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-base">
-      {/* Header */}
-      <header className="flex items-center p-3 border-b border-default animate-fade-in-down">
-        <button className="btn btn-ghost px-2 transition-fast" onClick={() => navigate("/settings")}>
-          ← Back
-        </button>
-        <h1 className="ml-2 text-lg font-medium text-primary-color">Runtime Management</h1>
-      </header>
-
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto overscroll-contain p-4">
+  const content = (
+    <>
         {loading && (
           <div className="text-center text-muted-color animate-pulse">Loading...</div>
         )}
@@ -354,6 +348,24 @@ export default function Runtime() {
             </div>
           </>
         )}
+    </>
+  );
+
+  if (embedded) {
+    return <div className="space-y-4">{content}</div>;
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-base">
+      <header className="flex items-center p-3 border-b border-default animate-fade-in-down">
+        <button className="btn btn-ghost px-2 transition-fast" onClick={() => navigate("/settings")}>
+          ← Back
+        </button>
+        <h1 className="ml-2 text-lg font-medium text-primary-color">Runtime Management</h1>
+      </header>
+
+      <div className="flex-1 overflow-y-auto overscroll-contain p-4">
+        {content}
       </div>
     </div>
   );

@@ -2,10 +2,22 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import { useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { MessageCircle, Search, Loader, EllipsisVertical, Users, UserX, RefreshCw } from "lucide-react";
+import {
+  Clapperboard,
+  EllipsisVertical,
+  Loader,
+  MessageCircle,
+  Music,
+  RefreshCw,
+  Search,
+  UserX,
+  Users,
+} from "lucide-react";
 
 import MessageInput from "@/components/MessageInput";
 import AttachmentPreview from "@/components/AttachmentPreview";
+import ImageGrid from "@/components/ImageGrid";
+import MediaLightbox, { type MediaItem } from "@/components/MediaLightbox";
 import GroupMemberDrawer from "@/components/group/GroupMemberDrawer";
 import GroupSyncIndicator from "@/components/group/GroupSyncIndicator";
 import { useContactsStore } from "@/store/contacts";
@@ -23,7 +35,7 @@ import {
   syncGroupOutbox,
   type GroupMessageView,
 } from "@/lib/tauri";
-import type { Message, CoreUpdateEvent, CloudflareStatus } from "@/lib/types";
+import type { Message, CoreUpdateEvent, CloudflareStatus, StorageRef } from "@/lib/types";
 import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
 
 interface SendMessageResult {
@@ -45,6 +57,7 @@ export default function ChatView() {
   const [transportBusy, setTransportBusy] = useState(false);
   const [transportError, setTransportError] = useState<string | null>(null);
   const [manualSyncBusy, setManualSyncBusy] = useState(false);
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -141,6 +154,37 @@ export default function ChatView() {
     const contact = contacts.find((item) => item.user_id === activeConversation.peer_user_id);
     return contact?.display_name || activeConversation.display_name || activeConversation.peer_user_id;
   }, [conversationId, activeConversation, contacts]);
+
+  const conversationMediaItems = useMemo(() => {
+    if (!conversationId) return [];
+    if (isGroup) {
+      return groupMessages.flatMap((message) =>
+        message.kind === "bubble"
+          ? refsToMediaItems(
+              message.storage_refs ?? [],
+              message.message_id,
+              conversationId,
+            )
+          : [],
+      );
+    }
+    return messages.flatMap((message) =>
+      refsToMediaItems(
+        message.storage_refs ?? [],
+        message.message_id,
+        conversationId,
+      ),
+    );
+  }, [conversationId, groupMessages, isGroup, messages]);
+
+  const openMedia = (item: MediaItem) => {
+    const index = conversationMediaItems.findIndex((candidate) =>
+      mediaItemKey(candidate) === mediaItemKey(item)
+    );
+    if (index >= 0) {
+      setLightboxIndex(index);
+    }
+  };
 
   const scrollToBottom = (behavior: "smooth" | "instant" = "smooth") => {
     messagesEndRef.current?.scrollIntoView({
@@ -459,20 +503,7 @@ export default function ChatView() {
             {senderName}
           </span>
         )}
-        <div className="flex flex-col gap-2">
-          {attachmentRefs.map((ref, index) => (
-            <AttachmentPreview
-              key={`${message.message_id}-${index}`}
-              messageId={message.message_id}
-              conversationId={conversationId!}
-              reference={ref.ref || ""}
-              mimeType={ref.mime_type || "application/octet-stream"}
-              fileName={ref.file_name}
-              sizeBytes={ref.size_bytes}
-              showInline={false}
-            />
-          ))}
-        </div>
+        {renderAttachmentStack(message.message_id, attachmentRefs)}
         <span className="block text-xs text-right mt-1 opacity-60">
           {formatTime(message.created_at)}
         </span>
@@ -522,23 +553,60 @@ export default function ChatView() {
 
     return (
       <div className={bubbleCls}>
-        <div className="flex flex-col gap-2">
-          {attachmentRefs.map((ref, index) => (
-            <AttachmentPreview
-              key={`${msg.message_id}-${index}`}
-              messageId={msg.message_id}
-              conversationId={conversationId!}
-              reference={ref.ref || ""}
-              mimeType={ref.mime_type || "application/octet-stream"}
-              fileName={ref.file_name}
-              sizeBytes={ref.size_bytes}
-              showInline={false}
-            />
-          ))}
-        </div>
+        {renderAttachmentStack(msg.message_id, attachmentRefs)}
         <span className="block text-xs text-right mt-1 opacity-60">
           {formatTime(msg.created_at)}
         </span>
+      </div>
+    );
+  };
+
+  const renderAttachmentStack = (messageId: string, refs: StorageRef[]) => {
+    const mediaItems = refsToMediaItems(refs, messageId, conversationId!);
+    const imageItems = mediaItems.filter((item) => item.type === "image");
+    const playableItems = mediaItems.filter((item) => item.type === "video" || item.type === "audio");
+    const fileRefs = refs.filter((ref) => !isMediaMime(ref.mime_type));
+
+    return (
+      <div className="flex flex-col gap-2">
+        {imageItems.length > 0 && (
+          <ImageGrid
+            items={imageItems}
+            onImageClick={(index) => openMedia(imageItems[index])}
+          />
+        )}
+        {playableItems.map((item) => (
+          <button
+            key={mediaItemKey(item)}
+            className="flex items-center gap-3 rounded-md border border-subtle bg-surface/40 px-3 py-2 text-left transition-colors hover:border-default hover:bg-surface"
+            onClick={() => openMedia(item)}
+          >
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-surface-elevated text-muted-color">
+              {item.type === "video" ? <Clapperboard size={18} /> : <Music size={18} />}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-medium text-primary-color">
+                {item.fileName || (item.type === "video" ? "Video" : "Audio")}
+              </span>
+              <span className="block text-xs text-muted-color">
+                {item.type === "video" ? "Video preview" : "Audio preview"}
+                {formatMediaSize(item.sizeBytes)}
+              </span>
+            </span>
+          </button>
+        ))}
+        {fileRefs.map((ref, index) => (
+          <AttachmentPreview
+            key={`${messageId}-file-${index}`}
+            messageId={messageId}
+            conversationId={conversationId!}
+            reference={ref.ref || ""}
+            mimeType={ref.mime_type || "application/octet-stream"}
+            fileName={ref.file_name}
+            sizeBytes={ref.size_bytes}
+            showInline={false}
+          />
+        ))}
       </div>
     );
   };
@@ -735,6 +803,55 @@ export default function ChatView() {
           onClose={() => setMemberDrawerOpen(false)}
         />
       )}
+      {lightboxIndex !== null && conversationMediaItems[lightboxIndex] && (
+        <MediaLightbox
+          items={conversationMediaItems}
+          initialIndex={lightboxIndex}
+          onClose={() => setLightboxIndex(null)}
+        />
+      )}
     </div>
   );
+}
+
+function mediaTypeFromMime(mimeType: string): MediaItem["type"] {
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("video/")) return "video";
+  if (mimeType.startsWith("audio/")) return "audio";
+  return "other";
+}
+
+function isMediaMime(mimeType: string | undefined): boolean {
+  const type = mediaTypeFromMime(mimeType || "application/octet-stream");
+  return type === "image" || type === "video" || type === "audio";
+}
+
+function refsToMediaItems(
+  refs: StorageRef[],
+  messageId: string,
+  conversationId: string,
+): MediaItem[] {
+  return refs
+    .filter((ref) => ref.ref && isMediaMime(ref.mime_type))
+    .map((ref) => ({
+      type: mediaTypeFromMime(ref.mime_type || "application/octet-stream"),
+      messageId,
+      conversationId,
+      reference: ref.ref,
+      mimeType: ref.mime_type || "application/octet-stream",
+      fileName: ref.file_name,
+      sizeBytes: ref.size_bytes,
+      metadataReady: true,
+    }));
+}
+
+function mediaItemKey(item: MediaItem): string {
+  return `${item.messageId}:${item.reference}:${item.mimeType}`;
+}
+
+function formatMediaSize(sizeBytes?: number): string {
+  if (!sizeBytes) return "";
+  if (sizeBytes < 1024) return ` · ${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return ` · ${(sizeBytes / 1024).toFixed(1)} KB`;
+  return ` · ${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
 }
