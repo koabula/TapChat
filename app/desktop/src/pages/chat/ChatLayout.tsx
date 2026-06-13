@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Outlet, useNavigate } from "react-router";
-import { Plus, Users, Settings, UsersRound } from "lucide-react";
+import { ContactRound, Plus, Settings, UsersRound } from "lucide-react";
 import ConversationList from "./ConversationList";
 import { NetworkIndicator } from "@/components/SystemBanner";
 import { useMessageRequestsStore } from "@/store/requests";
@@ -73,7 +73,7 @@ export default function ChatLayout() {
             title="Contacts (Ctrl+2)"
             onClick={() => navigate("/contacts")}
           >
-            <Users size={20} />
+            <ContactRound size={20} />
           </button>
           <button
             className="btn btn-ghost px-2"

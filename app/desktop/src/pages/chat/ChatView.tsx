@@ -567,8 +567,8 @@ export default function ChatView() {
     return (
       <div className="flex-1 flex items-center justify-center bg-base">
         <div className="text-center animate-fade-in">
-          <div className="w-16 h-16 rounded-full bg-surface-elevated mb-4 flex items-center justify-center animate-scale-in">
-            <MessageCircle size={28} className="text-muted-color" />
+          <div className="mx-auto w-16 h-16 rounded-full bg-surface-elevated mb-4 flex items-center justify-center animate-scale-in">
+            <MessageCircle size={28} className="shrink-0 leading-none text-muted-color" />
           </div>
           <h2 className="text-xl text-muted-color mb-2">Select a conversation</h2>
           <p className="text-muted-color text-sm">or create a new one to start messaging</p>
