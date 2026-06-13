@@ -407,16 +407,15 @@
     @apply rounded-lg p-4;
     background-color: var(--bg-surface);
     border: 1px solid var(--border-subtle);
-    transition: background-color 0.2s ease, box-shadow 0.2s ease;
-  }
-  .card:hover {
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    transition: background-color 0.2s ease, border-color 0.2s ease;
   }
 
   /* Message bubble */
   .bubble {
-    @apply px-4 py-2 rounded-bubble max-w-[70%];
-    animation: fadeInUp 0.2s ease;
+    max-width: min(72ch, 76%);
+    width: fit-content;
+    border-radius: 16px;
+    padding: 0.5rem 0.75rem;
     overflow-wrap: break-word;
     word-break: break-word;
     white-space: pre-wrap;
@@ -427,22 +426,30 @@
     background-color: var(--bubble-sent-bg);
     color: var(--bubble-sent-text);
     margin-left: auto;
+    border-bottom-right-radius: 6px;
   }
 
   .bubble-received {
     background-color: var(--bubble-received-bg);
     color: var(--bubble-received-text);
+    border-bottom-left-radius: 6px;
+  }
+
+  @media (max-width: 640px) {
+    .bubble {
+      max-width: 86%;
+    }
   }
 
   /* Date separator */
   .date-separator {
-    @apply flex items-center justify-center py-2 my-4;
-    animation: fadeIn 0.2s ease;
+    @apply flex items-center justify-center py-1.5 my-3;
   }
 
   .date-separator span {
-    @apply px-3 py-1 rounded-full text-xs font-medium;
-    background-color: var(--bg-surface-elevated);
+    @apply px-2.5 py-1 rounded-full text-xs font-medium;
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
     color: var(--text-muted);
   }
 
@@ -451,16 +458,12 @@
     @apply w-10 h-10 rounded-full flex items-center justify-center;
     background-color: var(--bg-surface-elevated);
     color: var(--text-muted);
-    transition: transform 0.2s ease;
-  }
-  .avatar:hover {
-    transform: scale(1.05);
   }
 
   /* Sidebar panel */
   .sidebar {
     background-color: var(--bg-surface);
-    border-right: 1px solid var(--border-default);
+    border-right: 1px solid var(--border-subtle);
   }
 
   /* Header */
@@ -495,17 +498,14 @@
 
   /* Conversation list item */
   .conv-item {
-    transition: background-color 0.15s ease, transform 0.15s ease;
+    transition: background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
   }
   .conv-item:hover {
     background-color: var(--bg-surface-elevated);
   }
-  .conv-item:active {
-    transform: scale(0.99);
-  }
   .conv-item.active {
-    background-color: var(--bg-surface-elevated);
-    border-left: 3px solid var(--accent-primary);
+    background-color: rgb(var(--accent-primary-rgb) / 0.1);
+    box-shadow: inset 2px 0 0 var(--accent-primary);
   }
 
   /* Page transitions */

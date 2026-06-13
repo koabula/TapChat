@@ -9,7 +9,7 @@ import BackupMnemonic from "./pages/onboarding/BackupMnemonic";
 import CloudflareSetup from "./pages/onboarding/CloudflareSetup";
 import Complete from "./pages/onboarding/Complete";
 
-import ChatLayout from "./pages/chat/ChatLayout";
+import AppShell from "./pages/shell/AppShell";
 import ChatView from "./pages/chat/ChatView";
 import GroupsPage from "./pages/groups/GroupsPage";
 
@@ -189,17 +189,17 @@ function AppInner({ startupError }: { startupError: string | null }) {
         {/* Main app routes - accessible only when active */}
         {!isOnboarding && (
           <>
-            <Route path="/" element={<ChatLayout />}>
+            <Route path="/" element={<AppShell />}>
               <Route index element={<ChatView />} />
               <Route path="chat/:id" element={<ChatView />} />
               <Route path="groups" element={<GroupsPage />} />
+              <Route path="contacts" element={<ContactList />} />
+              <Route path="contacts/:id" element={<ContactDetail />} />
+              <Route path="requests" element={<MessageRequests />} />
+              <Route path="settings" element={<Settings />} />
+              <Route path="settings/devices" element={<Devices />} />
+              <Route path="settings/runtime" element={<Runtime />} />
             </Route>
-            <Route path="/contacts" element={<ContactList />} />
-            <Route path="/contacts/:id" element={<ContactDetail />} />
-            <Route path="/requests" element={<MessageRequests />} />
-            <Route path="/settings" element={<Settings />} />
-            <Route path="/settings/devices" element={<Devices />} />
-            <Route path="/settings/runtime" element={<Runtime />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </>
         )}

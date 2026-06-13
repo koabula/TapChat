@@ -363,14 +363,8 @@ export default function Settings() {
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
       <div className="mx-auto flex min-h-0 max-w-2xl flex-1 flex-col">
         {/* Header */}
-        <header className="flex items-center p-3 border-b border-default">
-          <button
-            className="btn btn-ghost px-2"
-            onClick={() => navigate("/")}
-          >
-            ←
-          </button>
-          <h1 className="font-semibold text-primary-color ml-2">Settings</h1>
+        <header className="flex h-14 items-center border-b border-subtle px-4">
+          <h1 className="font-semibold text-primary-color">Settings</h1>
         </header>
 
         {/* Content */}

@@ -45,18 +45,18 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
   };
 
   return (
-    <div className="space-y-1 p-2">
+    <div className="space-y-0.5 p-1.5">
       {filteredConversations.length === 0 && searchQuery.trim() && (
-        <div className="text-center py-8 animate-fade-in">
+        <div className="px-3 py-8 text-center text-sm">
           <div className="text-muted-color">No conversations match "{searchQuery}"</div>
         </div>
       )}
 
       {filteredConversations.length === 0 && !searchQuery.trim() && (
-        <div className="text-center py-8 animate-fade-in">
+        <div className="px-3 py-8 text-center text-sm">
           <div className="text-muted-color">No conversations yet</div>
           <button
-            className="btn btn-secondary mt-2"
+            className="btn btn-secondary mt-3 text-sm"
             onClick={() => navigate("/contacts")}
           >
             Add a contact
@@ -64,7 +64,7 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         </div>
       )}
 
-      {filteredConversations.map((conv, index) => {
+      {filteredConversations.map((conv) => {
         const isGroup = conv.kind === "group";
         // Group rendering ---------------------------------------------------
         // Title fallback order: explicit manifest title → short hash of
@@ -86,22 +86,23 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         const displayLabel = isGroup
           ? groupTitle ?? "Group"
           : conv.display_name || conv.peer_user_id;
+        const unreadCount = conv.unread_count ?? (conv.has_unread ? 1 : 0);
+        const hasUnread = unreadCount > 0 || conv.has_unread;
 
         return (
           <button
             key={conv.conversation_id}
-            className={`conv-item w-full flex items-center gap-3 p-2 rounded-lg ${
+            className={`conv-item relative flex min-h-[60px] w-full items-center gap-2.5 rounded-md px-2 py-2 text-left ${
               activeId === conv.conversation_id ? "active" : ""
             } ${dissolved ? "opacity-60" : ""}`}
             onClick={() => navigate(`/chat/${conv.conversation_id}`)}
-            style={{ animationDelay: `${index * 50}ms` }}
           >
             {/* Avatar — group icon for groups, initial letter for direct chats. */}
-            <div className="avatar transition-medium">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-elevated text-muted-color">
               {isGroup ? (
-                <Users size={20} />
+                <Users size={17} />
               ) : (
-                <span className="text-lg font-medium">
+                <span className="text-sm font-medium">
                   {(conv.display_name || conv.peer_user_id)[0]?.toUpperCase() || "?"}
                 </span>
               )}
@@ -110,20 +111,25 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
             {/* Content */}
             <div className="flex-1 min-w-0">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-primary-color truncate font-medium">
+                <span
+                  className={`truncate text-sm text-primary-color ${
+                    hasUnread ? "font-semibold" : "font-medium"
+                  }`}
+                  title={displayLabel}
+                >
                   {displayLabel}
                 </span>
-                <span className="text-muted-color text-xs shrink-0">
+                <span className="w-12 shrink-0 text-right text-[11px] text-muted-color">
                   {formatTime(conv.last_message_time)}
                 </span>
               </div>
-              <div className="flex items-center justify-between gap-2 mt-1">
-                <span className="text-secondary-color truncate text-sm">
+              <div className="mt-0.5 flex items-center justify-between gap-2">
+                <span className="truncate text-xs text-secondary-color">
                   {isGroup
                     ? conv.last_message || memberCountLabel || "Group chat"
                     : conv.last_message || conv.peer_user_id}
                 </span>
-                <div className="flex items-center gap-1 shrink-0">
+                <div className="flex shrink-0 items-center gap-1">
                   {dissolved && (
                     <span className="badge badge-muted text-[10px] uppercase tracking-wide">
                       Dissolved
@@ -137,11 +143,16 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
                   {isGroup && conv.group_id && !dissolved && (
                     <GroupSyncIndicator status={statuses[conv.group_id]} compact />
                   )}
-                  {conv.has_unread && (
+                  {hasUnread && unreadCount > 1 && (
                     <span
-                      className="w-2.5 h-2.5 rounded-full bg-primary animate-scale-in"
-                      aria-label="Unread messages"
-                    />
+                      className="flex h-5 min-w-[1.25rem] items-center justify-center rounded-full bg-primary px-1.5 text-[10px] font-semibold"
+                      style={{ color: "var(--bubble-sent-text)" }}
+                    >
+                      {unreadCount > 99 ? "99+" : unreadCount}
+                    </span>
+                  )}
+                  {hasUnread && unreadCount <= 1 && (
+                    <span className="h-2 w-2 rounded-full bg-primary" aria-label="Unread messages" />
                   )}
                 </div>
               </div>

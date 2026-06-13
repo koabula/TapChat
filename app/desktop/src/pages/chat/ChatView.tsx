@@ -362,7 +362,7 @@ export default function ChatView() {
     const result: React.ReactNode[] = [];
     let lastDateKey: string | null = null;
 
-    messages.forEach((msg, index) => {
+    messages.forEach((msg) => {
       const dateStr = formatDateSeparator(msg.created_at, now);
       const dateKey = dateStr || "today";
 
@@ -379,7 +379,6 @@ export default function ChatView() {
         <div
           key={msg.message_id}
           className={`flex ${isMyMessage(msg) ? "justify-end" : "justify-start"}`}
-          style={{ animationDelay: `${index * 30}ms` }}
         >
           {renderMessageBubble(msg)}
         </div>,
@@ -397,7 +396,7 @@ export default function ChatView() {
    */
   const buildGroupMessageList = () => {
     if (groupMessages.length === 0) return null;
-    return groupMessages.map((message, index) => {
+    return groupMessages.map((message) => {
       if (message.kind === "system_banner") {
         return (
           <div
@@ -416,7 +415,6 @@ export default function ChatView() {
         <div
           key={message.message_id}
           className={`flex ${sent ? "justify-end" : "justify-start"}`}
-          style={{ animationDelay: `${index * 30}ms` }}
         >
           {renderGroupBubble(message, sent)}
         </div>
@@ -428,7 +426,7 @@ export default function ChatView() {
     message: Extract<GroupMessageView, { kind: "bubble" }>,
     sent: boolean,
   ) => {
-    const bubbleCls = `bubble ${sent ? "bubble-sent" : "bubble-received"} animate-fade-in-up`;
+    const bubbleCls = `bubble ${sent ? "bubble-sent" : "bubble-received"}`;
     const refs = message.storage_refs ?? [];
     const hasAttachment = message.has_attachment || refs.length > 0;
     const senderName = resolveGroupName({
@@ -484,7 +482,7 @@ export default function ChatView() {
 
   const renderMessageBubble = (msg: Message) => {
     const isSent = isMyMessage(msg);
-    const bubbleCls = `bubble ${isSent ? "bubble-sent" : "bubble-received"} animate-fade-in-up`;
+    const bubbleCls = `bubble ${isSent ? "bubble-sent" : "bubble-received"}`;
     const refs = msg.storage_refs ?? [];
     const hasAttachment = msg.has_attachment || refs.length > 0;
 
@@ -565,12 +563,12 @@ export default function ChatView() {
 
   if (!conversationId) {
     return (
-      <div className="flex-1 flex items-center justify-center bg-base">
-        <div className="text-center animate-fade-in">
-          <div className="mx-auto w-16 h-16 rounded-full bg-surface-elevated mb-4 flex items-center justify-center animate-scale-in">
-            <MessageCircle size={28} className="shrink-0 leading-none text-muted-color" />
+      <div className="flex flex-1 items-center justify-center bg-base px-6">
+        <div className="text-center">
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-surface-elevated">
+            <MessageCircle size={24} className="shrink-0 leading-none text-muted-color" />
           </div>
-          <h2 className="text-xl text-muted-color mb-2">Select a conversation</h2>
+          <h2 className="mb-2 text-lg font-medium text-secondary-color">Select a conversation</h2>
           <p className="text-muted-color text-sm">or create a new one to start messaging</p>
         </div>
       </div>
@@ -578,13 +576,13 @@ export default function ChatView() {
   }
 
   return (
-    <div className="flex-1 flex flex-col bg-base min-h-0">
-      <header className="flex items-center gap-3 p-3 border-b border-default bg-surface animate-fade-in-down">
-        <div className="avatar animate-scale-in">
+    <div className="flex min-h-0 flex-1 flex-col bg-base">
+      <header className="flex h-14 items-center gap-3 border-b border-subtle bg-base px-4">
+        <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-elevated text-muted-color">
           {isGroup ? (
             <Users size={18} />
           ) : (
-            <span className="text-lg font-medium">
+            <span className="text-sm font-medium">
               {peerName[0]?.toUpperCase() || "?"}
             </span>
           )}
@@ -655,41 +653,43 @@ export default function ChatView() {
       <div
         ref={messagesContainerRef}
         onScroll={handleScroll}
-        className="flex-1 min-h-0 overflow-y-auto overscroll-contain p-4 space-y-3"
+        className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5"
       >
-        {loading && (
-          <div className="text-center py-8">
-            <div className="inline-block text-2xl text-muted-color">
-              <Loader size={28} className="animate-spin" />
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-2">
+          {loading && (
+            <div className="py-8 text-center">
+              <div className="inline-block text-2xl text-muted-color">
+                <Loader size={28} className="animate-spin" />
+              </div>
+              <p className="mt-2 text-muted-color">Loading messages...</p>
             </div>
-            <p className="text-muted-color mt-2 animate-pulse">Loading messages...</p>
-          </div>
-        )}
+          )}
 
-        {!loading && !isGroup && messages.length === 0 && (
-          <div className="text-center py-8 animate-fade-in">
-            <div className="text-muted-color">
-              <p className="mb-2">Start the conversation</p>
-              <p className="text-sm">Send a message below</p>
+          {!loading && !isGroup && messages.length === 0 && (
+            <div className="py-8 text-center">
+              <div className="text-muted-color">
+                <p className="mb-2">Start the conversation</p>
+                <p className="text-sm">Send a message below</p>
+              </div>
             </div>
-          </div>
-        )}
-        {!loading && isGroup && groupMessages.length === 0 && (
-          <div className="text-center py-8 animate-fade-in">
-            <div className="text-muted-color">
-              <p className="mb-2">No messages in this group yet</p>
-              <p className="text-sm">Send the first one below</p>
+          )}
+          {!loading && isGroup && groupMessages.length === 0 && (
+            <div className="py-8 text-center">
+              <div className="text-muted-color">
+                <p className="mb-2">No messages in this group yet</p>
+                <p className="text-sm">Send the first one below</p>
+              </div>
             </div>
-          </div>
-        )}
+          )}
 
-        {buildMessageListWithSeparators()}
-        <div ref={messagesEndRef} />
+          {buildMessageListWithSeparators()}
+          <div ref={messagesEndRef} />
+        </div>
       </div>
 
       {composerDisabled ? (
         <div
-          className="flex flex-wrap items-center gap-2 p-4 border-t border-default bg-surface-elevated text-sm text-muted-color"
+          className="flex flex-wrap items-center gap-2 border-t border-subtle bg-base px-4 py-3 text-sm text-muted-color"
           title={composerTooltip}
         >
           <UserX size={16} />

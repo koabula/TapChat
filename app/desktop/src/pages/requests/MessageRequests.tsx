@@ -158,11 +158,8 @@ export default function MessageRequests() {
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
       <div className="flex-1 flex min-h-0 flex-col">
-        <header className="flex items-center p-3 border-b border-default">
-          <button className="btn btn-ghost px-2" onClick={() => navigate("/")}>
-            Back
-          </button>
-          <h1 className="font-semibold text-primary-color ml-2">
+        <header className="flex h-14 items-center border-b border-subtle px-4">
+          <h1 className="font-semibold text-primary-color">
             Message Requests ({requests.length})
           </h1>
         </header>

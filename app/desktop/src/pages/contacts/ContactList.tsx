@@ -106,14 +106,8 @@ export default function ContactList() {
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
       <div className="flex-1 flex min-h-0 flex-col">
         {/* Header */}
-        <header className="flex items-center p-3 border-b border-default">
-          <button
-            className="btn btn-ghost px-2"
-            onClick={() => navigate("/")}
-          >
-            ←
-          </button>
-          <h1 className="font-semibold text-primary-color ml-2">Contacts</h1>
+        <header className="flex h-14 items-center border-b border-subtle px-4">
+          <h1 className="font-semibold text-primary-color">Contacts</h1>
         </header>
 
         {/* Add contact */}

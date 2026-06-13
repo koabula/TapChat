@@ -10,6 +10,8 @@ import {
   Clapperboard,
   FileText,
   File,
+  Loader2,
+  Send,
 } from "lucide-react";
 
 const MAX_TEXTAREA_ROWS = 5;
@@ -422,10 +424,28 @@ export default function MessageInput({ conversationId, conversationKind = "direc
   };
 
   const hasAttachments = attachments.length > 0;
+  const primaryDisabled = sending || (!hasAttachments && !inputText.trim());
+  const statusLabel = sending
+    ? hasAttachments
+      ? `Uploading ${(uploadingIndex ?? 0) + 1}/${attachments.length}`
+      : "Sending message"
+    : hasAttachments
+      ? `${attachments.length} file${attachments.length > 1 ? "s" : ""} attached`
+      : null;
+  const sendTitle = hasAttachments
+    ? `Send ${attachments.length} file${attachments.length > 1 ? "s" : ""}`
+    : "Send message";
+  const handlePrimarySend = () => {
+    if (hasAttachments) {
+      void handleSendAttachments();
+      return;
+    }
+    void handleSendText();
+  };
 
   return (
     <div
-      className={`p-3 border-t border-default transition-all ${
+      className={`relative border-t border-subtle bg-base px-4 py-3 transition-colors ${
         isDragging ? "bg-primary/10 border-primary" : ""
       }`}
       onDragOver={handleDragOver}
@@ -434,129 +454,141 @@ export default function MessageInput({ conversationId, conversationKind = "direc
     >
       {/* Drag overlay */}
       {isDragging && (
-        <div className="absolute inset-0 drag-overlay flex items-center justify-center z-10">
+        <div className="drag-overlay absolute inset-0 z-10 flex items-center justify-center">
           <div className="text-center">
-            <Paperclip size={40} className="mb-2 animate-bounce text-primary-color" />
+            <Paperclip size={36} className="mb-2 text-primary-color" />
             <p className="text-primary-color font-medium">Drop files to attach</p>
           </div>
         </div>
       )}
 
-      {/* Attachments preview — horizontal scrollable list */}
-      {hasAttachments && (
-        <div className="mb-2 flex gap-2 overflow-x-auto pb-1">
-          {attachments.map((att, index) => (
-            <div
-              key={`${att.path}-${index}`}
-              className={`relative flex-shrink-0 w-20 h-20 rounded-lg border flex flex-col items-center justify-center gap-1 transition-colors ${
-                uploadingIndex === index
-                  ? "border-primary bg-primary/5"
-                  : "border-subtle bg-surface/50 hover:border-default"
-              }`}
-            >
-              {/* Upload progress overlay */}
-              {uploadingIndex === index && uploadProgress !== null && (
-                <div className="absolute inset-0 bg-black/10 rounded-lg flex flex-col items-center justify-center">
-                  <div className="w-8 h-8 relative">
-                    <svg className="w-8 h-8 -rotate-90" viewBox="0 0 36 36">
-                      <circle
-                        className="text-surface-elevated"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        fill="none"
-                        cx="18" cy="18" r="15"
-                      />
-                      <circle
-                        className="text-primary"
-                        stroke="currentColor"
-                        strokeWidth="3"
-                        fill="none"
-                        cx="18" cy="18" r="15"
-                        strokeDasharray={`${uploadProgress * 0.94} 94`}
-                        strokeLinecap="round"
-                      />
-                    </svg>
-                    <span className="absolute inset-0 flex items-center justify-center text-[8px] font-medium text-primary-color">
-                      {uploadProgress}%
+      <div className="mx-auto w-full max-w-4xl">
+        <div className="overflow-hidden rounded-lg border border-subtle bg-surface shadow-sm">
+          {hasAttachments && (
+            <div className="border-b border-subtle px-2 py-2">
+              <div className="flex gap-2 overflow-x-auto pb-1">
+                {attachments.map((att, index) => (
+                  <div
+                    key={`${att.path}-${index}`}
+                    className={`relative flex h-16 w-16 flex-shrink-0 flex-col items-center justify-center gap-1 rounded-md border transition-colors ${
+                      uploadingIndex === index
+                        ? "border-primary bg-primary/5"
+                        : "border-subtle bg-base hover:border-default"
+                    }`}
+                  >
+                    {uploadingIndex === index && uploadProgress !== null && (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center rounded-md bg-black/10">
+                        <div className="relative h-8 w-8">
+                          <svg className="h-8 w-8 -rotate-90" viewBox="0 0 36 36">
+                            <circle
+                              className="text-surface-elevated"
+                              stroke="currentColor"
+                              strokeWidth="3"
+                              fill="none"
+                              cx="18" cy="18" r="15"
+                            />
+                            <circle
+                              className="text-primary"
+                              stroke="currentColor"
+                              strokeWidth="3"
+                              fill="none"
+                              cx="18" cy="18" r="15"
+                              strokeDasharray={`${uploadProgress * 0.94} 94`}
+                              strokeLinecap="round"
+                            />
+                          </svg>
+                          <span className="absolute inset-0 flex items-center justify-center text-[8px] font-medium text-primary-color">
+                            {uploadProgress}%
+                          </span>
+                        </div>
+                      </div>
+                    )}
+
+                    {getFileIcon(att.mimeType)}
+
+                    <span className="w-12 truncate text-center text-[10px] leading-tight text-muted-color" title={att.name}>
+                      {att.name.length > 12 ? att.name.slice(0, 10) + ".." : att.name}
                     </span>
+
+                    <button
+                      className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-default bg-surface-elevated transition-colors hover:border-error hover:bg-error hover:text-white"
+                      onClick={() => handleRemoveAttachment(index)}
+                      disabled={sending}
+                      title="Remove attachment"
+                      aria-label={`Remove ${att.name}`}
+                    >
+                      <X size={10} />
+                    </button>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="flex items-end gap-2 px-2 py-2">
+            <button
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-secondary-color transition-colors hover:bg-surface-elevated hover:text-primary-color disabled:opacity-50"
+              title="Attach file"
+              aria-label="Attach file"
+              onClick={handleAttachClick}
+              disabled={sending}
+            >
+              <Paperclip size={19} />
+            </button>
+            <textarea
+              ref={textareaRef}
+              className="min-h-9 flex-1 resize-none bg-transparent px-1 py-1.5 text-sm text-primary-color outline-none placeholder:text-muted-color disabled:opacity-70"
+              style={{
+                lineHeight: `${TEXTAREA_LINE_HEIGHT_PX}px`,
+                minHeight: `${TEXTAREA_LINE_HEIGHT_PX + 12}px`,
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                overflowWrap: "break-word",
+              }}
+              rows={1}
+              placeholder={hasAttachments ? "Add a message (optional)..." : "Type a message..."}
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey && !hasAttachments) {
+                  e.preventDefault();
+                  void handleSendText();
+                }
+              }}
+              onPaste={handlePaste}
+              disabled={sending}
+            />
+            <button
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-primary transition-colors hover:bg-primary-dark disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={handlePrimarySend}
+              disabled={primaryDisabled}
+              title={sendTitle}
+              aria-label={sendTitle}
+              style={{ color: "var(--bubble-sent-text)" }}
+            >
+              {sending ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
+            </button>
+          </div>
+
+          {statusLabel && (
+            <div className="border-t border-subtle px-3 pb-2 pt-1">
+              <div className="flex items-center justify-between gap-3 text-xs text-muted-color">
+                <span>{statusLabel}</span>
+                {uploadProgress !== null && (
+                  <span>{uploadProgress}%</span>
+                )}
+              </div>
+              {uploadProgress !== null && (
+                <div className="mt-1 h-1 rounded-full bg-surface-elevated">
+                  <div
+                    className="h-1 rounded-full bg-primary"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
                 </div>
               )}
-
-              {/* File icon */}
-              {getFileIcon(att.mimeType)}
-
-              {/* File name */}
-              <span className="text-[10px] text-muted-color truncate w-16 text-center leading-tight" title={att.name}>
-                {att.name.length > 12 ? att.name.slice(0, 10) + ".." : att.name}
-              </span>
-
-              {/* Remove button */}
-              <button
-                className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-surface-elevated border border-default flex items-center justify-center hover:bg-error hover:text-white hover:border-error transition-colors"
-                onClick={() => handleRemoveAttachment(index)}
-                disabled={sending}
-                title="Remove attachment"
-              >
-                <X size={10} />
-              </button>
             </div>
-          ))}
+          )}
         </div>
-      )}
-
-      {/* Input row */}
-      <div className="flex items-end gap-2">
-        <button
-          className="btn btn-ghost px-2 transition-fast"
-          title="Attach file"
-          onClick={handleAttachClick}
-          disabled={sending}
-        >
-          <Paperclip size={20} />
-        </button>
-        <textarea
-          ref={textareaRef}
-          className="input flex-1 transition-fast resize-none"
-          style={{
-            lineHeight: `${TEXTAREA_LINE_HEIGHT_PX}px`,
-            minHeight: `${TEXTAREA_LINE_HEIGHT_PX + 24}px`,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-            overflowWrap: "break-word",
-          }}
-          rows={1}
-          placeholder={hasAttachments ? "Add a message (optional)..." : "Type a message..."}
-          value={inputText}
-          onChange={(e) => setInputText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !hasAttachments) {
-              e.preventDefault();
-              handleSendText();
-            }
-          }}
-          onPaste={handlePaste}
-          disabled={sending}
-        />
-        {hasAttachments ? (
-          <button
-            className="btn btn-primary px-3 transition-fast whitespace-nowrap"
-            onClick={handleSendAttachments}
-            disabled={sending}
-          >
-            {sending
-              ? `Uploading ${(uploadingIndex ?? 0) + 1}/${attachments.length}...`
-              : `Send ${attachments.length} file${attachments.length > 1 ? "s" : ""}`}
-          </button>
-        ) : (
-          <button
-            className="btn btn-primary px-3 transition-fast"
-            onClick={handleSendText}
-            disabled={sending || !inputText.trim()}
-          >
-            {sending ? "Sending..." : "Send"}
-          </button>
-        )}
       </div>
     </div>
   );
