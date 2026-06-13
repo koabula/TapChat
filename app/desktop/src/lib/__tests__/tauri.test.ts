@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: tauriMocks.listen,
 }));
 
-import { createOrLoadIdentity, setLocalDisplayName } from "../tauri";
+import { createOrLoadIdentity, selectProfileForRestart, setLocalDisplayName } from "../tauri";
 
 describe("tauri identity wrappers", () => {
   beforeEach(() => {
@@ -40,5 +40,20 @@ describe("tauri identity wrappers", () => {
     expect(tauriMocks.invoke).toHaveBeenCalledWith("set_local_display_name", {
       displayName: null,
     });
+  });
+
+  it("selects a profile for restart without invoking the hot-switch command", async () => {
+    tauriMocks.invoke.mockResolvedValueOnce({});
+
+    await selectProfileForRestart("D:/TapChat/profiles/bob", "secret");
+
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("select_profile_for_restart", {
+      path: "D:/TapChat/profiles/bob",
+      passphrase: "secret",
+    });
+    expect(tauriMocks.invoke).not.toHaveBeenCalledWith(
+      "activate_profile",
+      expect.anything(),
+    );
   });
 });

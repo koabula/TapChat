@@ -266,6 +266,43 @@ impl ProfileManager {
         Ok(())
     }
 
+    /// Select an existing profile for the next process start.
+    ///
+    /// This validates that the target profile can be opened, then writes the
+    /// registry's active profile on disk. It deliberately does not replace the
+    /// in-process active profile or engine; the desktop UI relaunches after this
+    /// command so the new process can perform a clean startup.
+    pub async fn select_profile_for_restart(
+        &self,
+        path: &PathBuf,
+        passphrase: Option<String>,
+    ) -> Result<()> {
+        {
+            let inner = self.inner.read().await;
+            if !inner
+                .registry
+                .profiles
+                .iter()
+                .any(|entry| entry.root_dir == *path)
+            {
+                return Err(anyhow!(
+                    "profile {} is not registered on this device",
+                    path.display()
+                ));
+            }
+        }
+
+        let profile = Profile::open_with_passphrase(path, passphrase)?;
+        drop(profile);
+
+        let mut inner = self.inner.write().await;
+        let mut registry = inner.registry.clone();
+        registry.set_active(path)?;
+        registry.save()?;
+        inner.registry = registry;
+        Ok(())
+    }
+
     /// Delete a profile (removes registry entry and directory).
     /// Cannot delete the active profile.
     pub async fn delete_profile(&self, path: &PathBuf) -> Result<()> {
@@ -393,5 +430,131 @@ fn load_registry_active_profile(
 impl Default for ProfileManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use tapchat_core::cli::profile::{Profile, ProfileInitOptions, ProfileRegistry};
+
+    use super::ProfileManager;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
+
+    fn test_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tapchat-desktop-profile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn select_profile_for_restart_rejects_wrong_passphrase_without_saving_active_profile() {
+        let _guard = env_lock();
+        let dir = test_dir();
+        let registry_path = dir.join("config").join("profiles.json");
+        unsafe {
+            std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
+        }
+
+        let alice_root = dir.join("alice");
+        let bob_root = dir.join("bob");
+        let alice = Profile::init_with_options(
+            "alice",
+            &alice_root,
+            ProfileInitOptions {
+                passphrase: Some("alice-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init alice");
+        let bob = Profile::init_with_options(
+            "bob",
+            &bob_root,
+            ProfileInitOptions {
+                passphrase: Some("bob-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init bob");
+        drop(alice);
+        drop(bob);
+
+        let manager = ProfileManager::new();
+        let error = manager
+            .select_profile_for_restart(&bob_root, Some("wrong".into()))
+            .await
+            .expect_err("wrong passphrase should fail");
+
+        assert!(error
+            .to_string()
+            .contains("failed to unlock encrypted profile"));
+        let registry = ProfileRegistry::load().expect("load registry");
+        assert_eq!(
+            registry.active_profile.as_deref(),
+            Some(alice_root.as_path())
+        );
+
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn select_profile_for_restart_saves_target_as_next_active_profile() {
+        let _guard = env_lock();
+        let dir = test_dir();
+        let registry_path = dir.join("config").join("profiles.json");
+        unsafe {
+            std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
+        }
+
+        let alice_root = dir.join("alice");
+        let bob_root = dir.join("bob");
+        let alice = Profile::init_with_options(
+            "alice",
+            &alice_root,
+            ProfileInitOptions {
+                passphrase: Some("alice-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init alice");
+        let bob = Profile::init_with_options(
+            "bob",
+            &bob_root,
+            ProfileInitOptions {
+                passphrase: Some("bob-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init bob");
+        drop(alice);
+        drop(bob);
+
+        let manager = ProfileManager::new();
+        manager
+            .select_profile_for_restart(&bob_root, Some("bob-passphrase".into()))
+            .await
+            .expect("select bob");
+
+        let registry = ProfileRegistry::load().expect("load registry");
+        assert_eq!(registry.active_profile.as_deref(), Some(bob_root.as_path()));
+
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

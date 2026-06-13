@@ -268,6 +268,7 @@ pub fn run() {
             commands::profile::create_profile,
             commands::profile::start_new_profile_onboarding,
             commands::profile::activate_profile,
+            commands::profile::select_profile_for_restart,
             commands::profile::unlock_active_profile,
             commands::profile::delete_profile,
             commands::profile::reload_engine,

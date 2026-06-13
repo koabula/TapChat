@@ -99,8 +99,21 @@ pub async fn on_app_ready(app: &AppHandle) {
         inner.session = SessionState::Onboarding { step };
         inner.profile_path = startup_check.profile_path;
         inner.startup_phase = StartupPhase::Ready; // Backend is ready, just needs onboarding
+        let session_status = SessionStatus {
+            state: match &inner.session {
+                SessionState::Onboarding { step } => {
+                    format!("onboarding:{:?}", step).to_lowercase()
+                }
+                _ => "onboarding:welcome".to_string(),
+            },
+            device_id: None,
+            ws_connected: false,
+            profile_path: None,
+            error: None,
+        };
         drop(inner);
         set_ws_connection_snapshot(&state, None, false).await;
+        let _ = app.emit("session-status", session_status);
 
         // Open onboarding window
         if let Err(error) =
@@ -190,7 +203,9 @@ pub async fn on_app_ready(app: &AppHandle) {
             // Create engine from restored state
             inner.engine = CoreEngine::from_restored_state(snapshot);
 
-            inner.session = SessionState::Active { device_id };
+            inner.session = SessionState::Active {
+                device_id: device_id.clone(),
+            };
             inner.profile_path = startup_check.profile_path;
             inner.startup_phase = StartupPhase::Ready; // Backend is fully ready
         }
@@ -207,6 +222,16 @@ pub async fn on_app_ready(app: &AppHandle) {
             }
         };
         set_ws_connection_snapshot(&state, active_device_id, false).await;
+        let _ = app.emit(
+            "session-status",
+            SessionStatus {
+                state: "active".to_string(),
+                device_id: Some(device_id.clone()),
+                ws_connected: false,
+                profile_path: None,
+                error: None,
+            },
+        );
 
         // Show main window (created hidden in tauri.conf.json)
         let show_window_started_at = Instant::now();

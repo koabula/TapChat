@@ -351,18 +351,33 @@ impl RealtimeManager {
     /// Used when switching profiles to avoid triggering disconnect notifications.
     /// Marks all connections as stale before closing.
     pub async fn close_all_silent(&self) -> Result<()> {
-        let mut sessions = self.sessions.write().await;
+        {
+            let mut sessions = self.sessions.write().await;
 
-        // Mark all as stale and close
-        for (_, session) in sessions.iter_mut() {
-            session.stale = true;
-            session.connecting = false;
-            session.connected = false;
-            let _ = session.stop_tx.send(()).await;
+            // Mark all as stale and close
+            for (_, session) in sessions.iter_mut() {
+                session.stale = true;
+                session.connecting = false;
+                session.connected = false;
+                let _ = session.stop_tx.send(()).await;
+            }
+
+            // Clear all sessions
+            sessions.clear();
         }
 
-        // Clear all sessions
-        sessions.clear();
+        {
+            let mut group_sessions = self.group_sessions.write().await;
+
+            for (_, session) in group_sessions.iter_mut() {
+                session.stale = true;
+                session.connecting = false;
+                session.connected = false;
+                let _ = session.stop_tx.send(()).await;
+            }
+
+            group_sessions.clear();
+        }
 
         Ok(())
     }

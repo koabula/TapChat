@@ -33,6 +33,7 @@ import { useCoreUpdate } from "./hooks/useCoreUpdate";
 import { useGroupSyncScheduler } from "./hooks/useGroupSyncScheduler";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
+import { waitForNonBootstrappingSessionStatus } from "./lib/sessionStartup";
 
 import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
 import type { MessageRequestItem } from "./store/requests";
@@ -69,7 +70,7 @@ function isRuntimeAuthError(detail: string | undefined | null): boolean {
  * Inner app component that has Router context.
  * Hooks that use useNavigate() must be called here, inside BrowserRouter.
  */
-function AppInner() {
+function AppInner({ startupError }: { startupError: string | null }) {
   const { sessionState, unlockError } = useSessionStore();
   const [unlockPassphrase, setUnlockPassphrase] = useState("");
   const [unlocking, setUnlocking] = useState(false);
@@ -99,7 +100,7 @@ function AppInner() {
           <div className="text-center">
             <div className="text-primary-color font-medium">TapChat</div>
             <div className="mt-2 text-sm text-muted-color">
-              Preparing your workspace
+              {startupError ?? "Preparing your workspace"}
             </div>
           </div>
         </div>
@@ -210,6 +211,7 @@ function App() {
   const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight, setUnlockError } = useSessionStore();
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [statusResolved, setStatusResolved] = useState(false);
+  const [startupError, setStartupError] = useState<string | null>(null);
   const isProfileSwitchingRef = useRef(false);
   const syncInFlightRef = useRef(false);
   const syncPendingRef = useRef(false);
@@ -380,7 +382,8 @@ function App() {
     });
 
     // Fetch initial session status
-    invoke<SessionStatus>("get_session_status")
+    setStartupError(null);
+    waitForNonBootstrappingSessionStatus(() => invoke<SessionStatus>("get_session_status"))
       .then((status) => {
         const elapsedMs = Math.round(performance.now() - mountedAt);
         console.debug(
@@ -397,7 +400,8 @@ function App() {
       })
       .catch((err) => {
         console.error(`[App] failed to get session status: ${String(err)}`);
-        setSessionState("uninitialized");
+        setStartupError(String(err));
+        setSessionState("bootstrapping");
         setStatusResolved(true);
       });
 
@@ -413,7 +417,7 @@ function App() {
 
   return (
     <BrowserRouter>
-      <AppInner key={statusResolved ? "resolved" : "bootstrapping"} />
+      <AppInner key={statusResolved ? "resolved" : "bootstrapping"} startupError={startupError} />
     </BrowserRouter>
   );
 }

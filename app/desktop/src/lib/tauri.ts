@@ -64,6 +64,13 @@ export async function activateProfile(path: string, passphrase?: string): Promis
   return invoke("activate_profile", { path, passphrase });
 }
 
+export async function selectProfileForRestart(
+  path: string,
+  passphrase?: string,
+): Promise<void> {
+  return invoke("select_profile_for_restart", { path, passphrase });
+}
+
 export async function unlockActiveProfile(passphrase: string): Promise<void> {
   return invoke("unlock_active_profile", { passphrase });
 }

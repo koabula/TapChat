@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { ChevronDown, ChevronRight, Code2, Download, ExternalLink, Monitor, RefreshCw, X } from "lucide-react";
 import { useManualUpdate } from "@/hooks/useAutoUpdate";
 
@@ -12,7 +13,7 @@ import {
   rotateShareLink,
   setLocalDisplayName,
   listProfiles,
-  activateProfile,
+  selectProfileForRestart,
   deleteProfile,
   startNewProfileOnboarding,
   cloudflareStatus,
@@ -289,7 +290,7 @@ export default function Settings() {
     setSwitchingProfile(path);
     try {
       try {
-        await activateProfile(path);
+        await selectProfileForRestart(path);
       } catch (err) {
         const errorMsg = String(err);
         if (!errorMsg.toLowerCase().includes("passphrase")) {
@@ -299,21 +300,20 @@ export default function Settings() {
         if (!passphrase) {
           throw err;
         }
-        await activateProfile(path, passphrase);
+        await selectProfileForRestart(path, passphrase);
       }
-      // Do NOT reload data here - wait for engine-reloaded event
-      // which will trigger useCoreUpdate to fetch new data
-      // The profile-switch-complete event signals that the switch is done
+      await relaunch();
     } catch (err) {
       console.error(`[Settings] Profile switch error: ${String(err)}`);
-      // Don't show popup for transient errors like websocket connect
       const errorMsg = String(err);
-      if (!errorMsg.includes("websocket") && !errorMsg.includes("connect") && errorMsg !== "") {
-        alert(errorMsg);
+      if (errorMsg !== "") {
+        if (errorMsg.toLowerCase().includes("restart") || errorMsg.toLowerCase().includes("relaunch")) {
+          alert(`Profile selected. Please restart TapChat manually to finish switching.\n\n${errorMsg}`);
+        } else {
+          alert(errorMsg);
+        }
       }
     } finally {
-      // Just update the profiles list and clear switching state
-      // Identity/runtime/allowlist data will be refreshed via engine-reloaded event
       loadProfiles();
       setSwitchingProfile(null);
     }
@@ -441,7 +441,7 @@ export default function Settings() {
                           onClick={() => handleSwitchProfile(profile.path)}
                           disabled={switchingProfile === profile.path}
                         >
-                          {switchingProfile === profile.path ? "Switching..." : "Switch"}
+                          {switchingProfile === profile.path ? "Restarting..." : "Switch"}
                         </button>
                         <button
                           className="btn btn-ghost text-xs status-error"

@@ -236,7 +236,9 @@ pub async fn get_session_status(state: State<'_, AppState>) -> Result<SessionSta
 
 #[cfg(test)]
 mod tests {
-    use crate::state::SyncGateState;
+    use crate::state::{AppState, OnboardingStep, SessionState, StartupPhase, SyncGateState};
+
+    use super::read_session_status_snapshot;
 
     #[tokio::test]
     async fn coalesced_sync_requests_set_pending_without_starting_second_run() {
@@ -255,5 +257,51 @@ mod tests {
         let state = gate.lock().await;
         assert!(state.in_flight);
         assert!(state.pending);
+    }
+
+    #[tokio::test]
+    async fn session_status_reports_bootstrapping_before_startup_is_ready() {
+        let state = AppState::new();
+
+        let status = read_session_status_snapshot(&state).await;
+
+        assert_eq!(status.state, "bootstrapping");
+        assert_eq!(status.device_id, None);
+        assert!(!status.ws_connected);
+    }
+
+    #[tokio::test]
+    async fn session_status_reports_active_after_startup_is_ready() {
+        let state = AppState::new();
+        {
+            let mut inner = state.inner.write().await;
+            inner.startup_phase = StartupPhase::Ready;
+            inner.session = SessionState::Active {
+                device_id: "device:test".into(),
+            };
+        }
+
+        let status = read_session_status_snapshot(&state).await;
+
+        assert_eq!(status.state, "active");
+        assert_eq!(status.device_id.as_deref(), Some("device:test"));
+        assert!(!status.ws_connected);
+    }
+
+    #[tokio::test]
+    async fn session_status_reports_onboarding_after_startup_is_ready() {
+        let state = AppState::new();
+        {
+            let mut inner = state.inner.write().await;
+            inner.startup_phase = StartupPhase::Ready;
+            inner.session = SessionState::Onboarding {
+                step: OnboardingStep::CloudflareSetup,
+            };
+        }
+
+        let status = read_session_status_snapshot(&state).await;
+
+        assert_eq!(status.state, "onboarding:cloudflaresetup");
+        assert_eq!(status.device_id, None);
     }
 }

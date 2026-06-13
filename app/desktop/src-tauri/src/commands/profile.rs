@@ -121,6 +121,24 @@ pub async fn activate_profile(
 }
 
 #[tauri::command]
+pub async fn select_profile_for_restart(
+    state: State<'_, AppState>,
+    path: PathBuf,
+    passphrase: Option<String>,
+) -> Result<(), String> {
+    log::info!(
+        "select_profile_for_restart: selecting profile at {} for next launch",
+        path.display()
+    );
+    let pm = &state.inner.read().await.profile_manager;
+    pm.select_profile_for_restart(&path, passphrase)
+        .await
+        .map_err(|e| e.to_string())?;
+    log::info!("select_profile_for_restart: completed successfully");
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn unlock_active_profile(
     app: AppHandle,
     state: State<'_, AppState>,
