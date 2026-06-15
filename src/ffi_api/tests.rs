@@ -2205,24 +2205,84 @@ mod tests {
             .expect("queue pending message");
         assert!(!alice.state.pending_outbox.is_empty());
 
-        alice
+        let delete_output = alice
             .handle_command(CoreCommand::DeleteContact {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("delete contact");
-        assert!(!alice.state.conversations.contains_key(&conversation_id));
+        assert!(delete_output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
+        assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
+        let archived = alice
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation retained");
+        assert_eq!(
+            archived.conversation.state,
+            crate::model::ConversationState::Archived
+        );
+        assert!(archived.messages.iter().any(|message| {
+            message.message_type == MessageType::ControlContactRemoved
+                && message
+                    .plaintext
+                    .as_deref()
+                    .is_some_and(|text| text.contains("archived"))
+        }));
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
-        assert!(alice.state.pending_outbox.is_empty());
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved }));
+        let pending_after_delete = alice.state.pending_outbox.len();
+        let send_err = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "blocked".into(),
+            })
+            .expect_err("closed relationship blocks send");
+        assert_eq!(send_err.code(), "relationship_closed");
+        assert_eq!(alice.state.pending_outbox.len(), pending_after_delete);
+
+        let allowlist_output = alice
+            .handle_event(CoreEvent::AllowlistFetched {
+                document: crate::transport_contract::AllowlistDocument {
+                    allowed_sender_user_ids: vec![bob_bundle.user_id.clone()],
+                    rejected_sender_user_ids: vec![],
+                },
+            })
+            .expect("allowlist fetched");
+        let replace = allowlist_output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReplaceAllowlist { update } => Some(update),
+                _ => None,
+            })
+            .expect("replace allowlist effect");
+        assert!(replace.document.allowed_sender_user_ids.is_empty());
+        assert!(replace.document.rejected_sender_user_ids.is_empty());
+
         let snapshot = alice.refresh_snapshot();
-        assert!(!snapshot
+        assert!(snapshot
             .conversations
             .iter()
             .any(|conversation| conversation.conversation_id == conversation_id));
         assert!(!snapshot
+            .contacts
+            .iter()
+            .any(|contact| contact.user_id == bob_bundle.user_id));
+        assert!(!snapshot
             .mls_states
             .iter()
             .any(|state| state.conversation_id == conversation_id));
-        assert!(snapshot.pending_outbox.is_empty());
+        assert!(snapshot
+            .pending_outbox
+            .iter()
+            .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved }));
 
         let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
         alice
@@ -2230,10 +2290,39 @@ mod tests {
                 bundle: refreshed_bob_bundle.clone(),
             })
             .expect("reimport contact");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&refreshed_bob_bundle.user_id)
+                .expect("contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
         let recreated =
             create_direct_conversation(&mut alice, refreshed_bob_bundle.user_id.clone());
-        assert_eq!(recreated, conversation_id);
-        assert!(alice.mls_summary(&conversation_id).is_some());
+        assert_ne!(recreated, conversation_id);
+        assert!(alice.mls_summary(&recreated).is_some());
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("archived conversation")
+                .conversation
+                .state,
+            crate::model::ConversationState::Archived
+        );
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&recreated)
+                .expect("conversation")
+                .conversation
+                .state,
+            crate::model::ConversationState::Active
+        );
     }
 
     #[test]
@@ -2248,6 +2337,8 @@ mod tests {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("delete contact");
+        assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
+        assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
 
         let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
         alice
@@ -2257,7 +2348,217 @@ mod tests {
             .expect("reimport contact");
         let recreated =
             create_direct_conversation(&mut alice, refreshed_bob_bundle.user_id.clone());
-        assert_eq!(recreated, conversation_id);
+        assert_ne!(recreated, conversation_id);
+    }
+
+    #[test]
+    fn app_started_migrates_legacy_removed_contact_to_archive() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .relationship_status = ContactRelationshipStatus::RemovedByMe;
+        alice
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .conversation
+            .state = crate::model::ConversationState::Closed;
+
+        let output = alice
+            .handle_event(CoreEvent::AppStarted)
+            .expect("migrate legacy removed contact");
+
+        assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
+        let archived = alice
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("archived conversation");
+        assert_eq!(
+            archived.conversation.state,
+            crate::model::ConversationState::Archived
+        );
+        assert!(archived.messages.iter().any(|message| {
+            message.message_id.ends_with(":system:legacy_archive")
+                && message
+                    .plaintext
+                    .as_deref()
+                    .is_some_and(|text| text.contains("archived"))
+        }));
+        assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
+
+        let allowlist_output = alice
+            .handle_event(CoreEvent::AllowlistFetched {
+                document: crate::transport_contract::AllowlistDocument {
+                    allowed_sender_user_ids: vec![bob_bundle.user_id.clone()],
+                    rejected_sender_user_ids: vec![bob_bundle.user_id.clone()],
+                },
+            })
+            .expect("legacy allowlist cleanup");
+        let replace = allowlist_output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReplaceAllowlist { update } => Some(update),
+                _ => None,
+            })
+            .expect("replace allowlist effect");
+        assert!(replace.document.allowed_sender_user_ids.is_empty());
+        assert!(replace.document.rejected_sender_user_ids.is_empty());
+    }
+
+    #[test]
+    fn received_contact_removed_control_closes_relationship_and_blocks_send() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundle {
+            bundle: alice_bundle.clone(),
+        })
+        .expect("bob imports alice");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        assert_eq!(
+            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
+            conversation_id
+        );
+
+        alice
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: bob_bundle.user_id.clone(),
+            })
+            .expect("alice deletes bob");
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+
+        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
+        let bob_conversation = bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("bob conversation");
+        assert_eq!(
+            bob_conversation.conversation.state,
+            crate::model::ConversationState::Archived
+        );
+        assert!(bob_conversation.messages.iter().any(|message| {
+            message.message_type == MessageType::ControlContactRemoved
+                && message
+                    .plaintext
+                    .as_deref()
+                    .is_some_and(|text| text.contains("archived"))
+        }));
+        assert!(!bob.state.mls_summaries.contains_key(&conversation_id));
+        let send_err = bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "blocked".into(),
+            })
+            .expect_err("removed by peer blocks send");
+        assert_eq!(send_err.code(), "relationship_closed");
+    }
+
+    #[test]
+    fn closed_relationship_acks_and_ignores_late_mls_application() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundle {
+            bundle: alice_bundle.clone(),
+        })
+        .expect("bob imports alice");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        assert_eq!(
+            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
+            conversation_id
+        );
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "late".into(),
+            })
+            .expect("queue late message");
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let stale_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::MlsApplication
+            })
+            .expect("stale app envelope")
+            .envelope
+            .clone();
+
+        alice
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: bob_bundle.user_id.clone(),
+            })
+            .expect("alice deletes bob");
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        let message_count_before = bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation")
+            .messages
+            .len();
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 2,
+            records: vec![InboxRecord {
+                seq: 2,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: stale_envelope.message_id.clone(),
+                received_at: 2,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: stale_envelope.clone(),
+            }],
+        })
+        .expect("late message ignored");
+
+        let bob_conversation = bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation");
+        assert_eq!(bob_conversation.messages.len(), message_count_before);
+        assert!(!bob_conversation
+            .messages
+            .iter()
+            .any(|message| message.message_id == stale_envelope.message_id));
+        assert!(!bob.state.recovery_contexts.contains_key(&conversation_id));
+        let sync_state = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state");
+        assert_eq!(sync_state.checkpoint.last_acked_seq, 2);
+        assert!(!sync_state.pending_retry);
     }
 
     #[test]

@@ -249,6 +249,8 @@ fn conversation_state_string(state: tapchat_core::model::ConversationState) -> S
     match state {
         tapchat_core::model::ConversationState::Active => "active".into(),
         tapchat_core::model::ConversationState::NeedsRebuild => "needs_rebuild".into(),
+        tapchat_core::model::ConversationState::Closed => "closed".into(),
+        tapchat_core::model::ConversationState::Archived => "archived".into(),
         tapchat_core::model::ConversationState::Dissolved => "dissolved".into(),
     }
 }
@@ -543,6 +545,9 @@ pub async fn get_group_messages_impl(
             }
             tapchat_core::model::MessageType::ControlIdentityStateUpdated => {
                 // Same as above — direct conversation concern.
+            }
+            tapchat_core::model::MessageType::ControlContactRemoved => {
+                // Direct relationship lifecycle message.
             }
             tapchat_core::model::MessageType::MlsWelcome
             | tapchat_core::model::MessageType::MlsCommit

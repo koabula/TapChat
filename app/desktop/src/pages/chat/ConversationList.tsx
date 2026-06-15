@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import { useNavigate, useParams } from "react-router";
 import { Users } from "lucide-react";
 import GroupSyncIndicator from "@/components/group/GroupSyncIndicator";
@@ -29,6 +30,13 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
       conv.display_name?.toLowerCase().includes(query) === true
     );
   });
+  const activeConversations = filteredConversations.filter(
+    (conv) => conv.state !== "archived",
+  );
+  const archivedConversations = filteredConversations.filter(
+    (conv) => conv.state === "archived",
+  );
+  const visibleConversations = [...activeConversations, ...archivedConversations];
 
   const formatTime = (timestamp: number | null | undefined) => {
     if (!timestamp) return "";
@@ -46,13 +54,13 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
 
   return (
     <div className="space-y-0.5 p-1.5">
-      {filteredConversations.length === 0 && searchQuery.trim() && (
+      {visibleConversations.length === 0 && searchQuery.trim() && (
         <div className="px-3 py-8 text-center text-sm">
           <div className="text-muted-color">No conversations match "{searchQuery}"</div>
         </div>
       )}
 
-      {filteredConversations.length === 0 && !searchQuery.trim() && (
+      {visibleConversations.length === 0 && !searchQuery.trim() && (
         <div className="px-3 py-8 text-center text-sm">
           <div className="text-muted-color">No conversations yet</div>
           <button
@@ -64,7 +72,7 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         </div>
       )}
 
-      {filteredConversations.map((conv) => {
+      {visibleConversations.map((conv, index) => {
         const isGroup = conv.kind === "group";
         // Group rendering ---------------------------------------------------
         // Title fallback order: explicit manifest title → short hash of
@@ -82,6 +90,9 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         const showRolePill =
           isGroup && (conv.group_role === "owner" || conv.group_role === "admin");
         const dissolved = isGroup && conv.dissolved_at != null;
+        const archived = conv.state === "archived";
+        const showArchiveHeader =
+          archived && index === activeConversations.length && archivedConversations.length > 0;
 
         const displayLabel = isGroup
           ? groupTitle ?? "Group"
@@ -90,13 +101,18 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         const hasUnread = unreadCount > 0 || conv.has_unread;
 
         return (
-          <button
-            key={conv.conversation_id}
-            className={`conv-item relative flex min-h-[60px] w-full items-center gap-2.5 rounded-md px-2 py-2 text-left ${
-              activeId === conv.conversation_id ? "active" : ""
-            } ${dissolved ? "opacity-60" : ""}`}
-            onClick={() => navigate(`/chat/${conv.conversation_id}`)}
-          >
+          <Fragment key={conv.conversation_id}>
+            {showArchiveHeader && (
+              <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-muted-color">
+                History
+              </div>
+            )}
+            <button
+              className={`conv-item relative flex min-h-[60px] w-full items-center gap-2.5 rounded-md px-2 py-2 text-left ${
+                activeId === conv.conversation_id ? "active" : ""
+              } ${dissolved || archived ? "opacity-60" : ""}`}
+              onClick={() => navigate(`/chat/${conv.conversation_id}`)}
+            >
             {/* Avatar — group icon for groups, initial letter for direct chats. */}
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-surface-elevated text-muted-color">
               {isGroup ? (
@@ -135,6 +151,11 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
                       Dissolved
                     </span>
                   )}
+                  {archived && (
+                    <span className="badge badge-muted text-[10px] uppercase tracking-wide">
+                      Archived
+                    </span>
+                  )}
                   {showRolePill && !dissolved && (
                     <span className="badge text-[10px] uppercase tracking-wide">
                       {conv.group_role}
@@ -157,7 +178,8 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
                 </div>
               </div>
             </div>
-          </button>
+            </button>
+          </Fragment>
         );
       })}
     </div>

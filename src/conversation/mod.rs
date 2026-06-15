@@ -75,9 +75,30 @@ impl ConversationManager {
         peer_user_id: &str,
         peer_device_ids: &[String],
     ) -> CoreResult<LocalConversationState> {
+        Self::create_direct_conversation_with_id(
+            direct_conversation_id(local_user_id, peer_user_id),
+            local_user_id,
+            local_device_id,
+            peer_user_id,
+            peer_device_ids,
+        )
+    }
+
+    pub fn create_direct_conversation_with_id(
+        conversation_id: String,
+        local_user_id: &str,
+        local_device_id: &str,
+        peer_user_id: &str,
+        peer_device_ids: &[String],
+    ) -> CoreResult<LocalConversationState> {
         if local_user_id.trim().is_empty() || local_device_id.trim().is_empty() {
             return Err(CoreError::invalid_input(
                 "local identity must be available before creating a conversation",
+            ));
+        }
+        if conversation_id.trim().is_empty() {
+            return Err(CoreError::invalid_input(
+                "conversation_id must not be empty",
             ));
         }
         if peer_user_id.trim().is_empty() {
@@ -98,7 +119,6 @@ impl ConversationManager {
                 peer_active_device_ids: peer_device_ids,
             },
         )?;
-        let conversation_id = direct_conversation_id(local_user_id, peer_user_id);
         let mut member_users = vec![local_user_id.to_string(), peer_user_id.to_string()];
         member_users.sort();
         member_users.dedup();

@@ -160,12 +160,18 @@ pub async fn get_messages(
                 .messages
                 .iter()
                 .filter(|msg| {
-                    // Only show application messages, not protocol messages
-                    // MlsWelcome and MlsCommit are MLS handshake messages with no plaintext
+                    // Show application messages plus direct lifecycle system
+                    // messages that carry plaintext. MLS protocol messages
+                    // remain hidden.
                     matches!(
                         msg.message_type,
                         tapchat_core::model::MessageType::MlsApplication
-                    )
+                    ) || (msg.plaintext.is_some()
+                        && matches!(
+                            msg.message_type,
+                            tapchat_core::model::MessageType::ControlContactRemoved
+                                | tapchat_core::model::MessageType::ControlIdentityStateUpdated
+                        ))
                 })
                 .map(|msg| {
                     // Log plaintext status for debugging
@@ -176,7 +182,13 @@ pub async fn get_messages(
                         summarize_plaintext(msg.plaintext.as_deref())
                     );
                     // Determine if this is a sent or received message
-                    let direction = if local_device_id.as_ref() == Some(&msg.sender_device_id) {
+                    let direction = if matches!(
+                        msg.message_type,
+                        tapchat_core::model::MessageType::ControlContactRemoved
+                            | tapchat_core::model::MessageType::ControlIdentityStateUpdated
+                    ) {
+                        "system"
+                    } else if local_device_id.as_ref() == Some(&msg.sender_device_id) {
                         "sent"
                     } else {
                         "received"
@@ -204,6 +216,12 @@ pub async fn get_messages(
         .pending_outbox
         .iter()
         .filter(|env| env.envelope.conversation_id == conversation_id)
+        .filter(|env| {
+            matches!(
+                env.envelope.message_type,
+                tapchat_core::model::MessageType::MlsApplication
+            )
+        })
         .filter_map(|env| {
             // Only include if not already in conversation messages
             let already_exists = conversation_messages

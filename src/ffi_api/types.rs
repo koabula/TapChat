@@ -908,6 +908,7 @@ pub(crate) struct GroupRealtimeSessionState {
 pub(crate) enum PendingAllowlistMutation {
     Add { user_id: String },
     Remove { user_id: String },
+    RemoveMany { user_ids: Vec<String> },
 }
 
 #[derive(Debug)]

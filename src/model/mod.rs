@@ -444,6 +444,7 @@ pub enum MessageType {
     ControlDeviceMembershipChanged,
     ControlIdentityStateUpdated,
     ControlConversationNeedsRebuild,
+    ControlContactRemoved,
     ControlGroupWelcomePickup,
 }
 
@@ -1250,6 +1251,8 @@ pub enum ConversationKind {
 pub enum ConversationState {
     Active,
     NeedsRebuild,
+    Closed,
+    Archived,
     Dissolved,
 }
 

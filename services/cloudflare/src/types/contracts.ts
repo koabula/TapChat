@@ -31,6 +31,7 @@ export type MessageType =
   | "control_device_membership_changed"
   | "control_identity_state_updated"
   | "control_conversation_needs_rebuild"
+  | "control_contact_removed"
   | "control_group_welcome_pickup";
 
 export interface Envelope {

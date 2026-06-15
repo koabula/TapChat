@@ -19,6 +19,10 @@ function relationshipLabel(status: ContactRelationshipStatus | undefined) {
       return "Pending request";
     case "rejected":
       return "Rejected";
+    case "removed_by_me":
+      return "Closed";
+    case "removed_by_peer":
+      return "Closed by contact";
     default:
       return null;
   }

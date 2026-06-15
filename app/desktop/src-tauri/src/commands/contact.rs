@@ -148,7 +148,17 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactSumm
     let snapshot = inner.engine.refresh_snapshot();
 
     // Build contact summaries from snapshot
-    let summaries: Vec<ContactSummary> = snapshot.contacts.iter().map(contact_summary).collect();
+    let summaries: Vec<ContactSummary> = snapshot
+        .contacts
+        .iter()
+        .filter(|contact| {
+            !matches!(
+                contact.relationship_status,
+                ContactRelationshipStatus::RemovedByMe | ContactRelationshipStatus::RemovedByPeer
+            )
+        })
+        .map(contact_summary)
+        .collect();
 
     Ok(summaries)
 }

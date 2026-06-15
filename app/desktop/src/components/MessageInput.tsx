@@ -47,6 +47,33 @@ interface DragDropPayload {
   paths: string[];
 }
 
+function describeSendError(err: unknown): string {
+  const errorMsg = String(err);
+  const normalized = errorMsg.toLowerCase();
+  if (normalized.includes("relationship_closed:")) {
+    return "This chat is archived. Import a fresh share link to start a new chat.";
+  }
+  if (normalized.includes("temporary_failure:")) {
+    return "Temporary delivery failure. Sync and try again.";
+  }
+  if (normalized.includes("invalid_input:")) {
+    return errorMsg.replace(/^invalid_input:\s*/i, "");
+  }
+  const transportFailure =
+    normalized.includes("network") ||
+    normalized.includes("transport") ||
+    normalized.includes("timeout") ||
+    normalized.includes("timed out") ||
+    normalized.includes("connect") ||
+    normalized.includes("connection") ||
+    normalized.includes("fetch failed") ||
+    normalized.includes("http");
+  if (transportFailure) {
+    return "Network error: Unable to deliver message. Check if your peer has Cloudflare deployed and accessible.";
+  }
+  return errorMsg;
+}
+
 export default function MessageInput({ conversationId, conversationKind = "direct", onSent }: MessageInputProps) {
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
@@ -230,12 +257,7 @@ export default function MessageInput({ conversationId, conversationKind = "direc
       onSentWithMessage?.(result);
     } catch (err) {
       console.error(`[MessageInput] Failed to send message: ${String(err)}`);
-      const errorMsg = String(err);
-      if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("request") || errorMsg.includes("connect")) {
-        alert("Network error: Unable to deliver message. Check if your peer has Cloudflare deployed and accessible.");
-      } else {
-        alert(errorMsg);
-      }
+      alert(describeSendError(err));
     } finally {
       setSending(false);
     }
@@ -276,6 +298,7 @@ export default function MessageInput({ conversationId, conversationKind = "direc
         uploadFallbackTimeoutRef.current = null;
       }
       console.error(`[MessageInput] Failed to send attachment: ${String(err)}`);
+      alert(describeSendError(err));
       setSending(false);
       setUploadProgress(null);
       setUploadingIndex(null);

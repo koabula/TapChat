@@ -18,6 +18,18 @@ function relationshipCopy(status: ContactRelationshipStatus | undefined) {
         detail: "This contact rejected the latest message request.",
         chatLabel: "Request rejected",
       };
+    case "removed_by_me":
+      return {
+        label: "Closed",
+        detail: "This legacy contact has been archived. Re-add by importing a share link.",
+        chatLabel: "Archived",
+      };
+    case "removed_by_peer":
+      return {
+        label: "Closed by contact",
+        detail: "This legacy contact has been archived. Re-add by importing a share link.",
+        chatLabel: "Archived",
+      };
     default:
       return null;
   }
@@ -96,7 +108,7 @@ export default function ContactDetail() {
     } catch (err) {
       console.error(`[ContactDetail] Failed to create conversation: ${String(err)}`);
       const errorMsg = String(err);
-      if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("request")) {
+      if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("connect")) {
         alert("Network error: Unable to connect to the peer's inbox. Both profiles need to have Cloudflare deployed to communicate.");
       } else {
         alert(errorMsg);
@@ -239,7 +251,7 @@ export default function ContactDetail() {
               className="btn btn-ghost w-full status-error"
               onClick={handleDeleteContact}
             >
-              Delete Contact
+              Close Chat
             </button>
           </div>
 
@@ -247,10 +259,10 @@ export default function ContactDetail() {
           {showDeleteConfirm && (
             <div className="card mt-4 border-t border-default">
               <p className="status-error mb-3">
-                Delete this contact?
+                Close this chat?
               </p>
               <p className="text-muted-color text-sm mb-3">
-                This will also delete any conversations with this contact. This action cannot be undone.
+                This closes the chat and keeps message history. New messages are disabled until you add each other again.
               </p>
               <div className="flex items-center gap-2">
                 <button
@@ -258,7 +270,7 @@ export default function ContactDetail() {
                   onClick={confirmDeleteContact}
                   disabled={deleting}
                 >
-                  {deleting ? "Deleting..." : "Yes, Delete"}
+                  {deleting ? "Closing..." : "Close Chat"}
                 </button>
                 <button
                   className="btn btn-ghost"

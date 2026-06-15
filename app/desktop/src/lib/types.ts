@@ -222,6 +222,7 @@ export interface Message {
   sender_device_id: string;
   recipient_device_id: string;
   message_type: string; // "sent" | "received" | "control"
+  raw_message_type?: string;
   created_at: number;
   plaintext: string | null;
   has_attachment: boolean;
@@ -233,6 +234,8 @@ export type ContactRelationshipStatus =
   | "available"
   | "pending_outbound"
   | "rejected"
+  | "removed_by_me"
+  | "removed_by_peer"
   | string;
 
 export interface ContactSummary {

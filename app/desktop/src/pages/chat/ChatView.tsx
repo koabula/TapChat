@@ -87,6 +87,23 @@ export default function ChatView() {
 
   const isGroup = activeConversation?.kind === "group";
   const dissolved = isGroup && activeConversation?.dissolved_at != null;
+  const activeDirectContact = useMemo(() => {
+    if (!activeConversation || activeConversation.kind === "group") return null;
+    return contacts.find((item) => item.user_id === activeConversation.peer_user_id) ?? null;
+  }, [activeConversation, contacts]);
+  const directClosed =
+    !isGroup &&
+    Boolean(activeConversation) &&
+    (activeConversation?.state === "closed" ||
+      activeConversation?.state === "archived" ||
+      activeDirectContact?.relationship_status === "removed_by_me" ||
+      activeDirectContact?.relationship_status === "removed_by_peer");
+  const directClosedReason =
+    activeConversation?.state === "archived"
+      ? "This chat is archived."
+      : directClosed
+        ? "This chat is closed."
+        : undefined;
 
   // Determine the local user's current status in this group so we can
   // fail-closed the composer when they have been removed / left /
@@ -116,13 +133,16 @@ export default function ChatView() {
           .length ?? 0
       : 0;
   const composerDisabled =
+    directClosed ||
     dissolved ||
     pendingGroupSetup ||
     (isGroup &&
       (groupSnapshot?.local_role == null ||
         localMember?.status === "removed" ||
         localMember?.status === "left"));
-  const composerTooltip = dissolved
+  const composerTooltip = directClosed
+    ? directClosedReason
+    : dissolved
     ? "This group has been dissolved."
     : pendingGroupSetup
       ? "Group transport is waiting for Cloudflare runtime upgrade or sync."
@@ -419,6 +439,19 @@ export default function ChatView() {
       }
       lastDateKey = dateKey;
 
+      if (msg.message_type === "system") {
+        result.push(
+          <div
+            key={msg.message_id}
+            className="date-separator"
+            data-raw-type={msg.raw_message_type}
+          >
+            <span>{msg.plaintext ?? "Conversation updated"}</span>
+          </div>,
+        );
+        return;
+      }
+
       result.push(
         <div
           key={msg.message_id}
@@ -486,7 +519,7 @@ export default function ChatView() {
             </span>
           )}
           <span className="block whitespace-pre-wrap break-words overflow-hidden">
-            {message.plaintext || "[empty message]"}
+            {message.plaintext || "Message unavailable"}
           </span>
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(message.created_at)}
@@ -539,7 +572,7 @@ export default function ChatView() {
       return (
         <div className={bubbleCls}>
           <span className="block whitespace-pre-wrap break-words overflow-hidden">
-            {msg.plaintext || "[empty message]"}
+            {msg.plaintext || "Message unavailable"}
           </span>
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(msg.created_at)}
@@ -681,8 +714,16 @@ export default function ChatView() {
               </>
             ) : (
               <>
-                <span className="w-1.5 h-1.5 rounded-full status-success animate-pulse" />
-                End-to-end encrypted
+                {directClosed ? (
+                  <span className="text-muted-color">
+                    {activeConversation?.state === "archived" ? "Archived" : "Closed"}
+                  </span>
+                ) : (
+                  <>
+                    <span className="w-1.5 h-1.5 rounded-full status-success animate-pulse" />
+                    End-to-end encrypted
+                  </>
+                )}
               </>
             )}
           </span>

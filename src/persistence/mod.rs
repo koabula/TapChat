@@ -38,6 +38,8 @@ pub enum ContactRelationshipStatus {
     Available,
     PendingOutbound,
     Rejected,
+    RemovedByMe,
+    RemovedByPeer,
 }
 
 impl Default for ContactRelationshipStatus {
