@@ -260,78 +260,92 @@ export function useCoreUpdate() {
     }
 
     const unlistenCoreUpdate = listen<CoreUpdateEvent>("core-update", (event) => {
-      const { state_update, view_model } = event.payload;
+      void (async () => {
+        const { state_update, view_model } = event.payload;
 
-      console.debug(
-        `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} identity_changed=${state_update.identity_changed ?? false} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
-      );
+        console.debug(
+          `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} identity_changed=${state_update.identity_changed ?? false} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
+        );
 
-      let nextContacts = useContactsStore.getState().contacts;
+        let nextContacts = useContactsStore.getState().contacts;
 
-      if (state_update.identity_changed && view_model?.identity) {
-        applyIdentitySummaryToSession(view_model.identity);
-      }
+        if (state_update.identity_changed && view_model?.identity) {
+          applyIdentitySummaryToSession(view_model.identity);
+        }
 
-      if (state_update.contacts_changed && view_model?.contacts) {
-        nextContacts = mapContacts(view_model.contacts);
-        setContacts(nextContacts);
-      }
-
-      if (state_update.conversations_changed || state_update.messages_changed) {
-        if (view_model?.conversations) {
-          const requestId = ++latestConversationRequestIdRef.current;
-          applyConversationSnapshot(
-            requestId,
-            view_model.conversations,
-            nextContacts,
-            state_update.messages_changed,
-            false,
-          );
-        } else {
-          void refreshConversationsFromBackend(
-            nextContacts,
-            state_update.messages_changed,
-          ).catch((err) => {
+        if (state_update.contacts_changed && view_model?.contacts) {
+          nextContacts = mapContacts(view_model.contacts);
+          setContacts(nextContacts);
+        } else if (state_update.contacts_changed) {
+          try {
+            const contacts = await invoke<ContactSummary[]>("list_contacts");
+            nextContacts = mapContacts(contacts);
+            setContacts(nextContacts);
+          } catch (err) {
             console.error(
-              `[useCoreUpdate] failed to refresh conversations from backend: ${String(err)}`,
+              `[useCoreUpdate] failed to refresh contacts from backend: ${String(err)}`,
+            );
+          }
+        }
+
+        if (state_update.conversations_changed || state_update.messages_changed) {
+          if (view_model?.conversations) {
+            const requestId = ++latestConversationRequestIdRef.current;
+            applyConversationSnapshot(
+              requestId,
+              view_model.conversations,
+              nextContacts,
+              state_update.messages_changed,
+              false,
+            );
+          } else {
+            void refreshConversationsFromBackend(
+              nextContacts,
+              state_update.messages_changed,
+            ).catch((err) => {
+              console.error(
+                `[useCoreUpdate] failed to refresh conversations from backend: ${String(err)}`,
+              );
+            });
+          }
+          // Keep group snapshots in lock-step with the conversation list.
+          // Every conversation change that could touch a group (membership
+          // commit, new join, metadata update, dissolve) goes through
+          // this branch, so we always re-fetch the flat group list and
+          // fan out per-group snapshot refreshes.
+          void refreshGroupsFromBackend().catch((err) => {
+            console.debug(
+              `[useCoreUpdate] failed to refresh groups from backend: ${String(err)}`,
             );
           });
+        } else if (state_update.contacts_changed) {
+          setConversations(useConversationsStore.getState().conversations, {
+            markUnread: false,
+            replace: true,
+          });
         }
-        // Keep group snapshots in lock-step with the conversation list.
-        // Every conversation change that could touch a group (membership
-        // commit, new join, metadata update, dissolve) goes through
-        // this branch, so we always re-fetch the flat group list and
-        // fan out per-group snapshot refreshes.
-        void refreshGroupsFromBackend().catch((err) => {
-          console.debug(
-            `[useCoreUpdate] failed to refresh groups from backend: ${String(err)}`,
+
+        if (view_model?.banners && view_model.banners.length > 0) {
+          for (const banner of view_model.banners) {
+            console.warn("[useCoreUpdate] System banner:", banner.status, banner.message);
+          }
+        }
+
+        if (view_model?.message_requests) {
+          const { deviceId, userId } = useSessionStore.getState();
+          const filtered = filterMessageRequestsForSession(
+            view_model.message_requests,
+            deviceId,
+            userId,
           );
-        });
-      } else if (state_update.contacts_changed) {
-        setConversations(useConversationsStore.getState().conversations, {
-          markUnread: false,
-          replace: true,
-        });
-      }
-
-      if (view_model?.banners && view_model.banners.length > 0) {
-        for (const banner of view_model.banners) {
-          console.warn("[useCoreUpdate] System banner:", banner.status, banner.message);
+          setRequests(filtered);
+          console.debug(
+            `[useCoreUpdate] message_requests=${filtered.length}`,
+          );
         }
-      }
-
-      if (view_model?.message_requests) {
-        const { deviceId, userId } = useSessionStore.getState();
-        const filtered = filterMessageRequestsForSession(
-          view_model.message_requests,
-          deviceId,
-          userId,
-        );
-        setRequests(filtered);
-        console.debug(
-          `[useCoreUpdate] message_requests=${filtered.length}`,
-        );
-      }
+      })().catch((err) => {
+        console.error(`[useCoreUpdate] failed to handle core-update: ${String(err)}`);
+      });
     });
 
     const unlistenEngineReloaded = listen<void>("engine-reloaded", () => {

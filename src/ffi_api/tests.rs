@@ -12,11 +12,11 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        ConversationKind, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth, Envelope,
-        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument,
-        GroupJoinRequest, GroupJoinRequestStatus, GroupMemberStatus, GroupMessageType,
-        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord,
-        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
+        ConversationKind, ConversationState, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth,
+        Envelope, GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility,
+        GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus, GroupMemberStatus,
+        GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle,
+        InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
         WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{
@@ -24,7 +24,8 @@ mod tests {
         PersistedPendingWelcomePickup,
     };
     use crate::transport_contract::{
-        GroupJoinDecision, SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
+        GroupJoinDecision, MessageRequestAction, MessageRequestActionResult,
+        SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use ed25519_dalek::Signer;
@@ -2196,6 +2197,12 @@ mod tests {
     fn delete_contact_then_reimport_same_peer_allows_direct_recreate() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .display_name = Some("Bobby".into());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -2223,6 +2230,13 @@ mod tests {
         assert_eq!(
             archived.conversation.state,
             crate::model::ConversationState::Archived
+        );
+        assert_eq!(
+            archived
+                .archive_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.peer_display_name.as_deref()),
+            Some("Bobby")
         );
         assert!(archived.messages.iter().any(|message| {
             message.message_type == MessageType::ControlContactRemoved
@@ -2432,6 +2446,11 @@ mod tests {
             bundle: alice_bundle.clone(),
         })
         .expect("bob imports alice");
+        bob.state
+            .contacts
+            .get_mut(&alice_bundle.user_id)
+            .expect("alice contact")
+            .display_name = Some("Alice".into());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         assert_eq!(
             create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
@@ -2456,6 +2475,13 @@ mod tests {
             bob_conversation.conversation.state,
             crate::model::ConversationState::Archived
         );
+        assert_eq!(
+            bob_conversation
+                .archive_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.peer_display_name.as_deref()),
+            Some("Alice")
+        );
         assert!(bob_conversation.messages.iter().any(|message| {
             message.message_type == MessageType::ControlContactRemoved
                 && message
@@ -2471,6 +2497,357 @@ mod tests {
             })
             .expect_err("removed by peer blocks send");
         assert_eq!(send_err.code(), "relationship_closed");
+    }
+
+    #[test]
+    fn duplicate_contact_removed_after_archive_is_acked_without_contact_bundle() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundle {
+            bundle: alice_bundle.clone(),
+        })
+        .expect("bob imports alice");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        assert_eq!(
+            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
+            conversation_id
+        );
+
+        alice
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: bob_bundle.user_id.clone(),
+            })
+            .expect("alice deletes bob");
+        let mut control_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::ControlContactRemoved)
+            .expect("control envelope")
+            .envelope
+            .clone();
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
+        let message_count_before = bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("archived conversation")
+            .messages
+            .len();
+        control_envelope.message_id = format!("{}:duplicate", control_envelope.message_id);
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 2,
+            records: vec![InboxRecord {
+                seq: 2,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: control_envelope.message_id.clone(),
+                received_at: 2,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: control_envelope,
+            }],
+        })
+        .expect("duplicate control ignored");
+
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("archived conversation")
+                .messages
+                .len(),
+            message_count_before
+        );
+        let sync_state = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state");
+        assert_eq!(sync_state.checkpoint.last_acked_seq, 2);
+        assert!(!sync_state.pending_retry);
+    }
+
+    #[test]
+    fn pending_outbound_relationship_allows_session_setup_but_blocks_user_messages() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                bundle: bob_bundle.clone(),
+                relationship_status: ContactRelationshipStatus::PendingOutbound,
+            })
+            .expect("import pending outbound");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        assert!(alice.state.pending_outbox.iter().any(|item| matches!(
+            item.envelope.message_type,
+            MessageType::MlsCommit | MessageType::MlsWelcome
+        )));
+
+        let pending_count = alice.state.pending_outbox.len();
+        let send_err = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "too early".into(),
+            })
+            .expect_err("pending outbound blocks normal messages");
+        assert_eq!(send_err.code(), "relationship_closed");
+        assert_eq!(alice.state.pending_outbox.len(), pending_count);
+    }
+
+    #[test]
+    fn contact_accepted_control_promotes_pending_outbound_to_available() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+
+        let output = alice
+            .handle_event(CoreEvent::MessageRequestActionCompleted {
+                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
+            })
+            .expect("alice accepts bob request");
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { .. })));
+
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let accepted_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::ControlContactAccepted
+            })
+            .expect("accepted control envelope")
+            .envelope
+            .clone();
+        let payload_b64 = accepted_envelope
+            .inline_ciphertext
+            .as_deref()
+            .expect("accepted payload");
+        let payload = STANDARD.decode(payload_b64).expect("payload base64");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("accepted payload json");
+        assert_eq!(payload["conversation_id"], conversation_id);
+        assert_eq!(payload["actor_user_id"], alice_bundle.user_id);
+        assert_eq!(payload["accepted_user_id"], bob_bundle.user_id);
+
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+
+        assert_eq!(
+            bob.state
+                .contacts
+                .get(&alice_bundle.user_id)
+                .expect("alice contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
+        assert!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .is_empty(),
+            "accepted control must stay protocol-only"
+        );
+    }
+
+    #[test]
+    fn contact_accepted_control_with_invalid_signature_does_not_promote() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        alice
+            .handle_event(CoreEvent::MessageRequestActionCompleted {
+                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
+            })
+            .expect("alice accepts bob request");
+
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let mut accepted_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
+            .expect("accepted control envelope")
+            .envelope
+            .clone();
+        accepted_envelope.sender_proof.value = "00".repeat(64);
+
+        let err = bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device_id.clone(),
+                to_seq: 1,
+                records: vec![InboxRecord {
+                    seq: 1,
+                    recipient_device_id: bob_device_id,
+                    message_id: accepted_envelope.message_id.clone(),
+                    received_at: 1,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: accepted_envelope,
+                }],
+            })
+            .expect_err("invalid accepted control is rejected");
+        assert_eq!(err.code(), "invalid_input");
+        assert_eq!(
+            bob.state
+                .contacts
+                .get(&alice_bundle.user_id)
+                .expect("alice contact")
+                .relationship_status,
+            ContactRelationshipStatus::PendingOutbound
+        );
+    }
+
+    #[test]
+    fn contact_accepted_control_does_not_revive_deleted_relationship() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        alice
+            .handle_event(CoreEvent::MessageRequestActionCompleted {
+                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
+            })
+            .expect("alice accepts bob request");
+        let accepted_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
+            .expect("accepted control envelope")
+            .envelope
+            .clone();
+
+        bob.handle_command(CoreCommand::DeleteContact {
+            user_id: alice_bundle.user_id.clone(),
+        })
+        .expect("bob deletes alice");
+        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
+
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 1,
+            records: vec![InboxRecord {
+                seq: 1,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: accepted_envelope.message_id.clone(),
+                received_at: 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: accepted_envelope,
+            }],
+        })
+        .expect("late accepted control ignored");
+
+        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("archived conversation")
+                .conversation
+                .state,
+            ConversationState::Archived
+        );
+        assert_eq!(
+            bob.state
+                .sync_states
+                .get(&bob_device_id)
+                .expect("sync state")
+                .checkpoint
+                .last_acked_seq,
+            1
+        );
+    }
+
+    #[test]
+    fn verified_inbound_mls_application_promotes_pending_outbound_contact() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
+        deliver_pending_outbox_to_device(&mut alice, &bob, &alice_device_id);
+
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "accepted now".into(),
+            })
+            .expect("alice sends verified app message");
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+
+        assert_eq!(
+            bob.state
+                .contacts
+                .get(&alice_bundle.user_id)
+                .expect("alice contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
     }
 
     #[test]
@@ -2843,6 +3220,7 @@ mod tests {
                 peer_user_id: "user:bob".into(),
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
+                archive_metadata: None,
             },
         );
 
@@ -3398,13 +3776,12 @@ mod tests {
             .get_mut(&bob_bundle.user_id)
             .expect("bob contact")
             .relationship_status = ContactRelationshipStatus::PendingOutbound;
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         let output = alice
-            .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
-                plaintext: "hello".into(),
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
             })
-            .expect("send");
+            .expect("conversation setup");
         let request_id = find_http_request_id(&output, "/messages");
 
         let output = alice
@@ -4244,6 +4621,7 @@ mod tests {
                 peer_user_id: "user:bob".into(),
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
+                archive_metadata: None,
             },
         );
         engine
@@ -5839,6 +6217,23 @@ mod tests {
             .handle_command(CoreCommand::ImportIdentityBundle { bundle })
             .expect("import");
         engine
+    }
+
+    fn accepted_request_result(
+        sender_user_id: &str,
+        conversation_id: &str,
+    ) -> MessageRequestActionResult {
+        MessageRequestActionResult {
+            accepted: true,
+            request_id: "request:pending".into(),
+            sender_user_id: sender_user_id.to_string(),
+            promoted_count: 1,
+            action: MessageRequestAction::Accept,
+            sender_bundle_share_url: None,
+            sender_bundle_hash: None,
+            sender_display_name: None,
+            promoted_conversation_ids: vec![conversation_id.to_string()],
+        }
     }
 
     fn local_engine(mnemonic: &str, device_name: &str) -> CoreEngine {

@@ -21,6 +21,9 @@ use tapchat_core::platform_ports::{
     BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
     TransportPort,
 };
+use tapchat_core::transport_contract::json_case::{
+    to_camel_case_json_string, to_snake_case_json_string,
+};
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
     BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest, CreateGroupInviteResult,
@@ -34,9 +37,6 @@ use tapchat_core::transport_contract::{
     PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
     RevokeGroupInviteRequest, RevokeGroupInviteResult, SealGroupOutboxRequest,
     SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
-};
-use tapchat_core::transport_contract::json_case::{
-    to_camel_case_json_string, to_snake_case_json_string,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;

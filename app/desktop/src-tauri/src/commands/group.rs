@@ -549,6 +549,9 @@ pub async fn get_group_messages_impl(
             tapchat_core::model::MessageType::ControlContactRemoved => {
                 // Direct relationship lifecycle message.
             }
+            tapchat_core::model::MessageType::ControlContactAccepted => {
+                // Direct relationship lifecycle protocol message.
+            }
             tapchat_core::model::MessageType::MlsWelcome
             | tapchat_core::model::MessageType::MlsCommit
             | tapchat_core::model::MessageType::ControlGroupWelcomePickup => {

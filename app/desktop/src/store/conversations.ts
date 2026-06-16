@@ -184,7 +184,10 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         conversation_id: conversation.conversation_id,
         peer_user_id: conversation.peer_user_id,
         state: conversation.state,
-        display_name: displayNameByUserId.get(conversation.peer_user_id) ?? null,
+        display_name:
+          displayNameByUserId.get(conversation.peer_user_id) ??
+          conversation.display_name ??
+          null,
         last_message: displayMessagePreview(conversation),
         last_message_time: null,
         message_count: conversation.message_count ?? 0,

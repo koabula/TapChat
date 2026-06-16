@@ -491,6 +491,8 @@ pub struct MessageRequestActionResult {
     pub sender_bundle_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promoted_conversation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

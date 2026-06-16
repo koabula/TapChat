@@ -91,6 +91,8 @@ export default function ChatView() {
     if (!activeConversation || activeConversation.kind === "group") return null;
     return contacts.find((item) => item.user_id === activeConversation.peer_user_id) ?? null;
   }, [activeConversation, contacts]);
+  const directPendingOutbound =
+    !isGroup && activeDirectContact?.relationship_status === "pending_outbound";
   const directClosed =
     !isGroup &&
     Boolean(activeConversation) &&
@@ -133,6 +135,7 @@ export default function ChatView() {
           .length ?? 0
       : 0;
   const composerDisabled =
+    directPendingOutbound ||
     directClosed ||
     dissolved ||
     pendingGroupSetup ||
@@ -140,7 +143,9 @@ export default function ChatView() {
       (groupSnapshot?.local_role == null ||
         localMember?.status === "removed" ||
         localMember?.status === "left"));
-  const composerTooltip = directClosed
+  const composerTooltip = directPendingOutbound
+    ? "Waiting for contact to accept request."
+    : directClosed
     ? directClosedReason
     : dissolved
     ? "This group has been dissolved."
@@ -572,7 +577,7 @@ export default function ChatView() {
       return (
         <div className={bubbleCls}>
           <span className="block whitespace-pre-wrap break-words overflow-hidden">
-            {msg.plaintext || "Message unavailable"}
+            {msg.plaintext ?? ""}
           </span>
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(msg.created_at)}
@@ -714,7 +719,9 @@ export default function ChatView() {
               </>
             ) : (
               <>
-                {directClosed ? (
+                {directPendingOutbound ? (
+                  <span className="text-muted-color">Waiting for accept</span>
+                ) : directClosed ? (
                   <span className="text-muted-color">
                     {activeConversation?.state === "archived" ? "Archived" : "Closed"}
                   </span>

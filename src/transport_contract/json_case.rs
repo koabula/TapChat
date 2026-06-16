@@ -107,7 +107,10 @@ mod tests {
 
         let camel = snake_to_camel_value(snake.clone());
         assert_eq!(camel["records"][0]["messageId"], "msg:1");
-        assert_eq!(camel["records"][0]["membershipProof"]["newManifestSha256"], "sha256:abc");
+        assert_eq!(
+            camel["records"][0]["membershipProof"]["newManifestSha256"],
+            "sha256:abc"
+        );
         assert_eq!(camel["currentRosterVersion"], 8);
 
         let round_trip = camel_to_snake_value(camel);

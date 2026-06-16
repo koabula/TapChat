@@ -445,6 +445,7 @@ pub enum MessageType {
     ControlIdentityStateUpdated,
     ControlConversationNeedsRebuild,
     ControlContactRemoved,
+    ControlContactAccepted,
     ControlGroupWelcomePickup,
 }
 

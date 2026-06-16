@@ -38,6 +38,15 @@ pub enum RecoveryStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationArchiveMetadata {
+    pub peer_user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_display_name: Option<String>,
+    pub archive_reason: String,
+    pub archived_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalConversationState {
     pub conversation: Conversation,
     pub messages: Vec<StoredMessage>,
@@ -45,6 +54,8 @@ pub struct LocalConversationState {
     pub peer_user_id: String,
     pub last_known_peer_active_devices: BTreeSet<String>,
     pub recovery_status: RecoveryStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_metadata: Option<ConversationArchiveMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +148,7 @@ impl ConversationManager {
             peer_user_id: peer_user_id.to_string(),
             last_known_peer_active_devices: peer_device_ids.iter().cloned().collect(),
             recovery_status: RecoveryStatus::Healthy,
+            archive_metadata: None,
         })
     }
 

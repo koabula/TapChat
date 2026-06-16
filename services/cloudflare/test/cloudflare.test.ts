@@ -13,6 +13,7 @@ import {
   type GroupCapabilityOperation,
   type GroupMessageType,
   type IdentityBundle,
+  type MessageRequestActionResult,
   type MessageRequestListResult,
   type SubmitGroupJoinRequest
 } from "../src/types/contracts";
@@ -619,6 +620,10 @@ test("message requests stay out of inbox until accepted and reject blocks future
     env
   );
   assert.equal(accept.status, 200);
+  const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
+  assert.equal(acceptResult.promotedCount, 1);
+  assert.deepEqual(acceptResult.promotedConversationIds, ["conv:alice:bob"]);
+
   const accepted = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
     env

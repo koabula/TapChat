@@ -1,4 +1,5 @@
 use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
+use tapchat_core::model::{ConversationKind, ConversationState};
 use tapchat_core::persistence::ContactRelationshipStatus;
 use tapchat_core::transport_contract::MessageRequestAction;
 use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
@@ -84,6 +85,16 @@ pub async fn act_on_message_request(
             .map_err(|error| error.to_string())?;
             let imported_sender_user_id = sender_bundle.user_id.clone();
 
+            drive_core_with_handle(
+                &app,
+                CoreInput::Command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+                    bundle: sender_bundle,
+                    relationship_status: ContactRelationshipStatus::Available,
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
             let output = drive_core_with_handle(
                 &app,
                 CoreInput::Command(CoreCommand::ActOnMessageRequest {
@@ -105,18 +116,6 @@ pub async fn act_on_message_request(
                 action_summary.sender_user_id.clone()
             };
 
-            if action_summary.accepted {
-                drive_core_with_handle(
-                    &app,
-                    CoreInput::Command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
-                        bundle: sender_bundle,
-                        relationship_status: ContactRelationshipStatus::Available,
-                    }),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            }
-
             let (contact_available, conversation_id) = {
                 let inner = state.inner.read().await;
                 let snapshot = inner.engine.refresh_snapshot();
@@ -127,7 +126,29 @@ pub async fn act_on_message_request(
                 let conversation_id = snapshot
                     .conversations
                     .iter()
-                    .find(|conversation| conversation.state.peer_user_id == sender_user_id)
+                    .filter(|conversation| {
+                        conversation.state.peer_user_id == sender_user_id
+                            && conversation.state.conversation.kind == ConversationKind::Direct
+                            && !matches!(
+                                conversation.state.conversation.state,
+                                ConversationState::Archived
+                                    | ConversationState::Closed
+                                    | ConversationState::Dissolved
+                            )
+                    })
+                    .max_by_key(|conversation| {
+                        (
+                            matches!(
+                                conversation.state.conversation.state,
+                                ConversationState::Active
+                            ),
+                            snapshot
+                                .mls_states
+                                .iter()
+                                .any(|state| state.conversation_id == conversation.conversation_id),
+                            conversation.state.conversation.updated_at,
+                        )
+                    })
                     .map(|conversation| conversation.conversation_id.clone());
                 (contact_available, conversation_id)
             };

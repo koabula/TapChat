@@ -62,7 +62,10 @@ pub async fn list_conversations(
                 .state
                 .messages
                 .iter()
-                .filter(|msg| matches!(msg.message_type, MessageType::MlsApplication))
+                .filter(|msg| {
+                    matches!(msg.message_type, MessageType::MlsApplication)
+                        && msg.plaintext.is_some()
+                })
                 .count();
 
             ConversationSummary {
@@ -71,6 +74,11 @@ pub async fn list_conversations(
                 state: format!("{:?}", persisted.state.conversation.state).to_lowercase(),
                 kind: Some(persisted.state.conversation.kind),
                 title: None,
+                display_name: persisted
+                    .state
+                    .archive_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.peer_display_name.clone()),
                 group_id: None,
                 member_count: None,
                 group_role: None,
@@ -163,15 +171,16 @@ pub async fn get_messages(
                     // Show application messages plus direct lifecycle system
                     // messages that carry plaintext. MLS protocol messages
                     // remain hidden.
-                    matches!(
+                    (matches!(
                         msg.message_type,
                         tapchat_core::model::MessageType::MlsApplication
-                    ) || (msg.plaintext.is_some()
-                        && matches!(
-                            msg.message_type,
-                            tapchat_core::model::MessageType::ControlContactRemoved
-                                | tapchat_core::model::MessageType::ControlIdentityStateUpdated
-                        ))
+                    ) && msg.plaintext.is_some())
+                        || (msg.plaintext.is_some()
+                            && matches!(
+                                msg.message_type,
+                                tapchat_core::model::MessageType::ControlContactRemoved
+                                    | tapchat_core::model::MessageType::ControlIdentityStateUpdated
+                            ))
                 })
                 .map(|msg| {
                     // Log plaintext status for debugging

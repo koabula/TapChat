@@ -39,7 +39,11 @@ fn emit_build_metadata() {
     println!("cargo:rustc-env=TAPCHAT_GIT_TAG={git_tag}");
     println!(
         "cargo:rustc-env=TAPCHAT_UPDATER_ENDPOINT_CONFIGURED={}",
-        if updater_endpoint_configured { "true" } else { "false" }
+        if updater_endpoint_configured {
+            "true"
+        } else {
+            "false"
+        }
     );
 }
 

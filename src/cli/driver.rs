@@ -750,6 +750,16 @@ impl CoreDriver {
                         .get("sender_display_name")
                         .and_then(|field| field.as_str())
                         .map(|value| value.to_string()),
+                    promoted_conversation_ids: value
+                        .get("promoted_conversation_ids")
+                        .and_then(|field| field.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 };
                 Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
             }

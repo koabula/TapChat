@@ -57,6 +57,7 @@ export interface ConversationSummary {
   state: string;
   kind?: "direct" | "group";
   title?: string | null;
+  display_name?: string | null;
   group_id?: string | null;
   member_count?: number | null;
   group_role?: GroupRole | null;

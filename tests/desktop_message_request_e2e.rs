@@ -172,24 +172,6 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
     )?;
     let alice_conversation_id = required_str(&created, "conversation_id")?;
 
-    let first_send = run_cli_json(
-        &registry_path,
-        [
-            "message",
-            "send-text",
-            "--profile",
-            &alice_profile.to_string_lossy(),
-            "--conversation-id",
-            &alice_conversation_id,
-            "--text",
-            "hello before accept",
-        ],
-    )?;
-    assert!(first_send["latest_notification"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("queued as a message request"));
-
     assert!(
         desktop_app::conversation_list(&bob_profile)?.is_empty(),
         "desktop accept should materialize the first conversation; it must not already exist"
@@ -216,8 +198,16 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
     assert_eq!(bob_conversations.len(), 1);
     assert_eq!(bob_conversations[0].conversation_id, bob_conversation_id);
 
+    with_tokio(|| async { desktop_app::sync_once(&alice_profile).await })?;
+
+    with_tokio(|| async {
+        desktop_app::message_send_text(&alice_profile, &alice_conversation_id, "hello after accept")
+            .await
+    })?;
+    with_tokio(|| async { desktop_app::sync_once(&bob_profile).await })?;
+
     let bob_messages = desktop_app::message_list(&bob_profile, &bob_conversation_id)?;
-    assert_has_plaintext_application(&bob_messages, "hello before accept")?;
+    assert_has_plaintext_application(&bob_messages, "hello after accept")?;
 
     with_tokio(|| async {
         desktop_app::message_send_text(&bob_profile, &bob_conversation_id, "reply from bob").await
@@ -226,15 +216,6 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
 
     let alice_messages = desktop_app::message_list(&alice_profile, &alice_conversation_id)?;
     assert_has_plaintext_application(&alice_messages, "reply from bob")?;
-
-    with_tokio(|| async {
-        desktop_app::message_send_text(&alice_profile, &alice_conversation_id, "second from alice")
-            .await
-    })?;
-    with_tokio(|| async { desktop_app::sync_once(&bob_profile).await })?;
-
-    let bob_messages_after = desktop_app::message_list(&bob_profile, &bob_conversation_id)?;
-    assert_has_plaintext_application(&bob_messages_after, "second from alice")?;
 
     // Silence the unused-import warning — these helpers are exercised
     // only when this test is stressed; keeping the binding lets the

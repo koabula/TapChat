@@ -32,6 +32,7 @@ export type MessageType =
   | "control_identity_state_updated"
   | "control_conversation_needs_rebuild"
   | "control_contact_removed"
+  | "control_contact_accepted"
   | "control_group_welcome_pickup";
 
 export interface Envelope {
@@ -694,6 +695,7 @@ export interface MessageRequestActionResult {
   senderBundleHash?: string;
   senderDisplayName?: string;
   promotedCount?: number;
+  promotedConversationIds?: string[];
 }
 
 

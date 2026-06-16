@@ -229,10 +229,14 @@ export class InboxService {
     );
 
     let promotedCount = 0;
+    const promotedConversationIds = new Set<string>();
     for (const request of entry.pendingRequests) {
       const delivered = await this.deliverEnvelope(request, now);
       await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
-      promotedCount += delivered.seq === undefined ? 0 : 1;
+      if (delivered.seq !== undefined) {
+        promotedCount += 1;
+        promotedConversationIds.add(request.envelope.conversationId);
+      }
     }
     await this.deleteMessageRequest(entry.senderUserId, "accepted");
     return {
@@ -242,7 +246,8 @@ export class InboxService {
       senderBundleShareUrl: entry.senderBundleShareUrl,
       senderBundleHash: entry.senderBundleHash,
       senderDisplayName: entry.senderDisplayName,
-      promotedCount
+      promotedCount,
+      promotedConversationIds: [...promotedConversationIds].sort()
     };
   }
 
@@ -265,7 +270,8 @@ export class InboxService {
       senderBundleShareUrl: entry.senderBundleShareUrl,
       senderBundleHash: entry.senderBundleHash,
       senderDisplayName: entry.senderDisplayName,
-      promotedCount: 0
+      promotedCount: 0,
+      promotedConversationIds: []
     };
   }
 
