@@ -3,6 +3,7 @@ mod tests {
     use crate::attachment_crypto::{
         AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
     };
+    use crate::conversation::RecoveryStatus;
     use crate::ffi_api::engine;
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
@@ -2603,6 +2604,114 @@ mod tests {
             .expect_err("pending outbound blocks normal messages");
         assert_eq!(send_err.code(), "relationship_closed");
         assert_eq!(alice.state.pending_outbox.len(), pending_count);
+    }
+
+    #[test]
+    fn accept_without_promoted_conversation_ids_does_not_send_base_id_control() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        let mut result = accepted_request_result(&bob_bundle.user_id, "unused");
+        result.promoted_conversation_ids.clear();
+
+        alice
+            .handle_event(CoreEvent::MessageRequestActionCompleted { result })
+            .expect("accept without promoted ids");
+
+        assert!(
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .all(|item| item.envelope.message_type != MessageType::ControlContactAccepted),
+            "missing promoted ids must not fall back to the legacy base direct conversation id"
+        );
+        assert!(bob.state.pending_outbox.is_empty());
+    }
+
+    #[test]
+    fn direct_shell_without_mls_state_is_recovery_only_and_blocks_send() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
+        let commit = bob
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == alice_device_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            })
+            .expect("setup commit")
+            .envelope
+            .clone();
+
+        alice
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: alice_device_id.clone(),
+                to_seq: 1,
+                records: vec![InboxRecord {
+                    seq: 1,
+                    recipient_device_id: alice_device_id,
+                    message_id: commit.message_id.clone(),
+                    received_at: 1,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: commit,
+                }],
+            })
+            .expect("commit pending retry");
+
+        assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("direct shell")
+                .recovery_status,
+            RecoveryStatus::NeedsRecovery
+        );
+        let create_again = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("existing recovery shell is returned");
+        assert_eq!(
+            create_again
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .conversations[0]
+                .state,
+            "needs_recovery"
+        );
+        let send_err = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "too early".into(),
+            })
+            .expect_err("missing mls state blocks send");
+        assert_eq!(send_err.code(), "temporary_failure");
     }
 
     #[test]

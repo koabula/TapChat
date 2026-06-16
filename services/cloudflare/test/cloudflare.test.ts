@@ -597,6 +597,8 @@ test("message requests stay out of inbox until accepted and reject blocks future
 
   const queued = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-1"));
   assert.equal(queued.status, 200);
+  const queuedWelcome = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-1b"));
+  assert.equal(queuedWelcome.status, 200);
 
   const head = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(token) }),
@@ -611,6 +613,7 @@ test("message requests stay out of inbox until accepted and reject blocks future
   const requests = (await list.json()) as MessageRequestListResult & { version: string };
   assert.equal(requests.requests.length, 1);
   assert.equal(requests.requests[0].senderUserId, "user:alice");
+  assert.equal(requests.requests[0].messageCount, 2);
 
   const accept = await handleRequest(
     new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`, {
@@ -621,7 +624,7 @@ test("message requests stay out of inbox until accepted and reject blocks future
   );
   assert.equal(accept.status, 200);
   const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
-  assert.equal(acceptResult.promotedCount, 1);
+  assert.equal(acceptResult.promotedCount, 2);
   assert.deepEqual(acceptResult.promotedConversationIds, ["conv:alice:bob"]);
 
   const accepted = await handleRequest(
@@ -629,13 +632,13 @@ test("message requests stay out of inbox until accepted and reject blocks future
     env
   );
   const fetched = (await accepted.json()) as { records: Array<{ messageId: string }> };
-  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1"]);
+  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1", "msg:req-1b"]);
 
   const allowlistedAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-2"));
   assert.deepEqual(await allowlistedAppend.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 2,
+    seq: 3,
     deliveredTo: "inbox"
   });
 
@@ -657,6 +660,8 @@ test("message requests stay out of inbox until accepted and reject blocks future
     env
   );
   assert.equal(reject.status, 200);
+  const rejectResult = (await reject.json()) as MessageRequestActionResult & { version: string };
+  assert.deepEqual(rejectResult.promotedConversationIds, []);
 
   const rejectedAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-4", "conv:alice:bob", "user:mallory"));
   assert.deepEqual(await rejectedAppend.json(), {

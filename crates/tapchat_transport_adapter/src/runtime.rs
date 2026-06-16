@@ -56,6 +56,7 @@ pub struct CloudflareRuntimeHandle {
     base_url: String,
     websocket_base_url: String,
     bootstrap_secret: String,
+    sharing_secret: String,
 }
 
 impl CloudflareRuntimeHandle {
@@ -141,6 +142,7 @@ impl CloudflareRuntimeHandle {
             base_url: announced_base_url,
             websocket_base_url: announced_ws_base_url,
             bootstrap_secret,
+            sharing_secret,
         };
         handle.wait_until_ready().await?;
         Ok(handle)
@@ -156,6 +158,10 @@ impl CloudflareRuntimeHandle {
 
     pub fn bootstrap_secret(&self) -> &str {
         &self.bootstrap_secret
+    }
+
+    pub fn sharing_secret(&self) -> &str {
+        &self.sharing_secret
     }
 
     pub async fn bootstrap_device_bundle(

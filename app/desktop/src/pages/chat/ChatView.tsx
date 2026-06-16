@@ -93,6 +93,10 @@ export default function ChatView() {
   }, [activeConversation, contacts]);
   const directPendingOutbound =
     !isGroup && activeDirectContact?.relationship_status === "pending_outbound";
+  const directRecovering =
+    !isGroup &&
+    (activeConversation?.state === "needs_recovery" ||
+      activeConversation?.state === "needs_rebuild");
   const directClosed =
     !isGroup &&
     Boolean(activeConversation) &&
@@ -136,6 +140,7 @@ export default function ChatView() {
       : 0;
   const composerDisabled =
     directPendingOutbound ||
+    directRecovering ||
     directClosed ||
     dissolved ||
     pendingGroupSetup ||
@@ -145,6 +150,8 @@ export default function ChatView() {
         localMember?.status === "left"));
   const composerTooltip = directPendingOutbound
     ? "Waiting for contact to accept request."
+    : directRecovering
+      ? "Secure chat setup is still syncing."
     : directClosed
     ? directClosedReason
     : dissolved

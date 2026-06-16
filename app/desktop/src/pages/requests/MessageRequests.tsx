@@ -31,6 +31,10 @@ export default function MessageRequests() {
   const setContacts = useContactsStore((s) => s.setContacts);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<{
+    kind: "error" | "info";
+    message: string;
+  } | null>(null);
 
   useEffect(() => {
     void loadFromBackend();
@@ -53,6 +57,7 @@ export default function MessageRequests() {
       }
     } catch (err) {
       console.error(`[MessageRequests] Failed to load message requests: ${String(err)}`);
+      setActionNotice({ kind: "error", message: String(err) });
     } finally {
       setLoading(false);
     }
@@ -76,10 +81,15 @@ export default function MessageRequests() {
         `[MessageRequests] Dropping stale request requestId=${requestId} recipient=${request.recipient_device_id} sender=${request.sender_user_id}`,
       );
       removeRequest(requestId);
+      setActionNotice({
+        kind: "info",
+        message: "This request no longer belongs to the active session.",
+      });
       void loadFromBackend();
       return;
     }
     setActing(requestId);
+    setActionNotice(null);
     try {
       const result = await invoke<MessageRequestActionOutput>("act_on_message_request", {
         requestId,
@@ -134,15 +144,21 @@ export default function MessageRequests() {
           } else if (result.conversation_id) {
             navigate(`/chat/${result.conversation_id}`);
           } else {
-            navigate("/");
+            setActionNotice({
+              kind: "info",
+              message: "Request accepted. Secure chat setup is still syncing.",
+            });
           }
         } catch (err) {
           console.error(`[MessageRequests] Failed to refresh after accept: ${String(err)}`);
-          navigate("/");
+          setActionNotice({ kind: "error", message: String(err) });
         }
+      } else if (action === "reject") {
+        setActionNotice({ kind: "info", message: "Message request rejected." });
       }
     } catch (err) {
       console.error(`[MessageRequests] Failed to ${action} request ${requestId}: ${String(err)}`);
+      setActionNotice({ kind: "error", message: String(err) });
       if (
         String(err).includes("message request not found") ||
         String(err).includes("not_found")
@@ -165,6 +181,18 @@ export default function MessageRequests() {
         </header>
 
         <div className="flex-1 overflow-y-auto overscroll-contain p-4">
+          {actionNotice && (
+            <div
+              className={`mb-4 rounded border px-3 py-2 text-sm ${
+                actionNotice.kind === "error"
+                  ? "border-error text-error"
+                  : "border-subtle text-secondary-color"
+              }`}
+            >
+              {actionNotice.message}
+            </div>
+          )}
+
           {loading && <div className="text-center text-muted-color">Loading...</div>}
 
           {!loading && requests.length === 0 && (

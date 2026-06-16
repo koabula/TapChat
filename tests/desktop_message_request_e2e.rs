@@ -5,6 +5,7 @@ use common::{
     binary_path, bundle_auth, export_identity_bundle_to_path, read_json_file, repo_temp_dir,
     required_str, run_cli_json, with_tokio, workspace_root, write_json_file, write_mnemonic_file,
 };
+use tapchat_core::cli::profile::{Profile, RuntimeMetadata};
 use tapchat_core::desktop_app;
 use tapchat_core::model::{IdentityBundle, MessageType};
 use tapchat_transport_adapter::CloudflareRuntimeHandle;
@@ -121,6 +122,16 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
             &bob_bundle_path.to_string_lossy(),
         ],
     )?;
+    for profile_path in [&alice_profile, &bob_profile] {
+        let profile = Profile::open(profile_path)?;
+        profile.save_runtime_metadata(&RuntimeMetadata {
+            base_url: Some(runtime.base_url().to_string()),
+            websocket_base_url: Some(runtime.websocket_base_url().to_string()),
+            bootstrap_secret: Some(runtime.bootstrap_secret().to_string()),
+            sharing_secret: Some(runtime.sharing_secret().to_string()),
+            ..RuntimeMetadata::default()
+        })?;
+    }
 
     let alice_identity_path = export_identity_bundle_to_path(
         &registry_path,
@@ -216,6 +227,75 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
 
     let alice_messages = desktop_app::message_list(&alice_profile, &alice_conversation_id)?;
     assert_has_plaintext_application(&alice_messages, "reply from bob")?;
+
+    with_tokio(|| async { desktop_app::contact_delete(&alice_profile, &bob_user_id).await })?;
+    with_tokio(|| async { desktop_app::sync_once(&bob_profile).await })?;
+
+    let alice_share_link =
+        with_tokio(|| async { desktop_app::contact_share_link_get(&alice_profile).await })?;
+    let bob_readd_conversation = with_tokio(|| async {
+        desktop_app::contact_start_direct_from_share_link(&bob_profile, &alice_share_link.url).await
+    })?;
+    let bob_readd_conversation_id = bob_readd_conversation.conversation_id.clone();
+
+    let pending_send = with_tokio(|| async {
+        desktop_app::message_send_text(
+            &bob_profile,
+            &bob_readd_conversation_id,
+            "should wait for accept",
+        )
+        .await
+    });
+    assert!(
+        pending_send.is_err(),
+        "pending outbound direct chat must not allow user application messages"
+    );
+
+    let readd_requests =
+        with_tokio(|| async { desktop_app::message_requests_list(&alice_profile).await })?;
+    let readd_request = readd_requests
+        .iter()
+        .find(|request| request.sender_user_id == bob_user_id)
+        .with_context(|| {
+            format!(
+                "expected Alice to receive Bob's re-add request, got {:?}",
+                readd_requests
+            )
+        })?;
+    assert_eq!(
+        readd_request.last_conversation_id, bob_readd_conversation_id,
+        "message request should point at the fresh re-add conversation"
+    );
+
+    let readd_accept = with_tokio(|| async {
+        desktop_app::message_request_accept(&alice_profile, &readd_request.request_id).await
+    })?;
+    assert!(readd_accept.accepted);
+    assert!(readd_accept.contact_available);
+    assert!(
+        readd_accept.conversation_available,
+        "accept should not expose a direct chat until MLS state is complete"
+    );
+    let alice_readd_conversation_id = readd_accept
+        .conversation_id
+        .clone()
+        .context("re-add accept should return the promoted conversation id")?;
+    assert_eq!(alice_readd_conversation_id, bob_readd_conversation_id);
+
+    with_tokio(|| async { desktop_app::sync_once(&bob_profile).await })?;
+    with_tokio(|| async {
+        desktop_app::message_send_text(
+            &bob_profile,
+            &bob_readd_conversation_id,
+            "hello after re-add",
+        )
+        .await
+    })?;
+    with_tokio(|| async { desktop_app::sync_once(&alice_profile).await })?;
+
+    let alice_readd_messages =
+        desktop_app::message_list(&alice_profile, &alice_readd_conversation_id)?;
+    assert_has_plaintext_application(&alice_readd_messages, "hello after re-add")?;
 
     // Silence the unused-import warning — these helpers are exercised
     // only when this test is stressed; keeping the binding lets the

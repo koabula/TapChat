@@ -26,6 +26,7 @@ use crate::ffi_api::{
     RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
 };
 use crate::model::{DeploymentBundle, IdentityBundle, MessageType, StorageRef, Validate};
+use crate::persistence::ContactRelationshipStatus;
 use crate::persistence::PersistedPendingBlobTransfer;
 use crate::transport_contract::{AllowlistDocument, MessageRequestAction, MessageRequestItem};
 
@@ -961,6 +962,40 @@ pub async fn contact_import_share_link(
     contact_show(profile.root(), &bundle.user_id)
 }
 
+pub async fn contact_start_direct_from_share_link(
+    profile_path: impl AsRef<Path>,
+    url: &str,
+) -> Result<ConversationDetailView> {
+    let mut profile = Profile::open(profile_path)?;
+    let bundle = fetch_identity_bundle_from_url(url).await?;
+    let user_id = bundle.user_id.clone();
+    let mut driver = load_driver(&profile)?;
+    driver
+        .run_command_until_idle(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .await?;
+    profile.save_identity_bundle(
+        &bundle,
+        &format!("identity_{}.json", bundle.user_id.replace(':', "_")),
+    )?;
+    let output = driver
+        .run_command_until_idle(CoreCommand::CreateConversation {
+            peer_user_id: user_id.clone(),
+            conversation_kind: crate::model::ConversationKind::Direct,
+        })
+        .await?;
+    let conversation_id = output
+        .view_model
+        .as_ref()
+        .and_then(|view_model| view_model.conversations.first())
+        .map(|conversation| conversation.conversation_id.clone())
+        .ok_or_else(|| anyhow!("failed to create or find direct conversation"))?;
+    persist_driver(&mut profile, &driver)?;
+    conversation_show(profile.root(), &conversation_id)
+}
+
 pub async fn contact_share_link_get(
     profile_path: impl AsRef<Path>,
 ) -> Result<ContactShareLinkView> {
@@ -1035,6 +1070,18 @@ pub async fn contact_refresh(
     contact_show(profile.root(), user_id)
 }
 
+pub async fn contact_delete(profile_path: impl AsRef<Path>, user_id: &str) -> Result<()> {
+    let mut profile = Profile::open(profile_path)?;
+    let mut driver = load_driver(&profile)?;
+    driver
+        .run_command_until_idle(CoreCommand::DeleteContact {
+            user_id: user_id.to_string(),
+        })
+        .await?;
+    persist_driver(&mut profile, &driver)?;
+    Ok(())
+}
+
 pub async fn message_requests_list(
     profile_path: impl AsRef<Path>,
 ) -> Result<Vec<MessageRequestItemView>> {
@@ -1097,7 +1144,13 @@ pub async fn message_request_accept(
         snapshot
             .conversations
             .iter()
-            .find(|conversation| conversation.state.peer_user_id == sender_user_id)
+            .find(|conversation| {
+                conversation.state.peer_user_id == sender_user_id
+                    && snapshot
+                        .mls_states
+                        .iter()
+                        .any(|state| state.conversation_id == conversation.conversation_id)
+            })
             .map(|conversation| conversation.conversation_id.clone())
     });
     let conversation_available = conversation_id.is_some();
@@ -2206,7 +2259,15 @@ fn map_contact_devices(devices: Vec<ContactDeviceSnapshot>) -> Vec<ContactDevice
 
 fn build_contact_share_url(profile: &Profile, bundle: &IdentityBundle) -> Result<String> {
     let runtime = profile.load_runtime_metadata()?;
-    build_contact_share_url_from_runtime(bundle, &runtime)
+    build_contact_share_url_from_runtime(bundle, &runtime).or_else(|_| {
+        let snapshot = profile.load_snapshot()?;
+        let base_url = snapshot
+            .deployment
+            .as_ref()
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone())
+            .ok_or_else(|| anyhow!("deployment inbox endpoint is not recorded"))?;
+        build_contact_share_url_from_base_url(bundle, &base_url, &runtime)
+    })
 }
 
 fn contact_bundle_share_url(profile: &Profile, bundle: &IdentityBundle) -> Option<String> {
@@ -2222,7 +2283,18 @@ fn build_contact_share_url_from_snapshot(
         .as_ref()
         .and_then(|deployment| deployment.local_bundle.as_ref())
         .ok_or_else(|| anyhow!("local identity bundle is not available"))?;
-    build_contact_share_url_from_runtime(bundle, runtime)
+    let base_url = runtime
+        .public_base_url
+        .clone()
+        .or(runtime.base_url.clone())
+        .or_else(|| {
+            snapshot
+                .deployment
+                .as_ref()
+                .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone())
+        })
+        .ok_or_else(|| anyhow!("runtime public base url is not recorded"))?;
+    build_contact_share_url_from_base_url(bundle, &base_url, runtime)
 }
 
 fn build_contact_share_url_from_runtime(
@@ -2234,6 +2306,14 @@ fn build_contact_share_url_from_runtime(
         .clone()
         .or(runtime.base_url.clone())
         .ok_or_else(|| anyhow!("runtime public base url is not recorded"))?;
+    build_contact_share_url_from_base_url(bundle, &base_url, runtime)
+}
+
+fn build_contact_share_url_from_base_url(
+    bundle: &IdentityBundle,
+    base_url: &str,
+    runtime: &RuntimeMetadata,
+) -> Result<String> {
     let secret = runtime
         .sharing_secret
         .clone()

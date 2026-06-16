@@ -123,33 +123,36 @@ pub async fn act_on_message_request(
                     contact.user_id == sender_user_id
                         && contact.relationship_status == ContactRelationshipStatus::Available
                 });
-                let conversation_id = snapshot
-                    .conversations
-                    .iter()
-                    .filter(|conversation| {
-                        conversation.state.peer_user_id == sender_user_id
-                            && conversation.state.conversation.kind == ConversationKind::Direct
-                            && !matches!(
-                                conversation.state.conversation.state,
-                                ConversationState::Archived
-                                    | ConversationState::Closed
-                                    | ConversationState::Dissolved
+                let conversation_id =
+                    snapshot
+                        .conversations
+                        .iter()
+                        .filter(|conversation| {
+                            conversation.state.peer_user_id == sender_user_id
+                                && conversation.state.conversation.kind == ConversationKind::Direct
+                                && snapshot.mls_states.iter().any(|state| {
+                                    state.conversation_id == conversation.conversation_id
+                                })
+                                && !matches!(
+                                    conversation.state.conversation.state,
+                                    ConversationState::Archived
+                                        | ConversationState::Closed
+                                        | ConversationState::Dissolved
+                                )
+                        })
+                        .max_by_key(|conversation| {
+                            (
+                                matches!(
+                                    conversation.state.conversation.state,
+                                    ConversationState::Active
+                                ),
+                                snapshot.mls_states.iter().any(|state| {
+                                    state.conversation_id == conversation.conversation_id
+                                }),
+                                conversation.state.conversation.updated_at,
                             )
-                    })
-                    .max_by_key(|conversation| {
-                        (
-                            matches!(
-                                conversation.state.conversation.state,
-                                ConversationState::Active
-                            ),
-                            snapshot
-                                .mls_states
-                                .iter()
-                                .any(|state| state.conversation_id == conversation.conversation_id),
-                            conversation.state.conversation.updated_at,
-                        )
-                    })
-                    .map(|conversation| conversation.conversation_id.clone());
+                        })
+                        .map(|conversation| conversation.conversation_id.clone());
                 (contact_available, conversation_id)
             };
 

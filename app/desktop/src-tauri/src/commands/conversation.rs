@@ -1,9 +1,9 @@
 use serde::Serialize;
 use tauri::State;
 
-use tapchat_core::conversation::StoredMessage;
+use tapchat_core::conversation::{RecoveryStatus, StoredMessage};
 use tapchat_core::ffi_api::ConversationSummary;
-use tapchat_core::model::{ConversationKind, MessageType};
+use tapchat_core::model::{ConversationKind, ConversationState, MessageType};
 use tapchat_core::CoreCommand;
 
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
@@ -71,7 +71,17 @@ pub async fn list_conversations(
             ConversationSummary {
                 conversation_id: persisted.conversation_id.clone(),
                 peer_user_id: persisted.state.peer_user_id.clone(),
-                state: format!("{:?}", persisted.state.conversation.state).to_lowercase(),
+                state: match persisted.state.conversation.state {
+                    ConversationState::Active => match persisted.state.recovery_status {
+                        RecoveryStatus::Healthy => "active".into(),
+                        RecoveryStatus::NeedsRecovery => "needs_recovery".into(),
+                        RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
+                    },
+                    ConversationState::NeedsRebuild => "needs_rebuild".into(),
+                    ConversationState::Closed => "closed".into(),
+                    ConversationState::Archived => "archived".into(),
+                    ConversationState::Dissolved => "dissolved".into(),
+                },
                 kind: Some(persisted.state.conversation.kind),
                 title: None,
                 display_name: persisted

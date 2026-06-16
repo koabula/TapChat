@@ -1879,21 +1879,44 @@ impl CoreEngine {
         if let Some((conversation_id, existing)) =
             self.active_direct_conversation_for_peer(&peer_user_id)
         {
-            let recovery = self.recovery_snapshot_for_conversation(&conversation_id);
             let existing_last_message_type = existing.last_message_type;
-            if !self.state.mls_summaries.contains_key(&conversation_id) {
-                return Err(CoreError::invalid_state(format!(
-                    "conversation {conversation_id} already exists but the MLS state is incomplete"
-                )));
+            let existing_state = existing.conversation.state;
+            let missing_mls_state = !self.state.mls_summaries.contains_key(&conversation_id);
+            if missing_mls_state {
+                self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingWelcome);
             }
+            let recovery = self.recovery_snapshot_for_conversation(&conversation_id);
+            let state = if missing_mls_state {
+                "needs_recovery".into()
+            } else {
+                format!("{:?}", existing_state).to_lowercase()
+            };
+            let effects = if missing_mls_state {
+                vec![persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveConversation {
+                            conversation_id: conversation_id.clone(),
+                        },
+                        PersistOp::SaveRecoveryContext {
+                            conversation_id: conversation_id.clone(),
+                        },
+                    ],
+                )]
+            } else {
+                Vec::new()
+            };
             return Ok(CoreOutput {
-                state_update: CoreStateUpdate::default(),
-                effects: Vec::new(),
+                state_update: CoreStateUpdate {
+                    conversations_changed: missing_mls_state,
+                    ..CoreStateUpdate::default()
+                },
+                effects,
                 view_model: Some(CoreViewModel {
                     conversations: vec![ConversationSummary {
                         conversation_id,
                         peer_user_id: peer_user_id.clone(),
-                        state: format!("{:?}", existing.conversation.state).to_lowercase(),
+                        state,
                         kind: Some(ConversationKind::Direct),
                         title: None,
                         display_name: self.contact_archive_display_name(&peer_user_id),
@@ -5816,6 +5839,17 @@ impl CoreEngine {
         ) {
             return Err(Self::relationship_closed_error(&peer_user_id));
         }
+        if !self.state.mls_summaries.contains_key(conversation_id)
+            || !self
+                .state
+                .mls_adapter
+                .as_ref()
+                .is_some_and(|adapter| adapter.has_conversation(conversation_id))
+        {
+            return Err(CoreError::temporary_failure(
+                "conversation setup is still syncing",
+            ));
+        }
 
         // Check if conversation is still recovering
         if recovery_status == RecoveryStatus::NeedsRecovery {
@@ -7384,8 +7418,11 @@ impl CoreEngine {
             return Ok(vec![conversation_id]);
         }
 
-        let local_user_id = self.local_identity_user_id()?;
-        Ok(vec![direct_conversation_id(&local_user_id, peer_user_id)])
+        log::warn!(
+            "contact accept completed for {} without promoted conversation ids or local active direct conversation; skipping ControlContactAccepted fallback",
+            peer_user_id
+        );
+        Ok(Vec::new())
     }
 
     fn build_contact_accepted_envelopes(
@@ -10233,25 +10270,13 @@ impl CoreEngine {
         Ok(output)
     }
 
-    fn allowlist_output(&self, document: AllowlistDocument, updated: bool) -> CoreOutput {
-        let message = if updated {
-            "allowlist updated"
-        } else {
-            "allowlist loaded"
-        };
+    fn allowlist_output(&self, document: AllowlistDocument, _updated: bool) -> CoreOutput {
         CoreOutput {
             state_update: CoreStateUpdate::default(),
             effects: vec![],
             view_model: Some(CoreViewModel {
                 allowlist: Some(document),
-                banners: if updated {
-                    vec![SystemBanner {
-                        status: SystemStatus::SyncInProgress,
-                        message: message.into(),
-                    }]
-                } else {
-                    Vec::new()
-                },
+                banners: Vec::new(),
                 ..CoreViewModel::default()
             }),
         }
