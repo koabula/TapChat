@@ -32,6 +32,11 @@ import { useGroupSyncScheduler } from "./hooks/useGroupSyncScheduler";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
 import { waitForNonBootstrappingSessionStatus } from "./lib/sessionStartup";
+import {
+  lockedProfileRetryDisabled,
+  lockedProfileRetryPayload,
+  lockedProfileView,
+} from "./lib/lockedProfile";
 import { useThemeStore } from "./store/theme";
 
 import type { ProfileSummary, SessionStatus, RealtimeEventPayload } from "./lib/types";
@@ -110,21 +115,25 @@ function AppInner({ startupError }: { startupError: string | null }) {
   }
 
   if (sessionState === "locked") {
-    const reasonLabel =
-      lockReason === "snapshot_load_failed"
-        ? "Profile data needs repair"
-        : lockReason === "restore_failed"
-          ? "Profile state could not be restored"
-          : "Profile locked";
-    const needsPassphrase = !lockReason || lockReason === "profile_locked";
+    const lockedView = lockedProfileView(lockReason);
 
     const handleRetry = async () => {
       setUnlocking(true);
       setUnlockSubmitError(null);
       try {
-        await invoke("retry_locked_profile_startup", {
-          passphrase: unlockPassphrase || null,
-        });
+        await invoke(
+          "retry_locked_profile_startup",
+          lockedProfileRetryPayload(lockReason, unlockPassphrase),
+        );
+        const status = await waitForNonBootstrappingSessionStatus(() =>
+          invoke<SessionStatus>("get_session_status"),
+        );
+        const session = useSessionStore.getState();
+        session.setSessionState(status.state);
+        session.setUnlockError(status.error ?? null);
+        session.setLockReason(status.lock_reason ?? null);
+        session.setWsConnected(status.ws_connected);
+        session.setDeviceId(status.device_id ?? null);
       } catch (err) {
         setUnlockSubmitError(String(err));
       } finally {
@@ -169,12 +178,12 @@ function AppInner({ startupError }: { startupError: string | null }) {
       <div className="flex h-full min-h-0 items-center justify-center bg-base p-8">
         <div className="w-full max-w-md space-y-4">
           <div>
-            <h1 className="text-xl font-semibold text-primary-color">{reasonLabel}</h1>
+            <h1 className="text-xl font-semibold text-primary-color">{lockedView.reasonLabel}</h1>
             <p className="mt-2 text-sm text-secondary-color">
               {unlockError ?? "TapChat could not unlock the active profile."}
             </p>
           </div>
-          {needsPassphrase && (
+          {lockedView.needsPassphrase && (
             <input
               className="input"
               type="password"
@@ -194,10 +203,10 @@ function AppInner({ startupError }: { startupError: string | null }) {
           <div className="grid grid-cols-2 gap-2">
             <button
               className="btn btn-primary"
-              disabled={unlocking || (needsPassphrase && !unlockPassphrase)}
+              disabled={lockedProfileRetryDisabled(lockReason, unlockPassphrase, unlocking)}
               onClick={handleRetry}
             >
-              {unlocking ? "Retrying..." : needsPassphrase ? "Unlock" : "Retry"}
+              {unlocking ? "Retrying..." : lockedView.primaryActionLabel}
             </button>
             <button className="btn" disabled={loadingProfiles} onClick={handleShowProfiles}>
               {loadingProfiles ? "Loading..." : "Switch Profile"}

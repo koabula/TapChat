@@ -3455,6 +3455,179 @@ mod tests {
     }
 
     #[test]
+    fn direct_attachment_download_after_snapshot_restore_refreshes_short_target() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let upload = alice
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id: conversation_id.clone(),
+                attachment_descriptor: sample_attachment_descriptor(),
+            })
+            .expect("attachment");
+        let task_id = upload
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+                _ => None,
+            })
+            .expect("upload task");
+        let prepared = alice
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id: task_id.clone(),
+                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+            })
+            .expect("attachment bytes loaded");
+        assert!(prepared
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::PrepareBlobUpload { .. })));
+        let upload_ready = alice
+            .handle_event(CoreEvent::BlobUploadPrepared {
+                task_id: task_id.clone(),
+                result: crate::transport_contract::PrepareBlobUploadResult {
+                    blob_ref: "blob:long-idle".into(),
+                    upload_target: "upload:long-idle".into(),
+                    upload_headers: std::collections::BTreeMap::new(),
+                    download_grant: Some(crate::transport_contract::BlobDownloadGrant {
+                        version: crate::model::CURRENT_MODEL_VERSION.into(),
+                        service: "storage".into(),
+                        action: "authorize_download".into(),
+                        blob_ref: "blob:long-idle".into(),
+                        authorize_endpoint: "https://storage.example/v1/storage/authorize-download"
+                            .into(),
+                        token: "refresh-long-idle".into(),
+                        expires_at: 365,
+                    }),
+                    download_target: None,
+                    expires_at: Some(15),
+                },
+            })
+            .expect("blob prepared");
+        let blob_ciphertext = upload_ready
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::UploadBlob { upload } => Some(upload.blob_ciphertext_b64.clone()),
+                _ => None,
+            })
+            .expect("upload blob ciphertext");
+        let appended = alice
+            .handle_event(CoreEvent::BlobUploaded { task_id })
+            .expect("blob uploaded");
+        let request_id = find_http_request_id(&appended, "/messages");
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":4,"delivered_to":"inbox"}"#.into()),
+            })
+            .expect("append response");
+
+        let snapshot = alice.refresh_snapshot();
+        let persisted_message = snapshot
+            .conversations
+            .iter()
+            .find(|conversation| conversation.conversation_id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .state
+                    .messages
+                    .iter()
+                    .find(|message| !message.storage_refs.is_empty())
+            })
+            .expect("persisted attachment message");
+        let message_id = persisted_message.message_id.clone();
+        let stored_ref = persisted_message
+            .storage_refs
+            .first()
+            .expect("attachment ref")
+            .object_ref
+            .clone();
+        assert_eq!(stored_ref, "blob:long-idle");
+        assert!(!stored_ref.starts_with("http"));
+        let metadata: AttachmentPayloadMetadata = serde_json::from_str(
+            persisted_message
+                .plaintext
+                .as_deref()
+                .expect("attachment metadata"),
+        )
+        .expect("attachment metadata json");
+        assert_eq!(
+            metadata
+                .download_grant
+                .as_ref()
+                .map(|grant| grant.token.as_str()),
+            Some("refresh-long-idle")
+        );
+
+        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let download = restored
+            .handle_command(CoreCommand::DownloadAttachment {
+                conversation_id,
+                message_id,
+                reference: stored_ref,
+                destination: "long-idle/download.bin".into(),
+            })
+            .expect("download after long idle restore");
+        assert!(download.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::AuthorizeBlobDownload { authorize }
+                if authorize.blob_ref == "blob:long-idle"
+                    && authorize.grant.token == "refresh-long-idle"
+        )));
+        assert!(!download
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::DownloadBlob { .. })));
+        let download_task_id = restored
+            .state
+            .pending_blob_downloads
+            .keys()
+            .next()
+            .cloned()
+            .expect("pending blob download");
+        let authorized = restored
+            .handle_event(CoreEvent::BlobDownloadAuthorized {
+                task_id: download_task_id.clone(),
+                result: crate::transport_contract::AuthorizeBlobDownloadResult {
+                    blob_ref: "blob:long-idle".into(),
+                    download_target: "download:long-idle:fresh".into(),
+                    download_headers: std::collections::BTreeMap::new(),
+                    expires_at: Some(30),
+                },
+            })
+            .expect("download authorized");
+        assert!(authorized.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::DownloadBlob { download }
+                if download.blob_ref == "blob:long-idle"
+                    && download.download_target == "download:long-idle:fresh"
+        )));
+        let completed = restored
+            .handle_event(CoreEvent::BlobDownloaded {
+                task_id: download_task_id,
+                blob_ciphertext: Some(blob_ciphertext),
+            })
+            .expect("blob downloaded");
+        let plaintext_b64 = completed
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::WriteDownloadedAttachment { write } => {
+                    Some(write.plaintext_b64.clone())
+                }
+                _ => None,
+            })
+            .expect("write downloaded attachment");
+        assert_eq!(
+            STANDARD.decode(plaintext_b64).expect("download plaintext"),
+            vec![1_u8, 2, 3, 4]
+        );
+    }
+
+    #[test]
     fn send_attachment_rejects_invalid_descriptor() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -5083,6 +5256,82 @@ mod tests {
                 .recovery_status,
             crate::conversation::RecoveryStatus::NeedsRebuild
         );
+    }
+
+    #[test]
+    fn reconcile_success_clears_restore_diagnostics_and_persists_delete() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        alice
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .recovery_status = RecoveryStatus::NeedsRecovery;
+        alice.state.recovery_contexts.insert(
+            conversation_id.clone(),
+            RecoveryContext {
+                conversation_id: conversation_id.clone(),
+                reason: RecoveryReason::MissingCommit,
+                phase: crate::ffi_api::RecoveryPhase::EscalatedToRebuild,
+                attempt_count: 1,
+                identity_refresh_retry_count: 0,
+                last_error: Some("failed to restore MLS group state: test".into()),
+                escalation_reason: Some(
+                    crate::ffi_api::RecoveryEscalationReason::MlsMarkedUnrecoverable,
+                ),
+                restore_failure_reason: Some("invalid_serialized_state".into()),
+                restore_failure_detail: Some("synthetic recoverable restore failure".into()),
+                restore_recoverable: Some(true),
+                suggested_action: Some("reconcile_conversation_membership".into()),
+            },
+        );
+        assert_eq!(alice.recovery_conversations_snapshot().len(), 1);
+
+        let output = alice
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("reconcile membership");
+
+        assert!(alice.recovery_conversations_snapshot().is_empty());
+        assert!(!alice.state.recovery_contexts.contains_key(&conversation_id));
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .recovery_status,
+            RecoveryStatus::Healthy
+        );
+        let ops = persist_ops(&output);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveRecoveryContext { conversation_id: id } if id == &conversation_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveMlsState { conversation_id: id } if id == &conversation_id
+        )));
+        let snapshot = extract_snapshot(&output);
+        assert!(!snapshot
+            .recovery_contexts
+            .iter()
+            .any(|context| context.conversation_id == conversation_id));
+
+        let send = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after recovery cleanup".into(),
+            })
+            .expect("send after cleanup");
+        assert!(send.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
+        )));
     }
 
     #[test]

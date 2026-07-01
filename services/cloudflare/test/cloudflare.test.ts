@@ -339,6 +339,7 @@ function sampleCapability(deviceId = "device:bob:phone", conversationScope?: str
 function signedIdentityFixture(options?: {
   capabilityExpiresAt?: number;
   conversationScope?: string[];
+  endpoint?: string;
   maxBytes?: number;
 }) {
   const now = Date.now();
@@ -353,7 +354,7 @@ function signedIdentityFixture(options?: {
     service: "inbox",
     userId,
     targetDeviceId: deviceId,
-    endpoint: `https://example.com/v1/inbox/${deviceId}/messages`,
+    endpoint: options?.endpoint ?? `https://example.com/v1/inbox/${deviceId}/messages`,
     operations: ["append"],
     conversationScope: options?.conversationScope,
     expiresAt: options?.capabilityExpiresAt ?? now + 60_000,
@@ -740,6 +741,88 @@ test("tampered append grant stays in message requests even when sender is allowl
     queuedAsRequest: true,
     requestId: "request:user:alice"
   });
+});
+
+test("expired signed append grant stays in message requests even when sender is allowlisted", async () => {
+  const { env, bucket } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const token = bundle.deviceRuntimeAuth!.token;
+  const fixture = signedIdentityFixture({ capabilityExpiresAt: Date.now() - 1 });
+  await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+  await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
+
+  const response = await handleRequest(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(fixture.capability.signature),
+        "X-Tapchat-Capability": JSON.stringify(fixture.capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleAppend(fixture.deviceId, "msg:expired-signed"))
+    }),
+    env
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 0,
+    deliveredTo: "message_request",
+    queuedAsRequest: true,
+    requestId: "request:user:alice"
+  });
+
+  const head = await handleRequest(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/head`, {
+      headers: authHeaders(token)
+    }),
+    env
+  );
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
+});
+
+test("signed append grant with mismatched target or endpoint is rejected", async () => {
+  {
+    const { env, bucket } = createEnv();
+    const fixture = signedIdentityFixture();
+    await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+    const response = await handleRequest(
+      new Request("https://example.com/v1/inbox/device:bob:tablet/messages", {
+        method: "POST",
+        headers: {
+          ...authHeaders(fixture.capability.signature),
+          "X-Tapchat-Capability": JSON.stringify(fixture.capability),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(sampleAppend("device:bob:tablet", "msg:target-mismatch"))
+      }),
+      env
+    );
+    assert.equal(response.status, 403);
+  }
+
+  {
+    const { env, bucket } = createEnv();
+    const fixture = signedIdentityFixture({
+      endpoint: "https://example.com/v1/inbox/device:bob:phone/wrong"
+    });
+    await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+    const response = await handleRequest(
+      new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
+        method: "POST",
+        headers: {
+          ...authHeaders(fixture.capability.signature),
+          "X-Tapchat-Capability": JSON.stringify(fixture.capability),
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(sampleAppend(fixture.deviceId, "msg:endpoint-mismatch"))
+      }),
+      env
+    );
+    assert.equal(response.status, 403);
+  }
 });
 
 test("routes append requests without capability header to message requests", async () => {

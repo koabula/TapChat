@@ -4357,7 +4357,7 @@ impl CoreEngine {
                         .insert(conversation_id.clone(), summary);
                 }
             }
-            self.state.recovery_contexts.remove(&conversation_id);
+            self.clear_recovery_context_as_healthy(&conversation_id);
             let mut output = CoreOutput {
                 state_update: CoreStateUpdate {
                     conversations_changed: true,
@@ -4365,9 +4365,17 @@ impl CoreEngine {
                 },
                 effects: vec![persist_effect(
                     &self.state,
-                    vec![PersistOp::SaveConversation {
-                        conversation_id: conversation_id.clone(),
-                    }],
+                    vec![
+                        PersistOp::SaveConversation {
+                            conversation_id: conversation_id.clone(),
+                        },
+                        PersistOp::SaveMlsState {
+                            conversation_id: conversation_id.clone(),
+                        },
+                        PersistOp::SaveRecoveryContext {
+                            conversation_id: conversation_id.clone(),
+                        },
+                    ],
                 )],
                 view_model: Some(CoreViewModel {
                     conversations: vec![self.conversation_summary(&conversation_id)?],
