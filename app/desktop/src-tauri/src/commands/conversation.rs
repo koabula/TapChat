@@ -3,41 +3,16 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use tauri::State;
 
-use tapchat_core::conversation::{RecoveryStatus, StoredMessage};
+use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::ConversationSummary;
-use tapchat_core::model::{ConversationKind, ConversationState, MessageType};
+use tapchat_core::model::{ConversationKind, ConversationState};
 use tapchat_core::CoreCommand;
 
+use super::conversation_view::{
+    application_plaintext_message_count, generate_last_message_preview, summarize_plaintext,
+};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::{AppState, SessionState};
-
-fn summarize_plaintext(plaintext: Option<&str>) -> String {
-    match plaintext {
-        Some(value) => format!("has_plaintext=true plaintext_len={}", value.len()),
-        None => "has_plaintext=false plaintext_len=0".into(),
-    }
-}
-
-/// Generate a preview string for the last message in a conversation.
-/// Returns None if there are no messages or the last message has no plaintext.
-fn generate_last_message_preview(messages: &[StoredMessage]) -> Option<String> {
-    // Find the last application message (not protocol messages like Welcome/Commit)
-    let last_app_message = messages
-        .iter()
-        .rev()
-        .find(|msg| matches!(msg.message_type, MessageType::MlsApplication));
-
-    last_app_message.and_then(|msg| {
-        msg.plaintext.as_ref().map(|p| {
-            // Truncate to 50 characters for preview
-            if p.len() > 50 {
-                format!("{}...", &p[..50])
-            } else {
-                p.clone()
-            }
-        })
-    })
-}
 
 /// Simplified result for create_conversation command
 #[derive(Debug, Clone, Serialize)]
@@ -64,50 +39,39 @@ pub async fn list_conversations(
     let summaries: Vec<ConversationSummary> = snapshot
         .conversations
         .iter()
-        .map(|persisted| {
-            // Filter to only application messages for count
-            let app_message_count = persisted
-                .state
-                .messages
-                .iter()
-                .filter(|msg| {
-                    matches!(msg.message_type, MessageType::MlsApplication)
-                        && msg.plaintext.is_some()
-                })
-                .count();
-
-            ConversationSummary {
-                conversation_id: persisted.conversation_id.clone(),
-                peer_user_id: persisted.state.peer_user_id.clone(),
-                state: match persisted.state.conversation.state {
-                    ConversationState::Active => match persisted.state.recovery_status {
-                        RecoveryStatus::Healthy => "active".into(),
-                        RecoveryStatus::NeedsRecovery => "needs_recovery".into(),
-                        RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
-                    },
-                    ConversationState::NeedsRebuild => "needs_rebuild".into(),
-                    ConversationState::Closed => "closed".into(),
-                    ConversationState::Archived => "archived".into(),
-                    ConversationState::Dissolved => "dissolved".into(),
+        .map(|persisted| ConversationSummary {
+            conversation_id: persisted.conversation_id.clone(),
+            peer_user_id: persisted.state.peer_user_id.clone(),
+            state: match persisted.state.conversation.state {
+                ConversationState::Active => match persisted.state.recovery_status {
+                    RecoveryStatus::Healthy => "active".into(),
+                    RecoveryStatus::NeedsRecovery => "needs_recovery".into(),
+                    RecoveryStatus::NeedsRebuild => "needs_rebuild".into(),
                 },
-                kind: Some(persisted.state.conversation.kind),
-                title: None,
-                display_name: persisted
-                    .state
-                    .archive_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.peer_display_name.clone()),
-                group_id: None,
-                member_count: None,
-                group_role: None,
-                group_cursor: None,
-                last_message_preview: generate_last_message_preview(&persisted.state.messages),
-                last_message_type: persisted.state.last_message_type,
-                message_count: Some(app_message_count),
-                recovery: recovery_by_conversation
-                    .get(&persisted.conversation_id)
-                    .cloned(),
-            }
+                ConversationState::NeedsRebuild => "needs_rebuild".into(),
+                ConversationState::Closed => "closed".into(),
+                ConversationState::Archived => "archived".into(),
+                ConversationState::Dissolved => "dissolved".into(),
+            },
+            kind: Some(persisted.state.conversation.kind),
+            title: None,
+            display_name: persisted
+                .state
+                .archive_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.peer_display_name.clone()),
+            group_id: None,
+            member_count: None,
+            group_role: None,
+            group_cursor: None,
+            last_message_preview: generate_last_message_preview(&persisted.state.messages),
+            last_message_type: persisted.state.last_message_type,
+            message_count: Some(application_plaintext_message_count(
+                &persisted.state.messages,
+            )),
+            recovery: recovery_by_conversation
+                .get(&persisted.conversation_id)
+                .cloned(),
         })
         .collect();
 

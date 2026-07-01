@@ -36,6 +36,10 @@ use tapchat_core::model::{
 use tapchat_core::persistence::PersistedGroupInvite;
 use tapchat_core::{CoreCommand, CoreEffect, CoreOutput};
 
+use super::group_view::{
+    application_message_count, canonical_group_invite_url, conversation_state_string,
+    last_application_preview, system_banner_text,
+};
 use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
 };
@@ -160,22 +164,6 @@ impl From<&PersistedGroupInvite> for GroupInviteView {
     }
 }
 
-fn canonical_group_invite_url(invite: &PersistedGroupInvite) -> String {
-    let Ok(parsed) = url::Url::parse(&invite.invite_url) else {
-        return invite.invite_url.clone();
-    };
-    let origin = parsed.origin().ascii_serialization();
-    if origin == "null" {
-        return invite.invite_url.clone();
-    }
-    let origin = origin.trim_end_matches('/');
-    format!(
-        "{origin}/v1/group-invite/{}/{}",
-        urlencoding::encode(&invite.group_id),
-        urlencoding::encode(&invite.invite_id)
-    )
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupJoinRequestView {
     pub request_id: String,
@@ -239,87 +227,6 @@ pub async fn apply_group_realtime_plan(
     .await
     .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers.
-// ---------------------------------------------------------------------------
-
-fn conversation_state_string(state: tapchat_core::model::ConversationState) -> String {
-    match state {
-        tapchat_core::model::ConversationState::Active => "active".into(),
-        tapchat_core::model::ConversationState::NeedsRebuild => "needs_rebuild".into(),
-        tapchat_core::model::ConversationState::Closed => "closed".into(),
-        tapchat_core::model::ConversationState::Archived => "archived".into(),
-        tapchat_core::model::ConversationState::Dissolved => "dissolved".into(),
-    }
-}
-
-fn system_banner_text(message_type: GroupMessageType) -> String {
-    // Localised copy is the UI's job; for now we emit a stable English
-    // string that R3.6 requires to be fixed for control_group_dissolved.
-    // Other visible control messages are surfaced verbatim so the UI can
-    // decide how to render them.
-    match message_type {
-        GroupMessageType::ControlGroupDissolved => {
-            "This group has been dissolved by the owner.".into()
-        }
-        GroupMessageType::ControlGroupMembershipChanged => "Group membership changed.".into(),
-        GroupMessageType::ControlGroupMetadataUpdated => "Group metadata updated.".into(),
-        GroupMessageType::ControlGroupJoinRequested => "A new join request was submitted.".into(),
-        GroupMessageType::ControlGroupJoinApproved => "A join request was approved.".into(),
-        GroupMessageType::ControlGroupJoinRejected => "A join request was rejected.".into(),
-        GroupMessageType::ControlGroupLeaveRequested => "A member requested to leave.".into(),
-        GroupMessageType::ControlConversationNeedsRebuild => {
-            "This conversation needs to be rebuilt.".into()
-        }
-        // Non-control types should never reach this helper; fall back to
-        // a neutral label rather than panicking so an unexpected code
-        // path does not crash the UI thread.
-        other => format!("{:?}", other),
-    }
-}
-
-/// Extract the short preview used in the sidebar — the plaintext of the
-/// last `mls_application` message (or None when the group has only had
-/// protocol traffic). Truncates to 50 chars to stay UI-friendly.
-fn last_application_preview(
-    messages: &[tapchat_core::conversation::StoredMessage],
-) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|msg| {
-            matches!(
-                msg.message_type,
-                tapchat_core::model::MessageType::MlsApplication
-            )
-        })
-        .and_then(|msg| msg.plaintext.as_ref())
-        .map(|text| {
-            if text.chars().count() > 50 {
-                let mut out: String = text.chars().take(50).collect();
-                out.push('…');
-                out
-            } else {
-                text.clone()
-            }
-        })
-}
-
-/// Count the user-facing application messages in a conversation so the
-/// sidebar can surface a total. Mirrors the convention used by
-/// `commands/conversation.rs::list_conversations`.
-fn application_message_count(messages: &[tapchat_core::conversation::StoredMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|msg| {
-            matches!(
-                msg.message_type,
-                tapchat_core::model::MessageType::MlsApplication
-            )
-        })
-        .count()
 }
 
 fn notification_error_from_output(output: &CoreOutput, fallback: &str) -> String {
