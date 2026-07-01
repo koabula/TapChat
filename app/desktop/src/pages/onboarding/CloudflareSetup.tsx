@@ -194,8 +194,8 @@ export default function CloudflareSetup() {
     : progress?.progress_percent ?? (preflight?.ready ? 20 : preflight?.authenticated ? 10 : 0);
 
   return (
-    <div className="flex h-screen flex-col bg-base p-8">
-      <div className="flex items-center">
+    <div className="flex h-screen min-h-0 flex-col bg-base p-6 md:p-8">
+      <div className="flex shrink-0 items-center">
         <button className="btn btn-ghost px-2" onClick={() => navigate("/onboarding/backup")}>
           <ArrowLeft size={16} />
           Back
@@ -203,8 +203,8 @@ export default function CloudflareSetup() {
         <span className="ml-auto text-sm text-muted-color">Step 4 of 5</span>
       </div>
 
-      <main className="flex min-h-0 flex-1 items-center justify-center">
-        <div className="grid w-full max-w-4xl gap-8 lg:grid-cols-[1fr_22rem]">
+      <main className="min-h-0 flex-1 overflow-y-auto overscroll-contain py-6">
+        <div className="mx-auto grid w-full max-w-5xl gap-6 md:grid-cols-[minmax(0,1fr)_20rem] lg:gap-8">
           <section className="flex flex-col justify-center">
             <div className="mb-6">
               <h1 className="text-2xl font-semibold text-primary-color">

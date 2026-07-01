@@ -1,13 +1,10 @@
 import { useState, useEffect } from "react";
-import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Check, Clipboard } from "lucide-react";
 import type { ContactLinkPreview } from "@/lib/types";
 
 export default function Complete() {
-  const navigate = useNavigate();
-
   const [shareLink, setShareLink] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [contactLink, setContactLink] = useState("");
@@ -80,8 +77,6 @@ export default function Complete() {
       // Call backend to transition from Onboarding to Active state
       // This will close the onboarding window and open the main window
       await invoke("complete_onboarding");
-      // Navigate to main app (this may not actually render since window changes)
-      navigate("/");
     } catch (err) {
       setError(String(err));
       setStarting(false);

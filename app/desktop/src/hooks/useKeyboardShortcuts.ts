@@ -53,12 +53,6 @@ export function useGlobalShortcuts() {
 
   useKeyboardShortcuts([
     {
-      key: "n",
-      ctrl: true,
-      action: () => navigate("/contacts"),
-      description: "New conversation",
-    },
-    {
       key: "s",
       ctrl: true,
       action: () => navigate("/settings"),

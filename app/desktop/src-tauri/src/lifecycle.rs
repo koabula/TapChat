@@ -119,8 +119,9 @@ pub async fn on_app_ready(app: &AppHandle) {
         if let Err(error) =
             WebviewWindowBuilder::new(app, "onboarding", WebviewUrl::App("/onboarding".into()))
                 .title("TapChat Setup")
-                .inner_size(960.0, 640.0)
-                .resizable(false)
+                .inner_size(1080.0, 720.0)
+                .min_inner_size(800.0, 600.0)
+                .resizable(true)
                 .center()
                 .build()
         {
@@ -470,6 +471,11 @@ fn merge_view_models(base: &mut CoreViewModel, mut next: CoreViewModel) {
 pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
 
+    // Hide setup immediately so the active route never renders in the setup window.
+    if let Some(onboarding_window) = app.get_webview_window("onboarding") {
+        onboarding_window.hide().map_err(|e| e.to_string())?;
+    }
+
     // Get device_id from profile and persist session state
     let device_id = {
         let inner = state.inner.read().await;
@@ -498,29 +504,29 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
 
     set_ws_connection_snapshot(&state, Some(device_id.clone()), false).await;
 
-    // Emit session-status event to notify frontend - this triggers route change
-    let _ = app.emit(
-        "session-status",
-        SessionStatus {
-            state: "active".to_string(),
-            device_id: Some(device_id),
-            ws_connected: false,
-            profile_path: None,
-            error: None,
-        },
-    );
+    let session_status = SessionStatus {
+        state: "active".to_string(),
+        device_id: Some(device_id),
+        ws_connected: false,
+        profile_path: None,
+        error: None,
+    };
 
-    // Close onboarding window if exists
-    if let Some(onboarding_window) = app.get_webview_window("onboarding") {
-        onboarding_window.close().map_err(|e| e.to_string())?;
-    }
-
-    // Show main window
+    // Show main window and notify only that frontend so onboarding cannot route into the app shell.
     if let Some(main_window) = app.get_webview_window("main") {
+        main_window.set_title("TapChat").map_err(|e| e.to_string())?;
+        let _ = main_window.emit("session-status", session_status.clone());
         main_window.show().map_err(|e| e.to_string())?;
         if let Err(e) = main_window.set_focus() {
             log::error!("Failed to focus main window: {}", e);
         }
+    } else {
+        let _ = app.emit("session-status", session_status);
+    }
+
+    // Close onboarding window after main is ready.
+    if let Some(onboarding_window) = app.get_webview_window("onboarding") {
+        onboarding_window.close().map_err(|e| e.to_string())?;
     }
 
     // Start session with AppStarted event

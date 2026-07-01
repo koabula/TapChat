@@ -3,7 +3,6 @@ import { Outlet, useLocation, useNavigate } from "react-router";
 import {
   ContactRound,
   MessageCircle,
-  Plus,
   Settings,
   UsersRound,
 } from "lucide-react";
@@ -44,7 +43,6 @@ export default function AppShell() {
           >
             <h1 className="truncate font-semibold text-primary-color">TapChat</h1>
           </button>
-          <span className="ml-auto text-xs text-muted-color">Ctrl+N</span>
         </div>
 
         <NetworkIndicator />
@@ -85,14 +83,6 @@ export default function AppShell() {
             onClick={() => navigate("/")}
           >
             <MessageCircle size={18} />
-          </button>
-          <button
-            className={shellNavButtonClass(false)}
-            title="New conversation (Ctrl+N)"
-            aria-label="New conversation"
-            onClick={() => navigate("/contacts")}
-          >
-            <Plus size={18} />
           </button>
           <button
             className={shellNavButtonClass(inGroups)}
