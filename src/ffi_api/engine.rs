@@ -41,14 +41,14 @@ use crate::transport_contract::{
     BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, DeviceStatusDocument,
     DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
     FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    FetchMessagesRequest, FetchMessagesResult, FetchWelcomePickupRequest,
-    FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
-    GetHeadResult, GroupJoinDecision, ListGroupJoinRequestsRequest, MessageRequestAction,
-    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
-    PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
+    FetchMessagesRequest, FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GetHeadResult, GroupJoinDecision,
+    ListGroupJoinRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
+    MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
+    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
+    SubmitGroupJoinRequest,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Verifier;
@@ -84,6 +84,10 @@ pub struct RecoveryContextSnapshot {
     pub identity_refresh_retry_count: u8,
     pub last_error: Option<String>,
     pub escalation_reason: Option<RecoveryEscalationReason>,
+    pub restore_failure_reason: Option<String>,
+    pub restore_failure_detail: Option<String>,
+    pub restore_recoverable: Option<bool>,
+    pub suggested_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -244,6 +248,10 @@ impl CoreEngine {
                 identity_refresh_retry_count: context.identity_refresh_retry_count,
                 last_error: context.last_error.clone(),
                 escalation_reason: context.escalation_reason,
+                restore_failure_reason: context.restore_failure_reason.clone(),
+                restore_failure_detail: context.restore_failure_detail.clone(),
+                restore_recoverable: context.restore_recoverable,
+                suggested_action: context.suggested_action.clone(),
             })
     }
 
@@ -578,6 +586,10 @@ impl CoreEngine {
                                 RecoveryEscalationReason::RecoveryPolicyExhausted
                             }
                         }),
+                        restore_failure_reason: context.restore_failure_reason,
+                        restore_failure_detail: context.restore_failure_detail,
+                        restore_recoverable: context.restore_recoverable,
+                        suggested_action: context.suggested_action,
                     },
                 )
             })
@@ -667,7 +679,8 @@ impl CoreEngine {
             }
         }
 
-        for conversation_id in restored_mls.failed_conversation_ids {
+        for failure in restored_mls.failures {
+            let conversation_id = failure.conversation_id.clone();
             if let Some(conversation) = engine.state.conversations.get_mut(&conversation_id) {
                 if matches!(
                     conversation.conversation.state,
@@ -691,8 +704,17 @@ impl CoreEngine {
                     phase: RecoveryPhase::EscalatedToRebuild,
                     attempt_count: 0,
                     identity_refresh_retry_count: MAX_TRANSPORT_RETRIES,
-                    last_error: Some("failed to restore MLS group state".into()),
+                    last_error: Some(match failure.detail.as_ref() {
+                        Some(detail) => {
+                            format!("failed to restore MLS group state: {detail}")
+                        }
+                        None => "failed to restore MLS group state".into(),
+                    }),
                     escalation_reason: Some(RecoveryEscalationReason::MlsMarkedUnrecoverable),
+                    restore_failure_reason: Some(failure.reason),
+                    restore_failure_detail: failure.detail,
+                    restore_recoverable: Some(failure.recoverable),
+                    suggested_action: Some(failure.suggested_action),
                 },
             );
         }
@@ -4923,7 +4945,69 @@ impl CoreEngine {
                 self.retry_pending_welcome_pickups()?,
             ),
         );
+        let output = merge_outputs(output, self.restore_degraded_output());
         self.merge_with_transport_flush(output)
+    }
+
+    fn restore_degraded_output(&self) -> CoreOutput {
+        let conversation_ids: Vec<String> = self
+            .state
+            .conversations
+            .keys()
+            .filter(|conversation_id| {
+                self.recovery_snapshot_for_conversation(conversation_id)
+                    .is_some_and(|recovery| {
+                        recovery.restore_failure_reason.is_some()
+                            || recovery.recovery_status == RecoveryStatus::NeedsRebuild
+                    })
+            })
+            .cloned()
+            .collect();
+        let conversations: Vec<ConversationSummary> = conversation_ids
+            .iter()
+            .filter_map(|conversation_id| self.conversation_summary(conversation_id).ok())
+            .collect();
+        if conversations.is_empty() {
+            return CoreOutput::default();
+        }
+        let message = if conversations.len() == 1 {
+            "A secure conversation needs recovery before it can send new messages.".to_string()
+        } else {
+            format!(
+                "{} secure conversations need recovery before they can send new messages.",
+                conversations.len()
+            )
+        };
+        let persist_ops = conversation_ids
+            .into_iter()
+            .flat_map(|conversation_id| {
+                [
+                    PersistOp::SaveConversation {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveRecoveryContext { conversation_id },
+                ]
+            })
+            .collect();
+        CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                system_statuses_changed: vec![SystemStatus::ConversationNeedsRebuild],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(&self.state, persist_ops)],
+            view_model: Some(CoreViewModel {
+                conversations,
+                banners: vec![SystemBanner {
+                    status: SystemStatus::ConversationNeedsRebuild,
+                    message,
+                }],
+                ..CoreViewModel::default()
+            }),
+        }
     }
 
     fn apply_group_realtime_plan(
@@ -5942,6 +6026,10 @@ impl CoreEngine {
                 identity_refresh_retry_count: 0,
                 last_error: None,
                 escalation_reason: None,
+                restore_failure_reason: None,
+                restore_failure_detail: None,
+                restore_recoverable: None,
+                suggested_action: None,
             })
     }
 
@@ -6000,6 +6088,10 @@ impl CoreEngine {
                     identity_refresh_retry_count: MAX_TRANSPORT_RETRIES,
                     last_error: Some(message.clone()),
                     escalation_reason: Some(escalation_reason),
+                    restore_failure_reason: None,
+                    restore_failure_detail: None,
+                    restore_recoverable: None,
+                    suggested_action: None,
                 },
             );
         }
@@ -8325,6 +8417,25 @@ impl CoreEngine {
                 .map(|value| value.status),
             escalation_reason: context.and_then(|value| value.escalation_reason),
             last_error: context.and_then(|value| value.last_error.clone()),
+            recoverable: context
+                .and_then(|value| value.restore_recoverable)
+                .unwrap_or(!matches!(
+                    conversation.conversation.state,
+                    ConversationState::Closed | ConversationState::Archived
+                )),
+            suggested_action: context
+                .and_then(|value| value.suggested_action.clone())
+                .unwrap_or_else(|| {
+                    if conversation.recovery_status == RecoveryStatus::NeedsRebuild
+                        || conversation.conversation.state == ConversationState::NeedsRebuild
+                    {
+                        "reconcile_conversation_membership".into()
+                    } else {
+                        "sync_then_retry".into()
+                    }
+                }),
+            restore_failure_reason: context.and_then(|value| value.restore_failure_reason.clone()),
+            restore_failure_detail: context.and_then(|value| value.restore_failure_detail.clone()),
         })
     }
 
@@ -13471,6 +13582,10 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                         PersistedRecoveryEscalationReason::RecoveryPolicyExhausted
                     }
                 }),
+                restore_failure_reason: context.restore_failure_reason.clone(),
+                restore_failure_detail: context.restore_failure_detail.clone(),
+                restore_recoverable: context.restore_recoverable,
+                suggested_action: context.suggested_action.clone(),
             })
             .collect(),
         realtime_sessions: state

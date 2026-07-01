@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ed25519 } from "@noble/curves/ed25519";
 import {
   CURRENT_MODEL_VERSION,
   type AllowlistDocument,
@@ -9,10 +10,12 @@ import {
   type CreateGroupInviteRequest,
   type DecideGroupJoinRequest,
   type DeploymentBundle,
+  type DeviceBinding,
   type GroupCapability,
   type GroupCapabilityOperation,
   type GroupMessageType,
   type IdentityBundle,
+  type InboxAppendCapability,
   type MessageRequestActionResult,
   type MessageRequestListResult,
   type SubmitGroupJoinRequest
@@ -333,6 +336,132 @@ function sampleCapability(deviceId = "device:bob:phone", conversationScope?: str
   };
 }
 
+function signedIdentityFixture(options?: {
+  capabilityExpiresAt?: number;
+  conversationScope?: string[];
+  maxBytes?: number;
+}) {
+  const now = Date.now();
+  const userSecret = new Uint8Array(32).fill(1);
+  const deviceSecret = new Uint8Array(32).fill(2);
+  const userId = "user:bob";
+  const deviceId = "device:bob:phone";
+  const userPublicKey = bytesToHex(ed25519.getPublicKey(userSecret));
+  const devicePublicKey = bytesToHex(ed25519.getPublicKey(deviceSecret));
+  const capability: InboxAppendCapability = {
+    version: CURRENT_MODEL_VERSION,
+    service: "inbox",
+    userId,
+    targetDeviceId: deviceId,
+    endpoint: `https://example.com/v1/inbox/${deviceId}/messages`,
+    operations: ["append"],
+    conversationScope: options?.conversationScope,
+    expiresAt: options?.capabilityExpiresAt ?? now + 60_000,
+    constraints:
+      options?.maxBytes === undefined ? undefined : { maxBytes: options.maxBytes },
+    signature: ""
+  };
+  capability.signature = signHex(deviceSecret, capabilityPayload(capability));
+
+  const binding: DeviceBinding = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    deviceId,
+    devicePublicKey,
+    createdAt: now,
+    signature: ""
+  };
+  binding.signature = signHex(userSecret, bindingPayload(binding));
+
+  const bundle: IdentityBundle = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    userPublicKey,
+    displayName: "Bob",
+    updatedAt: now,
+    bundleShareId: "share:bob",
+    identityBundleRef: `https://example.com/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`,
+    deviceStatusRef: `https://example.com/v1/shared-state/${encodeURIComponent(userId)}/device-status`,
+    storageProfile: {
+      baseUrl: "https://example.com",
+      profileRef: "profile:bob"
+    },
+    devices: [
+      {
+        version: CURRENT_MODEL_VERSION,
+        deviceId,
+        devicePublicKey,
+        binding,
+        status: "active",
+        inboxAppendCapability: capability,
+        keypackageRef: {
+          version: CURRENT_MODEL_VERSION,
+          userId,
+          deviceId,
+          ref: `https://example.com/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/kp1`,
+          expiresAt: now + 60_000
+        }
+      }
+    ],
+    signature: ""
+  };
+  bundle.signature = signHex(userSecret, identityBundlePayload(bundle, true));
+  return { bundle, capability, deviceId, userId };
+}
+
+function capabilityPayload(capability: InboxAppendCapability): string {
+  const constraints = capability.constraints
+    ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}`
+    : "";
+  return [
+    capability.version,
+    "Inbox",
+    capability.userId,
+    capability.targetDeviceId,
+    capability.endpoint,
+    `[${capability.operations.map((operation) => (operation === "append" ? "Append" : operation)).join(", ")}]`,
+    (capability.conversationScope ?? []).join(","),
+    String(capability.expiresAt),
+    constraints
+  ].join("|");
+}
+
+function bindingPayload(binding: DeviceBinding): string {
+  return `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`;
+}
+
+function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boolean): string {
+  const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
+  if (includeDisplayName) {
+    parts.push(bundle.displayName ?? "");
+  }
+  parts.push(
+    String(bundle.updatedAt),
+    bundle.bundleShareId ?? "",
+    bundle.identityBundleRef ?? "",
+    bundle.deviceStatusRef ?? "",
+    bundle.storageProfile?.baseUrl ?? "",
+    bundle.storageProfile?.profileRef ?? ""
+  );
+  for (const device of bundle.devices) {
+    parts.push(device.deviceId);
+    parts.push(device.devicePublicKey);
+    parts.push(device.binding.signature);
+    parts.push(device.inboxAppendCapability.signature);
+    parts.push(device.keypackageRef.ref);
+    parts.push(String(device.keypackageRef.expiresAt));
+  }
+  return parts.join("|");
+}
+
+function signHex(secretKey: Uint8Array, payload: string): string {
+  return bytesToHex(ed25519.sign(new TextEncoder().encode(payload), secretKey));
+}
+
+function bytesToHex(input: Uint8Array): string {
+  return Array.from(input, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function sampleGroupCapability(
   groupId = "group:project",
   operations: GroupCapabilityOperation[] = ["read", "append_application", "append_control", "append_membership"],
@@ -531,6 +660,77 @@ test("rotating sharing secret invalidates previously issued device runtime token
 test("accepts append requests only with explicit capability header", async () => {
   const { env } = createEnv();
   const response = await appendWithCapability(env);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 0,
+    deliveredTo: "message_request",
+    queuedAsRequest: true,
+    requestId: "request:user:alice"
+  });
+});
+
+test("verified append capability delivers allowlisted sender to inbox", async () => {
+  const { env, bucket } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const token = bundle.deviceRuntimeAuth!.token;
+  const fixture = signedIdentityFixture();
+  await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+  await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
+
+  const append = sampleAppend(fixture.deviceId, "msg:signed");
+  const response = await handleRequest(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(fixture.capability.signature),
+        "X-Tapchat-Capability": JSON.stringify(fixture.capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(append)
+    }),
+    env
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 1,
+    deliveredTo: "inbox"
+  });
+
+  const head = await handleRequest(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/head`, {
+      headers: authHeaders(token)
+    }),
+    env
+  );
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 1 });
+});
+
+test("tampered append grant stays in message requests even when sender is allowlisted", async () => {
+  const { env, bucket } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const token = bundle.deviceRuntimeAuth!.token;
+  const fixture = signedIdentityFixture();
+  await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+  await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
+
+  const response = await handleRequest(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(`${fixture.capability.signature.slice(0, -2)}00`),
+        "X-Tapchat-Capability": JSON.stringify(fixture.capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleAppend(fixture.deviceId, "msg:tampered"))
+    }),
+    env
+  );
+
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
     version: CURRENT_MODEL_VERSION,

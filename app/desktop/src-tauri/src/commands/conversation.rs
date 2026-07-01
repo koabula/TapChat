@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use tauri::State;
 
@@ -50,6 +52,12 @@ pub async fn list_conversations(
     let inner = state.inner.read().await;
 
     // Get snapshot from engine which contains all conversations
+    let recovery_by_conversation: BTreeMap<_, _> = inner
+        .engine
+        .recovery_conversations_snapshot()
+        .into_iter()
+        .map(|diagnostics| (diagnostics.conversation_id.clone(), diagnostics))
+        .collect();
     let snapshot = inner.engine.refresh_snapshot();
 
     // Build conversation summaries from snapshot
@@ -96,7 +104,9 @@ pub async fn list_conversations(
                 last_message_preview: generate_last_message_preview(&persisted.state.messages),
                 last_message_type: persisted.state.last_message_type,
                 message_count: Some(app_message_count),
-                recovery: None, // TODO: add recovery diagnostics if needed
+                recovery: recovery_by_conversation
+                    .get(&persisted.conversation_id)
+                    .cloned(),
             }
         })
         .collect();
@@ -126,6 +136,19 @@ pub async fn create_conversation(
         .ok_or_else(|| "Failed to get conversation_id from response".to_string())?;
 
     Ok(CreateConversationResult { conversation_id })
+}
+
+#[tauri::command]
+pub async fn recover_conversation(
+    app: tauri::AppHandle,
+    conversation_id: String,
+) -> Result<tapchat_core::CoreOutput, String> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ReconcileConversationMembership { conversation_id }),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -1069,6 +1069,14 @@ pub(crate) struct RecoveryContext {
     pub(crate) identity_refresh_retry_count: u8,
     pub(crate) last_error: Option<String>,
     pub(crate) escalation_reason: Option<RecoveryEscalationReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_failure_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) restore_recoverable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1088,6 +1096,14 @@ pub struct RecoveryDiagnostics {
     pub escalation_reason: Option<RecoveryEscalationReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub recoverable: bool,
+    #[serde(default)]
+    pub suggested_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_failure_detail: Option<String>,
 }
 
 impl Default for CoreState {

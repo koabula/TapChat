@@ -326,6 +326,10 @@ export interface RecoveryDiagnostics {
   mls_status?: string;
   escalation_reason?: RecoveryEscalationReason;
   last_error?: string;
+  recoverable?: boolean;
+  suggested_action?: string;
+  restore_failure_reason?: string;
+  restore_failure_detail?: string;
 }
 
 export type RecoveryReason =

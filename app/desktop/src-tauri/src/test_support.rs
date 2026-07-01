@@ -64,9 +64,9 @@ pub use crate::commands::group::{
 /// [`crate::lifecycle::on_app_ready`]:
 ///
 ///   - Opens the profile via [`Profile::open`].
-///   - Loads the persisted snapshot (empty default when none exists).
+///   - Loads the persisted snapshot and propagates any load error.
 ///   - Restores the engine via
-///     [`CoreEngine::from_restored_state`].
+///     [`CoreEngine::try_from_restored_state`], propagating fatal restore errors.
 ///   - Constructs [`DesktopPlatformPorts`] without ever calling
 ///     `set_app_handle` (the handle is only required for UI progress
 ///     emits which tests don't observe).
@@ -91,7 +91,12 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         .clone()
         .unwrap_or_else(|| "unknown-device".to_string());
     let profile_path = profile.root().to_path_buf();
-    let snapshot = profile.load_snapshot().unwrap_or_default();
+    let snapshot = profile.load_snapshot().with_context(|| {
+        format!(
+            "load desktop test profile snapshot at {}",
+            profile_path.display()
+        )
+    })?;
 
     // The ProfileManager wraps a shared registry; we don't need a real
     // registry for test usage — an empty default suffices because no
@@ -106,7 +111,8 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
     }));
     let profile_manager = ProfileManager::from_inner(inner_lock.clone());
 
-    let engine = CoreEngine::from_restored_state(snapshot);
+    let engine = CoreEngine::try_from_restored_state(snapshot)
+        .context("restore desktop test profile snapshot")?;
     let ports = DesktopPlatformPorts::new(inner_lock.clone());
 
     Ok(AppState {
@@ -121,4 +127,79 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
         ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use tapchat_core::cli::profile::{Profile, ProfileInitOptions};
+    use uuid::Uuid;
+
+    use super::build_test_app_state_for_profile;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
+
+    fn test_profile_root() -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("tapchat-desktop-fail-closed-{}", Uuid::new_v4()))
+            .join("broken");
+        std::fs::create_dir_all(&root).expect("create profile root");
+        root
+    }
+
+    #[tokio::test]
+    async fn build_test_app_state_for_profile_rejects_corrupt_snapshot_store() {
+        let _guard = env_lock();
+        let root = test_profile_root();
+        let passphrase = "test-passphrase";
+        let registry_path = root
+            .parent()
+            .expect("profile test parent")
+            .join("config")
+            .join("profiles.json");
+        unsafe {
+            std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
+        }
+        let profile = Profile::init_with_options(
+            "broken",
+            &root,
+            ProfileInitOptions {
+                passphrase: Some(passphrase.into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        let state_db_path = profile.state_db_path();
+        drop(profile);
+        std::fs::write(&state_db_path, b"not a sqlite database").expect("corrupt state db");
+
+        unsafe {
+            std::env::set_var("TAPCHAT_PROFILE_PASSPHRASE", passphrase);
+        }
+        let error = build_test_app_state_for_profile(&root)
+            .await
+            .expect_err("corrupt store should not start with an empty engine");
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_PASSPHRASE");
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("open desktop test profile")
+                || message.contains("load desktop test profile snapshot"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&state_db_path).expect("read corrupted db"),
+            b"not a sqlite database"
+        );
+    }
 }

@@ -3374,7 +3374,10 @@ mod tests {
         assert_eq!(metadata.file_name.as_deref(), Some("file.bin"));
         assert_eq!(metadata.size_bytes, 4);
         assert_eq!(
-            metadata.download_grant.as_ref().map(|grant| grant.token.as_str()),
+            metadata
+                .download_grant
+                .as_ref()
+                .map(|grant| grant.token.as_str()),
             Some("refresh-grant")
         );
 
@@ -4489,7 +4492,7 @@ mod tests {
         let mut snapshot = extract_snapshot(&output);
         snapshot.mls_states[0].serialized_group_state = Some("{broken".into());
 
-        let restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::from_restored_state(snapshot);
 
         assert_eq!(
             restored
@@ -4520,6 +4523,86 @@ mod tests {
         assert_eq!(
             recovery.escalation_reason,
             Some(crate::ffi_api::RecoveryEscalationReason::MlsMarkedUnrecoverable)
+        );
+        assert_eq!(
+            recovery.restore_failure_reason.as_deref(),
+            Some("invalid_serialized_state")
+        );
+        assert!(recovery
+            .restore_failure_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("failed to parse")));
+
+        let diagnostics = restored.recovery_conversations_snapshot();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].conversation_id, conversation_id);
+        assert_eq!(
+            diagnostics[0].restore_failure_reason.as_deref(),
+            Some("invalid_serialized_state")
+        );
+        assert!(diagnostics[0].recoverable);
+        assert_eq!(
+            diagnostics[0].suggested_action,
+            "reconcile_conversation_membership"
+        );
+
+        let started = restored
+            .handle_event(CoreEvent::AppStarted)
+            .expect("app started");
+        assert!(started.state_update.conversations_changed);
+        assert!(started
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
+        assert!(started.view_model.as_ref().is_some_and(|view| {
+            view.banners.iter().any(|banner| {
+                banner.status == crate::ffi_api::SystemStatus::ConversationNeedsRebuild
+            }) && view
+                .conversations
+                .iter()
+                .any(|conversation| conversation.conversation_id == conversation_id)
+        }));
+        assert!(started.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::PersistState { persist }
+                if persist.ops.iter().any(|op| matches!(
+                    op,
+                    PersistOp::SaveRecoveryContext { conversation_id: saved }
+                        if saved == &conversation_id
+                ))
+        )));
+    }
+
+    #[test]
+    fn corrupted_closed_mls_snapshot_does_not_surface_restore_recovery() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let mut snapshot = extract_snapshot(&output);
+        snapshot
+            .conversations
+            .iter_mut()
+            .find(|conversation| conversation.conversation_id == conversation_id)
+            .expect("conversation")
+            .state
+            .conversation
+            .state = crate::model::ConversationState::Archived;
+        snapshot.mls_states[0].serialized_group_state = Some("{broken".into());
+
+        let restored = CoreEngine::from_restored_state(snapshot);
+
+        assert!(restored
+            .recovery_context_snapshot(&conversation_id)
+            .is_none());
+        assert!(
+            restored.mls_summary(&conversation_id).is_none(),
+            "archived corrupted MLS state should be dropped from active summaries"
         );
     }
 
@@ -4812,6 +4895,10 @@ mod tests {
                 identity_refresh_retry_count: 0,
                 last_error: None,
                 escalation_reason: None,
+                restore_failure_reason: None,
+                restore_failure_detail: None,
+                restore_recoverable: None,
+                suggested_action: None,
             },
         );
 
@@ -5013,6 +5100,10 @@ mod tests {
                 identity_refresh_retry_count: 0,
                 last_error: None,
                 escalation_reason: None,
+                restore_failure_reason: None,
+                restore_failure_detail: None,
+                restore_recoverable: None,
+                suggested_action: None,
             },
         );
         alice
@@ -5069,6 +5160,10 @@ mod tests {
                 identity_refresh_retry_count: 1,
                 last_error: None,
                 escalation_reason: None,
+                restore_failure_reason: None,
+                restore_failure_detail: None,
+                restore_recoverable: None,
+                suggested_action: None,
             },
         );
         alice.state.recovery_contexts.remove(&conversation_id);

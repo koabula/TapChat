@@ -3,6 +3,7 @@ import { useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AlertTriangle,
   Clapperboard,
   EllipsisVertical,
   Loader,
@@ -57,6 +58,8 @@ export default function ChatView() {
   const [transportBusy, setTransportBusy] = useState(false);
   const [transportError, setTransportError] = useState<string | null>(null);
   const [manualSyncBusy, setManualSyncBusy] = useState(false);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -93,10 +96,12 @@ export default function ChatView() {
   }, [activeConversation, contacts]);
   const directPendingOutbound =
     !isGroup && activeDirectContact?.relationship_status === "pending_outbound";
-  const directRecovering =
-    !isGroup &&
+  const conversationRecovery = activeConversation?.recovery ?? null;
+  const conversationRecovering =
+    Boolean(activeConversation) &&
     (activeConversation?.state === "needs_recovery" ||
-      activeConversation?.state === "needs_rebuild");
+      activeConversation?.state === "needs_rebuild" ||
+      Boolean(conversationRecovery));
   const directClosed =
     !isGroup &&
     Boolean(activeConversation) &&
@@ -140,7 +145,7 @@ export default function ChatView() {
       : 0;
   const composerDisabled =
     directPendingOutbound ||
-    directRecovering ||
+    conversationRecovering ||
     directClosed ||
     dissolved ||
     pendingGroupSetup ||
@@ -150,8 +155,8 @@ export default function ChatView() {
         localMember?.status === "left"));
   const composerTooltip = directPendingOutbound
     ? "Waiting for contact to accept request."
-    : directRecovering
-      ? "Secure chat setup is still syncing."
+    : conversationRecovering
+      ? "Secure chat needs recovery before sending."
     : directClosed
     ? directClosedReason
     : dissolved
@@ -291,6 +296,23 @@ export default function ChatView() {
     }
   };
 
+  const handleRecoverConversation = async () => {
+    if (!conversationId) return;
+    setRecoveryBusy(true);
+    setRecoveryError(null);
+    try {
+      await invoke("recover_conversation", { conversationId });
+      if (isGroup && activeConversation?.group_id) {
+        await refreshCurrentGroupSnapshot();
+      }
+      await refreshMessages();
+    } catch (err) {
+      setRecoveryError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
+
   const syncCurrentGroup = async (reason: string, showBusy = false) => {
     const groupId = activeConversation?.group_id;
     if (!groupId) return;
@@ -321,6 +343,7 @@ export default function ChatView() {
 
   useEffect(() => {
     setActiveConversation(conversationId ?? null);
+    setRecoveryError(null);
     return () => { setActiveConversation(null); };
   }, [conversationId, setActiveConversation]);
 
@@ -707,6 +730,8 @@ export default function ChatView() {
               <>
                 {dissolved ? (
                   <span className="text-red-500">Dissolved</span>
+                ) : conversationRecovering ? (
+                  <span className="text-yellow-500">Needs recovery</span>
                 ) : (
                   <>
                     <GroupSyncIndicator status={groupSyncStatus} compact />
@@ -728,6 +753,8 @@ export default function ChatView() {
               <>
                 {directPendingOutbound ? (
                   <span className="text-muted-color">Waiting for accept</span>
+                ) : conversationRecovering ? (
+                  <span className="text-yellow-500">Needs recovery</span>
                 ) : directClosed ? (
                   <span className="text-muted-color">
                     {activeConversation?.state === "archived" ? "Archived" : "Closed"}
@@ -772,6 +799,34 @@ export default function ChatView() {
           </button>
         </div>
       </header>
+
+      {conversationRecovery && (
+        <div className="border-b border-subtle bg-surface px-4 py-3">
+          <div className="mx-auto flex max-w-4xl flex-wrap items-center gap-3 text-sm">
+            <AlertTriangle size={16} className="shrink-0 text-yellow-500" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium text-primary-color">Secure chat needs recovery</div>
+              <div className="break-words text-muted-color">
+                {formatRecoveryMessage(
+                  conversationRecovery.restore_failure_reason,
+                  conversationRecovery.restore_failure_detail,
+                  conversationRecovery.last_error,
+                )}
+              </div>
+            </div>
+            <button
+              className="btn btn-secondary text-xs"
+              onClick={handleRecoverConversation}
+              disabled={recoveryBusy || conversationRecovery.recoverable === false}
+            >
+              {recoveryBusy ? "Recovering..." : "Recover"}
+            </button>
+            {recoveryError && (
+              <span className="basis-full text-error break-words">{recoveryError}</span>
+            )}
+          </div>
+        </div>
+      )}
 
       <div
         ref={messagesContainerRef}
@@ -841,6 +896,20 @@ export default function ChatView() {
               )}
             </>
           )}
+          {conversationRecovering && !pendingGroupSetup && (
+            <>
+              <button
+                className="btn btn-secondary text-xs"
+                onClick={handleRecoverConversation}
+                disabled={recoveryBusy || conversationRecovery?.recoverable === false}
+              >
+                {recoveryBusy ? "Recovering..." : "Recover"}
+              </button>
+              {recoveryError && (
+                <span className="basis-full text-error break-words">{recoveryError}</span>
+              )}
+            </>
+          )}
         </div>
       ) : (
         <MessageInput
@@ -867,6 +936,14 @@ export default function ChatView() {
       )}
     </div>
   );
+}
+
+function formatRecoveryMessage(reason?: string, detail?: string, lastError?: string): string {
+  const normalizedReason = reason?.replace(/_/g, " ");
+  if (normalizedReason && detail) {
+    return `${normalizedReason}: ${detail}`;
+  }
+  return normalizedReason || lastError || "Secure state could not be restored for this conversation.";
 }
 
 function mediaTypeFromMime(mimeType: string): MediaItem["type"] {

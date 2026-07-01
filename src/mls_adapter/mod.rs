@@ -107,6 +107,43 @@ pub struct RestoreMlsStateResult {
     pub adapter: Option<MlsAdapter>,
     pub summaries: BTreeMap<String, MlsStateSummary>,
     pub failed_conversation_ids: Vec<String>,
+    pub failures: Vec<RestoreMlsFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreMlsFailure {
+    pub conversation_id: String,
+    pub reason: String,
+    pub detail: Option<String>,
+    pub recoverable: bool,
+    pub suggested_action: String,
+}
+
+impl RestoreMlsFailure {
+    fn new(
+        conversation_id: impl Into<String>,
+        reason: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            conversation_id: conversation_id.into(),
+            reason: reason.into(),
+            detail,
+            recoverable: true,
+            suggested_action: "reconcile_conversation_membership".into(),
+        }
+    }
+}
+
+fn record_restore_failure(
+    failed_conversation_ids: &mut Vec<String>,
+    failures: &mut Vec<RestoreMlsFailure>,
+    failure: RestoreMlsFailure,
+) {
+    if !failed_conversation_ids.contains(&failure.conversation_id) {
+        failed_conversation_ids.push(failure.conversation_id.clone());
+    }
+    failures.push(failure);
 }
 
 pub struct MlsAdapter {
@@ -600,6 +637,7 @@ impl MlsAdapter {
 
         let mut parsed_states = Vec::new();
         let mut failed_conversation_ids = Vec::new();
+        let mut failures = Vec::new();
         let provider = OpenMlsRustCrypto::default();
         let mut template: Option<(SignatureKeyPair, CredentialWithKey, String, String)> = None;
 
@@ -609,13 +647,31 @@ impl MlsAdapter {
                     parsed_states.push((conversation_id.clone(), summary.clone()));
                     continue;
                 }
-                failed_conversation_ids.push(conversation_id.clone());
+                record_restore_failure(
+                    &mut failed_conversation_ids,
+                    &mut failures,
+                    RestoreMlsFailure::new(
+                        conversation_id,
+                        "missing_serialized_state",
+                        Some("persisted MLS summary has no serialized group state".into()),
+                    ),
+                );
                 continue;
             };
             let parsed: PersistedGroupState = match serde_json::from_str(serialized_state) {
                 Ok(parsed) => parsed,
-                Err(_) => {
-                    failed_conversation_ids.push(conversation_id.clone());
+                Err(error) => {
+                    record_restore_failure(
+                        &mut failed_conversation_ids,
+                        &mut failures,
+                        RestoreMlsFailure::new(
+                            conversation_id,
+                            "invalid_serialized_state",
+                            Some(format!(
+                                "failed to parse persisted MLS group state: {error}"
+                            )),
+                        ),
+                    );
                     continue;
                 }
             };
@@ -632,7 +688,18 @@ impl MlsAdapter {
                 if template_identity != &credential_identity
                     || template_device_id != &local_device_id
                 {
-                    failed_conversation_ids.push(conversation_id.clone());
+                    record_restore_failure(
+                        &mut failed_conversation_ids,
+                        &mut failures,
+                        RestoreMlsFailure::new(
+                            conversation_id,
+                            "identity_mismatch",
+                            Some(
+                                "persisted MLS group belongs to a different local identity or device"
+                                    .into(),
+                            ),
+                        ),
+                    );
                     continue;
                 }
             } else {
@@ -645,18 +712,61 @@ impl MlsAdapter {
             }
 
             {
+                let mut decoded_values = Vec::with_capacity(storage.values.len());
+                let mut storage_decode_failed = false;
+                for (key, value) in &storage.values {
+                    let decoded_key = match BASE64.decode(key) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            record_restore_failure(
+                                &mut failed_conversation_ids,
+                                &mut failures,
+                                RestoreMlsFailure::new(
+                                    conversation_id,
+                                    "invalid_storage_key",
+                                    Some(format!(
+                                        "persisted MLS storage key is not base64: {error}"
+                                    )),
+                                ),
+                            );
+                            storage_decode_failed = true;
+                            break;
+                        }
+                    };
+                    let decoded_value = match BASE64.decode(value) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            record_restore_failure(
+                                &mut failed_conversation_ids,
+                                &mut failures,
+                                RestoreMlsFailure::new(
+                                    conversation_id,
+                                    "invalid_storage_value",
+                                    Some(format!(
+                                        "persisted MLS storage value is not base64: {error}"
+                                    )),
+                                ),
+                            );
+                            storage_decode_failed = true;
+                            break;
+                        }
+                    };
+                    decoded_values.push((decoded_key, decoded_value));
+                }
+                if storage_decode_failed {
+                    continue;
+                }
                 let mut values = provider.storage().values.write().map_err(|_| {
                     CoreError::invalid_state("failed to write restored MLS provider storage")
                 })?;
-                for (key, value) in &storage.values {
-                    let decoded_key = BASE64.decode(key).map_err(|_| {
-                        CoreError::invalid_input("invalid persisted MLS storage key")
-                    })?;
-                    let decoded_value = BASE64.decode(value).map_err(|_| {
-                        CoreError::invalid_input("invalid persisted MLS storage value")
-                    })?;
-                    values.insert(decoded_key, decoded_value);
-                }
+                values.extend(decoded_values);
+            }
+
+            if failures
+                .iter()
+                .any(|failure| failure.conversation_id == *conversation_id)
+            {
+                continue;
             }
 
             parsed_states.push((conversation_id.clone(), summary.clone()));
@@ -672,6 +782,7 @@ impl MlsAdapter {
                 adapter: None,
                 summaries,
                 failed_conversation_ids,
+                failures,
             });
         };
 
@@ -691,21 +802,70 @@ impl MlsAdapter {
                 continue;
             }
             let group_id = GroupId::from_slice(conversation_id.as_bytes());
-            let Some(group) =
-                MlsGroup::load(adapter.provider.storage(), &group_id).map_err(|error| {
-                    CoreError::invalid_state(format!(
-                        "failed to load persisted MLS group state: {error}"
-                    ))
-                })?
-            else {
-                failed_conversation_ids.push(conversation_id.clone());
+            let group = match MlsGroup::load(adapter.provider.storage(), &group_id) {
+                Ok(Some(group)) => group,
+                Ok(None) => {
+                    record_restore_failure(
+                        &mut failed_conversation_ids,
+                        &mut failures,
+                        RestoreMlsFailure::new(
+                            &conversation_id,
+                            "missing_group_state",
+                            Some("persisted MLS provider storage has no matching group".into()),
+                        ),
+                    );
+                    summary.status = MlsStateStatus::NeedsRebuild;
+                    summaries.insert(conversation_id, summary);
+                    continue;
+                }
+                Err(error) => {
+                    record_restore_failure(
+                        &mut failed_conversation_ids,
+                        &mut failures,
+                        RestoreMlsFailure::new(
+                            &conversation_id,
+                            "load_group_state_failed",
+                            Some(format!("failed to load persisted MLS group state: {error}")),
+                        ),
+                    );
+                    summary.status = MlsStateStatus::NeedsRebuild;
+                    summaries.insert(conversation_id, summary);
+                    continue;
+                }
+            };
+
+            let member_device_ids = match extract_member_device_ids(&group) {
+                Ok(member_device_ids) => member_device_ids,
+                Err(error) => {
+                    record_restore_failure(
+                        &mut failed_conversation_ids,
+                        &mut failures,
+                        RestoreMlsFailure::new(
+                            &conversation_id,
+                            "extract_members_failed",
+                            Some(format!("failed to read MLS member devices: {error}")),
+                        ),
+                    );
+                    summary.status = MlsStateStatus::NeedsRebuild;
+                    summaries.insert(conversation_id, summary);
+                    continue;
+                }
+            };
+
+            if summary.status == MlsStateStatus::NeedsRebuild {
                 summary.status = MlsStateStatus::NeedsRebuild;
                 summaries.insert(conversation_id, summary);
                 continue;
-            };
+            }
 
-            let member_device_ids = extract_member_device_ids(&group)?;
             let status = summary.status;
+            let exported = MlsStateSummary {
+                conversation_id: conversation_id.clone(),
+                epoch: group.epoch().as_u64(),
+                member_device_ids: member_device_ids.iter().cloned().collect(),
+                status,
+                updated_at: group.epoch().as_u64(),
+            };
             adapter.groups.insert(
                 conversation_id.clone(),
                 LocalMlsState {
@@ -714,14 +874,14 @@ impl MlsAdapter {
                     status,
                 },
             );
-            let exported = adapter.export_group_summary(&conversation_id)?;
-            summaries.insert(conversation_id, MlsStateSummary { status, ..exported });
+            summaries.insert(conversation_id, exported);
         }
 
         Ok(RestoreMlsStateResult {
             adapter: Some(adapter),
             summaries,
             failed_conversation_ids,
+            failures,
         })
     }
 

@@ -251,6 +251,14 @@ pub struct PersistedRecoveryContext {
     pub identity_refresh_retry_count: u8,
     pub last_error: Option<String>,
     pub escalation_reason: Option<PersistedRecoveryEscalationReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_failure_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_recoverable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -932,6 +940,10 @@ mod tests {
                 identity_refresh_retry_count: 1,
                 last_error: None,
                 escalation_reason: None,
+                restore_failure_reason: None,
+                restore_failure_detail: None,
+                restore_recoverable: None,
+                suggested_action: None,
             }],
             realtime_sessions: vec![PersistedRealtimeSession {
                 device_id: identity.device_identity.device_id.clone(),

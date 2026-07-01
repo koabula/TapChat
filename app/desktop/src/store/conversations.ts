@@ -1,5 +1,10 @@
 import { create } from "zustand";
-import type { ConversationSummary, GroupCursor, GroupRole } from "../lib/types";
+import type {
+  ConversationSummary,
+  GroupCursor,
+  GroupRole,
+  RecoveryDiagnostics,
+} from "../lib/types";
 import type { GroupConversationSummary } from "../lib/tauri";
 
 export interface Conversation {
@@ -22,6 +27,7 @@ export interface Conversation {
   member_count: number | null;
   group_role: GroupRole | null;
   group_cursor: GroupCursor | null;
+  recovery: RecoveryDiagnostics | null;
   /**
    * Unix ms timestamp when the group was dissolved (owner-only atomic
    * seal, PLAN_GROUP Phase 6 / Wave A). `null` for active groups and
@@ -149,6 +155,7 @@ function mergeConversationState(
       member_count: conversation.member_count ?? prior?.member_count ?? null,
       group_role: conversation.group_role ?? prior?.group_role ?? null,
       group_cursor: conversation.group_cursor ?? prior?.group_cursor ?? null,
+      recovery: conversation.recovery ?? prior?.recovery ?? null,
       dissolved_at: conversation.dissolved_at ?? prior?.dissolved_at ?? null,
     };
   });
@@ -200,6 +207,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         member_count: conversation.member_count ?? null,
         group_role: conversation.group_role ?? null,
         group_cursor: conversation.group_cursor ?? null,
+        recovery: conversation.recovery ?? null,
         // `ConversationSummary` does not currently carry `dissolved_at`;
         // the `useCoreUpdate` hook fans out to `getGroupSnapshot` for
         // groups and merges the authoritative dissolved_at via the
@@ -243,6 +251,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           group_id: group.group_id,
           member_count: group.member_count,
           group_role: group.local_role,
+          recovery: conversation.recovery,
           dissolved_at: group.dissolved_at,
           // Surface the group state (active / dissolved / etc) so UI
           // components can branch on it without a separate fetch.
@@ -272,6 +281,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           member_count: group.member_count,
           group_role: group.local_role,
           group_cursor: null,
+          recovery: null,
           dissolved_at: group.dissolved_at,
         }));
       return { conversations: [...conversations, ...missingGroups] };
