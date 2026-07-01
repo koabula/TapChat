@@ -1,5 +1,7 @@
 import {
   HttpError,
+  APPEND_AUTH_CONTEXT_HEADER,
+  APPEND_AUTH_REASON_HEADER,
   readGroupCapabilityHeader,
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
@@ -21,6 +23,7 @@ import {
   type AllowlistDocument,
   type AppendGroupEnvelopeRequest,
   type AppendEnvelopeRequest,
+  type AuthorizeBlobDownloadRequest,
   type BootstrapDeviceRequest,
   type DeploymentBundle,
   type DeviceRuntimeAuth,
@@ -108,6 +111,15 @@ function baseUrl(request: Request, env: Env): string {
 
 function sharedStateSecret(env: Env): string {
   return env.SHARING_TOKEN_SECRET ?? "replace-me";
+}
+
+function downloadGrantTtlDays(env: Env): number {
+  const raw = env.ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS?.trim();
+  if (!raw) {
+    return 365;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : 365;
 }
 
 function bootstrapSecret(env: Env): string {
@@ -204,7 +216,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const store = new StorageService(
     new R2JsonBlobStore(env.TAPCHAT_STORAGE),
     baseUrl(request, env),
-    sharedStateSecret(env)
+    sharedStateSecret(env),
+    downloadGrantTtlDays(env)
   );
   const sharedState = new SharedStateService(new R2JsonBlobStore(env.TAPCHAT_STORAGE), baseUrl(request, env));
   const welcomePickup = new WelcomePickupService(new R2JsonBlobStore(env.TAPCHAT_STORAGE));
@@ -261,8 +274,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "POST" && operation === "messages") {
         const bodyText = await request.text();
         const body = JSON.parse(bodyText) as AppendEnvelopeRequest;
-        validateAppendAuthorization(request, deviceId, body, now);
-        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+        const appendAuth = await validateAppendAuthorization(request, deviceId, body, now, sharedState);
+        const forwarded = forwardRequestWithBody(request, bodyText);
+        forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, appendAuth.mode);
+        if (appendAuth.reason) {
+          forwarded.headers.set(APPEND_AUTH_REASON_HEADER, appendAuth.reason);
+        }
+        return await stub.fetch(forwarded);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_read", now);
       } else if (request.method === "POST" && operation === "ack") {
@@ -526,6 +544,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const body = (await request.json()) as PrepareBlobUploadRequest;
       const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
       return jsonResponse(result);
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/storage/authorize-download") {
+      const header = request.headers.get("Authorization")?.trim();
+      if (!header?.startsWith("Bearer ")) {
+        throw new HttpError(401, "invalid_capability", "missing download refresh grant");
+      }
+      const token = header.slice("Bearer ".length).trim();
+      if (!token) {
+        throw new HttpError(401, "invalid_capability", "download refresh grant must not be empty");
+      }
+      const body = (await request.json()) as AuthorizeBlobDownloadRequest;
+      if (body.version !== CURRENT_MODEL_VERSION) {
+        throw new HttpError(400, "unsupported_version", "authorize download version is not supported");
+      }
+      return jsonResponse(await store.authorizeDownload(body.blobRef, token, now));
     }
 
     const uploadMatch = url.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);

@@ -30,6 +30,7 @@ export interface Env {
   RETENTION_DAYS?: string;
   RATE_LIMIT_PER_MINUTE?: string;
   RATE_LIMIT_PER_HOUR?: string;
+  ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS?: string;
   SHARING_TOKEN_SECRET?: string;
   BOOTSTRAP_TOKEN_SECRET?: string;
 }

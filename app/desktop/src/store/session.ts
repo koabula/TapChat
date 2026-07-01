@@ -8,6 +8,7 @@ interface SessionState {
   userId: string | null;
   displayName: string | null;
   unlockError: string | null;
+  lockReason: string | null;
   setSessionState: (state: string) => void;
   setWsConnected: (connected: boolean) => void;
   setSyncInFlight: (syncInFlight: boolean) => void;
@@ -15,6 +16,7 @@ interface SessionState {
   setUserId: (userId: string | null) => void;
   setDisplayName: (displayName: string | null) => void;
   setUnlockError: (error: string | null) => void;
+  setLockReason: (reason: string | null) => void;
 }
 
 export const useSessionStore = create<SessionState>((set) => ({
@@ -25,6 +27,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   userId: null,
   displayName: null,
   unlockError: null,
+  lockReason: null,
   setSessionState: (state) => set({ sessionState: state }),
   setWsConnected: (connected) => set({ wsConnected: connected }),
   setSyncInFlight: (syncInFlight) => set({ syncInFlight }),
@@ -32,4 +35,5 @@ export const useSessionStore = create<SessionState>((set) => ({
   setUserId: (userId) => set({ userId }),
   setDisplayName: (displayName) => set({ displayName }),
   setUnlockError: (unlockError) => set({ unlockError }),
+  setLockReason: (lockReason) => set({ lockReason }),
 }));

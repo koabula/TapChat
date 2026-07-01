@@ -11,6 +11,9 @@
     "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
     "cleanup:cloudflare": "node scripts/cleanup-cloudflare.mjs"
   },
+  "dependencies": {
+    "@noble/curves": "^1.9.7"
+  },
   "devDependencies": {
     "@types/node": "^22.15.30",
     "esbuild": "^0.27.4",

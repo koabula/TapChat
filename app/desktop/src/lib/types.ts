@@ -413,6 +413,7 @@ export interface SessionStatus {
   ws_connected: boolean;
   profile_path?: string | null;
   error?: string | null;
+  lock_reason?: "profile_locked" | "snapshot_load_failed" | "restore_failed" | string | null;
 }
 
 // Realtime WebSocket event payload

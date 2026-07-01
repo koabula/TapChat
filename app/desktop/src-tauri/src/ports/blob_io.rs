@@ -222,7 +222,7 @@ pub async fn download_blob(download: BlobDownloadRequest) -> Result<Vec<CoreEven
                 }
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
-                    retryable: false,
+                    retryable: status == 403,
                     detail: Some(format!("HTTP {}", status)),
                 }])
             }

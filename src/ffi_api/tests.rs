@@ -3319,7 +3319,17 @@ mod tests {
                     blob_ref: "blob:attachment-1".into(),
                     upload_target: "upload:attachment-1".into(),
                     upload_headers: std::collections::BTreeMap::new(),
-                    download_target: Some("blob-download:attachment-1".into()),
+                    download_grant: Some(crate::transport_contract::BlobDownloadGrant {
+                        version: crate::model::CURRENT_MODEL_VERSION.into(),
+                        service: "storage".into(),
+                        action: "authorize_download".into(),
+                        blob_ref: "blob:attachment-1".into(),
+                        authorize_endpoint: "https://storage.example/v1/storage/authorize-download"
+                            .into(),
+                        token: "refresh-grant".into(),
+                        expires_at: 9_999,
+                    }),
+                    download_target: None,
                     expires_at: Some(99),
                 },
             })
@@ -3345,7 +3355,7 @@ mod tests {
                 .first()
                 .expect("storage ref")
                 .object_ref,
-            "blob-download:attachment-1"
+            "blob:attachment-1"
         );
         let outbox_item = alice
             .state
@@ -3363,19 +3373,48 @@ mod tests {
         assert_eq!(metadata.mime_type, "application/octet-stream");
         assert_eq!(metadata.file_name.as_deref(), Some("file.bin"));
         assert_eq!(metadata.size_bytes, 4);
+        assert_eq!(
+            metadata.download_grant.as_ref().map(|grant| grant.token.as_str()),
+            Some("refresh-grant")
+        );
 
         let download = alice
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id: conversation_id.clone(),
                 message_id: message_id.clone(),
-                reference: "blob-download:attachment-1".into(),
+                reference: "blob:attachment-1".into(),
                 destination: "cached/file.bin".into(),
             })
             .expect("download attachment from pending outbox metadata");
         assert!(download.effects.iter().any(|effect| matches!(
             effect,
+            CoreEffect::AuthorizeBlobDownload { authorize }
+                if authorize.blob_ref == "blob:attachment-1"
+                    && authorize.grant.token == "refresh-grant"
+        )));
+        let download_task_id = alice
+            .state
+            .pending_blob_downloads
+            .keys()
+            .next()
+            .cloned()
+            .expect("pending blob download");
+        let authorized = alice
+            .handle_event(CoreEvent::BlobDownloadAuthorized {
+                task_id: download_task_id,
+                result: crate::transport_contract::AuthorizeBlobDownloadResult {
+                    blob_ref: "blob:attachment-1".into(),
+                    download_target: "blob-download:short".into(),
+                    download_headers: std::collections::BTreeMap::new(),
+                    expires_at: Some(999),
+                },
+            })
+            .expect("blob download authorized");
+        assert!(authorized.effects.iter().any(|effect| matches!(
+            effect,
             CoreEffect::DownloadBlob { download }
-                if download.blob_ref == "blob-download:attachment-1"
+                if download.blob_ref == "blob:attachment-1"
+                    && download.download_target == "blob-download:short"
         )));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
@@ -4377,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_blob_upload_survives_snapshot_restore() {
+    fn prepared_blob_upload_without_download_grant_reprepares_after_snapshot_restore() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut engine, bob_bundle.user_id.clone());
@@ -4397,7 +4436,7 @@ mod tests {
             .expect("read attachment effect");
         let prepared_output = engine
             .handle_event(CoreEvent::AttachmentBytesLoaded {
-                task_id,
+                task_id: task_id.clone(),
                 plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
             })
             .expect("attachment bytes loaded");
@@ -4417,6 +4456,7 @@ mod tests {
                 blob_ref: "blob:prepared".into(),
                 upload_target: "upload:prepared".into(),
                 upload_headers: std::collections::BTreeMap::new(),
+                download_grant: None,
                 download_target: Some("download:prepared".into()),
                 expires_at: Some(42),
             });
@@ -4431,7 +4471,7 @@ mod tests {
 
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::UploadBlob { upload } if upload.upload_target == "upload:prepared"
+            CoreEffect::PrepareBlobUpload { upload } if upload.task_id == task_id
         )));
     }
 
@@ -6268,6 +6308,7 @@ mod tests {
                                     blob_ref,
                                     upload_target: "memory-upload".into(),
                                     upload_headers: BTreeMap::new(),
+                                    download_grant: None,
                                     download_target: Some(download_target),
                                     expires_at: Some(u64::MAX / 2),
                                 },
@@ -6287,6 +6328,24 @@ mod tests {
                                 task_id: upload.task_id,
                             })
                             .expect("blob uploaded")
+                    }
+                    CoreEffect::AuthorizeBlobDownload { authorize } => {
+                        let download_target = self
+                            .prepared_blob_downloads
+                            .get(&authorize.task_id)
+                            .cloned()
+                            .unwrap_or_else(|| authorize.blob_ref.clone());
+                        user.engine
+                            .handle_event(CoreEvent::BlobDownloadAuthorized {
+                                task_id: authorize.task_id,
+                                result: crate::transport_contract::AuthorizeBlobDownloadResult {
+                                    blob_ref: authorize.blob_ref,
+                                    download_target,
+                                    download_headers: BTreeMap::new(),
+                                    expires_at: Some(u64::MAX / 2),
+                                },
+                            })
+                            .expect("blob download authorized")
                     }
                     CoreEffect::DownloadBlob { download } => {
                         let blob_ciphertext = self.blobs.get(&download.download_target).cloned();
@@ -6835,6 +6894,7 @@ mod tests {
                 key_b64: STANDARD.encode([1_u8; 32]),
                 nonce_b64: STANDARD.encode([2_u8; 12]),
             },
+            download_grant: None,
         }
     }
 

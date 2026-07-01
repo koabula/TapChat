@@ -457,7 +457,30 @@ export interface PrepareBlobUploadResult {
   blobRef: string;
   uploadTarget: string;
   uploadHeaders: Record<string, string>;
+  downloadGrant?: BlobDownloadGrant;
   downloadTarget?: string;
+  expiresAt?: number;
+}
+
+export interface BlobDownloadGrant {
+  version: string;
+  service: "storage";
+  action: "authorize_download";
+  blobRef: string;
+  authorizeEndpoint: string;
+  token: string;
+  expiresAt: number;
+}
+
+export interface AuthorizeBlobDownloadRequest {
+  version: string;
+  blobRef: string;
+}
+
+export interface AuthorizeBlobDownloadResult {
+  blobRef: string;
+  downloadTarget: string;
+  downloadHeaders: Record<string, string>;
   expiresAt?: number;
 }
 
@@ -557,6 +580,7 @@ export interface IdentityBundle {
   userId: string;
   userPublicKey: string;
   devices: DeviceContactProfile[];
+  displayName?: string;
   bundleShareId?: string;
   identityBundleRef?: string;
   deviceStatusRef?: string;

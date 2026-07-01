@@ -8,7 +8,7 @@ use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::profile::ProfileSummary;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
-use crate::state::{AppState, SessionState};
+use crate::state::{AppState, LockReason, SessionState};
 
 #[tauri::command]
 pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileSummary>, String> {
@@ -90,6 +90,7 @@ pub async fn start_new_profile_onboarding(
             ws_connected: false,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
     );
 
@@ -159,6 +160,27 @@ pub async fn unlock_active_profile(
             .await
             .map_err(|e| e.to_string())?;
     }
+    reload_engine_from_profile(&app, &state).await
+}
+
+#[tauri::command]
+pub async fn retry_locked_profile_startup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    passphrase: Option<String>,
+) -> Result<(), String> {
+    let reason = {
+        let inner = state.inner.read().await;
+        match &inner.session {
+            SessionState::Locked { reason, .. } => *reason,
+            _ => return reload_engine_from_profile(&app, &state).await,
+        }
+    };
+
+    if matches!(reason, LockReason::ProfileLocked) {
+        return unlock_active_profile(app, state, passphrase.unwrap_or_default()).await;
+    }
+
     reload_engine_from_profile(&app, &state).await
 }
 
@@ -248,11 +270,23 @@ async fn reload_engine_from_profile(
                 .active_profile
                 .is_some()
         );
-        inner
-            .profile_manager
-            .load_snapshot()
-            .await
-            .map_err(|e| format!("Failed to load snapshot: {}", e))?
+        match inner.profile_manager.load_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let profile_path = inner.profile_manager.active_profile_root().await;
+                drop(inner);
+                let message = format!("Failed to load snapshot: {error}");
+                set_locked_session(
+                    app,
+                    state,
+                    profile_path,
+                    message.clone(),
+                    LockReason::SnapshotLoadFailed,
+                )
+                .await;
+                return Err(message);
+            }
+        }
     };
 
     log::info!(
@@ -285,9 +319,28 @@ async fn reload_engine_from_profile(
     log::info!("reload_engine_from_profile: device_id={}", device_id);
 
     // Step 5: Reinitialize engine from snapshot
+    let restored_engine = match CoreEngine::try_from_restored_state(snapshot) {
+        Ok(engine) => engine,
+        Err(error) => {
+            let profile_path = {
+                let inner = state.inner.read().await;
+                inner.profile_manager.active_profile_root().await
+            };
+            let message = format!("Failed to restore profile state: {error}");
+            set_locked_session(
+                app,
+                state,
+                profile_path,
+                message.clone(),
+                LockReason::RestoreFailed,
+            )
+            .await;
+            return Err(message);
+        }
+    };
     {
         let mut inner = state.inner.write().await;
-        inner.engine = CoreEngine::from_restored_state(snapshot);
+        inner.engine = restored_engine;
         inner.session = SessionState::Active {
             device_id: device_id.clone(),
         };
@@ -304,6 +357,7 @@ async fn reload_engine_from_profile(
             ws_connected: false,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
     );
 
@@ -331,4 +385,42 @@ async fn reload_engine_from_profile(
     log::info!("reload_engine_from_profile: completed successfully");
 
     Ok(())
+}
+
+async fn set_locked_session(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    profile_path: Option<std::path::PathBuf>,
+    error: String,
+    reason: LockReason,
+) {
+    {
+        let inner = state.inner.read().await;
+        if let Err(error) = inner.ports.realtime.close_all_silent().await {
+            log::warn!("Failed to close realtime after profile lock: {}", error);
+        }
+    }
+    {
+        let mut inner = state.inner.write().await;
+        inner.engine = CoreEngine::new();
+        inner.session = SessionState::Locked {
+            profile_path: profile_path.clone(),
+            error: error.clone(),
+            reason,
+        };
+        inner.profile_path = profile_path.clone();
+        inner.startup_phase = crate::state::StartupPhase::Ready;
+    }
+    set_ws_connection_snapshot(state, None, false).await;
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "locked".to_string(),
+            device_id: None,
+            ws_connected: false,
+            profile_path: profile_path.map(|path| path.to_string_lossy().to_string()),
+            error: Some(error),
+            lock_reason: Some(reason.as_str().to_string()),
+        },
+    );
 }

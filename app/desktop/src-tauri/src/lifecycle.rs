@@ -1,18 +1,18 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use std::time::Instant;
 use tauri::webview::WebviewWindowBuilder;
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WindowEvent};
 
 use tapchat_core::ffi_api::CoreViewModel;
-use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::execute_platform_effect;
 use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
 
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
-use crate::state::{AppState, SessionState, StartupPhase};
+use crate::state::{AppState, LockReason, SessionState, StartupPhase};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
 pub enum CoreInput {
@@ -46,6 +46,7 @@ pub async fn on_app_ready(app: &AppHandle) {
     log::info!("Session startup check: {:?}", startup_check);
 
     if let Some(unlock_error) = startup_check.unlock_error.clone() {
+        let lock_reason = lock_reason_from_startup(startup_check.lock_reason.as_deref());
         log::warn!(
             "Active profile is locked or failed to unlock: {}",
             unlock_error
@@ -55,6 +56,7 @@ pub async fn on_app_ready(app: &AppHandle) {
             inner.session = SessionState::Locked {
                 profile_path: startup_check.profile_path.clone(),
                 error: unlock_error.clone(),
+                reason: lock_reason,
             };
             inner.profile_path = startup_check.profile_path.clone();
             inner.startup_phase = StartupPhase::Ready;
@@ -71,6 +73,7 @@ pub async fn on_app_ready(app: &AppHandle) {
                     .as_ref()
                     .map(|path| path.to_string_lossy().to_string()),
                 error: Some(unlock_error),
+                lock_reason: Some(lock_reason.as_str().to_string()),
             },
         );
         if let Some(main_window) = app.get_webview_window("main") {
@@ -110,6 +113,7 @@ pub async fn on_app_ready(app: &AppHandle) {
             ws_connected: false,
             profile_path: None,
             error: None,
+            lock_reason: None,
         };
         drop(inner);
         set_ws_connection_snapshot(&state, None, false).await;
@@ -162,14 +166,26 @@ pub async fn on_app_ready(app: &AppHandle) {
             let inner = state.inner.read().await;
 
             // Load snapshot from active profile
-            let snapshot = inner
-                .profile_manager
-                .load_snapshot()
-                .await
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to load snapshot: {}", e);
-                    CorePersistenceSnapshot::default()
-                });
+            let snapshot = match inner.profile_manager.load_snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let error = format!("Failed to load snapshot: {error}");
+                    drop(inner);
+                    enter_locked_session(
+                        app,
+                        &state,
+                        startup_check.profile_path.clone(),
+                        error,
+                        LockReason::SnapshotLoadFailed,
+                    )
+                    .await;
+                    log::info!(
+                        "on_app_ready: total startup path completed in {}ms",
+                        startup_started_at.elapsed().as_millis()
+                    );
+                    return;
+                }
+            };
 
             // Get device_id from profile metadata
             let device_id = inner
@@ -198,11 +214,29 @@ pub async fn on_app_ready(app: &AppHandle) {
 
         // Initialize engine from snapshot
         let restore_engine_started_at = Instant::now();
+        let restored_engine = match CoreEngine::try_from_restored_state(snapshot) {
+            Ok(engine) => engine,
+            Err(error) => {
+                enter_locked_session(
+                    app,
+                    &state,
+                    startup_check.profile_path.clone(),
+                    format!("Failed to restore profile state: {error}"),
+                    LockReason::RestoreFailed,
+                )
+                .await;
+                log::info!(
+                    "on_app_ready: total startup path completed in {}ms",
+                    startup_started_at.elapsed().as_millis()
+                );
+                return;
+            }
+        };
         {
             let mut inner = state.inner.write().await;
 
             // Create engine from restored state
-            inner.engine = CoreEngine::from_restored_state(snapshot);
+            inner.engine = restored_engine;
 
             inner.session = SessionState::Active {
                 device_id: device_id.clone(),
@@ -231,6 +265,7 @@ pub async fn on_app_ready(app: &AppHandle) {
                 ws_connected: false,
                 profile_path: None,
                 error: None,
+                lock_reason: None,
             },
         );
 
@@ -285,6 +320,51 @@ fn determine_onboarding_step(
     } else {
         // Everything complete
         crate::state::OnboardingStep::Complete
+    }
+}
+
+fn lock_reason_from_startup(reason: Option<&str>) -> LockReason {
+    match reason {
+        Some("snapshot_load_failed") => LockReason::SnapshotLoadFailed,
+        Some("restore_failed") => LockReason::RestoreFailed,
+        _ => LockReason::ProfileLocked,
+    }
+}
+
+async fn enter_locked_session(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    profile_path: Option<PathBuf>,
+    error: String,
+    reason: LockReason,
+) {
+    {
+        let mut inner = state.inner.write().await;
+        inner.session = SessionState::Locked {
+            profile_path: profile_path.clone(),
+            error: error.clone(),
+            reason,
+        };
+        inner.profile_path = profile_path.clone();
+        inner.startup_phase = StartupPhase::Ready;
+    }
+    set_ws_connection_snapshot(state, None, false).await;
+    let _ = app.emit(
+        "session-status",
+        SessionStatus {
+            state: "locked".to_string(),
+            device_id: None,
+            ws_connected: false,
+            profile_path: profile_path.map(|path| path.to_string_lossy().to_string()),
+            error: Some(error),
+            lock_reason: Some(reason.as_str().to_string()),
+        },
+    );
+    if let Some(main_window) = app.get_webview_window("main") {
+        if let Err(error) = main_window.show() {
+            log::error!("Failed to show main window: {}", error);
+        }
+        let _ = main_window.set_focus();
     }
 }
 
@@ -510,6 +590,7 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
         ws_connected: false,
         profile_path: None,
         error: None,
+        lock_reason: None,
     };
 
     // Show main window and notify only that frontend so onboarding cannot route into the app shell.

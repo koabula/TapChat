@@ -1,12 +1,16 @@
+import { ed25519 } from "@noble/curves/ed25519";
 import type {
   AppendEnvelopeRequest,
   AppendGroupEnvelopeRequest,
   BootstrapToken,
+  DeviceBinding,
+  DeviceContactProfile,
   DeviceRuntimeScope,
   DeviceRuntimeToken,
   GroupCapability,
   GroupCapabilityOperation,
   GroupMessageType,
+  IdentityBundle,
   InboxAppendCapability,
   KeyPackageWriteToken,
   SharedStateWriteToken,
@@ -14,6 +18,7 @@ import type {
 } from "../types/contracts";
 import { CURRENT_MODEL_VERSION } from "../types/contracts";
 import { verifySharingPayload } from "../storage/sharing";
+import type { SharedStateService } from "../storage/shared-state";
 
 export class HttpError extends Error {
   readonly status: number;
@@ -41,16 +46,36 @@ export function getBearerToken(request: Request): string {
   return token;
 }
 
-export function validateAppendAuthorization(
+export interface AppendAuthContext {
+  mode: "verified" | "legacy_unverified";
+  reason?: string;
+}
+
+export async function validateAppendAuthorization(
   request: Request,
   deviceId: string,
   body: AppendEnvelopeRequest,
-  now: number
-): void {
-  const signature = getBearerToken(request);
+  now: number,
+  sharedState: SharedStateService
+): Promise<AppendAuthContext> {
+  if (body.version !== CURRENT_MODEL_VERSION) {
+    throw new HttpError(400, "unsupported_version", "append request version is not supported");
+  }
+  if (body.recipientDeviceId !== deviceId || body.envelope.recipientDeviceId !== deviceId) {
+    throw new HttpError(403, "invalid_capability", "recipient device does not match target inbox");
+  }
+
+  const authorization = request.headers.get("Authorization")?.trim();
   const capabilityHeader = request.headers.get("X-Tapchat-Capability");
-  if (!capabilityHeader) {
-    throw new HttpError(401, "invalid_capability", "missing X-Tapchat-Capability header");
+  if (!authorization || !capabilityHeader) {
+    return { mode: "legacy_unverified", reason: "missing_append_grant" };
+  }
+  if (!authorization.startsWith("Bearer ")) {
+    return { mode: "legacy_unverified", reason: "invalid_bearer" };
+  }
+  const signature = authorization.slice("Bearer ".length).trim();
+  if (!signature) {
+    return { mode: "legacy_unverified", reason: "invalid_bearer" };
   }
 
   let capability: InboxAppendCapability;
@@ -60,11 +85,11 @@ export function validateAppendAuthorization(
     throw new HttpError(400, "invalid_capability", "X-Tapchat-Capability is not valid JSON");
   }
 
-  if (body.version !== CURRENT_MODEL_VERSION || capability.version !== CURRENT_MODEL_VERSION) {
+  if (capability.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "append capability version is not supported");
   }
   if (capability.signature !== signature) {
-    throw new HttpError(403, "invalid_capability", "capability signature does not match bearer token");
+    return { mode: "legacy_unverified", reason: "bearer_mismatch" };
   }
   if (capability.service !== "inbox") {
     throw new HttpError(403, "invalid_capability", "capability service must be inbox");
@@ -80,10 +105,7 @@ export function validateAppendAuthorization(
     throw new HttpError(403, "invalid_capability", "capability endpoint does not match request path");
   }
   if (capability.expiresAt <= now) {
-    throw new HttpError(403, "capability_expired", "append capability is expired");
-  }
-  if (body.recipientDeviceId !== deviceId || body.envelope.recipientDeviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "recipient device does not match target inbox");
+    return { mode: "legacy_unverified", reason: "capability_expired" };
   }
   if (capability.conversationScope?.length && !capability.conversationScope.includes(body.envelope.conversationId)) {
     throw new HttpError(403, "invalid_capability", "conversation is outside capability scope");
@@ -92,6 +114,148 @@ export function validateAppendAuthorization(
   if (capability.constraints?.maxBytes !== undefined && size > capability.constraints.maxBytes) {
     throw new HttpError(413, "payload_too_large", "envelope exceeds capability size limit");
   }
+  const bundle = await sharedState.getIdentityBundle(capability.userId);
+  if (!bundle) {
+    return { mode: "legacy_unverified", reason: "identity_bundle_missing" };
+  }
+  if (!verifyIdentityBundle(bundle)) {
+    return { mode: "legacy_unverified", reason: "identity_bundle_invalid" };
+  }
+  if (bundle.userId !== capability.userId) {
+    return { mode: "legacy_unverified", reason: "identity_bundle_scope_mismatch" };
+  }
+  const device = bundle.devices.find((item) => item.deviceId === capability.targetDeviceId);
+  if (!device) {
+    return { mode: "legacy_unverified", reason: "device_missing" };
+  }
+  if (device.status !== "active") {
+    return { mode: "legacy_unverified", reason: "device_not_active" };
+  }
+  if (
+    device.deviceId !== capability.targetDeviceId ||
+    device.binding.userId !== bundle.userId ||
+    device.binding.deviceId !== device.deviceId ||
+    device.binding.devicePublicKey !== device.devicePublicKey ||
+    device.inboxAppendCapability.signature !== capability.signature
+  ) {
+    return { mode: "legacy_unverified", reason: "device_binding_mismatch" };
+  }
+  if (!verifyDeviceBinding(bundle.userPublicKey, device.binding)) {
+    return { mode: "legacy_unverified", reason: "device_binding_invalid" };
+  }
+  if (!verifyInboxAppendCapability(capability, device.devicePublicKey)) {
+    return { mode: "legacy_unverified", reason: "capability_signature_invalid" };
+  }
+  return { mode: "verified" };
+}
+
+export const APPEND_AUTH_CONTEXT_HEADER = "X-Tapchat-Append-Auth";
+export const APPEND_AUTH_REASON_HEADER = "X-Tapchat-Append-Auth-Reason";
+
+function capabilityPayload(capability: InboxAppendCapability): string {
+  const constraints = capability.constraints
+    ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}`
+    : "";
+  return [
+    capability.version,
+    rustCapabilityServiceDebug(capability.service),
+    capability.userId,
+    capability.targetDeviceId,
+    capability.endpoint,
+    rustCapabilityOperationsDebug(capability.operations),
+    (capability.conversationScope ?? []).join(","),
+    String(capability.expiresAt),
+    constraints
+  ].join("|");
+}
+
+function rustCapabilityServiceDebug(service: InboxAppendCapability["service"]): string {
+  return service === "inbox" ? "Inbox" : service;
+}
+
+function rustCapabilityOperationsDebug(operations: string[]): string {
+  return `[${operations.map((operation) => (operation === "append" ? "Append" : operation)).join(", ")}]`;
+}
+
+function bindingPayload(binding: DeviceBinding): string {
+  return `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`;
+}
+
+function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boolean): string {
+  const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
+  if (includeDisplayName) {
+    parts.push(bundle.displayName ?? "");
+  }
+  parts.push(
+    String(bundle.updatedAt),
+    bundle.bundleShareId ?? "",
+    bundle.identityBundleRef ?? "",
+    bundle.deviceStatusRef ?? "",
+    bundle.storageProfile?.baseUrl ?? "",
+    bundle.storageProfile?.profileRef ?? ""
+  );
+  for (const device of bundle.devices) {
+    parts.push(device.deviceId);
+    parts.push(device.devicePublicKey);
+    parts.push(device.binding.signature);
+    parts.push(device.inboxAppendCapability.signature);
+    parts.push(keyPackageRefValue(device));
+    parts.push(String(device.keypackageRef.expiresAt));
+  }
+  return parts.join("|");
+}
+
+function keyPackageRefValue(device: DeviceContactProfile): string {
+  const keypackage = device.keypackageRef as DeviceContactProfile["keypackageRef"] & { objectRef?: string };
+  return keypackage.ref ?? keypackage.objectRef ?? "";
+}
+
+function verifyIdentityBundle(bundle: IdentityBundle): boolean {
+  if (bundle.version !== CURRENT_MODEL_VERSION) {
+    return false;
+  }
+  return (
+    verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) ||
+    verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false))
+  );
+}
+
+function verifyDeviceBinding(userPublicKey: string, binding: DeviceBinding): boolean {
+  if (binding.version !== CURRENT_MODEL_VERSION) {
+    return false;
+  }
+  return verifyEd25519(userPublicKey, binding.signature, bindingPayload(binding));
+}
+
+function verifyInboxAppendCapability(capability: InboxAppendCapability, devicePublicKey: string): boolean {
+  return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
+}
+
+function verifyEd25519(publicKeyHex: string, signatureHex: string, payload: string): boolean {
+  try {
+    return ed25519.verify(hexToBytes(signatureHex), new TextEncoder().encode(payload), hexToBytes(publicKeyHex));
+  } catch {
+    return false;
+  }
+}
+
+function hexToBytes(input: string): Uint8Array {
+  const value = input.trim();
+  if (value.length % 2 !== 0) {
+    throw new Error("hex input must have even length");
+  }
+  if (!/^[0-9a-fA-F]*$/.test(value)) {
+    throw new Error("invalid hex input");
+  }
+  const output = new Uint8Array(value.length / 2);
+  for (let index = 0; index < value.length; index += 2) {
+    const byte = Number.parseInt(value.slice(index, index + 2), 16);
+    if (!Number.isFinite(byte)) {
+      throw new Error("invalid hex input");
+    }
+    output[index / 2] = byte;
+  }
+  return output;
 }
 
 export function readGroupCapabilityHeader(request: Request): GroupCapability {

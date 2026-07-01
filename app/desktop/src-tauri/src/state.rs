@@ -49,8 +49,27 @@ pub enum SessionState {
     Locked {
         profile_path: Option<PathBuf>,
         error: String,
+        reason: LockReason,
     },
     Quitting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockReason {
+    ProfileLocked,
+    SnapshotLoadFailed,
+    RestoreFailed,
+}
+
+impl LockReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockReason::ProfileLocked => "profile_locked",
+            LockReason::SnapshotLoadFailed => "snapshot_load_failed",
+            LockReason::RestoreFailed => "restore_failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -34,11 +34,11 @@ import { useNotifications } from "./hooks/useNotifications";
 import { waitForNonBootstrappingSessionStatus } from "./lib/sessionStartup";
 import { useThemeStore } from "./store/theme";
 
-import type { SessionStatus, RealtimeEventPayload } from "./lib/types";
+import type { ProfileSummary, SessionStatus, RealtimeEventPayload } from "./lib/types";
 import type { MessageRequestItem } from "./store/requests";
 
 function summarizeSessionStatus(status: SessionStatus): string {
-  return `state=${status.state} ws_connected=${status.ws_connected} device_id=${status.device_id ?? "none"} error=${status.error ?? "none"}`;
+  return `state=${status.state} ws_connected=${status.ws_connected} device_id=${status.device_id ?? "none"} lock_reason=${status.lock_reason ?? "none"} error=${status.error ?? "none"}`;
 }
 
 function summarizeRealtimeEvent(event: RealtimeEventPayload): string {
@@ -70,10 +70,12 @@ function isRuntimeAuthError(detail: string | undefined | null): boolean {
  * Hooks that use useNavigate() must be called here, inside BrowserRouter.
  */
 function AppInner({ startupError }: { startupError: string | null }) {
-  const { sessionState, unlockError } = useSessionStore();
+  const { sessionState, unlockError, lockReason } = useSessionStore();
   const [unlockPassphrase, setUnlockPassphrase] = useState("");
   const [unlocking, setUnlocking] = useState(false);
   const [unlockSubmitError, setUnlockSubmitError] = useState<string | null>(null);
+  const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
+  const [loadingProfiles, setLoadingProfiles] = useState(false);
 
   // Connect to core-update events
   useCoreUpdate();
@@ -108,49 +110,115 @@ function AppInner({ startupError }: { startupError: string | null }) {
   }
 
   if (sessionState === "locked") {
-    const handleUnlock = async () => {
+    const reasonLabel =
+      lockReason === "snapshot_load_failed"
+        ? "Profile data needs repair"
+        : lockReason === "restore_failed"
+          ? "Profile state could not be restored"
+          : "Profile locked";
+    const needsPassphrase = !lockReason || lockReason === "profile_locked";
+
+    const handleRetry = async () => {
       setUnlocking(true);
       setUnlockSubmitError(null);
       try {
-        await invoke("unlock_active_profile", { passphrase: unlockPassphrase });
+        await invoke("retry_locked_profile_startup", {
+          passphrase: unlockPassphrase || null,
+        });
       } catch (err) {
         setUnlockSubmitError(String(err));
       } finally {
         setUnlocking(false);
       }
     };
+    const handleShowProfiles = async () => {
+      setLoadingProfiles(true);
+      setUnlockSubmitError(null);
+      try {
+        setProfiles(await invoke<ProfileSummary[]>("list_profiles"));
+      } catch (err) {
+        setUnlockSubmitError(String(err));
+      } finally {
+        setLoadingProfiles(false);
+      }
+    };
+    const handleActivateProfile = async (profile: ProfileSummary) => {
+      setUnlocking(true);
+      setUnlockSubmitError(null);
+      try {
+        await invoke("activate_profile", {
+          path: profile.path,
+          passphrase: unlockPassphrase || null,
+        });
+      } catch (err) {
+        setUnlockSubmitError(String(err));
+      } finally {
+        setUnlocking(false);
+      }
+    };
+    const handleOnboarding = async () => {
+      setUnlockSubmitError(null);
+      try {
+        await invoke("start_new_profile_onboarding");
+      } catch (err) {
+        setUnlockSubmitError(String(err));
+      }
+    };
 
     return (
       <div className="flex h-full min-h-0 items-center justify-center bg-base p-8">
-        <div className="w-full max-w-sm space-y-4">
+        <div className="w-full max-w-md space-y-4">
           <div>
-            <h1 className="text-xl font-semibold text-primary-color">Profile locked</h1>
+            <h1 className="text-xl font-semibold text-primary-color">{reasonLabel}</h1>
             <p className="mt-2 text-sm text-secondary-color">
               {unlockError ?? "TapChat could not unlock the active profile."}
             </p>
           </div>
-          <input
-            className="input"
-            type="password"
-            placeholder="Profile passphrase"
-            value={unlockPassphrase}
-            onChange={(event) => setUnlockPassphrase(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && unlockPassphrase && !unlocking) {
-                void handleUnlock();
-              }
-            }}
-          />
+          {needsPassphrase && (
+            <input
+              className="input"
+              type="password"
+              placeholder="Profile passphrase"
+              value={unlockPassphrase}
+              onChange={(event) => setUnlockPassphrase(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && unlockPassphrase && !unlocking) {
+                  void handleRetry();
+                }
+              }}
+            />
+          )}
           {unlockSubmitError && (
             <div className="status-error text-sm">{unlockSubmitError}</div>
           )}
-          <button
-            className="btn btn-primary w-full"
-            disabled={unlocking || !unlockPassphrase}
-            onClick={handleUnlock}
-          >
-            {unlocking ? "Unlocking..." : "Unlock"}
-          </button>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              className="btn btn-primary"
+              disabled={unlocking || (needsPassphrase && !unlockPassphrase)}
+              onClick={handleRetry}
+            >
+              {unlocking ? "Retrying..." : needsPassphrase ? "Unlock" : "Retry"}
+            </button>
+            <button className="btn" disabled={loadingProfiles} onClick={handleShowProfiles}>
+              {loadingProfiles ? "Loading..." : "Switch Profile"}
+            </button>
+            <button className="btn" onClick={handleOnboarding}>New Profile</button>
+            <button className="btn" onClick={handleOnboarding}>Recover</button>
+          </div>
+          {profiles.length > 0 && (
+            <div className="space-y-2 border-t border-default pt-3">
+              {profiles.map((profile) => (
+                <button
+                  key={profile.path}
+                  className="btn w-full justify-start"
+                  disabled={unlocking}
+                  onClick={() => void handleActivateProfile(profile)}
+                >
+                  {profile.name}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -207,7 +275,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
 }
 
 function App() {
-  const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight, setUnlockError } = useSessionStore();
+  const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight, setUnlockError, setLockReason } = useSessionStore();
   const hydrateTheme = useThemeStore((s) => s.hydrateTheme);
   const handleSystemThemeChanged = useThemeStore((s) => s.handleSystemThemeChanged);
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
@@ -302,10 +370,9 @@ function App() {
       console.debug(`[App] session-status ${summarizeSessionStatus(event.payload)}`);
       setSessionState(event.payload.state);
       setUnlockError(event.payload.error ?? null);
+      setLockReason(event.payload.lock_reason ?? null);
       setWsConnected(event.payload.ws_connected);
-      if (event.payload.device_id) {
-        setDeviceId(event.payload.device_id);
-      }
+      setDeviceId(event.payload.device_id ?? null);
     });
 
     // Subscribe to profile switch events to track state
@@ -405,10 +472,9 @@ function App() {
         console.debug(`[App] initial session-status ${summarizeSessionStatus(status)}`);
         setSessionState(status.state);
         setUnlockError(status.error ?? null);
+        setLockReason(status.lock_reason ?? null);
         setWsConnected(status.ws_connected);
-        if (status.device_id) {
-          setDeviceId(status.device_id);
-        }
+        setDeviceId(status.device_id ?? null);
         setStatusResolved(true);
       })
       .catch((err) => {
@@ -426,7 +492,7 @@ function App() {
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight, setUnlockError]);
+  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight, setUnlockError, setLockReason]);
 
   return (
     <BrowserRouter>

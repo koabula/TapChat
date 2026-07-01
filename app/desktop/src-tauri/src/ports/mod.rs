@@ -26,17 +26,17 @@ use tapchat_core::transport_contract::json_case::{
 };
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest, CreateGroupInviteResult,
-    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
-    FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult,
-    GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult, GroupRealtimeSubscriptionRequest,
-    ListGroupJoinRequestsRequest, ListGroupJoinRequestsResult, MessageRequestActionRequest,
-    PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
-    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest, RevokeGroupInviteResult, SealGroupOutboxRequest,
-    SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
+    AuthorizeBlobDownloadRequest, BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest,
+    CreateGroupInviteResult, DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest,
+    FetchGroupInviteRequest, FetchGroupInviteResult, FetchGroupOutboxRequest,
+    FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest,
+    GetGroupJoinRequestStatusResult, GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult,
+    GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest, ListGroupJoinRequestsResult,
+    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
+    PutWelcomePickupRequest, PutWelcomePickupResult, RealtimeSubscriptionRequest,
+    ReplaceAllowlistRequest, RevokeGroupInviteRequest, RevokeGroupInviteResult,
+    SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -1184,6 +1184,20 @@ impl BlobIoPort for DesktopPlatformPorts {
         let app_handle = self.app_handle.clone();
 
         blob_io::upload_blob_with_progress(upload, app_handle, conversation_id).await
+    }
+
+    async fn authorize_blob_download(
+        &mut self,
+        authorize: AuthorizeBlobDownloadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let result = self
+            .transport
+            .authorize_blob_download(authorize.clone())
+            .await?;
+        Ok(vec![CoreEvent::BlobDownloadAuthorized {
+            task_id: authorize.task_id,
+            result,
+        }])
     }
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {

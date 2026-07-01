@@ -920,6 +920,7 @@ mod tests {
                         key_b64: base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
                         nonce_b64: base64::engine::general_purpose::STANDARD.encode([9_u8; 12]),
                     },
+                    download_grant: None,
                 },
                 retries: 1,
             }],

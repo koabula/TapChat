@@ -8,7 +8,8 @@ use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_stri
 use tapchat_core::ffi_api::{CoreEvent, HttpMethod, HttpRequestEffect};
 use tapchat_core::model::{Ack, IdentityBundle, InboxRecord};
 use tapchat_core::transport_contract::{
-    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, FetchIdentityBundleRequest,
+    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult,
+    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, FetchIdentityBundleRequest,
     GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
 };
 
@@ -448,6 +449,40 @@ impl DesktopTransport {
             serde_json::from_str(&snake_case_response).context("parse prepare result")?;
 
         Ok(result)
+    }
+
+    /// Exchange a long-lived encrypted download grant for a short-lived URL.
+    pub async fn authorize_blob_download(
+        &self,
+        request: AuthorizeBlobDownloadRequest,
+    ) -> Result<AuthorizeBlobDownloadResult> {
+        let body = serde_json::json!({
+            "version": request.grant.version.clone(),
+            "blob_ref": request.blob_ref.clone(),
+        });
+        let snake_case_body = serde_json::to_string(&body)?;
+        let body = to_camel_case_json_string(&snake_case_body)
+            .context("convert authorize download request to camelCase")?;
+
+        let response = self
+            .client
+            .post(&request.grant.authorize_endpoint)
+            .bearer_auth(&request.grant.token)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .context("authorize blob download")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("authorize download failed with status {}", status);
+        }
+
+        let response_text = response.text().await.context("read authorize result")?;
+        let snake_case_response = to_snake_case_json_string(&response_text)
+            .context("convert authorize result to snake_case")?;
+        serde_json::from_str(&snake_case_response).context("parse authorize result")
     }
 }
 

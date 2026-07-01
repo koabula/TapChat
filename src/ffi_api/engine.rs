@@ -37,14 +37,15 @@ use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
     AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
     AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
-    DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult,
-    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest,
-    GetGroupOutboxHeadRequest, GetHeadResult, GroupJoinDecision, ListGroupJoinRequestsRequest,
-    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
-    MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, BlobDownloadRequest,
+    BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, DeviceStatusDocument,
+    DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
+    FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchMessagesRequest, FetchMessagesResult, FetchWelcomePickupRequest,
+    FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GetHeadResult, GroupJoinDecision, ListGroupJoinRequestsRequest, MessageRequestAction,
+    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
+    PrepareBlobUploadRequest, PrepareBlobUploadResult,
     PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
     SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
@@ -295,6 +296,16 @@ impl CoreEngine {
     }
 
     pub fn from_restored_state(snapshot: CorePersistenceSnapshot) -> Self {
+        match Self::try_from_restored_state(snapshot) {
+            Ok(engine) => engine,
+            Err(error) => {
+                log::error!("failed to restore core state, starting empty engine: {error}");
+                Self::new()
+            }
+        }
+    }
+
+    pub fn try_from_restored_state(snapshot: CorePersistenceSnapshot) -> CoreResult<Self> {
         let restored_mls = MlsAdapter::restore_from_persisted_states(
             &snapshot
                 .mls_states
@@ -307,8 +318,7 @@ impl CoreEngine {
                     )
                 })
                 .collect::<Vec<_>>(),
-        )
-        .unwrap_or_default();
+        )?;
         let mut contacts = BTreeMap::new();
         for contact in snapshot.contacts {
             contacts.insert(
@@ -452,7 +462,8 @@ impl CoreEngine {
                             payload_metadata,
                             message_id,
                             metadata_ciphertext,
-                            prepared_upload,
+                            prepared_upload: prepared_upload
+                                .filter(|prepared| prepared.download_grant.is_some()),
                             retries,
                             in_flight: false,
                         },
@@ -476,6 +487,7 @@ impl CoreEngine {
                             reference,
                             destination_id,
                             payload_metadata,
+                            authorized_download: None,
                             retries,
                             in_flight: false,
                         },
@@ -685,7 +697,7 @@ impl CoreEngine {
             );
         }
 
-        engine
+        Ok(engine)
     }
 
     pub fn handle_command(&mut self, command: CoreCommand) -> CoreResult<CoreOutput> {
@@ -1005,6 +1017,9 @@ impl CoreEngine {
             } => self.handle_attachment_bytes_loaded(task_id, plaintext_b64),
             CoreEvent::BlobUploadPrepared { task_id, result } => {
                 self.handle_blob_upload_prepared(task_id, result)
+            }
+            CoreEvent::BlobDownloadAuthorized { task_id, result } => {
+                self.handle_blob_download_authorized(task_id, result)
             }
             CoreEvent::BlobUploaded { task_id } => self.handle_blob_uploaded(task_id),
             CoreEvent::BlobDownloaded {
@@ -4196,6 +4211,7 @@ impl CoreEngine {
                 reference,
                 destination_id: destination,
                 payload_metadata,
+                authorized_download: None,
                 retries: 0,
                 in_flight: false,
             },
@@ -8631,14 +8647,33 @@ impl CoreEngine {
             if task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
                 continue;
             }
-            effects.push(CoreEffect::DownloadBlob {
-                download: BlobDownloadRequest {
-                    task_id: task.task_id.clone(),
-                    blob_ref: task.reference.clone(),
-                    download_target: task.reference.clone(),
-                    download_headers: BTreeMap::new(),
-                },
-            });
+            if let Some(authorized) = task.authorized_download.clone() {
+                effects.push(CoreEffect::DownloadBlob {
+                    download: BlobDownloadRequest {
+                        task_id: task.task_id.clone(),
+                        blob_ref: authorized.blob_ref,
+                        download_target: authorized.download_target,
+                        download_headers: authorized.download_headers,
+                    },
+                });
+            } else if let Some(grant) = task.payload_metadata.download_grant.clone() {
+                effects.push(CoreEffect::AuthorizeBlobDownload {
+                    authorize: AuthorizeBlobDownloadRequest {
+                        task_id: task.task_id.clone(),
+                        blob_ref: task.reference.clone(),
+                        grant,
+                    },
+                });
+            } else {
+                effects.push(CoreEffect::DownloadBlob {
+                    download: BlobDownloadRequest {
+                        task_id: task.task_id.clone(),
+                        blob_ref: task.reference.clone(),
+                        download_target: task.reference.clone(),
+                        download_headers: BTreeMap::new(),
+                    },
+                });
+            }
             if let Some(entry) = self.state.pending_blob_downloads.get_mut(&task_id) {
                 entry.in_flight = true;
             }
@@ -9240,11 +9275,47 @@ impl CoreEngine {
         task_id: String,
         result: PrepareBlobUploadResult,
     ) -> CoreResult<CoreOutput> {
+        let (conversation_id, payload_metadata) = {
+            let task = self
+                .state
+                .pending_blob_uploads
+                .get(&task_id)
+                .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
+            (task.conversation_id.clone(), task.payload_metadata.clone())
+        };
+        let mut payload_metadata = payload_metadata;
+        let mut metadata_ciphertext = None;
+        if let Some(download_grant) = result.download_grant.clone() {
+            if let Some(mut metadata) = payload_metadata.take() {
+                metadata.download_grant = Some(download_grant);
+                let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "failed to encode attachment payload metadata: {error}"
+                    ))
+                })?;
+                let ciphertext = self
+                    .state
+                    .mls_adapter
+                    .as_mut()
+                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                    .encrypt_application(&conversation_id, metadata_json.as_bytes())?
+                    .payload_b64;
+                payload_metadata = Some(metadata);
+                metadata_ciphertext = Some(ciphertext);
+            }
+        }
+
         let task = self
             .state
             .pending_blob_uploads
             .get_mut(&task_id)
             .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
+        if let Some(metadata) = payload_metadata {
+            task.payload_metadata = Some(metadata);
+        }
+        if let Some(ciphertext) = metadata_ciphertext {
+            task.metadata_ciphertext = Some(ciphertext);
+        }
         task.prepared_upload = Some(result);
         task.in_flight = false;
         Ok(merge_outputs(
@@ -9262,6 +9333,26 @@ impl CoreEngine {
         ))
     }
 
+    fn handle_blob_download_authorized(
+        &mut self,
+        task_id: String,
+        result: AuthorizeBlobDownloadResult,
+    ) -> CoreResult<CoreOutput> {
+        let task = self
+            .state
+            .pending_blob_downloads
+            .get_mut(&task_id)
+            .ok_or_else(|| CoreError::invalid_input("unknown blob download task"))?;
+        if result.blob_ref != task.reference {
+            return Err(CoreError::invalid_input(
+                "authorized blob_ref does not match pending download reference",
+            ));
+        }
+        task.authorized_download = Some(result);
+        task.in_flight = false;
+        self.flush_pending_transport()
+    }
+
     fn handle_blob_uploaded(&mut self, task_id: String) -> CoreResult<CoreOutput> {
         let task = self
             .state
@@ -9271,12 +9362,16 @@ impl CoreEngine {
         let prepared = task.prepared_upload.ok_or_else(|| {
             CoreError::invalid_state("blob upload completed before upload target was prepared")
         })?;
-        let final_ref = prepared.download_target.clone().ok_or_else(|| {
-            CoreError::invalid_state("blob upload result is missing download target")
-        })?;
         let payload_metadata = task.payload_metadata.clone().ok_or_else(|| {
             CoreError::invalid_state("blob upload completed before payload metadata was prepared")
         })?;
+        let final_ref = if payload_metadata.download_grant.is_some() {
+            prepared.blob_ref.clone()
+        } else {
+            prepared.download_target.clone().ok_or_else(|| {
+                CoreError::invalid_state("blob upload result is missing download grant")
+            })?
+        };
         let payload_metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
             CoreError::invalid_input(format!(
                 "failed to encode attachment payload metadata: {error}"
@@ -9302,7 +9397,11 @@ impl CoreEngine {
                 .file_name
                 .clone()
                 .or_else(|| task.descriptor.file_name.clone()),
-            expires_at: prepared.expires_at,
+            expires_at: payload_metadata
+                .download_grant
+                .as_ref()
+                .map(|grant| grant.expires_at)
+                .or(prepared.expires_at),
         };
         if let Some(group_id) = task.group_id {
             let conversation_id = task.conversation_id.clone();
@@ -9396,6 +9495,7 @@ impl CoreEngine {
             size_bytes,
             file_name,
             encryption: encrypted.metadata,
+            download_grant: None,
         };
         let metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
             CoreError::invalid_input(format!(
@@ -9531,6 +9631,7 @@ impl CoreEngine {
         }
         if let Some(task) = self.state.pending_blob_downloads.get_mut(&task_id) {
             task.in_flight = false;
+            task.authorized_download = None;
             task.retries = task.retries.saturating_add(1);
             if retryable && task.retries < MAX_TRANSPORT_RETRIES {
                 return Ok(CoreOutput {

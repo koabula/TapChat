@@ -542,7 +542,7 @@ test("accepts append requests only with explicit capability header", async () =>
   });
 });
 
-test("rejects append requests without capability header", async () => {
+test("routes append requests without capability header to message requests", async () => {
   const { env } = createEnv();
   const response = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
@@ -556,7 +556,15 @@ test("rejects append requests without capability header", async () => {
     env
   );
 
-  assert.equal(response.status, 401);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 0,
+    deliveredTo: "message_request",
+    queuedAsRequest: true,
+    requestId: "request:user:alice"
+  });
 });
 
 test("enforces append conversation scope and payload size", async () => {
@@ -638,8 +646,10 @@ test("message requests stay out of inbox until accepted and reject blocks future
   assert.deepEqual(await allowlistedAppend.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 3,
-    deliveredTo: "inbox"
+    seq: 0,
+    deliveredTo: "message_request",
+    queuedAsRequest: true,
+    requestId: "request:user:alice"
   });
 
   const rejectList = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-3", "conv:alice:bob", "user:mallory"));
@@ -687,7 +697,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
     new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(token) }),
     env
   );
-  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 1 });
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
 
   const fetch = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", {
@@ -697,7 +707,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
   );
   const fetched = (await fetch.json()) as { version: string; records: Array<{ seq: number }> };
   assert.equal(fetched.version, CURRENT_MODEL_VERSION);
-  assert.deepEqual(fetched.records.map((record) => record.seq), [1]);
+  assert.deepEqual(fetched.records.map((record) => record.seq), []);
 
   const ack = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/ack", {
@@ -751,8 +761,10 @@ test("rate limit is per recipient sender pair and idempotent retries do not cons
   assert.deepEqual(await duplicate.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 1,
-    deliveredTo: "inbox"
+    seq: 0,
+    deliveredTo: "message_request",
+    queuedAsRequest: true,
+    requestId: "request:user:alice"
   });
 
   const limited = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-2", "conv:alice:bob", "user:alice"));
@@ -804,11 +816,18 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
   const prepared = (await prepare.json()) as {
     version: string;
     uploadTarget: string;
-    downloadTarget: string;
+    downloadTarget?: string;
+    downloadGrant: {
+      authorizeEndpoint: string;
+      token: string;
+      expiresAt: number;
+    };
     blobRef: string;
   };
   assert.equal(prepared.version, CURRENT_MODEL_VERSION);
   assert.equal(prepared.blobRef, "blob/user:bob/device:bob:phone/direct/direct/conv:alice:bob/msg:blob-task-1");
+  assert.equal(prepared.downloadTarget, undefined);
+  assert.ok(prepared.downloadGrant.token);
 
   const wrongSize = await handleRequest(
     new Request(prepared.uploadTarget, {
@@ -820,11 +839,19 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
   );
   assert.equal(wrongSize.status, 400);
 
+  const uploadToken = new URL(prepared.uploadTarget).searchParams.get("token");
+  assert.ok(uploadToken);
   const wrongAction = await handleRequest(
-    new Request(prepared.downloadTarget.replace("/blob/", "/upload/"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/octet-stream" },
-      body: new Uint8Array([1, 2, 3, 4])
+    new Request(prepared.downloadGrant.authorizeEndpoint, {
+      method: "POST",
+      headers: {
+        ...authHeaders(uploadToken),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        blobRef: prepared.blobRef
+      })
     }),
     env
   );
@@ -838,11 +865,51 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
     }),
     env
   );
-  const download = await handleRequest(new Request(prepared.downloadTarget), env);
 
   assert.equal(upload.status, 204);
+  const authorize = await handleRequest(
+    new Request(prepared.downloadGrant.authorizeEndpoint, {
+      method: "POST",
+      headers: {
+        ...authHeaders(prepared.downloadGrant.token),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        blobRef: prepared.blobRef
+      })
+    }),
+    env
+  );
+  assert.equal(authorize.status, 200);
+  const authorized = (await authorize.json()) as { downloadTarget: string; blobRef: string; expiresAt: number };
+  assert.equal(authorized.blobRef, prepared.blobRef);
+
+  const download = await handleRequest(new Request(authorized.downloadTarget), env);
   assert.equal(download.status, 200);
   assert.deepEqual(new Uint8Array(await download.arrayBuffer()), new Uint8Array([1, 2, 3, 4]));
+
+  const expiredRefreshToken = await signSharingPayload("secret", {
+    service: "storage",
+    action: "authorize_download",
+    blobKey: prepared.blobRef,
+    expiresAt: Date.now() - 1
+  });
+  const expiredRefresh = await handleRequest(
+    new Request(prepared.downloadGrant.authorizeEndpoint, {
+      method: "POST",
+      headers: {
+        ...authHeaders(expiredRefreshToken),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        blobRef: prepared.blobRef
+      })
+    }),
+    env
+  );
+  assert.equal(expiredRefresh.status, 403);
 
   const expiredToken = await signSharingPayload("secret", {
     action: "download",

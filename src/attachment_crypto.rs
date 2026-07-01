@@ -7,6 +7,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
+use crate::transport_contract::BlobDownloadGrant;
 
 pub const ATTACHMENT_CIPHER_ALGORITHM: &str = "aes_256_gcm";
 const ATTACHMENT_KEY_LEN: usize = 32;
@@ -25,6 +26,8 @@ pub struct AttachmentPayloadMetadata {
     pub size_bytes: u64,
     pub file_name: Option<String>,
     pub encryption: AttachmentCipherMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_grant: Option<BlobDownloadGrant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

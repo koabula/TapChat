@@ -7,14 +7,14 @@ use crate::ffi_api::{
     WriteDownloadedAttachmentEffect,
 };
 use crate::transport_contract::{
-    AppendGroupEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest,
-    DecideGroupJoinRequest, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
-    GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest, MessageRequestActionRequest,
-    PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    SealGroupOutboxRequest, SubmitGroupJoinRequest,
+    AppendGroupEnvelopeRequest, AuthorizeBlobDownloadRequest, BlobDownloadRequest,
+    BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
+    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest,
+    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest,
+    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
+    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, SealGroupOutboxRequest, SubmitGroupJoinRequest,
 };
 
 pub trait TransportPort {
@@ -172,6 +172,11 @@ pub trait BlobIoPort {
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>>;
 
+    async fn authorize_blob_download(
+        &mut self,
+        authorize: AuthorizeBlobDownloadRequest,
+    ) -> Result<Vec<CoreEvent>>;
+
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>>;
 
     async fn write_downloaded_attachment(
@@ -242,6 +247,9 @@ where
         CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,
         CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
         CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,
+        CoreEffect::AuthorizeBlobDownload { authorize } => {
+            ports.authorize_blob_download(authorize).await
+        }
         CoreEffect::DownloadBlob { download } => ports.download_blob(download).await,
         CoreEffect::WriteDownloadedAttachment { write } => {
             ports.write_downloaded_attachment(write).await
@@ -370,6 +378,14 @@ mod tests {
 
         async fn upload_blob(&mut self, _upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
             self.calls.push("upload_blob");
+            Ok(Vec::new())
+        }
+
+        async fn authorize_blob_download(
+            &mut self,
+            _authorize: AuthorizeBlobDownloadRequest,
+        ) -> Result<Vec<CoreEvent>> {
+            self.calls.push("authorize_blob_download");
             Ok(Vec::new())
         }
 

@@ -1,4 +1,4 @@
-import { HttpError } from "../auth/capability";
+import { APPEND_AUTH_CONTEXT_HEADER, APPEND_AUTH_REASON_HEADER, HttpError } from "../auth/capability";
 import { InboxService } from "./service";
 import type {
   AckRequest,
@@ -168,7 +168,13 @@ export async function handleInboxDurableRequest(
 
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = (await request.json()) as AppendEnvelopeRequest;
-      const result = await service.appendEnvelope(body, now);
+      const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified"
+        ? "legacy_unverified"
+        : "verified";
+      const result = await service.appendEnvelope(body, now, {
+        mode,
+        reason: request.headers.get(APPEND_AUTH_REASON_HEADER) ?? undefined
+      });
       return jsonResponse(result);
     }
 

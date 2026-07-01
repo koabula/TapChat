@@ -24,17 +24,17 @@ use crate::platform_ports::{
 };
 use crate::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    BlobDownloadRequest, BlobUploadRequest, CreateGroupInviteRequest, CreateGroupInviteResult,
-    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
-    FetchWelcomePickupResult, GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult,
-    GetGroupOutboxHeadRequest, GetGroupOutboxHeadResult, ListGroupJoinRequestsRequest,
-    ListGroupJoinRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
-    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
-    SubmitGroupJoinResult,
+    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, BlobDownloadRequest,
+    BlobUploadRequest, CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
+    DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupInviteResult,
+    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult, GetGroupOutboxHeadRequest,
+    GetGroupOutboxHeadResult, ListGroupJoinRequestsRequest, ListGroupJoinRequestsResult,
+    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
+    PutWelcomePickupRequest, PutWelcomePickupResult, RealtimeSubscriptionRequest,
+    ReplaceAllowlistRequest, RevokeGroupInviteRequest, RevokeGroupInviteResult,
+    SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
 };
 
 use super::util::{
@@ -958,6 +958,48 @@ impl CoreDriver {
         }
     }
 
+    async fn authorize_blob_download(
+        &self,
+        authorize: AuthorizeBlobDownloadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let body = serde_json::json!({
+            "version": authorize.grant.version.clone(),
+            "blob_ref": authorize.blob_ref.clone(),
+        });
+        let body = to_camel_case_json_string(&serde_json::to_string(&body)?)?;
+        let request = self
+            .runtime
+            .client
+            .post(&authorize.grant.authorize_endpoint)
+            .bearer_auth(&authorize.grant.token)
+            .header("Content-Type", "application/json")
+            .body(body);
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                let body = response.text().await?;
+                let result: AuthorizeBlobDownloadResult =
+                    serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+                Ok(vec![CoreEvent::BlobDownloadAuthorized {
+                    task_id: authorize.task_id,
+                    result,
+                }])
+            }
+            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: authorize.task_id,
+                retryable: false,
+                detail: Some(format!(
+                    "authorize download failed with status {}",
+                    response.status()
+                )),
+            }]),
+            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
+                task_id: authorize.task_id,
+                retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
     async fn download_blob(&self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
         let mut request = self.runtime.client.get(download.download_target.clone());
         for (key, value) in &download.download_headers {
@@ -971,11 +1013,14 @@ impl CoreDriver {
                     blob_ciphertext: Some(STANDARD.encode(&bytes)),
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: download.task_id,
-                retryable: false,
-                detail: Some(format!("download failed with status {}", response.status())),
-            }]),
+            Ok(response) => {
+                let status = response.status();
+                Ok(vec![CoreEvent::BlobTransferFailed {
+                    task_id: download.task_id,
+                    retryable: status.as_u16() == 403,
+                    detail: Some(format!("download failed with status {status}")),
+                }])
+            }
             Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: download.task_id,
                 retryable: true,
@@ -1732,6 +1777,13 @@ impl BlobIoPort for CoreDriver {
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
         CoreDriver::upload_blob(self, upload).await
+    }
+
+    async fn authorize_blob_download(
+        &mut self,
+        authorize: AuthorizeBlobDownloadRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::authorize_blob_download(self, authorize).await
     }
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {

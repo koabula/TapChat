@@ -388,9 +388,22 @@ pub struct PrepareBlobUploadResult {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub upload_headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_grant: Option<BlobDownloadGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobDownloadGrant {
+    pub version: String,
+    pub service: String,
+    pub action: String,
+    pub blob_ref: String,
+    pub authorize_endpoint: String,
+    pub token: String,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +423,23 @@ pub struct BlobDownloadRequest {
     pub download_target: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub download_headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizeBlobDownloadRequest {
+    pub task_id: String,
+    pub blob_ref: String,
+    pub grant: BlobDownloadGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizeBlobDownloadResult {
+    pub blob_ref: String,
+    pub download_target: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub download_headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

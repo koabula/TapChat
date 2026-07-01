@@ -46,6 +46,8 @@ pub struct SessionStartupCheck {
     pub profile_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlock_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_reason: Option<String>,
 }
 
 impl ProfileManager {
@@ -118,6 +120,16 @@ impl ProfileManager {
         self.inner.clone()
     }
 
+    pub async fn active_profile_root(&self) -> Option<PathBuf> {
+        let inner = self.inner.read().await;
+        inner
+            .active_profile
+            .as_ref()
+            .map(|profile| profile.root().to_path_buf())
+            .or_else(|| inner.locked_profile_path.clone())
+            .or_else(|| inner.registry.active_profile.clone())
+    }
+
     /// Create ProfileManager from an existing inner Arc.
     pub fn from_inner(inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
         Self { inner }
@@ -136,21 +148,36 @@ impl ProfileManager {
             .map(|p| p.metadata().user_id.is_some() && p.metadata().device_id.is_some())
             .unwrap_or(false);
 
+        let snapshot_result = profile.map(|p| p.load_snapshot());
+        let snapshot_load_error = match &snapshot_result {
+            Some(Err(error)) => Some(format!("Failed to load snapshot: {error}")),
+            _ => None,
+        };
         let has_runtime_binding = profile
             .map(|p| {
                 let runtime_bound = p
                     .load_runtime_metadata()
                     .map(|r| r.base_url.is_some() || r.public_base_url.is_some())
                     .unwrap_or(false);
-                let snapshot_bound = p
-                    .load_snapshot()
+                let snapshot_bound = snapshot_result
+                    .as_ref()
+                    .and_then(|result| result.as_ref().ok())
                     .map(|snapshot| snapshot.deployment.is_some())
                     .unwrap_or(false);
                 runtime_bound && snapshot_bound
             })
             .unwrap_or(false);
 
-        let needs_onboarding = unlock_error.is_none()
+        let startup_error = unlock_error.clone().or(snapshot_load_error);
+        let lock_reason = if unlock_error.is_some() {
+            Some("profile_locked".to_string())
+        } else if startup_error.is_some() {
+            Some("snapshot_load_failed".to_string())
+        } else {
+            None
+        };
+
+        let needs_onboarding = startup_error.is_none()
             && (!has_active_profile || !has_identity || !has_runtime_binding);
 
         SessionStartupCheck {
@@ -161,7 +188,8 @@ impl ProfileManager {
             profile_path: profile
                 .map(|p| p.root().to_path_buf())
                 .or(locked_profile_path),
-            unlock_error,
+            unlock_error: startup_error,
+            lock_reason,
         }
     }
 

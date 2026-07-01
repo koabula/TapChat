@@ -17,6 +17,8 @@ pub struct SessionStatus {
     pub profile_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_reason: Option<String>,
 }
 
 pub async fn set_ws_connection_snapshot(
@@ -52,6 +54,7 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             ws_connected: false,
             profile_path: None,
             error: None,
+            lock_reason: None,
         };
     }
 
@@ -62,6 +65,7 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             ws_connected: ws_snapshot.ws_connected,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
         SessionState::Onboarding { step } => SessionStatus {
             state: format!("onboarding:{:?}", step).to_lowercase(),
@@ -69,16 +73,19 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             ws_connected: ws_snapshot.ws_connected,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
         SessionState::Locked {
             profile_path,
             error,
+            reason,
         } => SessionStatus {
             state: "locked".into(),
             device_id: ws_snapshot.last_known_device_id,
             ws_connected: false,
             profile_path: profile_path.map(|path| path.to_string_lossy().to_string()),
             error: Some(error),
+            lock_reason: Some(reason.as_str().to_string()),
         },
         SessionState::Uninitialized => SessionStatus {
             state: "uninitialized".into(),
@@ -86,6 +93,7 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             ws_connected: ws_snapshot.ws_connected,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
         SessionState::Quitting => SessionStatus {
             state: "quitting".into(),
@@ -93,6 +101,7 @@ pub async fn read_session_status_snapshot(state: &AppState) -> SessionStatus {
             ws_connected: ws_snapshot.ws_connected,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
     }
 }
@@ -215,6 +224,7 @@ pub async fn stop_realtime_session(
             ws_connected: false,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
     );
 

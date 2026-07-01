@@ -297,6 +297,7 @@ pub fn run() {
             commands::profile::activate_profile,
             commands::profile::select_profile_for_restart,
             commands::profile::unlock_active_profile,
+            commands::profile::retry_locked_profile_startup,
             commands::profile::delete_profile,
             commands::profile::reload_engine,
             // Message Requests

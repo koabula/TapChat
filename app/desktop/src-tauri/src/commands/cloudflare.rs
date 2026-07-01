@@ -830,6 +830,7 @@ async fn restart_runtime_session_after_deploy(
             ws_connected: false,
             profile_path: None,
             error: None,
+            lock_reason: None,
         },
     );
     if let Ok(status) = cloudflare_status_impl(state).await {

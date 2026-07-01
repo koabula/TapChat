@@ -18,7 +18,8 @@ use crate::persistence::{
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest, BlobDownloadRequest,
+    AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest,
+    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, BlobDownloadRequest,
     BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
     FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
     FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest,
@@ -324,6 +325,10 @@ pub enum CoreEvent {
     BlobUploadPrepared {
         task_id: String,
         result: PrepareBlobUploadResult,
+    },
+    BlobDownloadAuthorized {
+        task_id: String,
+        result: AuthorizeBlobDownloadResult,
     },
     BlobUploaded {
         task_id: String,
@@ -646,6 +651,9 @@ pub enum CoreEffect {
     UploadBlob {
         upload: BlobUploadRequest,
     },
+    AuthorizeBlobDownload {
+        authorize: AuthorizeBlobDownloadRequest,
+    },
     DownloadBlob {
         download: BlobDownloadRequest,
     },
@@ -888,6 +896,8 @@ pub(crate) struct PendingBlobDownload {
     pub(crate) reference: String,
     pub(crate) destination_id: String,
     pub(crate) payload_metadata: AttachmentPayloadMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) authorized_download: Option<AuthorizeBlobDownloadResult>,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
 }

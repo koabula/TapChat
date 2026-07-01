@@ -1,4 +1,4 @@
-import { HttpError } from "../auth/capability";
+import { HttpError, type AppendAuthContext } from "../auth/capability";
 import type {
   AckRequest,
   AckResult,
@@ -90,7 +90,11 @@ export class InboxService {
     this.defaults = defaults;
   }
 
-  async appendEnvelope(input: AppendEnvelopeRequest, now: number): Promise<AppendEnvelopeResult> {
+  async appendEnvelope(
+    input: AppendEnvelopeRequest,
+    now: number,
+    authContext: AppendAuthContext = { mode: "verified" }
+  ): Promise<AppendEnvelopeResult> {
     this.validateAppendRequest(input);
 
     const existingResult = await this.state.get<AppendEnvelopeResult>(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`);
@@ -110,6 +114,12 @@ export class InboxService {
       };
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, rejected);
       return rejected;
+    }
+
+    if (authContext.mode !== "verified") {
+      const request = await this.queueMessageRequest(input, now);
+      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
+      return request;
     }
 
     if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
