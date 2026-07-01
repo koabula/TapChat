@@ -6442,6 +6442,15 @@ impl CoreEngine {
             &Self::membership_proof_payload(proof),
             &proof.signature,
         )?;
+        if !Self::manifest_has_active_device(
+            manifest,
+            &proof.signer_user_id,
+            &proof.signer_device_id,
+        ) {
+            return Err(CoreError::invalid_input(
+                "membership proof signer device is not active in the current group manifest",
+            ));
+        }
         if self.is_reflected_membership_proof(envelope, manifest, proof)? {
             return Ok(proof.clone());
         }
@@ -6580,33 +6589,39 @@ impl CoreEngine {
             log::warn!("rejected invalid manifest update for group {group_id}: {err}");
             return false;
         }
-        if let Some(proof) = record.envelope.membership_proof.as_ref() {
-            let manifest_hash = match Self::manifest_sha256(&updated) {
-                Ok(hash) => hash,
-                Err(err) => {
-                    log::warn!("failed to hash manifest update for group {group_id}: {err}");
-                    return false;
-                }
-            };
-            let commit_matches = if record.envelope.message_type
-                == GroupMessageType::ControlGroupMembershipChanged
-            {
+        let Some(proof) = record.envelope.membership_proof.as_ref() else {
+            log::warn!("rejected manifest update for group {group_id}: missing membership proof");
+            return false;
+        };
+        let manifest_hash = match Self::manifest_sha256(&updated) {
+            Ok(hash) => hash,
+            Err(err) => {
+                log::warn!("failed to hash manifest update for group {group_id}: {err}");
+                return false;
+            }
+        };
+        let commit_matches =
+            if record.envelope.message_type == GroupMessageType::ControlGroupMembershipChanged {
                 updated.last_commit_message_id.as_ref() == Some(&proof.commit_message_id)
             } else {
                 true
             };
-            if manifest_hash != proof.new_manifest_sha256
-                || updated.roster_version != proof.new_roster_version
-                || current_state.manifest.roster_version != proof.previous_roster_version
-                || !commit_matches
-            {
-                log::warn!(
-                    "rejected manifest update for group {group_id}: manifest transition does not match proof"
-                );
-                return false;
-            }
+        if manifest_hash != proof.new_manifest_sha256
+            || updated.roster_version != proof.new_roster_version
+            || current_state.manifest.roster_version != proof.previous_roster_version
+            || current_state.manifest.last_commit_message_id != proof.previous_commit_message_id
+            || !commit_matches
+        {
+            log::warn!(
+                "rejected manifest update for group {group_id}: manifest transition does not match proof"
+            );
+            return false;
         }
-        if !Self::validate_manifest_transition(&current_state.manifest, &updated) {
+        if !Self::validate_manifest_transition_for_operation(
+            &current_state.manifest,
+            &updated,
+            proof,
+        ) {
             log::warn!(
                 "rejected invalid manifest transition for group {group_id} at roster_version {} -> {}",
                 current_state.manifest.roster_version,
@@ -6648,6 +6663,18 @@ impl CoreEngine {
         true
     }
 
+    fn manifest_has_active_device(
+        manifest: &GroupManifest,
+        user_id: &str,
+        device_id: &str,
+    ) -> bool {
+        manifest.member_devices.iter().any(|device| {
+            device.user_id == user_id
+                && device.device_id == device_id
+                && device.status == GroupMemberStatus::Active
+        })
+    }
+
     fn validate_manifest_transition(old: &GroupManifest, new: &GroupManifest) -> bool {
         if old.group_id != new.group_id || old.conversation_id != new.conversation_id {
             return false;
@@ -6666,6 +6693,9 @@ impl CoreEngine {
             })
             .map(|member| member.role);
         if !matches!(signer_role, Some(GroupRole::Owner | GroupRole::Admin)) {
+            return false;
+        }
+        if !Self::manifest_has_active_device(old, &new.signer_user_id, &new.signer_device_id) {
             return false;
         }
         let active_count = |m: &GroupManifest| {
@@ -6697,6 +6727,325 @@ impl CoreEngine {
             return false;
         }
         true
+    }
+
+    fn validate_manifest_transition_for_operation(
+        old: &GroupManifest,
+        new: &GroupManifest,
+        proof: &GroupMembershipProof,
+    ) -> bool {
+        if !Self::validate_manifest_transition(old, new) {
+            return false;
+        }
+        if proof.signer_user_id != new.signer_user_id
+            || proof.signer_device_id != new.signer_device_id
+        {
+            return false;
+        }
+        match proof.operation.as_str() {
+            "create" => Self::manifest_transition_matches(old, new, |expected| {
+                expected.last_commit_message_id = new.last_commit_message_id.clone();
+            }),
+            "invite" | "approve_join" => {
+                Self::membership_additions_are_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.members = new.members.clone();
+                        expected.last_commit_message_id = new.last_commit_message_id.clone();
+                    })
+            }
+            "remove" => {
+                Self::member_removal_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.members = new.members.clone();
+                        expected.last_commit_message_id = new.last_commit_message_id.clone();
+                    })
+            }
+            "add_device" => {
+                Self::device_addition_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.member_devices = new.member_devices.clone();
+                        expected.last_commit_message_id = new.last_commit_message_id.clone();
+                    })
+            }
+            "remove_device" => {
+                Self::device_removal_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.member_devices = new.member_devices.clone();
+                        expected.last_commit_message_id = new.last_commit_message_id.clone();
+                    })
+            }
+            "update_metadata" => {
+                Self::metadata_update_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.title = new.title.clone();
+                        expected.join_policy = new.join_policy;
+                        expected.member_invite_policy = new.member_invite_policy;
+                    })
+            }
+            "set_admin" => {
+                Self::admin_update_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.members = new.members.clone();
+                        expected.admins = new.admins.clone();
+                    })
+            }
+            "transfer_ownership" => {
+                Self::ownership_transfer_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.owner_user_id = new.owner_user_id.clone();
+                        expected.members = new.members.clone();
+                        expected.admins = new.admins.clone();
+                    })
+            }
+            "dissolve" => {
+                Self::dissolve_transition_is_well_formed(old, new)
+                    && Self::manifest_transition_matches(old, new, |expected| {
+                        expected.members = new.members.clone();
+                        expected.last_commit_message_id = new.last_commit_message_id.clone();
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn manifest_transition_matches<F>(
+        old: &GroupManifest,
+        new: &GroupManifest,
+        apply_allowed_changes: F,
+    ) -> bool
+    where
+        F: FnOnce(&mut GroupManifest),
+    {
+        let mut expected = old.clone();
+        expected.roster_version = new.roster_version;
+        expected.mls_epoch_hint = new.mls_epoch_hint;
+        expected.updated_at = new.updated_at;
+        expected.signer_user_id = new.signer_user_id.clone();
+        expected.signer_device_id = new.signer_device_id.clone();
+        expected.signature = new.signature.clone();
+        apply_allowed_changes(&mut expected);
+        expected == *new
+    }
+
+    fn membership_additions_are_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if new.members.len() <= old.members.len() {
+            return false;
+        }
+        let old_members: BTreeMap<&str, &GroupMember> = old
+            .members
+            .iter()
+            .map(|member| (member.user_id.as_str(), member))
+            .collect();
+        let mut added = 0usize;
+        for member in &new.members {
+            match old_members.get(member.user_id.as_str()) {
+                Some(old_member) if **old_member == *member => {}
+                Some(_) => return false,
+                None => {
+                    if member.role != GroupRole::Member
+                        || member.status != GroupMemberStatus::Active
+                    {
+                        return false;
+                    }
+                    added = added.saturating_add(1);
+                }
+            }
+        }
+        added > 0
+    }
+
+    fn member_removal_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if old.members.len() != new.members.len() {
+            return false;
+        }
+        let mut removals = 0usize;
+        for old_member in &old.members {
+            let Some(new_member) = new
+                .members
+                .iter()
+                .find(|member| member.user_id == old_member.user_id)
+            else {
+                return false;
+            };
+            if old_member == new_member {
+                continue;
+            }
+            if old_member.role == new_member.role
+                && old_member.status == GroupMemberStatus::Active
+                && new_member.status == GroupMemberStatus::Removed
+                && old_member.role != GroupRole::Owner
+            {
+                removals = removals.saturating_add(1);
+                continue;
+            }
+            return false;
+        }
+        removals == 1
+    }
+
+    fn device_addition_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if old.members != new.members || new.member_devices.len() != old.member_devices.len() + 1 {
+            return false;
+        }
+        let mut added = 0usize;
+        for device in &new.member_devices {
+            if old.member_devices.contains(device) {
+                continue;
+            }
+            if device.status != GroupMemberStatus::Active
+                || !old.members.iter().any(|member| {
+                    member.user_id == device.user_id
+                        && member.status == GroupMemberStatus::Active
+                })
+            {
+                return false;
+            }
+            added = added.saturating_add(1);
+        }
+        added == 1
+    }
+
+    fn device_removal_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if old.members != new.members || old.member_devices.len() != new.member_devices.len() {
+            return false;
+        }
+        let mut removals = 0usize;
+        for old_device in &old.member_devices {
+            let Some(new_device) = new
+                .member_devices
+                .iter()
+                .find(|device| device.device_id == old_device.device_id)
+            else {
+                return false;
+            };
+            if old_device == new_device {
+                continue;
+            }
+            if old_device.user_id == new_device.user_id
+                && old_device.status == GroupMemberStatus::Active
+                && new_device.status == GroupMemberStatus::Removed
+            {
+                removals = removals.saturating_add(1);
+                continue;
+            }
+            return false;
+        }
+        removals == 1
+    }
+
+    fn metadata_update_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        old.title != new.title
+            || old.join_policy != new.join_policy
+            || old.member_invite_policy != new.member_invite_policy
+    }
+
+    fn admin_update_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if old.members.len() != new.members.len() {
+            return false;
+        }
+        let mut role_changes = 0usize;
+        for old_member in &old.members {
+            let Some(new_member) = new
+                .members
+                .iter()
+                .find(|member| member.user_id == old_member.user_id)
+            else {
+                return false;
+            };
+            if old_member == new_member {
+                continue;
+            }
+            if old_member.status == new_member.status
+                && old_member.status == GroupMemberStatus::Active
+                && old_member.role != GroupRole::Owner
+                && matches!(
+                    (old_member.role, new_member.role),
+                    (GroupRole::Member, GroupRole::Admin)
+                        | (GroupRole::Admin, GroupRole::Member)
+                )
+            {
+                role_changes = role_changes.saturating_add(1);
+                continue;
+            }
+            return false;
+        }
+        role_changes == 1
+    }
+
+    fn ownership_transfer_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if old.owner_user_id == new.owner_user_id || old.members.len() != new.members.len() {
+            return false;
+        }
+        let mut old_owner_changed = false;
+        let mut new_owner_changed = false;
+        for old_member in &old.members {
+            let Some(new_member) = new
+                .members
+                .iter()
+                .find(|member| member.user_id == old_member.user_id)
+            else {
+                return false;
+            };
+            if old_member == new_member {
+                continue;
+            }
+            if old_member.user_id == old.owner_user_id
+                && new_member.user_id == old.owner_user_id
+                && old_member.role == GroupRole::Owner
+                && new_member.role == GroupRole::Admin
+                && old_member.status == new_member.status
+                && new_member.status == GroupMemberStatus::Active
+            {
+                old_owner_changed = true;
+                continue;
+            }
+            if old_member.user_id == new.owner_user_id
+                && new_member.user_id == new.owner_user_id
+                && old_member.role != GroupRole::Owner
+                && new_member.role == GroupRole::Owner
+                && old_member.status == new_member.status
+                && new_member.status == GroupMemberStatus::Active
+            {
+                new_owner_changed = true;
+                continue;
+            }
+            return false;
+        }
+        old_owner_changed && new_owner_changed
+    }
+
+    fn dissolve_transition_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+        if old.members.len() != new.members.len() {
+            return false;
+        }
+        let mut removed_count = 0usize;
+        for old_member in &old.members {
+            let Some(new_member) = new
+                .members
+                .iter()
+                .find(|member| member.user_id == old_member.user_id)
+            else {
+                return false;
+            };
+            if old_member.user_id == old.owner_user_id {
+                if old_member != new_member {
+                    return false;
+                }
+                continue;
+            }
+            if old_member.status == GroupMemberStatus::Active
+                && new_member.status == GroupMemberStatus::Removed
+                && old_member.role == new_member.role
+            {
+                removed_count = removed_count.saturating_add(1);
+                continue;
+            }
+            if old_member == new_member {
+                continue;
+            }
+            return false;
+        }
+        removed_count > 0 || old.members.len() == 1
     }
 
     fn welcome_pickup_descriptor(
@@ -12225,6 +12574,7 @@ impl CoreEngine {
                 CoreError::invalid_input("welcome pickup result is missing group manifest")
             })?;
             manifest.validate()?;
+            self.verify_manifest_signature(&manifest)?;
             let local_identity = self
                 .state
                 .local_identity
@@ -12942,7 +13292,7 @@ mod group_membership_security_tests {
         GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest, GroupMember,
         GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
         GroupMessageType, GroupOutboxDescriptor, GroupRole, SenderProof, Validate,
-        CURRENT_MODEL_VERSION,
+        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
 
     fn base_manifest() -> GroupManifest {
@@ -13060,6 +13410,14 @@ mod group_membership_security_tests {
     }
 
     #[test]
+    fn group_membership_manifest_transition_rejects_signer_device_absent_from_manifest() {
+        let old = base_manifest();
+        let new = next_manifest("user:admin", "device:admin:unlisted");
+
+        assert!(!CoreEngine::validate_manifest_transition(&old, &new));
+    }
+
+    #[test]
     fn group_membership_manifest_transition_rejects_roster_rollback_or_skip() {
         let old = base_manifest();
         let mut rollback = next_manifest("user:admin", "device:admin:desktop");
@@ -13113,6 +13471,145 @@ mod group_membership_security_tests {
             let proof = control.membership_proof.as_ref().expect("test proof");
             assert!(CoreEngine::verify_membership_proof_message_binding(&control, proof).is_err());
         }
+    }
+
+    #[test]
+    fn group_membership_operation_rejects_delta_that_does_not_match_proof_operation() {
+        let old = base_manifest();
+        let mut new = next_manifest("user:admin", "device:admin:desktop");
+        new.member_devices.push(GroupMemberDevice {
+            user_id: "user:admin".into(),
+            device_id: "device:admin:tablet".into(),
+            status: GroupMemberStatus::Active,
+        });
+        let mut proof = proof();
+        proof.operation = "update_metadata".into();
+        proof.signer_user_id = new.signer_user_id.clone();
+        proof.signer_device_id = new.signer_device_id.clone();
+        proof.previous_roster_version = old.roster_version;
+        proof.new_roster_version = new.roster_version;
+        proof.previous_commit_message_id = old.last_commit_message_id.clone();
+        proof.commit_message_id = new.last_commit_message_id.clone().expect("commit id");
+
+        assert!(!CoreEngine::validate_manifest_transition_for_operation(
+            &old, &new, &proof
+        ));
+    }
+
+    #[test]
+    fn group_membership_operation_accepts_single_device_addition() {
+        let old = base_manifest();
+        let mut new = next_manifest("user:admin", "device:admin:desktop");
+        new.member_devices.push(GroupMemberDevice {
+            user_id: "user:member".into(),
+            device_id: "device:member:tablet".into(),
+            status: GroupMemberStatus::Active,
+        });
+        let mut proof = proof();
+        proof.operation = "add_device".into();
+        proof.signer_user_id = new.signer_user_id.clone();
+        proof.signer_device_id = new.signer_device_id.clone();
+        proof.previous_roster_version = old.roster_version;
+        proof.new_roster_version = new.roster_version;
+        proof.previous_commit_message_id = old.last_commit_message_id.clone();
+        proof.commit_message_id = new.last_commit_message_id.clone().expect("commit id");
+
+        assert!(CoreEngine::validate_manifest_transition_for_operation(
+            &old, &new, &proof
+        ));
+    }
+
+    #[test]
+    fn group_membership_operation_metadata_keeps_commit_chain_unchanged() {
+        let old = base_manifest();
+        let mut new = old.clone();
+        new.title = "Security Updated".into();
+        new.roster_version = old.roster_version + 1;
+        new.mls_epoch_hint = old.mls_epoch_hint;
+        new.updated_at = old.updated_at + 1;
+        new.signer_user_id = "user:admin".into();
+        new.signer_device_id = "device:admin:desktop".into();
+        new.signature = "manifest-sig-updated".into();
+        let mut proof = proof();
+        proof.operation = "update_metadata".into();
+        proof.signer_user_id = new.signer_user_id.clone();
+        proof.signer_device_id = new.signer_device_id.clone();
+        proof.previous_roster_version = old.roster_version;
+        proof.new_roster_version = new.roster_version;
+        proof.previous_commit_message_id = old.last_commit_message_id.clone();
+        proof.commit_message_id = old.last_commit_message_id.clone().expect("commit id");
+
+        assert!(CoreEngine::validate_manifest_transition_for_operation(
+            &old, &new, &proof
+        ));
+
+        let mut forged = new.clone();
+        forged.last_commit_message_id = Some("msg:commit:forged".into());
+        assert!(!CoreEngine::validate_manifest_transition_for_operation(
+            &old, &forged, &proof
+        ));
+    }
+
+    #[test]
+    fn welcome_pickup_rejects_manifest_with_invalid_signature_before_importing_shell() {
+        let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::CreateOrLoadIdentity {
+                mnemonic: None,
+                device_name: Some("desktop".into()),
+                display_name: None,
+            })
+            .expect("create identity");
+        let user_id = engine.local_identity_user_id().expect("local user");
+        let device_id = engine.local_identity_device_id().expect("local device");
+        let manifest = GroupManifest {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            group_id: "group:welcome-invalid-signature".into(),
+            conversation_id: "conv:welcome-invalid-signature".into(),
+            title: "Invalid Signature".into(),
+            owner_user_id: user_id.clone(),
+            admins: vec![],
+            members: vec![GroupMember {
+                user_id: user_id.clone(),
+                role: GroupRole::Owner,
+                status: GroupMemberStatus::Active,
+            }],
+            member_devices: vec![GroupMemberDevice {
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
+                status: GroupMemberStatus::Active,
+            }],
+            join_policy: GroupJoinPolicy::ApprovalRequired,
+            member_invite_policy: GroupMemberInvitePolicy::OwnerAdminOnly,
+            roster_version: 1,
+            mls_epoch_hint: 1,
+            last_commit_message_id: Some("msg:welcome:commit".into()),
+            outbox: GroupOutboxDescriptor {
+                endpoint: "https://example.test/groups/welcome-invalid-signature/outbox".into(),
+                subscribe_endpoint: None,
+            },
+            updated_at: 1,
+            signer_user_id: user_id,
+            signer_device_id: device_id.clone(),
+            signature: "00".repeat(64),
+        };
+        let descriptor = WelcomePickupDescriptor {
+            group_id: manifest.group_id.clone(),
+            device_id,
+            endpoint: "https://example.test/welcome".into(),
+            capability: "capability".into(),
+            expires_at: 999,
+        };
+
+        let error = engine
+            .handle_welcome_pickup_fetched(descriptor, "Zm9yZ2Vk".into(), Some(manifest))
+            .expect_err("invalid manifest signature must be rejected");
+
+        assert!(!error.to_string().is_empty());
+        assert!(!engine
+            .state
+            .group_states
+            .contains_key("group:welcome-invalid-signature"));
     }
 
     #[test]

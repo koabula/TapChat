@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useNavigate } from "react-router";
+import { AlertCircle } from "lucide-react";
 
 interface Device {
   device_id: string;
@@ -83,7 +84,7 @@ export default function Devices({ embedded = false }: DevicesProps) {
   const handleAddDevice = async () => {
     // This would initiate adding a new device
     // For now, show a message
-    alert("To add another device, install TapChat on that device and use your recovery phrase during setup.");
+    alert("Multi-device support is experimental. To add another device, install TapChat on that device and use your recovery phrase during setup.");
   };
 
   const formatLastActive = (timestamp: number | null) => {
@@ -156,6 +157,10 @@ export default function Devices({ embedded = false }: DevicesProps) {
 
             {/* Device list */}
             <h2 className="text-sm font-medium text-muted-color mb-2">Your Devices</h2>
+            <div className="mb-3 flex gap-2 rounded border border-aurora.yellow/40 bg-aurora.yellow/10 p-2 text-sm text-secondary-color">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 status-warning" aria-hidden="true" />
+              <p>Multi-device support is experimental.</p>
+            </div>
             <div className="space-y-2">
               {devices.map((device) => (
                 <div key={device.device_id} className="card flex items-center justify-between">
