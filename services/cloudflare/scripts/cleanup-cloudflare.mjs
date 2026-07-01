@@ -11,7 +11,7 @@ const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SERVICE_DIR = path.resolve(SCRIPT_DIR, "..");
 const WRANGLER_ENTRY = path.join(SERVICE_DIR, "node_modules", "wrangler", "bin", "wrangler.js");
 const NODE_COMMAND = process.execPath;
-const PREFIX = "tapchat-";
+const MATCH_TEXT = "tapchat";
 const YES_MODE = process.argv.includes("--yes");
 const CF_API_BASE = "https://api.cloudflare.com/client/v4";
 
@@ -34,6 +34,23 @@ function normalizeJsonOutput(output) {
 
 function logStep(message) {
   stdout.write(`${message}\n`);
+}
+
+function matchesTapChat(value) {
+  return String(value ?? "").toLowerCase().includes(MATCH_TEXT);
+}
+
+function encodePathSegment(value) {
+  return encodeURIComponent(value);
+}
+
+function encodeObjectKeyPath(objectKey) {
+  // Cloudflare R2 object delete API requires literal "/" separators in object keys.
+  return String(objectKey).split("/").map(encodePathSegment).join("/");
+}
+
+function sortedUnique(values) {
+  return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
 
 async function runCommand(command, args, options = {}) {
@@ -105,7 +122,7 @@ async function listBuckets() {
   return result.stdout
     .split(/\r?\n/)
     .map((line) => line.match(/^\s*name:\s+(.+?)\s*$/)?.[1] ?? null)
-    .filter((name) => typeof name === "string" && name.startsWith(PREFIX));
+    .filter((name) => typeof name === "string" && matchesTapChat(name));
 }
 
 function deriveWorkersFromBuckets(buckets) {
@@ -119,7 +136,7 @@ function deriveWorkersFromBuckets(buckets) {
       workers.add(bucket.slice(0, -"-storage".length));
     }
   }
-  return [...workers].filter((name) => name.startsWith(PREFIX));
+  return [...workers].filter(matchesTapChat);
 }
 
 async function deleteWorker(name) {
@@ -179,55 +196,160 @@ async function httpDelete(url, headers) {
   });
 }
 
-async function listBucketObjects(accountId, bucketName, apiToken) {
-  // Use Cloudflare R2 REST API to list objects
-  // API endpoint: GET https://api.cloudflare.com/client/v4/accounts/{account_id}/r2/buckets/{bucket_name}/objects
-  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${bucketName}/objects`;
+async function listWorkersViaApi(accountId, apiToken) {
+  if (!accountId || !apiToken) {
+    return [];
+  }
 
-  try {
+  const workers = [];
+  let page = 1;
+  const perPage = 100;
+
+  while (true) {
+    const url = new URL(`${CF_API_BASE}/accounts/${accountId}/workers/scripts`);
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("per_page", String(perPage));
+
     const response = await httpGet(url, {
       "Authorization": `Bearer ${apiToken}`,
     });
 
     if (response.status !== 200) {
-      // Bucket might be empty or not exist
-      return [];
+      return sortedUnique(workers);
     }
 
     const parsed = JSON.parse(response.body);
-    // Response format: { result: [...] }
-    const objects = parsed.result || [];
-    return objects.map(obj => obj.key || obj.name || obj);
-  } catch {
+    const scripts = Array.isArray(parsed.result) ? parsed.result : [];
+    workers.push(
+      ...scripts
+        .map((script) => script.id ?? script.name ?? script.script_name)
+        .filter(matchesTapChat)
+    );
+
+    const info = parsed.result_info;
+    if (!info || page >= info.total_pages || scripts.length === 0) {
+      break;
+    }
+    page++;
+  }
+
+  return sortedUnique(workers);
+}
+
+async function listBucketsViaApi(accountId, apiToken) {
+  if (!accountId || !apiToken) {
     return [];
   }
+
+  const buckets = [];
+  let cursor;
+
+  while (true) {
+    const url = new URL(`${CF_API_BASE}/accounts/${accountId}/r2/buckets`);
+    url.searchParams.set("name_contains", MATCH_TEXT);
+    url.searchParams.set("per_page", "1000");
+    if (cursor) {
+      url.searchParams.set("cursor", cursor);
+    }
+
+    const response = await httpGet(url, {
+      "Authorization": `Bearer ${apiToken}`,
+    });
+
+    if (response.status !== 200) {
+      return sortedUnique(buckets);
+    }
+
+    const parsed = JSON.parse(response.body);
+    const result = parsed.result ?? {};
+    const items = Array.isArray(result) ? result : result.buckets ?? [];
+    buckets.push(...items.map((bucket) => bucket.name ?? bucket).filter(matchesTapChat));
+
+    const nextCursor = result.cursor ?? parsed.result_info?.cursor;
+    if (!nextCursor || nextCursor === cursor || items.length === 0) {
+      break;
+    }
+    cursor = nextCursor;
+  }
+
+  return sortedUnique(buckets);
+}
+
+async function deleteWorkerViaApi(accountId, workerName, apiToken) {
+  if (!accountId || !apiToken) {
+    return false;
+  }
+
+  const url = `${CF_API_BASE}/accounts/${accountId}/workers/scripts/${encodePathSegment(workerName)}`;
+  const response = await httpDelete(url, {
+    "Authorization": `Bearer ${apiToken}`,
+  });
+
+  return response.status === 200 || response.status === 202 || response.status === 204 || response.status === 404;
+}
+
+async function listBucketObjects(accountId, bucketName, apiToken) {
+  const objects = [];
+  let cursor;
+  try {
+    while (true) {
+      const url = new URL(`${CF_API_BASE}/accounts/${accountId}/r2/buckets/${encodePathSegment(bucketName)}/objects`);
+      url.searchParams.set("per_page", "1000");
+      if (cursor) {
+        url.searchParams.set("cursor", cursor);
+      }
+
+      const response = await httpGet(url, {
+        "Authorization": `Bearer ${apiToken}`,
+      });
+
+      if (response.status !== 200) {
+        return objects;
+      }
+
+      const parsed = JSON.parse(response.body);
+      const result = parsed.result ?? {};
+      const pageObjects = Array.isArray(result) ? result : result.objects ?? result.items ?? [];
+      objects.push(...pageObjects.map(obj => obj.key ?? obj.name ?? obj).filter(Boolean));
+
+      const nextCursor = result.cursor ?? parsed.result_info?.cursor;
+      if (!nextCursor || nextCursor === cursor || pageObjects.length === 0) {
+        break;
+      }
+      cursor = nextCursor;
+    }
+  } catch {
+    return objects;
+  }
+  return objects;
 }
 
 async function deleteBucketObjectViaApi(accountId, bucketName, objectKey, apiToken) {
-  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${bucketName}/objects/${encodeURIComponent(objectKey)}`;
+  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${encodePathSegment(bucketName)}/objects/${encodeObjectKeyPath(objectKey)}`;
 
   const response = await httpDelete(url, {
     "Authorization": `Bearer ${apiToken}`,
   });
 
-  return response.status === 200 || response.status === 204;
+  return response.status === 200 || response.status === 204 || response.status === 404;
 }
 
 async function deleteBucketObject(accountId, bucketName, objectKey, apiToken) {
   // Prefer REST API for efficiency, fallback to wrangler CLI if API fails
   try {
     const success = await deleteBucketObjectViaApi(accountId, bucketName, objectKey, apiToken);
-    if (success) return;
+    if (success) return true;
   } catch {
     // Fallback to wrangler
   }
 
   // Fallback: Use wrangler r2 object delete command
-  await runCommand(
+  const result = await runCommand(
     NODE_COMMAND,
     wranglerArgs("r2", "object", "delete", `${bucketName}/${objectKey}`),
     { capture: true, allowFailure: true }
   );
+  return result.code === 0;
 }
 
 async function emptyBucket(accountId, bucketName, apiToken) {
@@ -254,7 +376,7 @@ async function emptyBucket(accountId, bucketName, apiToken) {
     for (let i = 0; i < objects.length; i += batchSize) {
       const batch = objects.slice(i, i + batchSize);
       const results = await Promise.allSettled(
-        batch.map(objectKey => deleteBucketObjectViaApi(accountId, bucketName, objectKey, apiToken))
+        batch.map(objectKey => deleteBucketObject(accountId, bucketName, objectKey, apiToken))
       );
       for (const result of results) {
         if (result.status === "fulfilled" && result.value) {
@@ -274,7 +396,7 @@ async function deleteBucket(name, accountId, apiToken) {
   await emptyBucket(accountId, name, apiToken);
 
   // Now delete the empty bucket via REST API
-  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${name}`;
+  const url = `${CF_API_BASE}/accounts/${accountId}/r2/buckets/${encodePathSegment(name)}`;
   const response = await httpDelete(url, {
     "Authorization": `Bearer ${apiToken}`,
   });
@@ -318,9 +440,14 @@ async function main() {
   }
 
   logStep("Listing TapChat R2 buckets...");
-  const buckets = await listBuckets();
-  const workers = deriveWorkersFromBuckets(buckets);
-  logStep(`Found ${workers.length} TapChat workers inferred from buckets and ${buckets.length} TapChat R2 buckets.`);
+  const cliBuckets = await listBuckets();
+  const apiBuckets = await listBucketsViaApi(accountId, apiToken);
+  const buckets = sortedUnique([...cliBuckets, ...apiBuckets]);
+
+  logStep("Listing TapChat workers...");
+  const apiWorkers = await listWorkersViaApi(accountId, apiToken);
+  const workers = sortedUnique([...deriveWorkersFromBuckets(buckets), ...apiWorkers]);
+  logStep(`Found ${workers.length} TapChat workers and ${buckets.length} TapChat R2 buckets.`);
 
   if (workers.length === 0 && buckets.length === 0) {
     stdout.write("No TapChat Cloudflare resources found.\n");
@@ -339,7 +466,13 @@ async function main() {
   for (const worker of workers) {
     try {
       stdout.write(`Deleting worker ${worker}\n`);
-      await deleteWorker(worker);
+      let deletedViaApi = false;
+      if (apiToken && accountId) {
+        deletedViaApi = await deleteWorkerViaApi(accountId, worker, apiToken);
+      }
+      if (!deletedViaApi) {
+        await deleteWorker(worker);
+      }
     } catch (error) {
       workerFailures.push({ worker, error: error instanceof Error ? error.message : String(error) });
     }
