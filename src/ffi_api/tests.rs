@@ -13,12 +13,12 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
-        ConversationKind, ConversationState, DeliveryClass, DeploymentBundle, DeviceRuntimeAuth,
-        Envelope, GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility,
-        GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus, GroupMemberStatus,
-        GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle,
-        InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
-        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
+        CapabilityService, ConversationKind, ConversationState, DeliveryClass, DeploymentBundle,
+        DeviceRuntimeAuth, Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
+        GroupMemberStatus, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
+        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
+        WakeHint, WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{
         ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp,
@@ -778,6 +778,15 @@ mod tests {
             alice.state.pending_group_seal.contains_key(&group_id),
             "the seal request must be staged before its effect is emitted"
         );
+        let ops = persist_ops(&dissolve);
+        assert!(
+            ops.iter().any(|op| matches!(
+                op,
+                PersistOp::SavePendingGroupSeal { group_id: saved_group_id }
+                    if saved_group_id == &group_id
+            )),
+            "staged seal must be persisted incrementally"
+        );
         assert!(
             !dissolve
                 .effects
@@ -889,6 +898,131 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, CoreEffect::SealGroupOutbox { .. })),
             "seal must be emitted once the final pending group append is acknowledged"
+        );
+    }
+
+    #[test]
+    fn group_append_ack_persists_local_state_before_seal_effect() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+
+        alice.state.pending_group_outbox.clear();
+        alice
+            .handle_command(CoreCommand::DissolveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("dissolve");
+
+        let pending_ids: Vec<String> = alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| item.envelope.group_id == group_id)
+            .map(|item| item.envelope.message_id.clone())
+            .collect();
+        assert!(
+            !pending_ids.is_empty(),
+            "dissolve must stage append records before seal"
+        );
+
+        let mut last_output = None;
+        for (index, message_id) in pending_ids.iter().enumerate() {
+            last_output = Some(
+                alice
+                    .handle_event(CoreEvent::GroupEnvelopeAppended {
+                        group_id: group_id.clone(),
+                        message_id: message_id.clone(),
+                        seq: (index as u64) + 1,
+                    })
+                    .expect("ack group append"),
+            );
+        }
+        let output = last_output.expect("final append ack");
+        let persist_index = first_persist_effect_index(&output).expect("persist effect");
+        let seal_index = output
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, CoreEffect::SealGroupOutbox { .. }))
+            .expect("seal effect");
+        assert!(
+            persist_index < seal_index,
+            "local cleanup/message persistence must precede seal effect"
+        );
+
+        let ops = persist_ops(&output);
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, PersistOp::DeleteOutgoingGroupEnvelope { .. })));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, PersistOp::SaveConversation { .. })));
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, PersistOp::DeletePendingGroupSeal { .. })),
+            "pending seal must remain durable until seal ack succeeds"
+        );
+    }
+
+    #[test]
+    fn app_started_reissues_persisted_group_seal_after_outbox_drained() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+        alice.state.pending_group_outbox.clear();
+        let local_bundle = alice.local_bundle().expect("local bundle");
+        let capability = GroupCapability {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            service: CapabilityService::GroupOutbox,
+            group_id: group_id.clone(),
+            user_id: local_bundle.user_id.clone(),
+            device_id: local_bundle.devices[0].device_id.clone(),
+            operations: vec![GroupCapabilityOperation::SealGroup],
+            role: GroupRole::Owner,
+            expires_at: 999,
+            signature: "sig".into(),
+        };
+        alice.state.pending_group_seal.insert(
+            group_id.clone(),
+            SealGroupOutboxRequest {
+                group_id: group_id.clone(),
+                capability,
+            },
+        );
+
+        let output = alice
+            .handle_event(CoreEvent::AppStarted)
+            .expect("app started");
+
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::SealGroupOutbox { seal } if seal.group_id == group_id
+        )));
+        assert!(
+            !alice.state.pending_group_seal.contains_key(&group_id),
+            "seal is consumed in memory to avoid duplicate sends in this process"
         );
     }
 

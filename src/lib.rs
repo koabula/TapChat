@@ -9,6 +9,7 @@ pub mod ffi_api;
 pub(crate) mod fs_util;
 pub mod identity;
 pub mod local_store;
+pub(crate) mod log_sanitize;
 pub mod logging;
 pub mod mls_adapter;
 pub mod model;

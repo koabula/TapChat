@@ -12,6 +12,9 @@ use tapchat_core::transport_contract::{
     GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
 };
 
+use crate::platform::log_sanitize::{
+    redact_id, sanitize_url_for_log as sanitize_shared_url_for_log,
+};
 use crate::platform::profile::ProfileManagerInner;
 use crate::timetest;
 
@@ -21,29 +24,7 @@ fn looks_like_json(s: &str) -> bool {
 }
 
 fn sanitize_url_for_log(raw: &str) -> String {
-    let Ok(url) = url::Url::parse(raw) else {
-        return raw.split('?').next().unwrap_or(raw).to_string();
-    };
-
-    let mut path = url.path().to_string();
-    if let Some(prefix) = path.strip_prefix("/v1/contact-share/") {
-        if !prefix.is_empty() {
-            path = "/v1/contact-share/<redacted>".into();
-        }
-    }
-
-    let mut sanitized = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
-    if let Some(port) = url.port() {
-        sanitized.push(':');
-        sanitized.push_str(&port.to_string());
-    }
-    sanitized.push_str(&path);
-
-    if url.query().is_some() {
-        sanitized.push_str("?<redacted>");
-    }
-
-    sanitized
+    sanitize_shared_url_for_log(raw)
 }
 
 /// HTTP transport implementation for desktop app.
@@ -199,6 +180,7 @@ impl DesktopTransport {
     ) -> Result<AppendEnvelopeResult> {
         let start = std::time::Instant::now();
         let msg_id = request.envelope.message_id.clone();
+        let msg_ref = redact_id("msg", &msg_id);
         let base_url = self
             .get_base_url()
             .await
@@ -210,7 +192,7 @@ impl DesktopTransport {
             urlencoding::encode(&request.recipient_device_id)
         );
 
-        timetest!("append_begin msg_id={} ts={}", msg_id, crate::ts_ms());
+        timetest!("append_begin msg_id={} ts={}", msg_ref, crate::ts_ms());
 
         let body = serde_json::to_string(&request)?;
         let response = self
@@ -225,21 +207,20 @@ impl DesktopTransport {
         let status = response.status();
         let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
             timetest!(
                 "append_done msg_id={} status={} error=1 elapsed_ms={} ts={}",
-                msg_id,
+                msg_ref,
                 status,
                 elapsed_ms,
                 crate::ts_ms()
             );
-            anyhow::bail!("append failed: {} - {}", status, error_body);
+            anyhow::bail!("append failed with status {}", status);
         }
 
         let result: AppendEnvelopeResult = response.json().await.context("parse append result")?;
         timetest!(
             "append_done msg_id={} seq={} status={} elapsed_ms={} ts={}",
-            msg_id,
+            msg_ref,
             result.seq,
             status,
             elapsed_ms,
@@ -256,6 +237,7 @@ impl DesktopTransport {
         limit: u64,
     ) -> Result<(u64, Vec<InboxRecord>)> {
         let start = std::time::Instant::now();
+        let device_ref = redact_id("device", device_id);
         let base_url = self
             .get_base_url()
             .await
@@ -271,7 +253,7 @@ impl DesktopTransport {
 
         timetest!(
             "fetch_begin device_id={} from_seq={} limit={} ts={}",
-            device_id,
+            device_ref,
             from_seq,
             limit,
             crate::ts_ms()
@@ -287,22 +269,21 @@ impl DesktopTransport {
         let status = response.status();
         let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
             timetest!(
                 "fetch_done device_id={} status={} error=1 elapsed_ms={} ts={}",
-                device_id,
+                device_ref,
                 status,
                 elapsed_ms,
                 crate::ts_ms()
             );
-            anyhow::bail!("fetch failed: {} - {}", status, error_body);
+            anyhow::bail!("fetch failed with status {}", status);
         }
 
         let result: FetchMessagesResult = response.json().await.context("parse fetch result")?;
         let record_count = result.records.len();
         timetest!(
             "fetch_done device_id={} from_seq={} to_seq={} records={} elapsed_ms={} ts={}",
-            device_id,
+            device_ref,
             from_seq,
             result.to_seq,
             record_count,
@@ -337,8 +318,7 @@ impl DesktopTransport {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("ack failed: {} - {}", status, error_body);
+            anyhow::bail!("ack failed with status {}", status);
         }
 
         response.json().await.context("parse ack result")
@@ -347,6 +327,7 @@ impl DesktopTransport {
     /// Get inbox head sequence.
     pub async fn get_head(&self, device_id: &str) -> Result<u64> {
         let start = std::time::Instant::now();
+        let device_ref = redact_id("device", device_id);
         let base_url = self
             .get_base_url()
             .await
@@ -360,7 +341,7 @@ impl DesktopTransport {
 
         timetest!(
             "get_head_begin device_id={} ts={}",
-            device_id,
+            device_ref,
             crate::ts_ms()
         );
 
@@ -374,21 +355,20 @@ impl DesktopTransport {
         let status = response.status();
         let elapsed_ms = start.elapsed().as_millis();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
             timetest!(
                 "get_head_done device_id={} status={} error=1 elapsed_ms={} ts={}",
-                device_id,
+                device_ref,
                 status,
                 elapsed_ms,
                 crate::ts_ms()
             );
-            anyhow::bail!("get head failed: {} - {}", status, error_body);
+            anyhow::bail!("get head failed with status {}", status);
         }
 
         let result: GetHeadResult = response.json().await.context("parse head result")?;
         timetest!(
             "get_head_done device_id={} head_seq={} elapsed_ms={} ts={}",
-            device_id,
+            device_ref,
             result.head_seq,
             elapsed_ms,
             crate::ts_ms()
@@ -414,8 +394,7 @@ impl DesktopTransport {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("fetch bundle failed: {} - {}", status, error_body);
+            anyhow::bail!("fetch bundle failed with status {}", status);
         }
 
         let body = response.text().await.context("read identity bundle")?;
@@ -458,8 +437,7 @@ impl DesktopTransport {
 
         let status = response.status();
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_default();
-            anyhow::bail!("prepare upload failed: {} - {}", status, error_body);
+            anyhow::bail!("prepare upload failed with status {}", status);
         }
 
         // Convert camelCase response back to snake_case for Rust
@@ -484,15 +462,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_url_for_log_redacts_tokens_and_queries() {
+    fn sanitize_url_for_log_redacts_host_path_ids_and_queries() {
         let sanitized = sanitize_url_for_log(
             "https://example.com/v1/contact-share/secret-token?last_acked_seq=3",
         );
 
-        assert_eq!(
-            sanitized,
-            "https://example.com/v1/contact-share/<redacted>?<redacted>"
-        );
+        assert!(sanitized.starts_with("https://<host:"));
+        assert!(sanitized.ends_with("/v1/contact-share/<redacted>"));
+        assert!(!sanitized.contains("example.com"));
         assert!(!sanitized.contains("secret-token"));
         assert!(!sanitized.contains("last_acked_seq=3"));
     }

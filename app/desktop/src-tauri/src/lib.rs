@@ -41,6 +41,31 @@ pub fn ts_ms() -> u128 {
         .as_millis()
 }
 
+#[cfg(feature = "gui")]
+fn prune_old_log_files(logs_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+        .unwrap_or(std::time::UNIX_EPOCH);
+
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Emit a `[TIMETEST]` log line. No-op when debug mode is off.
 #[macro_export]
 macro_rules! timetest {
@@ -131,6 +156,11 @@ pub fn run() {
 
     // Determine log file name based on profile (multi-instance mode)
     let log_file_name = config.profile_name.as_ref().map(|n| format!("{}.log", n));
+    let log_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("TapChat")
+        .join("logs");
+    prune_old_log_files(&log_dir);
 
     let builder = builder.plugin(tauri_plugin_notification::init());
     #[cfg(feature = "gui")]
@@ -142,13 +172,10 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
-                .max_file_size(100_000_000) // ~100 MB — effectively disable rotation
+                .max_file_size(10_000_000)
                 .targets([tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::Folder {
-                        path: dirs::data_local_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
-                            .join("TapChat")
-                            .join("logs"),
+                        path: log_dir,
                         file_name: log_file_name,
                     },
                 )])

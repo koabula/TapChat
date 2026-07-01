@@ -18,6 +18,7 @@ use tapchat_core::transport_contract::{
 
 use crate::commands::session::set_ws_connection_snapshot;
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::ProfileManagerInner;
 use crate::state::AppState;
 use crate::timetest;
@@ -157,10 +158,11 @@ impl RealtimeManager {
     ) -> Result<Vec<CoreEvent>> {
         let device_id = subscription.device_id.clone();
         let endpoint = subscription.endpoint.clone();
+        let device_ref = redact_id("device", &device_id);
 
         log::info!(
             "RealtimeManager::open_connection: device_id={}, endpoint={}, last_acked_seq={}",
-            device_id,
+            device_ref,
             summarize_endpoint(&endpoint),
             subscription.last_acked_seq
         );
@@ -169,7 +171,7 @@ impl RealtimeManager {
             ConnectionReservation::Existing => {
                 log::debug!(
                     "RealtimeManager: reusing active or connecting session for device_id={}",
-                    device_id
+                    device_ref
                 );
                 return Ok(Vec::new());
             }
@@ -188,7 +190,10 @@ impl RealtimeManager {
         // Step 3: Build WebSocket URL
         let ws_url = self.build_ws_url(&endpoint, &device_id, subscription.last_acked_seq)?;
 
-        log::info!("RealtimeManager: built ws_url={}", ws_url);
+        log::info!(
+            "RealtimeManager: built ws_url={}",
+            sanitize_url_for_log(&ws_url)
+        );
 
         // Step 6: Create request with headers
         let mut request = Request::builder()
@@ -226,10 +231,9 @@ impl RealtimeManager {
                 }
                 let detail = format!("websocket connect: {}", error);
                 log::warn!(
-                    "RealtimeManager: websocket connect failed device_id={} endpoint={} error={}",
-                    device_id,
-                    summarize_endpoint(&endpoint),
-                    detail
+                    "RealtimeManager: websocket connect failed device_id={} endpoint={} error=connect_failed",
+                    device_ref,
+                    summarize_endpoint(&endpoint)
                 );
                 if let Some(app) = &self.app_handle {
                     set_ws_connection_snapshot(
@@ -256,10 +260,14 @@ impl RealtimeManager {
 
         log::info!(
             "RealtimeManager: WebSocket connected for device_id={}, connection_id={}",
-            device_id,
+            device_ref,
             connection_id.as_str()
         );
-        timetest!("ws_connected device_id={} ts={}", device_id, crate::ts_ms());
+        timetest!(
+            "ws_connected device_id={} ts={}",
+            device_ref,
+            crate::ts_ms()
+        );
 
         // Step 8: Emit WebSocketConnected to frontend
         if let Some(app) = &self.app_handle {
@@ -407,10 +415,11 @@ impl RealtimeManager {
     ) -> Result<Vec<CoreEvent>> {
         let group_id = subscription.group_id.clone();
         let endpoint = subscription.endpoint.clone();
+        let group_ref = redact_id("group", &group_id);
 
         log::info!(
             "RealtimeManager::open_group_connection: group_id={}, endpoint={}, last_seq={}",
-            group_id,
+            group_ref,
             summarize_endpoint(&endpoint),
             subscription.last_seq
         );
@@ -422,7 +431,7 @@ impl RealtimeManager {
                 if session.endpoint == endpoint && (session.connecting || session.connected) {
                     log::debug!(
                         "RealtimeManager: reusing active or connecting group session for group_id={}",
-                        group_id
+                        group_ref
                     );
                     return Ok(vec![CoreEvent::GroupWebSocketConnected { group_id }]);
                 }
@@ -474,7 +483,10 @@ impl RealtimeManager {
             format!("{url}?last_seq={}", subscription.last_seq)
         };
 
-        log::info!("RealtimeManager: built group ws_url={}", ws_url);
+        log::info!(
+            "RealtimeManager: built group ws_url={}",
+            sanitize_url_for_log(&ws_url)
+        );
 
         // Create request with group capability header
         let capability_json = to_camel_case_json_string(
@@ -513,9 +525,8 @@ impl RealtimeManager {
                 }
                 let detail = format!("group websocket connect: {}", error);
                 log::warn!(
-                    "RealtimeManager: group websocket connect failed group_id={} error={}",
-                    group_id,
-                    detail
+                    "RealtimeManager: group websocket connect failed group_id={} error=connect_failed",
+                    group_ref
                 );
                 if let Some(app) = &self.app_handle {
                     let _ = app.emit(
@@ -596,6 +607,7 @@ impl RealtimeManager {
         app_handle: Option<Arc<AppHandle>>,
     ) {
         let (mut write, mut read) = ws_stream.split();
+        let group_ref = redact_id("group", &group_id);
 
         loop {
             tokio::select! {
@@ -671,7 +683,7 @@ impl RealtimeManager {
                                     });
                                 }
                             } else {
-                                log::warn!("Group WS event failed to parse for {}: {}", group_id, text);
+                                log::warn!("Group WS event failed to parse for {}", group_ref);
                             }
                         }
                         Some(Ok(Message::Ping(data))) => {
@@ -710,7 +722,7 @@ impl RealtimeManager {
                             break;
                         }
                         Some(Err(e)) => {
-                            log::error!("Group WS error for {}: {:?}", group_id, e);
+                            log::error!("Group WS error for {}: {:?}", group_ref, e);
 
                             let should_emit = {
                                 let mut sessions_guard = sessions.write().await;
@@ -764,7 +776,7 @@ impl RealtimeManager {
                 log::info!(
                     "RealtimeManager: marking existing connection {} as stale for device_id={}",
                     existing.connection_id.as_str(),
-                    device_id
+                    redact_id("device", device_id)
                 );
                 existing.stale = true;
                 existing.connecting = false;
@@ -829,6 +841,7 @@ impl RealtimeManager {
         app_handle: Option<Arc<AppHandle>>,
     ) {
         let (mut write, mut read) = ws_stream.split();
+        let device_ref = redact_id("device", &device_id);
 
         loop {
             tokio::select! {
@@ -894,11 +907,11 @@ impl RealtimeManager {
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("?");
                                         timetest!("ws_recv device_id={} seq={} msg_id={} event=inbox_record_available ts={}",
-                                            device_id, seq, msg_id, crate::ts_ms());
+                                            device_ref, seq, redact_id("msg", msg_id), crate::ts_ms());
                                     }
                                     WsServerEvent::HeadUpdated { seq, .. } => {
                                         timetest!("ws_recv device_id={} seq={} event=head_updated ts={}",
-                                            device_id, seq, crate::ts_ms());
+                                            device_ref, seq, crate::ts_ms());
                                     }
                                     WsServerEvent::MessageRequestChanged { .. } => {}
                                     WsServerEvent::GroupHeadUpdated { .. } => {}
@@ -915,7 +928,7 @@ impl RealtimeManager {
                                     });
                                 }
                             } else {
-                                log::warn!("WS event failed to parse for {}: {}", device_id, text);
+                                log::warn!("WS event failed to parse for {}", device_ref);
                             }
                         }
                         Some(Ok(Message::Ping(data))) => {
@@ -961,8 +974,8 @@ impl RealtimeManager {
                             break;
                         }
                         Some(Err(e)) => {
-                            log::error!("WS error for {}: {:?}", device_id, e);
-                            timetest!("ws_error device_id={} error={:?} ts={}", device_id, e, crate::ts_ms());
+                            log::error!("WS error for {}: {:?}", device_ref, e);
+                            timetest!("ws_error device_id={} error=1 ts={}", device_ref, crate::ts_ms());
 
                             // Only emit error if this connection is still active
                             let should_emit = {
@@ -1010,11 +1023,7 @@ impl RealtimeManager {
 }
 
 fn summarize_endpoint(endpoint: &str) -> String {
-    let Ok(parsed) = url::Url::parse(endpoint) else {
-        return "<invalid-endpoint>".into();
-    };
-    let host = parsed.host_str().unwrap_or_default();
-    format!("{host}{}", parsed.path())
+    sanitize_url_for_log(endpoint)
 }
 
 /// Event payload sent to frontend via Tauri event.
@@ -1070,12 +1079,13 @@ fn group_core_event_from_ws_event(
 }
 
 fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
+    let device_ref = redact_id("device", device_id);
     match event {
         WsServerEvent::HeadUpdated { seq, .. } => {
-            format!("device_id={device_id} type=head_updated seq={seq}")
+            format!("device_id={device_ref} type=head_updated seq={seq}")
         }
         WsServerEvent::InboxRecordAvailable { seq, .. } => {
-            format!("device_id={device_id} type=inbox_record_available seq={seq}")
+            format!("device_id={device_ref} type=inbox_record_available seq={seq}")
         }
         WsServerEvent::MessageRequestChanged {
             sender_user_id,
@@ -1083,23 +1093,35 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
             change,
             ..
         } => format!(
-            "device_id={device_id} type=message_request_changed sender_user_id={sender_user_id} request_id={request_id} change={change}"
+            "device_id={device_ref} type=message_request_changed sender_user_id={} request_id={} change={change}",
+            redact_id("user", sender_user_id),
+            redact_id("request", request_id)
         ),
         WsServerEvent::GroupHeadUpdated {
             group_id, seq, ..
         } => {
-            format!("group_id={group_id} type=group_head_updated seq={seq}")
+            format!(
+                "group_id={} type=group_head_updated seq={seq}",
+                redact_id("group", group_id)
+            )
         }
         WsServerEvent::GroupOutboxRecordAvailable {
             group_id, seq, ..
         } => {
-            format!("group_id={group_id} type=group_outbox_record_available seq={seq}")
+            format!(
+                "group_id={} type=group_outbox_record_available seq={seq}",
+                redact_id("group", group_id)
+            )
         }
         WsServerEvent::GroupJoinRequestAvailable {
             group_id,
             request_id,
         } => {
-            format!("group_id={group_id} type=group_join_request_available request_id={request_id}")
+            format!(
+                "group_id={} type=group_join_request_available request_id={}",
+                redact_id("group", group_id),
+                redact_id("request", request_id)
+            )
         }
     }
 }
@@ -1108,6 +1130,26 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
 mod tests {
     use super::*;
     use tapchat_core::cli::profile::ProfileRegistry;
+
+    #[test]
+    fn summarize_ws_event_redacts_identifiers() {
+        let summary = summarize_ws_event(
+            "device:alice-secret",
+            &WsServerEvent::MessageRequestChanged {
+                device_id: "device:alice-secret".into(),
+                sender_user_id: "user:bob-secret".into(),
+                request_id: "request:secret".into(),
+                change: "created".into(),
+            },
+        );
+
+        assert!(summary.contains("device_id=<device:"));
+        assert!(summary.contains("sender_user_id=<user:"));
+        assert!(summary.contains("request_id=<request:"));
+        assert!(!summary.contains("alice"));
+        assert!(!summary.contains("bob"));
+        assert!(!summary.contains("request:secret"));
+    }
 
     #[tokio::test]
     async fn reserve_connection_skips_second_active_or_connecting_session() {

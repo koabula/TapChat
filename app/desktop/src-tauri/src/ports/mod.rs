@@ -41,6 +41,7 @@ use tapchat_core::transport_contract::{
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 
+use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::persistence::DesktopPersistence;
 use crate::platform::profile::ProfileManagerInner;
 use crate::platform::realtime::RealtimeManager;
@@ -259,20 +260,11 @@ fn summarize_share_url(url: Option<&str>) -> String {
     let Some(url) = url else {
         return "none".into();
     };
-    let Ok(parsed) = url::Url::parse(url) else {
-        return "<invalid-url>".into();
-    };
-    let host = parsed.host_str().unwrap_or_default();
-    let path = parsed.path();
-    if path.starts_with("/v1/contact-share/") {
-        return format!("{host}/v1/contact-share/<redacted>");
-    }
-    format!("{host}{path}")
+    sanitize_url_for_log(url)
 }
 
 fn summarize_endpoint_url(url: &url::Url) -> String {
-    let host = url.host_str().unwrap_or_default();
-    format!("{host}{}", url.path())
+    sanitize_url_for_log(url.as_str())
 }
 
 // --- TransportPort ---
@@ -417,7 +409,7 @@ impl TransportPort for DesktopPlatformPorts {
                         "Cloudflare runtime does not support group outbox. Upgrade runtime."
                             .to_string()
                     } else {
-                        body
+                        format!("HTTP {status}")
                     };
                     return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                         group_id: append.group_id,
@@ -451,9 +443,10 @@ impl TransportPort for DesktopPlatformPorts {
             .group_outbox_messages_url(&fetch.group_id, fetch.from_seq, fetch.limit)
             .await?;
         let endpoint = summarize_endpoint_url(&url);
+        let group_ref = redact_id("group", &fetch.group_id);
         log::info!(
             "[TransportPort] fetch_group_outbox start group_id={} from_seq={} limit={} endpoint={}",
-            fetch.group_id,
+            group_ref,
             fetch.from_seq,
             fetch.limit,
             endpoint
@@ -476,7 +469,7 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     log::warn!(
                         "[TransportPort] fetch_group_outbox failed group_id={} from_seq={} endpoint={} status={}",
-                        fetch.group_id,
+                        group_ref,
                         fetch.from_seq,
                         endpoint,
                         status
@@ -484,14 +477,14 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                         group_id: fetch.group_id,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupOutboxResult = serde_json::from_str(&body)?;
                 log::info!(
                     "[TransportPort] fetch_group_outbox accepted group_id={} from_seq={} endpoint={} to_seq={} records={}",
-                    fetch.group_id,
+                    group_ref,
                     fetch.from_seq,
                     endpoint,
                     result.to_seq,
@@ -506,7 +499,7 @@ impl TransportPort for DesktopPlatformPorts {
             Err(error) => {
                 log::warn!(
                     "[TransportPort] fetch_group_outbox request failed group_id={} from_seq={} endpoint={} error={}",
-                    fetch.group_id,
+                    group_ref,
                     fetch.from_seq,
                     endpoint,
                     error
@@ -526,9 +519,10 @@ impl TransportPort for DesktopPlatformPorts {
     ) -> Result<Vec<CoreEvent>> {
         let url = self.group_outbox_sibling_url(&get.group_id, "head").await?;
         let endpoint = summarize_endpoint_url(&url);
+        let group_ref = redact_id("group", &get.group_id);
         log::info!(
             "[TransportPort] get_group_outbox_head start group_id={} endpoint={}",
-            get.group_id,
+            group_ref,
             endpoint
         );
         let response = match self
@@ -549,7 +543,7 @@ impl TransportPort for DesktopPlatformPorts {
             Err(error) => {
                 log::warn!(
                     "[TransportPort] get_group_outbox_head request failed group_id={} endpoint={} error={}",
-                    get.group_id,
+                    group_ref,
                     endpoint,
                     error
                 );
@@ -565,14 +559,14 @@ impl TransportPort for DesktopPlatformPorts {
         if !(200..300).contains(&status) {
             log::warn!(
                 "[TransportPort] get_group_outbox_head failed group_id={} endpoint={} status={}",
-                get.group_id,
+                group_ref,
                 endpoint,
                 status
             );
             return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id: get.group_id,
                 retryable: status >= 500,
-                detail: Some(body_text),
+                detail: Some(format!("HTTP {status}")),
             }]);
         }
         let body = to_snake_case_json_string(&body_text).unwrap_or(body_text);
@@ -581,7 +575,7 @@ impl TransportPort for DesktopPlatformPorts {
             Err(error) => {
                 log::warn!(
                     "[TransportPort] get_group_outbox_head decode failed group_id={} endpoint={} error={}",
-                    get.group_id,
+                    group_ref,
                     endpoint,
                     error
                 );
@@ -594,7 +588,7 @@ impl TransportPort for DesktopPlatformPorts {
         };
         log::info!(
             "[TransportPort] get_group_outbox_head accepted group_id={} endpoint={} head_seq={}",
-            get.group_id,
+            group_ref,
             endpoint,
             result.head_seq
         );
@@ -605,11 +599,14 @@ impl TransportPort for DesktopPlatformPorts {
     }
 
     async fn put_welcome_pickup(&mut self, put: PutWelcomePickupRequest) -> Result<Vec<CoreEvent>> {
+        let group_ref = redact_id("group", &put.descriptor.group_id);
+        let device_ref = redact_id("device", &put.descriptor.device_id);
+        let endpoint = sanitize_url_for_log(&put.descriptor.endpoint);
         log::info!(
             "[TransportPort] put_welcome_pickup group_id={} device_id={} endpoint={}",
-            put.descriptor.group_id,
-            put.descriptor.device_id,
-            put.descriptor.endpoint
+            group_ref,
+            device_ref,
+            endpoint
         );
         let response = self
             .client
@@ -628,22 +625,22 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     log::warn!(
                         "[TransportPort] put_welcome_pickup failed group_id={} device_id={} status={}",
-                        put.descriptor.group_id,
-                        put.descriptor.device_id,
+                        group_ref,
+                        device_ref,
                         status
                     );
                     return Ok(vec![CoreEvent::WelcomePickupPutFailed {
                         descriptor: put.descriptor,
                         retryable: status >= 500,
-                        detail: response.text().await.ok(),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
                 let _result: PutWelcomePickupResult = serde_json::from_str(&body)?;
                 log::info!(
                     "[TransportPort] put_welcome_pickup accepted group_id={} device_id={}",
-                    put.descriptor.group_id,
-                    put.descriptor.device_id
+                    group_ref,
+                    device_ref
                 );
                 Ok(vec![CoreEvent::WelcomePickupPut {
                     descriptor: put.descriptor,
@@ -661,11 +658,14 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         fetch: FetchWelcomePickupRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let group_ref = redact_id("group", &fetch.descriptor.group_id);
+        let device_ref = redact_id("device", &fetch.descriptor.device_id);
+        let endpoint = sanitize_url_for_log(&fetch.descriptor.endpoint);
         log::info!(
             "[TransportPort] fetch_welcome_pickup group_id={} device_id={} endpoint={}",
-            fetch.descriptor.group_id,
-            fetch.descriptor.device_id,
-            fetch.descriptor.endpoint
+            group_ref,
+            device_ref,
+            endpoint
         );
         let response = self
             .client
@@ -687,22 +687,22 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     log::warn!(
                         "[TransportPort] fetch_welcome_pickup failed group_id={} device_id={} status={}",
-                        fetch.descriptor.group_id,
-                        fetch.descriptor.device_id,
+                        group_ref,
+                        device_ref,
                         status
                     );
                     return Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                         descriptor: fetch.descriptor,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchWelcomePickupResult = serde_json::from_str(&body)?;
                 log::info!(
                     "[TransportPort] fetch_welcome_pickup accepted group_id={} device_id={} manifest_present={}",
-                    fetch.descriptor.group_id,
-                    fetch.descriptor.device_id,
+                    group_ref,
+                    device_ref,
                     result.manifest.is_some()
                 );
                 Ok(vec![CoreEvent::WelcomePickupFetched {
@@ -714,8 +714,8 @@ impl TransportPort for DesktopPlatformPorts {
             Err(error) => {
                 log::warn!(
                     "[TransportPort] fetch_welcome_pickup transport error group_id={} device_id={} error={}",
-                    fetch.descriptor.group_id,
-                    fetch.descriptor.device_id,
+                    group_ref,
+                    device_ref,
                     error
                 );
                 Ok(vec![CoreEvent::WelcomePickupFetchFailed {
@@ -755,7 +755,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupInviteCreateFailed {
                         group_id: create.group_id,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -794,8 +794,9 @@ impl TransportPort for DesktopPlatformPorts {
             .body(to_camel_case_json_string(&serde_json::to_string(&revoke)?)?)
             .send()
             .await?;
-        if !(200..300).contains(&response.status().as_u16()) {
-            anyhow::bail!("group invite revoke failed: {}", response.text().await?);
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            anyhow::bail!("group invite revoke failed with status {}", status);
         }
         let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
         let result: RevokeGroupInviteResult = serde_json::from_str(&body)?;
@@ -818,9 +819,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupInviteFetchFailed {
                         invite_url: fetch.invite_url,
                         retryable: status >= 500,
-                        detail: Some(format!(
-                            "group invite fetch failed with status {status}: {body}"
-                        )),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -858,9 +857,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
                         invite_url: submit.invite_token,
                         retryable: status >= 500,
-                        detail: Some(format!(
-                            "group join request submit failed with status {status}: {body}"
-                        )),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -899,8 +896,9 @@ impl TransportPort for DesktopPlatformPorts {
             )
             .send()
             .await?;
-        if !(200..300).contains(&response.status().as_u16()) {
-            anyhow::bail!("group join list failed: {}", response.text().await?);
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            anyhow::bail!("group join list failed with status {}", status);
         }
         let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
         let result: ListGroupJoinRequestsResult = serde_json::from_str(&body)?;
@@ -923,8 +921,9 @@ impl TransportPort for DesktopPlatformPorts {
             )
             .send()
             .await?;
-        if !(200..300).contains(&response.status().as_u16()) {
-            anyhow::bail!("group join status failed: {}", response.text().await?);
+        let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            anyhow::bail!("group join status failed with status {}", status);
         }
         let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
         let result: GetGroupJoinRequestStatusResult = serde_json::from_str(&body)?;
@@ -966,7 +965,7 @@ impl TransportPort for DesktopPlatformPorts {
                         group_id: decide.group_id,
                         request_id: decide.request_id,
                         retryable: status >= 500,
-                        detail: Some(body),
+                        detail: Some(format!("HTTP {status}")),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1046,7 +1045,7 @@ fn map_seal_group_outbox_response(
             retryable: false,
             status: Some(status),
             code,
-            detail: Some(body_text.to_string()),
+            detail: Some(format!("HTTP {status}")),
         }];
     }
 
@@ -1057,7 +1056,7 @@ fn map_seal_group_outbox_response(
             retryable: status >= 500,
             status: Some(status),
             code: extract_error_code(&body),
-            detail: Some(body_text.to_string()),
+            detail: Some(format!("HTTP {status}")),
         }];
     }
 
@@ -1233,16 +1232,17 @@ impl BlobIoPort for DesktopPlatformPorts {
 
 // --- PersistencePort ---
 impl PersistencePort for DesktopPlatformPorts {
-    fn persist_state(&mut self, persist: PersistStateEffect) {
+    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
         // Use tokio runtime to call async persistence
         let persistence = self.persistence.clone();
         tokio::task::block_in_place(|| {
             tauri::async_runtime::handle().block_on(async {
-                if let Err(e) = persistence.persist(persist).await {
-                    log::error!("Persistence error: {:?}", e);
-                }
-            });
-        });
+                persistence
+                    .persist(persist)
+                    .await
+                    .context("desktop persistence failed")
+            })
+        })
     }
 }
 
@@ -1300,7 +1300,9 @@ mod tests {
         let summary = summarize_share_url(Some(
             "https://example.com/v1/contact-share/secret-token-value",
         ));
-        assert_eq!(summary, "example.com/v1/contact-share/<redacted>");
+        assert!(summary.starts_with("https://<host:"));
+        assert!(summary.ends_with("/v1/contact-share/<redacted>"));
+        assert!(!summary.contains("example.com"));
         assert!(!summary.contains("secret-token-value"));
     }
 

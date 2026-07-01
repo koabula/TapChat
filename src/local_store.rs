@@ -879,6 +879,16 @@ fn apply_persist_ops(
             PersistOp::DeleteOutgoingGroupEnvelope { message_id } => {
                 delete_key(tx, "pending_group_outbox", message_id)?;
             }
+            PersistOp::SavePendingGroupSeal { group_id } => upsert_from_snapshot(
+                tx,
+                "pending_group_seal",
+                &snapshot.pending_group_seal,
+                |item: &SealGroupOutboxRequest| item.group_id.clone(),
+                group_id,
+            )?,
+            PersistOp::DeletePendingGroupSeal { group_id } => {
+                delete_key(tx, "pending_group_seal", group_id)?;
+            }
             PersistOp::SaveGroupInvite { invite_id } => upsert_from_snapshot(
                 tx,
                 "group_invites",
@@ -1270,6 +1280,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        CapabilityService, GroupCapability, GroupCapabilityOperation, GroupRole,
+        CURRENT_MODEL_VERSION,
+    };
     use crate::profile_crypto::generate_pdek;
     use tempfile::tempdir;
 
@@ -1365,5 +1379,57 @@ mod tests {
             .expect("persist op");
 
         assert_eq!(store.load_snapshot().expect("load after"), after);
+    }
+
+    #[test]
+    fn persist_state_applies_pending_group_seal_ops() {
+        let dir = tempdir().expect("tempdir");
+        let pdek = generate_pdek();
+        let store = SqlCipherLocalStore::new(dir.path(), "profile:test", &*pdek);
+        store
+            .save_snapshot(&CorePersistenceSnapshot::default())
+            .expect("save before");
+
+        let seal = SealGroupOutboxRequest {
+            group_id: "group:seal".into(),
+            capability: GroupCapability {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                service: CapabilityService::GroupOutbox,
+                group_id: "group:seal".into(),
+                user_id: "user:alice".into(),
+                device_id: "device:alice:phone".into(),
+                operations: vec![GroupCapabilityOperation::SealGroup],
+                role: GroupRole::Owner,
+                expires_at: 999,
+                signature: "sig".into(),
+            },
+        };
+        let after_save = CorePersistenceSnapshot {
+            pending_group_seal: vec![seal],
+            ..CorePersistenceSnapshot::default()
+        };
+        store
+            .persist_state(&PersistStateEffect {
+                ops: vec![PersistOp::SavePendingGroupSeal {
+                    group_id: "group:seal".into(),
+                }],
+                snapshot: Some(after_save.clone()),
+            })
+            .expect("save pending seal");
+        assert_eq!(store.load_snapshot().expect("load seal"), after_save);
+
+        store
+            .persist_state(&PersistStateEffect {
+                ops: vec![PersistOp::DeletePendingGroupSeal {
+                    group_id: "group:seal".into(),
+                }],
+                snapshot: Some(CorePersistenceSnapshot::default()),
+            })
+            .expect("delete pending seal");
+        assert!(store
+            .load_snapshot()
+            .expect("load after delete")
+            .pending_group_seal
+            .is_empty());
     }
 }

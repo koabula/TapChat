@@ -11,6 +11,8 @@ use tapchat_core::ffi_api::{
 };
 use tapchat_core::transport_contract::{BlobDownloadRequest, BlobUploadRequest};
 
+use crate::platform::log_sanitize::redact_id;
+
 /// Progress event payload sent to frontend during uploads
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UploadProgressEvent {
@@ -37,7 +39,11 @@ pub async fn read_attachment_bytes(
             }])
         }
         Err(e) => {
-            log::error!("Failed to read attachment {}: {:?}", read.attachment_id, e);
+            log::error!(
+                "Failed to read attachment {}: {:?}",
+                redact_id("attachment", &read.attachment_id),
+                e
+            );
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: read.task_id,
                 retryable: false,
@@ -117,8 +123,11 @@ pub async fn upload_blob_with_progress(
                     task_id: upload.task_id,
                 }])
             } else {
-                let error_body = response.text().await.unwrap_or_default();
-                log::error!("Blob upload failed: {} - {}", status, error_body);
+                log::error!(
+                    "Blob upload failed: status={} task_id={}",
+                    status,
+                    redact_id("task", &upload.task_id)
+                );
 
                 // Emit progress: failed
                 if let Some(app_ref) = &app {
@@ -136,12 +145,16 @@ pub async fn upload_blob_with_progress(
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: upload.task_id,
                     retryable: false,
-                    detail: Some(format!("HTTP {}: {}", status, error_body)),
+                    detail: Some(format!("HTTP {}", status)),
                 }])
             }
         }
         Err(e) => {
-            log::error!("Blob upload error: {:?}", e);
+            log::error!(
+                "Blob upload error: task_id={} {:?}",
+                redact_id("task", &upload.task_id),
+                e
+            );
             let retryable = e.is_timeout() || e.is_connect();
 
             // Emit progress: failed
@@ -195,19 +208,31 @@ pub async fn download_blob(download: BlobDownloadRequest) -> Result<Vec<CoreEven
             } else {
                 let error_body = response.text().await.unwrap_or_default();
                 if status == 403 && error_body.contains("capability_expired") {
-                    log::warn!("Blob download link expired: {} - {}", status, error_body);
+                    log::warn!(
+                        "Blob download link expired: status={} task_id={}",
+                        status,
+                        redact_id("task", &download.task_id)
+                    );
                 } else {
-                    log::error!("Blob download failed: {} - {}", status, error_body);
+                    log::error!(
+                        "Blob download failed: status={} task_id={}",
+                        status,
+                        redact_id("task", &download.task_id)
+                    );
                 }
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
                     retryable: false,
-                    detail: Some(format!("HTTP {}: {}", status, error_body)),
+                    detail: Some(format!("HTTP {}", status)),
                 }])
             }
         }
         Err(e) => {
-            log::error!("Blob download error: {:?}", e);
+            log::error!(
+                "Blob download error: task_id={} {:?}",
+                redact_id("task", &download.task_id),
+                e
+            );
             let retryable = e.is_timeout() || e.is_connect();
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: download.task_id,
@@ -240,7 +265,7 @@ pub async fn write_downloaded_attachment(
     if is_encrypted_cache_destination(&write.destination_id) {
         log::debug!(
             "write_downloaded_attachment: deferred encrypted cache materialization for {}",
-            write.destination_id
+            redact_id("destination", &write.destination_id)
         );
         return Ok(Vec::new());
     }

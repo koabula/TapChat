@@ -181,7 +181,7 @@ pub trait BlobIoPort {
 }
 
 pub trait PersistencePort {
-    fn persist_state(&mut self, persist: PersistStateEffect);
+    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()>;
 }
 
 pub trait TimerPort {
@@ -247,7 +247,7 @@ where
             ports.write_downloaded_attachment(write).await
         }
         CoreEffect::PersistState { persist } => {
-            ports.persist_state(persist);
+            ports.persist_state(persist)?;
             Ok(Vec::new())
         }
         CoreEffect::ScheduleTimer { timer } => ports.schedule_timer(timer.timer_id, timer.delay_ms),
@@ -269,6 +269,7 @@ mod tests {
         timers: Vec<(String, u64)>,
         notifications: Vec<String>,
         persisted: Vec<PersistStateEffect>,
+        fail_persist: bool,
     }
 
     impl TransportPort for FakePorts {
@@ -390,9 +391,13 @@ mod tests {
     }
 
     impl PersistencePort for FakePorts {
-        fn persist_state(&mut self, persist: PersistStateEffect) {
+        fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
             self.calls.push("persist_state");
+            if self.fail_persist {
+                anyhow::bail!("synthetic persist failure");
+            }
             self.persisted.push(persist);
+            Ok(())
         }
     }
 
@@ -463,7 +468,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_platform_effect_routes_blob_persistence_timer_and_notification() {
+    async fn execute_platform_effect_records_successful_persist() {
+        let mut ports = FakePorts::default();
+        execute_platform_effect(
+            &mut ports,
+            CoreEffect::PersistState {
+                persist: PersistStateEffect {
+                    ops: vec![],
+                    snapshot: None,
+                },
+            },
+        )
+        .await
+        .expect("persist effect");
+
+        assert_eq!(ports.calls, vec!["persist_state"]);
+        assert_eq!(ports.persisted.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_platform_effect_propagates_persist_error() {
+        let mut ports = FakePorts {
+            fail_persist: true,
+            ..FakePorts::default()
+        };
+        let result = execute_platform_effect(
+            &mut ports,
+            CoreEffect::PersistState {
+                persist: PersistStateEffect {
+                    ops: vec![],
+                    snapshot: None,
+                },
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(ports.calls, vec!["persist_state"]);
+        assert!(ports.persisted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_platform_effect_routes_blob_timer_and_notification() {
         let mut ports = FakePorts::default();
         execute_platform_effect(
             &mut ports,
@@ -476,17 +522,6 @@ mod tests {
         )
         .await
         .expect("blob read effect");
-        execute_platform_effect(
-            &mut ports,
-            CoreEffect::PersistState {
-                persist: PersistStateEffect {
-                    ops: vec![],
-                    snapshot: None,
-                },
-            },
-        )
-        .await
-        .expect("persist effect");
         execute_platform_effect(
             &mut ports,
             CoreEffect::ScheduleTimer {
@@ -511,11 +546,9 @@ mod tests {
         .expect("notification effect");
 
         assert!(ports.calls.contains(&"read_attachment_bytes"));
-        assert!(ports.calls.contains(&"persist_state"));
         assert!(ports.calls.contains(&"schedule_timer"));
         assert!(ports.calls.contains(&"emit_user_notification"));
         assert_eq!(ports.timers, vec![("timer:1".into(), 5)]);
         assert_eq!(ports.notifications, vec!["hello".to_string()]);
-        assert_eq!(ports.persisted.len(), 1);
     }
 }

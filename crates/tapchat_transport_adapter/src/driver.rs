@@ -940,10 +940,11 @@ impl CoreDriver {
         Ok(Vec::new())
     }
 
-    fn persist_state(&mut self, persist: PersistStateEffect) {
+    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
         if let Some(snapshot) = persist.snapshot {
             self.runtime.latest_snapshot = Some(snapshot);
         }
+        Ok(())
     }
 
     fn record_observed_output(&mut self, output: &CoreOutput) {
@@ -1055,8 +1056,8 @@ impl BlobIoPort for CoreDriver {
 }
 
 impl PersistencePort for CoreDriver {
-    fn persist_state(&mut self, persist: PersistStateEffect) {
-        CoreDriver::persist_state(self, persist);
+    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
+        CoreDriver::persist_state(self, persist)
     }
 }
 

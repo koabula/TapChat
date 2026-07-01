@@ -306,12 +306,8 @@ pub async fn upload_worker_script(
             .await
             .map_err(|e| format!("Failed to read error response: {}", e))?;
 
-        let cf_error: CloudflareError = serde_json::from_str(&error_body).map_err(|e| {
-            format!(
-                "Failed to parse error response: {} (body: {})",
-                e, error_body
-            )
-        })?;
+        let cf_error: CloudflareError = serde_json::from_str(&error_body)
+            .map_err(|e| format!("Failed to parse error response: {}", e))?;
 
         let error_msg = cf_error
             .errors
@@ -473,20 +469,17 @@ pub async fn enable_workers_dev_routing(
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     if !status.is_success() {
-        // Log detailed error for debugging
-        eprintln!(
-            "Error enabling workers.dev routing: HTTP {} - {}",
-            status, response_body
-        );
+        eprintln!("Error enabling workers.dev routing: HTTP {}", status);
         return Err(format!(
-            "Failed to enable workers.dev routing: HTTP {} - {}",
-            status, response_body
+            "Failed to enable workers.dev routing: HTTP {}",
+            status
         ));
     }
 
+    let _ = response_body;
     eprintln!(
-        "Successfully enabled workers.dev routing for {}: {}",
-        worker_name, response_body
+        "Successfully enabled workers.dev routing for {}",
+        worker_name
     );
     Ok(())
 }
@@ -518,10 +511,7 @@ pub async fn check_worker_exists(
         return Ok(false);
     }
 
-    let error_body = response.text().await.unwrap_or_default();
-    Err(format!(
-        "Worker check failed before upload: HTTP {status} - {error_body}"
-    ))
+    Err(format!("Worker check failed before upload: HTTP {status}"))
 }
 
 /// Get Worker deployment info (account's workers.dev subdomain)
@@ -543,15 +533,7 @@ pub async fn get_worker_subdomain(
     let status = response.status();
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response: {}", e))?;
-
-        return Err(format!(
-            "Failed to get worker subdomain: HTTP {} - {}",
-            status, error_body
-        ));
+        return Err(format!("Failed to get worker subdomain: HTTP {}", status));
     }
 
     let body: serde_json::Value = response
@@ -616,17 +598,10 @@ pub async fn ensure_account_workers_dev_subdomain(
     let status = response.status();
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response: {}", e))?;
-        eprintln!(
-            "Failed to set workers.dev subdomain: HTTP {} - {}",
-            status, error_body
-        );
+        eprintln!("Failed to set workers.dev subdomain: HTTP {}", status);
         return Err(format!(
-            "Failed to set workers.dev subdomain: HTTP {} - {}",
-            status, error_body
+            "Failed to set workers.dev subdomain: HTTP {}",
+            status
         ));
     }
 
@@ -635,7 +610,7 @@ pub async fn ensure_account_workers_dev_subdomain(
         .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-    eprintln!("Workers.dev subdomain response: {:?}", body);
+    eprintln!("Workers.dev subdomain configured");
 
     // Extract subdomain from response
     body.get("result")

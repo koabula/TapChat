@@ -8,6 +8,7 @@ use crate::conversation::{
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
 use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
+use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
     CreateConversationArtifacts, IngestResult, MlsAdapter, PeerDeviceKeyPackage,
     RemoveMembersArtifacts,
@@ -8405,6 +8406,7 @@ impl CoreEngine {
         let mut output = CoreOutput::default();
         output = merge_outputs(output, self.flush_outbox()?);
         output = merge_outputs(output, self.flush_group_outbox()?);
+        output = merge_outputs(output, self.flush_group_seals()?);
         output = merge_outputs(output, self.flush_pending_acks()?);
         output = merge_outputs(output, self.flush_blob_uploads()?);
         output = merge_outputs(output, self.flush_blob_downloads()?);
@@ -8486,6 +8488,29 @@ impl CoreEngine {
                 messages_changed: !effects.is_empty(),
                 ..CoreStateUpdate::default()
             },
+            effects,
+            view_model: None,
+        })
+    }
+
+    fn flush_group_seals(&mut self) -> CoreResult<CoreOutput> {
+        let group_ids: Vec<String> = self.state.pending_group_seal.keys().cloned().collect();
+        let mut effects = Vec::new();
+        for group_id in group_ids {
+            if self
+                .state
+                .pending_group_outbox
+                .iter()
+                .any(|item| item.envelope.group_id == group_id)
+            {
+                continue;
+            }
+            if let Some(request) = self.state.pending_group_seal.remove(&group_id) {
+                effects.push(CoreEffect::SealGroupOutbox { seal: request });
+            }
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
             effects,
             view_model: None,
         })
@@ -9737,7 +9762,7 @@ impl CoreEngine {
                             IngestResult::AppliedApplication(application) => {
                                 log::info!(
                                     "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
-                                    record.message_id,
+                                    redact_id("msg", &record.message_id),
                                     application.plaintext.len()
                                 );
                                 if let Some(state) =
@@ -9751,19 +9776,14 @@ impl CoreEngine {
                                         message.plaintext =
                                             String::from_utf8(application.plaintext).ok();
                                         log::info!(
-                                            "handle_inbox_records: Set plaintext for message {} to {:?}",
-                                            record.message_id,
-                                            message.plaintext.as_deref().map(|s| if s.len() > 50 {
-                                                &s[..50]
-                                            } else {
-                                                s
-                                            })
+                                            "handle_inbox_records: stored plaintext for message {}",
+                                            redact_id("msg", &record.message_id)
                                         );
                                     } else {
                                         log::warn!(
                                             "handle_inbox_records: Could not find message {} in conversation {} to set plaintext",
-                                            record.message_id,
-                                            conversation_id
+                                            redact_id("msg", &record.message_id),
+                                            redact_id("conversation", &conversation_id)
                                         );
                                     }
                                 } else {
@@ -10532,8 +10552,8 @@ impl CoreEngine {
                         conv.last_message_type = Some(env.message_type);
                         log::info!(
                             "handle_append_delivery_result: stored message {} in conversation {} with plaintext={}",
-                            message_id,
-                            conversation_id,
+                            redact_id("msg", message_id),
+                            redact_id("conversation", &conversation_id),
                             plaintext_cache.is_some()
                         );
                         saved_conversation_id = Some(conversation_id);
@@ -11309,6 +11329,8 @@ impl CoreEngine {
             .pending_group_outbox
             .retain(|item| item.envelope.message_id != message_id);
         let mut messages = Vec::new();
+        let mut touched_conversation_id: Option<String> = None;
+        let mut touched_group_state = false;
         if let Some(item) = pending_item {
             let group_state = self
                 .state
@@ -11316,10 +11338,11 @@ impl CoreEngine {
                 .get(&group_id)
                 .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
                 .clone();
+            let conversation_id = group_state.conversation_id.clone();
             let already_stored = self
                 .state
                 .conversations
-                .get(&group_state.conversation_id)
+                .get(&conversation_id)
                 .map(|state| {
                     state
                         .messages
@@ -11339,13 +11362,14 @@ impl CoreEngine {
                     envelope: item.envelope,
                 };
                 self.store_group_record_message(
-                    &group_state.conversation_id,
+                    &conversation_id,
                     &record,
                     message_type,
                     item.plaintext_cache,
                 )?;
+                touched_conversation_id = Some(conversation_id.clone());
                 messages.push(MessageSummary {
-                    conversation_id: group_state.conversation_id,
+                    conversation_id,
                     message_id: message_id.clone(),
                     message_type,
                 });
@@ -11362,6 +11386,7 @@ impl CoreEngine {
                 {
                     if let Some(state) = self.state.group_states.get_mut(&group_id) {
                         state.pending_membership_transition = None;
+                        touched_group_state = true;
                     }
                 }
             }
@@ -11386,10 +11411,17 @@ impl CoreEngine {
             }
         }
 
-        let mut effects = vec![persist_effect(
-            &self.state,
-            vec![PersistOp::DeleteOutgoingGroupEnvelope { message_id }],
-        )];
+        let mut persist_ops = vec![PersistOp::DeleteOutgoingGroupEnvelope { message_id }];
+        if let Some(conversation_id) = touched_conversation_id {
+            persist_ops.push(PersistOp::SaveConversation { conversation_id });
+        }
+        if touched_group_state {
+            persist_ops.push(PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            });
+        }
+
+        let mut effects = vec![persist_effect(&self.state, persist_ops)];
         if let Some(effect) = seal_effect {
             effects.push(effect);
         }
@@ -11723,6 +11755,9 @@ impl CoreEngine {
                 capability,
             },
         );
+        persist_ops.push(PersistOp::SavePendingGroupSeal {
+            group_id: group_id.clone(),
+        });
 
         let effects = vec![persist_effect(&self.state, persist_ops)];
         self.merge_with_transport_flush(CoreOutput {
@@ -12465,6 +12500,9 @@ impl CoreEngine {
         // `GroupOutboxSealFailed` earlier), the terminal state is now
         // "sealed on the server", so no further seal effects are needed.
         self.state.pending_group_seal.remove(&group_id);
+        let mut persist_ops = vec![PersistOp::DeletePendingGroupSeal {
+            group_id: group_id.clone(),
+        }];
 
         let group_state = match self.state.group_states.get(&group_id) {
             Some(state) => state.clone(),
@@ -12473,14 +12511,13 @@ impl CoreEngine {
                 // was issued (e.g. profile reset). Nothing to transition.
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate::default(),
-                    effects: vec![],
+                    effects: vec![persist_effect(&self.state, persist_ops)],
                     view_model: None,
                 });
             }
         };
         let conversation_id = group_state.conversation_id.clone();
 
-        let mut persist_ops: Vec<PersistOp> = Vec::new();
         // Set the dissolved marker only now — after the server acknowledged.
         let mut updated_group_state = group_state.clone();
         let transitioned = updated_group_state.dissolved_at.is_none();
@@ -12570,6 +12607,30 @@ impl CoreEngine {
                                 capability,
                             },
                         );
+                        let persist = persist_effect(
+                            &self.state,
+                            vec![PersistOp::SavePendingGroupSeal {
+                                group_id: group_id.clone(),
+                            }],
+                        );
+                        return Ok(CoreOutput {
+                            state_update: CoreStateUpdate {
+                                system_statuses_changed: vec![
+                                    SystemStatus::TemporaryNetworkFailure,
+                                ],
+                                ..CoreStateUpdate::default()
+                            },
+                            effects: vec![
+                                persist,
+                                CoreEffect::ScheduleTimer {
+                                    timer: TimerEffect {
+                                        timer_id: format!("retry_group_seal:{group_id}"),
+                                        delay_ms: 0,
+                                    },
+                                },
+                            ],
+                            view_model: None,
+                        });
                     }
                     Err(_) => {
                         // Can't rebuild capability (unlikely); fall through
@@ -12582,12 +12643,7 @@ impl CoreEngine {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
                 },
-                effects: vec![CoreEffect::ScheduleTimer {
-                    timer: TimerEffect {
-                        timer_id: format!("retry_group_seal:{group_id}"),
-                        delay_ms: 0,
-                    },
-                }],
+                effects: Vec::new(),
                 view_model: None,
             });
         }
@@ -12599,13 +12655,22 @@ impl CoreEngine {
                 system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![CoreEffect::EmitUserNotification {
-                notification: UserNotificationEffect {
-                    status: SystemStatus::TemporaryNetworkFailure,
-                    message: detail
-                        .unwrap_or_else(|| format!("failed to seal dissolved group {group_id}")),
+            effects: vec![
+                persist_effect(
+                    &self.state,
+                    vec![PersistOp::DeletePendingGroupSeal {
+                        group_id: group_id.clone(),
+                    }],
+                ),
+                CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail.unwrap_or_else(|| {
+                            format!("failed to seal dissolved group {group_id}")
+                        }),
+                    },
                 },
-            }],
+            ],
             view_model: None,
         })
     }

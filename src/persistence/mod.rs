@@ -346,6 +346,8 @@ pub enum PersistOp {
     DeleteGroupCursor { group_id: String },
     SaveOutgoingGroupEnvelope { message_id: String },
     DeleteOutgoingGroupEnvelope { message_id: String },
+    SavePendingGroupSeal { group_id: String },
+    DeletePendingGroupSeal { group_id: String },
     SaveGroupInvite { invite_id: String },
     DeleteGroupInvite { invite_id: String },
     SaveGroupJoinRequest { request_id: String },
