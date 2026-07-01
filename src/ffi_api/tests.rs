@@ -2195,6 +2195,53 @@ mod tests {
     }
 
     #[test]
+    fn create_conversation_reuses_existing_direct_conversation_without_mls() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice.state.mls_summaries.remove(&conversation_id);
+
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("reuse existing conversation");
+
+        assert_eq!(alice.state.conversations.len(), 1);
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .conversations[0]
+                .conversation_id,
+            conversation_id
+        );
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .conversations[0]
+                .state,
+            "needs_recovery"
+        );
+        assert!(alice.state.recovery_contexts.contains_key(&conversation_id));
+        let ops = persist_ops(&output);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveConversation { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveRecoveryContext { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+    }
+
+    #[test]
     fn delete_contact_then_reimport_same_peer_allows_direct_recreate() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -3925,6 +3972,63 @@ mod tests {
     }
 
     #[test]
+    fn append_delivery_persists_delivered_message_after_pending_outbox_removed() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "persist me".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+        let pending_message_id = alice
+            .state
+            .pending_outbox
+            .last()
+            .expect("pending message")
+            .envelope
+            .message_id
+            .clone();
+
+        let output = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":9,"delivered_to":"inbox"}"#.into()),
+            })
+            .expect("append response");
+
+        let ops = persist_ops(&output);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::DeleteOutgoingEnvelope { message_id }
+                if message_id == &pending_message_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveConversation { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+        let snapshot = extract_snapshot(&output);
+        assert!(!snapshot
+            .pending_outbox
+            .iter()
+            .any(|item| item.message_id == pending_message_id));
+        let restored = CoreEngine::from_restored_state(snapshot);
+        let conversation = restored
+            .conversation_state(&conversation_id)
+            .expect("restored conversation");
+        let message = conversation
+            .messages
+            .iter()
+            .find(|message| message.message_id == pending_message_id)
+            .expect("restored sent message");
+        assert_eq!(message.plaintext.as_deref(), Some("persist me"));
+    }
+
+    #[test]
     fn import_identity_bundle_with_relationship_status_sets_pending_for_new_contact() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
@@ -4400,6 +4504,123 @@ mod tests {
                 .last_acked_seq,
             1
         );
+    }
+
+    #[test]
+    fn inbox_records_persist_conversation_mls_sync_and_pending_ack() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "hello after welcome".into(),
+            })
+            .expect("send application");
+
+        let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        let ops = persist_ops(&output);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveConversation { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveMlsState { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveSyncState { device_id } if device_id == &bob_device_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SavePendingAck { device_id } if device_id == &bob_device_id
+        )));
+        let persist_index = first_persist_effect_index(&output).expect("persist effect");
+        let ack_index = output
+            .effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
+                )
+            })
+            .expect("ack request");
+        assert!(
+            persist_index < ack_index,
+            "local state must be persisted before acking inbox records"
+        );
+
+        let snapshot = extract_snapshot(&output);
+        assert!(snapshot
+            .mls_states
+            .iter()
+            .any(|state| state.conversation_id == conversation_id));
+        assert!(snapshot
+            .sync_states
+            .iter()
+            .any(|state| state.device_id == bob_device_id));
+        assert!(snapshot
+            .pending_acks
+            .iter()
+            .any(|ack| ack.device_id == bob_device_id));
+        let restored = CoreEngine::from_restored_state(snapshot);
+        assert!(restored.mls_summary(&conversation_id).is_some());
+        let restored_conversation = restored
+            .conversation_state(&conversation_id)
+            .expect("restored conversation");
+        assert!(restored_conversation
+            .messages
+            .iter()
+            .any(|message| { message.plaintext.as_deref() == Some("hello after welcome") }));
+        assert!(restored.sync_checkpoint_snapshot(&bob_device_id).is_some());
+    }
+
+    #[test]
+    fn ack_success_deletes_persisted_pending_ack() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "ack me".into(),
+            })
+            .expect("send application");
+        let fetched = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        let ack_request_id = find_http_request_id(&fetched, "/ack");
+        assert!(bob.state.pending_acks.contains_key(&bob_device_id));
+
+        let output = bob
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: ack_request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"ack_seq":3}"#.into()),
+            })
+            .expect("ack accepted");
+
+        assert!(!bob.state.pending_acks.contains_key(&bob_device_id));
+        let ops = persist_ops(&output);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::DeletePendingAck { device_id } if device_id == &bob_device_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveSyncState { device_id } if device_id == &bob_device_id
+        )));
+        let snapshot = extract_snapshot(&output);
+        assert!(!snapshot
+            .pending_acks
+            .iter()
+            .any(|ack| ack.device_id == bob_device_id));
     }
 
     #[test]
@@ -6551,6 +6772,24 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected request containing {needle}"))
+    }
+
+    fn persist_ops(output: &crate::ffi_api::CoreOutput) -> Vec<PersistOp> {
+        output
+            .effects
+            .iter()
+            .flat_map(|effect| match effect {
+                CoreEffect::PersistState { persist } => persist.ops.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    fn first_persist_effect_index(output: &crate::ffi_api::CoreOutput) -> Option<usize> {
+        output
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, CoreEffect::PersistState { .. }))
     }
 
     fn extract_snapshot(output: &crate::ffi_api::CoreOutput) -> CorePersistenceSnapshot {

@@ -68,6 +68,12 @@ pub struct CoreEngine {
     pub(crate) state: CoreState,
 }
 
+#[derive(Debug, Default)]
+struct AppendDeliveryOutput {
+    output: CoreOutput,
+    saved_conversation_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecoveryContextSnapshot {
     pub reason: RecoveryReason,
@@ -6894,8 +6900,7 @@ impl CoreEngine {
             }
             if device.status != GroupMemberStatus::Active
                 || !old.members.iter().any(|member| {
-                    member.user_id == device.user_id
-                        && member.status == GroupMemberStatus::Active
+                    member.user_id == device.user_id && member.status == GroupMemberStatus::Active
                 })
             {
                 return false;
@@ -6960,8 +6965,7 @@ impl CoreEngine {
                 && old_member.role != GroupRole::Owner
                 && matches!(
                     (old_member.role, new_member.role),
-                    (GroupRole::Member, GroupRole::Admin)
-                        | (GroupRole::Admin, GroupRole::Member)
+                    (GroupRole::Member, GroupRole::Admin) | (GroupRole::Admin, GroupRole::Member)
                 )
             {
                 role_changes = role_changes.saturating_add(1);
@@ -8822,13 +8826,16 @@ impl CoreEngine {
                         "append response was not accepted",
                     ));
                 }
-                let request_output = self.handle_append_delivery_result(&message_id, &result);
+                let append_delivery = self.handle_append_delivery_result(&message_id, &result);
                 self.state
                     .pending_outbox
                     .retain(|item| item.envelope.message_id != message_id);
                 let mut persist_ops = vec![PersistOp::DeleteOutgoingEnvelope {
                     message_id: message_id.clone(),
                 }];
+                if let Some(conversation_id) = append_delivery.saved_conversation_id {
+                    persist_ops.push(PersistOp::SaveConversation { conversation_id });
+                }
                 if self.state.contacts.contains_key(&peer_user_id) {
                     persist_ops.push(PersistOp::SaveContact {
                         user_id: peer_user_id,
@@ -8836,7 +8843,7 @@ impl CoreEngine {
                 }
                 Ok(merge_outputs(
                     merge_outputs(
-                        request_output,
+                        append_delivery.output,
                         CoreOutput {
                             state_update: CoreStateUpdate::default(),
                             effects: vec![persist_effect(&self.state, persist_ops)],
@@ -8860,7 +8867,27 @@ impl CoreEngine {
                     ));
                 }
                 self.state.pending_acks.remove(&device_id);
-                self.flush_pending_transport()
+                Ok(merge_outputs(
+                    CoreOutput {
+                        state_update: CoreStateUpdate {
+                            checkpoints_changed: true,
+                            ..CoreStateUpdate::default()
+                        },
+                        effects: vec![persist_effect(
+                            &self.state,
+                            vec![
+                                PersistOp::DeletePendingAck {
+                                    device_id: device_id.clone(),
+                                },
+                                PersistOp::SaveSyncState {
+                                    device_id: device_id.clone(),
+                                },
+                            ],
+                        )],
+                        view_model: None,
+                    },
+                    self.flush_pending_transport()?,
+                ))
             }
             PendingRequest::AppendGroupEnvelope {
                 group_id,
@@ -9550,6 +9577,11 @@ impl CoreEngine {
         allow_pending_replay: bool,
     ) -> CoreResult<CoreOutput> {
         let mut pending_recovery_conversations = BTreeSet::new();
+        let mut touched_conversation_ids = BTreeSet::new();
+        let mut touched_mls_conversation_ids = BTreeSet::new();
+        let mut touched_recovery_context_ids = BTreeSet::new();
+        let touched_sync_device_ids = BTreeSet::from([device_id.clone()]);
+        let mut touched_pending_ack_device_ids = BTreeSet::new();
         let mut fresh_records = {
             let sync_state = self
                 .state
@@ -9657,6 +9689,7 @@ impl CoreEngine {
             }
             self.ensure_local_conversation_for_record(&device_id, &local_user_id, &record);
             let conversation_id = record.envelope.conversation_id.clone();
+            touched_conversation_ids.insert(conversation_id.clone());
             let apply_effect = {
                 let conversation_state = self
                     .state
@@ -9753,6 +9786,8 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
+                                touched_mls_conversation_ids.insert(conversation_id.clone());
+                                touched_recovery_context_ids.insert(conversation_id.clone());
                                 self.clear_recovery_context_as_healthy(&conversation_id);
                                 if self.direct_relationship_open_for_record(
                                     &record.envelope.sender_user_id,
@@ -9788,6 +9823,8 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
+                                touched_mls_conversation_ids.insert(conversation_id.clone());
+                                touched_recovery_context_ids.insert(conversation_id.clone());
                                 self.clear_recovery_context_as_healthy(&conversation_id);
                                 if self.direct_relationship_open_for_record(
                                     &record.envelope.sender_user_id,
@@ -9827,6 +9864,8 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
+                                touched_mls_conversation_ids.insert(conversation_id.clone());
+                                touched_recovery_context_ids.insert(conversation_id.clone());
                                 self.clear_recovery_context_as_healthy(&conversation_id);
                                 output
                                     .effects
@@ -9868,6 +9907,7 @@ impl CoreEngine {
                                     &conversation_id,
                                     RecoveryPhase::WaitingForPendingReplay,
                                 );
+                                touched_recovery_context_ids.insert(conversation_id.clone());
                                 pending_recovery_conversations.insert(conversation_id.clone());
                             }
                             IngestResult::NeedsRebuild => {
@@ -9884,6 +9924,7 @@ impl CoreEngine {
                                         "MLS marked conversation unrecoverable",
                                     )?,
                                 );
+                                touched_recovery_context_ids.insert(conversation_id.clone());
                             }
                         }
                     }
@@ -9957,6 +9998,7 @@ impl CoreEngine {
                                 merge_outputs(output, self.refresh_identity_state(peer_user_id)?);
                         }
                         if apply_effect.membership_refresh_needed {
+                            touched_recovery_context_ids.insert(conversation_id.clone());
                             output = merge_outputs(
                                 output,
                                 self.reconcile_conversation_membership(conversation_id.clone())?,
@@ -9971,6 +10013,7 @@ impl CoreEngine {
                                     "conversation received explicit rebuild control message",
                                 )?,
                             );
+                            touched_recovery_context_ids.insert(conversation_id.clone());
                         }
                     }
                 }
@@ -10005,7 +10048,9 @@ impl CoreEngine {
                     in_flight: false,
                 },
             );
+            touched_pending_ack_device_ids.insert(device_id.clone());
         }
+        let pending_recovery_conversations_for_persist = pending_recovery_conversations.clone();
         output = merge_outputs(
             output,
             self.process_pending_recovery_batch(
@@ -10014,6 +10059,52 @@ impl CoreEngine {
                 allow_pending_replay,
             )?,
         );
+        for conversation_id in pending_recovery_conversations_for_persist {
+            touched_conversation_ids.insert(conversation_id.clone());
+            touched_recovery_context_ids.insert(conversation_id);
+        }
+        let mut persist_ops = Vec::new();
+        persist_ops.extend(
+            touched_conversation_ids
+                .into_iter()
+                .map(|conversation_id| PersistOp::SaveConversation { conversation_id }),
+        );
+        persist_ops.extend(
+            touched_mls_conversation_ids
+                .into_iter()
+                .map(|conversation_id| PersistOp::SaveMlsState { conversation_id }),
+        );
+        persist_ops.extend(
+            touched_sync_device_ids
+                .into_iter()
+                .map(|device_id| PersistOp::SaveSyncState { device_id }),
+        );
+        persist_ops.extend(
+            touched_pending_ack_device_ids
+                .into_iter()
+                .map(|device_id| PersistOp::SavePendingAck { device_id }),
+        );
+        persist_ops.extend(
+            touched_recovery_context_ids
+                .into_iter()
+                .map(|conversation_id| {
+                    if self.state.recovery_contexts.contains_key(&conversation_id) {
+                        PersistOp::SaveRecoveryContext { conversation_id }
+                    } else {
+                        PersistOp::DeleteRecoveryContext { conversation_id }
+                    }
+                }),
+        );
+        if !persist_ops.is_empty() {
+            output = merge_outputs(
+                CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![persist_effect(&self.state, persist_ops)],
+                    view_model: None,
+                },
+                output,
+            );
+        }
         self.merge_with_transport_flush(output)
     }
 
@@ -10348,7 +10439,7 @@ impl CoreEngine {
         &mut self,
         message_id: &str,
         result: &AppendEnvelopeResult,
-    ) -> CoreOutput {
+    ) -> AppendDeliveryOutput {
         // Find the pending outbox item to get plaintext and conversation info
         let pending_item = self
             .state
@@ -10400,22 +10491,27 @@ impl CoreEngine {
             Vec::new()
         };
 
+        let mut saved_conversation_id = None;
+
         // When message is delivered to inbox, store it in conversation.messages
         // This ensures the message is preserved even after pending_outbox is cleared
         let messages_changed = if result.delivered_to == AppendDeliveryDisposition::Inbox {
             if let Some(env) = &envelope {
                 if protocol_only_contact_control {
-                    return CoreOutput {
-                        state_update: CoreStateUpdate {
-                            contacts_changed: contact_changed,
-                            ..CoreStateUpdate::default()
+                    return AppendDeliveryOutput {
+                        output: CoreOutput {
+                            state_update: CoreStateUpdate {
+                                contacts_changed: contact_changed,
+                                ..CoreStateUpdate::default()
+                            },
+                            effects: vec![],
+                            view_model: Some(CoreViewModel {
+                                append_result: Some(append_result),
+                                contacts,
+                                ..CoreViewModel::default()
+                            }),
                         },
-                        effects: vec![],
-                        view_model: Some(CoreViewModel {
-                            append_result: Some(append_result),
-                            contacts,
-                            ..CoreViewModel::default()
-                        }),
+                        saved_conversation_id: None,
                     };
                 }
                 let conversation_id = env.conversation_id.clone();
@@ -10440,6 +10536,7 @@ impl CoreEngine {
                             conversation_id,
                             plaintext_cache.is_some()
                         );
+                        saved_conversation_id = Some(conversation_id);
                         true
                     } else {
                         false
@@ -10456,19 +10553,22 @@ impl CoreEngine {
 
         let (status, message, banner) = match result.delivered_to {
             AppendDeliveryDisposition::Inbox => {
-                return CoreOutput {
-                    state_update: CoreStateUpdate {
-                        messages_changed,
-                        conversations_changed: messages_changed,
-                        contacts_changed: contact_changed,
-                        ..CoreStateUpdate::default()
+                return AppendDeliveryOutput {
+                    output: CoreOutput {
+                        state_update: CoreStateUpdate {
+                            messages_changed,
+                            conversations_changed: messages_changed,
+                            contacts_changed: contact_changed,
+                            ..CoreStateUpdate::default()
+                        },
+                        effects: vec![],
+                        view_model: Some(CoreViewModel {
+                            append_result: Some(append_result),
+                            contacts,
+                            ..CoreViewModel::default()
+                        }),
                     },
-                    effects: vec![],
-                    view_model: Some(CoreViewModel {
-                        append_result: Some(append_result),
-                        contacts,
-                        ..CoreViewModel::default()
-                    }),
+                    saved_conversation_id,
                 };
             }
             AppendDeliveryDisposition::MessageRequest => (
@@ -10482,24 +10582,27 @@ impl CoreEngine {
                 "message rejected by recipient policy".to_string(),
             ),
         };
-        CoreOutput {
-            state_update: CoreStateUpdate {
-                system_statuses_changed: vec![status],
-                contacts_changed: contact_changed,
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![CoreEffect::EmitUserNotification {
-                notification: UserNotificationEffect { status, message },
-            }],
-            view_model: Some(CoreViewModel {
-                append_result: Some(append_result),
-                contacts,
-                banners: vec![SystemBanner {
-                    status,
-                    message: banner,
+        AppendDeliveryOutput {
+            output: CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![status],
+                    contacts_changed: contact_changed,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect { status, message },
                 }],
-                ..CoreViewModel::default()
-            }),
+                view_model: Some(CoreViewModel {
+                    append_result: Some(append_result),
+                    contacts,
+                    banners: vec![SystemBanner {
+                        status,
+                        message: banner,
+                    }],
+                    ..CoreViewModel::default()
+                }),
+            },
+            saved_conversation_id,
         }
     }
 
