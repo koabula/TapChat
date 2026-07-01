@@ -58,7 +58,7 @@ pub async fn init_onboarding_profile(
             .await
             .map_err(|e| {
                 log::error!("Failed to create profile at {:?}: {}", path, e);
-                format!("Failed to create profile directory: {}", e)
+                format!("Failed to create profile: {}", e)
             })?
     };
 

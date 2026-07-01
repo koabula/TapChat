@@ -76,6 +76,28 @@ pub enum ProfileSubcommand {
         #[arg(long)]
         profile: Option<PathBuf>,
     },
+    Delete {
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    Keychain(ProfileKeychainCommand),
+}
+
+#[derive(Debug, Args)]
+pub struct ProfileKeychainCommand {
+    #[command(subcommand)]
+    pub command: ProfileKeychainSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfileKeychainSubcommand {
+    Doctor,
+    Cleanup {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -702,8 +724,8 @@ mod tests {
 
     use super::{
         Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
-        CloudflareRuntimeSubcommand, Command, OutputFormat, ProfileCommand, ProfileSubcommand,
-        RuntimeCommand, RuntimeSubcommand,
+        CloudflareRuntimeSubcommand, Command, OutputFormat, ProfileCommand, ProfileKeychainCommand,
+        ProfileKeychainSubcommand, ProfileSubcommand, RuntimeCommand, RuntimeSubcommand,
     };
 
     #[test]
@@ -770,6 +792,48 @@ mod tests {
                 assert_eq!(name.as_deref(), Some("alice"));
                 assert!(profile.is_none());
             }
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_profile_keychain_doctor() {
+        let cli = Cli::parse_from(["tapchat", "profile", "keychain", "doctor"]);
+        match cli.command {
+            Command::Profile(ProfileCommand {
+                command:
+                    ProfileSubcommand::Keychain(ProfileKeychainCommand {
+                        command: ProfileKeychainSubcommand::Doctor,
+                    }),
+            }) => {}
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_profile_keychain_cleanup_apply() {
+        let cli = Cli::parse_from(["tapchat", "profile", "keychain", "cleanup", "--apply"]);
+        match cli.command {
+            Command::Profile(ProfileCommand {
+                command:
+                    ProfileSubcommand::Keychain(ProfileKeychainCommand {
+                        command: ProfileKeychainSubcommand::Cleanup { dry_run, apply },
+                    }),
+            }) => {
+                assert!(!dry_run);
+                assert!(apply);
+            }
+            _ => panic!("unexpected command shape"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_profile_delete() {
+        let cli = Cli::parse_from(["tapchat", "profile", "delete", "--profile", "state/alice"]);
+        match cli.command {
+            Command::Profile(ProfileCommand {
+                command: ProfileSubcommand::Delete { profile },
+            }) => assert_eq!(profile, PathBuf::from("state/alice")),
             _ => panic!("unexpected command shape"),
         }
     }

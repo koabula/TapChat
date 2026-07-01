@@ -323,15 +323,17 @@ impl ProfileManager {
             return Err(anyhow!("Profile not found in registry"));
         }
 
-        // Remove from registry
-        inner.registry.remove(path);
-        inner.registry.save()?;
+        Profile::cleanup_profile_keychain_entries(path)?;
 
         // Delete the directory
         if path.exists() {
             std::fs::remove_dir_all(path)
                 .map_err(|e| anyhow!("Failed to delete profile directory: {}", e))?;
         }
+
+        // Remove from registry after keychain and directory deletion succeed.
+        inner.registry.remove(path);
+        inner.registry.save()?;
 
         Ok(())
     }

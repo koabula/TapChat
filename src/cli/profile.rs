@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
@@ -36,6 +36,7 @@ use super::util::to_snake_case_json_string;
 
 const PROFILE_LOCK_FILE_NAME: &str = ".profile.lock";
 const PROFILE_LOCK_INFO_FILE_NAME: &str = ".profile.lock.info";
+const PROFILE_METADATA_FILE_NAME: &str = "profile.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileMetadata {
@@ -190,6 +191,53 @@ pub struct ProfileOpenOptions {
     pub passphrase: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProfileKeychainEntryRef {
+    pub service: String,
+    pub account: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileKeychainProbeReport {
+    pub attempted: bool,
+    pub persistent_backend: bool,
+    pub writable: bool,
+    pub readable: bool,
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileKeychainDoctorReport {
+    pub backend_persistence: String,
+    pub persistent_backend: bool,
+    pub cleanup_supported: bool,
+    pub registered_profiles: usize,
+    pub registered_os_wrappers: usize,
+    pub matched_registered_targets: usize,
+    pub missing_registered_targets: usize,
+    pub tapchat_keychain_targets: usize,
+    pub orphan_targets: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_registered_accounts: Vec<String>,
+    pub probe: ProfileKeychainProbeReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProfileKeychainCleanupReport {
+    pub dry_run: bool,
+    pub would_delete: usize,
+    pub deleted: usize,
+    pub skipped_registered: usize,
+    pub orphan_accounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_registered_accounts: Vec<String>,
+    pub errors: Vec<String>,
+}
+
 impl Profile {
     pub fn init(name: &str, root: impl AsRef<Path>) -> Result<Self> {
         Self::init_with_options(
@@ -208,78 +256,89 @@ impl Profile {
         options: ProfileInitOptions,
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        fs::create_dir_all(&root).context("create profile root")?;
-        let profile_lock = ProfileLockGuard::acquire(&root)?;
-        if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
-            bail!(
-                "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
-                root.display()
-            );
-        }
-        let profile_id = format!("profile:{}", Uuid::new_v4());
-        let pdek = generate_pdek();
-        let mut wrappers = Vec::new();
+        let mut created_keychain_refs = Vec::new();
+        let init_result = (|| -> Result<Self> {
+            fs::create_dir_all(&root).context("create profile root")?;
+            let profile_lock = ProfileLockGuard::acquire(&root)?;
+            if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
+                bail!(
+                    "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
+                    root.display()
+                );
+            }
+            let profile_id = format!("profile:{}", Uuid::new_v4());
+            let pdek = generate_pdek();
+            let mut wrappers = Vec::new();
 
-        if options.use_keychain {
-            let wrapper_id = format!("wrapper:{}", Uuid::new_v4());
-            let os_kek = generate_wrap_key();
-            match store_os_kek(&profile_id, &wrapper_id, &*os_kek) {
-                Ok(()) => wrappers.push(
-                    build_os_keychain_wrapper(&profile_id, &wrapper_id, &*os_kek, &*pdek)
+            if options.use_keychain {
+                let wrapper_id = format!("wrapper:{}", Uuid::new_v4());
+                let os_kek = generate_wrap_key();
+                let keychain_ref = keychain_ref_for_wrapper(&profile_id, &wrapper_id);
+                match store_os_kek_entry(&keychain_ref, &*os_kek) {
+                    Ok(()) => {
+                        created_keychain_refs.push(keychain_ref);
+                        wrappers.push(
+                            build_os_keychain_wrapper(&profile_id, &wrapper_id, &*os_kek, &*pdek)
+                                .map_err(anyhow::Error::from)?,
+                        );
+                    }
+                    Err(error) if options.passphrase.is_some() => {
+                        log::warn!("OS keychain unavailable for profile {profile_id}: {error}");
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(keychain_unavailable_create_message);
+                    }
+                }
+            }
+
+            if let Some(passphrase) = options.passphrase.as_deref() {
+                if passphrase.is_empty() {
+                    bail!("profile passphrase must not be empty");
+                }
+                let wrapper_id = format!("wrapper:{}", Uuid::new_v4());
+                wrappers.push(
+                    build_passphrase_wrapper(&profile_id, &wrapper_id, passphrase, &*pdek)
                         .map_err(anyhow::Error::from)?,
-                ),
-                Err(error) if options.passphrase.is_some() => {
-                    log::warn!("OS keychain unavailable for profile {profile_id}: {error}");
-                }
-                Err(error) => {
-                    return Err(error).with_context(keychain_unavailable_create_message);
-                }
+                );
             }
-        }
 
-        if let Some(passphrase) = options.passphrase.as_deref() {
-            if passphrase.is_empty() {
-                bail!("profile passphrase must not be empty");
+            if wrappers.is_empty() {
+                bail!("profile encryption requires at least one key wrapper");
             }
-            let wrapper_id = format!("wrapper:{}", Uuid::new_v4());
-            wrappers.push(
-                build_passphrase_wrapper(&profile_id, &wrapper_id, passphrase, &*pdek)
-                    .map_err(anyhow::Error::from)?,
-            );
-        }
 
-        if wrappers.is_empty() {
-            bail!("profile encryption requires at least one key wrapper");
+            let meta = ProfileMetadata {
+                name: name.to_string(),
+                profile_id: profile_id.clone(),
+                bundles_dir: root.join("bundles"),
+                inbox_attachments_dir: root.join("attachments"),
+                outbox_attachments_dir: root.join("attachments"),
+                attachments_dir: root.join("attachments"),
+                runtime_dir: root.join("runtime"),
+                root_dir: root.clone(),
+                user_id: None,
+                device_id: None,
+                deployment_bundle_path: None,
+                encryption: Some(default_encryption_metadata(wrappers)),
+            };
+            let profile = Self {
+                root: root.clone(),
+                meta,
+                pdek,
+                _lock: profile_lock,
+            };
+            profile.ensure_layout()?;
+            profile.save_metadata()?;
+            if !profile.snapshot_path().exists() {
+                profile.save_snapshot(&CorePersistenceSnapshot::default())?;
+            }
+            profile.ensure_local_store_migrated()?;
+            profile.sync_registry_entry()?;
+            Ok(profile)
+        })();
+        if init_result.is_err() {
+            rollback_created_keychain_entries(&created_keychain_refs);
         }
-
-        let meta = ProfileMetadata {
-            name: name.to_string(),
-            profile_id: profile_id.clone(),
-            bundles_dir: root.join("bundles"),
-            inbox_attachments_dir: root.join("attachments"),
-            outbox_attachments_dir: root.join("attachments"),
-            attachments_dir: root.join("attachments"),
-            runtime_dir: root.join("runtime"),
-            root_dir: root.clone(),
-            user_id: None,
-            device_id: None,
-            deployment_bundle_path: None,
-            encryption: Some(default_encryption_metadata(wrappers)),
-        };
-        let profile = Self {
-            root,
-            meta,
-            pdek,
-            _lock: profile_lock,
-        };
-        profile.ensure_layout()?;
-        profile.save_metadata()?;
-        if !profile.snapshot_path().exists() {
-            profile.save_snapshot(&CorePersistenceSnapshot::default())?;
-        }
-        profile.ensure_local_store_migrated()?;
-        profile.sync_registry_entry()?;
-        Ok(profile)
+        init_result
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -295,7 +354,7 @@ impl Profile {
 
     pub fn open_with_options(root: impl AsRef<Path>, options: ProfileOpenOptions) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let meta_path = root.join("profile.json");
+        let meta_path = root.join(PROFILE_METADATA_FILE_NAME);
         if !meta_path.exists() {
             bail!("profile.json not found at {}", meta_path.display());
         }
@@ -611,7 +670,7 @@ impl Profile {
 
     fn save_metadata(&self) -> Result<()> {
         write_atomic_unique(
-            &self.root.join("profile.json"),
+            &self.root.join(PROFILE_METADATA_FILE_NAME),
             &serde_json::to_vec_pretty(&self.meta)?,
         )
     }
@@ -644,6 +703,20 @@ impl Profile {
             user_id: self.meta.user_id.clone(),
             device_id: self.meta.device_id.clone(),
         }
+    }
+
+    pub fn keychain_doctor() -> Result<ProfileKeychainDoctorReport> {
+        profile_keychain_doctor()
+    }
+
+    pub fn cleanup_orphan_keychain_entries(dry_run: bool) -> Result<ProfileKeychainCleanupReport> {
+        cleanup_orphan_keychain_entries(dry_run)
+    }
+
+    pub fn cleanup_profile_keychain_entries(
+        root: impl AsRef<Path>,
+    ) -> Result<ProfileKeychainCleanupReport> {
+        cleanup_profile_keychain_entries(root.as_ref())
     }
 }
 
@@ -922,24 +995,450 @@ fn unlock_profile_pdek(
     )
 }
 
-fn store_os_kek(profile_id: &str, wrapper_id: &str, key: &[u8]) -> Result<()> {
+#[derive(Debug, Clone, Default)]
+struct RegisteredProfileKeychainRefs {
+    registered_profiles: usize,
+    refs: BTreeSet<ProfileKeychainEntryRef>,
+    errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OrphanKeychainClassification {
+    orphan_accounts: Vec<String>,
+    missing_registered_accounts: Vec<String>,
+    skipped_registered: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeychainDeleteOutcome {
+    Deleted,
+    NoEntry,
+}
+
+fn keychain_ref_for_wrapper(profile_id: &str, wrapper_id: &str) -> ProfileKeychainEntryRef {
+    ProfileKeychainEntryRef {
+        service: OS_KEYCHAIN_SERVICE.into(),
+        account: crate::profile_crypto::generate_keychain_account(profile_id, wrapper_id),
+    }
+}
+
+fn keychain_ref_from_wrapper(
+    wrapper: &crate::profile_crypto::ProfileKeyWrapperMetadata,
+) -> Result<ProfileKeychainEntryRef> {
+    let service = wrapper
+        .keychain_service
+        .as_deref()
+        .unwrap_or(OS_KEYCHAIN_SERVICE)
+        .to_string();
+    let account = wrapper
+        .keychain_account
+        .as_deref()
+        .ok_or_else(|| anyhow!("OS keychain wrapper is missing account"))?
+        .to_string();
+    Ok(ProfileKeychainEntryRef { service, account })
+}
+
+fn store_os_kek_entry(entry_ref: &ProfileKeychainEntryRef, key: &[u8]) -> Result<()> {
     ensure_persistent_os_keychain()?;
-    let account = crate::profile_crypto::generate_keychain_account(profile_id, wrapper_id);
-    let entry = keyring::Entry::new(OS_KEYCHAIN_SERVICE, &account)
-        .with_context(|| format!("create OS keychain entry for {account}"))?;
-    entry
-        .set_password(&STANDARD.encode(key))
-        .with_context(|| format!("store OS keychain entry for {account}"))?;
+    let entry = keyring::Entry::new(&entry_ref.service, &entry_ref.account)
+        .with_context(|| format!("create OS keychain entry for {}", entry_ref.account))?;
+    entry.set_password(&STANDARD.encode(key)).with_context(|| {
+        format!(
+            "OS keychain cannot save new credentials for {}",
+            entry_ref.account
+        )
+    })?;
     let stored = entry
         .get_password()
-        .with_context(|| format!("verify OS keychain entry for {account}"))?;
+        .with_context(|| format!("verify OS keychain entry for {}", entry_ref.account))?;
     let stored = STANDARD
         .decode(stored)
         .context("decode OS keychain verification secret")?;
     if stored != key {
-        bail!("OS keychain verification failed for {account}");
+        bail!("OS keychain verification failed for {}", entry_ref.account);
     }
     Ok(())
+}
+
+fn delete_os_keychain_entry(entry_ref: &ProfileKeychainEntryRef) -> Result<KeychainDeleteOutcome> {
+    let entry = keyring::Entry::new(&entry_ref.service, &entry_ref.account)
+        .with_context(|| format!("create OS keychain entry for {}", entry_ref.account))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(KeychainDeleteOutcome::Deleted),
+        Err(keyring::Error::NoEntry) => Ok(KeychainDeleteOutcome::NoEntry),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "delete OS keychain entry for {}",
+            entry_ref.account
+        ))),
+    }
+}
+
+fn rollback_created_keychain_entries(entries: &[ProfileKeychainEntryRef]) {
+    for entry_ref in entries {
+        if let Err(error) = delete_os_keychain_entry(entry_ref) {
+            log::warn!(
+                "failed to roll back OS keychain entry {}: {error:#}",
+                entry_ref.account
+            );
+        }
+    }
+}
+
+fn profile_keychain_doctor() -> Result<ProfileKeychainDoctorReport> {
+    let persistence = default::default_credential_builder().persistence();
+    let persistent_backend = matches!(persistence, CredentialPersistence::UntilDelete);
+    let registered = collect_registered_os_keychain_refs()?;
+    let cleanup_supported = keychain_cleanup_supported();
+    let mut errors = registered.errors;
+    let tapchat_accounts = if cleanup_supported {
+        match enumerate_tapchat_keychain_accounts() {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                errors.push(format!("enumerate TapChat keychain targets: {error:#}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let classification = classify_orphan_keychain_accounts(&tapchat_accounts, &registered.refs);
+    Ok(ProfileKeychainDoctorReport {
+        backend_persistence: credential_persistence_label(&persistence).into(),
+        persistent_backend,
+        cleanup_supported,
+        registered_profiles: registered.registered_profiles,
+        registered_os_wrappers: registered.refs.len(),
+        matched_registered_targets: classification.skipped_registered,
+        missing_registered_targets: classification.missing_registered_accounts.len(),
+        tapchat_keychain_targets: tapchat_accounts.len(),
+        orphan_targets: classification.orphan_accounts.len(),
+        missing_registered_accounts: classification.missing_registered_accounts,
+        probe: probe_os_keychain(),
+        errors,
+    })
+}
+
+fn cleanup_orphan_keychain_entries(dry_run: bool) -> Result<ProfileKeychainCleanupReport> {
+    let mut report = ProfileKeychainCleanupReport {
+        dry_run,
+        ..ProfileKeychainCleanupReport::default()
+    };
+    if !keychain_cleanup_supported() {
+        report
+            .errors
+            .push("TapChat keychain cleanup is only supported on Windows in this release".into());
+        return Ok(report);
+    }
+
+    let registered = collect_registered_os_keychain_refs()?;
+    report.errors.extend(registered.errors);
+    if !report.errors.is_empty() {
+        return Ok(report);
+    }
+
+    let tapchat_accounts = match enumerate_tapchat_keychain_accounts() {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            report
+                .errors
+                .push(format!("enumerate TapChat keychain targets: {error:#}"));
+            return Ok(report);
+        }
+    };
+    let classification = classify_orphan_keychain_accounts(&tapchat_accounts, &registered.refs);
+    report.skipped_registered = classification.skipped_registered;
+    report.would_delete = classification.orphan_accounts.len();
+    report.orphan_accounts = classification.orphan_accounts.clone();
+    report.missing_registered_accounts = classification.missing_registered_accounts.clone();
+
+    if dry_run {
+        return Ok(report);
+    }
+
+    for account in classification.orphan_accounts {
+        let entry_ref = ProfileKeychainEntryRef {
+            service: OS_KEYCHAIN_SERVICE.into(),
+            account,
+        };
+        match delete_os_keychain_entry(&entry_ref) {
+            Ok(KeychainDeleteOutcome::Deleted) => report.deleted += 1,
+            Ok(KeychainDeleteOutcome::NoEntry) => {}
+            Err(error) => report.errors.push(error.to_string()),
+        }
+    }
+    Ok(report)
+}
+
+fn cleanup_profile_keychain_entries(root: &Path) -> Result<ProfileKeychainCleanupReport> {
+    let refs = profile_os_keychain_refs_from_path(root)?;
+    let mut report = ProfileKeychainCleanupReport {
+        dry_run: false,
+        would_delete: refs.len(),
+        orphan_accounts: refs
+            .iter()
+            .map(|entry_ref| entry_ref.account.clone())
+            .collect(),
+        ..ProfileKeychainCleanupReport::default()
+    };
+    for entry_ref in refs {
+        match delete_os_keychain_entry(&entry_ref) {
+            Ok(KeychainDeleteOutcome::Deleted) => report.deleted += 1,
+            Ok(KeychainDeleteOutcome::NoEntry) => {}
+            Err(error) => report.errors.push(error.to_string()),
+        }
+    }
+    if !report.errors.is_empty() {
+        bail!(
+            "failed to delete profile OS keychain wrappers: {}",
+            report.errors.join("; ")
+        );
+    }
+    Ok(report)
+}
+
+fn collect_registered_os_keychain_refs() -> Result<RegisteredProfileKeychainRefs> {
+    let registry = ProfileRegistry::load()?;
+    let mut result = RegisteredProfileKeychainRefs {
+        registered_profiles: registry.profiles.len(),
+        ..RegisteredProfileKeychainRefs::default()
+    };
+    for entry in registry.profiles {
+        match read_profile_metadata_if_present(&entry.root_dir) {
+            Ok(Some(meta)) => match os_keychain_refs_from_metadata(&meta) {
+                Ok(refs) => result.refs.extend(refs),
+                Err(error) => result.errors.push(format!(
+                    "failed to inspect OS keychain wrappers in {}: {error:#}",
+                    entry.root_dir.display()
+                )),
+            },
+            Ok(None) => result.errors.push(format!(
+                "registered profile {} has no profile.json",
+                entry.root_dir.display()
+            )),
+            Err(error) => result.errors.push(format!(
+                "failed to read registered profile metadata at {}: {error:#}",
+                entry.root_dir.display()
+            )),
+        }
+    }
+    Ok(result)
+}
+
+fn profile_os_keychain_refs_from_path(root: &Path) -> Result<Vec<ProfileKeychainEntryRef>> {
+    let Some(meta) = read_profile_metadata_if_present(root)? else {
+        return Ok(Vec::new());
+    };
+    os_keychain_refs_from_metadata(&meta)
+}
+
+fn read_profile_metadata_if_present(root: &Path) -> Result<Option<ProfileMetadata>> {
+    let meta_path = root.join(PROFILE_METADATA_FILE_NAME);
+    if !meta_path.exists() {
+        return Ok(None);
+    }
+    let mut meta: ProfileMetadata =
+        serde_json::from_slice(&fs::read(&meta_path).context("read profile metadata")?)
+            .with_context(|| format!("decode profile metadata at {}", meta_path.display()))?;
+    if meta.attachments_dir.as_os_str().is_empty() {
+        meta.attachments_dir = root.join("attachments");
+        meta.inbox_attachments_dir = meta.attachments_dir.clone();
+        meta.outbox_attachments_dir = meta.attachments_dir.clone();
+    }
+    Ok(Some(meta))
+}
+
+fn os_keychain_refs_from_metadata(meta: &ProfileMetadata) -> Result<Vec<ProfileKeychainEntryRef>> {
+    let Some(encryption) = meta.encryption.as_ref() else {
+        return Ok(Vec::new());
+    };
+    encryption
+        .wrappers
+        .iter()
+        .filter(|wrapper| wrapper.kind == ProfileKeyWrapperKind::OsKeychain)
+        .map(keychain_ref_from_wrapper)
+        .collect()
+}
+
+fn classify_orphan_keychain_accounts(
+    tapchat_accounts: &[String],
+    registered_refs: &BTreeSet<ProfileKeychainEntryRef>,
+) -> OrphanKeychainClassification {
+    let registered_accounts: BTreeSet<String> = registered_refs
+        .iter()
+        .filter(|entry_ref| entry_ref.service == OS_KEYCHAIN_SERVICE)
+        .map(|entry_ref| entry_ref.account.clone())
+        .collect();
+    let tapchat_account_set: BTreeSet<_> = tapchat_accounts.iter().map(String::as_str).collect();
+    let mut classification = OrphanKeychainClassification::default();
+    for account in tapchat_accounts {
+        if registered_accounts.contains(account.as_str()) {
+            classification.skipped_registered += 1;
+        } else {
+            classification.orphan_accounts.push(account.clone());
+        }
+    }
+    classification.missing_registered_accounts = registered_accounts
+        .iter()
+        .filter(|account| !tapchat_account_set.contains(account.as_str()))
+        .cloned()
+        .collect();
+    classification.orphan_accounts.sort();
+    classification.orphan_accounts.dedup();
+    classification.missing_registered_accounts.sort();
+    classification
+}
+
+fn probe_os_keychain() -> ProfileKeychainProbeReport {
+    let persistence = default::default_credential_builder().persistence();
+    let persistent_backend = matches!(persistence, CredentialPersistence::UntilDelete);
+    let mut report = ProfileKeychainProbeReport {
+        attempted: persistent_backend,
+        persistent_backend,
+        writable: false,
+        readable: false,
+        deleted: false,
+        error: None,
+    };
+    if !persistent_backend {
+        append_probe_error(
+            &mut report,
+            format!(
+                "OS keychain backend is not persistent ({})",
+                credential_persistence_label(&persistence)
+            ),
+        );
+        return report;
+    }
+
+    let entry_ref = ProfileKeychainEntryRef {
+        service: OS_KEYCHAIN_SERVICE.into(),
+        account: format!("probe:{}", Uuid::new_v4()),
+    };
+    let entry = match keyring::Entry::new(&entry_ref.service, &entry_ref.account) {
+        Ok(entry) => entry,
+        Err(error) => {
+            append_probe_error(
+                &mut report,
+                format!("create probe OS keychain entry: {error}"),
+            );
+            return report;
+        }
+    };
+    let probe_secret = generate_wrap_key();
+    let encoded = STANDARD.encode(&*probe_secret);
+    if let Err(error) = entry.set_password(&encoded) {
+        append_probe_error(
+            &mut report,
+            format!("write probe OS keychain entry: {error}"),
+        );
+        return report;
+    }
+    report.writable = true;
+
+    match entry.get_password() {
+        Ok(stored) if stored == encoded => report.readable = true,
+        Ok(_) => append_probe_error(&mut report, "probe OS keychain verification mismatch"),
+        Err(error) => append_probe_error(
+            &mut report,
+            format!("read probe OS keychain entry: {error}"),
+        ),
+    }
+
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => report.deleted = true,
+        Err(error) => append_probe_error(
+            &mut report,
+            format!(
+                "delete probe OS keychain entry {}: {error}",
+                entry_ref.account
+            ),
+        ),
+    }
+    report
+}
+
+fn append_probe_error(report: &mut ProfileKeychainProbeReport, error: impl Into<String>) {
+    let error = error.into();
+    if let Some(existing) = report.error.as_mut() {
+        existing.push_str("; ");
+        existing.push_str(&error);
+    } else {
+        report.error = Some(error);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn keychain_cleanup_supported() -> bool {
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn keychain_cleanup_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_tapchat_keychain_accounts() -> Result<Vec<String>> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_NOT_FOUND,
+        Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW},
+    };
+
+    let mut count = 0_u32;
+    let mut credentials: *mut *mut CREDENTIALW = std::ptr::null_mut();
+    let ok = unsafe { CredEnumerateW(std::ptr::null(), 0, &mut count, &mut credentials) };
+    if ok == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+            return Ok(Vec::new());
+        }
+        return Err(anyhow!(
+            "Windows Credential Manager enumeration failed: {}",
+            error
+        ));
+    }
+    let mut accounts = Vec::new();
+    if !credentials.is_null() {
+        let credential_slice = unsafe { std::slice::from_raw_parts(credentials, count as usize) };
+        for credential_ptr in credential_slice {
+            if credential_ptr.is_null() {
+                continue;
+            }
+            let credential = unsafe { &**credential_ptr };
+            if credential.TargetName.is_null() {
+                continue;
+            }
+            let target_name = unsafe { wide_ptr_to_string(credential.TargetName) };
+            if let Some(account) = tapchat_account_from_windows_target(&target_name) {
+                accounts.push(account);
+            }
+        }
+    }
+    unsafe { CredFree(credentials.cast()) };
+    accounts.sort();
+    accounts.dedup();
+    Ok(accounts)
+}
+
+#[cfg(target_os = "windows")]
+fn tapchat_account_from_windows_target(target_name: &str) -> Option<String> {
+    target_name
+        .strip_suffix(&format!(".{OS_KEYCHAIN_SERVICE}"))
+        .map(str::to_string)
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+    let mut len = 0;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn enumerate_tapchat_keychain_accounts() -> Result<Vec<String>> {
+    bail!("TapChat keychain cleanup is only supported on Windows in this release")
 }
 
 fn ensure_persistent_os_keychain() -> Result<()> {
@@ -1005,14 +1504,18 @@ fn load_os_kek(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use tempfile::tempdir;
 
     use keyring::{credential::CredentialPersistence, default};
 
-    use super::{Profile, ProfileInitOptions, ProfileRegistry, RuntimeMetadata};
+    use super::{
+        Profile, ProfileInitOptions, ProfileKeychainEntryRef, ProfileRegistry, RuntimeMetadata,
+    };
     use crate::persistence::CorePersistenceSnapshot;
+    use crate::profile_crypto::OS_KEYCHAIN_SERVICE;
 
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1343,6 +1846,58 @@ mod tests {
                 CredentialPersistence::UntilDelete
             ));
         }
+    }
+
+    #[test]
+    fn keychain_orphan_classification_keeps_registered_wrappers() {
+        let registered = BTreeSet::from([ProfileKeychainEntryRef {
+            service: OS_KEYCHAIN_SERVICE.into(),
+            account: "profile:live:wrapper:live".into(),
+        }]);
+        let accounts = vec![
+            "profile:live:wrapper:live".to_string(),
+            "profile:old:wrapper:old".to_string(),
+        ];
+
+        let classification = super::classify_orphan_keychain_accounts(&accounts, &registered);
+
+        assert_eq!(classification.skipped_registered, 1);
+        assert_eq!(
+            classification.orphan_accounts,
+            vec!["profile:old:wrapper:old".to_string()]
+        );
+        assert!(classification.missing_registered_accounts.is_empty());
+    }
+
+    #[test]
+    fn keychain_orphan_classification_reports_missing_registered_wrapper() {
+        let registered = BTreeSet::from([ProfileKeychainEntryRef {
+            service: OS_KEYCHAIN_SERVICE.into(),
+            account: "profile:missing:wrapper:missing".into(),
+        }]);
+        let accounts = vec!["profile:old:wrapper:old".to_string()];
+
+        let classification = super::classify_orphan_keychain_accounts(&accounts, &registered);
+
+        assert_eq!(classification.skipped_registered, 0);
+        assert_eq!(
+            classification.missing_registered_accounts,
+            vec!["profile:missing:wrapper:missing".to_string()]
+        );
+        assert_eq!(
+            classification.orphan_accounts,
+            vec!["profile:old:wrapper:old".to_string()]
+        );
+    }
+
+    #[test]
+    fn cleanup_profile_keychain_entries_without_metadata_is_noop() {
+        let dir = tempdir().expect("tempdir");
+        let report = super::cleanup_profile_keychain_entries(dir.path()).expect("cleanup");
+
+        assert_eq!(report.would_delete, 0);
+        assert_eq!(report.deleted, 0);
+        assert!(report.errors.is_empty());
     }
 
     #[test]

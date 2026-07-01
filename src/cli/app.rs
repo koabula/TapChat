@@ -23,8 +23,8 @@ use super::args::{
     ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand, GroupCommand,
     GroupInviteCommand, GroupInviteSubcommand, GroupJoinCommand, GroupJoinSubcommand,
     GroupMemberCommand, GroupMemberSubcommand, GroupSubcommand, MessageCommand, MessageSubcommand,
-    OutputFormat, ProfileCommand, ProfileSubcommand, RuntimeCommand, RuntimeSubcommand,
-    SyncCommand, SyncSubcommand,
+    OutputFormat, ProfileCommand, ProfileKeychainCommand, ProfileKeychainSubcommand,
+    ProfileSubcommand, RuntimeCommand, RuntimeSubcommand, SyncCommand, SyncSubcommand,
 };
 use super::driver::CoreDriver;
 use super::profile::{Profile, ProfileInitOptions, ProfileRegistry, RuntimeMetadata};
@@ -182,6 +182,46 @@ impl CliApp {
                     "active_profile": registry.active_profile,
                 }))
             }
+            ProfileSubcommand::Delete { profile } => {
+                let mut registry = ProfileRegistry::load()?;
+                if registry.active_profile.as_ref() == Some(&profile) {
+                    bail!("cannot delete the active profile; activate another profile first");
+                }
+                if !registry
+                    .profiles
+                    .iter()
+                    .any(|entry| entry.root_dir == profile)
+                {
+                    bail!(
+                        "profile {} is not registered on this device",
+                        profile.display()
+                    );
+                }
+                let keychain_cleanup = Profile::cleanup_profile_keychain_entries(&profile)?;
+                if profile.exists() {
+                    std::fs::remove_dir_all(&profile).with_context(|| {
+                        format!("delete profile directory {}", profile.display())
+                    })?;
+                }
+                registry.remove(&profile);
+                registry.save()?;
+                self.print_value(&serde_json::json!({
+                    "deleted": true,
+                    "profile": profile,
+                    "active_profile": registry.active_profile,
+                    "keychain_cleanup": keychain_cleanup,
+                }))
+            }
+            ProfileSubcommand::Keychain(ProfileKeychainCommand { command }) => match command {
+                ProfileKeychainSubcommand::Doctor => {
+                    let report = Profile::keychain_doctor()?;
+                    self.print_value(&report)
+                }
+                ProfileKeychainSubcommand::Cleanup { dry_run, apply } => {
+                    let report = Profile::cleanup_orphan_keychain_entries(dry_run || !apply)?;
+                    self.print_value(&report)
+                }
+            },
         }
     }
 

@@ -2,6 +2,7 @@
 /doc
 /draft
 node_modules/
+/app/desktop/node_modules/
 /.tmp*/
 /.cli-smoke*/
 /.cli-smoke*.ps1
@@ -29,6 +30,10 @@ node_modules/
 # Test and debug files
 *.log
 *.trace
+
+# Local recovery artifacts
+/.local-backups/
+/.local-recovery/
 
 # OS specific
 .DS_Store
