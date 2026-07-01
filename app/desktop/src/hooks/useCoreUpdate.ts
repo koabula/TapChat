@@ -16,24 +16,19 @@ import {
   retryPendingWelcomePickups,
   type GroupConversationSummary,
 } from "../lib/tauri";
+import {
+  mapContacts,
+  staleGroupSnapshotIds,
+  visibleGroupIds,
+} from "../lib/coreUpdateProjection";
 
 import type {
   CoreUpdateEvent,
   ConversationSummary,
-  ContactSummary,
   LocalIdentitySummary,
   MessageRequestItem,
 } from "../lib/types";
-
-function mapContacts(contacts: ContactSummary[]) {
-  return contacts.map((contact) => ({
-    user_id: contact.user_id,
-    display_name: contact.display_name ?? null,
-    device_count: contact.device_count,
-    last_refresh: null,
-    relationship_status: contact.relationship_status ?? "available",
-  }));
-}
+import type { ContactSummary } from "../lib/types";
 
 async function fetchConversationSnapshot(): Promise<ConversationSummary[]> {
   return invoke<ConversationSummary[]>("list_conversations");
@@ -158,19 +153,17 @@ export function useCoreUpdate() {
       return;
     }
     mergeGroupConversationSnapshot(summaries);
-    const visible = new Set(summaries.map((summary) => summary.group_id));
+    const visible = visibleGroupIds(summaries);
     for (const summary of summaries) {
       scheduleGroupSnapshotRefresh(summary.group_id);
     }
     const known = Object.keys(useGroupsStore.getState().snapshots);
-    for (const groupId of known) {
-      if (!visible.has(groupId)) {
-        removeGroupSnapshot(groupId);
-        const pending = groupRefreshTimersRef.current.get(groupId);
-        if (pending) {
-          clearTimeout(pending);
-          groupRefreshTimersRef.current.delete(groupId);
-        }
+    for (const groupId of staleGroupSnapshotIds(known, visible)) {
+      removeGroupSnapshot(groupId);
+      const pending = groupRefreshTimersRef.current.get(groupId);
+      if (pending) {
+        clearTimeout(pending);
+        groupRefreshTimersRef.current.delete(groupId);
       }
     }
   };
