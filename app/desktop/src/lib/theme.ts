@@ -1,4 +1,5 @@
 export const THEME_STORAGE_KEY = "tapchat:theme-preference";
+export const DEFAULT_THEME_PREFERENCE: ThemePreference = "mono-light";
 
 export const THEME_PREFERENCES = [
   "system",
@@ -113,14 +114,14 @@ export function getSystemPrefersDark(): boolean {
 export function getStoredThemePreference(): ThemePreference {
   const storage = getStorage();
   if (!storage) {
-    return "system";
+    return DEFAULT_THEME_PREFERENCE;
   }
 
   try {
     const value = storage.getItem(THEME_STORAGE_KEY);
-    return isThemePreference(value) ? value : "system";
+    return isThemePreference(value) ? value : DEFAULT_THEME_PREFERENCE;
   } catch {
-    return "system";
+    return DEFAULT_THEME_PREFERENCE;
   }
 }
 

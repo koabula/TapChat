@@ -67,17 +67,17 @@ afterEach(() => {
 });
 
 describe("theme helpers", () => {
-  test("defaults to system when localStorage is empty", () => {
+  test("defaults to mono-light when localStorage is empty", () => {
     stubStorage();
 
-    expect(getStoredThemePreference()).toBe("system");
+    expect(getStoredThemePreference()).toBe("mono-light");
   });
 
-  test("falls back to system for invalid localStorage values", () => {
+  test("falls back to mono-light for invalid localStorage values", () => {
     const storage = stubStorage();
     storage.setItem(THEME_STORAGE_KEY, "solarized");
 
-    expect(getStoredThemePreference()).toBe("system");
+    expect(getStoredThemePreference()).toBe("mono-light");
   });
 
   test("resolves system to nord-light in light OS mode", () => {
