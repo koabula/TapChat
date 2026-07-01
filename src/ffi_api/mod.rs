@@ -1,4 +1,8 @@
+mod attachments;
 mod engine;
+mod groups;
+mod recovery;
+mod sync;
 mod tests;
 mod types;
 

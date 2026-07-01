@@ -4,7 +4,7 @@ mod tests {
         AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
     };
     use crate::conversation::RecoveryStatus;
-    use crate::ffi_api::engine;
+    use crate::ffi_api::groups;
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput,
@@ -516,15 +516,15 @@ mod tests {
         ];
 
         assert_eq!(
-            engine::test_group_capability_operations(GroupRole::Owner),
+            groups::test_group_capability_operations(GroupRole::Owner),
             owner_privileged
         );
         assert_eq!(
-            engine::test_group_capability_operations(GroupRole::Admin),
+            groups::test_group_capability_operations(GroupRole::Admin),
             admin_privileged
         );
         assert_eq!(
-            engine::test_group_capability_operations(GroupRole::Member),
+            groups::test_group_capability_operations(GroupRole::Member),
             member
         );
     }

@@ -1,5 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::attachments::{attachment_download_task_id, validate_attachment_descriptor};
+use super::groups::{
+    active_peer_key_packages, group_capability_operations, group_message_type_to_direct,
+};
+use super::recovery::{
+    is_degraded_restore_diagnostic, recovery_recoverable, suggested_recovery_action,
+};
+use super::sync::{
+    pending_welcome_pickup_key, GROUP_OUTBOX_FETCH_LIMIT, WELCOME_PICKUP_RETRY_TIMER_PREFIX,
+};
 use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
 use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
@@ -15,13 +25,12 @@ use crate::mls_adapter::{
 };
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
-    DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCapabilityOperation,
-    GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy,
-    GroupJoinRequest, GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberDevice,
-    GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
-    GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle,
-    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate,
-    WelcomePickupDescriptor,
+    DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
+    GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy, GroupJoinRequest,
+    GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberDevice, GroupMemberInvitePolicy,
+    GroupMemberStatus, GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor,
+    GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord, MessageType,
+    MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
@@ -55,15 +64,6 @@ use ed25519_dalek::Verifier;
 use log;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
-const MAX_ATTACHMENT_MIME_TYPE_LEN: usize = 255;
-const MAX_ATTACHMENT_FILE_NAME_LEN: usize = 255;
-/// Batch size for group outbox fetches during sync catch-up.
-/// Increased from 100 to reduce round-trips when many messages accumulated
-/// while the member was offline.
-const GROUP_OUTBOX_FETCH_LIMIT: u64 = 1000;
-const WELCOME_PICKUP_RETRY_TIMER_PREFIX: &str = "retry_welcome_pickup:";
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
@@ -145,41 +145,6 @@ struct ContactAcceptedControl {
     request_id: String,
     #[serde(alias = "created_at")]
     created_at: u64,
-}
-
-fn pending_welcome_pickup_key(group_id: &str, device_id: &str) -> String {
-    format!("{group_id}::{device_id}")
-}
-
-fn validate_attachment_descriptor(descriptor: &AttachmentDescriptor) -> CoreResult<()> {
-    if descriptor.attachment_id.trim().is_empty() {
-        return Err(CoreError::invalid_input("attachment id is required"));
-    }
-    if descriptor.mime_type.trim().is_empty()
-        || descriptor.mime_type.len() > MAX_ATTACHMENT_MIME_TYPE_LEN
-        || descriptor.mime_type.contains('\r')
-        || descriptor.mime_type.contains('\n')
-    {
-        return Err(CoreError::invalid_input("attachment mime type is invalid"));
-    }
-    if descriptor.size_bytes == 0 || descriptor.size_bytes > MAX_ATTACHMENT_BYTES {
-        return Err(CoreError::invalid_input(
-            "attachment size is outside supported limits",
-        ));
-    }
-    if let Some(file_name) = &descriptor.file_name {
-        if file_name.trim().is_empty()
-            || file_name.len() > MAX_ATTACHMENT_FILE_NAME_LEN
-            || file_name.contains('/')
-            || file_name.contains('\\')
-            || file_name.contains('\0')
-            || file_name.contains('\r')
-            || file_name.contains('\n')
-        {
-            return Err(CoreError::invalid_input("attachment file name is invalid"));
-        }
-    }
-    Ok(())
 }
 
 impl CoreEngine {
@@ -4964,10 +4929,7 @@ impl CoreEngine {
             .keys()
             .filter(|conversation_id| {
                 self.recovery_snapshot_for_conversation(conversation_id)
-                    .is_some_and(|recovery| {
-                        recovery.restore_failure_reason.is_some()
-                            || recovery.recovery_status == RecoveryStatus::NeedsRebuild
-                    })
+                    .is_some_and(|recovery| is_degraded_restore_diagnostic(&recovery))
             })
             .cloned()
             .collect();
@@ -8425,23 +8387,15 @@ impl CoreEngine {
                 .map(|value| value.status),
             escalation_reason: context.and_then(|value| value.escalation_reason),
             last_error: context.and_then(|value| value.last_error.clone()),
-            recoverable: context
-                .and_then(|value| value.restore_recoverable)
-                .unwrap_or(!matches!(
-                    conversation.conversation.state,
-                    ConversationState::Closed | ConversationState::Archived
-                )),
-            suggested_action: context
-                .and_then(|value| value.suggested_action.clone())
-                .unwrap_or_else(|| {
-                    if conversation.recovery_status == RecoveryStatus::NeedsRebuild
-                        || conversation.conversation.state == ConversationState::NeedsRebuild
-                    {
-                        "reconcile_conversation_membership".into()
-                    } else {
-                        "sync_then_retry".into()
-                    }
-                }),
+            recoverable: recovery_recoverable(
+                conversation.conversation.state,
+                context.and_then(|value| value.restore_recoverable),
+            ),
+            suggested_action: suggested_recovery_action(
+                conversation.recovery_status,
+                conversation.conversation.state,
+                context.and_then(|value| value.suggested_action.clone()),
+            ),
             restore_failure_reason: context.and_then(|value| value.restore_failure_reason.clone()),
             restore_failure_detail: context.and_then(|value| value.restore_failure_detail.clone()),
         })
@@ -13307,84 +13261,6 @@ fn group_capability_for_manifest(manifest: &GroupManifest, role: GroupRole) -> G
     }
 }
 
-fn group_capability_operations(role: GroupRole) -> Vec<GroupCapabilityOperation> {
-    match role {
-        GroupRole::Owner => vec![
-            GroupCapabilityOperation::Read,
-            GroupCapabilityOperation::Subscribe,
-            GroupCapabilityOperation::AppendApplication,
-            GroupCapabilityOperation::AppendControl,
-            GroupCapabilityOperation::AppendMembership,
-            GroupCapabilityOperation::ManageInvites,
-            GroupCapabilityOperation::ApproveJoin,
-            GroupCapabilityOperation::RemoveMember,
-            GroupCapabilityOperation::UpdateGroupMetadata,
-            // Only the owner may seal the outbox (PROTOCOL_GROUP_CN.md §10.4).
-            GroupCapabilityOperation::SealGroup,
-        ],
-        GroupRole::Admin => vec![
-            GroupCapabilityOperation::Read,
-            GroupCapabilityOperation::Subscribe,
-            GroupCapabilityOperation::AppendApplication,
-            GroupCapabilityOperation::AppendControl,
-            GroupCapabilityOperation::AppendMembership,
-            GroupCapabilityOperation::ManageInvites,
-            GroupCapabilityOperation::ApproveJoin,
-            GroupCapabilityOperation::RemoveMember,
-            GroupCapabilityOperation::UpdateGroupMetadata,
-        ],
-        GroupRole::Member => vec![
-            GroupCapabilityOperation::Read,
-            GroupCapabilityOperation::Subscribe,
-            GroupCapabilityOperation::AppendApplication,
-            GroupCapabilityOperation::AppendControl,
-        ],
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn test_group_capability_operations(role: GroupRole) -> Vec<GroupCapabilityOperation> {
-    group_capability_operations(role)
-}
-
-fn group_message_type_to_direct(message_type: GroupMessageType) -> MessageType {
-    match message_type {
-        GroupMessageType::MlsApplication => MessageType::MlsApplication,
-        GroupMessageType::MlsCommit => MessageType::MlsCommit,
-        GroupMessageType::ControlConversationNeedsRebuild => {
-            MessageType::ControlConversationNeedsRebuild
-        }
-        GroupMessageType::ControlGroupDissolved => MessageType::ControlConversationNeedsRebuild,
-        GroupMessageType::ControlGroupMembershipChanged
-        | GroupMessageType::ControlGroupJoinRequested
-        | GroupMessageType::ControlGroupJoinApproved
-        | GroupMessageType::ControlGroupJoinRejected
-        | GroupMessageType::ControlGroupLeaveRequested => {
-            // Dissolve is a terminal membership-change event; fold it into the
-            // existing membership-changed bucket here so direct-chat message
-            // type derivation stays a pure model projection. The
-            // dissolve-specific behaviour (owner-only, seal outbox, etc.)
-            // lives in the engine path added by later A.2-A.6 tasks.
-            MessageType::ControlDeviceMembershipChanged
-        }
-        GroupMessageType::ControlGroupMetadataUpdated => MessageType::ControlIdentityStateUpdated,
-    }
-}
-
-fn active_peer_key_packages(bundle: &IdentityBundle) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
-    Ok(bundle
-        .devices
-        .iter()
-        .filter(|device| matches!(device.status, DeviceStatusKind::Active))
-        .map(|device| PeerDeviceKeyPackage {
-            user_id: bundle.user_id.clone(),
-            device_id: device.device_id.clone(),
-            device_public_key: device.device_public_key.clone(),
-            key_package_b64: device.keypackage_ref.object_ref.clone(),
-        })
-        .collect())
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -13616,16 +13492,6 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .collect(),
         mls_state_persistence_blocked,
     }
-}
-
-fn attachment_download_task_id(message_id: &str, reference: &str, destination: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(reference.as_bytes());
-    hasher.update([0]);
-    hasher.update(destination.as_bytes());
-    let digest = hasher.finalize();
-    let hash: String = format!("{digest:x}").chars().take(12).collect();
-    format!("blob-download:{message_id}:{hash}")
 }
 
 fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
