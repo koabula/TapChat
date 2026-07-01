@@ -5310,7 +5310,7 @@ mod tests {
         let ops = persist_ops(&output);
         assert!(ops.iter().any(|op| matches!(
             op,
-            PersistOp::SaveRecoveryContext { conversation_id: id } if id == &conversation_id
+            PersistOp::DeleteRecoveryContext { conversation_id: id } if id == &conversation_id
         )));
         assert!(ops.iter().any(|op| matches!(
             op,

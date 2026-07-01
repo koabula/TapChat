@@ -33,6 +33,7 @@ import {
   cloudflareStatus,
   getGroupMessages,
   getGroupSnapshot,
+  listConversations,
   syncGroupOutbox,
   type GroupMessageView,
 } from "@/lib/tauri";
@@ -67,7 +68,8 @@ export default function ChatView() {
   const shouldAutoScrollRef = useRef(true);
 
   const { contacts } = useContactsStore();
-  const { conversations, setActiveConversation } = useConversationsStore();
+  const { conversations, mergeConversationSnapshot, setActiveConversation } =
+    useConversationsStore();
   const { deviceId, displayName: localDisplayName } = useSessionStore();
   const groupSnapshot = useGroupsStore((s) =>
     s.snapshots[
@@ -305,6 +307,11 @@ export default function ChatView() {
       if (isGroup && activeConversation?.group_id) {
         await refreshCurrentGroupSnapshot();
       }
+      const refreshedConversations = await listConversations();
+      mergeConversationSnapshot(refreshedConversations, contacts, {
+        markUnread: false,
+        replace: true,
+      });
       await refreshMessages();
     } catch (err) {
       setRecoveryError(err instanceof Error ? err.message : String(err));

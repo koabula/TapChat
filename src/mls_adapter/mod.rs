@@ -77,6 +77,7 @@ pub enum IngestResult {
     AppliedApplication(DecryptedApplicationMessage),
     AppliedCommit { epoch: u64 },
     AppliedWelcome { epoch: u64 },
+    IgnoredReplay,
     PendingRetry,
     NeedsRebuild,
 }
@@ -144,6 +145,14 @@ fn record_restore_failure(
         failed_conversation_ids.push(failure.conversation_id.clone());
     }
     failures.push(failure);
+}
+
+fn is_replay_or_duplicate_process_error(error: &impl std::fmt::Debug) -> bool {
+    let debug = format!("{error:?}").to_ascii_lowercase();
+    debug.contains("secretreuseerror")
+        || debug.contains("secret reuse")
+        || debug.contains("generation out of bounds")
+        || debug.contains("ciphertext generation out of bounds")
 }
 
 pub struct MlsAdapter {
@@ -953,7 +962,20 @@ impl MlsAdapter {
             .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
-            Err(_) => {
+            Err(error) if is_replay_or_duplicate_process_error(&error) => {
+                log::warn!(
+                    "ingest_protocol_message: ignoring replay/duplicate MLS message for conversation {}: {:?}",
+                    conversation_id,
+                    error
+                );
+                return Ok(IngestResult::IgnoredReplay);
+            }
+            Err(error) => {
+                log::warn!(
+                    "ingest_protocol_message: MLS process_message failed for conversation {}: {:?}",
+                    conversation_id,
+                    error
+                );
                 state.status = MlsStateStatus::NeedsRecovery;
                 return Ok(IngestResult::PendingRetry);
             }
@@ -1198,6 +1220,77 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn replayed_application_message_is_ignored_without_recovery() {
+        let alice_identity =
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
+
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
+        let (mut bob_adapter, bob_package) =
+            MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+
+        let artifacts = alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: bob_package.key_package_b64,
+                }],
+            )
+            .expect("create conversation");
+
+        bob_adapter
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &artifacts.welcomes[0].payload_b64,
+            )
+            .expect("welcome");
+        let _ = bob_adapter
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &artifacts.commit_b64,
+            )
+            .expect("commit");
+
+        let outbound = alice_adapter
+            .encrypt_application("conv:alice:bob", b"hello once")
+            .expect("application");
+        let first = bob_adapter
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("first receive");
+        assert!(matches!(first, IngestResult::AppliedApplication(_)));
+
+        let replay = bob_adapter
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("replay receive");
+        assert_eq!(replay, IngestResult::IgnoredReplay);
+        assert_eq!(
+            bob_adapter
+                .export_group_summary("conv:alice:bob")
+                .expect("summary")
+                .status,
+            MlsStateStatus::Active
+        );
     }
 
     #[test]

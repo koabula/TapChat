@@ -4315,46 +4315,91 @@ impl CoreEngine {
         };
 
         if !reconcile.changed && !needs_rebootstrap {
-            if let Some(adapter) = self.state.mls_adapter.as_mut() {
-                if let Ok(summary) = adapter.attempt_recovery(&conversation_id) {
-                    self.state
-                        .mls_summaries
-                        .insert(conversation_id.clone(), summary);
-                }
-            }
-            self.clear_recovery_context_as_healthy(&conversation_id);
+            let device_id = self
+                .state
+                .local_identity
+                .as_ref()
+                .map(|identity| identity.device_identity.device_id.clone());
+            let should_drive_recovery = {
+                let has_recovery_context =
+                    self.state.recovery_contexts.contains_key(&conversation_id);
+                let conversation_needs_recovery = self
+                    .state
+                    .conversations
+                    .get(&conversation_id)
+                    .map(|state| state.recovery_status != RecoveryStatus::Healthy)
+                    .unwrap_or(false);
+                let has_pending_records = device_id
+                    .as_deref()
+                    .map(|device_id| {
+                        self.has_pending_records_for_conversation(device_id, &conversation_id)
+                    })
+                    .unwrap_or(false);
+                has_recovery_context || conversation_needs_recovery || has_pending_records
+            };
             let mut output = CoreOutput {
                 state_update: CoreStateUpdate {
                     conversations_changed: true,
                     ..CoreStateUpdate::default()
                 },
-                effects: vec![persist_effect(
-                    &self.state,
-                    vec![
-                        PersistOp::SaveConversation {
-                            conversation_id: conversation_id.clone(),
-                        },
-                        PersistOp::SaveMlsState {
-                            conversation_id: conversation_id.clone(),
-                        },
-                        PersistOp::SaveRecoveryContext {
-                            conversation_id: conversation_id.clone(),
-                        },
-                    ],
-                )],
+                effects: vec![],
                 view_model: Some(CoreViewModel {
                     conversations: vec![self.conversation_summary(&conversation_id)?],
                     ..CoreViewModel::default()
                 }),
             };
-            if let Some(device_id) = self
-                .state
-                .local_identity
-                .as_ref()
-                .map(|identity| identity.device_identity.device_id.clone())
-            {
-                output = merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
+            if should_drive_recovery {
+                if let Some(device_id) = device_id.clone() {
+                    output = merge_outputs(output, self.sync_inbox(device_id.clone())?);
+                    output =
+                        merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
+                }
             }
+            let still_pending = device_id
+                .as_deref()
+                .map(|device_id| {
+                    self.has_pending_records_for_conversation(device_id, &conversation_id)
+                })
+                .unwrap_or(false);
+            if still_pending {
+                self.transition_recovery_phase(&conversation_id, RecoveryPhase::WaitingForSync);
+            } else {
+                if let Some(adapter) = self.state.mls_adapter.as_mut() {
+                    if let Ok(summary) = adapter.attempt_recovery(&conversation_id) {
+                        self.state
+                            .mls_summaries
+                            .insert(conversation_id.clone(), summary);
+                    }
+                }
+                self.clear_recovery_context_as_healthy(&conversation_id);
+            }
+            output.view_model = Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(&conversation_id)?],
+                ..output.view_model.unwrap_or_default()
+            });
+            let recovery_context_op = if self.state.recovery_contexts.contains_key(&conversation_id)
+            {
+                PersistOp::SaveRecoveryContext {
+                    conversation_id: conversation_id.clone(),
+                }
+            } else {
+                PersistOp::DeleteRecoveryContext {
+                    conversation_id: conversation_id.clone(),
+                }
+            };
+            output.effects.push(persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveConversation {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    recovery_context_op,
+                ],
+            ));
+            refresh_persist_effect_snapshots(&mut output, &self.state);
             return self.merge_with_transport_flush(output);
         }
 
@@ -9810,6 +9855,7 @@ impl CoreEngine {
             .get(&device_id)
             .map(|state| state.checkpoint.last_acked_seq)
             .unwrap_or(0);
+        let mut deferred_ackable_seqs = BTreeSet::new();
         for record in fresh_records {
             record.validate()?;
             if record.recipient_device_id != device_id {
@@ -9833,7 +9879,11 @@ impl CoreEngine {
                             .or_insert_with(|| SyncEngine::new_device_state(&device_id));
                         SyncEngine::clear_pending_retry(sync_state, record.seq);
                     }
-                    contiguous_ack = record.seq.max(contiguous_ack);
+                    advance_contiguous_ack(
+                        &mut contiguous_ack,
+                        &mut deferred_ackable_seqs,
+                        record.seq,
+                    );
                     continue;
                 }
                 output = merge_outputs(
@@ -9848,7 +9898,7 @@ impl CoreEngine {
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
-                contiguous_ack = record.seq.max(contiguous_ack);
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 continue;
             }
             if record.envelope.message_type == MessageType::ControlContactAccepted {
@@ -9864,7 +9914,7 @@ impl CoreEngine {
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
-                contiguous_ack = record.seq.max(contiguous_ack);
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 continue;
             }
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
@@ -9883,7 +9933,7 @@ impl CoreEngine {
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
-                contiguous_ack = record.seq.max(contiguous_ack);
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 continue;
             }
             self.ensure_local_conversation_for_record(&device_id, &local_user_id, &record);
@@ -9980,6 +10030,13 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
+                                self.ack_pending_records_for_conversation_up_to(
+                                    &device_id,
+                                    &conversation_id,
+                                    record.seq,
+                                    &mut contiguous_ack,
+                                    &mut deferred_ackable_seqs,
+                                );
                                 touched_mls_conversation_ids.insert(conversation_id.clone());
                                 touched_recovery_context_ids.insert(conversation_id.clone());
                                 self.clear_recovery_context_as_healthy(&conversation_id);
@@ -10017,6 +10074,13 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
+                                self.ack_pending_records_for_conversation_up_to(
+                                    &device_id,
+                                    &conversation_id,
+                                    record.seq,
+                                    &mut contiguous_ack,
+                                    &mut deferred_ackable_seqs,
+                                );
                                 touched_mls_conversation_ids.insert(conversation_id.clone());
                                 touched_recovery_context_ids.insert(conversation_id.clone());
                                 self.clear_recovery_context_as_healthy(&conversation_id);
@@ -10041,10 +10105,6 @@ impl CoreEngine {
                                     conversation_id,
                                     epoch
                                 );
-                                self.clear_pending_records_for_conversation(
-                                    &device_id,
-                                    &conversation_id,
-                                );
                                 if let Ok(summary) = self
                                     .state
                                     .mls_adapter
@@ -10058,6 +10118,13 @@ impl CoreEngine {
                                         .mls_summaries
                                         .insert(conversation_id.clone(), summary);
                                 }
+                                self.ack_pending_records_for_conversation_up_to(
+                                    &device_id,
+                                    &conversation_id,
+                                    record.seq,
+                                    &mut contiguous_ack,
+                                    &mut deferred_ackable_seqs,
+                                );
                                 touched_mls_conversation_ids.insert(conversation_id.clone());
                                 touched_recovery_context_ids.insert(conversation_id.clone());
                                 self.clear_recovery_context_as_healthy(&conversation_id);
@@ -10077,6 +10144,14 @@ impl CoreEngine {
                                         )?,
                                     );
                                 }
+                                ackable = true;
+                            }
+                            IngestResult::IgnoredReplay => {
+                                log::warn!(
+                                    "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
+                                    record.message_id,
+                                    conversation_id
+                                );
                                 ackable = true;
                             }
                             IngestResult::PendingRetry => {
@@ -10222,7 +10297,7 @@ impl CoreEngine {
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
-                contiguous_ack = record.seq.max(contiguous_ack);
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
             }
         }
         let ack = {
@@ -10380,7 +10455,27 @@ impl CoreEngine {
             });
     }
 
-    fn clear_pending_records_for_conversation(&mut self, device_id: &str, conversation_id: &str) {
+    fn has_pending_records_for_conversation(&self, device_id: &str, conversation_id: &str) -> bool {
+        self.state
+            .sync_states
+            .get(device_id)
+            .map(|sync_state| {
+                sync_state
+                    .pending_records
+                    .values()
+                    .any(|record| record.envelope.conversation_id == conversation_id)
+            })
+            .unwrap_or(false)
+    }
+
+    fn ack_pending_records_for_conversation_up_to(
+        &mut self,
+        device_id: &str,
+        conversation_id: &str,
+        up_to_seq: u64,
+        contiguous_ack: &mut u64,
+        deferred_ackable_seqs: &mut BTreeSet<u64>,
+    ) {
         let Some(sync_state) = self.state.sync_states.get_mut(device_id) else {
             return;
         };
@@ -10388,11 +10483,21 @@ impl CoreEngine {
             .pending_records
             .iter()
             .filter_map(|(seq, record)| {
-                (record.envelope.conversation_id == conversation_id).then_some(*seq)
+                if *seq <= up_to_seq && record.envelope.conversation_id == conversation_id {
+                    Some(*seq)
+                } else {
+                    None
+                }
             })
             .collect();
         for seq in pending_seqs {
+            log::warn!(
+                "handle_inbox_records: clearing pending retry seq {} for conversation {} after later MLS record applied",
+                seq,
+                conversation_id
+            );
             SyncEngine::clear_pending_retry(sync_state, seq);
+            advance_contiguous_ack(contiguous_ack, deferred_ackable_seqs, seq);
         }
     }
 
@@ -11313,6 +11418,14 @@ impl CoreEngine {
                     }
                     IngestResult::PendingRetry => {
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
+                        continue;
+                    }
+                    IngestResult::IgnoredReplay => {
+                        log::warn!(
+                            "sync_group_outbox: ignoring replay/duplicate MLS record {} for group {}",
+                            record.envelope.message_id,
+                            group_id
+                        );
                         continue;
                     }
                     IngestResult::NeedsRebuild => {
@@ -13209,6 +13322,20 @@ fn current_timestamp_hint(outbox_len: usize) -> u64 {
     outbox_len as u64 + 1
 }
 
+fn advance_contiguous_ack(
+    contiguous_ack: &mut u64,
+    deferred_ackable_seqs: &mut BTreeSet<u64>,
+    seq: u64,
+) {
+    if seq <= *contiguous_ack {
+        return;
+    }
+    deferred_ackable_seqs.insert(seq);
+    while deferred_ackable_seqs.remove(&(*contiguous_ack).saturating_add(1)) {
+        *contiguous_ack = (*contiguous_ack).saturating_add(1);
+    }
+}
+
 fn normalize_display_name(display_name: Option<String>) -> CoreResult<Option<String>> {
     let Some(display_name) = display_name else {
         return Ok(None);
@@ -13279,6 +13406,15 @@ fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
             ops: unique.into_iter().collect(),
             snapshot: Some(build_persistence_snapshot(state)),
         },
+    }
+}
+
+fn refresh_persist_effect_snapshots(output: &mut CoreOutput, state: &CoreState) {
+    let snapshot = build_persistence_snapshot(state);
+    for effect in &mut output.effects {
+        if let CoreEffect::PersistState { persist } = effect {
+            persist.snapshot = Some(snapshot.clone());
+        }
     }
 }
 
@@ -13544,7 +13680,7 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod group_membership_security_tests {
-    use super::CoreEngine;
+    use super::{advance_contiguous_ack, CoreEngine};
     use crate::ffi_api::CoreCommand;
     use crate::model::{
         GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest, GroupMember,
@@ -13552,6 +13688,30 @@ mod group_membership_security_tests {
         GroupMessageType, GroupOutboxDescriptor, GroupRole, SenderProof, Validate,
         WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn contiguous_ack_does_not_advance_past_pending_gap() {
+        let mut ack = 6;
+        let mut deferred = BTreeSet::new();
+
+        advance_contiguous_ack(&mut ack, &mut deferred, 8);
+
+        assert_eq!(ack, 6);
+        assert!(deferred.contains(&8));
+    }
+
+    #[test]
+    fn contiguous_ack_advances_after_gap_becomes_ackable() {
+        let mut ack = 6;
+        let mut deferred = BTreeSet::new();
+
+        advance_contiguous_ack(&mut ack, &mut deferred, 8);
+        advance_contiguous_ack(&mut ack, &mut deferred, 7);
+
+        assert_eq!(ack, 8);
+        assert!(deferred.is_empty());
+    }
 
     fn base_manifest() -> GroupManifest {
         GroupManifest {
