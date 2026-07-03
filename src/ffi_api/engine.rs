@@ -8,7 +8,8 @@ use super::recovery::{
     is_degraded_restore_diagnostic, recovery_recoverable, suggested_recovery_action,
 };
 use super::sync::{
-    pending_welcome_pickup_key, GROUP_OUTBOX_FETCH_LIMIT, WELCOME_PICKUP_RETRY_TIMER_PREFIX,
+    pending_welcome_pickup_key, retry_delay_ms, GROUP_OUTBOX_FETCH_LIMIT,
+    WELCOME_PICKUP_RETRY_TIMER_PREFIX,
 };
 use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
 use crate::conversation::{
@@ -479,6 +480,7 @@ impl CoreEngine {
                         connected: false,
                         last_known_seq: session.last_known_seq,
                         needs_reconnect: session.needs_reconnect,
+                        reconnect_failures: 0,
                     },
                 )
             })
@@ -494,6 +496,7 @@ impl CoreEngine {
                         connected: false,
                         last_known_seq: session.last_known_seq,
                         needs_reconnect: session.needs_reconnect,
+                        reconnect_failures: 0,
                     },
                 )
             })
@@ -793,7 +796,7 @@ impl CoreEngine {
                 reference,
                 destination,
             } => self.download_attachment(conversation_id, message_id, reference, destination),
-            CoreCommand::SyncInbox { device_id, .. } => self.sync_inbox(device_id),
+            CoreCommand::SyncInbox { device_id, reason } => self.sync_inbox(device_id, reason),
             CoreCommand::RefreshIdentityState { user_id } => self.refresh_identity_state(user_id),
             CoreCommand::ListMessageRequests => self.list_message_requests(),
             CoreCommand::ActOnMessageRequest { request_id, action } => {
@@ -849,7 +852,8 @@ impl CoreEngine {
 
     pub fn handle_event(&mut self, event: CoreEvent) -> CoreResult<CoreOutput> {
         match event {
-            CoreEvent::AppStarted | CoreEvent::AppForegrounded => self.start_foreground_sync(),
+            CoreEvent::AppStarted => self.start_foreground_sync("startup"),
+            CoreEvent::AppForegrounded => self.start_foreground_sync("foreground"),
             CoreEvent::WebSocketConnected { device_id } => {
                 self.handle_websocket_connected(device_id)
             }
@@ -868,7 +872,9 @@ impl CoreEngine {
             CoreEvent::GroupRealtimeEventReceived { group_id, event } => {
                 self.handle_group_realtime_event(group_id, event)
             }
-            CoreEvent::WakeupReceived { device_id, .. } => self.sync_inbox(device_id),
+            CoreEvent::WakeupReceived { device_id, .. } => {
+                self.sync_inbox(device_id, Some("wakeup".into()))
+            }
             CoreEvent::InboxRecordsFetched {
                 device_id,
                 records,
@@ -1029,31 +1035,17 @@ impl CoreEngine {
             } => self.handle_group_outbox_records(group_id, records, to_seq),
             CoreEvent::GroupOutboxFetchFailed {
                 group_id,
-                retryable: _,
+                retryable,
                 detail,
-            } => Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![CoreEffect::EmitUserNotification {
-                    notification: UserNotificationEffect {
-                        status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail
-                            .map(|detail| format!("group outbox fetch failed: {detail}"))
-                            .unwrap_or_else(|| format!("group outbox fetch failed for {group_id}")),
-                    },
-                }],
-                view_model: None,
-            }),
+            } => self.handle_group_sync_failed(group_id, retryable, detail),
             CoreEvent::GroupOutboxHeadFetched { group_id, head_seq } => {
                 self.handle_group_outbox_head_fetched(group_id, head_seq)
             }
             CoreEvent::GroupOutboxHeadFetchFailed {
-                group_id: _,
-                retryable: _,
-                detail: _,
-            } => Ok(CoreOutput::default()),
+                group_id,
+                retryable,
+                detail,
+            } => self.handle_group_sync_failed(group_id, retryable, detail),
             CoreEvent::GroupEnvelopeAppended {
                 group_id,
                 message_id,
@@ -4350,7 +4342,8 @@ impl CoreEngine {
             };
             if should_drive_recovery {
                 if let Some(device_id) = device_id.clone() {
-                    output = merge_outputs(output, self.sync_inbox(device_id.clone())?);
+                    output =
+                        merge_outputs(output, self.sync_inbox(device_id.clone(), None)?);
                     output =
                         merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
                 }
@@ -4539,7 +4532,7 @@ impl CoreEngine {
         })
     }
 
-    fn sync_inbox(&mut self, device_id: String) -> CoreResult<CoreOutput> {
+    fn sync_inbox(&mut self, device_id: String, reason: Option<String>) -> CoreResult<CoreOutput> {
         if device_id.trim().is_empty() {
             return Err(CoreError::invalid_input("device_id must not be empty"));
         }
@@ -4557,6 +4550,12 @@ impl CoreEngine {
         let inbox_websocket_endpoint = deployment.inbox_websocket_endpoint.clone();
         let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
         let headers = self.device_runtime_headers()?;
+        let retry_reset_ops =
+            if Self::should_reset_pending_direct_transport(reason.as_deref()) {
+                self.reset_pending_direct_transport_for_retry(&device_id)
+            } else {
+                Vec::new()
+            };
         let sync_state = self
             .state
             .sync_states
@@ -4580,7 +4579,7 @@ impl CoreEngine {
                 device_id: device_id.clone(),
             },
         );
-        Ok(CoreOutput {
+        let sync_output = CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
                 system_statuses_changed: vec![SystemStatus::SyncInProgress],
@@ -4620,7 +4619,24 @@ impl CoreEngine {
                 },
             ],
             view_model: None,
-        })
+        };
+        if retry_reset_ops.is_empty() {
+            return Ok(sync_output);
+        }
+        let retry_output = merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    messages_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(&self.state, retry_reset_ops)],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        );
+        Ok(merge_outputs(retry_output, sync_output))
     }
 
     fn next_request_id(&mut self, prefix: &str) -> String {
@@ -4947,7 +4963,7 @@ impl CoreEngine {
         })
     }
 
-    fn start_foreground_sync(&mut self) -> CoreResult<CoreOutput> {
+    fn start_foreground_sync(&mut self, reason: &str) -> CoreResult<CoreOutput> {
         let device_id = self
             .state
             .local_identity
@@ -4959,7 +4975,7 @@ impl CoreEngine {
         let output = merge_outputs(
             self.migrate_legacy_removed_relationships()?,
             merge_outputs(
-                self.sync_inbox(device_id)?,
+                self.sync_inbox(device_id, Some(reason.to_string()))?,
                 self.retry_pending_welcome_pickups()?,
             ),
         );
@@ -5069,6 +5085,7 @@ impl CoreEngine {
                     connected: false,
                     last_known_seq: last_seq,
                     needs_reconnect: false,
+                    reconnect_failures: 0,
                 });
             effects.push(CoreEffect::OpenGroupRealtimeConnection {
                 subscription: crate::transport_contract::GroupRealtimeSubscriptionRequest {
@@ -5099,6 +5116,7 @@ impl CoreEngine {
                 .or_default();
             session.connected = true;
             session.needs_reconnect = false;
+            session.reconnect_failures = 0;
             session.last_known_seq
         };
 
@@ -5107,6 +5125,7 @@ impl CoreEngine {
             .sync_states
             .entry(device_id.clone())
             .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+        SyncEngine::clear_sync_failures(sync_state);
         if last_known_seq > 0 {
             SyncEngine::register_head(sync_state, last_known_seq);
         }
@@ -5133,6 +5152,8 @@ impl CoreEngine {
             .or_default();
         session.connected = false;
         session.needs_reconnect = true;
+        session.reconnect_failures = session.reconnect_failures.saturating_add(1);
+        let timer = self.sync_retry_timer(&device_id);
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
@@ -5140,10 +5161,7 @@ impl CoreEngine {
                 ..CoreStateUpdate::default()
             },
             effects: vec![CoreEffect::ScheduleTimer {
-                timer: TimerEffect {
-                    timer_id: format!("sync:{device_id}"),
-                    delay_ms: 0,
-                },
+                timer,
             }],
             view_model: None,
         })
@@ -5157,6 +5175,7 @@ impl CoreEngine {
             .or_default();
         session.connected = true;
         session.needs_reconnect = false;
+        session.reconnect_failures = 0;
         Ok(CoreOutput::default())
     }
 
@@ -5172,6 +5191,9 @@ impl CoreEngine {
             .or_default();
         session.connected = false;
         session.needs_reconnect = true;
+        session.reconnect_failures = session.reconnect_failures.saturating_add(1);
+        let timer_id = format!("group_sync:{group_id}");
+        let delay_ms = retry_delay_ms(&timer_id, session.reconnect_failures);
         let notification = error.and_then(|detail| {
             if detail.contains("404") {
                 Some(CoreEffect::EmitUserNotification {
@@ -5188,8 +5210,8 @@ impl CoreEngine {
         });
         let mut effects = vec![CoreEffect::ScheduleTimer {
             timer: TimerEffect {
-                timer_id: format!("group_sync:{group_id}"),
-                delay_ms: 5_000,
+                timer_id,
+                delay_ms,
             },
         }];
         if let Some(notification) = notification {
@@ -5202,6 +5224,49 @@ impl CoreEngine {
                 ..CoreStateUpdate::default()
             },
             effects,
+            view_model: None,
+        })
+    }
+
+    fn group_sync_retry_timer(&mut self, group_id: &str) -> TimerEffect {
+        let session = self
+            .state
+            .group_realtime_sessions
+            .entry(group_id.to_string())
+            .or_default();
+        session.reconnect_failures = session.reconnect_failures.saturating_add(1);
+        let timer_id = format!("group_sync:{group_id}");
+        TimerEffect {
+            delay_ms: retry_delay_ms(&timer_id, session.reconnect_failures),
+            timer_id,
+        }
+    }
+
+    fn handle_group_sync_failed(
+        &mut self,
+        group_id: String,
+        retryable: bool,
+        detail: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            effects: if retryable {
+                vec![CoreEffect::ScheduleTimer {
+                    timer: self.group_sync_retry_timer(&group_id),
+                }]
+            } else {
+                vec![CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::TemporaryNetworkFailure,
+                        message: detail
+                            .map(|detail| format!("group outbox sync failed: {detail}"))
+                            .unwrap_or_else(|| format!("group outbox sync failed for {group_id}")),
+                    },
+                }]
+            },
             view_model: None,
         })
     }
@@ -5397,7 +5462,7 @@ impl CoreEngine {
 
     fn handle_timer(&mut self, timer_id: String) -> CoreResult<CoreOutput> {
         if let Some(device_id) = timer_id.strip_prefix("sync:") {
-            return self.sync_inbox(device_id.to_string());
+            return self.sync_inbox(device_id.to_string(), None);
         }
         if let Some(group_id) = timer_id.strip_prefix("group_sync:") {
             return self.sync_group_outbox(group_id.to_string(), None);
@@ -8662,6 +8727,58 @@ impl CoreEngine {
         reset_message_ids
     }
 
+    fn reset_pending_direct_transport_for_retry(&mut self, device_id: &str) -> Vec<PersistOp> {
+        let mut persist_ops = Vec::new();
+        for item in &mut self.state.pending_outbox {
+            if !item.in_flight && item.retries >= MAX_TRANSPORT_RETRIES {
+                item.retries = 0;
+                persist_ops.push(PersistOp::SaveOutgoingEnvelope {
+                    message_id: item.envelope.message_id.clone(),
+                });
+            }
+        }
+        if let Some(ack) = self.state.pending_acks.get_mut(device_id) {
+            if !ack.in_flight && ack.retries >= MAX_TRANSPORT_RETRIES {
+                ack.retries = 0;
+                persist_ops.push(PersistOp::SavePendingAck {
+                    device_id: device_id.to_string(),
+                });
+            }
+        }
+        for task in self.state.pending_blob_uploads.values_mut() {
+            if !task.in_flight && task.retries >= MAX_TRANSPORT_RETRIES {
+                task.retries = 0;
+                persist_ops.push(PersistOp::SavePendingBlobTransfer {
+                    task_id: task.task_id.clone(),
+                });
+            }
+        }
+        for task in self.state.pending_blob_downloads.values_mut() {
+            if !task.in_flight && task.retries >= MAX_TRANSPORT_RETRIES {
+                task.retries = 0;
+                task.authorized_download = None;
+                persist_ops.push(PersistOp::SavePendingBlobTransfer {
+                    task_id: task.task_id.clone(),
+                });
+            }
+        }
+        persist_ops
+    }
+
+    fn should_reset_pending_direct_transport(reason: Option<&str>) -> bool {
+        reason.is_some_and(|reason| {
+            matches!(
+                reason,
+                "startup"
+                    | "manual"
+                    | "manual_retry"
+                    | "network_recovered"
+                    | "runtime_upgraded"
+                    | "retry_pending"
+            )
+        })
+    }
+
     fn flush_pending_acks(&mut self) -> CoreResult<CoreOutput> {
         let keys: Vec<String> = self.state.pending_acks.keys().cloned().collect();
         let mut effects = Vec::new();
@@ -9188,6 +9305,20 @@ impl CoreEngine {
         }
     }
 
+    fn sync_retry_timer(&mut self, device_id: &str) -> TimerEffect {
+        let sync_state = self
+            .state
+            .sync_states
+            .entry(device_id.to_string())
+            .or_insert_with(|| SyncEngine::new_device_state(device_id));
+        let attempt = SyncEngine::note_sync_failure(sync_state);
+        let timer_id = format!("sync:{device_id}");
+        TimerEffect {
+            delay_ms: retry_delay_ms(&timer_id, attempt),
+            timer_id,
+        }
+    }
+
     fn handle_http_failure(
         &mut self,
         request_id: String,
@@ -9210,6 +9341,7 @@ impl CoreEngine {
                     item.in_flight = false;
                     item.retries = item.retries.saturating_add(1);
                     if retryable && item.retries < MAX_TRANSPORT_RETRIES {
+                        let timer_id = format!("retry_append:{message_id}");
                         return Ok(CoreOutput {
                             state_update: CoreStateUpdate {
                                 system_statuses_changed: vec![
@@ -9219,8 +9351,8 @@ impl CoreEngine {
                             },
                             effects: vec![CoreEffect::ScheduleTimer {
                                 timer: TimerEffect {
-                                    timer_id: format!("retry_append:{message_id}"),
-                                    delay_ms: 0,
+                                    delay_ms: retry_delay_ms(&timer_id, u32::from(item.retries)),
+                                    timer_id,
                                 },
                             }],
                             view_model: None,
@@ -9248,6 +9380,7 @@ impl CoreEngine {
                     ack.in_flight = false;
                     ack.retries = ack.retries.saturating_add(1);
                     if retryable && ack.retries < MAX_TRANSPORT_RETRIES {
+                        let timer_id = format!("retry_ack:{device_id}");
                         return Ok(CoreOutput {
                             state_update: CoreStateUpdate {
                                 system_statuses_changed: vec![
@@ -9257,8 +9390,8 @@ impl CoreEngine {
                             },
                             effects: vec![CoreEffect::ScheduleTimer {
                                 timer: TimerEffect {
-                                    timer_id: format!("retry_ack:{device_id}"),
-                                    delay_ms: 0,
+                                    delay_ms: retry_delay_ms(&timer_id, u32::from(ack.retries)),
+                                    timer_id,
                                 },
                             }],
                             view_model: None,
@@ -9288,10 +9421,7 @@ impl CoreEngine {
                 },
                 effects: if retryable {
                     vec![CoreEffect::ScheduleTimer {
-                        timer: TimerEffect {
-                            timer_id: format!("sync:{device_id}"),
-                            delay_ms: 0,
-                        },
+                        timer: self.sync_retry_timer(&device_id),
                     }]
                 } else {
                     vec![CoreEffect::EmitUserNotification {
@@ -9710,6 +9840,7 @@ impl CoreEngine {
             task.in_flight = false;
             task.retries = task.retries.saturating_add(1);
             if retryable && task.retries < MAX_TRANSPORT_RETRIES {
+                let timer_id = format!("retry_blob_upload:{task_id}");
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -9717,8 +9848,8 @@ impl CoreEngine {
                     },
                     effects: vec![CoreEffect::ScheduleTimer {
                         timer: TimerEffect {
-                            timer_id: format!("retry_blob_upload:{task_id}"),
-                            delay_ms: 0,
+                            delay_ms: retry_delay_ms(&timer_id, u32::from(task.retries)),
+                            timer_id,
                         },
                     }],
                     view_model: None,
@@ -9752,6 +9883,7 @@ impl CoreEngine {
             task.authorized_download = None;
             task.retries = task.retries.saturating_add(1);
             if retryable && task.retries < MAX_TRANSPORT_RETRIES {
+                let timer_id = format!("retry_blob_download:{task_id}");
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -9759,8 +9891,8 @@ impl CoreEngine {
                     },
                     effects: vec![CoreEffect::ScheduleTimer {
                         timer: TimerEffect {
-                            timer_id: format!("retry_blob_download:{task_id}"),
-                            delay_ms: 0,
+                            delay_ms: retry_delay_ms(&timer_id, u32::from(task.retries)),
+                            timer_id,
                         },
                     }],
                     view_model: None,
@@ -9832,7 +9964,9 @@ impl CoreEngine {
                 .sync_states
                 .entry(device_id.clone())
                 .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-            SyncEngine::register_fetch(sync_state, &records, to_seq)
+            let fresh = SyncEngine::register_fetch(sync_state, &records, to_seq);
+            SyncEngine::clear_sync_failures(sync_state);
+            fresh
         };
         fresh_records.sort_by_key(|record| record.seq);
         let mut output = CoreOutput {
@@ -10527,6 +10661,7 @@ impl CoreEngine {
                         item.in_flight = false;
                         item.retries = item.retries.saturating_add(1);
                         if item.retries < MAX_TRANSPORT_RETRIES {
+                            let timer_id = format!("retry_append:{message_id}");
                             return Ok(CoreOutput {
                                 state_update: CoreStateUpdate {
                                     system_statuses_changed: vec![
@@ -10536,8 +10671,11 @@ impl CoreEngine {
                                 },
                                 effects: vec![CoreEffect::ScheduleTimer {
                                     timer: TimerEffect {
-                                        timer_id: format!("retry_append:{message_id}"),
-                                        delay_ms: 0,
+                                        delay_ms: retry_delay_ms(
+                                            &timer_id,
+                                            u32::from(item.retries),
+                                        ),
+                                        timer_id,
                                     },
                                 }],
                                 view_model: None,
@@ -10571,6 +10709,7 @@ impl CoreEngine {
                         ack.in_flight = false;
                         ack.retries = ack.retries.saturating_add(1);
                         if ack.retries < MAX_TRANSPORT_RETRIES {
+                            let timer_id = format!("retry_ack:{device_id}");
                             return Ok(CoreOutput {
                                 state_update: CoreStateUpdate {
                                     system_statuses_changed: vec![
@@ -10580,8 +10719,11 @@ impl CoreEngine {
                                 },
                                 effects: vec![CoreEffect::ScheduleTimer {
                                     timer: TimerEffect {
-                                        timer_id: format!("retry_ack:{device_id}"),
-                                        delay_ms: 0,
+                                        delay_ms: retry_delay_ms(
+                                            &timer_id,
+                                            u32::from(ack.retries),
+                                        ),
+                                        timer_id,
                                     },
                                 }],
                                 view_model: None,
@@ -10612,10 +10754,7 @@ impl CoreEngine {
                     ..CoreStateUpdate::default()
                 },
                 effects: vec![CoreEffect::ScheduleTimer {
-                    timer: TimerEffect {
-                        timer_id: format!("sync:{device_id}"),
-                        delay_ms: 0,
-                    },
+                    timer: self.sync_retry_timer(&device_id),
                 }],
                 view_model: None,
             }),
@@ -10625,10 +10764,7 @@ impl CoreEngine {
                     ..CoreStateUpdate::default()
                 },
                 effects: vec![CoreEffect::ScheduleTimer {
-                    timer: TimerEffect {
-                        timer_id: format!("sync:{device_id}"),
-                        delay_ms: 0,
-                    },
+                    timer: self.sync_retry_timer(&device_id),
                 }],
                 view_model: None,
             }),
@@ -11016,7 +11152,7 @@ impl CoreEngine {
         if result.accepted && result.action == MessageRequestAction::Accept {
             output = merge_outputs(output, self.contact_accepted_notification_output(&result)?);
             let device_id = self.local_device_id_required()?;
-            return Ok(merge_outputs(output, self.sync_inbox(device_id)?));
+            return Ok(merge_outputs(output, self.sync_inbox(device_id, None)?));
         }
         Ok(output)
     }
@@ -11094,12 +11230,15 @@ impl CoreEngine {
     ) -> CoreResult<CoreOutput> {
         let affected_conversations = self.affected_conversations_for_peer(user_id);
         let mut should_retry = false;
+        let mut retry_attempt = 1_u32;
         for conversation_id in &affected_conversations {
             if let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) {
                 if context.identity_refresh_retry_count < MAX_TRANSPORT_RETRIES {
                     context.identity_refresh_retry_count =
                         context.identity_refresh_retry_count.saturating_add(1);
                 }
+                retry_attempt =
+                    retry_attempt.max(u32::from(context.identity_refresh_retry_count));
                 context.phase = RecoveryPhase::WaitingForIdentityRefresh;
                 context.last_error = Some(message.clone());
                 if context.identity_refresh_retry_count < MAX_TRANSPORT_RETRIES {
@@ -11108,6 +11247,7 @@ impl CoreEngine {
             }
         }
         if should_retry {
+            let timer_id = format!("refresh_identity:{user_id}");
             Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     contacts_changed: true,
@@ -11116,8 +11256,8 @@ impl CoreEngine {
                 },
                 effects: vec![CoreEffect::ScheduleTimer {
                     timer: TimerEffect {
-                        timer_id: format!("refresh_identity:{user_id}"),
-                        delay_ms: 0,
+                        delay_ms: retry_delay_ms(&timer_id, retry_attempt),
+                        timer_id,
                     },
                 }],
                 view_model: None,
@@ -11143,6 +11283,9 @@ impl CoreEngine {
         group_id: String,
         head_seq: u64,
     ) -> CoreResult<CoreOutput> {
+        if let Some(session) = self.state.group_realtime_sessions.get_mut(&group_id) {
+            session.reconnect_failures = 0;
+        }
         // If this head request was issued by sync_group_outbox (not by the
         // welcome-pickup join fast-forward path), fetch the actual records
         // rather than skipping ahead.
@@ -11743,6 +11886,7 @@ impl CoreEngine {
             item.in_flight = false;
             item.retries = item.retries.saturating_add(1);
             if retryable && item.retries < MAX_TRANSPORT_RETRIES {
+                let timer_id = format!("retry_group_append:{message_id}");
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -11750,8 +11894,8 @@ impl CoreEngine {
                     },
                     effects: vec![CoreEffect::ScheduleTimer {
                         timer: TimerEffect {
-                            timer_id: format!("retry_group_append:{message_id}"),
-                            delay_ms: 0,
+                            delay_ms: retry_delay_ms(&timer_id, u32::from(item.retries)),
+                            timer_id,
                         },
                     }],
                     view_model: None,
@@ -12900,6 +13044,7 @@ impl CoreEngine {
                                 group_id: group_id.clone(),
                             }],
                         );
+                        let timer_id = format!("retry_group_seal:{group_id}");
                         return Ok(CoreOutput {
                             state_update: CoreStateUpdate {
                                 system_statuses_changed: vec![
@@ -12911,8 +13056,8 @@ impl CoreEngine {
                                 persist,
                                 CoreEffect::ScheduleTimer {
                                     timer: TimerEffect {
-                                        timer_id: format!("retry_group_seal:{group_id}"),
-                                        delay_ms: 0,
+                                        delay_ms: retry_delay_ms(&timer_id, 1),
+                                        timer_id,
                                     },
                                 },
                             ],
@@ -12984,10 +13129,11 @@ impl CoreEngine {
                 device_id: descriptor.device_id.clone(),
             });
             if retryable && pending.retries < MAX_TRANSPORT_RETRIES {
+                let timer_id = format!("{WELCOME_PICKUP_RETRY_TIMER_PREFIX}{key}");
                 effects.push(CoreEffect::ScheduleTimer {
                     timer: TimerEffect {
-                        timer_id: format!("{WELCOME_PICKUP_RETRY_TIMER_PREFIX}{key}"),
-                        delay_ms: 0,
+                        delay_ms: retry_delay_ms(&timer_id, u32::from(pending.retries)),
+                        timer_id,
                     },
                 });
             }

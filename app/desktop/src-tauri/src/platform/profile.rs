@@ -12,6 +12,7 @@ use tapchat_core::persistence::CorePersistenceSnapshot;
 
 /// Desktop profile manager - wraps CLI ProfileRegistry and provides
 /// async access for the Tauri app.
+#[derive(Clone)]
 pub struct ProfileManager {
     pub inner: Arc<RwLock<ProfileManagerInner>>,
 }

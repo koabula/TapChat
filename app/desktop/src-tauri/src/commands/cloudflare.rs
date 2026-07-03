@@ -810,8 +810,11 @@ async fn restart_runtime_session_after_deploy(
     device_id: &str,
 ) {
     {
-        let inner = state.inner.read().await;
-        if let Err(error) = inner.ports.realtime.close_all_silent().await {
+        let realtime = {
+            let ports = state.ports.lock().await;
+            ports.realtime.clone()
+        };
+        if let Err(error) = realtime.close_all_silent().await {
             log::warn!("cloudflare_deploy: failed to close old realtime sessions: {error}");
         }
     }

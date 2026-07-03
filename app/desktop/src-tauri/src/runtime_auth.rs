@@ -159,9 +159,12 @@ pub async fn ensure_fresh_device_runtime_auth(
 }
 
 pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Result<bool> {
-    let refreshed = {
+    let profile_manager = {
         let inner = state.inner.read().await;
-        ensure_fresh_device_runtime_auth(&inner.profile_manager).await?
+        inner.profile_manager.clone()
+    };
+    let refreshed = {
+        ensure_fresh_device_runtime_auth(&profile_manager).await?
     };
 
     let Some(bundle) = refreshed else {
@@ -178,7 +181,7 @@ pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Res
 
     let snapshot = inner.engine.refresh_snapshot();
     {
-        let mut pm_inner = inner.profile_manager.inner.write().await;
+        let mut pm_inner = profile_manager.inner.write().await;
         let profile = pm_inner.active_profile.as_mut().ok_or_else(|| {
             anyhow!("active profile disappeared while updating engine runtime auth")
         })?;

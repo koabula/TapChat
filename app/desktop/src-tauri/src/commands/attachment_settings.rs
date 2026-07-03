@@ -94,8 +94,11 @@ pub async fn set_attachment_settings(
 /// Returns the cache directory path for downloaded attachments.
 #[tauri::command]
 pub async fn get_attachment_cache_dir(state: State<'_, AppState>) -> Result<String, String> {
-    let inner = state.inner.read().await;
-    let dir = inner.ports.persistence.attachments_dir().await;
+    let persistence = {
+        let ports = state.ports.lock().await;
+        ports.persistence.clone()
+    };
+    let dir = persistence.attachments_dir().await;
     match dir {
         Some(path) => Ok(path.to_string_lossy().into()),
         None => Err("No profile active".into()),

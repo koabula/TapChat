@@ -853,6 +853,7 @@ mod tests {
                     pending_record_seqs: Default::default(),
                     pending_retry: false,
                     last_head_seq: 1,
+                    consecutive_failures: 0,
                 },
             }],
             pending_outbox: vec![PersistedOutgoingEnvelope {

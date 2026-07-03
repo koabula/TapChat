@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::webview::WebviewWindowBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WindowEvent};
 
@@ -370,6 +370,41 @@ async fn enter_locked_session(
 
 /// Central window event handler. Manages close behavior based on SessionState.
 pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
+    if let WindowEvent::Focused(true) = event {
+        if window.label() == "main" {
+            let app = window.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                let is_active = {
+                    let inner = state.inner.read().await;
+                    matches!(inner.session, SessionState::Active { .. })
+                };
+                if !is_active {
+                    return;
+                }
+
+                let now = Instant::now();
+                {
+                    let mut gate = state.foreground_sync_gate.lock().await;
+                    if gate
+                        .last_triggered_at
+                        .is_some_and(|last| now.duration_since(last) < Duration::from_secs(30))
+                    {
+                        return;
+                    }
+                    gate.last_triggered_at = Some(now);
+                }
+
+                if let Err(error) =
+                    drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppForegrounded))
+                        .await
+                {
+                    log::warn!("foreground sync failed: {}", error);
+                }
+            });
+        }
+    }
+
     if let WindowEvent::CloseRequested { api, .. } = event {
         let label = window.label();
         let app = window.app_handle();
@@ -416,8 +451,6 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
 
     let mut output = {
         let mut inner = state.inner.write().await;
-        // Set app handle on ports for progress events
-        inner.ports.set_app_handle(app_arc.clone());
         match input {
             CoreInput::Command(cmd) => inner.engine.handle_command(cmd)?,
             CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
@@ -440,10 +473,9 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
     let effects = output.effects.clone();
     for effect in effects {
         let events = {
-            let mut inner = state.inner.write().await;
-            // Ensure app handle is set
-            inner.ports.set_app_handle(app_arc.clone());
-            execute_platform_effect(&mut inner.ports, effect).await?
+            let mut ports = state.ports.lock().await;
+            ports.set_app_handle(app_arc.clone());
+            execute_platform_effect(&mut *ports, effect).await?
         };
         for event in events {
             let event_output =
@@ -491,8 +523,8 @@ pub async fn drive_core_without_handle(state: &AppState, input: CoreInput) -> Re
     let effects = output.effects.clone();
     for effect in effects {
         let events = {
-            let mut inner = state.inner.write().await;
-            execute_platform_effect(&mut inner.ports, effect).await?
+            let mut ports = state.ports.lock().await;
+            execute_platform_effect(&mut *ports, effect).await?
         };
         for event in events {
             let event_output =

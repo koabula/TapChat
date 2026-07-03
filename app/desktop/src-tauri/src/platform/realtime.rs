@@ -13,7 +13,7 @@ use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
 use tapchat_core::cli::util::to_camel_case_json_string;
 use tapchat_core::ffi_api::{CoreEvent, RealtimeEvent};
 use tapchat_core::transport_contract::{
-    GroupRealtimeSubscriptionRequest, RealtimeSubscriptionRequest,
+    GroupRealtimeSubscriptionRequest, MessageRequestRealtimeChange, RealtimeSubscriptionRequest,
 };
 
 use crate::commands::session::set_ws_connection_snapshot;
@@ -44,6 +44,7 @@ impl Default for ConnectionId {
 }
 
 /// Realtime connection manager for WebSocket subscriptions.
+#[derive(Clone)]
 pub struct RealtimeManager {
     sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
     group_sessions: Arc<RwLock<HashMap<String, RealtimeSession>>>,
@@ -66,6 +67,14 @@ struct RealtimeSession {
     stop_tx: mpsc::Sender<()>,
     /// Time when connection was established
     connected_at: Option<Instant>,
+}
+
+fn spawn_core_event(app: Arc<AppHandle>, event: CoreEvent, context: &'static str) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = drive_core_with_handle(app.as_ref(), CoreInput::Event(event)).await {
+            log::warn!("RealtimeManager: failed to drive core from {context}: {error}");
+        }
+    });
 }
 
 enum ConnectionReservation {
@@ -665,22 +674,7 @@ impl RealtimeManager {
                                     app_handle.as_ref(),
                                     group_core_event_from_ws_event(&group_id, &event),
                                 ) {
-                                    let app = app.clone();
-                                    std::thread::spawn(move || {
-                                        tauri::async_runtime::handle().block_on(async move {
-                                            if let Err(error) = Box::pin(drive_core_with_handle(
-                                                app.as_ref(),
-                                                CoreInput::Event(core_event),
-                                            ))
-                                            .await
-                                            {
-                                                log::warn!(
-                                                    "RealtimeManager: failed to drive core from group realtime event: {}",
-                                                    error
-                                                );
-                                            }
-                                        });
-                                    });
+                                    spawn_core_event(app.clone(), core_event, "group realtime event");
                                 }
                             } else {
                                 log::warn!("Group WS event failed to parse for {}", group_ref);
@@ -717,12 +711,21 @@ impl RealtimeManager {
                                         event_type: "group_disconnected".to_string(),
                                         data: None,
                                     });
+                                    spawn_core_event(
+                                        app.clone(),
+                                        CoreEvent::GroupWebSocketDisconnected {
+                                            group_id: group_id.clone(),
+                                            error: Some("closed by server".into()),
+                                        },
+                                        "group websocket close",
+                                    );
                                 }
                             }
                             break;
                         }
                         Some(Err(e)) => {
                             log::error!("Group WS error for {}: {:?}", group_ref, e);
+                            let error_detail = e.to_string();
 
                             let should_emit = {
                                 let mut sessions_guard = sessions.write().await;
@@ -740,8 +743,16 @@ impl RealtimeManager {
                                     let _ = app.emit("realtime-event", RealtimeEventPayload {
                                         device_id: group_id.clone(),
                                         event_type: "group_error".to_string(),
-                                        data: Some(e.to_string()),
+                                        data: Some(error_detail.clone()),
                                     });
+                                    spawn_core_event(
+                                        app.clone(),
+                                        CoreEvent::GroupWebSocketDisconnected {
+                                            group_id: group_id.clone(),
+                                            error: Some(error_detail.clone()),
+                                        },
+                                        "group websocket error",
+                                    );
                                 }
                             }
                             break;
@@ -926,6 +937,15 @@ impl RealtimeManager {
                                         event_type: event.event_type_name(),
                                         data: Some(text.to_string()),
                                     });
+                                    if let Some(core_event) =
+                                        direct_core_event_from_ws_event(&device_id, &event)
+                                    {
+                                        spawn_core_event(
+                                            app.clone(),
+                                            core_event,
+                                            "direct realtime event",
+                                        );
+                                    }
                                 }
                             } else {
                                 log::warn!("WS event failed to parse for {}", device_ref);
@@ -969,6 +989,14 @@ impl RealtimeManager {
                                         event_type: "disconnected".to_string(),
                                         data: None,
                                     });
+                                    spawn_core_event(
+                                        app.clone(),
+                                        CoreEvent::WebSocketDisconnected {
+                                            device_id: device_id.clone(),
+                                            reason: Some("closed by server".into()),
+                                        },
+                                        "direct websocket close",
+                                    );
                                 }
                             }
                             break;
@@ -976,6 +1004,7 @@ impl RealtimeManager {
                         Some(Err(e)) => {
                             log::error!("WS error for {}: {:?}", device_ref, e);
                             timetest!("ws_error device_id={} error=1 ts={}", device_ref, crate::ts_ms());
+                            let error_detail = e.to_string();
 
                             // Only emit error if this connection is still active
                             let should_emit = {
@@ -999,8 +1028,16 @@ impl RealtimeManager {
                                     let _ = app.emit("realtime-event", RealtimeEventPayload {
                                         device_id: device_id.clone(),
                                         event_type: "error".to_string(),
-                                        data: Some(e.to_string()),
+                                        data: Some(error_detail.clone()),
                                     });
+                                    spawn_core_event(
+                                        app.clone(),
+                                        CoreEvent::WebSocketDisconnected {
+                                            device_id: device_id.clone(),
+                                            reason: Some(error_detail.clone()),
+                                        },
+                                        "direct websocket error",
+                                    );
                                 }
                             }
                             break;
@@ -1071,6 +1108,53 @@ fn group_core_event_from_ws_event(
                     group_id: group_id.clone(),
                     seq: *seq,
                     record: None,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn direct_core_event_from_ws_event(
+    subscribed_device_id: &str,
+    event: &WsServerEvent,
+) -> Option<CoreEvent> {
+    match event {
+        WsServerEvent::HeadUpdated { device_id, seq } if device_id == subscribed_device_id => {
+            Some(CoreEvent::RealtimeEventReceived {
+                device_id: device_id.clone(),
+                event: RealtimeEvent::HeadUpdated { seq: *seq },
+            })
+        }
+        WsServerEvent::InboxRecordAvailable { device_id, seq, .. }
+            if device_id == subscribed_device_id =>
+        {
+            Some(CoreEvent::RealtimeEventReceived {
+                device_id: device_id.clone(),
+                event: RealtimeEvent::InboxRecordAvailable {
+                    seq: *seq,
+                    record: None,
+                },
+            })
+        }
+        WsServerEvent::MessageRequestChanged {
+            device_id,
+            sender_user_id,
+            request_id,
+            change,
+        } if device_id == subscribed_device_id => {
+            let change = match change.as_str() {
+                "queued" => MessageRequestRealtimeChange::Queued,
+                "accepted" => MessageRequestRealtimeChange::Accepted,
+                "rejected" => MessageRequestRealtimeChange::Rejected,
+                _ => return None,
+            };
+            Some(CoreEvent::RealtimeEventReceived {
+                device_id: device_id.clone(),
+                event: RealtimeEvent::MessageRequestChanged {
+                    sender_user_id: sender_user_id.clone(),
+                    request_id: request_id.clone(),
+                    change,
                 },
             })
         }
@@ -1198,6 +1282,83 @@ mod tests {
         assert!(!summary.contains("inlineCiphertext"));
         assert!(!summary.contains("senderProof"));
         assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn direct_ws_events_map_to_core_realtime_events() {
+        let head = direct_core_event_from_ws_event(
+            "device:local",
+            &WsServerEvent::HeadUpdated {
+                device_id: "device:local".into(),
+                seq: 7,
+            },
+        );
+        assert!(matches!(
+            head,
+            Some(CoreEvent::RealtimeEventReceived {
+                device_id,
+                event: RealtimeEvent::HeadUpdated { seq: 7 }
+            }) if device_id == "device:local"
+        ));
+
+        let record = direct_core_event_from_ws_event(
+            "device:local",
+            &WsServerEvent::InboxRecordAvailable {
+                device_id: "device:local".into(),
+                seq: 8,
+                record: Some(serde_json::json!({"messageId": "ignored"})),
+            },
+        );
+        assert!(matches!(
+            record,
+            Some(CoreEvent::RealtimeEventReceived {
+                device_id,
+                event: RealtimeEvent::InboxRecordAvailable {
+                    seq: 8,
+                    record: None
+                }
+            }) if device_id == "device:local"
+        ));
+
+        let request = direct_core_event_from_ws_event(
+            "device:local",
+            &WsServerEvent::MessageRequestChanged {
+                device_id: "device:local".into(),
+                sender_user_id: "user:bob".into(),
+                request_id: "request:1".into(),
+                change: "queued".into(),
+            },
+        );
+        assert!(matches!(
+            request,
+            Some(CoreEvent::RealtimeEventReceived {
+                device_id,
+                event: RealtimeEvent::MessageRequestChanged {
+                    sender_user_id,
+                    request_id,
+                    change: MessageRequestRealtimeChange::Queued,
+                }
+            }) if device_id == "device:local"
+                && sender_user_id == "user:bob"
+                && request_id == "request:1"
+        ));
+    }
+
+    #[test]
+    fn non_matching_direct_ws_events_do_not_drive_core() {
+        let mismatched = WsServerEvent::HeadUpdated {
+            device_id: "device:other".into(),
+            seq: 1,
+        };
+        let unknown_change = WsServerEvent::MessageRequestChanged {
+            device_id: "device:local".into(),
+            sender_user_id: "user:bob".into(),
+            request_id: "request:1".into(),
+            change: "created".into(),
+        };
+
+        assert!(direct_core_event_from_ws_event("device:local", &mismatched).is_none());
+        assert!(direct_core_event_from_ws_event("device:local", &unknown_change).is_none());
     }
 
     #[test]

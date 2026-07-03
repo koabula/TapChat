@@ -20,6 +20,8 @@ pub struct DeviceSyncState {
     pub pending_record_seqs: BTreeSet<u64>,
     pub pending_retry: bool,
     pub last_head_seq: u64,
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +47,7 @@ impl SyncEngine {
             pending_record_seqs: BTreeSet::new(),
             pending_retry: false,
             last_head_seq: 0,
+            consecutive_failures: 0,
         }
     }
 
@@ -67,6 +70,16 @@ impl SyncEngine {
     pub fn register_head(state: &mut DeviceSyncState, head_seq: u64) {
         state.last_head_seq = head_seq.max(state.last_head_seq);
         state.checkpoint.updated_at = state.last_head_seq;
+        state.consecutive_failures = 0;
+    }
+
+    pub fn note_sync_failure(state: &mut DeviceSyncState) -> u32 {
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.consecutive_failures
+    }
+
+    pub fn clear_sync_failures(state: &mut DeviceSyncState) {
+        state.consecutive_failures = 0;
     }
 
     pub fn next_fetch(state: &DeviceSyncState) -> Option<SyncDecision> {

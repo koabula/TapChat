@@ -250,8 +250,11 @@ pub async fn get_attachment_preview(
 pub async fn clear_attachment_cache(app: tauri::AppHandle) -> Result<(), String> {
     let attachments_dir = {
         let state = app.state::<AppState>();
-        let inner = state.inner.read().await;
-        inner.ports.persistence.attachments_dir().await
+        let persistence = {
+            let ports = state.ports.lock().await;
+            ports.persistence.clone()
+        };
+        persistence.attachments_dir().await
     }
     .ok_or_else(|| "no attachments directory configured".to_string())?;
 
@@ -285,8 +288,11 @@ async fn ensure_attachment_cached(
 ) -> Result<std::path::PathBuf, String> {
     let attachments_dir = {
         let state = app.state::<AppState>();
-        let inner = state.inner.read().await;
-        inner.ports.persistence.attachments_dir().await
+        let persistence = {
+            let ports = state.ports.lock().await;
+            ports.persistence.clone()
+        };
+        persistence.attachments_dir().await
     }
     .ok_or_else(|| "no attachments directory configured".to_string())?;
 
@@ -826,6 +832,7 @@ mod tests {
             size_bytes: plaintext.len() as u64,
             file_name: Some("image.png".to_string()),
             encryption: encrypted.metadata,
+            download_grant: None,
         };
         let downloaded_blob_b64 = BASE64.encode(encrypted.ciphertext);
         let temp_dir =

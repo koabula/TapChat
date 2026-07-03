@@ -61,8 +61,11 @@ pub async fn start_new_profile_onboarding(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     {
-        let inner = state.inner.read().await;
-        if let Err(e) = inner.ports.realtime.close_all_silent().await {
+        let realtime = {
+            let ports = state.ports.lock().await;
+            ports.realtime.clone()
+        };
+        if let Err(e) = realtime.close_all_silent().await {
             log::warn!("Failed to close realtime before onboarding: {}", e);
         }
     }
@@ -238,8 +241,11 @@ async fn reload_engine_from_profile(
 
     // Step 1: Close all existing realtime connections silently
     {
-        let inner = state.inner.read().await;
-        if let Err(e) = inner.ports.realtime.close_all_silent().await {
+        let realtime = {
+            let ports = state.ports.lock().await;
+            ports.realtime.clone()
+        };
+        if let Err(e) = realtime.close_all_silent().await {
             log::warn!("Failed to close realtime connections silently: {}", e);
         }
     }
@@ -395,8 +401,11 @@ async fn set_locked_session(
     reason: LockReason,
 ) {
     {
-        let inner = state.inner.read().await;
-        if let Err(error) = inner.ports.realtime.close_all_silent().await {
+        let realtime = {
+            let ports = state.ports.lock().await;
+            ports.realtime.clone()
+        };
+        if let Err(error) = realtime.close_all_silent().await {
             log::warn!("Failed to close realtime after profile lock: {}", error);
         }
     }

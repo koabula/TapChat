@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tapchat_core::CoreEngine;
@@ -23,13 +24,14 @@ pub enum StartupPhase {
 /// async runtime.
 pub struct AppState {
     pub inner: Arc<RwLock<AppStateInner>>,
+    pub ports: Arc<Mutex<DesktopPlatformPorts>>,
     pub sync_gate: Arc<Mutex<SyncGateState>>,
     pub ws_status: Arc<RwLock<WsStatusSnapshot>>,
+    pub foreground_sync_gate: Arc<Mutex<ForegroundSyncGate>>,
 }
 
 pub struct AppStateInner {
     pub engine: CoreEngine,
-    pub ports: DesktopPlatformPorts,
     pub profile_manager: ProfileManager,
     pub session: SessionState,
     pub profile_path: Option<PathBuf>,
@@ -89,6 +91,11 @@ pub struct SyncGateState {
     pub pending: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct ForegroundSyncGate {
+    pub last_triggered_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WsStatusSnapshot {
     pub ws_connected: bool,
@@ -99,17 +106,19 @@ impl AppState {
     pub fn new() -> Self {
         let profile_manager = ProfileManager::new();
         let inner_arc = profile_manager.inner_arc();
+        let ports = DesktopPlatformPorts::new(inner_arc);
         Self {
             inner: Arc::new(RwLock::new(AppStateInner {
                 engine: CoreEngine::new(),
-                ports: DesktopPlatformPorts::new(inner_arc),
                 profile_manager,
                 session: SessionState::Uninitialized,
                 profile_path: None,
                 startup_phase: StartupPhase::NotStarted,
             })),
+            ports: Arc::new(Mutex::new(ports)),
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
+            foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
         }
     }
 
@@ -117,17 +126,19 @@ impl AppState {
     pub fn with_profile_name(name: &str) -> Self {
         let profile_manager = ProfileManager::with_profile_name(name);
         let inner_arc = profile_manager.inner_arc();
+        let ports = DesktopPlatformPorts::new(inner_arc);
         Self {
             inner: Arc::new(RwLock::new(AppStateInner {
                 engine: CoreEngine::new(),
-                ports: DesktopPlatformPorts::new(inner_arc),
                 profile_manager,
                 session: SessionState::Uninitialized,
                 profile_path: None,
                 startup_phase: StartupPhase::NotStarted,
             })),
+            ports: Arc::new(Mutex::new(ports)),
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
+            foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
         }
     }
 

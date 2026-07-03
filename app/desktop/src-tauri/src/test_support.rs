@@ -23,7 +23,8 @@ use tapchat_core::CoreEngine;
 use crate::platform::profile::{ProfileManager, ProfileManagerInner};
 use crate::ports::DesktopPlatformPorts;
 use crate::state::{
-    AppState, AppStateInner, SessionState, StartupPhase, SyncGateState, WsStatusSnapshot,
+    AppState, AppStateInner, ForegroundSyncGate, SessionState, StartupPhase, SyncGateState,
+    WsStatusSnapshot,
 };
 
 // Re-export the no-handle driver so integration tests can drive the
@@ -118,14 +119,15 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
     Ok(AppState {
         inner: Arc::new(RwLock::new(AppStateInner {
             engine,
-            ports,
             profile_manager,
             session: SessionState::Active { device_id },
             profile_path: Some(profile_path),
             startup_phase: StartupPhase::Ready,
         })),
+        ports: Arc::new(Mutex::new(ports)),
         sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
         ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
+        foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
     })
 }
 
@@ -183,9 +185,10 @@ mod tests {
         unsafe {
             std::env::set_var("TAPCHAT_PROFILE_PASSPHRASE", passphrase);
         }
-        let error = build_test_app_state_for_profile(&root)
-            .await
-            .expect_err("corrupt store should not start with an empty engine");
+        let error = match build_test_app_state_for_profile(&root).await {
+            Ok(_) => panic!("corrupt store should not start with an empty engine"),
+            Err(error) => error,
+        };
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_PASSPHRASE");
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");

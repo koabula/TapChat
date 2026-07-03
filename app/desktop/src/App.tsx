@@ -33,6 +33,10 @@ import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useNotifications } from "./hooks/useNotifications";
 import { waitForNonBootstrappingSessionStatus } from "./lib/sessionStartup";
 import {
+  directRealtimeEventHandledByRustCore,
+  shouldFrontendInvokeSyncForRealtimeEvent,
+} from "./lib/realtimeEventPolicy";
+import {
   lockedProfileRetryDisabled,
   lockedProfileRetryPayload,
   lockedProfileView,
@@ -48,15 +52,6 @@ function summarizeSessionStatus(status: SessionStatus): string {
 
 function summarizeRealtimeEvent(event: RealtimeEventPayload): string {
   return `type=${event.event_type} device_id=${event.device_id}`;
-}
-
-function isBenignMessageRequestSyncError(error: unknown): boolean {
-  const message = String(error);
-  return (
-    message.includes("unknown request_id") ||
-    message.includes("message request not found") ||
-    message.includes("not_found")
-  );
 }
 
 function isRuntimeAuthError(detail: string | undefined | null): boolean {
@@ -284,15 +279,13 @@ function AppInner({ startupError }: { startupError: string | null }) {
 }
 
 function App() {
-  const { setSessionState, setWsConnected, setDeviceId, setSyncInFlight, setUnlockError, setLockReason } = useSessionStore();
+  const { setSessionState, setWsConnected, setDeviceId, setUnlockError, setLockReason } = useSessionStore();
   const hydrateTheme = useThemeStore((s) => s.hydrateTheme);
   const handleSystemThemeChanged = useThemeStore((s) => s.handleSystemThemeChanged);
   const setRequests = useMessageRequestsStore((s) => s.setRequests);
   const [statusResolved, setStatusResolved] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
   const isProfileSwitchingRef = useRef(false);
-  const syncInFlightRef = useRef(false);
-  const syncPendingRef = useRef(false);
 
   useEffect(() => {
     hydrateTheme();
@@ -329,51 +322,6 @@ function App() {
       }
     };
 
-    const scheduleSync = () => {
-      if (isProfileSwitchingRef.current) {
-        console.debug("[App] skipping sync during profile switch");
-        return;
-      }
-
-      if (syncInFlightRef.current) {
-        syncPendingRef.current = true;
-        console.debug("[App] sync already in flight; marked trailing sync");
-        return;
-      }
-
-      syncInFlightRef.current = true;
-      setSyncInFlight(true);
-
-      const runSync = async () => {
-        try {
-          await invoke("sync_now");
-          console.debug("[App] sync completed");
-        } catch (err) {
-          if (isBenignMessageRequestSyncError(err)) {
-            console.warn(`[App] benign sync race ignored: ${String(err)}`);
-            try {
-              await refreshMessageRequests();
-            } catch (refreshErr) {
-              console.warn(`[App] message request refresh after benign sync race failed: ${String(refreshErr)}`);
-            }
-          } else {
-            console.error(`[App] sync failed: ${String(err)}`);
-          }
-        } finally {
-          if (syncPendingRef.current) {
-            syncPendingRef.current = false;
-            console.debug("[App] running trailing sync");
-            void runSync();
-            return;
-          }
-          syncInFlightRef.current = false;
-          setSyncInFlight(false);
-        }
-      };
-
-      void runSync();
-    };
-
     // Subscribe to session-status events
     const unlistenSessionStatus = listen<SessionStatus>("session-status", (event) => {
       console.debug(`[App] session-status ${summarizeSessionStatus(event.payload)}`);
@@ -408,30 +356,20 @@ function App() {
           break;
         case "disconnected":
           setWsConnected(false);
-          // Only attempt reconnect if not in profile switch mode
-          if (!isProfileSwitchingRef.current) {
-            console.debug("[App] websocket disconnected; scheduling reconnect");
-            // Schedule a reconnect attempt after a short delay
-            setTimeout(() => {
-              if (!isProfileSwitchingRef.current) {
-                scheduleSync();
-              }
-            }, 2000);
-          } else {
+          if (shouldFrontendInvokeSyncForRealtimeEvent(event_type)) {
+            console.warn("[App] unexpected frontend sync policy for disconnected event");
+          }
+          if (isProfileSwitchingRef.current) {
             console.debug("[App] websocket disconnected during profile switch");
           }
           break;
         case "error":
           setWsConnected(false);
+          if (shouldFrontendInvokeSyncForRealtimeEvent(event_type)) {
+            console.warn("[App] unexpected frontend sync policy for websocket error event");
+          }
           console.warn(`[App] websocket error ${event.payload.device_id}: ${event.payload.data ?? "unknown"}`);
-          // Avoid tight reconnect loops when runtime auth is invalid or expired.
-          if (!isProfileSwitchingRef.current && !isRuntimeAuthError(event.payload.data)) {
-            setTimeout(() => {
-              if (!isProfileSwitchingRef.current) {
-                scheduleSync();
-              }
-            }, 3000);
-          } else if (isRuntimeAuthError(event.payload.data)) {
+          if (isRuntimeAuthError(event.payload.data)) {
             console.warn("[App] websocket auth error detected; waiting for explicit refresh instead of auto-retrying");
           }
           break;
@@ -452,9 +390,10 @@ function App() {
             });
           break;
         case "inbox_record_available":
-          scheduleSync();
-          break;
         case "head_updated":
+          if (directRealtimeEventHandledByRustCore(event_type)) {
+            console.debug(`[App] ${event_type} handled by Rust core`);
+          }
           break;
       }
     });
@@ -501,7 +440,7 @@ function App() {
       unlistenWsConnect.then((fn) => fn());
       unlistenWsDisconnect.then((fn) => fn());
     };
-  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setSyncInFlight, setUnlockError, setLockReason]);
+  }, [setSessionState, setWsConnected, setRequests, setDeviceId, setUnlockError, setLockReason]);
 
   return (
     <BrowserRouter>

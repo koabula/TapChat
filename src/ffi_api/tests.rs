@@ -3959,6 +3959,149 @@ mod tests {
             effect,
             CoreEffect::ScheduleTimer { timer } if timer.timer_id == format!("sync:{device_id}")
         )));
+        let delay = scheduled_timer_delay(&output, &format!("sync:{device_id}"))
+            .expect("sync retry timer");
+        assert!(delay >= 1_000, "retry delay should be nonzero");
+    }
+
+    #[test]
+    fn retryable_direct_head_failure_backs_off_exponentially() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let device_id = engine.local_identity_summary().expect("identity").device_id;
+
+        let sync = engine
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let first_request_id = first_http_request_id_containing(&sync, "/head");
+        let first_failure = engine
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id: first_request_id,
+                retryable: true,
+                detail: Some("network".into()),
+            })
+            .expect("first failure");
+        let timer_id = format!("sync:{device_id}");
+        let first_delay = scheduled_timer_delay(&first_failure, &timer_id).expect("first timer");
+
+        let retry_sync = engine
+            .handle_event(CoreEvent::TimerTriggered {
+                timer_id: timer_id.clone(),
+            })
+            .expect("retry sync");
+        let second_request_id = first_http_request_id_containing(&retry_sync, "/head");
+        let second_failure = engine
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id: second_request_id,
+                retryable: true,
+                detail: Some("network".into()),
+            })
+            .expect("second failure");
+        let second_delay =
+            scheduled_timer_delay(&second_failure, &timer_id).expect("second timer");
+
+        assert!(first_delay >= 1_000);
+        assert!(second_delay >= 2_000);
+        assert!(
+            second_delay > first_delay,
+            "second retry should back off beyond first retry"
+        );
+    }
+
+    #[test]
+    fn successful_direct_head_response_resets_retry_backoff() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let device_id = engine.local_identity_summary().expect("identity").device_id;
+
+        let sync = engine
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let request_id = first_http_request_id_containing(&sync, "/head");
+        engine
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id,
+                retryable: true,
+                detail: Some("network".into()),
+            })
+            .expect("failure");
+        assert_eq!(
+            engine
+                .sync_state(&device_id)
+                .expect("sync state")
+                .consecutive_failures,
+            1
+        );
+
+        let sync = engine
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync after failure");
+        let request_id = first_http_request_id_containing(&sync, "/head");
+        engine
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some("{\"head_seq\":0}".into()),
+            })
+            .expect("head response");
+
+        assert_eq!(
+            engine
+                .sync_state(&device_id)
+                .expect("sync state")
+                .consecutive_failures,
+            0
+        );
+    }
+
+    #[test]
+    fn startup_sync_resets_exhausted_direct_pending_transport() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id);
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let pending = alice
+            .state
+            .pending_outbox
+            .first_mut()
+            .expect("pending outbox");
+        pending.in_flight = false;
+        pending.retries = MAX_TRANSPORT_RETRIES;
+        let message_id = pending.envelope.message_id.clone();
+
+        let output = alice
+            .handle_event(CoreEvent::AppStarted)
+            .expect("startup sync");
+
+        let pending = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_id == message_id)
+            .expect("pending after startup");
+        assert_eq!(pending.retries, 0);
+        assert!(pending.in_flight, "startup should re-flush reset pending message");
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::PersistState { persist }
+                if persist.ops.iter().any(|op| matches!(
+                    op,
+                    PersistOp::SaveOutgoingEnvelope { message_id: persisted }
+                        if persisted == &message_id
+                ))
+        )));
     }
 
     #[test]
@@ -7118,6 +7261,28 @@ mod tests {
             })
             .expect("identity");
         engine
+    }
+
+    fn scheduled_timer_delay(output: &CoreOutput, timer_id: &str) -> Option<u64> {
+        output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ScheduleTimer { timer } if timer.timer_id == timer_id => {
+                Some(timer.delay_ms)
+            }
+            _ => None,
+        })
+    }
+
+    fn first_http_request_id_containing(output: &CoreOutput, needle: &str) -> String {
+        output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request } if request.url.contains(needle) => {
+                    Some(request.request_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing HTTP request containing {needle}"))
     }
 
     fn create_direct_conversation(engine: &mut CoreEngine, peer_user_id: String) -> String {

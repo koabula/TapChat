@@ -907,6 +907,8 @@ pub(crate) struct RealtimeSessionState {
     pub(crate) connected: bool,
     pub(crate) last_known_seq: u64,
     pub(crate) needs_reconnect: bool,
+    #[serde(default)]
+    pub(crate) reconnect_failures: u32,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -914,6 +916,8 @@ pub(crate) struct GroupRealtimeSessionState {
     pub(crate) connected: bool,
     pub(crate) last_known_seq: u64,
     pub(crate) needs_reconnect: bool,
+    #[serde(default)]
+    pub(crate) reconnect_failures: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
