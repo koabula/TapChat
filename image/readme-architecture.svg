@@ -1,0 +1,254 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="TapChat architecture diagram">
+  <title>TapChat architecture diagram</title>
+  <style>
+:root {
+      --ink: #1f2e78;
+      --muted: #7d86b8;
+      --soft: #eef1fa;
+      --shadow: #d9ddeb;
+      --white: #ffffff;
+    }
+
+    .card-shadow {
+      fill: var(--shadow);
+      opacity: 0.72;
+    }
+
+    .card {
+      fill: var(--white);
+      stroke: var(--ink);
+      stroke-width: 2.4;
+    }
+
+    .soft-card {
+      fill: var(--soft);
+      stroke: var(--ink);
+      stroke-width: 2.4;
+    }
+
+    .optional-card {
+      fill: #f7f8fd;
+      stroke: var(--muted);
+      stroke-width: 2;
+    }
+
+    .icon {
+      fill: none;
+      stroke: var(--ink);
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .optional-icon {
+      fill: none;
+      stroke: var(--muted);
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .title {
+      fill: var(--ink);
+      font-size: 20px;
+      font-weight: 750;
+      text-anchor: middle;
+    }
+
+    .optional-title {
+      fill: var(--muted);
+      font-size: 16px;
+      font-weight: 700;
+      text-anchor: middle;
+    }
+
+    .edge-main {
+      fill: none;
+      stroke: var(--ink);
+      stroke-width: 2.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .edge-muted {
+      fill: none;
+      stroke: var(--muted);
+      stroke-width: 2.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .edge-dashed {
+      stroke-dasharray: 8 8;
+    }
+
+    .pill {
+      fill: var(--soft);
+      stroke: var(--muted);
+      stroke-width: 1.4;
+    }
+
+    .pill-muted {
+      fill: #fafbff;
+      stroke: #a5acd0;
+      stroke-width: 1.2;
+    }
+
+    .label {
+      fill: var(--ink);
+      font-size: 15px;
+      font-weight: 700;
+      text-anchor: middle;
+      dominant-baseline: middle;
+    }
+
+    .label-muted {
+      fill: var(--muted);
+      font-size: 14px;
+      font-weight: 700;
+      text-anchor: middle;
+      dominant-baseline: middle;
+    }
+
+    .endpoint {
+      fill: var(--white);
+      stroke: var(--muted);
+      stroke-width: 2.2;
+    }
+  </style>
+    <defs>
+      <marker id="arrow-main" viewBox="0 0 12 12" markerWidth="12" markerHeight="12" refX="10.2" refY="6" orient="auto" markerUnits="strokeWidth">
+        <path d="M2 2 L10 6 L2 10 Z" fill="#1f2e78" />
+      </marker>
+      <marker id="arrow-muted" viewBox="0 0 12 12" markerWidth="12" markerHeight="12" refX="10.2" refY="6" orient="auto" markerUnits="strokeWidth">
+        <path d="M2 2 L10 6 L2 10 Z" fill="#7d86b8" />
+      </marker>
+
+      <symbol id="icon-laptop" viewBox="0 0 64 64">
+        <rect x="13" y="14" width="38" height="28" rx="4" />
+        <path d="M8 48h48l-5 6H13l-5-6Z" />
+        <path d="M28 48h8" />
+      </symbol>
+
+      <symbol id="icon-inbox" viewBox="0 0 64 64">
+        <rect x="14" y="12" width="36" height="12" rx="4" />
+        <rect x="14" y="26" width="36" height="12" rx="4" />
+        <rect x="14" y="40" width="36" height="12" rx="4" />
+        <circle cx="22" cy="18" r="1.8" />
+        <circle cx="22" cy="32" r="1.8" />
+        <circle cx="22" cy="46" r="1.8" />
+        <path d="M30 18h12M30 32h12M30 46h12" />
+      </symbol>
+
+      <symbol id="icon-storage" viewBox="0 0 64 64">
+        <ellipse cx="32" cy="16" rx="18" ry="7" />
+        <path d="M14 16v28c0 3.9 8.1 7 18 7s18-3.1 18-7V16" />
+        <path d="M14 30c0 3.9 8.1 7 18 7s18-3.1 18-7" />
+        <path d="M14 44c0 3.9 8.1 7 18 7s18-3.1 18-7" />
+      </symbol>
+
+      <symbol id="icon-cloud" viewBox="0 0 64 64">
+        <path d="M22 48h24a12 12 0 0 0 1.4-23.9A17 17 0 0 0 15.1 29.8A9.8 9.8 0 0 0 22 48Z" />
+      </symbol>
+
+      <symbol id="icon-envelope" viewBox="0 0 24 24">
+        <rect x="3" y="5" width="18" height="14" rx="2" />
+        <path d="M4 7l8 6 8-6" />
+      </symbol>
+
+      <symbol id="icon-ws" viewBox="0 0 24 24">
+        <path d="M8 7 4 12l4 5" />
+        <path d="M16 7l4 5-4 5" />
+        <path d="M10 18 14 6" />
+      </symbol>
+
+      <symbol id="icon-blob" viewBox="0 0 24 24">
+        <path d="M19.5 11.7c1.7 3.6-.7 7.7-4.5 8.9-4 1.3-8.3-.6-10-4.3-1.7-3.8.2-8.6 3.8-10.7 3.5-2 7.9-1.2 10 1.7.8 1.1.2 2.3.7 4.4Z" />
+      </symbol>
+
+      <symbol id="icon-fetch" viewBox="0 0 24 24">
+        <path d="M20 7v6h-6" />
+        <path d="M20 13a8 8 0 1 1-2.3-5.7" />
+      </symbol>
+    </defs>
+
+    <path class="edge-main" d="M226 166H426" marker-end="url(#arrow-main)" />
+    <path class="edge-muted edge-dashed" d="M579 166C704 112 833 112 974 166" />
+    <circle class="endpoint" cx="579" cy="166" r="6" />
+    <circle class="endpoint" cx="974" cy="166" r="6" />
+
+    <path class="edge-muted" d="M151 228V568C151 594 172 612 198 612H434" marker-end="url(#arrow-muted)" />
+    <path class="edge-muted" d="M579 612H990C1014 612 1034 592 1034 568V228" marker-end="url(#arrow-muted)" />
+
+    <path class="edge-main" d="M504 228C512 292 548 330 616 352" marker-end="url(#arrow-main)" />
+    <path class="edge-muted" d="M754 352C839 333 901 281 969 218" marker-end="url(#arrow-muted)" />
+
+    <g transform="translate(76 104)">
+      <rect class="card-shadow" x="8" y="8" width="150" height="126" rx="22" />
+      <rect class="card" x="0" y="0" width="150" height="126" rx="22" />
+      <use class="icon" href="#icon-laptop" x="43" y="24" width="64" height="64" />
+      <text class="title" x="75" y="102">Alice Client</text>
+    </g>
+
+    <g transform="translate(430 104)">
+      <rect class="card-shadow" x="8" y="8" width="150" height="126" rx="22" />
+      <rect class="soft-card" x="0" y="0" width="150" height="126" rx="22" />
+      <use class="icon" href="#icon-inbox" x="43" y="23" width="64" height="64" />
+      <text class="title" x="75" y="102">Bob Inbox</text>
+    </g>
+
+    <g transform="translate(958 104)">
+      <rect class="card-shadow" x="8" y="8" width="150" height="126" rx="22" />
+      <rect class="card" x="0" y="0" width="150" height="126" rx="22" />
+      <use class="icon" href="#icon-laptop" x="43" y="24" width="64" height="64" />
+      <text class="title" x="75" y="102">Bob Client</text>
+    </g>
+
+    <g transform="translate(430 550)">
+      <rect class="card-shadow" x="8" y="8" width="150" height="126" rx="22" />
+      <rect class="soft-card" x="0" y="0" width="150" height="126" rx="22" />
+      <use class="icon" href="#icon-storage" x="43" y="24" width="64" height="64" />
+      <text class="title" x="75" y="102">Alice Storage</text>
+    </g>
+
+    <g transform="translate(616 304)">
+      <rect class="card-shadow" x="8" y="8" width="138" height="96" rx="20" />
+      <rect class="optional-card" x="0" y="0" width="138" height="96" rx="20" />
+      <use class="optional-icon" href="#icon-cloud" x="41" y="14" width="56" height="56" />
+      <text class="optional-title" x="69" y="78">Wakeup</text>
+    </g>
+
+    <g transform="translate(280 146)">
+      <rect class="pill" x="0" y="0" width="112" height="40" rx="20" />
+      <use class="icon" href="#icon-envelope" x="17" y="8" width="24" height="24" />
+      <text class="label" x="72" y="20">envelope</text>
+    </g>
+
+    <g transform="translate(706 102)">
+      <rect class="pill" x="0" y="0" width="132" height="40" rx="20" />
+      <use class="icon" href="#icon-ws" x="17" y="8" width="24" height="24" />
+      <text class="label" x="80" y="20">subscribe</text>
+    </g>
+
+    <g transform="translate(256 592)">
+      <rect class="pill" x="0" y="0" width="80" height="40" rx="20" />
+      <use class="icon" href="#icon-blob" x="16" y="8" width="24" height="24" />
+      <text class="label" x="54" y="20">blob</text>
+    </g>
+
+    <g transform="translate(758 592)">
+      <rect class="pill" x="0" y="0" width="88" height="40" rx="20" />
+      <use class="icon" href="#icon-fetch" x="16" y="8" width="24" height="24" />
+      <text class="label" x="58" y="20">fetch</text>
+    </g>
+
+    <g transform="translate(520 268)">
+      <rect class="pill" x="0" y="0" width="68" height="36" rx="18" />
+      <text class="label" x="34" y="18">call</text>
+    </g>
+
+    <g transform="translate(786 314)">
+      <rect class="pill-muted" x="0" y="0" width="94" height="36" rx="18" />
+      <text class="label-muted" x="47" y="18">optional</text>
+    </g>
+  </svg>

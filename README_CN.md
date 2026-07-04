@@ -1,91 +1,145 @@
 # TapChat
-[ENG](./README.md) | 中文
 
-一个面向抗审查和元数据隐私的去中心化即时通信应用。
+[English](./README.md) | 中文
 
-## 项目概览
+面向抗审查和元数据隐私的用户自带传输层即时通信应用。
 
-TapChat 是一个去中心化即时通信系统。每个用户拥有并控制自己的传输基础设施组件。整体架构由以下部分组成：
+TapChat 目前是早期公开 alpha，适合实验、协议反馈和小规模试用。项目尚未经过外部安全审计，不应在高风险通信场景中依赖。
 
-- **Client**：本地客户端核心，负责状态管理、加密与解密。只有 Client 会接触消息明文。
-- **Inbox**：消息队列与消息索引的真实来源。
-- **Storage**：用于附件和大消息的 Blob 存储服务。
-- **Wakeup**：通知组件，用于提醒客户端同步 Inbox；对于桌面端可以是可选组件。
+## TapChat 是什么？
 
-这些组件都由用户自行部署和持有，因此不会有一个中心化服务器统一掌握所有消息和元数据。
+TapChat 是一个端到端加密即时通信应用，每个用户都拥有自己的传输组件。消息不经过一个统一的 TapChat 中心服务器，而是由每个用户自行部署 Inbox 和 Storage，并通过受限 capability 授权联系人发送消息。
 
-## 特性
+客户端是唯一处理消息明文的地方。当前桌面端参考实现可以把传输层部署到用户自己的 Cloudflare 账户中。
 
-- 基于 OpenMLS 的端到端加密，兼容 MLS（RFC 9420）
-- 去中心化架构，每个用户拥有自己的传输组件
-- 面向元数据隐私的消息传输设计
-- 支持基于 WebSocket 的实时订阅
-- 基于 BIP39 / BIP32 的跨设备身份派生模型
+## 为什么是用户自带传输层？
 
-## 项目结构
+大多数即时通信系统仍依赖中心服务来完成消息投递、账号状态和元数据聚合。TapChat 探索另一种模型：
 
-```text
-src/                     # Rust core 库
-  identity/              # BIP39 身份系统
-  mls_adapter/           # OpenMLS 集成
-  model/                 # 核心数据结构
-  ffi_api/               # 面向平台绑定的 FFI 接口
+- 用户控制自己接收消息所需的传输层
+- 联系人只获得发送加密 Envelope 所需的最小权限
+- 消息历史通过 cursor 同步，而不是依赖 best-effort 推送状态
+- 附件会先在本地加密，再作为 blob 上传
 
-services/cloudflare/     # Cloudflare 参考后端实现
-  inbox/                 # Inbox Durable Object
-  storage/               # 基于 R2 的 Blob 存储
+这并不会消除所有元数据。网络时序、Cloudflare 账号层面的元数据和联系人关系线索仍然可能存在。TapChat 的目标是在保持可用性的前提下，降低中心化控制和元数据集中度。
 
-app/desktop/             # Tauri 桌面应用
-  src/                   # React 前端
-  src-tauri/             # Rust 后端绑定
-```
+## 工作方式
+
+![TapChat 架构](./image/readme-architecture.svg)
+
+- **Client** 在本地运行，持有身份状态，执行加密与解密，并管理会话。
+- **Inbox** 是小消息 Envelope 和消息索引的真实来源。
+- **Storage** 存储附件和大消息等加密 blob。
+- **Inbox.Subscribe** 为桌面端提供在线 WebSocket 同步路径。
+- **Wakeup** 是未来用于移动端和后台同步的 best-effort 通知层。
+
+TapChat 当前提供基于 Cloudflare Workers、Durable Objects、WebSocket 和 R2 的参考传输层。协议设计上允许后续接入其他传输实现。
 
 ## 当前状态
 
-**v0.1**：当前仓库已经具备 1 对 1 私聊主链路的实现，并包含 Rust core、Cloudflare 参考传输层和桌面端应用。
+| 范围 | 状态 |
+| --- | --- |
+| 可用于 alpha 试用 | 桌面端、私聊、Cloudflare 参考传输层、附件、WebSocket 同步 |
+| 实验中 | 群聊、多设备群聊语义、恢复流程硬化 |
+| 尚未完成 | 移动端 wakeup bridge、外部安全审计、生产规模部署指南 |
 
-## 快速开始
+## 试用桌面端 alpha
 
-你可以在 [GitHub Releases](https://github.com/koabula/TapChat/releases) 页面获取最新的安装包。
-使用 TapChat Desktop 需要一个 Cloudflare 账户，并开通 Worker 和 R2 对象存储服务。
+1. 从 [GitHub Releases](https://github.com/koabula/TapChat/releases) 下载最新安装包。
+2. 准备一个已开通 Workers、Durable Objects 和 R2 的 Cloudflare 账户。
+3. 打开 TapChat Desktop，并按照下面的初始化流程完成设置。
+4. 与可信联系人交换 Share Link 后即可开始聊天。
+
+当前 alpha 没有中心化 TapChat 目录，也没有用户名搜索。联系人发现有意保持为手动交换。
+
+## 如何使用
 
 ### 初始化
 
-第一次进入 TapChat 需要创建一个 Profile，请按照 App 的引导进行初始化。在 Step 4 会跳转至 Cloudflare 登录界面，请授权后回到 TapChat 继续下一步。
+**1. 开始初始化。** 打开 TapChat，选择创建新身份或恢复已有身份。
 
-### 添加好友
+![TapChat 初始化首页](./image/screenshots/onboarding-start.png)
 
-TapChat 并没有一个中心服务器来进行好友查找。我们使用 Share Link 来让好友能够添加我们。你可以在 Setting > Account 中复制和轮换你的 Share Link。
+**2. 创建本地 profile。** 设置本地 profile 名称，也可以选择为当前设备设置 passphrase。
 
-![界面截图](./image/image.png)
+![TapChat 创建 profile 界面](./image/screenshots/onboarding-profile.png)
 
-在获取好友的 Share Link 之后，你需要点击主界面左下角的 + 按钮，粘贴 Share Link，就可以看到好友的信息。之后点击 Chat，就会自动发送好友请求。
+**3. 备份恢复助记词。** 继续之前请安全保存恢复助记词；它是恢复身份所必需的凭证。
 
-在收到好友请求后，会在 Message Request 中进行提示，点击进入后可以选择同意。
+![TapChat 恢复助记词备份界面](./image/screenshots/onboarding-recovery-phrase.png)
 
-之后，双方就可以开始聊天。
+**4. 部署或连接 Cloudflare runtime。** 连接 Cloudflare，部署 Inbox 和 Storage runtime，然后确认 endpoint 可以访问。
+
+![TapChat Cloudflare runtime 部署界面](./image/screenshots/onboarding-cloudflare-runtime.png)
+
+### 聊天
+
+**1. 复制你的 Share Link。** 打开 Settings > Account，复制要分享给联系人的链接。
+
+![TapChat Share Link 界面](./image/screenshots/chat-share-link.png)
+
+**2. 添加联系人。** 粘贴对方的 Share Link，点击 Add，然后进入聊天。
+
+![TapChat 添加联系人界面](./image/screenshots/chat-add-contact.png)
+
+**3. 接受消息请求。** 对方接受 Message Request 后，双方即可开始聊天。
+
+![TapChat 消息请求界面](./image/screenshots/chat-message-request.png)
 
 ## 开发环境
 
-### 前置依赖
+前置依赖：
 
-- Rust 1.70+
-- Node.js 18+
-- Cloudflare 账户（用于部署参考后端）
+- Rust stable
+- Node.js 20+
+- 用于真实传输层部署的 Cloudflare 账户
 
-### 构建
+常用命令：
 
 ```bash
-# 构建 Rust core
+# Rust core
 cargo build
+cargo test -q --lib
 
-# 启动桌面端
+# Cloudflare 参考传输层
+cd services/cloudflare
+npm install
+npm run check
+npm test
+
+# 桌面端
 cd app/desktop
 npm install
 npm run tauri:dev
 ```
 
+## 安全说明
 
-## License
+- 消息明文应只存在于客户端。
+- Cloudflare 参考传输层只负责存储和路由加密 Envelope 与加密 blob，不应具备解密消息内容的能力。
+- TapChat 仍会暴露部分元数据，例如网络时序、endpoint 访问、账号层基础设施和用户部署方式带来的信息。
+- 项目尚未经过第三方安全审计。
+- 请不要把当前 alpha 用于高风险或生命安全相关通信。
+
+## 项目结构
+
+```text
+src/                     Rust core 和 CLI
+  identity/              基于 BIP39/BIP32 的用户身份与设备绑定
+  mls_adapter/           OpenMLS 集成
+  ffi_api/               面向平台绑定的 command/event/effect API
+  transport_contract/    面向传输层的请求与响应类型
+
+services/cloudflare/     Cloudflare 参考传输层
+  src/inbox/             每设备 Inbox Durable Object
+  src/storage/           基于 R2 的加密 blob 存储
+  src/group-outbox/      实验性群聊 outbox
+
+app/desktop/             Tauri 桌面端
+  src/                   React UI
+  src-tauri/             Rust 桌面后端与平台端口
+```
+
+## 许可证
 
 MIT

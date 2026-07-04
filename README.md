@@ -1,88 +1,143 @@
 # TapChat
-ENG | [中文](./README_CN.md)
 
-A decentralized instant messaging app built for censorship resistance and metadata privacy.
+English | [中文](./README_CN.md)
 
-## Overview
+User-provisioned transport for censorship-resistant and metadata-private messaging.
 
-TapChat is a decentralized instant messaging system. Each user owns and controls their own transport components. The architecture consists of:
+TapChat is an early public alpha. It is suitable for experimentation, protocol feedback, and small-scale trials. It has not received an external security audit and should not yet be relied on for high-risk communications.
 
-- **Client**: The local client core, responsible for state management, encryption, and decryption. Only the Client handles plaintext messages.
-- **Inbox**: The source of truth for message queues and message indexes.
-- **Storage**: A blob storage service for attachments and large messages.
-- **Wakeup**: A notification component used to remind the client to sync the Inbox. It can be optional on desktop.
+## What is TapChat?
 
-Because these components are user-deployed and user-controlled, there is no central server that holds all messages and metadata.
+TapChat is an end-to-end encrypted messaging app where every user owns their own transport components. Instead of sending all messages through one central TapChat server, each user provisions an Inbox and Storage endpoint that other contacts can use with limited capabilities.
 
-## Features
+The client is the only place where plaintext messages are handled. The reference desktop app can deploy the transport layer into a user's own Cloudflare account.
 
-- End-to-end encryption using OpenMLS, compatible with MLS (RFC 9420)
-- A decentralized architecture where each user owns their own transport components
-- Messaging flows designed around metadata privacy
-- Real-time subscriptions over WebSocket
-- Cross-device identity derivation based on BIP39 / BIP32
+## Why user-provisioned transport?
 
-## Project Structure
+Most messaging systems still depend on a central service for message delivery, account state, and metadata aggregation. TapChat explores a different model:
 
-```text
-src/                     # Rust core library
-  identity/              # BIP39 identity system
-  mls_adapter/           # OpenMLS integration
-  model/                 # Core data structures
-  ffi_api/               # FFI interface for platform bindings
+- users control the transport layer used to receive messages
+- contacts receive only the minimum capability needed to send encrypted envelopes
+- message history is synchronized by cursor, not by best-effort push state
+- attachments are encrypted locally before being uploaded as blobs
 
-services/cloudflare/     # Cloudflare reference backend
-  inbox/                 # Inbox Durable Object
-  storage/               # R2-backed blob storage
+This does not remove all metadata. Network timing, account-level Cloudflare metadata, and contact graph hints can still exist. The goal is to reduce centralized control and metadata concentration while keeping the app usable.
 
-app/desktop/             # Tauri desktop application
-  src/                   # React frontend
-  src-tauri/             # Rust backend bindings
-```
+## How it works
 
-## Current Status
+![TapChat architecture](./image/readme-architecture.svg)
 
-**v0.1**: The repository already includes the main implementation path for 1-to-1 private chat, including the Rust core, the Cloudflare reference transport layer, and the desktop app.
+- **Client** runs locally, owns identity state, performs encryption and decryption, and manages conversations.
+- **Inbox** is the source of truth for small message envelopes and message indexes.
+- **Storage** stores encrypted blobs such as attachments and large payloads.
+- **Inbox.Subscribe** provides an online WebSocket sync path for desktop clients.
+- **Wakeup** is a future best-effort notification layer for mobile/background sync.
 
-## Quick Start
+TapChat currently ships a Cloudflare reference transport using Workers, Durable Objects, WebSocket, and R2. The protocol is designed so other transport implementations can be added later.
 
-You can download the latest installer from [GitHub Releases](https://github.com/koabula/TapChat/releases).
-Using TapChat Desktop requires a Cloudflare account with Worker and R2 object storage enabled.
+## Current status
 
-### Initialization
+| Area | Status |
+| --- | --- |
+| Ready for alpha testing | Desktop app, direct messaging, Cloudflare reference transport, attachments, WebSocket sync |
+| Experimental | Group chat, multi-device group semantics, recovery hardening |
+| Not yet | Mobile wakeup bridge, external security audit, production-scale deployment guidance |
 
-The first time you open TapChat, you need to create a Profile. Follow the in-app onboarding flow. In Step 4, the app will redirect you to the Cloudflare login page. After authorization, return to TapChat to continue.
+## Try the desktop alpha
 
-### Add Contacts
+1. Download the latest installer from [GitHub Releases](https://github.com/koabula/TapChat/releases).
+2. Prepare a Cloudflare account with Workers, Durable Objects, and R2 enabled.
+3. Open TapChat Desktop and follow the onboarding flow below.
+4. Exchange Share Links with someone you trust to start a chat.
 
-TapChat does not rely on a central server for contact discovery. Instead, it uses Share Links so other people can add you. You can copy or rotate your Share Link in Setting > Account.
+There is no central TapChat directory or username search. Contact discovery is intentionally manual in this alpha.
 
-![App screenshot](./image/image.png)
+## How to use it
 
-After you get your friend's Share Link, click the + button in the lower-left corner of the main window and paste the Share Link. You will then see your friend's profile. Clicking Chat will automatically send a contact request.
+### Onboarding
 
-When you receive a contact request, it will appear in Message Request. Open it and accept the request.
+**1. Start onboarding.** Open TapChat and choose whether to create a new identity or recover an existing one.
 
-After that, both sides can start chatting.
+![TapChat onboarding start screen](./image/screenshots/onboarding-start.png)
 
-## Developer Setup
+**2. Create a local profile.** Choose a local profile name and optionally set a passphrase for this device.
 
-### Prerequisites
+![TapChat profile creation screen](./image/screenshots/onboarding-profile.png)
 
-- Rust 1.70+
-- Node.js 18+
-- Cloudflare account (for deploying the reference backend)
+**3. Back up the recovery phrase.** Store the phrase safely before continuing; it is required to recover the identity.
 
-### Build
+![TapChat recovery phrase backup screen](./image/screenshots/onboarding-recovery-phrase.png)
+
+**4. Deploy or connect the Cloudflare runtime.** Connect Cloudflare, deploy the Inbox and Storage runtime, then verify that the endpoint is reachable.
+
+![TapChat Cloudflare runtime deployment screen](./image/screenshots/onboarding-cloudflare-runtime.png)
+
+### Chat
+
+**1. Copy your Share Link.** Open Settings > Account and copy the link you want to share.
+
+![TapChat share link screen](./image/screenshots/chat-share-link.png)
+
+**2. Add a contact.** Paste someone else's Share Link, click Add, then open the chat.
+
+![TapChat add contact screen](./image/screenshots/chat-add-contact.png)
+
+**3. Accept the message request.** The recipient accepts the request before both sides start chatting.
+
+![TapChat message request screen](./image/screenshots/chat-message-request.png)
+
+## Developer setup
+
+Prerequisites:
+
+- Rust stable
+- Node.js 20+
+- Cloudflare account for real transport deployment
+
+Useful commands:
 
 ```bash
-# Build Rust core
+# Rust core
 cargo build
+cargo test -q --lib
 
-# Launch the desktop app
+# Cloudflare reference transport
+cd services/cloudflare
+npm install
+npm run check
+npm test
+
+# Desktop app
 cd app/desktop
 npm install
 npm run tauri:dev
+```
+
+## Security note
+
+- Plaintext messages should only exist in the client.
+- The Cloudflare reference transport stores and routes encrypted envelopes and encrypted blobs; it should not be able to decrypt message contents.
+- TapChat still exposes some metadata through network timing, endpoint access, account-level infrastructure, and user-controlled deployment choices.
+- The project has not received a third-party security audit.
+- Do not use this alpha for high-risk or life-critical communication.
+
+## Project layout
+
+```text
+src/                     Rust core and CLI
+  identity/              BIP39/BIP32-based user identity and device binding
+  mls_adapter/           OpenMLS integration
+  ffi_api/               command/event/effect API for platform bindings
+  transport_contract/    transport-facing request and response types
+
+services/cloudflare/     Cloudflare reference transport
+  src/inbox/             per-device Inbox Durable Object
+  src/storage/           R2-backed encrypted blob storage
+  src/group-outbox/      experimental group outbox
+
+app/desktop/             Tauri desktop app
+  src/                   React UI
+  src-tauri/             Rust desktop backend and platform ports
 ```
 
 ## License
