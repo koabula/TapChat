@@ -88,6 +88,8 @@ pub struct PersistedOutgoingEnvelope {
     pub peer_user_id: String,
     pub retries: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_cache: Option<String>,
 }
 
@@ -880,6 +882,7 @@ mod tests {
                 },
                 peer_user_id: "user:bob".into(),
                 retries: 0,
+                app_message_id: Some("app:conv:one:1:device:alice:phone".into()),
                 plaintext_cache: Some("test plaintext".into()),
             }],
             group_states: vec![],

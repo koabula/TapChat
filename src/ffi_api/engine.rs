@@ -21,8 +21,8 @@ use crate::ffi_api::types::*;
 use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
-    CreateConversationArtifacts, IngestResult, MlsAdapter, PeerDeviceKeyPackage,
-    RemoveMembersArtifacts,
+    CreateConversationArtifacts, DecryptedApplicationMessage, IngestResult, MlsAdapter,
+    PeerDeviceKeyPackage, RemoveMembersArtifacts,
 };
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
@@ -31,7 +31,8 @@ use crate::model::{
     GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberDevice, GroupMemberInvitePolicy,
     GroupMemberStatus, GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor,
     GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord, MessageType,
-    MlsStateStatus, MlsStateSummary, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
+    MlsStateStatus, MlsStateSummary, ProtectedAppMessage, ProtectedPayloadKind, SenderProof,
+    StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
@@ -146,6 +147,26 @@ struct ContactAcceptedControl {
     request_id: String,
     #[serde(alias = "created_at")]
     created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedMlsSenderIdentity {
+    user_id: String,
+    device_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApplicationPlaintextDecision {
+    Accepted {
+        plaintext: String,
+        app_message_id: Option<String>,
+    },
+    DuplicateAppMessage {
+        app_message_id: String,
+    },
+    RejectedProtocol {
+        reason: String,
+    },
 }
 
 impl CoreEngine {
@@ -328,6 +349,7 @@ impl CoreEngine {
                 peer_user_id: item.peer_user_id,
                 retries: item.retries,
                 in_flight: false,
+                app_message_id: item.app_message_id,
                 plaintext_cache: item.plaintext_cache,
             })
             .collect();
@@ -2048,14 +2070,35 @@ impl CoreEngine {
         if plaintext.trim().is_empty() {
             return Err(CoreError::invalid_input("plaintext must not be empty"));
         }
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let sender_user_id = local_identity.user_identity.user_id.clone();
+        let sender_device_id = local_identity.device_identity.device_id.clone();
+        let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
+        let mut recipient_device_ids = self.recipient_device_ids(&conversation_id)?;
+        recipient_device_ids.sort();
+        let app_message_nonce = self.next_message_nonce();
+        let app_message_id =
+            self.next_app_message_id(&conversation_id, &sender_device_id, app_message_nonce);
+        let protected_message = ProtectedAppMessage::new_text(
+            app_message_id.clone(),
+            conversation_id.clone(),
+            sender_user_id,
+            sender_device_id,
+            peer_user_id.clone(),
+            recipient_device_ids.clone(),
+            plaintext.clone(),
+        )?;
+        let protected_bytes = protected_message.to_json_bytes()?;
         let payload = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&conversation_id, plaintext.as_bytes())?;
-        let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
-        let recipient_device_ids = self.recipient_device_ids(&conversation_id)?;
+            .encrypt_application(&conversation_id, &protected_bytes)?;
         let envelopes = recipient_device_ids
             .iter()
             .map(|device_id| {
@@ -2068,7 +2111,12 @@ impl CoreEngine {
             })
             .collect::<CoreResult<Vec<_>>>()?;
         // Cache plaintext for display until message is synced
-        self.enqueue_envelopes_with_plaintext(peer_user_id, envelopes.clone(), plaintext.clone());
+        self.enqueue_envelopes_with_plaintext(
+            peer_user_id,
+            envelopes.clone(),
+            plaintext.clone(),
+            Some(app_message_id),
+        );
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -5820,6 +5868,7 @@ impl CoreEngine {
             let nonce = self.next_message_nonce();
             let system_message = StoredMessage {
                 message_id: format!("{conversation_id}:system:legacy_archive"),
+                app_message_id: None,
                 sender_user_id: None,
                 sender_device_id: local_device_id.clone(),
                 recipient_device_id: peer_user_id,
@@ -5971,6 +6020,7 @@ impl CoreEngine {
                 peer_user_id: peer_user_id.clone(),
                 retries: 0,
                 in_flight: false,
+                app_message_id: None,
                 plaintext_cache: None,
             });
         }
@@ -5982,6 +6032,7 @@ impl CoreEngine {
         peer_user_id: String,
         envelopes: Vec<Envelope>,
         plaintext: String,
+        app_message_id: Option<String>,
     ) {
         for envelope in envelopes {
             self.state.outbox.push(envelope.clone());
@@ -5990,9 +6041,193 @@ impl CoreEngine {
                 peer_user_id: peer_user_id.clone(),
                 retries: 0,
                 in_flight: false,
+                app_message_id: app_message_id.clone(),
                 plaintext_cache: Some(plaintext.clone()),
             });
         }
+    }
+
+    fn evaluate_direct_application_plaintext(
+        &self,
+        record: &InboxRecord,
+        local_user_id: &str,
+        local_device_id: &str,
+        application: DecryptedApplicationMessage,
+    ) -> ApplicationPlaintextDecision {
+        let Some(mls_sender) = Self::parse_mls_sender_identity(&application.sender_identity) else {
+            return ApplicationPlaintextDecision::RejectedProtocol {
+                reason: "MLS sender identity is malformed".into(),
+            };
+        };
+        if mls_sender.user_id != record.envelope.sender_user_id
+            || mls_sender.device_id != record.envelope.sender_device_id
+        {
+            return ApplicationPlaintextDecision::RejectedProtocol {
+                reason: "MLS sender identity does not match envelope sender".into(),
+            };
+        }
+
+        match ProtectedAppMessage::from_json_slice(&application.plaintext) {
+            Ok(protected) => {
+                if protected.sender_user_id != record.envelope.sender_user_id
+                    || protected.sender_device_id != record.envelope.sender_device_id
+                    || protected.sender_user_id != mls_sender.user_id
+                    || protected.sender_device_id != mls_sender.device_id
+                {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "protected sender does not match MLS/envelope sender".into(),
+                    };
+                }
+                if protected.conversation_id != record.envelope.conversation_id {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "protected conversation_id does not match envelope".into(),
+                    };
+                }
+                if protected.recipient_user_id != local_user_id {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "protected recipient_user_id does not match local user".into(),
+                    };
+                }
+                if record.envelope.recipient_device_id != local_device_id {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "envelope recipient_device_id does not match local device".into(),
+                    };
+                }
+                if !protected
+                    .audience_device_ids
+                    .iter()
+                    .any(|device_id| device_id == local_device_id)
+                {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "local device is not in protected audience".into(),
+                    };
+                }
+                if protected.payload_kind != ProtectedPayloadKind::Text {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "unsupported protected payload kind".into(),
+                    };
+                }
+                let app_prefix = format!("app:{}:", protected.conversation_id);
+                let app_suffix = format!(":{}", protected.sender_device_id);
+                if !protected.app_message_id.starts_with(&app_prefix)
+                    || !protected.app_message_id.ends_with(&app_suffix)
+                {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "protected app_message_id does not bind conversation and sender"
+                            .into(),
+                    };
+                }
+                if self.conversation_has_app_message(
+                    &record.envelope.conversation_id,
+                    &protected.app_message_id,
+                ) {
+                    return ApplicationPlaintextDecision::DuplicateAppMessage {
+                        app_message_id: protected.app_message_id,
+                    };
+                }
+                ApplicationPlaintextDecision::Accepted {
+                    plaintext: protected.body,
+                    app_message_id: Some(protected.app_message_id),
+                }
+            }
+            Err(error) => {
+                if Self::plaintext_looks_like_protected_app_message(&application.plaintext) {
+                    return ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: format!("malformed protected app message: {}", error.message()),
+                    };
+                }
+                match String::from_utf8(application.plaintext) {
+                    Ok(plaintext) => ApplicationPlaintextDecision::Accepted {
+                        plaintext,
+                        app_message_id: None,
+                    },
+                    Err(_) => ApplicationPlaintextDecision::RejectedProtocol {
+                        reason: "legacy application plaintext is not utf-8".into(),
+                    },
+                }
+            }
+        }
+    }
+
+    fn parse_mls_sender_identity(value: &str) -> Option<ParsedMlsSenderIdentity> {
+        let parts = value.split('|').collect::<Vec<_>>();
+        if parts.len() != 4 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+            return None;
+        }
+        Some(ParsedMlsSenderIdentity {
+            user_id: parts[0].to_string(),
+            device_id: parts[1].to_string(),
+        })
+    }
+
+    fn plaintext_looks_like_protected_app_message(bytes: &[u8]) -> bool {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return false;
+        };
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        [
+            "app_message_id",
+            "audience_device_ids",
+            "payload_kind",
+            "recipient_user_id",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
+    }
+
+    fn conversation_has_app_message(&self, conversation_id: &str, app_message_id: &str) -> bool {
+        self.state
+            .conversations
+            .get(conversation_id)
+            .is_some_and(|state| {
+                state
+                    .messages
+                    .iter()
+                    .any(|message| message.app_message_id.as_deref() == Some(app_message_id))
+            })
+    }
+
+    fn store_accepted_application_message(
+        &mut self,
+        record: &InboxRecord,
+        plaintext: String,
+        app_message_id: Option<String>,
+    ) -> CoreResult<bool> {
+        let conversation_id = &record.envelope.conversation_id;
+        let state = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let duplicate = state.messages.iter().any(|message| {
+            message.message_id == record.message_id
+                || app_message_id
+                    .as_deref()
+                    .is_some_and(|app_id| message.app_message_id.as_deref() == Some(app_id))
+        });
+        if duplicate {
+            return Ok(false);
+        }
+        state.messages.push(StoredMessage {
+            message_id: record.message_id.clone(),
+            app_message_id,
+            sender_user_id: Some(record.envelope.sender_user_id.clone()),
+            sender_device_id: record.envelope.sender_device_id.clone(),
+            recipient_device_id: record.envelope.recipient_device_id.clone(),
+            message_type: record.envelope.message_type,
+            created_at: record.envelope.created_at,
+            plaintext: Some(plaintext),
+            storage_refs: record.envelope.storage_refs.clone(),
+            downloaded_blob_b64: None,
+        });
+        state.last_message_type = Some(record.envelope.message_type);
+        state.conversation.updated_at = record.envelope.created_at;
+        state
+            .last_known_peer_active_devices
+            .insert(record.envelope.sender_device_id.clone());
+        Ok(true)
     }
 
     fn ensure_conversation_ready_for_send(&mut self, conversation_id: &str) -> CoreResult<()> {
@@ -7692,6 +7927,7 @@ impl CoreEngine {
         let nonce = self.next_message_nonce();
         StoredMessage {
             message_id: format!("{conversation_id}:system:{tag}:{nonce}"),
+            app_message_id: None,
             sender_user_id,
             sender_device_id,
             recipient_device_id,
@@ -8244,6 +8480,7 @@ impl CoreEngine {
         )?;
         let system_message = StoredMessage {
             message_id: envelope.message_id.clone(),
+            app_message_id: None,
             sender_user_id: Some(peer_user_id.clone()),
             sender_device_id: envelope.sender_device_id.clone(),
             recipient_device_id: envelope.recipient_device_id.clone(),
@@ -8595,6 +8832,15 @@ impl CoreEngine {
 
     fn next_message_id(&self, conversation_id: &str, suffix: &str, message_nonce: u64) -> String {
         format!("msg:{conversation_id}:{message_nonce}:{suffix}")
+    }
+
+    fn next_app_message_id(
+        &self,
+        conversation_id: &str,
+        sender_device_id: &str,
+        message_nonce: u64,
+    ) -> String {
+        format!("app:{conversation_id}:{message_nonce}:{sender_device_id}")
     }
 
     fn merge_with_transport_flush(&mut self, output: CoreOutput) -> CoreResult<CoreOutput> {
@@ -9694,7 +9940,12 @@ impl CoreEngine {
                 envelope.storage_refs.push(storage_ref.clone());
                 envelopes.push(envelope);
             }
-            self.enqueue_envelopes_with_plaintext(peer_user_id, envelopes, payload_metadata_json);
+            self.enqueue_envelopes_with_plaintext(
+                peer_user_id,
+                envelopes,
+                payload_metadata_json,
+                None,
+            );
             Ok(merge_outputs(
                 CoreOutput {
                     state_update: CoreStateUpdate::default(),
@@ -10073,6 +10324,256 @@ impl CoreEngine {
             self.ensure_local_conversation_for_record(&device_id, &local_user_id, &record);
             let conversation_id = record.envelope.conversation_id.clone();
             touched_conversation_ids.insert(conversation_id.clone());
+            if record.envelope.message_type == MessageType::MlsApplication {
+                let duplicate_delivery = self
+                    .state
+                    .conversations
+                    .get(&conversation_id)
+                    .is_some_and(|state| {
+                        state
+                            .messages
+                            .iter()
+                            .any(|message| message.message_id == record.message_id)
+                    });
+                let mut ackable = duplicate_delivery;
+                if !duplicate_delivery {
+                    match self
+                        .state
+                        .mls_adapter
+                        .as_mut()
+                        .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                        .ingest_message(
+                            &conversation_id,
+                            &record.envelope.sender_device_id,
+                            record.envelope.message_type,
+                            record
+                                .envelope
+                                .inline_ciphertext
+                                .as_deref()
+                                .unwrap_or_default(),
+                        )? {
+                        IngestResult::AppliedApplication(application) => {
+                            log::info!(
+                                "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
+                                redact_id("msg", &record.message_id),
+                                application.plaintext.len()
+                            );
+                            match self.evaluate_direct_application_plaintext(
+                                &record,
+                                &local_user_id,
+                                &device_id,
+                                application,
+                            ) {
+                                ApplicationPlaintextDecision::Accepted {
+                                    plaintext,
+                                    app_message_id,
+                                } => {
+                                    if self.store_accepted_application_message(
+                                        &record,
+                                        plaintext,
+                                        app_message_id,
+                                    )? {
+                                        output.state_update.messages_changed = true;
+                                        output.state_update.conversations_changed = true;
+                                        output
+                                            .view_model
+                                            .get_or_insert_with(CoreViewModel::default)
+                                            .messages
+                                            .push(MessageSummary {
+                                                conversation_id: conversation_id.clone(),
+                                                message_id: record.message_id.clone(),
+                                                message_type: record.envelope.message_type,
+                                            });
+                                    }
+                                    if self.direct_relationship_open_for_record(
+                                        &record.envelope.sender_user_id,
+                                        &conversation_id,
+                                    ) {
+                                        output = merge_outputs(
+                                            output,
+                                            self.promote_pending_outbound_contact(
+                                                &record.envelope.sender_user_id,
+                                                "verified_inbound_mls_application",
+                                            )?,
+                                        );
+                                    }
+                                }
+                                ApplicationPlaintextDecision::DuplicateAppMessage {
+                                    app_message_id,
+                                } => {
+                                    log::info!(
+                                        "handle_inbox_records: acking duplicate protected app message {} for delivery {}",
+                                        redact_id("app", &app_message_id),
+                                        redact_id("msg", &record.message_id)
+                                    );
+                                }
+                                ApplicationPlaintextDecision::RejectedProtocol { reason } => {
+                                    log::warn!(
+                                        "handle_inbox_records: rejecting MLS application delivery {} after open: {}",
+                                        redact_id("msg", &record.message_id),
+                                        reason
+                                    );
+                                }
+                            }
+                            if let Ok(summary) = self
+                                .state
+                                .mls_adapter
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    CoreError::invalid_state("mls adapter is not initialized")
+                                })?
+                                .export_group_summary(&conversation_id)
+                            {
+                                self.state
+                                    .mls_summaries
+                                    .insert(conversation_id.clone(), summary);
+                            }
+                            self.ack_pending_records_for_conversation_up_to(
+                                &device_id,
+                                &conversation_id,
+                                record.seq,
+                                &mut contiguous_ack,
+                                &mut deferred_ackable_seqs,
+                            );
+                            touched_mls_conversation_ids.insert(conversation_id.clone());
+                            touched_recovery_context_ids.insert(conversation_id.clone());
+                            self.clear_recovery_context_as_healthy(&conversation_id);
+                            ackable = true;
+                        }
+                        IngestResult::AppliedCommit { epoch } => {
+                            log::info!(
+                                "handle_inbox_records: unexpected AppliedCommit for application message {} in conversation {}, epoch={}",
+                                record.message_id,
+                                conversation_id,
+                                epoch
+                            );
+                            if let Ok(summary) = self
+                                .state
+                                .mls_adapter
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    CoreError::invalid_state("mls adapter is not initialized")
+                                })?
+                                .export_group_summary(&conversation_id)
+                            {
+                                self.state
+                                    .mls_summaries
+                                    .insert(conversation_id.clone(), summary);
+                            }
+                            self.ack_pending_records_for_conversation_up_to(
+                                &device_id,
+                                &conversation_id,
+                                record.seq,
+                                &mut contiguous_ack,
+                                &mut deferred_ackable_seqs,
+                            );
+                            touched_mls_conversation_ids.insert(conversation_id.clone());
+                            touched_recovery_context_ids.insert(conversation_id.clone());
+                            self.clear_recovery_context_as_healthy(&conversation_id);
+                            ackable = true;
+                        }
+                        IngestResult::AppliedWelcome { epoch } => {
+                            log::info!(
+                                "handle_inbox_records: unexpected AppliedWelcome for application message {} in conversation {}, epoch={}",
+                                record.message_id,
+                                conversation_id,
+                                epoch
+                            );
+                            if let Ok(summary) = self
+                                .state
+                                .mls_adapter
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    CoreError::invalid_state("mls adapter is not initialized")
+                                })?
+                                .export_group_summary(&conversation_id)
+                            {
+                                self.state
+                                    .mls_summaries
+                                    .insert(conversation_id.clone(), summary);
+                            }
+                            self.ack_pending_records_for_conversation_up_to(
+                                &device_id,
+                                &conversation_id,
+                                record.seq,
+                                &mut contiguous_ack,
+                                &mut deferred_ackable_seqs,
+                            );
+                            touched_mls_conversation_ids.insert(conversation_id.clone());
+                            touched_recovery_context_ids.insert(conversation_id.clone());
+                            self.clear_recovery_context_as_healthy(&conversation_id);
+                            output
+                                .effects
+                                .extend(self.rotate_local_key_package_after_welcome()?);
+                            output.state_update.contacts_changed = true;
+                            ackable = true;
+                        }
+                        IngestResult::IgnoredReplay => {
+                            log::warn!(
+                                "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
+                                record.message_id,
+                                conversation_id
+                            );
+                            ackable = true;
+                        }
+                        IngestResult::PendingRetry => {
+                            log::warn!(
+                                "handle_inbox_records: PendingRetry for message {} in conversation {}",
+                                record.message_id,
+                                conversation_id
+                            );
+                            let reason = self.recovery_reason_for_record(&conversation_id);
+                            {
+                                let sync_state = self
+                                    .state
+                                    .sync_states
+                                    .entry(device_id.clone())
+                                    .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                                SyncEngine::store_pending_record(sync_state, &record);
+                            }
+                            self.mark_recovery_needed(&conversation_id, reason);
+                            self.transition_recovery_phase(
+                                &conversation_id,
+                                RecoveryPhase::WaitingForPendingReplay,
+                            );
+                            touched_recovery_context_ids.insert(conversation_id.clone());
+                            pending_recovery_conversations.insert(conversation_id.clone());
+                        }
+                        IngestResult::NeedsRebuild => {
+                            log::warn!(
+                                "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
+                                record.message_id,
+                                conversation_id
+                            );
+                            output = merge_outputs(
+                                output,
+                                self.escalate_conversation_to_rebuild(
+                                    &conversation_id,
+                                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
+                                    "MLS marked conversation unrecoverable",
+                                )?,
+                            );
+                            touched_recovery_context_ids.insert(conversation_id.clone());
+                        }
+                    }
+                }
+                if ackable {
+                    {
+                        let sync_state = self
+                            .state
+                            .sync_states
+                            .entry(device_id.clone())
+                            .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                        SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    }
+                    advance_contiguous_ack(
+                        &mut contiguous_ack,
+                        &mut deferred_ackable_seqs,
+                        record.seq,
+                    );
+                }
+                continue;
+            }
             let apply_effect = {
                 let conversation_state = self
                     .state
@@ -10887,6 +11388,7 @@ impl CoreEngine {
             .unwrap_or_else(|| "peer".into());
 
         let plaintext_cache = pending_item.and_then(|item| item.plaintext_cache.clone());
+        let app_message_id = pending_item.and_then(|item| item.app_message_id.clone());
 
         let envelope = pending_item.map(|item| item.envelope.clone());
 
@@ -10952,9 +11454,16 @@ impl CoreEngine {
                 let conversation_id = env.conversation_id.clone();
                 if let Some(conv) = self.state.conversations.get_mut(&conversation_id) {
                     // Check if message already exists (avoid duplicates)
-                    if !conv.messages.iter().any(|m| m.message_id == message_id) {
+                    let duplicate = conv.messages.iter().any(|m| {
+                        m.message_id == message_id
+                            || app_message_id
+                                .as_deref()
+                                .is_some_and(|app_id| m.app_message_id.as_deref() == Some(app_id))
+                    });
+                    if !duplicate {
                         conv.messages.push(crate::conversation::StoredMessage {
                             message_id: message_id.to_string(),
+                            app_message_id: app_message_id.clone(),
                             sender_user_id: Some(env.sender_user_id.clone()),
                             sender_device_id: env.sender_device_id.clone(),
                             recipient_device_id: env.recipient_device_id.clone(),
@@ -11729,6 +12238,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         state.messages.push(crate::conversation::StoredMessage {
             message_id: record.message_id.clone(),
+            app_message_id: None,
             sender_user_id: Some(record.envelope.sender_user_id.clone()),
             sender_device_id: record.envelope.sender_device_id.clone(),
             recipient_device_id: String::new(),
@@ -13635,6 +14145,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 envelope: item.envelope.clone(),
                 peer_user_id: item.peer_user_id.clone(),
                 retries: item.retries,
+                app_message_id: item.app_message_id.clone(),
                 plaintext_cache: item.plaintext_cache.clone(),
             })
             .collect(),
@@ -13822,6 +14333,242 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
         _ => {}
     }
     base
+}
+
+#[cfg(test)]
+mod protected_application_message_tests {
+    use super::{ApplicationPlaintextDecision, CoreEngine};
+    use crate::conversation::{LocalConversationState, RecoveryStatus, StoredMessage};
+    use crate::mls_adapter::DecryptedApplicationMessage;
+    use crate::model::{
+        Conversation, ConversationKind, ConversationMember, ConversationState, DeliveryClass,
+        DeviceStatusKind, Envelope, InboxRecord, InboxRecordState, MessageType,
+        ProtectedAppMessage, SenderProof, CURRENT_MODEL_VERSION,
+    };
+
+    fn sender_identity(user_id: &str, device_id: &str) -> String {
+        format!("{user_id}|{device_id}|pk|sig")
+    }
+
+    fn sample_record() -> InboxRecord {
+        InboxRecord {
+            seq: 1,
+            recipient_device_id: "device:bob:phone".into(),
+            message_id: "msg:conv:alice:bob:1:device:bob:phone".into(),
+            received_at: 1,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: Envelope {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                message_id: "msg:conv:alice:bob:1:device:bob:phone".into(),
+                conversation_id: "conv:alice:bob".into(),
+                sender_user_id: "user:alice".into(),
+                sender_device_id: "device:alice:phone".into(),
+                recipient_device_id: "device:bob:phone".into(),
+                created_at: 1,
+                message_type: MessageType::MlsApplication,
+                inline_ciphertext: Some("cipher".into()),
+                storage_refs: Vec::new(),
+                delivery_class: DeliveryClass::Normal,
+                wake_hint: None,
+                sender_proof: SenderProof {
+                    proof_type: "signature".into(),
+                    value: "proof".into(),
+                },
+            },
+        }
+    }
+
+    fn protected_plaintext(audience: Vec<String>) -> Vec<u8> {
+        ProtectedAppMessage::new_text(
+            "app:conv:alice:bob:1:device:alice:phone".into(),
+            "conv:alice:bob".into(),
+            "user:alice".into(),
+            "device:alice:phone".into(),
+            "user:bob".into(),
+            audience,
+            "hello protected".into(),
+        )
+        .expect("protected message")
+        .to_json_bytes()
+        .expect("protected bytes")
+    }
+
+    fn decrypted(
+        plaintext: Vec<u8>,
+        user_id: &str,
+        device_id: &str,
+    ) -> DecryptedApplicationMessage {
+        DecryptedApplicationMessage {
+            plaintext,
+            sender_identity: sender_identity(user_id, device_id),
+        }
+    }
+
+    #[test]
+    fn protected_wrapper_accepts_body_and_app_message_id() {
+        let engine = CoreEngine::default();
+        let record = sample_record();
+        let decision = engine.evaluate_direct_application_plaintext(
+            &record,
+            "user:bob",
+            "device:bob:phone",
+            decrypted(
+                protected_plaintext(vec!["device:bob:phone".into()]),
+                "user:alice",
+                "device:alice:phone",
+            ),
+        );
+
+        match decision {
+            ApplicationPlaintextDecision::Accepted {
+                plaintext,
+                app_message_id,
+            } => {
+                assert_eq!(plaintext, "hello protected");
+                assert_eq!(
+                    app_message_id.as_deref(),
+                    Some("app:conv:alice:bob:1:device:alice:phone")
+                );
+            }
+            other => panic!("expected accepted wrapper, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protected_wrapper_rejects_context_mismatch() {
+        let engine = CoreEngine::default();
+        let record = sample_record();
+        let sender_mismatch = engine.evaluate_direct_application_plaintext(
+            &record,
+            "user:bob",
+            "device:bob:phone",
+            decrypted(
+                protected_plaintext(vec!["device:bob:phone".into()]),
+                "user:alice",
+                "device:alice:laptop",
+            ),
+        );
+        assert!(matches!(
+            sender_mismatch,
+            ApplicationPlaintextDecision::RejectedProtocol { .. }
+        ));
+
+        let audience_miss = engine.evaluate_direct_application_plaintext(
+            &record,
+            "user:bob",
+            "device:bob:phone",
+            decrypted(
+                protected_plaintext(vec!["device:bob:laptop".into()]),
+                "user:alice",
+                "device:alice:phone",
+            ),
+        );
+        assert!(matches!(
+            audience_miss,
+            ApplicationPlaintextDecision::RejectedProtocol { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_app_message_id_is_not_accepted_again() {
+        let mut engine = CoreEngine::default();
+        engine.state.conversations.insert(
+            "conv:alice:bob".into(),
+            LocalConversationState {
+                conversation: Conversation {
+                    conversation_id: "conv:alice:bob".into(),
+                    kind: ConversationKind::Direct,
+                    member_users: vec!["user:alice".into(), "user:bob".into()],
+                    member_devices: vec![
+                        ConversationMember {
+                            user_id: "user:alice".into(),
+                            device_id: "device:alice:phone".into(),
+                            status: DeviceStatusKind::Active,
+                        },
+                        ConversationMember {
+                            user_id: "user:bob".into(),
+                            device_id: "device:bob:phone".into(),
+                            status: DeviceStatusKind::Active,
+                        },
+                    ],
+                    state: ConversationState::Active,
+                    updated_at: 1,
+                },
+                messages: vec![StoredMessage {
+                    message_id: "msg:existing".into(),
+                    app_message_id: Some("app:conv:alice:bob:1:device:alice:phone".into()),
+                    sender_user_id: Some("user:alice".into()),
+                    sender_device_id: "device:alice:phone".into(),
+                    recipient_device_id: "device:bob:phone".into(),
+                    message_type: MessageType::MlsApplication,
+                    created_at: 1,
+                    plaintext: Some("hello protected".into()),
+                    storage_refs: Vec::new(),
+                    downloaded_blob_b64: None,
+                }],
+                last_message_type: Some(MessageType::MlsApplication),
+                peer_user_id: "user:alice".into(),
+                last_known_peer_active_devices: Default::default(),
+                recovery_status: RecoveryStatus::Healthy,
+                archive_metadata: None,
+            },
+        );
+
+        let decision = engine.evaluate_direct_application_plaintext(
+            &sample_record(),
+            "user:bob",
+            "device:bob:phone",
+            decrypted(
+                protected_plaintext(vec!["device:bob:phone".into()]),
+                "user:alice",
+                "device:alice:phone",
+            ),
+        );
+        assert!(matches!(
+            decision,
+            ApplicationPlaintextDecision::DuplicateAppMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_plaintext_is_accepted_but_malformed_wrapper_is_rejected() {
+        let engine = CoreEngine::default();
+        let record = sample_record();
+        let legacy = engine.evaluate_direct_application_plaintext(
+            &record,
+            "user:bob",
+            "device:bob:phone",
+            decrypted(b"legacy hello".to_vec(), "user:alice", "device:alice:phone"),
+        );
+        assert!(matches!(
+            legacy,
+            ApplicationPlaintextDecision::Accepted {
+                app_message_id: None,
+                ..
+            }
+        ));
+
+        let malformed = serde_json::json!({
+            "version": CURRENT_MODEL_VERSION,
+            "payload_kind": "text",
+            "body": "do not show"
+        });
+        let malformed = engine.evaluate_direct_application_plaintext(
+            &record,
+            "user:bob",
+            "device:bob:phone",
+            decrypted(
+                malformed.to_string().into_bytes(),
+                "user:alice",
+                "device:alice:phone",
+            ),
+        );
+        assert!(matches!(
+            malformed,
+            ApplicationPlaintextDecision::RejectedProtocol { .. }
+        ));
+    }
 }
 
 #[cfg(test)]

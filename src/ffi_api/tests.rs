@@ -2280,7 +2280,7 @@ mod tests {
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
+                conversation_id: conversation_id.clone(),
                 plaintext: "hello".into(),
             })
             .expect("send");
@@ -2290,6 +2290,24 @@ mod tests {
                 if request.url.contains("/messages")
                     && request.headers.contains_key("X-Tapchat-Capability")
         )));
+        let pending = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::MlsApplication)
+            .expect("pending application delivery");
+        let app_message_id = pending.app_message_id.as_deref().expect("app message id");
+        assert!(app_message_id.starts_with(&format!("app:{conversation_id}:")));
+        assert!(app_message_id.ends_with(&format!(
+            ":{}",
+            alice
+                .local_identity()
+                .expect("local identity")
+                .device_identity
+                .device_id
+        )));
+        assert_eq!(pending.plaintext_cache.as_deref(), Some("hello"));
+        assert_ne!(pending.envelope.message_id, app_message_id);
     }
 
     #[test]
@@ -3709,6 +3727,7 @@ mod tests {
                 },
                 messages: vec![crate::conversation::StoredMessage {
                     message_id: "msg:download".into(),
+                    app_message_id: None,
                     sender_user_id: None,
                     sender_device_id: "device:sender".into(),
                     recipient_device_id: "device:recipient".into(),
@@ -3959,8 +3978,8 @@ mod tests {
             effect,
             CoreEffect::ScheduleTimer { timer } if timer.timer_id == format!("sync:{device_id}")
         )));
-        let delay = scheduled_timer_delay(&output, &format!("sync:{device_id}"))
-            .expect("sync retry timer");
+        let delay =
+            scheduled_timer_delay(&output, &format!("sync:{device_id}")).expect("sync retry timer");
         assert!(delay >= 1_000, "retry delay should be nonzero");
     }
 
@@ -3999,8 +4018,7 @@ mod tests {
                 detail: Some("network".into()),
             })
             .expect("second failure");
-        let second_delay =
-            scheduled_timer_delay(&second_failure, &timer_id).expect("second timer");
+        let second_delay = scheduled_timer_delay(&second_failure, &timer_id).expect("second timer");
 
         assert!(first_delay >= 1_000);
         assert!(second_delay >= 2_000);
@@ -4092,7 +4110,10 @@ mod tests {
             .find(|item| item.envelope.message_id == message_id)
             .expect("pending after startup");
         assert_eq!(pending.retries, 0);
-        assert!(pending.in_flight, "startup should re-flush reset pending message");
+        assert!(
+            pending.in_flight,
+            "startup should re-flush reset pending message"
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::PersistState { persist }
@@ -5596,6 +5617,7 @@ mod tests {
                 },
                 messages: vec![crate::conversation::StoredMessage {
                     message_id: "msg:download".into(),
+                    app_message_id: None,
                     sender_user_id: None,
                     sender_device_id: "device:sender".into(),
                     recipient_device_id: "device:recipient".into(),

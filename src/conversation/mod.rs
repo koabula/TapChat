@@ -20,6 +20,8 @@ impl ConversationModule {
 pub struct StoredMessage {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_user_id: Option<String>,
     pub sender_device_id: String,
     pub recipient_device_id: String,
@@ -257,6 +259,7 @@ impl ConversationManager {
 
         state.messages.push(StoredMessage {
             message_id: envelope.message_id.clone(),
+            app_message_id: None,
             sender_user_id: Some(envelope.sender_user_id.clone()),
             sender_device_id: envelope.sender_device_id.clone(),
             recipient_device_id: envelope.recipient_device_id.clone(),

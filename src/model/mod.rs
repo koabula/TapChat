@@ -249,6 +249,103 @@ pub enum DeliveryClass {
     Normal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectedPayloadKind {
+    Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedAppMessage {
+    pub version: String,
+    pub app_message_id: String,
+    pub conversation_id: String,
+    pub sender_user_id: String,
+    pub sender_device_id: String,
+    pub recipient_user_id: String,
+    pub audience_device_ids: Vec<String>,
+    pub payload_kind: ProtectedPayloadKind,
+    pub body: String,
+}
+
+impl ProtectedAppMessage {
+    pub fn new_text(
+        app_message_id: String,
+        conversation_id: String,
+        sender_user_id: String,
+        sender_device_id: String,
+        recipient_user_id: String,
+        mut audience_device_ids: Vec<String>,
+        body: String,
+    ) -> CoreResult<Self> {
+        audience_device_ids.sort();
+        let message = Self {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            app_message_id,
+            conversation_id,
+            sender_user_id,
+            sender_device_id,
+            recipient_user_id,
+            audience_device_ids,
+            payload_kind: ProtectedPayloadKind::Text,
+            body,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    pub fn to_json_bytes(&self) -> CoreResult<Vec<u8>> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| {
+            CoreError::invalid_input(format!("protected app message serialize failed: {error}"))
+        })
+    }
+
+    pub fn from_json_slice(bytes: &[u8]) -> CoreResult<Self> {
+        let message: Self = serde_json::from_slice(bytes).map_err(|error| {
+            CoreError::invalid_input(format!("protected app message parse failed: {error}"))
+        })?;
+        message.validate()?;
+        Ok(message)
+    }
+}
+
+impl Validate for ProtectedAppMessage {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("app_message_id", &self.app_message_id)?;
+        validate_required("conversation_id", &self.conversation_id)?;
+        validate_required("sender_user_id", &self.sender_user_id)?;
+        validate_required("sender_device_id", &self.sender_device_id)?;
+        validate_required("recipient_user_id", &self.recipient_user_id)?;
+        if self.audience_device_ids.is_empty() {
+            return Err(CoreError::invalid_input(
+                "audience_device_ids must contain at least one device",
+            ));
+        }
+        for device_id in &self.audience_device_ids {
+            validate_required("audience_device_ids", device_id)?;
+        }
+        for pair in self.audience_device_ids.windows(2) {
+            if pair[0] == pair[1] {
+                return Err(CoreError::invalid_input(
+                    "audience_device_ids must not contain duplicates",
+                ));
+            }
+            if pair[0] > pair[1] {
+                return Err(CoreError::invalid_input(
+                    "audience_device_ids must be sorted",
+                ));
+            }
+        }
+        match self.payload_kind {
+            ProtectedPayloadKind::Text => {}
+        }
+        validate_required("body", &self.body)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WakeHint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1545,6 +1642,98 @@ mod tests {
     #[test]
     fn module_name_is_stable() {
         assert_eq!(ModelModule.name(), "model");
+    }
+
+    fn sample_protected_app_message() -> ProtectedAppMessage {
+        ProtectedAppMessage::new_text(
+            "app:conv:alice:bob:7:device:alice:phone".into(),
+            "conv:alice:bob".into(),
+            "user:alice".into(),
+            "device:alice:phone".into(),
+            "user:bob".into(),
+            vec!["device:bob:laptop".into(), "device:bob:phone".into()],
+            "hello bob".into(),
+        )
+        .expect("sample protected app message")
+    }
+
+    #[test]
+    fn protected_app_message_round_trips_json() {
+        let message = sample_protected_app_message();
+        let bytes = message.to_json_bytes().expect("serialize wrapper");
+        let decoded = ProtectedAppMessage::from_json_slice(&bytes).expect("decode wrapper");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn protected_app_message_rejects_unknown_and_missing_fields() {
+        let unknown = serde_json::json!({
+            "version": CURRENT_MODEL_VERSION,
+            "app_message_id": "app:conv:alice:bob:7:device:alice:phone",
+            "conversation_id": "conv:alice:bob",
+            "sender_user_id": "user:alice",
+            "sender_device_id": "device:alice:phone",
+            "recipient_user_id": "user:bob",
+            "audience_device_ids": ["device:bob:laptop", "device:bob:phone"],
+            "payload_kind": "text",
+            "body": "hello bob",
+            "extra": true
+        });
+        assert!(ProtectedAppMessage::from_json_slice(unknown.to_string().as_bytes()).is_err());
+
+        let missing = serde_json::json!({
+            "version": CURRENT_MODEL_VERSION,
+            "conversation_id": "conv:alice:bob",
+            "sender_user_id": "user:alice",
+            "sender_device_id": "device:alice:phone",
+            "recipient_user_id": "user:bob",
+            "audience_device_ids": ["device:bob:laptop", "device:bob:phone"],
+            "payload_kind": "text",
+            "body": "hello bob"
+        });
+        assert!(ProtectedAppMessage::from_json_slice(missing.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn protected_app_message_rejects_invalid_audience() {
+        let empty = serde_json::json!({
+            "version": CURRENT_MODEL_VERSION,
+            "app_message_id": "app:conv:alice:bob:7:device:alice:phone",
+            "conversation_id": "conv:alice:bob",
+            "sender_user_id": "user:alice",
+            "sender_device_id": "device:alice:phone",
+            "recipient_user_id": "user:bob",
+            "audience_device_ids": [],
+            "payload_kind": "text",
+            "body": "hello bob"
+        });
+        assert!(ProtectedAppMessage::from_json_slice(empty.to_string().as_bytes()).is_err());
+
+        let duplicate = serde_json::json!({
+            "version": CURRENT_MODEL_VERSION,
+            "app_message_id": "app:conv:alice:bob:7:device:alice:phone",
+            "conversation_id": "conv:alice:bob",
+            "sender_user_id": "user:alice",
+            "sender_device_id": "device:alice:phone",
+            "recipient_user_id": "user:bob",
+            "audience_device_ids": ["device:bob:phone", "device:bob:phone"],
+            "payload_kind": "text",
+            "body": "hello bob"
+        });
+        assert!(ProtectedAppMessage::from_json_slice(duplicate.to_string().as_bytes()).is_err());
+
+        let unsorted = serde_json::json!({
+            "version": CURRENT_MODEL_VERSION,
+            "app_message_id": "app:conv:alice:bob:7:device:alice:phone",
+            "conversation_id": "conv:alice:bob",
+            "sender_user_id": "user:alice",
+            "sender_device_id": "device:alice:phone",
+            "recipient_user_id": "user:bob",
+            "audience_device_ids": ["device:bob:phone", "device:bob:laptop"],
+            "payload_kind": "text",
+            "body": "hello bob"
+        });
+        assert!(ProtectedAppMessage::from_json_slice(unsorted.to_string().as_bytes()).is_err());
     }
 
     #[test]
