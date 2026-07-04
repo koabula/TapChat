@@ -5772,7 +5772,7 @@ impl CoreEngine {
         self.state
             .conversations
             .iter()
-            .find_map(|(conversation_id, state)| {
+            .filter(|(_, state)| {
                 if state.peer_user_id == peer_user_id
                     && state.conversation.kind == ConversationKind::Direct
                     && matches!(
@@ -5780,11 +5780,65 @@ impl CoreEngine {
                         ConversationState::Active | ConversationState::NeedsRebuild
                     )
                 {
-                    Some((conversation_id.clone(), state))
+                    true
                 } else {
-                    None
+                    false
                 }
             })
+            .max_by_key(|(conversation_id, state)| {
+                self.direct_conversation_selection_rank(conversation_id, state)
+            })
+            .map(|(conversation_id, state)| (conversation_id.clone(), state))
+    }
+
+    fn direct_conversation_selection_rank(
+        &self,
+        conversation_id: &str,
+        state: &LocalConversationState,
+    ) -> (bool, bool, bool, u64, u64) {
+        (
+            state.conversation.state == ConversationState::Active,
+            state.recovery_status == RecoveryStatus::Healthy,
+            self.state.mls_summaries.contains_key(conversation_id),
+            state.conversation.updated_at,
+            Self::direct_relationship_nonce(conversation_id),
+        )
+    }
+
+    fn promoted_conversation_selection_rank(
+        &self,
+        peer_user_id: &str,
+        conversation_id: &str,
+    ) -> (bool, bool, bool, bool, u64, u64, String) {
+        let Some(state) = self.state.conversations.get(conversation_id) else {
+            return (
+                false,
+                false,
+                false,
+                false,
+                0,
+                Self::direct_relationship_nonce(conversation_id),
+                conversation_id.to_string(),
+            );
+        };
+        (
+            state.peer_user_id == peer_user_id
+                && state.conversation.kind == ConversationKind::Direct,
+            state.conversation.state == ConversationState::Active,
+            state.recovery_status == RecoveryStatus::Healthy,
+            self.state.mls_summaries.contains_key(conversation_id),
+            state.conversation.updated_at,
+            Self::direct_relationship_nonce(conversation_id),
+            conversation_id.to_string(),
+        )
+    }
+
+    fn direct_relationship_nonce(conversation_id: &str) -> u64 {
+        conversation_id
+            .split_once(":rel:")
+            .and_then(|(_, suffix)| suffix.split(':').next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
     }
 
     fn direct_conversations_for_peer(&self, peer_user_id: &str) -> Vec<String> {
@@ -8189,7 +8243,18 @@ impl CoreEngine {
         conversation_ids.sort();
         conversation_ids.dedup();
         if !conversation_ids.is_empty() {
-            return Ok(conversation_ids);
+            if conversation_ids.len() > 1 {
+                log::warn!(
+                    "contact accept completed for {} with multiple promoted direct conversation ids; selecting one and ignoring superseded ids",
+                    peer_user_id
+                );
+            }
+            conversation_ids.sort_by_key(|conversation_id| {
+                self.promoted_conversation_selection_rank(peer_user_id, conversation_id)
+            });
+            if let Some(conversation_id) = conversation_ids.pop() {
+                return Ok(vec![conversation_id]);
+            }
         }
 
         if let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id) {

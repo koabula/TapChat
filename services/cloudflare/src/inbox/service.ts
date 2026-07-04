@@ -238,12 +238,26 @@ export class InboxService {
       now
     );
 
+    const requestsToPromote = this.messageRequestsToPromote(entry);
+    const promotedMessageIds = new Set(
+      requestsToPromote.map((request) => request.envelope.messageId)
+    );
+    for (const request of entry.pendingRequests) {
+      if (promotedMessageIds.has(request.envelope.messageId)) {
+        continue;
+      }
+      await this.state.put(
+        `${APPEND_RESULT_PREFIX}${request.envelope.messageId}`,
+        this.supersededMessageRequestResult()
+      );
+    }
+
     let promotedCount = 0;
     const promotedConversationIds = new Set<string>();
-    for (const request of entry.pendingRequests) {
+    for (const request of requestsToPromote) {
       const delivered = await this.deliverEnvelope(request, now);
       await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
-      if (delivered.seq !== undefined) {
+      if (delivered.deliveredTo === "inbox") {
         promotedCount += 1;
         promotedConversationIds.add(request.envelope.conversationId);
       }
@@ -413,6 +427,30 @@ export class InboxService {
       deliveredTo: "message_request",
       queuedAsRequest: true,
       requestId
+    };
+  }
+
+  private messageRequestsToPromote(entry: MessageRequestEntry): AppendEnvelopeRequest[] {
+    if (this.groupInviteMetadata(entry)) {
+      return entry.pendingRequests;
+    }
+    const latestConversationId =
+      entry.lastConversationId ||
+      entry.pendingRequests[entry.pendingRequests.length - 1]?.envelope.conversationId;
+    if (!latestConversationId) {
+      return [];
+    }
+    return entry.pendingRequests.filter(
+      (request) => request.envelope.conversationId === latestConversationId
+    );
+  }
+
+  private supersededMessageRequestResult(): AppendEnvelopeResult {
+    return {
+      accepted: true,
+      seq: 0,
+      deliveredTo: "rejected",
+      queuedAsRequest: false
     };
   }
 

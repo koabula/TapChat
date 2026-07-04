@@ -1,3 +1,4 @@
+use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
 use tapchat_core::model::{ConversationKind, ConversationState};
 use tapchat_core::persistence::ContactRelationshipStatus;
@@ -123,36 +124,29 @@ pub async fn act_on_message_request(
                     contact.user_id == sender_user_id
                         && contact.relationship_status == ContactRelationshipStatus::Available
                 });
-                let conversation_id =
-                    snapshot
-                        .conversations
-                        .iter()
-                        .filter(|conversation| {
-                            conversation.state.peer_user_id == sender_user_id
-                                && conversation.state.conversation.kind == ConversationKind::Direct
-                                && snapshot.mls_states.iter().any(|state| {
-                                    state.conversation_id == conversation.conversation_id
-                                })
-                                && !matches!(
-                                    conversation.state.conversation.state,
-                                    ConversationState::Archived
-                                        | ConversationState::Closed
-                                        | ConversationState::Dissolved
-                                )
-                        })
-                        .max_by_key(|conversation| {
-                            (
-                                matches!(
-                                    conversation.state.conversation.state,
-                                    ConversationState::Active
-                                ),
-                                snapshot.mls_states.iter().any(|state| {
-                                    state.conversation_id == conversation.conversation_id
-                                }),
-                                conversation.state.conversation.updated_at,
+                let conversation_id = snapshot
+                    .conversations
+                    .iter()
+                    .filter(|conversation| {
+                        conversation.state.peer_user_id == sender_user_id
+                            && conversation.state.conversation.kind == ConversationKind::Direct
+                            && conversation.state.recovery_status == RecoveryStatus::Healthy
+                            && matches!(
+                                conversation.state.conversation.state,
+                                ConversationState::Active
                             )
-                        })
-                        .map(|conversation| conversation.conversation_id.clone());
+                            && snapshot
+                                .mls_states
+                                .iter()
+                                .any(|state| state.conversation_id == conversation.conversation_id)
+                    })
+                    .max_by_key(|conversation| {
+                        (
+                            conversation.state.recovery_status == RecoveryStatus::Healthy,
+                            conversation.state.conversation.updated_at,
+                        )
+                    })
+                    .map(|conversation| conversation.conversation_id.clone());
                 (contact_available, conversation_id)
             };
 

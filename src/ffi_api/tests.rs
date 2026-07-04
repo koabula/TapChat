@@ -2834,6 +2834,91 @@ mod tests {
     }
 
     #[test]
+    fn accept_with_multiple_promoted_direct_conversations_sends_one_control() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+
+        let mut result =
+            accepted_request_result(&bob_bundle.user_id, "conv:user:alice:user:bob:rel:1");
+        result.promoted_count = 2;
+        result.promoted_conversation_ids = vec![
+            "conv:user:alice:user:bob:rel:1".into(),
+            "conv:user:alice:user:bob:rel:2".into(),
+        ];
+        alice
+            .handle_event(CoreEvent::MessageRequestActionCompleted { result })
+            .expect("accept with multiple promoted ids");
+
+        let accepted_envelopes = alice
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
+            .collect::<Vec<_>>();
+        assert_eq!(accepted_envelopes.len(), 1);
+        let payload_b64 = accepted_envelopes[0]
+            .envelope
+            .inline_ciphertext
+            .as_deref()
+            .expect("accepted payload");
+        let payload = STANDARD.decode(payload_b64).expect("payload base64");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("accepted payload json");
+        assert_eq!(payload["conversation_id"], "conv:user:alice:user:bob:rel:2");
+    }
+
+    #[test]
+    fn create_direct_conversation_prefers_healthy_mls_conversation_for_peer() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let healthy_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let mut stale = alice
+            .state
+            .conversations
+            .get(&healthy_id)
+            .expect("healthy conversation")
+            .clone();
+        let stale_id = "conv:000-stale-direct".to_string();
+        stale.conversation.conversation_id = stale_id.clone();
+        stale.conversation.updated_at = stale.conversation.updated_at.saturating_add(10_000);
+        stale.recovery_status = RecoveryStatus::NeedsRecovery;
+        alice.state.conversations.insert(stale_id, stale);
+
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("reuse best direct conversation");
+
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .conversations[0]
+                .conversation_id,
+            healthy_id
+        );
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .conversations[0]
+                .state,
+            "active"
+        );
+        assert!(output.effects.is_empty());
+    }
+
+    #[test]
     fn direct_shell_without_mls_state_is_recovery_only_and_blocks_send() {
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
@@ -2911,6 +2996,127 @@ mod tests {
             })
             .expect_err("missing mls state blocks send");
         assert_eq!(send_err.code(), "temporary_failure");
+    }
+
+    #[test]
+    fn pending_retry_clears_after_later_welcome_applies() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let commit = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            })
+            .expect("setup commit")
+            .envelope
+            .clone();
+        let welcome = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::MlsWelcome
+            })
+            .expect("setup welcome")
+            .envelope
+            .clone();
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 1,
+            records: vec![InboxRecord {
+                seq: 1,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: commit.message_id.clone(),
+                received_at: 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: commit.clone(),
+            }],
+        })
+        .expect("commit pending retry");
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("direct shell")
+                .recovery_status,
+            RecoveryStatus::NeedsRecovery
+        );
+        bob.state
+            .sync_states
+            .get_mut(&bob_device_id)
+            .expect("sync state")
+            .pending_records
+            .insert(
+                1,
+                InboxRecord {
+                    seq: 1,
+                    recipient_device_id: bob_device_id.clone(),
+                    message_id: commit.message_id.clone(),
+                    received_at: 1,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: commit,
+                },
+            );
+        {
+            let sync_state = bob
+                .state
+                .sync_states
+                .get_mut(&bob_device_id)
+                .expect("sync state");
+            sync_state.pending_record_seqs.insert(1);
+            sync_state.pending_retry = true;
+        }
+        assert!(bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state")
+            .pending_records
+            .contains_key(&1));
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 2,
+            records: vec![InboxRecord {
+                seq: 2,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: welcome.message_id.clone(),
+                received_at: 2,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: welcome,
+            }],
+        })
+        .expect("welcome applies");
+
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("direct conversation")
+                .recovery_status,
+            RecoveryStatus::Healthy
+        );
+        assert!(!bob.state.recovery_contexts.contains_key(&conversation_id));
+        let sync_state = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state");
+        assert!(!sync_state.pending_records.contains_key(&1));
+        assert!(!sync_state.pending_record_seqs.contains(&1));
+        assert!(!sync_state.pending_retry);
     }
 
     #[test]

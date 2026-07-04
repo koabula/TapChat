@@ -82,4 +82,44 @@ describe("conversation store snapshot merging", () => {
 
     expect(useConversationsStore.getState().conversations[0].display_name).toBeNull();
   });
+
+  test("authoritative conversation snapshot clears stale recovery diagnostics", () => {
+    useConversationsStore.getState().setConversations(
+      [
+        {
+          ...baseConversation("bob"),
+          peer_user_id: "user:bob",
+          recovery: {
+            conversation_id: "bob",
+            recovery_status: "needs_recovery",
+            reason: "missing_welcome",
+            phase: "waiting_for_sync",
+            attempt_count: 1,
+            identity_refresh_retry_count: 0,
+            pending_record_count: 1,
+            pending_record_seqs: [1],
+            last_fetched_seq: 1,
+            last_acked_seq: 0,
+          },
+        },
+      ],
+      { replace: true },
+    );
+
+    useConversationsStore.getState().mergeConversationSnapshot(
+      [
+        {
+          conversation_id: "bob",
+          peer_user_id: "user:bob",
+          state: "active",
+          kind: "direct",
+          message_count: 0,
+        },
+      ],
+      [{ user_id: "user:bob", display_name: "Bob" }],
+      { replace: true },
+    );
+
+    expect(useConversationsStore.getState().conversations[0].recovery).toBeNull();
+  });
 });

@@ -966,6 +966,58 @@ test("message requests stay out of inbox until accepted and reject blocks future
   });
 });
 
+test("direct message request accept promotes only the latest conversation group", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const token = bundle.deviceRuntimeAuth!.token;
+
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-commit", "conv:alice:bob:rel:1"));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-welcome", "conv:alice:bob:rel:1"));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:new-commit", "conv:alice:bob:rel:2"));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:new-welcome", "conv:alice:bob:rel:2"));
+
+  const list = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/message-requests", { headers: authHeaders(token) }),
+    env
+  );
+  const requests = (await list.json()) as MessageRequestListResult & { version: string };
+  assert.equal(requests.requests.length, 1);
+  assert.equal(requests.requests[0].lastConversationId, "conv:alice:bob:rel:2");
+  assert.equal(requests.requests[0].messageCount, 4);
+
+  const accept = await handleRequest(
+    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`, {
+      method: "POST",
+      headers: authHeaders(token)
+    }),
+    env
+  );
+  assert.equal(accept.status, 200);
+  const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
+  assert.equal(acceptResult.promotedCount, 2);
+  assert.deepEqual(acceptResult.promotedConversationIds, ["conv:alice:bob:rel:2"]);
+
+  const accepted = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
+    env
+  );
+  const fetched = (await accepted.json()) as { records: Array<{ messageId: string; envelope: { conversationId: string } }> };
+  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:new-commit", "msg:new-welcome"]);
+  assert.deepEqual(
+    fetched.records.map((record) => record.envelope.conversationId),
+    ["conv:alice:bob:rel:2", "conv:alice:bob:rel:2"]
+  );
+
+  const oldRetry = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-commit", "conv:alice:bob:rel:1"));
+  assert.deepEqual(await oldRetry.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 0,
+    deliveredTo: "rejected",
+    queuedAsRequest: false
+  });
+});
+
 test("requires device runtime auth for head, fetch, ack, subscribe, and manage routes", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);

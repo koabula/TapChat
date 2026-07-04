@@ -155,7 +155,7 @@ function mergeConversationState(
       member_count: conversation.member_count ?? prior?.member_count ?? null,
       group_role: conversation.group_role ?? prior?.group_role ?? null,
       group_cursor: conversation.group_cursor ?? prior?.group_cursor ?? null,
-      recovery: conversation.recovery ?? prior?.recovery ?? null,
+      recovery: conversation.recovery ?? null,
       dissolved_at: conversation.dissolved_at ?? prior?.dissolved_at ?? null,
     };
   });
