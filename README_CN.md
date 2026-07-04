@@ -40,8 +40,11 @@ TapChat 当前提供基于 Cloudflare Workers、Durable Objects、WebSocket 和 
 | 范围 | 状态 |
 | --- | --- |
 | 可用于 alpha 试用 | 桌面端、私聊、Cloudflare 参考传输层、附件、WebSocket 同步 |
-| 实验中 | 群聊、多设备群聊语义、恢复流程硬化 |
+| 已可试用但可能不稳定 | 群聊 |
+| 开发中 | 多设备支持、备份与恢复 |
 | 尚未完成 | 移动端 wakeup bridge、外部安全审计、生产规模部署指南 |
+
+群聊功能已经可以进行早期试用，但仍可能存在 bug。多设备支持和备份/恢复功能正在开发中，尚未加入当前 release。
 
 ## 试用桌面端 alpha
 

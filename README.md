@@ -40,8 +40,11 @@ TapChat currently ships a Cloudflare reference transport using Workers, Durable 
 | Area | Status |
 | --- | --- |
 | Ready for alpha testing | Desktop app, direct messaging, Cloudflare reference transport, attachments, WebSocket sync |
-| Experimental | Group chat, multi-device group semantics, recovery hardening |
+| Available but unstable | Group chat |
+| In development | Multi-device support, backup and recovery |
 | Not yet | Mobile wakeup bridge, external security audit, production-scale deployment guidance |
+
+Group chat is available for early testing, but it may still have bugs. Multi-device support and backup/recovery are under active development and are not included in the current release yet.
 
 ## Try the desktop alpha
 
