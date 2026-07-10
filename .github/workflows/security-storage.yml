@@ -1,16 +1,13 @@
 name: Security Storage
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_call:
 
 env:
   RUST_MIN_STACK: "67108864"
 
 jobs:
   cargo-security-storage:
-    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'release:') }}
     name: cargo test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:

@@ -18,6 +18,9 @@ env:
   RUST_MIN_STACK: 67108864
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
   validate:
     runs-on: ubuntu-latest
     outputs:
@@ -108,7 +111,7 @@ jobs:
           fi
 
   build:
-    needs: validate
+    needs: [quality, validate]
     strategy:
       fail-fast: false
       matrix:
