@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use crate::model::{
     Ack, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupInviteDocument,
-    GroupJoinRequest, GroupManifest, GroupOutboxRecord, IdentityBundle, InboxRecord,
+    GroupJoinRequest, GroupLeaveRequest, GroupManifest, GroupOutboxRecord,
+    GroupTransitionOperation, GroupTransitionRequestBinding, IdentityBundle, InboxRecord,
     WelcomePickupDescriptor,
 };
 
@@ -107,6 +108,12 @@ pub struct AppendGroupEnvelopeRequest {
     pub capability: GroupCapability,
     #[serde(
         default,
+        alias = "authorization_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub authorization_update: Option<GroupAuthorizationUpdate>,
+    #[serde(
+        default,
         alias = "expected_previous_roster_version",
         skip_serializing_if = "Option::is_none"
     )]
@@ -120,9 +127,84 @@ pub struct AppendGroupEnvelopeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupAuthorizationUpdate {
+    pub manifest: GroupManifest,
+    pub identity_bundles: Vec<IdentityBundle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitializeGroupAuthorizationRequest {
+    pub version: String,
+    pub group_id: String,
+    pub manifest: GroupManifest,
+    pub identity_bundles: Vec<IdentityBundle>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitializeGroupAuthorizationResult {
+    pub initialized: bool,
+    pub already_initialized: bool,
+    pub roster_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendGroupEnvelopeResult {
     pub accepted: bool,
     pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendGroupTransitionRequest {
+    pub version: String,
+    pub group_id: String,
+    pub transition_id: String,
+    pub operation: GroupTransitionOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_binding: Option<GroupTransitionRequestBinding>,
+    pub expected_previous_roster_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_previous_commit_message_id: Option<String>,
+    pub envelopes: Vec<GroupEnvelope>,
+    pub authorization_update: GroupAuthorizationUpdate,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendGroupTransitionResult {
+    pub accepted: bool,
+    pub transition_id: String,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    pub roster_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_commit_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetGroupAuthorizationStateRequest {
+    pub group_id: String,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetGroupAuthorizationStateResult {
+    pub manifest: GroupManifest,
+    pub manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_id: Option<String>,
+    pub phase: GroupAuthorizationPhase,
+    pub materialized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupAuthorizationPhase {
+    Provisioning,
+    Active,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +335,39 @@ pub struct CreateGroupInviteResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupInviteStatus {
+    Active,
+    Revoked,
+    Expired,
+    Exhausted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInviteSummary {
+    pub invite_url: String,
+    pub invite: GroupInviteDocument,
+    pub status: GroupInviteStatus,
+    pub uses: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListGroupInvitesRequest {
+    pub group_id: String,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListGroupInvitesResult {
+    pub revision: u64,
+    pub invites: Vec<GroupInviteSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokeGroupInviteRequest {
     pub version: String,
     pub group_id: String,
@@ -362,6 +477,82 @@ pub struct DecideGroupJoinRequest {
 pub struct DecideGroupJoinResult {
     pub accepted: bool,
     pub request: GroupJoinRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimGroupJoinRequest {
+    pub version: String,
+    pub group_id: String,
+    pub request_id: String,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimGroupJoinResult {
+    pub accepted: bool,
+    pub request: GroupJoinRequest,
+    pub lease_token: String,
+    pub lease_expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteGroupJoinRequest {
+    pub version: String,
+    pub group_id: String,
+    pub request_id: String,
+    pub capability: GroupCapability,
+    pub lease_token: String,
+    pub transition_id: String,
+    pub welcome_pickup: WelcomePickupDescriptor,
+    pub manifest: GroupManifest,
+    pub start_cursor: GroupCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompleteGroupJoinResult {
+    pub accepted: bool,
+    pub request: GroupJoinRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitGroupLeaveRequest {
+    pub version: String,
+    pub group_id: String,
+    pub request: GroupLeaveRequest,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmitGroupLeaveResult {
+    pub accepted: bool,
+    pub request: GroupLeaveRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListGroupLeaveRequestsRequest {
+    pub group_id: String,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListGroupLeaveRequestsResult {
+    pub requests: Vec<GroupLeaveRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimGroupLeaveRequest {
+    pub version: String,
+    pub group_id: String,
+    pub request_id: String,
+    pub capability: GroupCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimGroupLeaveResult {
+    pub accepted: bool,
+    pub request: GroupLeaveRequest,
+    pub lease_token: String,
+    pub lease_expires_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,6 +871,7 @@ mod tests {
             group_id: "group:project".into(),
             envelope: sample_group_envelope(),
             capability: sample_group_capability(),
+            authorization_update: None,
             expected_previous_roster_version: None,
             expected_previous_commit_message_id: None,
         };
@@ -712,6 +904,10 @@ mod tests {
                 endpoint: "https://example.com/welcome/group%3Aproject/device%3Abob%3Aphone".into(),
                 capability: "cap:welcome:1".into(),
                 expires_at: 99,
+                start_seq: None,
+                roster_version: None,
+                last_commit_message_id: None,
+                request_id: None,
             },
             welcome_b64: "d2VsY29tZQ==".into(),
             manifest: None,
@@ -767,9 +963,11 @@ mod tests {
                 previous_commit_message_id: None,
                 commit_message_id: "msg:commit:1".into(),
                 control_message_id: "msg:control:1".into(),
+                state_event_message_id: None,
                 new_manifest_sha256: "sha256:abc".into(),
                 signature: "member-proof".into(),
             }),
+            transition_id: None,
         }
     }
 

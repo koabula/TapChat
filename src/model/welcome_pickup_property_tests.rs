@@ -128,6 +128,10 @@ prop_compose! {
             endpoint,
             capability,
             expires_at,
+            start_seq: None,
+            roster_version: None,
+            last_commit_message_id: None,
+            request_id: None,
         }
     }
 }

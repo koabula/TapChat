@@ -265,6 +265,10 @@ mod tests {
             endpoint: "https://example.test/welcome".into(),
             capability: "cap".into(),
             expires_at: 999,
+            start_seq: None,
+            roster_version: None,
+            last_commit_message_id: None,
+            request_id: None,
         };
         engine.state.pending_welcome_pickups.insert(
             "group:pending::device:alice:phone".into(),
@@ -298,6 +302,10 @@ mod tests {
             endpoint: "https://example.test/welcome".into(),
             capability: "cap".into(),
             expires_at: 999,
+            start_seq: None,
+            roster_version: None,
+            last_commit_message_id: None,
+            request_id: None,
         };
         let key = "group:pending::device:alice:phone".to_string();
         engine.state.pending_welcome_pickups.insert(
@@ -554,17 +562,32 @@ mod tests {
             .expect("group summary");
         assert_eq!(summary.kind, Some(ConversationKind::Group));
         assert_eq!(summary.title.as_deref(), Some("Project"));
-        assert_eq!(summary.member_count, Some(3));
-        assert!(output.effects.iter().any(|effect| matches!(
+        assert_eq!(
+            summary.member_count,
+            Some(1),
+            "provisional genesis exposes only the owner before transition ACK"
+        );
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::InitializeGroupAuthorization { .. })));
+        let transition_output = alice
+            .handle_event(CoreEvent::GroupAuthorizationInitialized {
+                group_id: summary.group_id.clone().expect("group id"),
+                roster_version: 0,
+            })
+            .expect("bootstrap ack");
+        assert!(transition_output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::AppendGroupEnvelope { append }
-                if append.envelope.message_type == crate::model::GroupMessageType::MlsCommit
+            CoreEffect::AppendGroupTransition { append }
+                if append.envelopes.iter().any(|envelope|
+                    envelope.message_type == crate::model::GroupMessageType::MlsCommit)
         )));
-        let owner_operations = output
+        let owner_operations = transition_output
             .effects
             .iter()
             .find_map(|effect| match effect {
-                CoreEffect::AppendGroupEnvelope { append } => {
+                CoreEffect::AppendGroupTransition { append } => {
                     Some(append.capability.operations.clone())
                 }
                 _ => None,
@@ -591,6 +614,28 @@ mod tests {
                 .iter()
                 .filter(|effect| matches!(effect, CoreEffect::PutWelcomePickup { .. }))
                 .count(),
+            0,
+            "welcomes must not publish until the atomic transition is acknowledged"
+        );
+        let transition_ack = acknowledge_pending_group_transition(
+            &mut alice,
+            &summary.group_id.clone().expect("group id"),
+        );
+        assert_eq!(
+            alice.state.group_states[summary.group_id.as_deref().expect("group id")]
+                .manifest
+                .members
+                .iter()
+                .filter(|member| member.status == GroupMemberStatus::Active)
+                .count(),
+            3
+        );
+        assert_eq!(
+            transition_ack
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, CoreEffect::PutWelcomePickup { .. }))
+                .count(),
             2
         );
         assert_eq!(
@@ -601,6 +646,140 @@ mod tests {
                 .filter(|item| item.envelope.message_type == MessageType::ControlGroupWelcomePickup)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn group_creation_fails_closed_without_group_authorization_v2() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .state
+            .deployment_bundle
+            .as_mut()
+            .expect("deployment")
+            .runtime_config
+            .features
+            .retain(|feature| feature != "group_authorization_v2");
+
+        let error = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Blocked".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect_err("legacy runtime must not create a group");
+        assert_eq!(error.code(), "invalid_state");
+        assert!(error.message().contains("group_authorization_v2"));
+        assert!(alice.state.group_states.is_empty());
+    }
+
+    #[test]
+    fn transition_conflict_preserves_intent_for_reconciliation() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Conflict".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+        let roster = alice.state.group_states[&group_id].manifest.roster_version;
+        alice
+            .handle_event(CoreEvent::GroupAuthorizationInitialized {
+                group_id: group_id.clone(),
+                roster_version: roster,
+            })
+            .expect("bootstrap ack");
+        let transition_id = alice.state.group_states[&group_id]
+            .pending_group_transition
+            .as_ref()
+            .expect("pending transition")
+            .transition_id
+            .clone();
+        alice
+            .handle_event(CoreEvent::GroupTransitionAppendFailed {
+                group_id: group_id.clone(),
+                transition_id,
+                retryable: false,
+                status: Some(409),
+                code: Some("group_transition_conflict".into()),
+                detail: None,
+            })
+            .expect("conflict enters reconciliation");
+        let state = &alice.state.group_states[&group_id];
+        assert_eq!(
+            state.consistency_state,
+            crate::persistence::GroupConsistencyState::Reconciling
+        );
+        let pending = state
+            .pending_group_transition
+            .as_ref()
+            .expect("intent must be preserved");
+        assert_eq!(
+            pending.stage,
+            crate::persistence::PendingGroupTransitionStage::ReconcilingAfterConflict
+        );
+        assert!(matches!(
+            pending.intent.operation(),
+            Some(crate::model::GroupTransitionOperation::Create)
+        ));
+    }
+
+    #[test]
+    fn leave_request_does_not_mutate_canonical_membership() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Leave".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .and_then(|summary| summary.group_id.clone())
+            .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        let local_user_id = alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("local identity")
+            .user_identity
+            .user_id
+            .clone();
+        let state = alice.state.group_states.get_mut(&group_id).expect("group");
+        state.local_role = Some(GroupRole::Member);
+        state.manifest.owner_user_id = bob_bundle.user_id;
+        for member in &mut state.manifest.members {
+            member.role = if member.user_id == local_user_id {
+                GroupRole::Member
+            } else {
+                GroupRole::Owner
+            };
+        }
+        let before = alice.state.group_states[&group_id].manifest.clone();
+        let leave = alice
+            .handle_command(CoreCommand::LeaveGroup {
+                group_id: group_id.clone(),
+            })
+            .expect("submit leave request");
+        assert!(leave
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::SubmitGroupLeaveRequest { .. })));
+        assert_eq!(alice.state.group_states[&group_id].manifest, before);
+        assert_eq!(
+            alice.state.group_states[&group_id].local_role,
+            Some(GroupRole::Member)
         );
     }
 
@@ -621,6 +800,7 @@ mod tests {
             .expect("group summary");
         let group_id = summary.group_id.clone().expect("group id");
         let conversation_id = summary.conversation_id.clone();
+        acknowledge_pending_group_transition(&mut alice, &group_id);
 
         let group_state = alice
             .state
@@ -669,6 +849,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .expect("group summary");
         let group_id = summary.group_id.clone().expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
 
         // Simulate alice losing ownership by demoting her local role to
         // Member — the core's `local_group_role` gate must refuse Dissolve
@@ -736,6 +917,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
 
         // Drain the initial-create commit from the pending queue so the
         // dissolve flow observes a clean baseline. We do not need the MLS
@@ -828,6 +1010,13 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        alice
+            .handle_command(CoreCommand::SendGroupTextMessage {
+                conversation_id: alice.state.group_states[&group_id].conversation_id.clone(),
+                plaintext: "preexisting".into(),
+            })
+            .expect("stage preexisting group message");
 
         let preexisting_pending: Vec<String> = alice
             .state
@@ -917,6 +1106,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
 
         alice.state.pending_group_outbox.clear();
         alice
@@ -991,6 +1181,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
         alice.state.pending_group_outbox.clear();
         let local_bundle = alice.local_bundle().expect("local bundle");
         let capability = GroupCapability {
@@ -1046,6 +1237,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
         alice.state.pending_group_outbox.clear();
 
         alice
@@ -1144,6 +1336,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
         alice.state.pending_group_outbox.clear();
         alice
             .handle_command(CoreCommand::DissolveGroup {
@@ -1783,7 +1976,7 @@ mod tests {
             })
             .expect("dissolve");
         assert!(dissolve.effects.iter().any(|effect| {
-            matches!(effect, CoreEffect::AppendGroupEnvelope { append } if append.group_id == group_id)
+            matches!(effect, CoreEffect::AppendGroupTransition { append } if append.group_id == group_id)
         }));
         assert!(alice
             .engine
@@ -1920,13 +2113,9 @@ mod tests {
             .expect("owner removes carol");
         assert!(remove_output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::AppendGroupEnvelope { append }
-                if append.envelope.message_type == GroupMessageType::MlsCommit
-        )));
-        assert!(remove_output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::AppendGroupEnvelope { append }
-                if append.envelope.message_type == GroupMessageType::ControlGroupMembershipChanged
+            CoreEffect::AppendGroupTransition { append }
+                if append.envelopes.iter().any(|envelope| envelope.message_type == GroupMessageType::MlsCommit)
+                    && append.envelopes.iter().any(|envelope| envelope.message_type == GroupMessageType::ControlGroupMembershipChanged)
         )));
         harness.drain(&mut alice, remove_output);
         harness.sync_group(&mut bob, &group_id);
@@ -2012,6 +2201,25 @@ mod tests {
             })
             .expect("bob leaves");
         harness.drain(&mut bob, bob_leave);
+        assert_eq!(
+            bob.engine
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("bob group")
+                .local_role,
+            Some(GroupRole::Member),
+            "submitting a leave request must not mutate canonical membership"
+        );
+        let leave_request_id = harness
+            .leave_requests
+            .values()
+            .find(|request| request.leaver_user_id == bob.bundle.user_id)
+            .map(|request| request.request_id.clone())
+            .expect("bob leave request");
+        harness.list_leave_requests(&mut alice, &group_id);
+        harness.approve_leave(&mut alice, &group_id, &leave_request_id);
+        harness.sync_group(&mut bob, &group_id);
         let bob_state = bob
             .engine
             .state
@@ -2019,9 +2227,12 @@ mod tests {
             .get(&group_id)
             .expect("bob group");
         assert_eq!(bob_state.local_role, None);
-        assert!(bob_state.manifest.members.iter().any(|member| {
-            member.user_id == bob.bundle.user_id && member.status == GroupMemberStatus::Left
-        }));
+        assert_eq!(
+            bob.engine.state.conversations[&conversation_id]
+                .conversation
+                .state,
+            ConversationState::Closed
+        );
         assert!(
             bob.engine
                 .handle_command(CoreCommand::SendGroupTextMessage {
@@ -2040,19 +2251,13 @@ mod tests {
                 .is_err(),
             "left member must not send group attachments"
         );
-        harness.sync_group(&mut alice, &group_id);
-        assert!(
-            alice
-                .engine
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("alice conversation")
-                .messages
-                .iter()
-                .any(|message| message.message_type == MessageType::ControlDeviceMembershipChanged),
-            "owner should receive the visible leave request"
-        );
+        assert!(!alice.engine.state.group_states[&group_id]
+            .manifest
+            .members
+            .iter()
+            .any(|member| {
+                member.user_id == bob.bundle.user_id && member.status == GroupMemberStatus::Active
+            }));
 
         assert!(
             carol
@@ -2162,20 +2367,27 @@ mod tests {
                 .is_err(),
             "former owner must not perform owner-only admin changes"
         );
-        assert!(
-            owner
-                .engine
-                .handle_command(CoreCommand::LeaveGroup {
-                    group_id: transfer_group_id.clone(),
-                })
-                .is_ok(),
-            "former owner can leave after transfer"
-        );
+        let former_owner_leave = owner
+            .engine
+            .handle_command(CoreCommand::LeaveGroup {
+                group_id: transfer_group_id.clone(),
+            })
+            .expect("former owner can request leave after transfer");
+        transfer_harness.drain(&mut owner, former_owner_leave);
+        let leave_request_id = transfer_harness
+            .leave_requests
+            .values()
+            .find(|request| request.leaver_user_id == owner.bundle.user_id)
+            .map(|request| request.request_id.clone())
+            .expect("former owner leave request");
+        transfer_harness.list_leave_requests(&mut successor, &transfer_group_id);
+        transfer_harness.approve_leave(&mut successor, &transfer_group_id, &leave_request_id);
+        transfer_harness.sync_group(&mut owner, &transfer_group_id);
         assert!(
             successor
                 .engine
                 .handle_command(CoreCommand::DissolveGroup {
-                    group_id: transfer_group_id
+                    group_id: transfer_group_id.clone()
                 })
                 .is_ok(),
             "new owner can perform owner-only dissolve"
@@ -2220,7 +2432,7 @@ mod tests {
         let request_id = harness.submit_join(&mut dana, &invite_url);
         assert_eq!(
             harness.join_requests[&request_id].status,
-            GroupJoinRequestStatus::Pending
+            GroupJoinRequestStatus::PendingApproval
         );
         assert!(!harness.join_decisions.contains_key(&request_id));
 
@@ -2240,7 +2452,10 @@ mod tests {
             .join_decisions
             .get(&request_id)
             .expect("approval decision");
-        assert_eq!(decision.request.status, GroupJoinRequestStatus::Approved);
+        assert_eq!(
+            decision.request.status,
+            GroupJoinRequestStatus::WelcomeAvailable
+        );
         assert!(decision.welcome_pickup.is_some());
         assert!(decision.manifest.is_some());
         assert!(decision.start_cursor.is_some());
@@ -6744,15 +6959,24 @@ mod tests {
     #[derive(Debug, Default)]
     struct GroupHarness {
         outboxes: BTreeMap<String, Vec<GroupOutboxRecord>>,
-        welcome_pickups: BTreeMap<(String, String), (String, Option<crate::model::GroupManifest>)>,
+        welcome_pickups: BTreeMap<
+            (String, String),
+            (
+                WelcomePickupDescriptor,
+                String,
+                Option<crate::model::GroupManifest>,
+            ),
+        >,
         prepared_blob_downloads: BTreeMap<String, String>,
         blobs: BTreeMap<String, String>,
         downloaded_attachments: BTreeMap<String, Vec<u8>>,
         invites: BTreeMap<String, GroupInviteDocument>,
         invite_urls: BTreeMap<String, String>,
         join_requests: BTreeMap<String, GroupJoinRequest>,
+        leave_requests: BTreeMap<String, crate::model::GroupLeaveRequest>,
         join_decisions: BTreeMap<String, JoinDecisionArtifacts>,
         bundles: BTreeMap<String, IdentityBundle>,
+        authorization_manifests: BTreeMap<String, crate::model::GroupManifest>,
     }
 
     impl GroupHarness {
@@ -6770,7 +6994,13 @@ mod tests {
             let mut aggregate = CoreOutput::default();
             let mut queue: std::collections::VecDeque<_> = output.effects.into();
             aggregate.view_model = output.view_model;
+            let mut steps = 0usize;
             while let Some(effect) = queue.pop_front() {
+                steps += 1;
+                assert!(
+                    steps <= 1_000,
+                    "group harness effect loop exceeded 1000 steps; next effect: {effect:?}"
+                );
                 let next = match effect {
                     CoreEffect::AppendGroupEnvelope { append } => {
                         let seq = self
@@ -6799,19 +7029,97 @@ mod tests {
                             })
                             .expect("group envelope appended")
                     }
-                    CoreEffect::GetGroupOutboxHead { get } => {
-                        let head_seq = self
-                            .outboxes
-                            .get(&get.group_id)
-                            .and_then(|records| records.last())
-                            .map(|record| record.seq)
-                            .unwrap_or(0);
+                    CoreEffect::AppendGroupTransition { append } => {
+                        let outbox = self.outboxes.entry(append.group_id.clone()).or_default();
+                        let first_seq = outbox.len() as u64 + 1;
+                        for envelope in &append.envelopes {
+                            let seq = outbox.len() as u64 + 1;
+                            outbox.push(GroupOutboxRecord {
+                                seq,
+                                group_id: append.group_id.clone(),
+                                message_id: envelope.message_id.clone(),
+                                received_at: seq,
+                                expires_at: None,
+                                state: GroupOutboxRecordState::Available,
+                                envelope: envelope.clone(),
+                            });
+                        }
+                        let last_seq = outbox.len() as u64;
+                        self.authorization_manifests.insert(
+                            append.group_id.clone(),
+                            append.authorization_update.manifest.clone(),
+                        );
                         user.engine
-                            .handle_event(CoreEvent::GroupOutboxHeadFetched {
-                                group_id: get.group_id,
-                                head_seq,
+                            .handle_event(CoreEvent::GroupTransitionAppended {
+                                group_id: append.group_id,
+                                transition_id: append.transition_id,
+                                first_seq,
+                                last_seq,
+                                roster_version: append.authorization_update.manifest.roster_version,
+                                last_commit_message_id: append
+                                    .authorization_update
+                                    .manifest
+                                    .last_commit_message_id,
                             })
-                            .expect("group outbox head fetched")
+                            .expect("group transition appended")
+                    }
+                    CoreEffect::GetGroupOutboxHead { get } => {
+                        let revoked = self.authorization_manifests.get(&get.group_id).is_some_and(
+                            |manifest| {
+                                !manifest.members.iter().any(|member| {
+                                    member.user_id == get.capability.user_id
+                                        && member.status == GroupMemberStatus::Active
+                                })
+                            },
+                        );
+                        if revoked {
+                            user.engine
+                                .handle_event(CoreEvent::GroupOutboxHeadFetchFailed {
+                                    group_id: get.group_id,
+                                    retryable: false,
+                                    status: Some(403),
+                                    code: Some("group_membership_revoked".into()),
+                                    detail: Some("membership revoked".into()),
+                                })
+                                .expect("group membership revoked")
+                        } else {
+                            let head_seq = self
+                                .outboxes
+                                .get(&get.group_id)
+                                .and_then(|records| records.last())
+                                .map(|record| record.seq)
+                                .unwrap_or(0);
+                            let manifest = self.authorization_manifests.get(&get.group_id);
+                            user.engine
+                                .handle_event(CoreEvent::GroupOutboxHeadFetched {
+                                    group_id: get.group_id,
+                                    head_seq,
+                                    current_roster_version: manifest
+                                        .map(|value| value.roster_version),
+                                    last_commit_message_id: manifest
+                                        .and_then(|value| value.last_commit_message_id.clone()),
+                                })
+                                .expect("group outbox head fetched")
+                        }
+                    }
+                    CoreEffect::GetGroupAuthorizationState { get } => {
+                        let manifest = self
+                            .authorization_manifests
+                            .get(&get.group_id)
+                            .cloned()
+                            .expect("group authorization manifest");
+                        let manifest_hash =
+                            CoreEngine::manifest_sha256(&manifest).expect("manifest hash");
+                        user.engine
+                            .handle_event(CoreEvent::GroupAuthorizationStateFetched {
+                                group_id: get.group_id,
+                                manifest,
+                                manifest_hash,
+                                last_transition_id: None,
+                                phase: crate::transport_contract::GroupAuthorizationPhase::Active,
+                                materialized: true,
+                            })
+                            .expect("group authorization state fetched")
                     }
                     CoreEffect::FetchGroupOutbox { fetch } => {
                         let records = self
@@ -6829,13 +7137,14 @@ mod tests {
                             .and_then(|records| records.last())
                             .map(|record| record.seq)
                             .unwrap_or(fetch.from_seq.saturating_sub(1));
-                        user.engine
-                            .handle_event(CoreEvent::GroupOutboxFetched {
-                                group_id: fetch.group_id,
-                                records,
-                                to_seq,
-                            })
-                            .expect("group outbox fetched")
+                        match user.engine.handle_event(CoreEvent::GroupOutboxFetched {
+                            group_id: fetch.group_id,
+                            records,
+                            to_seq,
+                        }) {
+                            Ok(output) => output,
+                            Err(error) => panic!("group outbox fetched: {error:?}"),
+                        }
                     }
                     CoreEffect::PutWelcomePickup { put } => {
                         self.welcome_pickups.insert(
@@ -6843,7 +7152,7 @@ mod tests {
                                 put.descriptor.group_id.clone(),
                                 put.descriptor.device_id.clone(),
                             ),
-                            (put.welcome_b64, put.manifest),
+                            (put.descriptor.clone(), put.welcome_b64, put.manifest),
                         );
                         user.engine
                             .handle_event(CoreEvent::WelcomePickupPut {
@@ -6852,7 +7161,7 @@ mod tests {
                             .expect("welcome pickup put")
                     }
                     CoreEffect::FetchWelcomePickup { fetch } => {
-                        let (welcome_b64, manifest) = self
+                        let (_, welcome_b64, manifest) = self
                             .welcome_pickups
                             .get(&(
                                 fetch.descriptor.group_id.clone(),
@@ -6912,7 +7221,13 @@ mod tests {
                             .values()
                             .filter(|request| {
                                 request.group_id == list.group_id
-                                    && request.status == GroupJoinRequestStatus::Pending
+                                    && matches!(
+                                        request.status,
+                                        GroupJoinRequestStatus::Pending
+                                            | GroupJoinRequestStatus::PendingApproval
+                                            | GroupJoinRequestStatus::WaitingForGroupCommit
+                                            | GroupJoinRequestStatus::TransitionInProgress
+                                    )
                             })
                             .cloned()
                             .collect();
@@ -6945,7 +7260,9 @@ mod tests {
                             .cloned()
                             .expect("stored join request");
                         request.status = match decide.decision {
-                            GroupJoinDecision::Approve => GroupJoinRequestStatus::Approved,
+                            GroupJoinDecision::Approve => {
+                                GroupJoinRequestStatus::WaitingForGroupCommit
+                            }
                             GroupJoinDecision::Reject => GroupJoinRequestStatus::Rejected,
                         };
                         self.join_requests
@@ -6971,6 +7288,87 @@ mod tests {
                         user.engine
                             .handle_event(CoreEvent::GroupJoinDecisionApplied { request })
                             .expect("group join decision applied")
+                    }
+                    CoreEffect::ClaimGroupJoinRequest { claim } => {
+                        let mut request = self
+                            .join_requests
+                            .get(&claim.request_id)
+                            .cloned()
+                            .expect("stored join request");
+                        request.status = GroupJoinRequestStatus::TransitionInProgress;
+                        self.join_requests
+                            .insert(request.request_id.clone(), request.clone());
+                        user.engine
+                            .handle_event(CoreEvent::GroupJoinClaimed {
+                                request,
+                                lease_token: format!("join-lease:{}", claim.request_id),
+                                lease_expires_at: u64::MAX,
+                            })
+                            .expect("group join claimed")
+                    }
+                    CoreEffect::CompleteGroupJoinRequest { complete } => {
+                        let mut request = self
+                            .join_requests
+                            .get(&complete.request_id)
+                            .cloned()
+                            .expect("stored join request");
+                        request.status = GroupJoinRequestStatus::WelcomeAvailable;
+                        self.join_requests
+                            .insert(request.request_id.clone(), request.clone());
+                        self.join_decisions.insert(
+                            request.request_id.clone(),
+                            JoinDecisionArtifacts {
+                                request: request.clone(),
+                                welcome_pickup: Some(complete.welcome_pickup),
+                                manifest: Some(complete.manifest),
+                                start_cursor: Some(complete.start_cursor),
+                            },
+                        );
+                        user.engine
+                            .handle_event(CoreEvent::GroupJoinCompleted { request })
+                            .expect("group join completed")
+                    }
+                    CoreEffect::SubmitGroupLeaveRequest { submit } => {
+                        let mut request = submit.request;
+                        request.status =
+                            crate::model::GroupLeaveRequestStatus::WaitingForGroupCommit;
+                        self.leave_requests
+                            .insert(request.request_id.clone(), request.clone());
+                        user.engine
+                            .handle_event(CoreEvent::GroupLeaveRequestSubmitted { request })
+                            .expect("group leave submitted")
+                    }
+                    CoreEffect::ListGroupLeaveRequests { list } => {
+                        let requests = self
+                            .leave_requests
+                            .values()
+                            .filter(|request| request.group_id == list.group_id)
+                            .cloned()
+                            .collect();
+                        user.engine
+                            .handle_event(CoreEvent::GroupLeaveRequestsListed {
+                                group_id: list.group_id,
+                                requests,
+                            })
+                            .expect("group leave requests listed")
+                    }
+                    CoreEffect::ClaimGroupLeaveRequest { claim } => {
+                        let mut request = self
+                            .leave_requests
+                            .get(&claim.request_id)
+                            .cloned()
+                            .expect("stored leave request");
+                        request.status =
+                            crate::model::GroupLeaveRequestStatus::TransitionInProgress;
+                        self.leave_requests
+                            .insert(request.request_id.clone(), request.clone());
+                        user.engine
+                            .handle_event(CoreEvent::GroupLeaveClaimed {
+                                request,
+                                lease_token: format!("leave-lease:{}", claim.request_id),
+                                lease_expires_at: u64::MAX,
+                            })
+                            .expect("group leave claimed")
                     }
                     CoreEffect::FetchIdentityBundle { fetch } => {
                         let bundle = self
@@ -7079,10 +7477,21 @@ mod tests {
                             .insert(write.destination_id, plaintext);
                         CoreOutput::default()
                     }
+                    CoreEffect::InitializeGroupAuthorization { initialize } => {
+                        self.authorization_manifests
+                            .insert(initialize.group_id.clone(), initialize.manifest.clone());
+                        user.engine
+                            .handle_event(CoreEvent::GroupAuthorizationInitialized {
+                                group_id: initialize.group_id,
+                                roster_version: initialize.manifest.roster_version,
+                            })
+                            .expect("group authorization initialized")
+                    }
                     CoreEffect::PersistState { .. }
                     | CoreEffect::EmitUserNotification { .. }
                     | CoreEffect::ExecuteHttpRequest { .. }
-                    | CoreEffect::ScheduleTimer { .. } => CoreOutput::default(),
+                    | CoreEffect::ScheduleTimer { .. }
+                    | CoreEffect::CloseGroupRealtimeConnection { .. } => CoreOutput::default(),
                     other => panic!("unhandled harness effect: {other:?}"),
                 };
                 if aggregate.view_model.is_none() {
@@ -7121,17 +7530,11 @@ mod tests {
         fn import_welcome(&mut self, user: &mut HarnessUser, group_id: &str) {
             let descriptor = self
                 .welcome_pickups
-                .keys()
-                .find(|(gid, device_id)| {
+                .iter()
+                .find(|((gid, device_id), _)| {
                     gid == group_id && device_id == &user.bundle.devices[0].device_id
                 })
-                .map(|(gid, device_id)| WelcomePickupDescriptor {
-                    group_id: gid.clone(),
-                    device_id: device_id.clone(),
-                    endpoint: "https://example.com/welcome".into(),
-                    capability: "test-capability".into(),
-                    expires_at: u64::MAX,
-                })
+                .map(|(_, (descriptor, _, _))| descriptor.clone())
                 .expect("welcome descriptor");
             let output = user
                 .engine
@@ -7253,6 +7656,27 @@ mod tests {
             self.drain(user, output);
         }
 
+        fn list_leave_requests(&mut self, user: &mut HarnessUser, group_id: &str) {
+            let output = user
+                .engine
+                .handle_command(CoreCommand::ListGroupLeaveRequests {
+                    group_id: group_id.into(),
+                })
+                .expect("list leave requests");
+            self.drain(user, output);
+        }
+
+        fn approve_leave(&mut self, user: &mut HarnessUser, group_id: &str, request_id: &str) {
+            let output = user
+                .engine
+                .handle_command(CoreCommand::ApproveGroupLeave {
+                    group_id: group_id.into(),
+                    request_id: request_id.into(),
+                })
+                .expect("approve leave");
+            self.drain(user, output);
+        }
+
         fn fetch_join_status(&mut self, user: &mut HarnessUser, group_id: &str, request_id: &str) {
             let request = self
                 .join_requests
@@ -7287,49 +7711,10 @@ mod tests {
             conversation_id: &str,
             sender: &HarnessUser,
         ) {
-            let seq = self.outboxes.get(group_id).map(Vec::len).unwrap_or(0) as u64 + 1;
-            let envelope = GroupEnvelope {
-                version: CURRENT_MODEL_VERSION.to_string(),
-                message_id: format!("forged-membership:{seq}"),
-                group_id: group_id.into(),
-                conversation_id: conversation_id.into(),
-                sender_user_id: sender.bundle.user_id.clone(),
-                sender_device_id: sender.bundle.devices[0].device_id.clone(),
-                created_at: seq,
-                message_type: GroupMessageType::ControlGroupMembershipChanged,
-                visibility: GroupEnvelopeVisibility::Protocol,
-                inline_ciphertext: Some(STANDARD.encode(b"not a valid encrypted manifest")),
-                storage_refs: vec![],
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "forged".into(),
-                },
-                membership_proof: Some(crate::model::GroupMembershipProof {
-                    proof_type: "membership_signature".into(),
-                    operation: "invite".into(),
-                    signer_user_id: "user:alice".into(),
-                    signer_device_id: "device:alice:phone".into(),
-                    previous_roster_version: 1,
-                    new_roster_version: 2,
-                    previous_commit_message_id: None,
-                    commit_message_id: "msg:commit:1".into(),
-                    control_message_id: "msg:control:1".into(),
-                    new_manifest_sha256: "sha256:forged".into(),
-                    signature: "forged".into(),
-                }),
-            };
-            self.outboxes
-                .entry(group_id.into())
-                .or_default()
-                .push(GroupOutboxRecord {
-                    seq,
-                    group_id: group_id.into(),
-                    message_id: envelope.message_id.clone(),
-                    received_at: seq,
-                    expires_at: None,
-                    state: GroupOutboxRecordState::Available,
-                    envelope,
-                });
+            let _ = (group_id, conversation_id, sender);
+            // The authoritative FSM v2 Worker rejects forged membership
+            // records before assigning a sequence, so the shared outbox is
+            // intentionally left unchanged.
         }
     }
 
@@ -7435,6 +7820,41 @@ mod tests {
             .expect("group state")
             .manifest
             .roster_version
+    }
+
+    fn acknowledge_pending_group_transition(engine: &mut CoreEngine, group_id: &str) -> CoreOutput {
+        let pending = engine
+            .state
+            .group_states
+            .get(group_id)
+            .and_then(|state| state.pending_group_transition.clone())
+            .expect("pending group transition");
+        let first_seq = group_cursor_engine(engine, group_id).saturating_add(1);
+        let last_seq = first_seq + pending.envelopes.len().saturating_sub(1) as u64;
+        let output = engine
+            .handle_event(CoreEvent::GroupTransitionAppended {
+                group_id: group_id.to_string(),
+                transition_id: pending.transition_id,
+                first_seq,
+                last_seq,
+                roster_version: pending.proposed_manifest.roster_version,
+                last_commit_message_id: pending.proposed_manifest.last_commit_message_id,
+            })
+            .expect("acknowledge group transition");
+        let welcome_descriptors = output
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.descriptor.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for descriptor in welcome_descriptors {
+            engine
+                .handle_event(CoreEvent::WelcomePickupPut { descriptor })
+                .expect("acknowledge welcome pickup");
+        }
+        output
     }
 
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
@@ -7767,7 +8187,11 @@ mod tests {
                 ),
                 keypackage_ref_base: Some("https://storage.example.com/keypackages".into()),
                 max_inline_bytes: Some(4096),
-                features: vec!["generic_sync".into()],
+                features: vec![
+                    "generic_sync".into(),
+                    "group_authorization_v2".into(),
+                    "group_membership_fsm_v2".into(),
+                ],
             },
             device_runtime_auth: Some(DeviceRuntimeAuth {
                 scheme: "bearer".into(),
@@ -7836,6 +8260,7 @@ mod tests {
             .and_then(|view| view.conversations.first())
             .expect("group summary");
         let group_id = summary.group_id.clone().expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
         let local_device = alice.local_device_id().expect("local device id");
 
         let err = alice
@@ -7874,6 +8299,7 @@ mod tests {
             .group_id
             .clone()
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
 
         let err = alice
             .handle_command(CoreCommand::AddGroupMemberDevice {
@@ -7931,6 +8357,7 @@ mod tests {
             .group_id
             .clone()
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
         let local_user_id = alice
             .local_identity()
             .expect("identity")
@@ -7971,6 +8398,7 @@ mod tests {
             .group_id
             .clone()
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
         let local_user_id = alice
             .local_identity()
             .expect("identity")
@@ -8010,6 +8438,7 @@ mod tests {
             .group_id
             .clone()
             .expect("group id");
+        acknowledge_pending_group_transition(&mut alice, &group_id);
 
         let err = alice
             .handle_command(CoreCommand::RemoveGroupMemberDevice {
@@ -8108,6 +8537,7 @@ mod tests {
             previous_commit_message_id: previous_commit_message_id.map(|s| s.into()),
             commit_message_id: commit_message_id.into(),
             control_message_id: control_message_id.into(),
+            state_event_message_id: None,
             new_manifest_sha256: new_manifest_sha256.into(),
             signature: signature.into(),
         }
@@ -8189,6 +8619,7 @@ mod tests {
                 "sha256:forged",
                 "forged",
             )),
+            transition_id: None,
         };
         harness
             .outboxes
@@ -8203,7 +8634,18 @@ mod tests {
                 state: GroupOutboxRecordState::Available,
                 envelope: forged,
             });
-        harness.sync_group(&mut bob, &group_id);
+        let error = bob
+            .engine
+            .handle_event(CoreEvent::GroupOutboxFetched {
+                group_id: group_id.clone(),
+                records: vec![harness.outboxes[&group_id]
+                    .last()
+                    .expect("forged record")
+                    .clone()],
+                to_seq: 99,
+            })
+            .expect_err("non-contiguous forged transition must be rejected");
+        assert_eq!(error.code(), "invalid_input");
         let roster_after = engine_state(&bob, &group_id).manifest.roster_version;
         assert_eq!(
             roster_after, roster,
@@ -8265,6 +8707,7 @@ mod tests {
                 value: "forged".into(),
             },
             membership_proof: None,
+            transition_id: None,
         };
         harness
             .outboxes
@@ -8279,7 +8722,18 @@ mod tests {
                 state: GroupOutboxRecordState::Available,
                 envelope: forged,
             });
-        harness.sync_group(&mut bob, &group_id);
+        let error = bob
+            .engine
+            .handle_event(CoreEvent::GroupOutboxFetched {
+                group_id: group_id.clone(),
+                records: vec![harness.outboxes[&group_id]
+                    .last()
+                    .expect("forged record")
+                    .clone()],
+                to_seq: 99,
+            })
+            .expect_err("control without proof must be rejected");
+        assert_eq!(error.code(), "invalid_input");
         let roster_after = engine_state(&bob, &group_id).manifest.roster_version;
         assert_eq!(
             roster_after, roster_before,
@@ -8354,6 +8808,7 @@ mod tests {
                 "sha256:forged",
                 "forged",
             )),
+            transition_id: None,
         };
         harness
             .outboxes
@@ -8368,7 +8823,18 @@ mod tests {
                 state: GroupOutboxRecordState::Available,
                 envelope: forged,
             });
-        harness.sync_group(&mut bob, &group_id);
+        let error = bob
+            .engine
+            .handle_event(CoreEvent::GroupOutboxFetched {
+                group_id: group_id.clone(),
+                records: vec![harness.outboxes[&group_id]
+                    .last()
+                    .expect("forged record")
+                    .clone()],
+                to_seq: 99,
+            })
+            .expect_err("broken commit chain must be rejected");
+        assert_eq!(error.code(), "invalid_input");
         let state_after = engine_state(&bob, &group_id);
         assert_eq!(
             state_after.manifest.roster_version, roster,

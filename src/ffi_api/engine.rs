@@ -28,38 +28,45 @@ use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
     GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy, GroupJoinRequest,
-    GroupJoinRequestStatus, GroupManifest, GroupMember, GroupMemberDevice, GroupMemberInvitePolicy,
-    GroupMemberStatus, GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor,
-    GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord, MessageType,
-    MlsStateStatus, MlsStateSummary, ProtectedAppMessage, ProtectedPayloadKind, SenderProof,
-    StorageRef, Validate, WelcomePickupDescriptor,
+    GroupJoinRequestStatus, GroupLeaveRequest, GroupLeaveRequestStatus, GroupManifest, GroupMember,
+    GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
+    GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
+    GroupStateEvent, GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, ProtectedAppMessage,
+    ProtectedPayloadKind, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
-    ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
+    ContactRelationshipStatus, CorePersistenceSnapshot, GroupConsistencyState,
+    GroupTransitionIntent, PendingGroupTransitionStage, PersistOp, PersistedContact,
     PersistedConversation, PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite,
-    PersistedGroupJoinRequest, PersistedGroupRealtimeSession, PersistedGroupState,
-    PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    PersistedGroupJoinRequest, PersistedGroupLeaveRequest, PersistedGroupRealtimeSession,
+    PersistedGroupState, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
     PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
-    PersistedPendingGroupMembershipTransition, PersistedPendingWelcomePickup,
-    PersistedRealtimeSession, PersistedRecoveryContext, PersistedRecoveryEscalationReason,
-    PersistedRecoveryPhase, PersistedRecoveryReason, PersistedSyncState,
+    PersistedPendingGroupMembershipTransition, PersistedPendingGroupTransition,
+    PersistedPendingWelcomePickup, PersistedRealtimeSession, PersistedRecoveryContext,
+    PersistedRecoveryEscalationReason, PersistedRecoveryPhase, PersistedRecoveryReason,
+    PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
     AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
     AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, BlobDownloadRequest,
-    BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, DeviceStatusDocument,
-    DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
-    FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    FetchMessagesRequest, FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
-    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GetHeadResult, GroupJoinDecision,
-    ListGroupJoinRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
-    MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
-    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
-    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
-    SubmitGroupJoinRequest,
+    AppendGroupTransitionRequest, AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult,
+    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
+    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest,
+    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult,
+    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupAuthorizationStateRequest,
+    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GetHeadResult,
+    GroupAuthorizationUpdate, GroupJoinDecision, InitializeGroupAuthorizationRequest,
+    ListGroupInvitesRequest, ListGroupJoinRequestsRequest, ListGroupLeaveRequestsRequest,
+    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
+    MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
+    SubmitGroupLeaveRequest,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Verifier;
@@ -76,6 +83,12 @@ pub struct CoreEngine {
 struct AppendDeliveryOutput {
     output: CoreOutput,
     saved_conversation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxRecordSource {
+    Fetch,
+    PendingReplay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -371,16 +384,9 @@ impl CoreEngine {
             .pending_group_outbox
             .into_iter()
             .filter_map(|item| {
-                let capability = item.capability.or_else(|| {
-                    group_states.get(&item.group_id).and_then(|state| {
-                        state
-                            .local_role
-                            .map(|role| group_capability_for_manifest(&state.manifest, role))
-                    })
-                })?;
+                group_states.get(&item.group_id)?.local_role?;
                 Some(PendingGroupOutboxItem {
                     envelope: item.envelope,
-                    capability,
                     retries: item.retries,
                     in_flight: false,
                     plaintext_cache: item.plaintext_cache,
@@ -713,7 +719,71 @@ impl CoreEngine {
     }
 
     pub fn handle_command(&mut self, command: CoreCommand) -> CoreResult<CoreOutput> {
-        match command {
+        let staged_join_request_id = match &command {
+            CoreCommand::ApproveGroupJoin { request_id, .. }
+            | CoreCommand::ApproveGroupLeave { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        };
+        let stage_group_transition = matches!(
+            &command,
+            CoreCommand::ApproveGroupJoin { .. }
+                | CoreCommand::InviteToGroup { .. }
+                | CoreCommand::ApproveGroupLeave { .. }
+                | CoreCommand::RemoveGroupMember { .. }
+                | CoreCommand::TransferGroupOwnership { .. }
+                | CoreCommand::SetGroupAdmin { .. }
+                | CoreCommand::UpdateGroupMetadata { .. }
+                | CoreCommand::DissolveGroup { .. }
+                | CoreCommand::AddGroupMemberDevice { .. }
+                | CoreCommand::RemoveGroupMemberDevice { .. }
+                | CoreCommand::SyncGroupsForNewDevice { .. }
+                | CoreCommand::SyncGroupsForRemovedDevice { .. }
+        );
+        let requires_membership_fsm_v2 = stage_group_transition
+            || matches!(
+                &command,
+                CoreCommand::CreateGroupConversation { .. }
+                    | CoreCommand::CreateGroupInviteLink { .. }
+                    | CoreCommand::RevokeGroupInviteLink { .. }
+                    | CoreCommand::LeaveGroup { .. }
+                    | CoreCommand::RejectGroupJoin { .. }
+            );
+        if requires_membership_fsm_v2 {
+            self.require_group_membership_fsm_v2()?;
+        }
+        let transition_group_id = match &command {
+            CoreCommand::ApproveGroupJoin { group_id, .. }
+            | CoreCommand::InviteToGroup { group_id, .. }
+            | CoreCommand::LeaveGroup { group_id }
+            | CoreCommand::ApproveGroupLeave { group_id, .. }
+            | CoreCommand::RemoveGroupMember { group_id, .. }
+            | CoreCommand::TransferGroupOwnership { group_id, .. }
+            | CoreCommand::SetGroupAdmin { group_id, .. }
+            | CoreCommand::UpdateGroupMetadata { group_id, .. }
+            | CoreCommand::DissolveGroup { group_id }
+            | CoreCommand::AddGroupMemberDevice { group_id, .. }
+            | CoreCommand::RemoveGroupMemberDevice { group_id, .. } => Some(group_id.as_str()),
+            _ => None,
+        };
+        if let Some(group_id) = transition_group_id {
+            self.ensure_group_state_operation_ready(group_id)?;
+        }
+        let staging_context = if stage_group_transition {
+            let canonical_mls = self.state.mls_adapter.take();
+            let staged_mls = canonical_mls.as_ref().map(MlsAdapter::fork).transpose()?;
+            self.state.mls_adapter = staged_mls;
+            Some((
+                canonical_mls,
+                self.state.group_states.clone(),
+                self.state.conversations.clone(),
+                self.state.mls_summaries.clone(),
+                self.state.pending_group_outbox.len(),
+            ))
+        } else {
+            None
+        };
+
+        let result = match command {
             CoreCommand::CreateOrLoadIdentity {
                 mnemonic,
                 device_name,
@@ -755,6 +825,7 @@ impl CoreEngine {
                 group_id,
                 invite_id,
             } => self.revoke_group_invite_link(group_id, invite_id),
+            CoreCommand::ListGroupInvites { group_id } => self.list_group_invites(group_id),
             CoreCommand::FetchGroupInvite { invite_url } => self.fetch_group_invite(invite_url),
             CoreCommand::SubmitGroupJoinRequest { invite_url } => {
                 self.submit_group_join_request(invite_url)
@@ -781,6 +852,13 @@ impl CoreEngine {
                 invitee_user_ids,
             } => self.invite_to_group(group_id, invitee_user_ids),
             CoreCommand::LeaveGroup { group_id } => self.leave_group(group_id),
+            CoreCommand::ListGroupLeaveRequests { group_id } => {
+                self.list_group_leave_requests(group_id)
+            }
+            CoreCommand::ApproveGroupLeave {
+                group_id,
+                request_id,
+            } => self.approve_group_leave(group_id, request_id),
             CoreCommand::RemoveGroupMember {
                 group_id,
                 target_user_id,
@@ -869,7 +947,197 @@ impl CoreEngine {
             CoreCommand::SyncGroupsForRemovedDevice { device_id } => {
                 self.sync_groups_for_removed_device(device_id)
             }
+        };
+
+        let Some((
+            canonical_mls,
+            canonical_groups,
+            canonical_conversations,
+            canonical_summaries,
+            pending_start,
+        )) = staging_context
+        else {
+            return result;
+        };
+        let mut output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                self.state.mls_adapter = canonical_mls;
+                self.state.group_states = canonical_groups;
+                self.state.conversations = canonical_conversations;
+                self.state.mls_summaries = canonical_summaries;
+                self.state.pending_group_outbox.truncate(pending_start);
+                return Err(error);
+            }
+        };
+        let staged_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
+        let Some(mut proof) = staged_items
+            .iter()
+            .find_map(|item| item.envelope.membership_proof.clone())
+        else {
+            self.state.mls_adapter = canonical_mls;
+            self.state.group_states = canonical_groups;
+            self.state.conversations = canonical_conversations;
+            self.state.mls_summaries = canonical_summaries;
+            self.state.pending_group_outbox.truncate(pending_start);
+            return Ok(output);
+        };
+        let group_id = staged_items
+            .iter()
+            .find(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
+            .map(|item| item.envelope.group_id.clone())
+            .ok_or_else(|| CoreError::invalid_state("staged group transition has no group"))?;
+        let proposed = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("staged group transition lost proposed state"))?
+            .clone();
+        let base_manifest = canonical_groups
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
+            .manifest
+            .clone();
+        let transition_id = format!("group-transition:{}", proof.control_message_id);
+        let mut event_envelope = self.build_group_envelope(
+            &group_id,
+            &proposed.conversation_id,
+            GroupMessageType::ControlGroupStateEvent,
+            GroupEnvelopeVisibility::Visible,
+            "pending-state-event".into(),
+        )?;
+        event_envelope.transition_id = Some(transition_id.clone());
+        let event_record = GroupOutboxRecord {
+            seq: 0,
+            group_id: group_id.clone(),
+            message_id: event_envelope.message_id.clone(),
+            received_at: event_envelope.created_at,
+            expires_at: None,
+            state: GroupOutboxRecordState::Available,
+            envelope: event_envelope.clone(),
+        };
+        let event_plaintext = Self::derive_group_state_event(
+            &base_manifest,
+            &proposed.manifest,
+            &proof,
+            &event_record,
+        )
+        .ok_or_else(|| CoreError::invalid_state("failed to derive group state event"))?;
+        let encrypted_event = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
+            .encrypt_application(&proposed.conversation_id, event_plaintext.as_bytes())?;
+        event_envelope.inline_ciphertext = Some(encrypted_event.payload_b64.clone());
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        event_envelope.sender_proof.value =
+            identity.sign_sender_proof(encrypted_event.payload_b64.as_bytes());
+        proof.state_event_message_id = Some(event_envelope.message_id.clone());
+        proof.signature = identity.sign_sender_proof(&Self::membership_proof_payload(&proof));
+        proof.validate()?;
+        for item in &mut self.state.pending_group_outbox[pending_start..] {
+            if item.envelope.membership_proof.is_some() {
+                item.envelope.membership_proof = Some(proof.clone());
+                item.envelope.transition_id = Some(transition_id.clone());
+            }
         }
+        event_envelope.membership_proof = Some(proof.clone());
+        let capability = self.group_capability_for_state(&proposed)?;
+        self.enqueue_group_envelope(event_envelope, capability, Some(event_plaintext));
+        let new_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
+        let welcomes: Vec<PutWelcomePickupRequest> = output
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.clone()),
+                _ => None,
+            })
+            .collect();
+        let join_request_id = staged_join_request_id.or_else(|| {
+            output.effects.iter().find_map(|effect| match effect {
+                CoreEffect::DecideGroupJoinRequest { decide }
+                    if decide.decision == GroupJoinDecision::Approve =>
+                {
+                    Some(decide.request_id.clone())
+                }
+                _ => None,
+            })
+        });
+        let intent = self.transition_intent_from_staged_state(
+            &base_manifest,
+            &proposed.manifest,
+            &proof,
+            join_request_id.as_deref(),
+        )?;
+        let mls_patch = canonical_mls
+            .as_ref()
+            .zip(self.state.mls_adapter.as_ref())
+            .map(|(canonical, staged)| {
+                canonical.conversation_patch(staged, &proposed.conversation_id)
+            })
+            .transpose()?
+            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?;
+        self.state.mls_adapter = canonical_mls;
+        self.state.group_states = canonical_groups;
+        self.state.conversations = canonical_conversations;
+        self.state.mls_summaries = canonical_summaries;
+        let base = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
+            .clone();
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.pending_group_transition = Some(PersistedPendingGroupTransition {
+                transition_id: transition_id.clone(),
+                intent,
+                stage: PendingGroupTransitionStage::Prepared,
+                base_manifest_hash: Self::manifest_sha256(&base.manifest)?,
+                base_roster_version: proof.previous_roster_version,
+                base_commit_message_id: proof.previous_commit_message_id.clone(),
+                proposed_manifest: proposed.manifest,
+                mls_patch: Some(mls_patch),
+                staged_mls_state: None,
+                envelopes: new_items
+                    .iter()
+                    .filter(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
+                    .map(|item| item.envelope.clone())
+                    .collect(),
+                state_event_plaintext: new_items
+                    .iter()
+                    .find(|item| {
+                        item.envelope.message_type == GroupMessageType::ControlGroupStateEvent
+                    })
+                    .and_then(|item| item.plaintext_cache.clone()),
+                welcomes,
+                join_request_id,
+                retries: 0,
+                first_seq: None,
+                last_seq: None,
+            });
+        }
+        output.effects.retain(|effect| {
+            !matches!(
+                effect,
+                CoreEffect::PutWelcomePickup { .. }
+                    | CoreEffect::AppendGroupEnvelope { .. }
+                    | CoreEffect::AppendGroupTransition { .. }
+                    | CoreEffect::DecideGroupJoinRequest { .. }
+            )
+        });
+        output.view_model = None;
+        for effect in &mut output.effects {
+            if let CoreEffect::PersistState { persist } = effect {
+                persist.snapshot = Some(build_persistence_snapshot(&self.state));
+            }
+        }
+        output = merge_outputs(output, self.flush_group_outbox()?);
+        Ok(output)
     }
 
     pub fn handle_event(&mut self, event: CoreEvent) -> CoreResult<CoreOutput> {
@@ -1058,16 +1326,28 @@ impl CoreEngine {
             CoreEvent::GroupOutboxFetchFailed {
                 group_id,
                 retryable,
+                status,
+                code,
                 detail,
-            } => self.handle_group_sync_failed(group_id, retryable, detail),
-            CoreEvent::GroupOutboxHeadFetched { group_id, head_seq } => {
-                self.handle_group_outbox_head_fetched(group_id, head_seq)
-            }
+            } => self.handle_group_sync_failed(group_id, retryable, status, code, detail),
+            CoreEvent::GroupOutboxHeadFetched {
+                group_id,
+                head_seq,
+                current_roster_version,
+                last_commit_message_id,
+            } => self.handle_group_outbox_head_fetched(
+                group_id,
+                head_seq,
+                current_roster_version,
+                last_commit_message_id,
+            ),
             CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id,
                 retryable,
+                status,
+                code,
                 detail,
-            } => self.handle_group_sync_failed(group_id, retryable, detail),
+            } => self.handle_group_sync_failed(group_id, retryable, status, code, detail),
             CoreEvent::GroupEnvelopeAppended {
                 group_id,
                 message_id,
@@ -1077,8 +1357,101 @@ impl CoreEngine {
                 group_id,
                 message_id,
                 retryable,
+                status,
+                code,
                 detail,
-            } => self.handle_group_append_failed(group_id, message_id, retryable, detail),
+            } => self
+                .handle_group_append_failed(group_id, message_id, retryable, status, code, detail),
+            CoreEvent::GroupTransitionAppended {
+                group_id,
+                transition_id,
+                first_seq,
+                last_seq,
+                roster_version,
+                last_commit_message_id,
+            } => self.handle_group_transition_appended(
+                group_id,
+                transition_id,
+                first_seq,
+                last_seq,
+                roster_version,
+                last_commit_message_id,
+            ),
+            CoreEvent::GroupTransitionAppendFailed {
+                group_id,
+                transition_id,
+                retryable,
+                status,
+                code,
+                detail,
+            } => self.handle_group_transition_failed(
+                group_id,
+                transition_id,
+                retryable,
+                status,
+                code,
+                detail,
+            ),
+            CoreEvent::GroupAuthorizationStateFetched {
+                group_id,
+                manifest,
+                manifest_hash,
+                last_transition_id,
+                phase,
+                materialized,
+            } => self.handle_group_authorization_state_fetched(
+                group_id,
+                manifest,
+                manifest_hash,
+                last_transition_id,
+                phase,
+                materialized,
+            ),
+            CoreEvent::GroupAuthorizationStateFetchFailed {
+                group_id,
+                retryable,
+                status,
+                code,
+                detail,
+            } => self.handle_group_sync_failed(group_id, retryable, status, code, detail),
+            CoreEvent::GroupAuthorizationInitialized {
+                group_id,
+                roster_version,
+            } => self.handle_group_authorization_initialized(group_id, roster_version),
+            CoreEvent::GroupAuthorizationInitializeFailed {
+                group_id,
+                retryable,
+                status,
+                code,
+                detail,
+            } => {
+                log::warn!(
+                    "group authorization initialization failed: group_id={} retryable={} status={:?} code={:?} detail={:?}",
+                    group_id,
+                    retryable,
+                    status,
+                    code,
+                    detail
+                );
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message: format!(
+                                "group authorization initialization failed for {group_id}: {}",
+                                detail
+                                    .or(code)
+                                    .unwrap_or_else(|| "unknown transport error".into())
+                            ),
+                        },
+                    }],
+                    view_model: None,
+                })
+            }
             CoreEvent::WelcomePickupFetched {
                 descriptor,
                 welcome_b64,
@@ -1089,7 +1462,9 @@ impl CoreEngine {
                 retryable,
                 detail,
             } => self.handle_welcome_pickup_fetch_failed(descriptor, retryable, detail),
-            CoreEvent::WelcomePickupPut { .. } => Ok(CoreOutput::default()),
+            CoreEvent::WelcomePickupPut { descriptor } => {
+                self.handle_welcome_pickup_put(descriptor)
+            }
             CoreEvent::WelcomePickupPutFailed {
                 descriptor,
                 retryable: _,
@@ -1119,6 +1494,11 @@ impl CoreEngine {
                         invite_id: invite.invite_id.clone(),
                         invite_url: invite_url.clone(),
                         document: invite.clone(),
+                        revision: 0,
+                        status: crate::transport_contract::GroupInviteStatus::Active,
+                        uses: 0,
+                        max_uses: None,
+                        revoked_at: None,
                     },
                 );
                 Ok(CoreOutput {
@@ -1180,8 +1560,12 @@ impl CoreEngine {
                     signature: local.sign_sender_proof(
                         format!("group_join_request:{}:{request_id}", invite.group_id).as_bytes(),
                     ),
-                    status: GroupJoinRequestStatus::Pending,
-                    auto_approve: None,
+                    status: if invite.join_policy == GroupJoinPolicy::OpenByInvite {
+                        GroupJoinRequestStatus::WaitingForGroupCommit
+                    } else {
+                        GroupJoinRequestStatus::PendingApproval
+                    },
+                    auto_approve: Some(invite.join_policy == GroupJoinPolicy::OpenByInvite),
                 };
                 request.validate()?;
                 self.state.group_join_requests.insert(
@@ -1194,6 +1578,8 @@ impl CoreEngine {
                         welcome_pickup: None,
                         manifest: None,
                         start_cursor: None,
+                        lease_token: None,
+                        lease_expires_at: None,
                     },
                 );
                 let invite_token = invite.signature.clone();
@@ -1220,7 +1606,7 @@ impl CoreEngine {
                         },
                     ],
                     view_model: Some(CoreViewModel {
-                        group_join_requests: vec![request],
+                        group_join_requests: vec![request.clone()],
                         ..CoreViewModel::default()
                     }),
                 })
@@ -1241,6 +1627,8 @@ impl CoreEngine {
                         welcome_pickup: None,
                         manifest: None,
                         start_cursor: None,
+                        lease_token: None,
+                        lease_expires_at: None,
                     },
                 );
                 Ok(CoreOutput {
@@ -1272,6 +1660,8 @@ impl CoreEngine {
                             welcome_pickup: None,
                             manifest: None,
                             start_cursor: None,
+                            lease_token: previous.and_then(|stored| stored.lease_token.clone()),
+                            lease_expires_at: previous.and_then(|stored| stored.lease_expires_at),
                         },
                     );
                     effects.push(CoreEffect::FetchIdentityBundle {
@@ -1326,6 +1716,8 @@ impl CoreEngine {
                         welcome_pickup: welcome_pickup.clone(),
                         manifest,
                         start_cursor,
+                        lease_token: previous.and_then(|stored| stored.lease_token.clone()),
+                        lease_expires_at: previous.and_then(|stored| stored.lease_expires_at),
                     },
                 );
                 let mut effects = vec![persist_effect(
@@ -1385,6 +1777,11 @@ impl CoreEngine {
                     view_model: None,
                 })
             }
+            CoreEvent::GroupInvitesListed {
+                group_id,
+                revision,
+                invites,
+            } => self.handle_group_invites_listed(group_id, revision, invites),
             CoreEvent::GroupJoinDecisionApplied { request } => {
                 let previous = self
                     .state
@@ -1407,9 +1804,15 @@ impl CoreEngine {
                         start_cursor: previous
                             .as_ref()
                             .and_then(|stored| stored.start_cursor.clone()),
+                        lease_token: previous
+                            .as_ref()
+                            .and_then(|stored| stored.lease_token.clone()),
+                        lease_expires_at: previous
+                            .as_ref()
+                            .and_then(|stored| stored.lease_expires_at),
                     },
                 );
-                Ok(CoreOutput {
+                let output = CoreOutput {
                     state_update: CoreStateUpdate {
                         conversations_changed: true,
                         ..CoreStateUpdate::default()
@@ -1432,11 +1835,289 @@ impl CoreEngine {
                         },
                     ],
                     view_model: Some(CoreViewModel {
+                        group_join_requests: vec![request.clone()],
+                        ..CoreViewModel::default()
+                    }),
+                };
+                if request.status == GroupJoinRequestStatus::WaitingForGroupCommit {
+                    let continuation = self.handle_command(CoreCommand::ApproveGroupJoin {
+                        group_id: request.group_id,
+                        request_id: request.request_id,
+                    })?;
+                    Ok(merge_outputs(output, continuation))
+                } else {
+                    Ok(output)
+                }
+            }
+            CoreEvent::GroupJoinClaimed {
+                request,
+                lease_token,
+                lease_expires_at,
+            } => {
+                let stored = self
+                    .state
+                    .group_join_requests
+                    .get_mut(&request.request_id)
+                    .ok_or_else(|| {
+                        CoreError::invalid_input("claimed join request does not exist locally")
+                    })?;
+                stored.request = request.clone();
+                stored.lease_token = Some(lease_token);
+                stored.lease_expires_at = Some(lease_expires_at);
+                let persist = persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveGroupJoinRequest {
+                        request_id: request.request_id.clone(),
+                    }],
+                );
+                let transition = self.handle_command(CoreCommand::ApproveGroupJoin {
+                    group_id: request.group_id,
+                    request_id: request.request_id,
+                })?;
+                Ok(merge_outputs(
+                    CoreOutput {
+                        state_update: CoreStateUpdate::default(),
+                        effects: vec![persist],
+                        view_model: None,
+                    },
+                    transition,
+                ))
+            }
+            CoreEvent::GroupJoinCompleted { request } => {
+                if let Some(stored) = self.state.group_join_requests.get_mut(&request.request_id) {
+                    stored.request = request.clone();
+                    stored.lease_token = None;
+                    stored.lease_expires_at = None;
+                }
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        conversations_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveGroupJoinRequest {
+                            request_id: request.request_id.clone(),
+                        }],
+                    )],
+                    view_model: Some(CoreViewModel {
                         group_join_requests: vec![request],
                         ..CoreViewModel::default()
                     }),
                 })
             }
+            CoreEvent::GroupJoinClaimFailed {
+                group_id,
+                request_id,
+                retryable,
+                status: _,
+                code,
+                detail,
+            } => {
+                let message = detail
+                    .or(code)
+                    .unwrap_or_else(|| "group join claim failed".into());
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: if retryable {
+                        vec![CoreEffect::ScheduleTimer {
+                            timer: TimerEffect {
+                                timer_id: format!("group_join_claim:{group_id}:{request_id}"),
+                                delay_ms: 5_000,
+                            },
+                        }]
+                    } else {
+                        vec![CoreEffect::EmitUserNotification {
+                            notification: UserNotificationEffect {
+                                status: SystemStatus::TemporaryNetworkFailure,
+                                message,
+                            },
+                        }]
+                    },
+                    view_model: None,
+                })
+            }
+            CoreEvent::GroupJoinCompleteFailed {
+                group_id,
+                request_id,
+                retryable,
+                status: _,
+                code,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: if retryable {
+                    vec![CoreEffect::ScheduleTimer {
+                        timer: TimerEffect {
+                            timer_id: format!("group_join_complete:{group_id}:{request_id}"),
+                            delay_ms: 5_000,
+                        },
+                    }]
+                } else {
+                    vec![CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message: detail
+                                .or(code)
+                                .unwrap_or_else(|| "group join completion failed".into()),
+                        },
+                    }]
+                },
+                view_model: None,
+            }),
+            CoreEvent::GroupLeaveRequestSubmitted { request } => {
+                let state = self
+                    .state
+                    .group_states
+                    .get_mut(&request.group_id)
+                    .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+                state
+                    .leave_requests
+                    .retain(|stored| stored.request.request_id != request.request_id);
+                state.leave_requests.push(PersistedGroupLeaveRequest {
+                    request: request.clone(),
+                    lease_token: None,
+                    lease_expires_at: None,
+                });
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        conversations_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveGroupState {
+                            group_id: request.group_id.clone(),
+                        }],
+                    )],
+                    view_model: Some(CoreViewModel {
+                        group_leave_requests: vec![request],
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupLeaveRequestsListed { group_id, requests } => {
+                let state = self
+                    .state
+                    .group_states
+                    .get_mut(&group_id)
+                    .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+                let old = std::mem::take(&mut state.leave_requests);
+                state.leave_requests = requests
+                    .iter()
+                    .cloned()
+                    .map(|request| {
+                        let prior = old
+                            .iter()
+                            .find(|stored| stored.request.request_id == request.request_id);
+                        PersistedGroupLeaveRequest {
+                            request,
+                            lease_token: prior.and_then(|stored| stored.lease_token.clone()),
+                            lease_expires_at: prior.and_then(|stored| stored.lease_expires_at),
+                        }
+                    })
+                    .collect();
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        conversations_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveGroupState {
+                            group_id: group_id.clone(),
+                        }],
+                    )],
+                    view_model: Some(CoreViewModel {
+                        group_leave_requests: requests,
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
+            CoreEvent::GroupLeaveClaimed {
+                request,
+                lease_token,
+                lease_expires_at,
+            } => {
+                let state = self
+                    .state
+                    .group_states
+                    .get_mut(&request.group_id)
+                    .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+                let stored = state
+                    .leave_requests
+                    .iter_mut()
+                    .find(|stored| stored.request.request_id == request.request_id)
+                    .ok_or_else(|| {
+                        CoreError::invalid_input("claimed leave request does not exist locally")
+                    })?;
+                stored.request = request.clone();
+                stored.lease_token = Some(lease_token);
+                stored.lease_expires_at = Some(lease_expires_at);
+                let persist = persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveGroupState {
+                        group_id: request.group_id.clone(),
+                    }],
+                );
+                let transition = self.handle_command(CoreCommand::ApproveGroupLeave {
+                    group_id: request.group_id,
+                    request_id: request.request_id,
+                })?;
+                Ok(merge_outputs(
+                    CoreOutput {
+                        state_update: CoreStateUpdate::default(),
+                        effects: vec![persist],
+                        view_model: None,
+                    },
+                    transition,
+                ))
+            }
+            CoreEvent::GroupLeaveRequestSubmitFailed {
+                group_id,
+                request_id,
+                retryable,
+                status: _,
+                code,
+                detail,
+            }
+            | CoreEvent::GroupLeaveClaimFailed {
+                group_id,
+                request_id,
+                retryable,
+                status: _,
+                code,
+                detail,
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: if retryable {
+                    vec![CoreEffect::ScheduleTimer {
+                        timer: TimerEffect {
+                            timer_id: format!("group_leave:{group_id}:{request_id}"),
+                            delay_ms: 5_000,
+                        },
+                    }]
+                } else {
+                    vec![CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message: detail
+                                .or(code)
+                                .unwrap_or_else(|| "group leave operation failed".into()),
+                        },
+                    }]
+                },
+                view_model: None,
+            }),
             CoreEvent::GroupOutboxSealed {
                 group_id,
                 sealed_at,
@@ -2155,6 +2836,7 @@ impl CoreEngine {
         title: String,
         member_user_ids: Vec<String>,
     ) -> CoreResult<CoreOutput> {
+        self.require_group_authorization_v2()?;
         let title = title.trim().to_string();
         if title.is_empty() {
             return Err(CoreError::invalid_input("group title must not be empty"));
@@ -2239,21 +2921,23 @@ impl CoreEngine {
             ));
         }
 
-        let artifacts = self
+        let canonical_summary = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .create_conversation(&conversation_id, &peer_keypackages)?;
-        let summary = self
+            .create_owner_conversation(&conversation_id)?;
+        let mut staged_mls = self
             .state
             .mls_adapter
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter missing after create"))?
-            .export_group_summary(&conversation_id)?;
+            .ok_or_else(|| CoreError::invalid_state("mls adapter missing after owner genesis"))?
+            .fork()?;
+        let artifacts = staged_mls.add_members(&conversation_id, &peer_keypackages)?;
+        let summary = staged_mls.export_group_summary(&conversation_id)?;
         self.state
             .mls_summaries
-            .insert(conversation_id.clone(), summary.clone());
+            .insert(conversation_id.clone(), canonical_summary.clone());
 
         let now = current_unix_millis(self.state.message_nonce);
         let mut manifest = self.build_group_manifest(
@@ -2267,14 +2951,31 @@ impl CoreEngine {
             now,
         )?;
         manifest.validate()?;
+        let mut genesis_manifest = manifest.clone();
+        genesis_manifest
+            .members
+            .retain(|member| member.user_id == local_identity.user_identity.user_id);
+        genesis_manifest.member_devices.retain(|device| {
+            device.user_id == local_identity.user_identity.user_id
+                && device.device_id == local_identity.device_identity.device_id
+        });
+        genesis_manifest.admins.clear();
+        genesis_manifest.roster_version = 0;
+        genesis_manifest.mls_epoch_hint = canonical_summary.epoch;
+        genesis_manifest.last_commit_message_id = None;
+        genesis_manifest.signature = self.sign_manifest(&genesis_manifest)?;
+        genesis_manifest.validate()?;
         let group_state = PersistedGroupState {
             group_id: group_id.clone(),
             conversation_id: conversation_id.clone(),
-            manifest: manifest.clone(),
+            manifest: genesis_manifest.clone(),
             local_role: Some(GroupRole::Owner),
             welcome_pickup: None,
             dissolved_at: None,
             pending_membership_transition: None,
+            consistency_state: GroupConsistencyState::Ready,
+            pending_group_transition: None,
+            leave_requests: Vec::new(),
         };
         self.state
             .group_states
@@ -2293,14 +2994,12 @@ impl CoreEngine {
                 conversation: Conversation {
                     conversation_id: conversation_id.clone(),
                     kind: ConversationKind::Group,
-                    member_users: {
-                        let mut users = member_user_ids.clone();
-                        users.push(local_identity.user_identity.user_id.clone());
-                        users.sort();
-                        users.dedup();
-                        users
-                    },
-                    member_devices,
+                    member_users: vec![local_identity.user_identity.user_id.clone()],
+                    member_devices: vec![ConversationMember {
+                        user_id: local_identity.user_identity.user_id.clone(),
+                        device_id: local_identity.device_identity.device_id.clone(),
+                        status: DeviceStatusKind::Active,
+                    }],
                     state: ConversationState::Active,
                     updated_at: now,
                 },
@@ -2314,14 +3013,6 @@ impl CoreEngine {
         );
 
         let capability = self.group_capability(&group_id, GroupRole::Owner)?;
-        // For the initial group creation there is no previous manifest.
-        // Synthesise a genesis state with roster_version 0 so the proof
-        // chain starts cleanly (0 -> 1).
-        let genesis_manifest = GroupManifest {
-            roster_version: 0,
-            last_commit_message_id: None,
-            ..manifest.clone()
-        };
         let mut commit = self.build_group_envelope(
             &group_id,
             &conversation_id,
@@ -2335,12 +3026,8 @@ impl CoreEngine {
         let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode manifest: {error}"))
         })?;
-        let control_plaintext = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&conversation_id, &manifest_payload)?;
+        let control_plaintext =
+            staged_mls.encrypt_application(&conversation_id, &manifest_payload)?;
         let mut control = self.build_group_envelope(
             &group_id,
             &conversation_id,
@@ -2348,32 +3035,81 @@ impl CoreEngine {
             GroupEnvelopeVisibility::Protocol,
             control_plaintext.payload_b64,
         )?;
-        let membership_proof = self.build_membership_proof(
+        let mut membership_proof = self.build_membership_proof(
             "create",
             &genesis_manifest,
             &manifest,
             &commit.message_id,
             &control.message_id,
         )?;
+        let transition_id = format!("group-transition:{}", membership_proof.control_message_id);
+        let mut state_event = self.build_group_envelope(
+            &group_id,
+            &conversation_id,
+            GroupMessageType::ControlGroupStateEvent,
+            GroupEnvelopeVisibility::Visible,
+            "pending-state-event".into(),
+        )?;
+        state_event.transition_id = Some(transition_id.clone());
+        let state_event_record = GroupOutboxRecord {
+            seq: 0,
+            group_id: group_id.clone(),
+            message_id: state_event.message_id.clone(),
+            received_at: state_event.created_at,
+            expires_at: None,
+            state: GroupOutboxRecordState::Available,
+            envelope: state_event.clone(),
+        };
+        let state_event_plaintext = Self::derive_group_state_event(
+            &genesis_manifest,
+            &manifest,
+            &membership_proof,
+            &state_event_record,
+        )
+        .ok_or_else(|| CoreError::invalid_state("failed to build genesis group state event"))?;
+        let protected_state_event =
+            staged_mls.encrypt_application(&conversation_id, state_event_plaintext.as_bytes())?;
+        state_event.inline_ciphertext = Some(protected_state_event.payload_b64.clone());
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        state_event.sender_proof.value =
+            identity.sign_sender_proof(protected_state_event.payload_b64.as_bytes());
+        membership_proof.state_event_message_id = Some(state_event.message_id.clone());
+        membership_proof.signature =
+            identity.sign_sender_proof(&Self::membership_proof_payload(&membership_proof));
+        commit.transition_id = Some(transition_id.clone());
+        control.transition_id = Some(transition_id.clone());
         commit.membership_proof = Some(membership_proof.clone());
-        control.membership_proof = Some(membership_proof);
+        control.membership_proof = Some(membership_proof.clone());
+        state_event.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
         self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(
+            state_event.clone(),
+            capability.clone(),
+            Some(state_event_plaintext.clone()),
+        );
 
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
                 group_id: group_id.clone(),
                 conversation_id: conversation_id.clone(),
-                manifest: manifest.clone(),
+                manifest: genesis_manifest.clone(),
                 local_role: Some(GroupRole::Owner),
                 welcome_pickup: None,
                 dissolved_at: None,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Reconciling,
+                pending_group_transition: None,
+                leave_requests: Vec::new(),
             },
         );
 
-        let mut persist_ops = vec![
+        let persist_ops = vec![
             PersistOp::SaveConversation {
                 conversation_id: conversation_id.clone(),
             },
@@ -2392,8 +3128,11 @@ impl CoreEngine {
             PersistOp::SaveOutgoingGroupEnvelope {
                 message_id: control.message_id.clone(),
             },
+            PersistOp::SaveOutgoingGroupEnvelope {
+                message_id: state_event.message_id.clone(),
+            },
         ];
-        let mut transport_effects = Vec::new();
+        let mut pending_welcomes = Vec::new();
         for welcome in artifacts.welcomes {
             let descriptor =
                 self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
@@ -2403,57 +3142,13 @@ impl CoreEngine {
                 welcome.recipient_device_id,
                 descriptor.endpoint
             );
-            transport_effects.push(CoreEffect::PutWelcomePickup {
-                put: PutWelcomePickupRequest {
-                    descriptor: descriptor.clone(),
-                    welcome_b64: welcome.payload_b64,
-                    manifest: Some(manifest.clone()),
-                    headers: BTreeMap::new(),
-                },
+            pending_welcomes.push(PutWelcomePickupRequest {
+                descriptor: descriptor.clone(),
+                welcome_b64: welcome.payload_b64,
+                manifest: Some(manifest.clone()),
+                headers: BTreeMap::new(),
             });
-            if let Some(invitee_user_id) = invitee_user_by_device.get(&welcome.recipient_device_id)
-            {
-                let direct_conversation_id = self
-                    .active_direct_conversation_for_peer(invitee_user_id)
-                    .map(|(conversation_id, _)| conversation_id)
-                    .unwrap_or_else(|| {
-                        direct_conversation_id(
-                            &local_identity.user_identity.user_id,
-                            invitee_user_id,
-                        )
-                    });
-                let invite = GroupWelcomePickupControl {
-                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-                    group_id: group_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    title: title.clone(),
-                    inviter_user_id: local_identity.user_identity.user_id.clone(),
-                    welcome_pickup_descriptor: descriptor,
-                };
-                let invite_payload = serde_json::to_vec(&invite).map_err(|error| {
-                    CoreError::invalid_input(format!(
-                        "failed to encode group welcome pickup control: {error}"
-                    ))
-                })?;
-                let envelope = self.build_envelope(
-                    &direct_conversation_id,
-                    &welcome.recipient_device_id,
-                    MessageType::ControlGroupWelcomePickup,
-                    STANDARD.encode(invite_payload),
-                )?;
-                log::info!(
-                    "create_group_conversation: enqueue group welcome control group_id={} invitee_user_id={} recipient_device_id={} direct_conversation_id={} message_id={}",
-                    group_id,
-                    invitee_user_id,
-                    welcome.recipient_device_id,
-                    direct_conversation_id,
-                    envelope.message_id
-                );
-                persist_ops.push(PersistOp::SaveOutgoingEnvelope {
-                    message_id: envelope.message_id.clone(),
-                });
-                self.enqueue_envelopes(invitee_user_id.clone(), vec![envelope]);
-            } else {
+            if !invitee_user_by_device.contains_key(&welcome.recipient_device_id) {
                 log::warn!(
                     "create_group_conversation: missing invitee user mapping for welcome recipient_device_id={} group_id={}",
                     welcome.recipient_device_id,
@@ -2461,16 +3156,40 @@ impl CoreEngine {
                 );
             }
         }
-        let mut effects = vec![persist_effect(&self.state, persist_ops)];
-        effects.extend(transport_effects);
-
-        let pickup_descriptors: Vec<_> = effects
+        let pickup_descriptors = pending_welcomes
             .iter()
-            .filter_map(|effect| match effect {
-                CoreEffect::PutWelcomePickup { put } => Some(put.descriptor.clone()),
-                _ => None,
-            })
-            .collect();
+            .map(|welcome| welcome.descriptor.clone())
+            .collect::<Vec<_>>();
+        let mls_patch = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .conversation_patch(&staged_mls, &conversation_id)?;
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.pending_group_transition = Some(PersistedPendingGroupTransition {
+                transition_id,
+                intent: GroupTransitionIntent::typed(GroupTransitionOperation::Create),
+                stage: PendingGroupTransitionStage::AwaitingAuthorizationBootstrap,
+                base_manifest_hash: Self::manifest_sha256(&genesis_manifest)?,
+                base_roster_version: genesis_manifest.roster_version,
+                base_commit_message_id: genesis_manifest.last_commit_message_id.clone(),
+                proposed_manifest: manifest.clone(),
+                mls_patch: Some(mls_patch),
+                staged_mls_state: None,
+                envelopes: vec![commit.clone(), control.clone(), state_event.clone()],
+                state_event_plaintext: Some(state_event_plaintext),
+                welcomes: pending_welcomes,
+                join_request_id: None,
+                retries: 0,
+                first_seq: None,
+                last_seq: None,
+            });
+        }
+        let mut effects = vec![persist_effect(&self.state, persist_ops)];
+        effects.push(CoreEffect::InitializeGroupAuthorization {
+            initialize: self.initialize_group_authorization_request(&group_id)?,
+        });
 
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
@@ -2564,6 +3283,9 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
+        if state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild {
+            return Ok(CoreOutput::default());
+        }
         let should_retry_pending = reason.as_deref().is_some_and(|reason| {
             matches!(
                 reason,
@@ -2575,6 +3297,9 @@ impl CoreEngine {
         } else {
             Vec::new()
         };
+        if self.state.pending_sync_group_head.contains(&group_id) {
+            return Ok(CoreOutput::default());
+        }
         // Check head first so we only fetch when there is a real gap.
         // This avoids a wasteful fetch round-trip when the cursor is already
         // caught up — each group on every AppForegrounded / AppStarted fires
@@ -2747,6 +3472,125 @@ impl CoreEngine {
         })
     }
 
+    fn handle_welcome_pickup_put(
+        &mut self,
+        descriptor: WelcomePickupDescriptor,
+    ) -> CoreResult<CoreOutput> {
+        let group_state = self.state.group_states.get(&descriptor.group_id).cloned();
+        let mut completed_join = None;
+        let mut persist_ops = vec![PersistOp::SaveGroupState {
+            group_id: descriptor.group_id.clone(),
+        }];
+        if let Some(state) = self.state.group_states.get_mut(&descriptor.group_id) {
+            if let Some(pending) = state.pending_group_transition.as_mut() {
+                pending
+                    .welcomes
+                    .retain(|welcome| welcome.descriptor.device_id != descriptor.device_id);
+                if pending.stage == PendingGroupTransitionStage::AcceptedPublishingWelcomes
+                    && pending.welcomes.is_empty()
+                {
+                    completed_join = pending.join_request_id.clone().map(|request_id| {
+                        (
+                            request_id,
+                            pending.transition_id.clone(),
+                            pending.proposed_manifest.clone(),
+                            pending.last_seq.unwrap_or(0),
+                        )
+                    });
+                    state.pending_group_transition = None;
+                }
+            }
+        }
+        if let Some(group_state) = group_state {
+            if let Some(recipient_user_id) = group_state
+                .manifest
+                .member_devices
+                .iter()
+                .find(|device| device.device_id == descriptor.device_id)
+                .map(|device| device.user_id.clone())
+            {
+                let local_user_id = self.local_identity_user_id()?;
+                if recipient_user_id != local_user_id
+                    && self.state.contacts.contains_key(&recipient_user_id)
+                {
+                    let direct_conversation_id = self
+                        .active_direct_conversation_for_peer(&recipient_user_id)
+                        .map(|(conversation_id, _)| conversation_id)
+                        .unwrap_or_else(|| {
+                            direct_conversation_id(&local_user_id, &recipient_user_id)
+                        });
+                    let invite = GroupWelcomePickupControl {
+                        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                        group_id: group_state.group_id.clone(),
+                        conversation_id: group_state.conversation_id.clone(),
+                        title: group_state.manifest.title.clone(),
+                        inviter_user_id: local_user_id,
+                        welcome_pickup_descriptor: descriptor.clone(),
+                    };
+                    let payload = serde_json::to_vec(&invite).map_err(|error| {
+                        CoreError::invalid_input(format!(
+                            "failed to encode group welcome pickup control: {error}"
+                        ))
+                    })?;
+                    let envelope = self.build_envelope(
+                        &direct_conversation_id,
+                        &descriptor.device_id,
+                        MessageType::ControlGroupWelcomePickup,
+                        STANDARD.encode(payload),
+                    )?;
+                    persist_ops.push(PersistOp::SaveOutgoingEnvelope {
+                        message_id: envelope.message_id.clone(),
+                    });
+                    self.enqueue_envelopes(recipient_user_id, vec![envelope]);
+                }
+            }
+        }
+        let mut output = CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(&self.state, persist_ops)],
+            view_model: Some(CoreViewModel {
+                welcome_pickups: vec![descriptor.clone()],
+                ..CoreViewModel::default()
+            }),
+        };
+        if let Some((request_id, transition_id, manifest, start_seq)) = completed_join {
+            let state = self
+                .state
+                .group_states
+                .get(&descriptor.group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+            let lease_token = self
+                .state
+                .group_join_requests
+                .get(&request_id)
+                .and_then(|stored| stored.lease_token.clone())
+                .ok_or_else(|| {
+                    CoreError::invalid_state("group join completion is missing its lease")
+                })?;
+            output.effects.push(CoreEffect::CompleteGroupJoinRequest {
+                complete: CompleteGroupJoinRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: descriptor.group_id.clone(),
+                    request_id,
+                    capability: self.group_capability_for_state(state)?,
+                    lease_token,
+                    transition_id,
+                    welcome_pickup: descriptor.clone(),
+                    manifest,
+                    start_cursor: GroupCursor {
+                        group_id: descriptor.group_id.clone(),
+                        last_fetched_seq: start_seq,
+                        updated_at: current_unix_millis(self.state.message_nonce),
+                    },
+                },
+            });
+        }
+        self.merge_with_transport_flush(output)
+    }
+
     fn create_group_invite_link(
         &mut self,
         group_id: String,
@@ -2853,6 +3697,86 @@ impl CoreEngine {
                 },
             }],
             view_model: None,
+        })
+    }
+
+    fn list_group_invites(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let capability = self.group_capability_for_state(state)?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::ListGroupInvites {
+                list: ListGroupInvitesRequest {
+                    group_id: group_id.clone(),
+                    capability,
+                },
+            }],
+            view_model: Some(CoreViewModel {
+                group_invites: self
+                    .state
+                    .group_invites
+                    .values()
+                    .filter(|invite| invite.group_id == group_id)
+                    .cloned()
+                    .collect(),
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn handle_group_invites_listed(
+        &mut self,
+        group_id: String,
+        revision: u64,
+        invites: Vec<crate::transport_contract::GroupInviteSummary>,
+    ) -> CoreResult<CoreOutput> {
+        let existing_ids: Vec<String> = self
+            .state
+            .group_invites
+            .values()
+            .filter(|invite| invite.group_id == group_id)
+            .map(|invite| invite.invite_id.clone())
+            .collect();
+        let mut persist_ops = Vec::new();
+        for invite_id in existing_ids {
+            self.state.group_invites.remove(&invite_id);
+            persist_ops.push(PersistOp::DeleteGroupInvite { invite_id });
+        }
+        for summary in invites {
+            let invite_id = summary.invite.invite_id.clone();
+            self.state.group_invites.insert(
+                invite_id.clone(),
+                PersistedGroupInvite {
+                    group_id: group_id.clone(),
+                    invite_id: invite_id.clone(),
+                    invite_url: summary.invite_url,
+                    document: summary.invite,
+                    revision,
+                    status: summary.status,
+                    uses: summary.uses,
+                    max_uses: summary.max_uses,
+                    revoked_at: summary.revoked_at,
+                },
+            );
+            persist_ops.push(PersistOp::SaveGroupInvite { invite_id });
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![persist_effect(&self.state, persist_ops)],
+            view_model: Some(CoreViewModel {
+                group_invites: self
+                    .state
+                    .group_invites
+                    .values()
+                    .filter(|invite| invite.group_id == group_id)
+                    .cloned()
+                    .collect(),
+                ..CoreViewModel::default()
+            }),
         })
     }
 
@@ -2971,17 +3895,76 @@ impl CoreEngine {
                 "only owner or admin can approve group join requests",
             ));
         }
-        let join = self
+        let stored_join = self
             .state
             .group_join_requests
             .get(&request_id)
             .ok_or_else(|| CoreError::invalid_input("join request does not exist"))?
-            .request
             .clone();
-        if join.group_id != group_id || join.status != GroupJoinRequestStatus::Pending {
+        let join = stored_join.request.clone();
+        if join.group_id != group_id
+            || !matches!(
+                join.status,
+                GroupJoinRequestStatus::Pending
+                    | GroupJoinRequestStatus::PendingApproval
+                    | GroupJoinRequestStatus::WaitingForGroupCommit
+                    | GroupJoinRequestStatus::TransitionInProgress
+            )
+        {
             return Err(CoreError::invalid_input(
                 "join request is not pending for this group",
             ));
+        }
+        if matches!(
+            join.status,
+            GroupJoinRequestStatus::Pending | GroupJoinRequestStatus::PendingApproval
+        ) {
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::DecideGroupJoinRequest {
+                    decide: DecideGroupJoinRequest {
+                        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                        group_id: group_id.clone(),
+                        request_id,
+                        decision: GroupJoinDecision::Approve,
+                        capability: self.group_capability(&group_id, role)?,
+                        welcome_pickup: None,
+                        manifest: None,
+                        start_cursor: None,
+                        reason: None,
+                        headers: BTreeMap::new(),
+                    },
+                }],
+                view_model: Some(CoreViewModel {
+                    group_join_requests: vec![join],
+                    ..CoreViewModel::default()
+                }),
+            });
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        if stored_join.lease_token.is_none()
+            || stored_join
+                .lease_expires_at
+                .is_none_or(|expires_at| expires_at <= now)
+        {
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::ClaimGroupJoinRequest {
+                    claim: ClaimGroupJoinRequest {
+                        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                        group_id: group_id.clone(),
+                        request_id,
+                        capability: self.group_capability(&group_id, role)?,
+                    },
+                }],
+                view_model: None,
+            });
         }
         let group_state = self
             .state
@@ -3059,6 +4042,18 @@ impl CoreEngine {
                 status: GroupMemberStatus::Active,
             });
         }
+        for device in &peer_devices {
+            if !manifest.member_devices.iter().any(|member_device| {
+                member_device.user_id == device.user_id
+                    && member_device.device_id == device.device_id
+            }) {
+                manifest.member_devices.push(GroupMemberDevice {
+                    user_id: device.user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    status: GroupMemberStatus::Active,
+                });
+            }
+        }
         self.apply_membership_change_to_manifest(
             &mut manifest,
             artifacts.epoch,
@@ -3075,6 +4070,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -3126,6 +4124,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -3146,11 +4147,10 @@ impl CoreEngine {
                 },
             ],
         )];
-        let mut first_welcome = None;
         for welcome in artifacts.welcomes {
-            let descriptor =
+            let mut descriptor =
                 self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
-            first_welcome.get_or_insert_with(|| descriptor.clone());
+            descriptor.request_id = Some(request_id.clone());
             effects.push(CoreEffect::PutWelcomePickup {
                 put: PutWelcomePickupRequest {
                     descriptor,
@@ -3167,25 +4167,6 @@ impl CoreEngine {
                 _ => None,
             })
             .collect();
-        let start_cursor = GroupCursor {
-            group_id: group_id.clone(),
-            last_fetched_seq: 0,
-            updated_at: current_unix_millis(self.state.message_nonce),
-        };
-        effects.push(CoreEffect::DecideGroupJoinRequest {
-            decide: DecideGroupJoinRequest {
-                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-                group_id: group_id.clone(),
-                request_id,
-                decision: GroupJoinDecision::Approve,
-                capability,
-                welcome_pickup: first_welcome,
-                manifest: Some(manifest),
-                start_cursor: Some(start_cursor),
-                reason: None,
-                headers: BTreeMap::new(),
-            },
-        });
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
@@ -3342,6 +4323,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -3392,6 +4376,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         let mut effects = vec![persist_effect(
@@ -3460,6 +4447,15 @@ impl CoreEngine {
         &mut self,
         group_id: String,
         target_user_id: String,
+    ) -> CoreResult<CoreOutput> {
+        self.remove_group_member_with_operation(group_id, target_user_id, "remove")
+    }
+
+    fn remove_group_member_with_operation(
+        &mut self,
+        group_id: String,
+        target_user_id: String,
+        proof_operation: &str,
     ) -> CoreResult<CoreOutput> {
         let target_user_id = target_user_id.trim().to_string();
         if target_user_id.is_empty() {
@@ -3533,9 +4529,19 @@ impl CoreEngine {
         let now = current_unix_millis(self.state.message_nonce);
         for member in &mut manifest.members {
             if member.user_id == target_user_id && member.status == GroupMemberStatus::Active {
-                member.status = GroupMemberStatus::Removed;
+                member.status = if proof_operation == "leave" {
+                    GroupMemberStatus::Left
+                } else {
+                    GroupMemberStatus::Removed
+                };
             }
         }
+        for device in &mut manifest.member_devices {
+            if device.user_id == target_user_id && device.status == GroupMemberStatus::Active {
+                device.status = GroupMemberStatus::Removed;
+            }
+        }
+        manifest.admins.retain(|admin| admin != &target_user_id);
         self.apply_membership_change_to_manifest(&mut manifest, artifacts.epoch, now)?;
         self.sync_conversation_members_from_manifest(&group_state.conversation_id, &manifest)?;
         self.state.group_states.insert(
@@ -3548,6 +4554,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -3578,7 +4587,7 @@ impl CoreEngine {
             control_plaintext.payload_b64,
         )?;
         let membership_proof = self.build_membership_proof(
-            "remove",
+            proof_operation,
             &previous_manifest,
             &manifest,
             &commit.message_id,
@@ -3598,6 +4607,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         let effects = vec![persist_effect(
@@ -3661,83 +4673,134 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
             .clone();
-        let conversation_id = group_state.conversation_id.clone();
-        let leave_payload = serde_json::to_vec(&serde_json::json!({
-            "group_id": group_id,
-            "leaving_user_id": local_identity.user_identity.user_id,
-            "leaving_device_id": local_identity.device_identity.device_id,
-            "left_at": current_unix_millis(self.state.message_nonce),
-        }))
-        .map_err(|error| {
-            CoreError::invalid_input(format!("failed to encode leave payload: {error}"))
-        })?;
-        let leave_b64 = STANDARD.encode(&leave_payload);
-        let capability = self.group_capability(&group_id, role)?;
-        let envelope = self.build_group_envelope(
-            &group_id,
-            &conversation_id,
-            GroupMessageType::ControlGroupLeaveRequested,
-            GroupEnvelopeVisibility::Visible,
-            leave_b64,
-        )?;
-        self.enqueue_group_envelope(envelope.clone(), capability, None);
-        if let Some(conversation) = self.state.conversations.get_mut(&conversation_id) {
-            conversation.conversation.state = ConversationState::NeedsRebuild;
-            conversation.recovery_status = RecoveryStatus::NeedsRebuild;
-        }
-        let previous_manifest = group_state.manifest.clone();
-        let mut manifest = previous_manifest.clone();
-        for member in &mut manifest.members {
-            if member.user_id == local_identity.user_identity.user_id {
-                member.status = GroupMemberStatus::Left;
-            }
-        }
-        let now = current_unix_millis(self.state.message_nonce);
-        manifest.roster_version = manifest.roster_version.saturating_add(1);
-        manifest.updated_at = now;
-        manifest.signer_user_id = local_identity.user_identity.user_id.clone();
-        manifest.signer_device_id = local_identity.device_identity.device_id.clone();
-        manifest.signature = self.sign_manifest(&manifest)?;
-        manifest.validate()?;
-        self.state.group_states.insert(
-            group_id.clone(),
-            PersistedGroupState {
+        let existing = group_state.leave_requests.iter().find(|stored| {
+            stored.request.leaver_user_id == local_identity.user_identity.user_id
+                && stored.request.leaver_device_id == local_identity.device_identity.device_id
+                && matches!(
+                    stored.request.status,
+                    GroupLeaveRequestStatus::WaitingForGroupCommit
+                        | GroupLeaveRequestStatus::TransitionInProgress
+                )
+        });
+        let request = if let Some(existing) = existing {
+            existing.request.clone()
+        } else {
+            let requested_at = current_unix_millis(self.state.message_nonce);
+            let request_id = format!(
+                "group-leave:{}:{}:{}",
+                group_id,
+                local_identity.user_identity.user_id,
+                local_identity.device_identity.device_id
+            );
+            let request_capability = local_identity
+                .sign_sender_proof(format!("group_leave_request:{request_id}").as_bytes());
+            let signature_payload = format!(
+                "{}\n{}\n{}\n{}\n{}\n{}",
+                crate::model::CURRENT_MODEL_VERSION,
+                request_id,
+                group_id,
+                local_identity.user_identity.user_id,
+                local_identity.device_identity.device_id,
+                requested_at
+            );
+            GroupLeaveRequest {
+                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                request_id,
                 group_id: group_id.clone(),
-                conversation_id: conversation_id.clone(),
-                manifest,
-                local_role: None,
-                welcome_pickup: group_state.welcome_pickup,
-                dissolved_at: group_state.dissolved_at,
-                pending_membership_transition: group_state.pending_membership_transition,
-            },
-        );
-        self.merge_with_transport_flush(CoreOutput {
+                leaver_user_id: local_identity.user_identity.user_id.clone(),
+                leaver_device_id: local_identity.device_identity.device_id.clone(),
+                requested_at,
+                request_capability,
+                signature: local_identity.sign_sender_proof(signature_payload.as_bytes()),
+                status: GroupLeaveRequestStatus::WaitingForGroupCommit,
+            }
+        };
+        request.validate()?;
+        Ok(CoreOutput {
             state_update: CoreStateUpdate {
-                conversations_changed: true,
-                messages_changed: true,
-                system_statuses_changed: vec![SystemStatus::ConversationNeedsRebuild],
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![
-                    PersistOp::SaveGroupState {
-                        group_id: group_id.clone(),
-                    },
-                    PersistOp::SaveOutgoingGroupEnvelope {
-                        message_id: envelope.message_id.clone(),
-                    },
-                ],
-            )],
+            effects: vec![CoreEffect::SubmitGroupLeaveRequest {
+                submit: SubmitGroupLeaveRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: group_id.clone(),
+                    request: request.clone(),
+                    capability: self.group_capability(&group_id, role)?,
+                },
+            }],
             view_model: Some(CoreViewModel {
-                messages: vec![MessageSummary {
-                    conversation_id,
-                    message_id: envelope.message_id,
-                    message_type: MessageType::ControlDeviceMembershipChanged,
-                }],
+                group_leave_requests: vec![request],
                 ..CoreViewModel::default()
             }),
         })
+    }
+
+    fn list_group_leave_requests(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can list group leave requests",
+            ));
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::ListGroupLeaveRequests {
+                list: ListGroupLeaveRequestsRequest {
+                    group_id: group_id.clone(),
+                    capability: self.group_capability(&group_id, role)?,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn approve_group_leave(
+        &mut self,
+        group_id: String,
+        request_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can approve group leave requests",
+            ));
+        }
+        let stored = self
+            .state
+            .group_states
+            .get(&group_id)
+            .and_then(|state| {
+                state
+                    .leave_requests
+                    .iter()
+                    .find(|stored| stored.request.request_id == request_id)
+            })
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_input("group leave request does not exist"))?;
+        let now = current_unix_millis(self.state.message_nonce);
+        if stored.lease_token.is_none()
+            || stored
+                .lease_expires_at
+                .is_none_or(|expires_at| expires_at <= now)
+        {
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::ClaimGroupLeaveRequest {
+                    claim: ClaimGroupLeaveRequest {
+                        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                        group_id,
+                        request_id,
+                        capability: self.group_capability(&stored.request.group_id, role)?,
+                    },
+                }],
+                view_model: None,
+            });
+        }
+        self.remove_group_member_with_operation(group_id, stored.request.leaver_user_id, "leave")
     }
 
     fn transfer_group_ownership(
@@ -3800,11 +4863,14 @@ impl CoreEngine {
             }
         }
         manifest.owner_user_id = new_owner_user_id.clone();
-        if !manifest.admins.iter().any(|a| a == &new_owner_user_id) {
-            manifest
-                .admins
-                .retain(|a| a != &local_identity.user_identity.user_id);
-        }
+        manifest.admins = manifest
+            .members
+            .iter()
+            .filter(|member| {
+                member.status == GroupMemberStatus::Active && member.role == GroupRole::Admin
+            })
+            .map(|member| member.user_id.clone())
+            .collect();
         manifest.roster_version = manifest.roster_version.saturating_add(1);
         manifest.updated_at = now;
         manifest.signer_user_id = local_identity.user_identity.user_id.clone();
@@ -3850,6 +4916,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -3949,6 +5018,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -4079,6 +5151,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup,
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: group_state.pending_membership_transition.clone(),
+                consistency_state: group_state.consistency_state.clone(),
+                pending_group_transition: group_state.pending_group_transition.clone(),
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -4390,8 +5465,7 @@ impl CoreEngine {
             };
             if should_drive_recovery {
                 if let Some(device_id) = device_id.clone() {
-                    output =
-                        merge_outputs(output, self.sync_inbox(device_id.clone(), None)?);
+                    output = merge_outputs(output, self.sync_inbox(device_id.clone(), None)?);
                     output =
                         merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
                 }
@@ -4598,12 +5672,11 @@ impl CoreEngine {
         let inbox_websocket_endpoint = deployment.inbox_websocket_endpoint.clone();
         let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
         let headers = self.device_runtime_headers()?;
-        let retry_reset_ops =
-            if Self::should_reset_pending_direct_transport(reason.as_deref()) {
-                self.reset_pending_direct_transport_for_retry(&device_id)
-            } else {
-                Vec::new()
-            };
+        let retry_reset_ops = if Self::should_reset_pending_direct_transport(reason.as_deref()) {
+            self.reset_pending_direct_transport_for_retry(&device_id)
+        } else {
+            Vec::new()
+        };
         let sync_state = self
             .state
             .sync_states
@@ -5028,7 +6101,58 @@ impl CoreEngine {
             ),
         );
         let output = merge_outputs(output, self.restore_degraded_output());
+        let output = merge_outputs(
+            output,
+            self.initialize_locally_hosted_group_authorizations(),
+        );
         self.merge_with_transport_flush(output)
+    }
+
+    fn initialize_locally_hosted_group_authorizations(&self) -> CoreOutput {
+        let Some(deployment) = self.state.deployment_bundle.as_ref() else {
+            return CoreOutput::default();
+        };
+        if !deployment
+            .runtime_config
+            .features
+            .iter()
+            .any(|feature| feature == "group_authorization_v2")
+        {
+            return CoreOutput::default();
+        }
+        let Some(local_user_id) = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.user_identity.user_id.as_str())
+        else {
+            return CoreOutput::default();
+        };
+        let local_base = deployment.inbox_http_endpoint.trim_end_matches('/');
+        let mut effects = Vec::new();
+        for (group_id, state) in &self.state.group_states {
+            if state.local_role != Some(GroupRole::Owner)
+                || state.manifest.owner_user_id != local_user_id
+                || !state.manifest.outbox.endpoint.starts_with(local_base)
+            {
+                continue;
+            }
+            match self.initialize_group_authorization_request(group_id) {
+                Ok(initialize) => {
+                    effects.push(CoreEffect::InitializeGroupAuthorization { initialize })
+                }
+                Err(error) => log::warn!(
+                    "skipping group authorization migration for {}: {}",
+                    group_id,
+                    error
+                ),
+            }
+        }
+        CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects,
+            view_model: None,
+        }
     }
 
     fn restore_degraded_output(&self) -> CoreOutput {
@@ -5125,7 +6249,7 @@ impl CoreEngine {
             let local_role = group_state
                 .local_role
                 .unwrap_or(crate::model::GroupRole::Member);
-            let capability = group_capability_for_manifest(&group_state.manifest, local_role);
+            let capability = self.group_capability(&group_id, local_role)?;
             self.state
                 .group_realtime_sessions
                 .entry(group_id.clone())
@@ -5208,9 +6332,7 @@ impl CoreEngine {
                 system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![CoreEffect::ScheduleTimer {
-                timer,
-            }],
+            effects: vec![CoreEffect::ScheduleTimer { timer }],
             view_model: None,
         })
     }
@@ -5257,10 +6379,7 @@ impl CoreEngine {
             }
         });
         let mut effects = vec![CoreEffect::ScheduleTimer {
-            timer: TimerEffect {
-                timer_id,
-                delay_ms,
-            },
+            timer: TimerEffect { timer_id, delay_ms },
         }];
         if let Some(notification) = notification {
             effects.push(notification);
@@ -5294,8 +6413,75 @@ impl CoreEngine {
         &mut self,
         group_id: String,
         retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
         detail: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        if status == Some(403) && code.as_deref() == Some("group_membership_revoked") {
+            let mut persist_ops = Vec::new();
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.local_role = None;
+                state.consistency_state = GroupConsistencyState::BlockedNeedsRebuild;
+                persist_ops.push(PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                });
+                if let Some(conversation) = self.state.conversations.get_mut(&state.conversation_id)
+                {
+                    conversation.conversation.state = ConversationState::Closed;
+                    persist_ops.push(PersistOp::SaveConversation {
+                        conversation_id: state.conversation_id.clone(),
+                    });
+                }
+            }
+            self.state.pending_sync_group_head.remove(&group_id);
+            self.state.group_sync_target_head.remove(&group_id);
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    system_statuses_changed: vec![SystemStatus::GroupMembershipRevoked],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![
+                    persist_effect(&self.state, persist_ops),
+                    CoreEffect::CloseGroupRealtimeConnection {
+                        group_id: group_id.clone(),
+                    },
+                    CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::GroupMembershipRevoked,
+                            message: format!("you are no longer a member of group {group_id}"),
+                        },
+                    },
+                ],
+                view_model: None,
+            });
+        }
+        if status == Some(403) && code.as_deref() == Some("invalid_capability") {
+            let mut persist_ops = Vec::new();
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.local_role = None;
+                persist_ops.push(PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                });
+                if let Some(conversation) = self.state.conversations.get_mut(&state.conversation_id)
+                {
+                    conversation.conversation.state = ConversationState::NeedsRebuild;
+                    conversation.recovery_status = RecoveryStatus::NeedsRebuild;
+                    persist_ops.push(PersistOp::SaveConversation {
+                        conversation_id: state.conversation_id.clone(),
+                    });
+                }
+            }
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    system_statuses_changed: vec![SystemStatus::ConversationNeedsRebuild],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(&self.state, persist_ops)],
+                view_model: None,
+            });
+        }
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -5324,6 +6510,11 @@ impl CoreEngine {
         group_id: String,
         event: RealtimeEvent,
     ) -> CoreResult<CoreOutput> {
+        if self.state.group_states.get(&group_id).is_some_and(|state| {
+            state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild
+        }) {
+            return Ok(CoreOutput::default());
+        }
         match event {
             RealtimeEvent::GroupHeadUpdated {
                 group_id: event_group_id,
@@ -5350,12 +6541,12 @@ impl CoreEngine {
                         .get(&group_id)
                         .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
                         .clone();
-                    let capability = group_capability_for_manifest(
-                        &group_state.manifest,
+                    let capability = self.group_capability(
+                        &group_id,
                         group_state
                             .local_role
                             .unwrap_or(crate::model::GroupRole::Member),
-                    );
+                    )?;
                     let from_seq = self
                         .state
                         .group_cursors
@@ -5393,10 +6584,11 @@ impl CoreEngine {
                     .entry(group_id.clone())
                     .or_default()
                     .last_known_seq = seq;
-                if let Some(record) = record {
-                    let output = self.handle_group_outbox_records(group_id, vec![record], seq)?;
-                    Ok(output)
-                } else {
+                // A realtime notification may contain only one record from an
+                // atomic transition bundle.  Never ingest it directly; use it
+                // solely as a head hint and fetch from the durable cursor.
+                let _ = record;
+                {
                     let needs_backfill = self
                         .state
                         .group_cursors
@@ -5410,12 +6602,12 @@ impl CoreEngine {
                             .get(&group_id)
                             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
                             .clone();
-                        let capability = group_capability_for_manifest(
-                            &group_state.manifest,
+                        let capability = self.group_capability(
+                            &group_id,
                             group_state
                                 .local_role
                                 .unwrap_or(crate::model::GroupRole::Member),
-                        );
+                        )?;
                         let from_seq = self
                             .state
                             .group_cursors
@@ -5441,6 +6633,22 @@ impl CoreEngine {
                     }
                 }
             }
+            RealtimeEvent::GroupInvitesChanged {
+                group_id: event_group_id,
+                revision: _,
+            } if event_group_id == group_id => self.list_group_invites(group_id),
+            RealtimeEvent::GroupAutoJoinAvailable {
+                group_id: event_group_id,
+                request_id: _,
+            }
+            | RealtimeEvent::GroupJoinRequestAvailable {
+                group_id: event_group_id,
+                request_id: _,
+            } if event_group_id == group_id => self.list_group_join_requests(group_id),
+            RealtimeEvent::GroupLeaveRequestAvailable {
+                group_id: event_group_id,
+                request_id: _,
+            } if event_group_id == group_id => self.list_group_leave_requests(group_id),
             _ => Ok(CoreOutput::default()),
         }
     }
@@ -5550,6 +6758,21 @@ impl CoreEngine {
                 .find(|item| item.envelope.message_id == message_id)
             {
                 item.in_flight = false;
+            }
+            return self.flush_pending_transport();
+        }
+        if let Some(transition_id) = timer_id.strip_prefix("retry_group_transition:") {
+            for item in &mut self.state.pending_group_outbox {
+                if item
+                    .envelope
+                    .membership_proof
+                    .as_ref()
+                    .is_some_and(|proof| {
+                        format!("group-transition:{}", proof.control_message_id) == transition_id
+                    })
+                {
+                    item.in_flight = false;
+                }
             }
             return self.flush_pending_transport();
         }
@@ -6605,20 +7828,20 @@ impl CoreEngine {
                 value: sender_proof,
             },
             membership_proof: None,
+            transition_id: None,
         })
     }
 
     fn enqueue_group_envelope(
         &mut self,
         envelope: GroupEnvelope,
-        capability: GroupCapability,
+        _capability: GroupCapability,
         plaintext: Option<String>,
     ) {
         self.state
             .pending_group_outbox
             .push(PendingGroupOutboxItem {
                 envelope,
-                capability,
                 retries: 0,
                 in_flight: false,
                 plaintext_cache: plaintext,
@@ -6691,7 +7914,7 @@ impl CoreEngine {
         Ok(payload)
     }
 
-    fn manifest_sha256(manifest: &GroupManifest) -> CoreResult<String> {
+    pub(crate) fn manifest_sha256(manifest: &GroupManifest) -> CoreResult<String> {
         let mut unsigned = manifest.clone();
         unsigned.signature.clear();
         let encoded = serde_json::to_vec(&unsigned).map_err(|error| {
@@ -6701,7 +7924,7 @@ impl CoreEngine {
     }
 
     fn membership_proof_payload(proof: &GroupMembershipProof) -> Vec<u8> {
-        format!(
+        let mut payload = format!(
             "tapchat.group.membership.v1\nproof_type={}\noperation={}\nsigner_user_id={}\nsigner_device_id={}\nprevious_roster_version={}\nnew_roster_version={}\nprevious_commit_message_id={}\ncommit_message_id={}\ncontrol_message_id={}\nnew_manifest_sha256={}",
             proof.proof_type,
             proof.operation,
@@ -6713,8 +7936,12 @@ impl CoreEngine {
             proof.commit_message_id,
             proof.control_message_id,
             proof.new_manifest_sha256,
-        )
-        .into_bytes()
+        );
+        if let Some(message_id) = &proof.state_event_message_id {
+            payload.push_str("\nstate_event_message_id=");
+            payload.push_str(message_id);
+        }
+        payload.into_bytes()
     }
 
     fn verify_device_signature(
@@ -6807,6 +8034,7 @@ impl CoreEngine {
             previous_commit_message_id: previous.last_commit_message_id.clone(),
             commit_message_id: commit_message_id.to_string(),
             control_message_id: control_message_id.to_string(),
+            state_event_message_id: None,
             new_manifest_sha256: Self::manifest_sha256(updated)?,
             signature: String::new(),
         };
@@ -7017,6 +8245,7 @@ impl CoreEngine {
             record.envelope.message_type,
             GroupMessageType::ControlGroupMembershipChanged
                 | GroupMessageType::ControlGroupMetadataUpdated
+                | GroupMessageType::ControlGroupDissolved
         ) {
             return false;
         }
@@ -7141,6 +8370,9 @@ impl CoreEngine {
                 welcome_pickup: current_state.welcome_pickup.clone(),
                 dissolved_at: current_state.dissolved_at,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Ready,
+                pending_group_transition: None,
+                leave_requests: current_state.leave_requests.clone(),
             },
         );
         let _ = self.sync_conversation_members_from_manifest(conversation_id, &updated);
@@ -7234,13 +8466,22 @@ impl CoreEngine {
                 Self::membership_additions_are_well_formed(old, new)
                     && Self::manifest_transition_matches(old, new, |expected| {
                         expected.members = new.members.clone();
+                        expected.member_devices = new.member_devices.clone();
                         expected.last_commit_message_id = new.last_commit_message_id.clone();
                     })
             }
-            "remove" => {
-                Self::member_removal_is_well_formed(old, new)
+            operation @ ("remove" | "leave") => {
+                let expected_status = if operation == "leave" {
+                    GroupMemberStatus::Left
+                } else {
+                    GroupMemberStatus::Removed
+                };
+                Self::member_removal_is_well_formed(old, new, expected_status)
+                    && Self::member_devices_for_removal_are_well_formed(old, new)
                     && Self::manifest_transition_matches(old, new, |expected| {
                         expected.members = new.members.clone();
+                        expected.member_devices = new.member_devices.clone();
+                        expected.admins = new.admins.clone();
                         expected.last_commit_message_id = new.last_commit_message_id.clone();
                     })
             }
@@ -7338,7 +8579,11 @@ impl CoreEngine {
         added > 0
     }
 
-    fn member_removal_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
+    fn member_removal_is_well_formed(
+        old: &GroupManifest,
+        new: &GroupManifest,
+        expected_status: GroupMemberStatus,
+    ) -> bool {
         if old.members.len() != new.members.len() {
             return false;
         }
@@ -7356,7 +8601,7 @@ impl CoreEngine {
             }
             if old_member.role == new_member.role
                 && old_member.status == GroupMemberStatus::Active
-                && new_member.status == GroupMemberStatus::Removed
+                && new_member.status == expected_status
                 && old_member.role != GroupRole::Owner
             {
                 removals = removals.saturating_add(1);
@@ -7365,6 +8610,44 @@ impl CoreEngine {
             return false;
         }
         removals == 1
+    }
+
+    fn member_devices_for_removal_are_well_formed(
+        old: &GroupManifest,
+        new: &GroupManifest,
+    ) -> bool {
+        if old.member_devices.len() != new.member_devices.len() {
+            return false;
+        }
+        let removed_user = old.members.iter().find_map(|old_member| {
+            new.members
+                .iter()
+                .find(|member| member.user_id == old_member.user_id)
+                .filter(|member| {
+                    old_member.status == GroupMemberStatus::Active
+                        && member.status != GroupMemberStatus::Active
+                })
+                .map(|_| old_member.user_id.as_str())
+        });
+        let Some(removed_user) = removed_user else {
+            return false;
+        };
+        old.member_devices.iter().all(|old_device| {
+            new.member_devices
+                .iter()
+                .find(|device| {
+                    device.user_id == old_device.user_id && device.device_id == old_device.device_id
+                })
+                .is_some_and(|new_device| {
+                    if old_device.user_id == removed_user
+                        && old_device.status == GroupMemberStatus::Active
+                    {
+                        new_device.status == GroupMemberStatus::Removed
+                    } else {
+                        new_device == old_device
+                    }
+                })
+        })
     }
 
     fn device_addition_is_well_formed(old: &GroupManifest, new: &GroupManifest) -> bool {
@@ -7561,10 +8844,15 @@ impl CoreEngine {
             endpoint,
             capability,
             expires_at,
+            start_seq: None,
+            roster_version: None,
+            last_commit_message_id: None,
+            request_id: None,
         })
     }
 
     fn group_capability(&self, group_id: &str, role: GroupRole) -> CoreResult<GroupCapability> {
+        self.require_group_authorization_v2()?;
         let identity = self
             .state
             .local_identity
@@ -7572,14 +8860,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
         let expires_at = current_unix_millis(self.state.message_nonce) + 24 * 60 * 60 * 1000;
         let operations = group_capability_operations(role);
-        let signature = identity.sign_sender_proof(
-            format!(
-                "group_capability:{group_id}:{}:{}:{expires_at}",
-                identity.user_identity.user_id, identity.device_identity.device_id
-            )
-            .as_bytes(),
-        );
-        Ok(GroupCapability {
+        let mut capability = GroupCapability {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             service: CapabilityService::GroupOutbox,
             group_id: group_id.to_string(),
@@ -7588,18 +8869,170 @@ impl CoreEngine {
             operations,
             role,
             expires_at,
-            signature,
-        })
+            signature: String::new(),
+        };
+        capability.signature =
+            identity.sign_sender_proof(group_capability_signing_payload(&capability).as_bytes());
+        Ok(capability)
+    }
+
+    fn require_group_authorization_v2(&self) -> CoreResult<()> {
+        let supported = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .is_some_and(|deployment| {
+                deployment
+                    .runtime_config
+                    .features
+                    .iter()
+                    .any(|feature| feature == "group_authorization_v2")
+            });
+        if supported {
+            Ok(())
+        } else {
+            Err(CoreError::invalid_state(
+                "group operations require a runtime with group_authorization_v2; upgrade or redeploy the transport",
+            ))
+        }
+    }
+
+    fn require_group_membership_fsm_v2(&self) -> CoreResult<()> {
+        let supported = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .is_some_and(|deployment| {
+                deployment
+                    .runtime_config
+                    .features
+                    .iter()
+                    .any(|feature| feature == "group_membership_fsm_v2")
+            });
+        if supported {
+            Ok(())
+        } else {
+            Err(CoreError::invalid_state(
+                "group state changes require a runtime with group_membership_fsm_v2; upgrade or redeploy the transport",
+            ))
+        }
+    }
+
+    fn ensure_group_state_operation_ready(&self, group_id: &str) -> CoreResult<()> {
+        let state = self
+            .state
+            .group_states
+            .get(group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        if state.consistency_state != GroupConsistencyState::Ready {
+            return Err(CoreError::invalid_state(
+                "group state is reconciling or blocked; wait for synchronization before changing membership",
+            ));
+        }
+        if state.pending_group_transition.is_some() {
+            return Err(CoreError::invalid_state(
+                "another group state transition is already in progress",
+            ));
+        }
+        Ok(())
     }
 
     fn group_capability_for_state(
         &self,
         state: &PersistedGroupState,
     ) -> CoreResult<GroupCapability> {
+        let local_user_id = self.local_identity_user_id()?;
         let role = state
             .local_role
+            .or_else(|| {
+                state
+                    .manifest
+                    .members
+                    .iter()
+                    .find(|member| member.user_id == local_user_id)
+                    .map(|member| member.role)
+            })
             .ok_or_else(|| CoreError::invalid_input("local group role is missing"))?;
         self.group_capability(&state.group_id, role)
+    }
+
+    fn group_authorization_update(&self, group_id: &str) -> CoreResult<GroupAuthorizationUpdate> {
+        let group_state = self
+            .state
+            .group_states
+            .get(group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let manifest = group_state
+            .pending_group_transition
+            .as_ref()
+            .map(|transition| &transition.proposed_manifest)
+            .unwrap_or(&group_state.manifest);
+        self.group_authorization_update_for_manifest(manifest, false)
+    }
+
+    fn group_authorization_update_for_manifest(
+        &self,
+        manifest: &GroupManifest,
+        require_all_active_members: bool,
+    ) -> CoreResult<GroupAuthorizationUpdate> {
+        let mut user_ids = manifest
+            .members
+            .iter()
+            .filter(|member| member.status == GroupMemberStatus::Active)
+            .map(|member| member.user_id.clone())
+            .collect::<BTreeSet<_>>();
+        user_ids.insert(manifest.signer_user_id.clone());
+
+        let local_user_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.user_identity.user_id.as_str());
+        let mut identity_bundles = Vec::new();
+        for user_id in user_ids {
+            let bundle = if local_user_id == Some(user_id.as_str()) {
+                self.state.local_bundle.clone()
+            } else {
+                self.state
+                    .contacts
+                    .get(&user_id)
+                    .map(|contact| contact.bundle.clone())
+            };
+            match bundle {
+                Some(bundle) => identity_bundles.push(bundle),
+                None if require_all_active_members || user_id == manifest.signer_user_id => {
+                    return Err(CoreError::invalid_state(format!(
+                        "identity bundle is missing for active group member {user_id}"
+                    )));
+                }
+                None => {}
+            }
+        }
+        identity_bundles.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        Ok(GroupAuthorizationUpdate {
+            manifest: manifest.clone(),
+            identity_bundles,
+        })
+    }
+
+    fn initialize_group_authorization_request(
+        &self,
+        group_id: &str,
+    ) -> CoreResult<InitializeGroupAuthorizationRequest> {
+        let manifest = &self
+            .state
+            .group_states
+            .get(group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .manifest;
+        let update = self.group_authorization_update_for_manifest(manifest, true)?;
+        Ok(InitializeGroupAuthorizationRequest {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            group_id: group_id.to_string(),
+            manifest: update.manifest,
+            identity_bundles: update.identity_bundles,
+            headers: self.device_runtime_headers()?,
+        })
     }
 
     fn local_group_role(&self, group_id: &str) -> CoreResult<GroupRole> {
@@ -8947,14 +10380,162 @@ impl CoreEngine {
     }
 
     fn flush_group_outbox(&mut self) -> CoreResult<CoreOutput> {
+        if self.require_group_authorization_v2().is_err() {
+            return Ok(CoreOutput::default());
+        }
         let mut effects = Vec::new();
+        let mut bundled_message_ids = BTreeSet::new();
+
+        let proofs: Vec<GroupMembershipProof> = self
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| !item.in_flight && item.retries < MAX_TRANSPORT_RETRIES)
+            .filter_map(|item| item.envelope.membership_proof.clone())
+            .fold(
+                BTreeMap::<String, GroupMembershipProof>::new(),
+                |mut proofs, proof| {
+                    proofs
+                        .entry(proof.control_message_id.clone())
+                        .or_insert(proof);
+                    proofs
+                },
+            )
+            .into_values()
+            .collect();
+
+        for proof in proofs {
+            let mut indexes = Vec::new();
+            for (index, item) in self.state.pending_group_outbox.iter().enumerate() {
+                if item.in_flight || item.retries >= MAX_TRANSPORT_RETRIES {
+                    continue;
+                }
+                if item.envelope.membership_proof.as_ref() == Some(&proof)
+                    && (item.envelope.message_id == proof.commit_message_id
+                        || item.envelope.message_id == proof.control_message_id
+                        || proof.state_event_message_id.as_ref() == Some(&item.envelope.message_id))
+                {
+                    indexes.push(index);
+                }
+            }
+            let has_control = indexes.iter().any(|index| {
+                self.state.pending_group_outbox[*index].envelope.message_id
+                    == proof.control_message_id
+            });
+            let commit_is_new =
+                proof.previous_commit_message_id.as_ref() != Some(&proof.commit_message_id);
+            let has_commit = indexes.iter().any(|index| {
+                self.state.pending_group_outbox[*index].envelope.message_id
+                    == proof.commit_message_id
+            });
+            if !has_control || (commit_is_new && !has_commit) {
+                continue;
+            }
+            let group_id = self.state.pending_group_outbox[indexes[0]]
+                .envelope
+                .group_id
+                .clone();
+            let transition_id = format!("group-transition:{}", proof.control_message_id);
+            let group_state = self
+                .state
+                .group_states
+                .get(&group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                .clone();
+            if group_state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild {
+                continue;
+            }
+            let Some(pending_transition) = group_state
+                .pending_group_transition
+                .as_ref()
+                .filter(|pending| pending.transition_id == transition_id)
+            else {
+                // Membership envelopes without a persisted semantic intent are
+                // legacy partial transitions.  They must be reconciled, never
+                // replayed one record at a time.
+                if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                    state.consistency_state = GroupConsistencyState::Reconciling;
+                }
+                continue;
+            };
+            let Some(operation) = pending_transition.intent.operation().cloned() else {
+                if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                    state.consistency_state = GroupConsistencyState::Reconciling;
+                }
+                continue;
+            };
+            if matches!(
+                pending_transition.stage,
+                PendingGroupTransitionStage::AwaitingAuthorizationBootstrap
+                    | PendingGroupTransitionStage::ReconcilingAfterConflict
+            ) {
+                continue;
+            }
+            let request_binding = pending_transition.intent.request_binding().cloned();
+            let role = group_state.local_role.unwrap_or(GroupRole::Member);
+            let mut envelopes = Vec::new();
+            for index in &indexes {
+                let item = &mut self.state.pending_group_outbox[*index];
+                item.in_flight = true;
+                let mut envelope = item.envelope.clone();
+                envelope.transition_id = Some(transition_id.clone());
+                bundled_message_ids.insert(envelope.message_id.clone());
+                envelopes.push(envelope);
+            }
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                if let Some(pending) = state.pending_group_transition.as_mut() {
+                    if pending.transition_id == transition_id {
+                        pending.stage = PendingGroupTransitionStage::Submitting;
+                    }
+                }
+            }
+            envelopes.sort_by_key(|envelope| {
+                if envelope.message_id == proof.commit_message_id {
+                    0
+                } else {
+                    1
+                }
+            });
+            effects.push(CoreEffect::AppendGroupTransition {
+                append: AppendGroupTransitionRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: group_id.clone(),
+                    transition_id,
+                    operation,
+                    request_binding,
+                    expected_previous_roster_version: proof.previous_roster_version,
+                    expected_previous_commit_message_id: proof.previous_commit_message_id.clone(),
+                    envelopes,
+                    authorization_update: self.group_authorization_update(&group_id)?,
+                    capability: self.group_capability(&group_id, role)?,
+                },
+            });
+        }
+
         for index in 0..self.state.pending_group_outbox.len() {
             if self.state.pending_group_outbox[index].in_flight
                 || self.state.pending_group_outbox[index].retries >= MAX_TRANSPORT_RETRIES
+                || bundled_message_ids
+                    .contains(&self.state.pending_group_outbox[index].envelope.message_id)
             {
                 continue;
             }
             let item = self.state.pending_group_outbox[index].clone();
+            if item.envelope.membership_proof.is_some() {
+                continue;
+            }
+            // The server derives the effective role from its authorization manifest.
+            // Keep the queued role only as a signing hint for operations such as a
+            // self-leave, where local state is intentionally deactivated before the
+            // request is dispatched; the queued signature itself is never reused.
+            let role = self.local_group_role(&item.envelope.group_id)?;
+            let fresh_capability = self.group_capability(&item.envelope.group_id, role)?;
+            let authorization_update = item
+                .envelope
+                .membership_proof
+                .as_ref()
+                .map(|_| self.group_authorization_update(&item.envelope.group_id))
+                .transpose()?;
             self.state.pending_group_outbox[index].in_flight = true;
             let carries_membership_transition = item
                 .envelope
@@ -8987,7 +10568,8 @@ impl CoreEngine {
                     version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                     group_id: item.envelope.group_id.clone(),
                     envelope: item.envelope,
-                    capability: item.capability,
+                    capability: fresh_capability,
+                    authorization_update,
                     expected_previous_roster_version,
                     expected_previous_commit_message_id,
                 },
@@ -9748,7 +11330,9 @@ impl CoreEngine {
             PendingRequest::AppendGroupEnvelope {
                 group_id,
                 message_id,
-            } => self.handle_group_append_failed(group_id, message_id, retryable, detail),
+            } => {
+                self.handle_group_append_failed(group_id, message_id, retryable, None, None, detail)
+            }
             PendingRequest::FetchGroupOutbox { group_id, .. } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -10258,7 +11842,13 @@ impl CoreEngine {
         records: Vec<InboxRecord>,
         to_seq: u64,
     ) -> CoreResult<CoreOutput> {
-        self.handle_inbox_records_internal(device_id, records, to_seq, true)
+        self.handle_inbox_records_internal(
+            device_id,
+            records,
+            to_seq,
+            true,
+            InboxRecordSource::Fetch,
+        )
     }
 
     fn handle_inbox_records_internal(
@@ -10267,24 +11857,55 @@ impl CoreEngine {
         records: Vec<InboxRecord>,
         to_seq: u64,
         allow_pending_replay: bool,
+        source: InboxRecordSource,
     ) -> CoreResult<CoreOutput> {
+        // Validate the complete transport batch before touching conversation,
+        // MLS, seen-message, or checkpoint state. A malformed batch must be
+        // safely retryable and must never consume a delivery.
+        let mut previous_seq = None;
+        let mut batch_message_ids = BTreeSet::new();
+        for record in &records {
+            record.validate()?;
+            if record.recipient_device_id != device_id {
+                return Err(CoreError::invalid_input(
+                    "fetched inbox record recipient_device_id does not match target device",
+                ));
+            }
+            if previous_seq.is_some_and(|seq| record.seq <= seq) {
+                return Err(CoreError::invalid_input(
+                    "fetched inbox records must have strictly increasing seq values",
+                ));
+            }
+            if !batch_message_ids.insert(record.message_id.clone()) {
+                return Err(CoreError::invalid_input(
+                    "fetched inbox records must not repeat message_id",
+                ));
+            }
+            previous_seq = Some(record.seq);
+        }
+        if previous_seq.is_some_and(|seq| seq > to_seq) {
+            return Err(CoreError::invalid_input(
+                "fetched inbox to_seq must cover every returned record",
+            ));
+        }
+
         let mut pending_recovery_conversations = BTreeSet::new();
         let mut touched_conversation_ids = BTreeSet::new();
         let mut touched_mls_conversation_ids = BTreeSet::new();
         let mut touched_recovery_context_ids = BTreeSet::new();
         let touched_sync_device_ids = BTreeSet::from([device_id.clone()]);
         let mut touched_pending_ack_device_ids = BTreeSet::new();
-        let mut fresh_records = {
-            let sync_state = self
+        let mut fresh_records = match source {
+            InboxRecordSource::Fetch => self
                 .state
                 .sync_states
-                .entry(device_id.clone())
-                .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-            let fresh = SyncEngine::register_fetch(sync_state, &records, to_seq);
-            SyncEngine::clear_sync_failures(sync_state);
-            fresh
+                .get(&device_id)
+                .map(|sync_state| SyncEngine::select_fresh(sync_state, &records))
+                .unwrap_or(records),
+            InboxRecordSource::PendingReplay => records,
         };
         fresh_records.sort_by_key(|record| record.seq);
+        let mut processed_records = Vec::new();
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
@@ -10307,12 +11928,6 @@ impl CoreEngine {
             .unwrap_or(0);
         let mut deferred_ackable_seqs = BTreeSet::new();
         for record in fresh_records {
-            record.validate()?;
-            if record.recipient_device_id != device_id {
-                return Err(CoreError::invalid_input(
-                    "fetched inbox record recipient_device_id does not match target device",
-                ));
-            }
             if record.envelope.message_type == MessageType::ControlContactRemoved {
                 if self.should_ignore_idempotent_contact_removed_record(&local_user_id, &record) {
                     log::info!(
@@ -10334,6 +11949,7 @@ impl CoreEngine {
                         &mut deferred_ackable_seqs,
                         record.seq,
                     );
+                    processed_records.push(record);
                     continue;
                 }
                 output = merge_outputs(
@@ -10349,6 +11965,7 @@ impl CoreEngine {
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+                processed_records.push(record);
                 continue;
             }
             if record.envelope.message_type == MessageType::ControlContactAccepted {
@@ -10365,6 +11982,7 @@ impl CoreEngine {
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+                processed_records.push(record);
                 continue;
             }
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
@@ -10384,6 +12002,7 @@ impl CoreEngine {
                     SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+                processed_records.push(record);
                 continue;
             }
             self.ensure_local_conversation_for_record(&device_id, &local_user_id, &record);
@@ -10637,6 +12256,7 @@ impl CoreEngine {
                         record.seq,
                     );
                 }
+                processed_records.push(record);
                 continue;
             }
             let apply_effect = {
@@ -10999,6 +12619,19 @@ impl CoreEngine {
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
             }
+            processed_records.push(record);
+        }
+
+        {
+            let sync_state = self
+                .state
+                .sync_states
+                .entry(device_id.clone())
+                .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+            for record in &processed_records {
+                SyncEngine::commit_fetched_record(sync_state, record);
+            }
+            SyncEngine::clear_sync_failures(sync_state);
         }
         let ack = {
             let sync_state = self
@@ -11337,12 +12970,21 @@ impl CoreEngine {
             PendingRequest::AppendGroupEnvelope {
                 group_id,
                 message_id,
-            } => self.handle_group_append_failed(
-                group_id,
-                message_id,
-                status >= 500,
-                body.or_else(|| Some(format!("group append returned status {status}"))),
-            ),
+            } => {
+                let code = body.as_deref().and_then(|value| {
+                    serde_json::from_str::<serde_json::Value>(value)
+                        .ok()
+                        .and_then(|json| json.get("error")?.as_str().map(str::to_owned))
+                });
+                self.handle_group_append_failed(
+                    group_id,
+                    message_id,
+                    status >= 500,
+                    Some(status),
+                    code,
+                    body.or_else(|| Some(format!("group append returned status {status}"))),
+                )
+            }
             PendingRequest::FetchGroupOutbox { group_id, .. } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -11811,8 +13453,7 @@ impl CoreEngine {
                     context.identity_refresh_retry_count =
                         context.identity_refresh_retry_count.saturating_add(1);
                 }
-                retry_attempt =
-                    retry_attempt.max(u32::from(context.identity_refresh_retry_count));
+                retry_attempt = retry_attempt.max(u32::from(context.identity_refresh_retry_count));
                 context.phase = RecoveryPhase::WaitingForIdentityRefresh;
                 context.last_error = Some(message.clone());
                 if context.identity_refresh_retry_count < MAX_TRANSPORT_RETRIES {
@@ -11856,9 +13497,55 @@ impl CoreEngine {
         &mut self,
         group_id: String,
         head_seq: u64,
+        current_roster_version: Option<u64>,
+        last_commit_message_id: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        if self.state.group_states.get(&group_id).is_some_and(|state| {
+            state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild
+        }) {
+            self.state.pending_sync_group_head.remove(&group_id);
+            self.state.group_sync_target_head.remove(&group_id);
+            return Ok(CoreOutput::default());
+        }
         if let Some(session) = self.state.group_realtime_sessions.get_mut(&group_id) {
             session.reconnect_failures = 0;
+        }
+        if let Some(remote_roster) = current_roster_version {
+            let local = self
+                .state
+                .group_states
+                .get(&group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+            if local.manifest.roster_version != remote_roster
+                || local.manifest.last_commit_message_id != last_commit_message_id
+            {
+                let capability = self.group_capability_for_state(local)?;
+                if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                    state.consistency_state = GroupConsistencyState::Reconciling;
+                }
+                self.state
+                    .group_sync_target_head
+                    .insert(group_id.clone(), head_seq);
+                self.state.pending_sync_group_head.remove(&group_id);
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        checkpoints_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![CoreEffect::GetGroupAuthorizationState {
+                        get: GetGroupAuthorizationStateRequest {
+                            group_id,
+                            capability,
+                        },
+                    }],
+                    view_model: None,
+                });
+            }
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                if state.consistency_state == GroupConsistencyState::Reconciling {
+                    state.consistency_state = GroupConsistencyState::Ready;
+                }
+            }
         }
         // If this head request was issued by sync_group_outbox (not by the
         // welcome-pickup join fast-forward path), fetch the actual records
@@ -11926,37 +13613,465 @@ impl CoreEngine {
                 view_model: None,
             })
         } else {
-            // Welcome-pickup join fast-forward path: skip every outbox record
-            // produced before the joiner was added because those records belong
-            // to MLS epochs she cannot decrypt.
-            let Some(cursor) = self.state.group_cursors.get_mut(&group_id) else {
-                return Ok(CoreOutput::default());
-            };
-            if head_seq <= cursor.last_fetched_seq {
-                return Ok(CoreOutput::default());
-            }
-            log::info!(
-                "handle_group_outbox_head_fetched: welcome fast-forward group_id={} from_seq={} to_seq={}",
-                group_id,
-                cursor.last_fetched_seq,
-                head_seq
+            Ok(CoreOutput::default())
+        }
+    }
+
+    fn handle_group_authorization_state_fetched(
+        &mut self,
+        group_id: String,
+        manifest: GroupManifest,
+        manifest_hash: String,
+        _last_transition_id: Option<String>,
+        phase: crate::transport_contract::GroupAuthorizationPhase,
+        materialized: bool,
+    ) -> CoreResult<CoreOutput> {
+        if self.state.group_states.get(&group_id).is_some_and(|state| {
+            state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild
+        }) {
+            return Ok(CoreOutput::default());
+        }
+        manifest.validate()?;
+        self.verify_manifest_signature(&manifest)?;
+        if phase == crate::transport_contract::GroupAuthorizationPhase::Active && !materialized {
+            return self.block_group_needs_rebuild(
+                &group_id,
+                "active authorization state is not materialized",
             );
-            cursor.last_fetched_seq = head_seq;
-            cursor.updated_at = current_unix_millis(self.state.message_nonce);
-            Ok(CoreOutput {
+        }
+        if Self::manifest_sha256(&manifest)? != manifest_hash {
+            return Err(CoreError::invalid_input(
+                "group authorization manifest hash does not match the response",
+            ));
+        }
+        let local = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let local_hash = Self::manifest_sha256(&local.manifest)?;
+        let local_epoch = self
+            .state
+            .mls_summaries
+            .get(&local.conversation_id)
+            .map(|summary| summary.epoch)
+            .unwrap_or(0);
+
+        if local_hash == manifest_hash && local_epoch == manifest.mls_epoch_hint {
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.consistency_state = GroupConsistencyState::Ready;
+            }
+            if self.state.group_states.get(&group_id).is_some_and(|state| {
+                state
+                    .pending_group_transition
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.stage == PendingGroupTransitionStage::ReconcilingAfterConflict
+                    })
+            }) {
+                return self.resume_group_transition_after_reconciliation(group_id);
+            }
+            return Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     checkpoints_changed: true,
                     ..CoreStateUpdate::default()
                 },
                 effects: vec![persist_effect(
                     &self.state,
-                    vec![PersistOp::SaveGroupCursor {
+                    vec![PersistOp::SaveGroupState {
                         group_id: group_id.clone(),
                     }],
                 )],
                 view_model: None,
-            })
+            });
         }
+
+        if manifest.roster_version < local.manifest.roster_version
+            || (manifest.roster_version == local.manifest.roster_version
+                && local_hash != manifest_hash)
+            || manifest.mls_epoch_hint < local_epoch
+        {
+            return self.block_group_needs_rebuild(
+                &group_id,
+                "authoritative group state conflicts with the local manifest or MLS epoch",
+            );
+        }
+
+        let from_seq = self
+            .state
+            .group_cursors
+            .get(&group_id)
+            .map(|cursor| cursor.last_fetched_seq.saturating_add(1).max(1))
+            .unwrap_or(1);
+        let capability = self.group_capability_for_state(&local)?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![CoreEffect::FetchGroupOutbox {
+                fetch: FetchGroupOutboxRequest {
+                    group_id,
+                    from_seq,
+                    limit: GROUP_OUTBOX_FETCH_LIMIT,
+                    capability,
+                },
+            }],
+            view_model: None,
+        })
+    }
+
+    fn group_transition_target_achieved(
+        operation: &GroupTransitionOperation,
+        manifest: &GroupManifest,
+    ) -> bool {
+        match operation {
+            GroupTransitionOperation::Create => manifest.roster_version >= 1,
+            GroupTransitionOperation::InviteMembers { user_ids } => {
+                user_ids.iter().all(|user_id| {
+                    manifest.members.iter().any(|member| {
+                        member.user_id == *user_id && member.status == GroupMemberStatus::Active
+                    })
+                })
+            }
+            GroupTransitionOperation::ApproveJoin {
+                user_id, device_id, ..
+            } => {
+                manifest.members.iter().any(|member| {
+                    member.user_id == *user_id && member.status == GroupMemberStatus::Active
+                }) && manifest.member_devices.iter().any(|device| {
+                    device.user_id == *user_id
+                        && device.device_id == *device_id
+                        && device.status == GroupMemberStatus::Active
+                })
+            }
+            GroupTransitionOperation::ApproveLeave { user_id, .. }
+            | GroupTransitionOperation::RemoveMember { user_id } => {
+                !manifest.members.iter().any(|member| {
+                    member.user_id == *user_id && member.status == GroupMemberStatus::Active
+                })
+            }
+            GroupTransitionOperation::TransferOwnership { user_id } => {
+                manifest.owner_user_id == *user_id
+            }
+            GroupTransitionOperation::SetAdmin { user_id, is_admin } => manifest
+                .members
+                .iter()
+                .find(|member| member.user_id == *user_id)
+                .is_some_and(|member| (member.role == GroupRole::Admin) == *is_admin),
+            GroupTransitionOperation::UpdateMetadata => false,
+            GroupTransitionOperation::Dissolve => false,
+            GroupTransitionOperation::AddDevice { user_id, device_id } => {
+                manifest.member_devices.iter().any(|device| {
+                    device.user_id == *user_id
+                        && device.device_id == *device_id
+                        && device.status == GroupMemberStatus::Active
+                })
+            }
+            GroupTransitionOperation::RemoveDevice { user_id, device_id } => {
+                !manifest.member_devices.iter().any(|device| {
+                    device.user_id == *user_id
+                        && device.device_id == *device_id
+                        && device.status == GroupMemberStatus::Active
+                })
+            }
+        }
+    }
+
+    fn command_for_group_transition_intent(
+        group_id: &str,
+        operation: &GroupTransitionOperation,
+        proposed: &GroupManifest,
+    ) -> Option<CoreCommand> {
+        Some(match operation {
+            GroupTransitionOperation::Create => return None,
+            GroupTransitionOperation::InviteMembers { user_ids } => CoreCommand::InviteToGroup {
+                group_id: group_id.to_string(),
+                invitee_user_ids: user_ids.clone(),
+            },
+            GroupTransitionOperation::ApproveJoin { request_id, .. } => {
+                CoreCommand::ApproveGroupJoin {
+                    group_id: group_id.to_string(),
+                    request_id: request_id.clone(),
+                }
+            }
+            GroupTransitionOperation::ApproveLeave { request_id, .. } => {
+                CoreCommand::ApproveGroupLeave {
+                    group_id: group_id.to_string(),
+                    request_id: request_id.clone(),
+                }
+            }
+            GroupTransitionOperation::RemoveMember { user_id } => CoreCommand::RemoveGroupMember {
+                group_id: group_id.to_string(),
+                target_user_id: user_id.clone(),
+            },
+            GroupTransitionOperation::TransferOwnership { user_id } => {
+                CoreCommand::TransferGroupOwnership {
+                    group_id: group_id.to_string(),
+                    new_owner_user_id: user_id.clone(),
+                }
+            }
+            GroupTransitionOperation::SetAdmin { user_id, is_admin } => {
+                CoreCommand::SetGroupAdmin {
+                    group_id: group_id.to_string(),
+                    target_user_id: user_id.clone(),
+                    is_admin: *is_admin,
+                }
+            }
+            GroupTransitionOperation::UpdateMetadata => CoreCommand::UpdateGroupMetadata {
+                group_id: group_id.to_string(),
+                title: Some(proposed.title.clone()),
+                join_policy: Some(proposed.join_policy),
+                member_invite_policy: Some(proposed.member_invite_policy),
+            },
+            GroupTransitionOperation::Dissolve => CoreCommand::DissolveGroup {
+                group_id: group_id.to_string(),
+            },
+            GroupTransitionOperation::AddDevice { user_id, device_id } => {
+                CoreCommand::AddGroupMemberDevice {
+                    group_id: group_id.to_string(),
+                    user_id: user_id.clone(),
+                    device_id: device_id.clone(),
+                }
+            }
+            GroupTransitionOperation::RemoveDevice { user_id, device_id } => {
+                CoreCommand::RemoveGroupMemberDevice {
+                    group_id: group_id.to_string(),
+                    user_id: user_id.clone(),
+                    device_id: device_id.clone(),
+                }
+            }
+        })
+    }
+
+    fn resume_group_transition_after_reconciliation(
+        &mut self,
+        group_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let Some(pending) = state.pending_group_transition.clone().filter(|pending| {
+            pending.stage == PendingGroupTransitionStage::ReconcilingAfterConflict
+        }) else {
+            return Ok(CoreOutput::default());
+        };
+        let Some(operation) = pending.intent.operation().cloned() else {
+            return self.block_group_needs_rebuild(
+                &group_id,
+                "legacy transition intent cannot be reconstructed safely",
+            );
+        };
+        if Self::group_transition_target_achieved(&operation, &state.manifest) {
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.pending_group_transition = None;
+                state.consistency_state = GroupConsistencyState::Ready;
+            }
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
+                    }],
+                )],
+                view_model: None,
+            });
+        }
+        let already_rebuilt = matches!(
+            pending.intent,
+            GroupTransitionIntent::Typed {
+                conflict_rebuild_attempted: true,
+                ..
+            }
+        );
+        if already_rebuilt {
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.pending_group_transition = None;
+                state.consistency_state = GroupConsistencyState::Ready;
+            }
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![
+                    persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveGroupState {
+                            group_id: group_id.clone(),
+                        }],
+                    ),
+                    CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message: format!(
+                                "group {group_id} changed concurrently; retry the operation manually"
+                            ),
+                        },
+                    },
+                ],
+                view_model: None,
+            });
+        }
+        let Some(command) = Self::command_for_group_transition_intent(
+            &group_id,
+            &operation,
+            &pending.proposed_manifest,
+        ) else {
+            return self.block_group_needs_rebuild(
+                &group_id,
+                "create transition conflict cannot be rebuilt safely",
+            );
+        };
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.pending_group_transition = None;
+            state.consistency_state = GroupConsistencyState::Ready;
+        }
+        let mut output = match self.handle_command(command) {
+            Ok(output) => output,
+            Err(error) => {
+                return Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        checkpoints_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![
+                        persist_effect(
+                            &self.state,
+                            vec![PersistOp::SaveGroupState {
+                                group_id: group_id.clone(),
+                            }],
+                        ),
+                        CoreEffect::EmitUserNotification {
+                            notification: UserNotificationEffect {
+                                status: SystemStatus::TemporaryNetworkFailure,
+                                message: format!(
+                                    "group operation was cancelled after reconciliation: {error}"
+                                ),
+                            },
+                        },
+                    ],
+                    view_model: None,
+                });
+            }
+        };
+        if let Some(rebuilt) = self
+            .state
+            .group_states
+            .get_mut(&group_id)
+            .and_then(|state| state.pending_group_transition.as_mut())
+        {
+            if let GroupTransitionIntent::Typed {
+                conflict_rebuild_attempted,
+                ..
+            } = &mut rebuilt.intent
+            {
+                *conflict_rebuild_attempted = true;
+            }
+        }
+        output.effects.push(persist_effect(
+            &self.state,
+            vec![PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            }],
+        ));
+        Ok(output)
+    }
+
+    fn handle_group_authorization_initialized(
+        &mut self,
+        group_id: String,
+        roster_version: u64,
+    ) -> CoreResult<CoreOutput> {
+        let state = self
+            .state
+            .group_states
+            .get_mut(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        if state.manifest.roster_version != roster_version {
+            return self.block_group_needs_rebuild(
+                &group_id,
+                "authorization bootstrap ACK does not match the provisional manifest",
+            );
+        }
+        let Some(pending) = state.pending_group_transition.as_mut() else {
+            return Ok(CoreOutput::default());
+        };
+        if pending.stage != PendingGroupTransitionStage::AwaitingAuthorizationBootstrap {
+            return Ok(CoreOutput::default());
+        }
+        pending.stage = PendingGroupTransitionStage::Prepared;
+        let persist = persist_effect(
+            &self.state,
+            vec![PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            }],
+        );
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist],
+                view_model: None,
+            },
+            self.flush_group_outbox()?,
+        ))
+    }
+
+    fn block_group_needs_rebuild(
+        &mut self,
+        group_id: &str,
+        reason: &str,
+    ) -> CoreResult<CoreOutput> {
+        let mut persist_ops = Vec::new();
+        if let Some(state) = self.state.group_states.get_mut(group_id) {
+            state.consistency_state = GroupConsistencyState::BlockedNeedsRebuild;
+            state.pending_group_transition = None;
+            persist_ops.push(PersistOp::SaveGroupState {
+                group_id: group_id.to_string(),
+            });
+            if let Some(conversation) = self.state.conversations.get_mut(&state.conversation_id) {
+                conversation.conversation.state = ConversationState::NeedsRebuild;
+                conversation.recovery_status = RecoveryStatus::NeedsRebuild;
+                persist_ops.push(PersistOp::SaveConversation {
+                    conversation_id: state.conversation_id.clone(),
+                });
+            }
+        }
+        self.state.pending_sync_group_head.remove(group_id);
+        self.state.group_sync_target_head.remove(group_id);
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                checkpoints_changed: true,
+                system_statuses_changed: vec![SystemStatus::ConversationNeedsRebuild],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![
+                persist_effect(&self.state, persist_ops),
+                CoreEffect::CloseGroupRealtimeConnection {
+                    group_id: group_id.to_string(),
+                },
+                CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::ConversationNeedsRebuild,
+                        message: format!("group {group_id} was blocked: {reason}"),
+                    },
+                },
+            ],
+            view_model: None,
+        })
     }
 
     fn handle_group_outbox_records(
@@ -11965,6 +14080,11 @@ impl CoreEngine {
         mut records: Vec<GroupOutboxRecord>,
         to_seq: u64,
     ) -> CoreResult<CoreOutput> {
+        if self.state.group_states.get(&group_id).is_some_and(|state| {
+            state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild
+        }) {
+            return Ok(CoreOutput::default());
+        }
         let group_state = self
             .state
             .group_states
@@ -11973,10 +14093,59 @@ impl CoreEngine {
             .clone();
         let conversation_id = group_state.conversation_id.clone();
         records.sort_by_key(|record| record.seq);
+        let initial_cursor = self
+            .state
+            .group_cursors
+            .get(&group_id)
+            .map(|cursor| cursor.last_fetched_seq)
+            .unwrap_or(0);
+        records.retain(|record| record.seq > initial_cursor);
+        let mut expected_seq = initial_cursor.saturating_add(1).max(1);
+        for record in &records {
+            record.validate()?;
+            if record.seq != expected_seq {
+                return Err(CoreError::invalid_input(
+                    "group outbox records must be contiguous from the local cursor",
+                ));
+            }
+            expected_seq = expected_seq.saturating_add(1);
+        }
+        if records.last().is_some_and(|record| record.seq > to_seq) {
+            return Err(CoreError::invalid_input(
+                "group outbox to_seq must cover every returned record",
+            ));
+        }
         let record_count = records.len();
         let mut messages = Vec::new();
-        for record in records {
-            record.validate()?;
+        let mut last_terminal_seq = initial_cursor;
+        let mut stopped_on_retryable_gap = false;
+        let mut record_iter = records.into_iter().peekable();
+        while let Some(record) = record_iter.next() {
+            if let Some(transition_id) = record.envelope.transition_id.clone() {
+                if record.envelope.membership_proof.is_some() {
+                    let mut bundle = vec![record];
+                    while record_iter.peek().is_some_and(|next| {
+                        next.envelope.transition_id.as_deref() == Some(transition_id.as_str())
+                    }) {
+                        if let Some(next) = record_iter.next() {
+                            bundle.push(next);
+                        }
+                    }
+                    let bundle_last_seq = bundle.last().map(|item| item.seq).unwrap_or(0);
+                    match self.apply_inbound_group_transition_bundle(&group_id, &bundle)? {
+                        Some(mut applied) => {
+                            messages.append(&mut applied);
+                            last_terminal_seq = bundle_last_seq;
+                        }
+                        None => {
+                            stopped_on_retryable_gap = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            let record_seq = record.seq;
             if record.group_id != group_id || record.envelope.conversation_id != conversation_id {
                 return Err(CoreError::invalid_input(
                     "group outbox record does not match local group",
@@ -11994,6 +14163,7 @@ impl CoreEngine {
                 })
                 .unwrap_or(false)
             {
+                last_terminal_seq = record_seq;
                 continue;
             }
             let group_state = self
@@ -12033,13 +14203,14 @@ impl CoreEngine {
                                 RecoveryReason::MissingCommit,
                             );
                         }
-                        continue;
+                        stopped_on_retryable_gap = true;
+                        break;
                     }
                 }
             } else {
                 None
             };
-            let message_type = group_message_type_to_direct(record.envelope.message_type);
+            let mut message_type = group_message_type_to_direct(record.envelope.message_type);
             if membership_proof.as_ref().is_some_and(|proof| {
                 group_state.manifest.roster_version == proof.new_roster_version
                     && group_state.manifest.last_commit_message_id.as_ref()
@@ -12058,6 +14229,7 @@ impl CoreEngine {
                     message_id: record.message_id,
                     message_type,
                 });
+                last_terminal_seq = record_seq;
                 continue;
             }
             if matches!(
@@ -12068,7 +14240,8 @@ impl CoreEngine {
                     && record.envelope.message_type == GroupMessageType::MlsApplication
                 {
                     self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
-                    continue;
+                    stopped_on_retryable_gap = true;
+                    break;
                 }
                 let result = match self
                     .state
@@ -12096,7 +14269,8 @@ impl CoreEngine {
                             group_id
                         );
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
-                        continue;
+                        stopped_on_retryable_gap = true;
+                        break;
                     }
                     Err(error) => return Err(error),
                 };
@@ -12135,7 +14309,8 @@ impl CoreEngine {
                     }
                     IngestResult::PendingRetry => {
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
-                        continue;
+                        stopped_on_retryable_gap = true;
+                        break;
                     }
                     IngestResult::IgnoredReplay => {
                         log::warn!(
@@ -12143,6 +14318,7 @@ impl CoreEngine {
                             record.envelope.message_id,
                             group_id
                         );
+                        last_terminal_seq = record_seq;
                         continue;
                     }
                     IngestResult::NeedsRebuild => {
@@ -12190,7 +14366,9 @@ impl CoreEngine {
                     record.envelope.message_type,
                     GroupMessageType::ControlGroupMembershipChanged
                         | GroupMessageType::ControlGroupMetadataUpdated
+                        | GroupMessageType::ControlGroupDissolved
                 );
+                let mut plaintext = None;
                 if is_manifest_control
                     && !self.try_apply_control_manifest_update(
                         &conversation_id,
@@ -12199,11 +14377,23 @@ impl CoreEngine {
                         &group_state,
                     )
                 {
-                    continue;
+                    stopped_on_retryable_gap = true;
+                    break;
                 }
-                let plaintext = (record.envelope.message_type
-                    == GroupMessageType::ControlGroupDissolved)
-                    .then(|| "control_group_dissolved".to_string());
+                if is_manifest_control {
+                    if let (Some(updated), Some(proof)) = (
+                        self.state.group_states.get(&group_id),
+                        record.envelope.membership_proof.as_ref(),
+                    ) {
+                        plaintext = Self::derive_group_state_event(
+                            &group_state.manifest,
+                            &updated.manifest,
+                            proof,
+                            &record,
+                        );
+                        message_type = MessageType::ControlGroupStateEvent;
+                    }
+                }
                 self.store_group_record_message(
                     &conversation_id,
                     &record,
@@ -12216,13 +14406,14 @@ impl CoreEngine {
                 message_id: record.message_id,
                 message_type,
             });
+            last_terminal_seq = record_seq;
         }
         let now = current_unix_millis(self.state.message_nonce);
         self.state.group_cursors.insert(
             group_id.clone(),
             GroupCursor {
                 group_id: group_id.clone(),
-                last_fetched_seq: to_seq,
+                last_fetched_seq: last_terminal_seq,
                 updated_at: now,
             },
         );
@@ -12231,7 +14422,7 @@ impl CoreEngine {
             group_id,
             record_count,
             messages.len(),
-            to_seq
+            last_terminal_seq
         );
         let target_head = self.state.group_sync_target_head.get(&group_id).copied();
         let mut output = CoreOutput {
@@ -12265,8 +14456,24 @@ impl CoreEngine {
             }),
         };
         // Continue fetching if we haven't caught up to the target head.
-        if let Some(head_seq) = target_head {
-            if to_seq < head_seq {
+        if stopped_on_retryable_gap {
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.consistency_state = GroupConsistencyState::Reconciling;
+            }
+            let state = self
+                .state
+                .group_states
+                .get(&group_id)
+                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+                .clone();
+            output.effects.push(CoreEffect::GetGroupAuthorizationState {
+                get: GetGroupAuthorizationStateRequest {
+                    group_id: group_id.clone(),
+                    capability: self.group_capability_for_state(&state)?,
+                },
+            });
+        } else if let Some(head_seq) = target_head {
+            if last_terminal_seq < head_seq {
                 let state = self
                     .state
                     .group_states
@@ -12276,7 +14483,7 @@ impl CoreEngine {
                 let next_fetch = CoreEffect::FetchGroupOutbox {
                     fetch: FetchGroupOutboxRequest {
                         group_id,
-                        from_seq: to_seq.saturating_add(1),
+                        from_seq: last_terminal_seq.saturating_add(1),
                         limit: GROUP_OUTBOX_FETCH_LIMIT,
                         capability: self.group_capability_for_state(&state)?,
                     },
@@ -12284,9 +14491,534 @@ impl CoreEngine {
                 output.effects.push(next_fetch);
             } else {
                 self.state.group_sync_target_head.remove(&group_id);
+                if self.state.group_states.get(&group_id).is_some_and(|state| {
+                    state
+                        .pending_group_transition
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.stage == PendingGroupTransitionStage::ReconcilingAfterConflict
+                        })
+                }) {
+                    output = merge_outputs(
+                        output,
+                        self.resume_group_transition_after_reconciliation(group_id.clone())?,
+                    );
+                }
             }
         }
         self.merge_with_transport_flush(output)
+    }
+
+    fn apply_inbound_group_transition_bundle(
+        &mut self,
+        group_id: &str,
+        bundle: &[GroupOutboxRecord],
+    ) -> CoreResult<Option<Vec<MessageSummary>>> {
+        let current = self
+            .state
+            .group_states
+            .get(group_id)
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        if current.consistency_state == GroupConsistencyState::BlockedNeedsRebuild {
+            return Ok(None);
+        }
+        let first = bundle
+            .first()
+            .ok_or_else(|| CoreError::invalid_input("transition bundle must not be empty"))?;
+        let transition_id = first.envelope.transition_id.as_deref().ok_or_else(|| {
+            CoreError::invalid_input("transition bundle is missing transition_id")
+        })?;
+        let proof = first
+            .envelope
+            .membership_proof
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_input("transition bundle is missing proof"))?
+            .clone();
+        if bundle.iter().any(|record| {
+            record.envelope.transition_id.as_deref() != Some(transition_id)
+                || record.envelope.membership_proof.as_ref() != Some(&proof)
+                || record.envelope.group_id != group_id
+                || record.envelope.conversation_id != current.conversation_id
+                || record.envelope.sender_user_id != proof.signer_user_id
+                || record.envelope.sender_device_id != proof.signer_device_id
+        }) {
+            return Err(CoreError::invalid_input(
+                "transition bundle records do not share identity, proof, and transition_id",
+            ));
+        }
+        let commit = bundle
+            .iter()
+            .find(|record| record.message_id == proof.commit_message_id);
+        let control = bundle
+            .iter()
+            .find(|record| record.message_id == proof.control_message_id)
+            .ok_or_else(|| CoreError::invalid_input("transition bundle is missing control"))?;
+        let state_event_id = proof.state_event_message_id.as_deref().ok_or_else(|| {
+            CoreError::invalid_input("transition proof is missing state_event_message_id")
+        })?;
+        let state_event = bundle
+            .iter()
+            .find(|record| record.message_id == state_event_id)
+            .ok_or_else(|| CoreError::invalid_input("transition bundle is missing state event"))?;
+        let commit_is_new =
+            proof.previous_commit_message_id.as_ref() != Some(&proof.commit_message_id);
+        if commit_is_new != commit.is_some()
+            || control.envelope.message_type == GroupMessageType::ControlGroupStateEvent
+            || state_event.envelope.message_type != GroupMessageType::ControlGroupStateEvent
+            || bundle.len() != if commit_is_new { 3 } else { 2 }
+        {
+            return Err(CoreError::invalid_input(
+                "transition bundle has an invalid commit/control/event shape",
+            ));
+        }
+        self.verify_membership_operation_authority(&control.envelope, &current.manifest)?;
+        if let Some(commit) = commit {
+            self.verify_membership_operation_authority(&commit.envelope, &current.manifest)?;
+        }
+        for record in bundle {
+            let ciphertext = record
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .ok_or_else(|| CoreError::invalid_input("transition record has no ciphertext"))?;
+            self.verify_device_signature(
+                &record.envelope.sender_user_id,
+                &record.envelope.sender_device_id,
+                ciphertext.as_bytes(),
+                &record.envelope.sender_proof.value,
+            )?;
+        }
+
+        let mut staged_mls = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .fork()?;
+        if let Some(commit) = commit {
+            match staged_mls.ingest_message(
+                &current.conversation_id,
+                &commit.envelope.sender_device_id,
+                MessageType::MlsCommit,
+                commit
+                    .envelope
+                    .inline_ciphertext
+                    .as_deref()
+                    .unwrap_or_default(),
+            )? {
+                IngestResult::AppliedCommit { .. } | IngestResult::IgnoredReplay => {}
+                IngestResult::PendingRetry => return Ok(None),
+                IngestResult::NeedsRebuild => {
+                    return Err(CoreError::invalid_state(
+                        "transition commit marked MLS state unrecoverable",
+                    ))
+                }
+                _ => {
+                    return Err(CoreError::invalid_input(
+                        "transition commit did not produce an MLS commit",
+                    ))
+                }
+            }
+        }
+        let manifest_plaintext = match staged_mls.ingest_message(
+            &current.conversation_id,
+            &control.envelope.sender_device_id,
+            MessageType::MlsApplication,
+            control
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .unwrap_or_default(),
+        )? {
+            IngestResult::AppliedApplication(application) => application.plaintext,
+            IngestResult::PendingRetry => return Ok(None),
+            _ => {
+                return Err(CoreError::invalid_input(
+                    "transition control did not decrypt as an application message",
+                ))
+            }
+        };
+        let updated: GroupManifest =
+            serde_json::from_slice(&manifest_plaintext).map_err(|error| {
+                CoreError::invalid_input(format!("transition manifest is invalid JSON: {error}"))
+            })?;
+        updated.validate()?;
+        self.verify_manifest_signature(&updated)?;
+        if updated.group_id != group_id
+            || updated.conversation_id != current.conversation_id
+            || Self::manifest_sha256(&updated)? != proof.new_manifest_sha256
+            || updated.roster_version != proof.new_roster_version
+            || updated.last_commit_message_id.as_ref() != Some(&proof.commit_message_id)
+            || !Self::validate_manifest_transition_for_operation(
+                &current.manifest,
+                &updated,
+                &proof,
+            )
+        {
+            return Err(CoreError::invalid_input(
+                "transition manifest does not match its proof and previous state",
+            ));
+        }
+        let state_event_plaintext = match staged_mls.ingest_message(
+            &current.conversation_id,
+            &state_event.envelope.sender_device_id,
+            MessageType::MlsApplication,
+            state_event
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .unwrap_or_default(),
+        )? {
+            IngestResult::AppliedApplication(application) => application.plaintext,
+            IngestResult::PendingRetry => return Ok(None),
+            _ => {
+                return Err(CoreError::invalid_input(
+                    "transition state event did not decrypt as an application message",
+                ))
+            }
+        };
+        let event: GroupStateEvent =
+            serde_json::from_slice(&state_event_plaintext).map_err(|error| {
+                CoreError::invalid_input(format!("transition state event is invalid JSON: {error}"))
+            })?;
+        let expected_json =
+            Self::derive_group_state_event(&current.manifest, &updated, &proof, state_event)
+                .ok_or_else(|| CoreError::invalid_state("failed to derive expected state event"))?;
+        let expected: GroupStateEvent = serde_json::from_str(&expected_json).map_err(|error| {
+            CoreError::invalid_state(format!("failed to parse expected state event: {error}"))
+        })?;
+        if event != expected || event.transition_id != transition_id {
+            return Err(CoreError::invalid_input(
+                "transition state event does not match the verified manifest diff",
+            ));
+        }
+
+        let summary = staged_mls.export_group_summary(&current.conversation_id)?;
+        if summary.epoch != updated.mls_epoch_hint {
+            return Err(CoreError::invalid_input(
+                "transition MLS epoch does not match manifest",
+            ));
+        }
+        self.state.mls_adapter = Some(staged_mls);
+        self.state
+            .mls_summaries
+            .insert(current.conversation_id.clone(), summary);
+        let local_user_id = self.local_identity_user_id()?;
+        let local_role = updated
+            .members
+            .iter()
+            .find(|member| {
+                member.user_id == local_user_id && member.status == GroupMemberStatus::Active
+            })
+            .map(|member| member.role);
+        if let Some(state) = self.state.group_states.get_mut(group_id) {
+            state.manifest = updated.clone();
+            state.local_role = local_role;
+            state.pending_membership_transition = None;
+            state.consistency_state = if proof.operation == "dissolve" {
+                GroupConsistencyState::Dissolved
+            } else {
+                GroupConsistencyState::Ready
+            };
+        }
+        self.sync_conversation_members_from_manifest(&current.conversation_id, &updated)?;
+        let mut messages = Vec::new();
+        for record in bundle {
+            let (message_type, plaintext) = if record.message_id == state_event.message_id {
+                (
+                    MessageType::ControlGroupStateEvent,
+                    String::from_utf8(state_event_plaintext.clone()).ok(),
+                )
+            } else {
+                (
+                    group_message_type_to_direct(record.envelope.message_type),
+                    None,
+                )
+            };
+            if !self
+                .state
+                .conversations
+                .get(&current.conversation_id)
+                .is_some_and(|conversation| {
+                    conversation
+                        .messages
+                        .iter()
+                        .any(|message| message.message_id == record.message_id)
+                })
+            {
+                self.store_group_record_message(
+                    &current.conversation_id,
+                    record,
+                    message_type,
+                    plaintext,
+                )?;
+            }
+            messages.push(MessageSummary {
+                conversation_id: current.conversation_id.clone(),
+                message_id: record.message_id.clone(),
+                message_type,
+            });
+        }
+        Ok(Some(messages))
+    }
+
+    fn derive_group_state_event(
+        previous: &GroupManifest,
+        updated: &GroupManifest,
+        proof: &GroupMembershipProof,
+        record: &GroupOutboxRecord,
+    ) -> Option<String> {
+        let active = |manifest: &GroupManifest| {
+            manifest
+                .members
+                .iter()
+                .filter(|member| member.status == GroupMemberStatus::Active)
+                .map(|member| (member.user_id.clone(), member.role))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = active(previous);
+        let after = active(updated);
+        let joined = after
+            .keys()
+            .filter(|user_id| !before.contains_key(*user_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = before
+            .keys()
+            .filter(|user_id| !after.contains_key(*user_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let role_change = before.iter().find_map(|(user_id, old_role)| {
+            after
+                .get(user_id)
+                .filter(|new_role| *new_role != old_role)
+                .map(|new_role| (user_id.clone(), *old_role, *new_role))
+        });
+        let (kind, subject_user_ids, old_role, new_role) = if proof.operation == "dissolve" {
+            (GroupStateEventKind::GroupDissolved, Vec::new(), None, None)
+        } else if previous.owner_user_id != updated.owner_user_id {
+            (
+                GroupStateEventKind::OwnershipTransferred,
+                vec![updated.owner_user_id.clone()],
+                Some(GroupRole::Member),
+                Some(GroupRole::Owner),
+            )
+        } else if let Some((user_id, old_role, new_role)) = role_change {
+            (
+                GroupStateEventKind::RoleChanged,
+                vec![user_id],
+                Some(old_role),
+                Some(new_role),
+            )
+        } else if !joined.is_empty() {
+            (GroupStateEventKind::MemberJoined, joined, None, None)
+        } else if !removed.is_empty() {
+            let kind = if proof.operation == "leave" {
+                GroupStateEventKind::MemberLeft
+            } else {
+                GroupStateEventKind::MemberRemoved
+            };
+            (kind, removed, None, None)
+        } else {
+            (
+                GroupStateEventKind::GroupMetadataChanged,
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        serde_json::to_string(&GroupStateEvent {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            event_id: record.message_id.clone(),
+            transition_id: record
+                .envelope
+                .transition_id
+                .clone()
+                .unwrap_or_else(|| format!("group-transition:{}", proof.control_message_id)),
+            kind,
+            actor_user_id: proof.signer_user_id.clone(),
+            subject_user_ids,
+            old_role,
+            new_role,
+            roster_version: updated.roster_version,
+            manifest_hash: proof.new_manifest_sha256.clone(),
+            occurred_at: record.envelope.created_at,
+        })
+        .ok()
+    }
+
+    fn transition_intent_from_staged_state(
+        &self,
+        previous: &GroupManifest,
+        updated: &GroupManifest,
+        proof: &GroupMembershipProof,
+        join_request_id: Option<&str>,
+    ) -> CoreResult<GroupTransitionIntent> {
+        let active_users = |manifest: &GroupManifest| {
+            manifest
+                .members
+                .iter()
+                .filter(|member| member.status == GroupMemberStatus::Active)
+                .map(|member| member.user_id.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let before_users = active_users(previous);
+        let after_users = active_users(updated);
+        let added_users = after_users
+            .difference(&before_users)
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed_users = before_users
+            .difference(&after_users)
+            .cloned()
+            .collect::<Vec<_>>();
+        let added_device = updated.member_devices.iter().find(|device| {
+            device.status == GroupMemberStatus::Active
+                && !previous.member_devices.iter().any(|old| {
+                    old.user_id == device.user_id
+                        && old.device_id == device.device_id
+                        && old.status == GroupMemberStatus::Active
+                })
+        });
+        let removed_device = previous.member_devices.iter().find(|device| {
+            device.status == GroupMemberStatus::Active
+                && !updated.member_devices.iter().any(|new| {
+                    new.user_id == device.user_id
+                        && new.device_id == device.device_id
+                        && new.status == GroupMemberStatus::Active
+                })
+        });
+        let operation = match proof.operation.as_str() {
+            "create" => GroupTransitionOperation::Create,
+            "invite" => GroupTransitionOperation::InviteMembers {
+                user_ids: added_users,
+            },
+            "approve_join" => {
+                let request_id = join_request_id.ok_or_else(|| {
+                    CoreError::invalid_state("approve_join transition is missing request_id")
+                })?;
+                let request = self
+                    .state
+                    .group_join_requests
+                    .get(request_id)
+                    .ok_or_else(|| CoreError::invalid_state("join request does not exist"))?;
+                GroupTransitionOperation::ApproveJoin {
+                    request_id: request_id.to_string(),
+                    user_id: request.request.joiner_user_id.clone(),
+                    device_id: request.request.joiner_device_id.clone(),
+                }
+            }
+            "leave" => {
+                let request_id = join_request_id.ok_or_else(|| {
+                    CoreError::invalid_state("leave transition is missing request_id")
+                })?;
+                let request = self
+                    .state
+                    .group_states
+                    .get(&previous.group_id)
+                    .and_then(|state| {
+                        state
+                            .leave_requests
+                            .iter()
+                            .find(|stored| stored.request.request_id == request_id)
+                    })
+                    .ok_or_else(|| CoreError::invalid_state("leave request does not exist"))?;
+                let user_id = request.request.leaver_user_id.clone();
+                let device_id = request.request.leaver_device_id.clone();
+                GroupTransitionOperation::ApproveLeave {
+                    request_id: request_id.to_string(),
+                    user_id,
+                    device_id,
+                }
+            }
+            "remove" => GroupTransitionOperation::RemoveMember {
+                user_id: removed_users.first().cloned().ok_or_else(|| {
+                    CoreError::invalid_state("remove transition removed no active member")
+                })?,
+            },
+            "transfer_ownership" => GroupTransitionOperation::TransferOwnership {
+                user_id: updated.owner_user_id.clone(),
+            },
+            "set_admin" => {
+                let (user_id, is_admin) = updated
+                    .members
+                    .iter()
+                    .find_map(|member| {
+                        previous
+                            .members
+                            .iter()
+                            .find(|old| old.user_id == member.user_id)
+                            .filter(|old| old.role != member.role)
+                            .map(|_| (member.user_id.clone(), member.role == GroupRole::Admin))
+                    })
+                    .ok_or_else(|| CoreError::invalid_state("set_admin changed no role"))?;
+                GroupTransitionOperation::SetAdmin { user_id, is_admin }
+            }
+            "update_metadata" => GroupTransitionOperation::UpdateMetadata,
+            "dissolve" => GroupTransitionOperation::Dissolve,
+            "add_device" => {
+                let device = added_device.ok_or_else(|| {
+                    CoreError::invalid_state("add_device transition added no active device")
+                })?;
+                GroupTransitionOperation::AddDevice {
+                    user_id: device.user_id.clone(),
+                    device_id: device.device_id.clone(),
+                }
+            }
+            "remove_device" => {
+                let device = removed_device.ok_or_else(|| {
+                    CoreError::invalid_state("remove_device transition removed no active device")
+                })?;
+                GroupTransitionOperation::RemoveDevice {
+                    user_id: device.user_id.clone(),
+                    device_id: device.device_id.clone(),
+                }
+            }
+            operation => {
+                return Err(CoreError::invalid_state(format!(
+                    "unsupported group transition operation {operation}"
+                )))
+            }
+        };
+        let request_binding = match (&operation, join_request_id) {
+            (GroupTransitionOperation::ApproveJoin { .. }, Some(request_id)) => self
+                .state
+                .group_join_requests
+                .get(request_id)
+                .and_then(|request| {
+                    request.lease_token.as_ref().map(|lease_token| {
+                        GroupTransitionRequestBinding::Join {
+                            request_id: request.request_id.clone(),
+                            lease_token: lease_token.clone(),
+                        }
+                    })
+                }),
+            (GroupTransitionOperation::ApproveLeave { .. }, Some(request_id)) => self
+                .state
+                .group_states
+                .get(&previous.group_id)
+                .and_then(|state| {
+                    state
+                        .leave_requests
+                        .iter()
+                        .find(|stored| stored.request.request_id == request_id)
+                })
+                .and_then(|stored| {
+                    stored.lease_token.as_ref().map(|lease_token| {
+                        GroupTransitionRequestBinding::Leave {
+                            request_id: stored.request.request_id.clone(),
+                            lease_token: lease_token.clone(),
+                        }
+                    })
+                }),
+            _ => None,
+        };
+        Ok(GroupTransitionIntent::Typed {
+            operation,
+            request_binding,
+            conflict_rebuild_attempted: false,
+        })
     }
 
     fn store_group_record_message(
@@ -12316,6 +15048,318 @@ impl CoreEngine {
         state.last_message_type = Some(message_type);
         state.conversation.updated_at = record.envelope.created_at;
         Ok(())
+    }
+
+    fn handle_group_transition_appended(
+        &mut self,
+        group_id: String,
+        transition_id: String,
+        first_seq: u64,
+        last_seq: u64,
+        roster_version: u64,
+        last_commit_message_id: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let pending = group_state
+            .pending_group_transition
+            .clone()
+            .ok_or_else(|| {
+                CoreError::invalid_state("group transition ACK has no pending transition")
+            })?;
+        if pending.transition_id != transition_id
+            || pending.proposed_manifest.roster_version != roster_version
+            || pending.proposed_manifest.last_commit_message_id != last_commit_message_id
+            || first_seq == 0
+            || last_seq < first_seq
+            || last_seq.saturating_sub(first_seq).saturating_add(1)
+                != pending.envelopes.len() as u64
+            || group_state.manifest.roster_version != pending.base_roster_version
+            || group_state.manifest.last_commit_message_id != pending.base_commit_message_id
+            || Self::manifest_sha256(&group_state.manifest)? != pending.base_manifest_hash
+        {
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.consistency_state = GroupConsistencyState::Reconciling;
+            }
+            return self.sync_group_outbox(group_id, Some("stale_transition_ack".into()));
+        }
+
+        let mut summaries = self.state.mls_summaries.clone();
+        summaries.insert(
+            group_state.conversation_id.clone(),
+            MlsStateSummary {
+                conversation_id: group_state.conversation_id.clone(),
+                epoch: pending.proposed_manifest.mls_epoch_hint,
+                member_device_ids: pending
+                    .proposed_manifest
+                    .member_devices
+                    .iter()
+                    .filter(|device| device.status == GroupMemberStatus::Active)
+                    .map(|device| device.device_id.clone())
+                    .collect(),
+                status: MlsStateStatus::Active,
+                updated_at: current_unix_millis(self.state.message_nonce),
+            },
+        );
+        let Some(patch) = pending.mls_patch.as_ref() else {
+            // A legacy full-adapter snapshot cannot be promoted safely because
+            // it may overwrite unrelated conversations that advanced while the
+            // transition was in flight.
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.consistency_state = GroupConsistencyState::Reconciling;
+            }
+            return self.sync_group_outbox(group_id, Some("legacy_transition_ack".into()));
+        };
+        let patched_adapter = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .apply_conversation_patch(patch, &summaries);
+        let patched_adapter = match patched_adapter {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                    state.consistency_state = GroupConsistencyState::Reconciling;
+                }
+                return self.sync_group_outbox(group_id, Some("mls_patch_conflict".into()));
+            }
+        };
+        self.state.mls_adapter = Some(patched_adapter);
+        self.state.mls_summaries = summaries;
+        let local_user_id = self.local_identity_user_id()?;
+        let local_role = pending
+            .proposed_manifest
+            .members
+            .iter()
+            .find(|member| {
+                member.user_id == local_user_id && member.status == GroupMemberStatus::Active
+            })
+            .map(|member| member.role);
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.manifest = pending.proposed_manifest.clone();
+            state.local_role = local_role;
+            state.consistency_state = if state.dissolved_at.is_some() {
+                GroupConsistencyState::Dissolved
+            } else {
+                GroupConsistencyState::Ready
+            };
+            if let Some(staged) = state.pending_group_transition.as_mut() {
+                staged.stage = PendingGroupTransitionStage::AcceptedPublishingWelcomes;
+                staged.first_seq = Some(first_seq);
+                staged.last_seq = Some(last_seq);
+            }
+            if state
+                .pending_group_transition
+                .as_ref()
+                .is_some_and(|pending| pending.welcomes.is_empty())
+            {
+                state.pending_group_transition = None;
+            }
+        }
+        self.sync_conversation_members_from_manifest(
+            &group_state.conversation_id,
+            &pending.proposed_manifest,
+        )?;
+        self.state.group_cursors.insert(
+            group_id.clone(),
+            GroupCursor {
+                group_id: group_id.clone(),
+                last_fetched_seq: last_seq,
+                updated_at: current_unix_millis(self.state.message_nonce),
+            },
+        );
+        let mut system_message = None;
+        if let Some(envelope) = pending
+            .envelopes
+            .iter()
+            .find(|envelope| envelope.message_type == GroupMessageType::ControlGroupStateEvent)
+        {
+            let record = GroupOutboxRecord {
+                seq: last_seq,
+                group_id: group_id.clone(),
+                message_id: envelope.message_id.clone(),
+                received_at: current_unix_millis(self.state.message_nonce),
+                expires_at: None,
+                state: GroupOutboxRecordState::Available,
+                envelope: envelope.clone(),
+            };
+            self.store_group_record_message(
+                &group_state.conversation_id,
+                &record,
+                MessageType::ControlGroupStateEvent,
+                pending.state_event_plaintext.clone(),
+            )?;
+            system_message = Some(MessageSummary {
+                conversation_id: group_state.conversation_id.clone(),
+                message_id: envelope.message_id.clone(),
+                message_type: MessageType::ControlGroupStateEvent,
+            });
+        }
+        let transition_message_ids: BTreeSet<_> = pending
+            .envelopes
+            .iter()
+            .map(|envelope| envelope.message_id.as_str())
+            .collect();
+        self.state
+            .pending_group_outbox
+            .retain(|item| !transition_message_ids.contains(item.envelope.message_id.as_str()));
+
+        let mut effects = Vec::new();
+        for mut welcome in pending.welcomes {
+            welcome.descriptor.start_seq = Some(last_seq);
+            welcome.descriptor.roster_version = Some(roster_version);
+            welcome.descriptor.last_commit_message_id = last_commit_message_id.clone();
+            effects.push(CoreEffect::PutWelcomePickup { put: welcome });
+        }
+        // Atomic membership transitions bypass the legacy per-envelope ACK
+        // handler. A dissolve still stages its seal there, so dispatch it
+        // here once the acknowledged bundle has drained every pending record.
+        let seal = if !self
+            .state
+            .pending_group_outbox
+            .iter()
+            .any(|item| item.envelope.group_id == group_id)
+        {
+            self.state.pending_group_seal.remove(&group_id)
+        } else {
+            None
+        };
+        let mut persist_ops = vec![
+            PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            },
+            PersistOp::SaveGroupCursor {
+                group_id: group_id.clone(),
+            },
+            PersistOp::SaveConversation {
+                conversation_id: group_state.conversation_id.clone(),
+            },
+            PersistOp::SaveMlsState {
+                conversation_id: group_state.conversation_id.clone(),
+            },
+        ];
+        if seal.is_some() {
+            persist_ops.push(PersistOp::DeletePendingGroupSeal {
+                group_id: group_id.clone(),
+            });
+        }
+        effects.insert(0, persist_effect(&self.state, persist_ops));
+        if let Some(seal) = seal {
+            effects.push(CoreEffect::SealGroupOutbox { seal });
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: system_message.is_some(),
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: system_message.map(|message| CoreViewModel {
+                messages: vec![message],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn handle_group_transition_failed(
+        &mut self,
+        group_id: String,
+        transition_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    ) -> CoreResult<CoreOutput> {
+        let message_ids: BTreeSet<String> = self
+            .state
+            .group_states
+            .get(&group_id)
+            .and_then(|state| state.pending_group_transition.as_ref())
+            .filter(|pending| pending.transition_id == transition_id)
+            .map(|pending| {
+                pending
+                    .envelopes
+                    .iter()
+                    .map(|envelope| envelope.message_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for item in &mut self.state.pending_group_outbox {
+            if message_ids.contains(&item.envelope.message_id) {
+                item.in_flight = false;
+                item.retries = item.retries.saturating_add(1);
+            }
+        }
+        if status == Some(409)
+            && matches!(
+                code.as_deref(),
+                Some("roster_version_conflict") | Some("group_transition_conflict")
+            )
+        {
+            self.state
+                .pending_group_outbox
+                .retain(|item| !message_ids.contains(&item.envelope.message_id));
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                if let Some(pending) = state.pending_group_transition.as_mut() {
+                    if pending.transition_id == transition_id {
+                        pending.stage = PendingGroupTransitionStage::ReconcilingAfterConflict;
+                        pending.mls_patch = None;
+                        pending.staged_mls_state = None;
+                        pending.envelopes.clear();
+                        pending.welcomes.clear();
+                        pending.first_seq = None;
+                        pending.last_seq = None;
+                    }
+                }
+                state.consistency_state = GroupConsistencyState::Reconciling;
+            }
+            let persist = persist_effect(
+                &self.state,
+                vec![PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                }],
+            );
+            return Ok(merge_outputs(
+                CoreOutput {
+                    state_update: CoreStateUpdate {
+                        checkpoints_changed: true,
+                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist],
+                    view_model: None,
+                },
+                self.sync_group_outbox(group_id, Some("transition_conflict".into()))?,
+            ));
+        }
+        if retryable {
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![CoreEffect::ScheduleTimer {
+                    timer: TimerEffect {
+                        timer_id: format!("retry_group_transition:{transition_id}"),
+                        delay_ms: retry_delay_ms(&transition_id, 1),
+                    },
+                }],
+                view_model: None,
+            });
+        }
+        self.block_group_needs_rebuild(
+            &group_id,
+            detail
+                .as_deref()
+                .or(code.as_deref())
+                .unwrap_or("group transition was rejected"),
+        )
     }
 
     fn handle_group_envelope_appended(
@@ -12450,8 +15494,16 @@ impl CoreEngine {
         group_id: String,
         message_id: String,
         retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
         detail: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        if status == Some(403) && code.as_deref() == Some("group_membership_revoked") {
+            self.state
+                .pending_group_outbox
+                .retain(|item| item.envelope.message_id != message_id);
+            return self.handle_group_sync_failed(group_id, false, status, code, detail);
+        }
         if let Some(item) = self
             .state
             .pending_group_outbox
@@ -12643,6 +15695,9 @@ impl CoreEngine {
                 // server-side seal is in effect.
                 dissolved_at: None,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Ready,
+                pending_group_transition: None,
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -12693,6 +15748,9 @@ impl CoreEngine {
         }
         manifest.signature = self.sign_manifest(&manifest)?;
         manifest.validate()?;
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.manifest = manifest.clone();
+        }
 
         // Step (b): visible `ControlGroupDissolved` control message.
         let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -12892,6 +15950,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Ready,
+                pending_group_transition: None,
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -12943,6 +16004,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Ready,
+                pending_group_transition: None,
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -13138,6 +16202,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Ready,
+                pending_group_transition: None,
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -13189,6 +16256,9 @@ impl CoreEngine {
                 welcome_pickup: group_state.welcome_pickup.clone(),
                 dissolved_at: group_state.dissolved_at,
                 pending_membership_transition: None,
+                consistency_state: GroupConsistencyState::Ready,
+                pending_group_transition: None,
+                leave_requests: group_state.leave_requests.clone(),
             },
         );
 
@@ -13751,6 +16821,25 @@ impl CoreEngine {
             })?;
             manifest.validate()?;
             self.verify_manifest_signature(&manifest)?;
+            let start_seq = descriptor
+                .start_seq
+                .ok_or_else(|| CoreError::invalid_input("fsm_v2 welcome is missing startSeq"))?;
+            let roster_version = descriptor.roster_version.ok_or_else(|| {
+                CoreError::invalid_input("fsm_v2 welcome is missing rosterVersion")
+            })?;
+            let last_commit_message_id =
+                descriptor.last_commit_message_id.as_ref().ok_or_else(|| {
+                    CoreError::invalid_input("fsm_v2 welcome is missing lastCommitMessageId")
+                })?;
+            if manifest.group_id != descriptor.group_id
+                || roster_version != manifest.roster_version
+                || manifest.last_commit_message_id.as_ref() != Some(last_commit_message_id)
+                || start_seq == 0
+            {
+                return Err(CoreError::invalid_input(
+                    "welcome cursor metadata does not match the imported manifest",
+                ));
+            }
             let local_identity = self
                 .state
                 .local_identity
@@ -13829,6 +16918,9 @@ impl CoreEngine {
                     welcome_pickup: Some(descriptor.clone()),
                     dissolved_at: None,
                     pending_membership_transition: None,
+                    consistency_state: GroupConsistencyState::Ready,
+                    pending_group_transition: None,
+                    leave_requests: Vec::new(),
                 },
             );
             imported_shell = Some((imported_group_id, imported_conversation_id));
@@ -13849,17 +16941,18 @@ impl CoreEngine {
             .get(&descriptor.group_id)
             .ok_or_else(|| CoreError::invalid_input("group state does not exist for welcome"))?
             .clone();
-        let result = self
+        let mut staged_mls = self
             .state
             .mls_adapter
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .ingest_message(
-                &group_state.conversation_id,
-                &group_state.manifest.signer_device_id,
-                MessageType::MlsWelcome,
-                &welcome_b64,
-            );
+            .fork()?;
+        let result = staged_mls.ingest_message(
+            &group_state.conversation_id,
+            &group_state.manifest.signer_device_id,
+            MessageType::MlsWelcome,
+            &welcome_b64,
+        );
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -13918,15 +17011,50 @@ impl CoreEngine {
                 view_model: None,
             });
         }
-        let summary = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .export_group_summary(&group_state.conversation_id)?;
+        let summary = staged_mls.export_group_summary(&group_state.conversation_id)?;
+        if summary.epoch != group_state.manifest.mls_epoch_hint {
+            if let Some((group_id, conversation_id)) = imported_shell {
+                self.state.group_states.remove(&group_id);
+                self.state.group_cursors.remove(&group_id);
+                self.state.conversations.remove(&conversation_id);
+            }
+            return Err(CoreError::invalid_input(
+                "welcome MLS epoch does not match the imported manifest",
+            ));
+        }
+        self.state.mls_adapter = Some(staged_mls);
         self.state
             .mls_summaries
             .insert(group_state.conversation_id.clone(), summary);
+        if descriptor
+            .roster_version
+            .is_some_and(|version| version != group_state.manifest.roster_version)
+            || descriptor.last_commit_message_id.is_some()
+                && descriptor.last_commit_message_id != group_state.manifest.last_commit_message_id
+        {
+            return self.block_group_needs_rebuild(
+                &group_state.group_id,
+                "welcome cursor metadata does not match the imported manifest",
+            );
+        }
+        if let Some(state) = self.state.group_states.get_mut(&group_state.group_id) {
+            state.consistency_state = GroupConsistencyState::Ready;
+        }
+        let start_seq = descriptor.start_seq.unwrap_or_else(|| {
+            self.state
+                .group_cursors
+                .get(&group_state.group_id)
+                .map(|cursor| cursor.last_fetched_seq)
+                .unwrap_or(0)
+        });
+        self.state.group_cursors.insert(
+            group_state.group_id.clone(),
+            GroupCursor {
+                group_id: group_state.group_id.clone(),
+                last_fetched_seq: start_seq,
+                updated_at: current_unix_millis(self.state.message_nonce),
+            },
+        );
         let post_welcome_effects = self.rotate_local_key_package_after_welcome()?;
         log::info!(
             "handle_welcome_pickup_fetched: group imported group_id={} conversation_id={} epoch_ready=true",
@@ -13939,41 +17067,23 @@ impl CoreEngine {
             .pending_welcome_pickups
             .remove(&pending_key)
             .is_some();
-        // The welcome established a cryptographically valid group state at
-        // the MLS epoch where the approver added this device. Any outbox
-        // records that predate that epoch cannot be decrypted by us and
-        // would otherwise trip MLS's `process_message` into returning
-        // `PendingRetry`, which would incorrectly flip our recovery status
-        // to `NeedsRecovery`. We proactively advance the group cursor to
-        // the current server head so future syncs only consider records
-        // emitted after we joined; the head lookup is issued as an effect
-        // so the driver can perform the real HTTP call.
-        let head_request = CoreEffect::GetGroupOutboxHead {
-            get: GetGroupOutboxHeadRequest {
-                group_id: group_state.group_id.clone(),
-                capability: self.group_capability_for_state(&group_state)?,
-            },
-        };
-        let mut effects = vec![
-            persist_effect(
-                &self.state,
-                vec![
-                    PersistOp::SaveConversation {
-                        conversation_id: group_state.conversation_id.clone(),
-                    },
-                    PersistOp::SaveMlsState {
-                        conversation_id: group_state.conversation_id.clone(),
-                    },
-                    PersistOp::SaveGroupState {
-                        group_id: group_state.group_id.clone(),
-                    },
-                    PersistOp::SaveGroupCursor {
-                        group_id: group_state.group_id.clone(),
-                    },
-                ],
-            ),
-            head_request,
-        ];
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![
+                PersistOp::SaveConversation {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: group_state.conversation_id.clone(),
+                },
+                PersistOp::SaveGroupState {
+                    group_id: group_state.group_id.clone(),
+                },
+                PersistOp::SaveGroupCursor {
+                    group_id: group_state.group_id.clone(),
+                },
+            ],
+        )];
         if had_pending {
             effects.insert(
                 0,
@@ -14002,22 +17112,23 @@ impl CoreEngine {
     }
 
     fn replay_pending_records_for_device(&mut self, device_id: String) -> CoreResult<CoreOutput> {
-        let records = {
-            let Some(sync_state) = self.state.sync_states.get_mut(&device_id) else {
+        let records: Vec<InboxRecord> = {
+            let Some(sync_state) = self.state.sync_states.get(&device_id) else {
                 return Ok(CoreOutput::default());
             };
             if sync_state.pending_records.is_empty() {
                 return Ok(CoreOutput::default());
             }
-            let records: Vec<InboxRecord> = sync_state.pending_records.values().cloned().collect();
-            for record in &records {
-                sync_state.seen_message_ids.remove(&record.message_id);
-            }
-            records
+            sync_state.pending_records.values().cloned().collect()
         };
         let to_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
-        let output =
-            self.handle_inbox_records_internal(device_id.clone(), records, to_seq, false)?;
+        let output = self.handle_inbox_records_internal(
+            device_id.clone(),
+            records,
+            to_seq,
+            false,
+            InboxRecordSource::PendingReplay,
+        )?;
         let pending_retry = self
             .state
             .sync_states
@@ -14095,18 +17206,39 @@ fn hex_nibble(value: u8) -> char {
     }
 }
 
-fn group_capability_for_manifest(manifest: &GroupManifest, role: GroupRole) -> GroupCapability {
-    GroupCapability {
-        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-        service: CapabilityService::GroupOutbox,
-        group_id: manifest.group_id.clone(),
-        user_id: manifest.signer_user_id.clone(),
-        device_id: manifest.signer_device_id.clone(),
-        operations: group_capability_operations(role),
+fn group_capability_signing_payload(capability: &GroupCapability) -> String {
+    let mut operations = capability
+        .operations
+        .iter()
+        .map(|operation| match operation {
+            crate::model::GroupCapabilityOperation::Read => "read",
+            crate::model::GroupCapabilityOperation::Subscribe => "subscribe",
+            crate::model::GroupCapabilityOperation::AppendApplication => "append_application",
+            crate::model::GroupCapabilityOperation::AppendControl => "append_control",
+            crate::model::GroupCapabilityOperation::AppendMembership => "append_membership",
+            crate::model::GroupCapabilityOperation::ManageInvites => "manage_invites",
+            crate::model::GroupCapabilityOperation::ApproveJoin => "approve_join",
+            crate::model::GroupCapabilityOperation::RemoveMember => "remove_member",
+            crate::model::GroupCapabilityOperation::UpdateGroupMetadata => "update_group_metadata",
+            crate::model::GroupCapabilityOperation::SealGroup => "seal_group",
+        })
+        .collect::<Vec<_>>();
+    operations.sort_unstable();
+    let role = match capability.role {
+        GroupRole::Owner => "owner",
+        GroupRole::Admin => "admin",
+        GroupRole::Member => "member",
+    };
+    format!(
+        "tapchat.group_capability.v2\nversion={}\nservice=group_outbox\ngroup_id={}\nuser_id={}\ndevice_id={}\nrole={}\noperations={}\nexpires_at={}",
+        capability.version,
+        capability.group_id,
+        capability.user_id,
+        capability.device_id,
         role,
-        expires_at: current_unix_millis(0) + 60 * 60 * 1000,
-        signature: manifest.signature.clone(),
-    }
+        operations.join(","),
+        capability.expires_at
+    )
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -14230,7 +17362,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 message_id: item.envelope.message_id.clone(),
                 group_id: item.envelope.group_id.clone(),
                 envelope: item.envelope.clone(),
-                capability: Some(item.capability.clone()),
+                capability: None,
                 retries: item.retries,
                 plaintext_cache: item.plaintext_cache.clone(),
             })
@@ -14391,6 +17523,9 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
                 .group_join_requests
                 .append(&mut next_view.group_join_requests);
             base_view
+                .group_leave_requests
+                .append(&mut next_view.group_leave_requests);
+            base_view
                 .welcome_pickups
                 .append(&mut next_view.welcome_pickups);
         }
@@ -14442,6 +17577,38 @@ mod protected_application_message_tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn invalid_inbox_batch_does_not_commit_seen_or_checkpoint_state() {
+        let mut engine = CoreEngine::default();
+        let mut record = sample_record();
+        record.recipient_device_id = "device:mallory:phone".into();
+        record.envelope.recipient_device_id = "device:mallory:phone".into();
+
+        let error = engine
+            .handle_inbox_records("device:bob:phone".into(), vec![record], 1)
+            .expect_err("recipient mismatch must fail before registration");
+
+        assert_eq!(error.code(), "invalid_input");
+        assert!(engine.state.sync_states.is_empty());
+    }
+
+    #[test]
+    fn non_monotonic_inbox_batch_does_not_commit_seen_or_checkpoint_state() {
+        let mut engine = CoreEngine::default();
+        let mut second = sample_record();
+        second.seq = 2;
+        second.message_id = "msg:conv:alice:bob:2:device:bob:phone".into();
+        second.envelope.message_id = second.message_id.clone();
+        let first = sample_record();
+
+        let error = engine
+            .handle_inbox_records("device:bob:phone".into(), vec![second, first], 2)
+            .expect_err("non-monotonic batch must fail before registration");
+
+        assert_eq!(error.code(), "invalid_input");
+        assert!(engine.state.sync_states.is_empty());
     }
 
     fn protected_plaintext(audience: Vec<String>) -> Vec<u8> {
@@ -14641,12 +17808,36 @@ mod group_membership_security_tests {
     use super::{advance_contiguous_ack, CoreEngine};
     use crate::ffi_api::CoreCommand;
     use crate::model::{
-        GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest, GroupMember,
-        GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
-        GroupMessageType, GroupOutboxDescriptor, GroupRole, SenderProof, Validate,
-        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
+        DeploymentBundle, GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest,
+        GroupMember, GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus,
+        GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor, GroupRole, RuntimeConfig,
+        SenderProof, StorageBaseInfo, Validate, WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use std::collections::BTreeSet;
+
+    fn membership_fsm_deployment() -> DeploymentBundle {
+        DeploymentBundle {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            region: "test".into(),
+            inbox_http_endpoint: "https://example.test".into(),
+            inbox_websocket_endpoint: "wss://example.test/ws".into(),
+            storage_base_info: StorageBaseInfo {
+                base_url: Some("https://storage.example.test".into()),
+                bucket_hint: None,
+            },
+            runtime_config: RuntimeConfig {
+                supported_realtime_kinds: vec![],
+                identity_bundle_ref: None,
+                device_status_ref: None,
+                keypackage_ref_base: None,
+                max_inline_bytes: Some(4096),
+                features: vec!["group_membership_fsm_v2".into()],
+            },
+            device_runtime_auth: None,
+            expected_user_id: None,
+            expected_device_id: None,
+        }
+    }
 
     #[test]
     fn contiguous_ack_does_not_advance_past_pending_gap() {
@@ -14751,6 +17942,7 @@ mod group_membership_security_tests {
             previous_commit_message_id: Some("msg:commit:old".into()),
             commit_message_id: "msg:commit:new".into(),
             control_message_id: "msg:control:new".into(),
+            state_event_message_id: None,
             new_manifest_sha256: "sha256:manifest".into(),
             signature: "proof-sig".into(),
         }
@@ -14774,6 +17966,7 @@ mod group_membership_security_tests {
                 value: "sender-sig".into(),
             },
             membership_proof: Some(proof()),
+            transition_id: None,
         }
     }
 
@@ -14975,6 +18168,10 @@ mod group_membership_security_tests {
             endpoint: "https://example.test/welcome".into(),
             capability: "capability".into(),
             expires_at: 999,
+            start_seq: None,
+            roster_version: None,
+            last_commit_message_id: None,
+            request_id: None,
         };
 
         let error = engine
@@ -14991,6 +18188,11 @@ mod group_membership_security_tests {
     #[test]
     fn sync_groups_for_removed_device_rejects_current_device() {
         let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: membership_fsm_deployment(),
+            })
+            .expect("deployment");
         engine
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: None,
@@ -15017,6 +18219,11 @@ mod group_membership_security_tests {
     #[test]
     fn sync_groups_for_removed_device_reports_empty_batch() {
         let mut engine = CoreEngine::new();
+        engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: membership_fsm_deployment(),
+            })
+            .expect("deployment");
         engine
             .handle_command(CoreCommand::CreateOrLoadIdentity {
                 mnemonic: None,

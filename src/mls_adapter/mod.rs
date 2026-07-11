@@ -5,6 +5,7 @@ use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use serde::{Deserialize as SerdeDeserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{CoreError, CoreResult};
 use crate::identity::LocalIdentityState;
@@ -103,6 +104,23 @@ struct PersistedGroupState {
     storage: SerializableStore,
 }
 
+/// A compare-and-swap delta for the OpenMLS provider entries changed while a
+/// single conversation is staged on a fork.  Keeping the delta, rather than a
+/// serialized copy of the whole adapter, prevents a later transition ACK from
+/// rolling back unrelated conversations that advanced while the request was
+/// in flight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlsConversationPatch {
+    pub conversation_id: String,
+    pub base_state_sha256: String,
+    pub staged_state_sha256: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub base_values: BTreeMap<String, Option<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub staged_values: BTreeMap<String, Option<String>>,
+}
+
 #[derive(Debug, Default)]
 pub struct RestoreMlsStateResult {
     pub adapter: Option<MlsAdapter>,
@@ -155,6 +173,13 @@ fn is_replay_or_duplicate_process_error(error: &impl std::fmt::Debug) -> bool {
         || debug.contains("ciphertext generation out of bounds")
 }
 
+fn store_sha256(store: &SerializableStore) -> CoreResult<String> {
+    let canonical = serde_json::to_vec(store).map_err(|error| {
+        CoreError::invalid_state(format!("failed to encode MLS provider state: {error}"))
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
 pub struct MlsAdapter {
     provider: OpenMlsRustCrypto,
     signer: SignatureKeyPair,
@@ -175,6 +200,125 @@ impl std::fmt::Debug for MlsAdapter {
 }
 
 impl MlsAdapter {
+    pub fn fork(&self) -> CoreResult<Self> {
+        let serialized = self.export_serializable_state()?;
+        if self.groups.is_empty() {
+            return Self::restore_from_bootstrap_state(&serialized);
+        }
+        let persisted_states: Vec<_> = self
+            .groups
+            .iter()
+            .map(|(conversation_id, state)| {
+                (
+                    conversation_id.clone(),
+                    MlsStateSummary {
+                        conversation_id: conversation_id.clone(),
+                        epoch: state.group.epoch().as_u64(),
+                        member_device_ids: state.member_device_ids.iter().cloned().collect(),
+                        status: state.status,
+                        updated_at: state.group.epoch().as_u64(),
+                    },
+                    Some(serialized.clone()),
+                )
+            })
+            .collect();
+        Self::restore_from_persisted_states(&persisted_states)?
+            .adapter
+            .ok_or_else(|| CoreError::invalid_state("failed to fork MLS adapter state"))
+    }
+
+    pub fn conversation_patch(
+        &self,
+        staged: &Self,
+        conversation_id: &str,
+    ) -> CoreResult<MlsConversationPatch> {
+        if conversation_id.trim().is_empty() {
+            return Err(CoreError::invalid_input(
+                "conversation_id must not be empty",
+            ));
+        }
+        if self.credential_identity != staged.credential_identity
+            || self.local_device_id != staged.local_device_id
+        {
+            return Err(CoreError::invalid_state(
+                "cannot diff MLS adapters belonging to different local identities",
+            ));
+        }
+        let base = self.serializable_store()?;
+        let target = staged.serializable_store()?;
+        let keys = base
+            .values
+            .keys()
+            .chain(target.values.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut base_values = BTreeMap::new();
+        let mut staged_values = BTreeMap::new();
+        for key in keys {
+            let before = base.values.get(&key).cloned();
+            let after = target.values.get(&key).cloned();
+            if before != after {
+                base_values.insert(key.clone(), before);
+                staged_values.insert(key, after);
+            }
+        }
+        Ok(MlsConversationPatch {
+            conversation_id: conversation_id.to_string(),
+            base_state_sha256: store_sha256(&base)?,
+            staged_state_sha256: store_sha256(&target)?,
+            base_values,
+            staged_values,
+        })
+    }
+
+    /// Apply a previously staged target-conversation delta to the current
+    /// adapter.  Every changed provider entry is compared with its base value;
+    /// a mismatch means the target conversation advanced concurrently and the
+    /// caller must reconcile instead of overwriting it.
+    pub fn apply_conversation_patch(
+        &self,
+        patch: &MlsConversationPatch,
+        summaries: &BTreeMap<String, MlsStateSummary>,
+    ) -> CoreResult<Self> {
+        let mut current = self.serializable_store()?;
+        for (key, expected) in &patch.base_values {
+            let actual = current.values.get(key).cloned();
+            if &actual != expected {
+                return Err(CoreError::invalid_state(format!(
+                    "MLS conversation patch CAS failed for {}",
+                    patch.conversation_id
+                )));
+            }
+        }
+        for (key, value) in &patch.staged_values {
+            if let Some(value) = value {
+                current.values.insert(key.clone(), value.clone());
+            } else {
+                current.values.remove(key);
+            }
+        }
+        let serialized = self.serialize_with_store(current)?;
+        Self::restore_serialized_state(&serialized, summaries)
+    }
+
+    pub fn restore_serialized_state(
+        serialized: &str,
+        summaries: &BTreeMap<String, MlsStateSummary>,
+    ) -> CoreResult<Self> {
+        let persisted_states: Vec<_> = summaries
+            .iter()
+            .map(|(conversation_id, summary)| {
+                (
+                    conversation_id.clone(),
+                    summary.clone(),
+                    Some(serialized.to_string()),
+                )
+            })
+            .collect();
+        Self::restore_from_persisted_states(&persisted_states)?
+            .adapter
+            .ok_or_else(|| CoreError::invalid_state("failed to restore staged MLS adapter state"))
+    }
     pub fn bootstrap(
         local_identity: &LocalIdentityState,
     ) -> CoreResult<(Self, PublishedKeyPackage)> {
@@ -312,6 +456,49 @@ impl MlsAdapter {
             member_device_ids: member_device_ids.into_iter().collect(),
             epoch: self.export_group_summary(conversation_id)?.epoch,
         })
+    }
+
+    /// Create the canonical provisional MLS group containing only the local
+    /// owner.  Initial invitees are added on a fork and become canonical only
+    /// after the roster-0 -> roster-1 transition is acknowledged.
+    pub fn create_owner_conversation(
+        &mut self,
+        conversation_id: &str,
+    ) -> CoreResult<MlsStateSummary> {
+        if conversation_id.trim().is_empty() {
+            return Err(CoreError::invalid_input(
+                "conversation_id must not be empty",
+            ));
+        }
+        if self.groups.contains_key(conversation_id) {
+            return Err(CoreError::invalid_state(
+                "conversation MLS state already exists",
+            ));
+        }
+        let group_id = GroupId::from_slice(conversation_id.as_bytes());
+        self.delete_stale_persisted_group(&group_id)?;
+        let config = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let group = MlsGroup::new_with_group_id(
+            &self.provider,
+            &self.signer,
+            &config,
+            group_id,
+            self.credential_with_key.clone(),
+        )
+        .map_err(|error| {
+            CoreError::invalid_state(format!("failed to create owner MLS group: {error}"))
+        })?;
+        self.groups.insert(
+            conversation_id.to_string(),
+            LocalMlsState {
+                group,
+                member_device_ids: BTreeSet::from([self.local_device_id.clone()]),
+                status: MlsStateStatus::Active,
+            },
+        );
+        self.export_group_summary(conversation_id)
     }
 
     pub fn add_members(
@@ -616,15 +803,22 @@ impl MlsAdapter {
     }
 
     fn export_serializable_state(&self) -> CoreResult<String> {
+        self.serialize_with_store(self.serializable_store()?)
+    }
+
+    fn serializable_store(&self) -> CoreResult<SerializableStore> {
         let values = self.provider.storage().values.read().map_err(|_| {
             CoreError::invalid_state("failed to read MLS provider storage for persistence")
         })?;
-        let storage = SerializableStore {
+        Ok(SerializableStore {
             values: values
                 .iter()
                 .map(|(key, value)| (BASE64.encode(key), BASE64.encode(value)))
                 .collect(),
-        };
+        })
+    }
+
+    fn serialize_with_store(&self, storage: SerializableStore) -> CoreResult<String> {
         serde_json::to_string(&PersistedGroupState {
             credential_identity: self.credential_identity.clone(),
             local_device_id: self.local_device_id.clone(),

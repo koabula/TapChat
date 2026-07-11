@@ -974,9 +974,79 @@ impl CliApp {
                     })
                     .await?;
                 persist_driver(&mut profile, &driver)?;
+                let request = driver.latest_snapshot().and_then(|snapshot| {
+                    snapshot
+                        .group_states
+                        .iter()
+                        .find(|state| state.group_id == group_id)
+                        .into_iter()
+                        .flat_map(|state| state.leave_requests.iter())
+                        .max_by_key(|persisted| persisted.request.requested_at)
+                        .map(|persisted| persisted.request.clone())
+                });
                 self.print_value(&serde_json::json!({
-                    "left": true,
+                    "submitted": true,
                     "group_id": group_id,
+                    "request_id": request.as_ref().map(|request| request.request_id.clone()),
+                    "status": request.as_ref().map(|request| request.status),
+                }))
+            }
+            GroupSubcommand::LeaveRequests { profile, group_id } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ListGroupLeaveRequests {
+                        group_id: group_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let rows = output
+                    .view_model
+                    .as_ref()
+                    .map(|view| view.group_leave_requests.clone())
+                    .unwrap_or_default();
+                self.print_value(&rows)
+            }
+            GroupSubcommand::ApproveLeave {
+                profile,
+                group_id,
+                request_id,
+            } => {
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                let output = driver
+                    .run_command_until_idle(CoreCommand::ApproveGroupLeave {
+                        group_id: group_id.clone(),
+                        request_id: request_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
+                let request = output
+                    .view_model
+                    .as_ref()
+                    .and_then(|view| {
+                        view.group_leave_requests
+                            .iter()
+                            .find(|request| request.request_id == request_id)
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        driver.latest_snapshot().and_then(|snapshot| {
+                            snapshot
+                                .group_states
+                                .iter()
+                                .find(|state| state.group_id == group_id)
+                                .into_iter()
+                                .flat_map(|state| state.leave_requests.iter())
+                                .find(|persisted| persisted.request.request_id == request_id)
+                                .map(|persisted| persisted.request.clone())
+                        })
+                    })
+                    .ok_or_else(|| anyhow!("group leave request not found after approval"))?;
+                self.print_value(&serde_json::json!({
+                    "group_id": group_id,
+                    "request_id": request_id,
+                    "status": request.status,
                 }))
             }
             GroupSubcommand::TransferOwnership {
@@ -1213,7 +1283,14 @@ impl CliApp {
                 }))
             }
             GroupInviteSubcommand::List { profile, group_id } => {
-                let profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+                let mut driver = load_driver(&profile)?;
+                driver
+                    .run_command_until_idle(CoreCommand::ListGroupInvites {
+                        group_id: group_id.clone(),
+                    })
+                    .await?;
+                persist_driver(&mut profile, &driver)?;
                 let snapshot = profile.load_snapshot()?;
                 let rows: Vec<_> = snapshot
                     .group_invites
@@ -1227,6 +1304,10 @@ impl CliApp {
                             "max_uses": invite.document.max_uses,
                             "join_policy": invite.document.join_policy,
                             "created_at": invite.document.created_at,
+                            "status": invite.status,
+                            "uses": invite.uses,
+                            "revision": invite.revision,
+                            "revoked_at": invite.revoked_at,
                         })
                     })
                     .collect();
@@ -1329,17 +1410,43 @@ impl CliApp {
             } => {
                 let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
-                driver
+                let output = driver
                     .run_command_until_idle(CoreCommand::ApproveGroupJoin {
                         group_id: group_id.clone(),
                         request_id: request_id.clone(),
                     })
                     .await?;
                 persist_driver(&mut profile, &driver)?;
+                let request = output
+                    .view_model
+                    .as_ref()
+                    .and_then(|view| {
+                        view.group_join_requests
+                            .iter()
+                            .find(|request| request.request_id == request_id)
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        driver.latest_snapshot().and_then(|snapshot| {
+                            snapshot
+                                .group_join_requests
+                                .iter()
+                                .find(|persisted| persisted.request_id == request_id)
+                                .map(|persisted| persisted.request.clone())
+                        })
+                    })
+                    .ok_or_else(|| anyhow!("group join request not found after approval"))?;
                 self.print_value(&serde_json::json!({
-                    "approved": true,
+                    "approved": matches!(
+                        request.status,
+                        crate::model::GroupJoinRequestStatus::TransitionInProgress
+                            | crate::model::GroupJoinRequestStatus::WelcomeAvailable
+                            | crate::model::GroupJoinRequestStatus::Joined
+                            | crate::model::GroupJoinRequestStatus::Approved
+                    ),
                     "group_id": group_id,
                     "request_id": request_id,
+                    "status": request.status,
                 }))
             }
             GroupJoinSubcommand::Reject {

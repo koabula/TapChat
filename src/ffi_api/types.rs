@@ -8,8 +8,8 @@ use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
     Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope,
-    GroupInviteDocument, GroupJoinRequest, GroupRole, IdentityBundle, InboxRecord, MessageType,
-    MlsStateStatus, MlsStateSummary, WelcomePickupDescriptor,
+    GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupRole, IdentityBundle,
+    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
@@ -19,16 +19,19 @@ use crate::persistence::{
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
     AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest,
-    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, BlobDownloadRequest,
-    BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
-    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest,
-    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest,
-    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
-    MessageRequestItem, MessageRequestRealtimeChange, PrepareBlobUploadRequest,
-    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
+    AppendGroupTransitionRequest, AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult,
+    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
+    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
+    GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GroupRealtimeSubscriptionRequest, InitializeGroupAuthorizationRequest, ListGroupInvitesRequest,
+    ListGroupJoinRequestsRequest, ListGroupLeaveRequestsRequest, MessageRequestAction,
+    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
+    MessageRequestRealtimeChange, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    PublishSharedStateRequest, PutWelcomePickupRequest, RealtimeSubscriptionRequest,
+    ReplaceAllowlistRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
+    SharedStateDocumentKind, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -120,6 +123,9 @@ pub enum CoreCommand {
         group_id: String,
         invite_id: String,
     },
+    ListGroupInvites {
+        group_id: String,
+    },
     FetchGroupInvite {
         invite_url: String,
     },
@@ -148,6 +154,13 @@ pub enum CoreCommand {
     },
     LeaveGroup {
         group_id: String,
+    },
+    ListGroupLeaveRequests {
+        group_id: String,
+    },
+    ApproveGroupLeave {
+        group_id: String,
+        request_id: String,
     },
     RemoveGroupMember {
         group_id: String,
@@ -356,15 +369,21 @@ pub enum CoreEvent {
     GroupOutboxFetchFailed {
         group_id: String,
         retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
         detail: Option<String>,
     },
     GroupOutboxHeadFetched {
         group_id: String,
         head_seq: u64,
+        current_roster_version: Option<u64>,
+        last_commit_message_id: Option<String>,
     },
     GroupOutboxHeadFetchFailed {
         group_id: String,
         retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
         detail: Option<String>,
     },
     GroupEnvelopeAppended {
@@ -376,6 +395,50 @@ pub enum CoreEvent {
         group_id: String,
         message_id: String,
         retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    GroupTransitionAppended {
+        group_id: String,
+        transition_id: String,
+        first_seq: u64,
+        last_seq: u64,
+        roster_version: u64,
+        last_commit_message_id: Option<String>,
+    },
+    GroupTransitionAppendFailed {
+        group_id: String,
+        transition_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    GroupAuthorizationStateFetched {
+        group_id: String,
+        manifest: crate::model::GroupManifest,
+        manifest_hash: String,
+        last_transition_id: Option<String>,
+        phase: crate::transport_contract::GroupAuthorizationPhase,
+        materialized: bool,
+    },
+    GroupAuthorizationStateFetchFailed {
+        group_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    GroupAuthorizationInitialized {
+        group_id: String,
+        roster_version: u64,
+    },
+    GroupAuthorizationInitializeFailed {
+        group_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
         detail: Option<String>,
     },
     GroupOutboxSealed {
@@ -431,6 +494,11 @@ pub enum CoreEvent {
         group_id: String,
         invite_id: String,
     },
+    GroupInvitesListed {
+        group_id: String,
+        revision: u64,
+        invites: Vec<crate::transport_contract::GroupInviteSummary>,
+    },
     GroupJoinRequestSubmitted {
         request: GroupJoinRequest,
     },
@@ -451,6 +519,58 @@ pub enum CoreEvent {
     },
     GroupJoinDecisionApplied {
         request: GroupJoinRequest,
+    },
+    GroupJoinClaimed {
+        request: GroupJoinRequest,
+        lease_token: String,
+        lease_expires_at: u64,
+    },
+    GroupJoinClaimFailed {
+        group_id: String,
+        request_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    GroupJoinCompleted {
+        request: GroupJoinRequest,
+    },
+    GroupJoinCompleteFailed {
+        group_id: String,
+        request_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    GroupLeaveRequestSubmitted {
+        request: GroupLeaveRequest,
+    },
+    GroupLeaveRequestSubmitFailed {
+        group_id: String,
+        request_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    GroupLeaveRequestsListed {
+        group_id: String,
+        requests: Vec<GroupLeaveRequest>,
+    },
+    GroupLeaveClaimed {
+        request: GroupLeaveRequest,
+        lease_token: String,
+        lease_expires_at: u64,
+    },
+    GroupLeaveClaimFailed {
+        group_id: String,
+        request_id: String,
+        retryable: bool,
+        status: Option<u16>,
+        code: Option<String>,
+        detail: Option<String>,
     },
     GroupJoinDecisionFailed {
         group_id: String,
@@ -494,6 +614,22 @@ pub enum RealtimeEvent {
         group_id: String,
         seq: u64,
         record: Option<crate::model::GroupOutboxRecord>,
+    },
+    GroupInvitesChanged {
+        group_id: String,
+        revision: u64,
+    },
+    GroupAutoJoinAvailable {
+        group_id: String,
+        request_id: String,
+    },
+    GroupJoinRequestAvailable {
+        group_id: String,
+        request_id: String,
+    },
+    GroupLeaveRequestAvailable {
+        group_id: String,
+        request_id: String,
     },
 }
 
@@ -588,11 +724,20 @@ pub enum CoreEffect {
     AppendGroupEnvelope {
         append: AppendGroupEnvelopeRequest,
     },
+    AppendGroupTransition {
+        append: AppendGroupTransitionRequest,
+    },
+    InitializeGroupAuthorization {
+        initialize: InitializeGroupAuthorizationRequest,
+    },
     FetchGroupOutbox {
         fetch: FetchGroupOutboxRequest,
     },
     GetGroupOutboxHead {
         get: GetGroupOutboxHeadRequest,
+    },
+    GetGroupAuthorizationState {
+        get: GetGroupAuthorizationStateRequest,
     },
     SealGroupOutbox {
         seal: SealGroupOutboxRequest,
@@ -609,6 +754,9 @@ pub enum CoreEffect {
     RevokeGroupInvite {
         revoke: RevokeGroupInviteRequest,
     },
+    ListGroupInvites {
+        list: ListGroupInvitesRequest,
+    },
     FetchGroupInvite {
         fetch: FetchGroupInviteRequest,
     },
@@ -623,6 +771,21 @@ pub enum CoreEffect {
     },
     DecideGroupJoinRequest {
         decide: DecideGroupJoinRequest,
+    },
+    ClaimGroupJoinRequest {
+        claim: ClaimGroupJoinRequest,
+    },
+    CompleteGroupJoinRequest {
+        complete: CompleteGroupJoinRequest,
+    },
+    SubmitGroupLeaveRequest {
+        submit: SubmitGroupLeaveRequest,
+    },
+    ListGroupLeaveRequests {
+        list: ListGroupLeaveRequestsRequest,
+    },
+    ClaimGroupLeaveRequest {
+        claim: ClaimGroupLeaveRequest,
     },
     FetchIdentityBundle {
         fetch: FetchIdentityBundleRequest,
@@ -681,6 +844,7 @@ pub enum SystemStatus {
     TemporaryNetworkFailure,
     MessageQueuedForApproval,
     MessageRejectedByPolicy,
+    GroupMembershipRevoked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -821,6 +985,8 @@ pub struct CoreViewModel {
     pub group_invites: Vec<PersistedGroupInvite>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_join_requests: Vec<GroupJoinRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_leave_requests: Vec<GroupLeaveRequest>,
     /// Welcome pickup descriptors produced by the most recent command.
     ///
     /// Populated when the owner/admin creates a group or approves a join
@@ -860,7 +1026,6 @@ pub(crate) struct PendingOutboxItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingGroupOutboxItem {
     pub(crate) envelope: GroupEnvelope,
-    pub(crate) capability: crate::model::GroupCapability,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

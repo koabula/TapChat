@@ -416,6 +416,22 @@ pub enum GroupSubcommand {
         #[arg(long)]
         group_id: String,
     },
+    /// List pending leave requests visible to this owner/admin
+    LeaveRequests {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+    },
+    /// Claim and execute a pending leave request (owner/admin only)
+    ApproveLeave {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        group_id: String,
+        #[arg(long)]
+        request_id: String,
+    },
     /// Transfer ownership to another active member (owner only)
     TransferOwnership {
         #[arg(long)]

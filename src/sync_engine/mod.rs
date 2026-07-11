@@ -51,20 +51,23 @@ impl SyncEngine {
         }
     }
 
-    pub fn register_fetch(
-        state: &mut DeviceSyncState,
-        records: &[InboxRecord],
-        to_seq: u64,
-    ) -> Vec<InboxRecord> {
-        let mut fresh = Vec::new();
-        for record in records {
-            if state.seen_message_ids.insert(record.message_id.clone()) {
-                fresh.push(record.clone());
-            }
-        }
-        state.checkpoint.last_fetched_seq = to_seq.max(state.checkpoint.last_fetched_seq);
+    /// Select records that have not reached a terminal local disposition.
+    ///
+    /// This function is intentionally side-effect free. Callers must not
+    /// advance `seen_message_ids` or the fetched checkpoint until validation
+    /// and record processing have completed successfully.
+    pub fn select_fresh(state: &DeviceSyncState, records: &[InboxRecord]) -> Vec<InboxRecord> {
+        records
+            .iter()
+            .filter(|record| !state.seen_message_ids.contains(&record.message_id))
+            .cloned()
+            .collect()
+    }
+
+    pub fn commit_fetched_record(state: &mut DeviceSyncState, record: &InboxRecord) {
+        state.seen_message_ids.insert(record.message_id.clone());
+        state.checkpoint.last_fetched_seq = record.seq.max(state.checkpoint.last_fetched_seq);
         state.checkpoint.updated_at = state.checkpoint.last_fetched_seq;
-        fresh
     }
 
     pub fn register_head(state: &mut DeviceSyncState, head_seq: u64) {
@@ -139,10 +142,13 @@ mod tests {
     fn duplicate_records_are_filtered_during_fetch_registration() {
         let mut state = SyncEngine::new_device_state("device:bob:phone");
         let record = sample_record("msg:1", 1);
-        let fresh = SyncEngine::register_fetch(&mut state, &[record.clone(), record], 1);
+        let fresh = SyncEngine::select_fresh(&state, &[record.clone(), record.clone()]);
 
-        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(state.checkpoint.last_fetched_seq, 0);
+        SyncEngine::commit_fetched_record(&mut state, &record);
         assert_eq!(state.checkpoint.last_fetched_seq, 1);
+        assert!(SyncEngine::select_fresh(&state, &[record]).is_empty());
     }
 
     #[test]
@@ -192,13 +198,14 @@ mod tests {
         let mut state = SyncEngine::new_device_state("device:bob:phone");
         let record = sample_record("msg:1", 4);
 
-        let fresh = SyncEngine::register_fetch(&mut state, std::slice::from_ref(&record), 4);
+        let fresh = SyncEngine::select_fresh(&state, std::slice::from_ref(&record));
         assert_eq!(fresh.len(), 1);
+        SyncEngine::commit_fetched_record(&mut state, &record);
         SyncEngine::store_pending_record(&mut state, &record);
         let ack = SyncEngine::ack_up_to(&mut state, 4);
         assert_eq!(ack.ack_seq, 4);
 
-        let duplicate = SyncEngine::register_fetch(&mut state, std::slice::from_ref(&record), 4);
+        let duplicate = SyncEngine::select_fresh(&state, std::slice::from_ref(&record));
         assert!(duplicate.is_empty());
         assert_eq!(state.checkpoint.last_fetched_seq, 4);
         assert_eq!(state.checkpoint.last_acked_seq, 4);

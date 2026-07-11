@@ -544,6 +544,7 @@ pub enum MessageType {
     ControlContactRemoved,
     ControlContactAccepted,
     ControlGroupWelcomePickup,
+    ControlGroupStateEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -898,6 +899,7 @@ pub enum GroupMessageType {
     ControlGroupJoinRejected,
     ControlGroupLeaveRequested,
     ControlGroupDissolved,
+    ControlGroupStateEvent,
     ControlConversationNeedsRebuild,
 }
 
@@ -932,6 +934,12 @@ pub struct GroupMembershipProof {
     pub commit_message_id: String,
     #[serde(alias = "control_message_id")]
     pub control_message_id: String,
+    #[serde(
+        default,
+        alias = "state_event_message_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state_event_message_id: Option<String>,
     #[serde(alias = "new_manifest_sha256")]
     pub new_manifest_sha256: String,
     pub signature: String,
@@ -999,6 +1007,130 @@ pub struct GroupEnvelope {
         skip_serializing_if = "Option::is_none"
     )]
     pub membership_proof: Option<GroupMembershipProof>,
+    #[serde(
+        default,
+        alias = "transition_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transition_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupStateEventKind {
+    MemberJoined,
+    MemberLeft,
+    MemberRemoved,
+    RoleChanged,
+    OwnershipTransferred,
+    GroupMetadataChanged,
+    GroupDissolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupStateEvent {
+    pub version: String,
+    #[serde(alias = "event_id")]
+    pub event_id: String,
+    #[serde(alias = "transition_id")]
+    pub transition_id: String,
+    pub kind: GroupStateEventKind,
+    #[serde(alias = "actor_user_id")]
+    pub actor_user_id: String,
+    #[serde(default, alias = "subject_user_ids")]
+    pub subject_user_ids: Vec<String>,
+    #[serde(default, alias = "old_role", skip_serializing_if = "Option::is_none")]
+    pub old_role: Option<GroupRole>,
+    #[serde(default, alias = "new_role", skip_serializing_if = "Option::is_none")]
+    pub new_role: Option<GroupRole>,
+    #[serde(alias = "roster_version")]
+    pub roster_version: u64,
+    #[serde(alias = "manifest_hash")]
+    pub manifest_hash: String,
+    #[serde(alias = "occurred_at")]
+    pub occurred_at: u64,
+}
+
+/// Semantic operation authorized by an atomic group transition.  The tagged
+/// shape is shared by Core and the transport so authorization never has to
+/// infer a privileged operation from an untrusted free-form string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum GroupTransitionOperation {
+    Create,
+    InviteMembers {
+        user_ids: Vec<String>,
+    },
+    ApproveJoin {
+        request_id: String,
+        user_id: String,
+        device_id: String,
+    },
+    ApproveLeave {
+        request_id: String,
+        user_id: String,
+        device_id: String,
+    },
+    RemoveMember {
+        user_id: String,
+    },
+    TransferOwnership {
+        user_id: String,
+    },
+    SetAdmin {
+        user_id: String,
+        is_admin: bool,
+    },
+    UpdateMetadata,
+    Dissolve,
+    AddDevice {
+        user_id: String,
+        device_id: String,
+    },
+    RemoveDevice {
+        user_id: String,
+        device_id: String,
+    },
+}
+
+impl GroupTransitionOperation {
+    pub fn proof_operation(&self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::InviteMembers { .. } => "invite",
+            Self::ApproveJoin { .. } => "approve_join",
+            Self::ApproveLeave { .. } => "leave",
+            Self::RemoveMember { .. } => "remove",
+            Self::TransferOwnership { .. } => "transfer_ownership",
+            Self::SetAdmin { .. } => "set_admin",
+            Self::UpdateMetadata => "update_metadata",
+            Self::Dissolve => "dissolve",
+            Self::AddDevice { .. } => "add_device",
+            Self::RemoveDevice { .. } => "remove_device",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum GroupTransitionRequestBinding {
+    Join {
+        request_id: String,
+        lease_token: String,
+    },
+    Leave {
+        request_id: String,
+        lease_token: String,
+    },
 }
 
 impl Validate for GroupEnvelope {
@@ -1103,6 +1235,22 @@ pub struct WelcomePickupDescriptor {
     pub capability: String,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
+    #[serde(default, alias = "start_seq", skip_serializing_if = "Option::is_none")]
+    pub start_seq: Option<u64>,
+    #[serde(
+        default,
+        alias = "roster_version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub roster_version: Option<u64>,
+    #[serde(
+        default,
+        alias = "last_commit_message_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_commit_message_id: Option<String>,
+    #[serde(default, alias = "request_id", skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 impl Validate for WelcomePickupDescriptor {
@@ -1259,6 +1407,11 @@ impl Validate for GroupInviteDocument {
 pub enum GroupJoinRequestStatus {
     Pending,
     Approved,
+    PendingApproval,
+    WaitingForGroupCommit,
+    TransitionInProgress,
+    WelcomeAvailable,
+    Joined,
     Rejected,
     Expired,
     Revoked,
@@ -1352,6 +1505,48 @@ pub enum ConversationState {
     Closed,
     Archived,
     Dissolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupLeaveRequestStatus {
+    WaitingForGroupCommit,
+    TransitionInProgress,
+    Completed,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupLeaveRequest {
+    pub version: String,
+    #[serde(alias = "request_id")]
+    pub request_id: String,
+    #[serde(alias = "group_id")]
+    pub group_id: String,
+    #[serde(alias = "leaver_user_id")]
+    pub leaver_user_id: String,
+    #[serde(alias = "leaver_device_id")]
+    pub leaver_device_id: String,
+    #[serde(alias = "requested_at")]
+    pub requested_at: u64,
+    #[serde(alias = "request_capability")]
+    pub request_capability: String,
+    pub signature: String,
+    pub status: GroupLeaveRequestStatus,
+}
+
+impl Validate for GroupLeaveRequest {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("request_id", &self.request_id)?;
+        validate_required("group_id", &self.group_id)?;
+        validate_required("leaver_user_id", &self.leaver_user_id)?;
+        validate_required("leaver_device_id", &self.leaver_device_id)?;
+        validate_required("request_capability", &self.request_capability)?;
+        validate_required("signature", &self.signature)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1950,6 +2145,10 @@ mod tests {
                     .into(),
             capability: "cap-bob-123".into(),
             expires_at: 1_775_004_800_000,
+            start_seq: None,
+            roster_version: None,
+            last_commit_message_id: None,
+            request_id: None,
         };
         let url = descriptor.to_welcome_pickup_url();
         assert!(
@@ -2389,9 +2588,11 @@ mod tests {
                     previous_commit_message_id: None,
                     commit_message_id: "msg:commit:1".into(),
                     control_message_id: "msg:control:1".into(),
+                    state_event_message_id: None,
                     new_manifest_sha256: "sha256:abc".into(),
                     signature: "member-proof".into(),
                 }),
+                transition_id: None,
             },
         }
     }

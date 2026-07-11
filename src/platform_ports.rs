@@ -7,14 +7,17 @@ use crate::ffi_api::{
     WriteDownloadedAttachmentEffect,
 };
 use crate::transport_contract::{
-    AppendGroupEnvelopeRequest, AuthorizeBlobDownloadRequest, BlobDownloadRequest,
-    BlobUploadRequest, CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
-    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupJoinRequestStatusRequest,
-    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest, ListGroupJoinRequestsRequest,
-    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
-    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest, SealGroupOutboxRequest, SubmitGroupJoinRequest,
+    AppendGroupEnvelopeRequest, AppendGroupTransitionRequest, AuthorizeBlobDownloadRequest,
+    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
+    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
+    GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GroupRealtimeSubscriptionRequest, InitializeGroupAuthorizationRequest, ListGroupInvitesRequest,
+    ListGroupJoinRequestsRequest, ListGroupLeaveRequestsRequest, MessageRequestActionRequest,
+    PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    SealGroupOutboxRequest, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
 pub trait TransportPort {
@@ -55,6 +58,27 @@ pub trait TransportPort {
         _append: AppendGroupEnvelopeRequest,
     ) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("group append transport is not implemented by this platform")
+    }
+
+    async fn initialize_group_authorization(
+        &mut self,
+        _initialize: InitializeGroupAuthorizationRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group authorization initialization is not implemented by this platform")
+    }
+
+    async fn append_group_transition(
+        &mut self,
+        _append: AppendGroupTransitionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group transition transport is not implemented by this platform")
+    }
+
+    async fn get_group_authorization_state(
+        &mut self,
+        _get: GetGroupAuthorizationStateRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group authorization state transport is not implemented by this platform")
     }
 
     async fn fetch_group_outbox(
@@ -99,6 +123,13 @@ pub trait TransportPort {
         anyhow::bail!("group invite revoke transport is not implemented by this platform")
     }
 
+    async fn list_group_invites(
+        &mut self,
+        _list: ListGroupInvitesRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group invite list transport is not implemented by this platform")
+    }
+
     async fn fetch_group_invite(
         &mut self,
         _fetch: FetchGroupInviteRequest,
@@ -132,6 +163,41 @@ pub trait TransportPort {
         _decide: DecideGroupJoinRequest,
     ) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("group join decision transport is not implemented by this platform")
+    }
+
+    async fn claim_group_join_request(
+        &mut self,
+        _claim: ClaimGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group join claim transport is not implemented by this platform")
+    }
+
+    async fn complete_group_join_request(
+        &mut self,
+        _complete: CompleteGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group join completion transport is not implemented by this platform")
+    }
+
+    async fn submit_group_leave_request(
+        &mut self,
+        _submit: SubmitGroupLeaveRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group leave submit transport is not implemented by this platform")
+    }
+
+    async fn list_group_leave_requests(
+        &mut self,
+        _list: ListGroupLeaveRequestsRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group leave list transport is not implemented by this platform")
+    }
+
+    async fn claim_group_leave_request(
+        &mut self,
+        _claim: ClaimGroupLeaveRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group leave claim transport is not implemented by this platform")
     }
 
     async fn seal_group_outbox(&mut self, _seal: SealGroupOutboxRequest) -> Result<Vec<CoreEvent>> {
@@ -226,12 +292,20 @@ where
             ports.close_group_realtime(group_id).await
         }
         CoreEffect::AppendGroupEnvelope { append } => ports.append_group_envelope(append).await,
+        CoreEffect::AppendGroupTransition { append } => ports.append_group_transition(append).await,
+        CoreEffect::InitializeGroupAuthorization { initialize } => {
+            ports.initialize_group_authorization(initialize).await
+        }
         CoreEffect::FetchGroupOutbox { fetch } => ports.fetch_group_outbox(fetch).await,
         CoreEffect::GetGroupOutboxHead { get } => ports.get_group_outbox_head(get).await,
+        CoreEffect::GetGroupAuthorizationState { get } => {
+            ports.get_group_authorization_state(get).await
+        }
         CoreEffect::FetchWelcomePickup { fetch } => ports.fetch_welcome_pickup(fetch).await,
         CoreEffect::PutWelcomePickup { put } => ports.put_welcome_pickup(put).await,
         CoreEffect::CreateGroupInvite { create } => ports.create_group_invite(create).await,
         CoreEffect::RevokeGroupInvite { revoke } => ports.revoke_group_invite(revoke).await,
+        CoreEffect::ListGroupInvites { list } => ports.list_group_invites(list).await,
         CoreEffect::FetchGroupInvite { fetch } => ports.fetch_group_invite(fetch).await,
         CoreEffect::SubmitGroupJoinRequest { submit } => {
             ports.submit_group_join_request(submit).await
@@ -242,6 +316,17 @@ where
         }
         CoreEffect::DecideGroupJoinRequest { decide } => {
             ports.decide_group_join_request(decide).await
+        }
+        CoreEffect::ClaimGroupJoinRequest { claim } => ports.claim_group_join_request(claim).await,
+        CoreEffect::CompleteGroupJoinRequest { complete } => {
+            ports.complete_group_join_request(complete).await
+        }
+        CoreEffect::SubmitGroupLeaveRequest { submit } => {
+            ports.submit_group_leave_request(submit).await
+        }
+        CoreEffect::ListGroupLeaveRequests { list } => ports.list_group_leave_requests(list).await,
+        CoreEffect::ClaimGroupLeaveRequest { claim } => {
+            ports.claim_group_leave_request(claim).await
         }
         CoreEffect::SealGroupOutbox { seal } => ports.seal_group_outbox(seal).await,
         CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,

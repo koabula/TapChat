@@ -52,9 +52,11 @@ pub(super) fn group_message_type_to_direct(message_type: GroupMessageType) -> Me
         GroupMessageType::ControlConversationNeedsRebuild => {
             MessageType::ControlConversationNeedsRebuild
         }
-        GroupMessageType::ControlGroupDissolved => MessageType::ControlConversationNeedsRebuild,
-        GroupMessageType::ControlGroupMembershipChanged
-        | GroupMessageType::ControlGroupJoinRequested
+        GroupMessageType::ControlGroupDissolved
+        | GroupMessageType::ControlGroupMembershipChanged
+        | GroupMessageType::ControlGroupMetadataUpdated
+        | GroupMessageType::ControlGroupStateEvent => MessageType::ControlGroupStateEvent,
+        GroupMessageType::ControlGroupJoinRequested
         | GroupMessageType::ControlGroupJoinApproved
         | GroupMessageType::ControlGroupJoinRejected
         | GroupMessageType::ControlGroupLeaveRequested => {
@@ -65,7 +67,6 @@ pub(super) fn group_message_type_to_direct(message_type: GroupMessageType) -> Me
             // lives in the engine path added by later A.2-A.6 tasks.
             MessageType::ControlDeviceMembershipChanged
         }
-        GroupMessageType::ControlGroupMetadataUpdated => MessageType::ControlIdentityStateUpdated,
     }
 }
 

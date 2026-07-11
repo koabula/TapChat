@@ -24,17 +24,23 @@ use crate::platform_ports::{
 };
 use crate::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, BlobDownloadRequest,
-    BlobUploadRequest, CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
-    DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupInviteResult,
-    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    AppendGroupTransitionRequest, AppendGroupTransitionResult, AuthorizeBlobDownloadRequest,
+    AuthorizeBlobDownloadResult, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
+    ClaimGroupJoinResult, ClaimGroupLeaveRequest, ClaimGroupLeaveResult, CompleteGroupJoinRequest,
+    CompleteGroupJoinResult, CreateGroupInviteRequest, CreateGroupInviteResult,
+    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
+    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
+    FetchWelcomePickupResult, GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
     GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult, GetGroupOutboxHeadRequest,
-    GetGroupOutboxHeadResult, ListGroupJoinRequestsRequest, ListGroupJoinRequestsResult,
-    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
-    PutWelcomePickupRequest, PutWelcomePickupResult, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest, RevokeGroupInviteRequest, RevokeGroupInviteResult,
-    SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
+    GetGroupOutboxHeadResult, InitializeGroupAuthorizationRequest,
+    InitializeGroupAuthorizationResult, ListGroupInvitesRequest, ListGroupInvitesResult,
+    ListGroupJoinRequestsRequest, ListGroupJoinRequestsResult, ListGroupLeaveRequestsRequest,
+    ListGroupLeaveRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
+    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
+    SubmitGroupJoinResult, SubmitGroupLeaveRequest, SubmitGroupLeaveResult,
 };
 
 use super::util::{
@@ -1181,6 +1187,8 @@ impl TransportPort for CoreDriver {
                         group_id: append.group_id,
                         message_id: append.envelope.message_id,
                         retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
                         detail: Some(body),
                     }]);
                 }
@@ -1196,6 +1204,204 @@ impl TransportPort for CoreDriver {
                 group_id: append.group_id,
                 message_id: append.envelope.message_id,
                 retryable: true,
+                status: None,
+                code: None,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn initialize_group_authorization(
+        &mut self,
+        initialize: InitializeGroupAuthorizationRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?
+            .deployment_bundle
+            .inbox_http_endpoint;
+        let endpoint = format!(
+            "{}/v1/groups/{}/authorization/bootstrap",
+            base.trim_end_matches('/'),
+            urlencoding::encode(&initialize.group_id)
+        );
+        let mut request = self
+            .runtime
+            .client
+            .post(endpoint)
+            .header("Content-Type", "application/json");
+        for (name, value) in &initialize.headers {
+            request = request.header(name, value);
+        }
+        let group_id = initialize.group_id.clone();
+        match request
+            .body(to_camel_case_json_string(&serde_json::to_string(
+                &initialize,
+            )?)?)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
+                        group_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: InitializeGroupAuthorizationResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupAuthorizationInitialized {
+                    group_id,
+                    roster_version: result.roster_version,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
+                group_id,
+                retryable: true,
+                status: None,
+                code: None,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn append_group_transition(
+        &mut self,
+        append: AppendGroupTransitionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let messages_endpoint = self
+            .engine
+            .refresh_snapshot()
+            .group_states
+            .iter()
+            .find(|state| state.group_id == append.group_id)
+            .map(|state| state.manifest.outbox.endpoint.clone())
+            .ok_or_else(|| anyhow!("group outbox endpoint is missing"))?;
+        let suffix = "/outbox/messages";
+        let base = messages_endpoint
+            .strip_suffix(suffix)
+            .ok_or_else(|| anyhow!("group outbox endpoint must end with {suffix}"))?;
+        let endpoint = format!("{base}/outbox/transitions");
+        let group_id = append.group_id.clone();
+        let transition_id = append.transition_id.clone();
+        let response = self
+            .runtime
+            .client
+            .post(endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", append.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&append.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&append)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupTransitionAppendFailed {
+                        group_id,
+                        transition_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: AppendGroupTransitionResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupTransitionAppended {
+                    group_id,
+                    transition_id: result.transition_id,
+                    first_seq: result.first_seq,
+                    last_seq: result.last_seq,
+                    roster_version: result.roster_version,
+                    last_commit_message_id: result.last_commit_message_id,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupTransitionAppendFailed {
+                group_id,
+                transition_id,
+                retryable: true,
+                status: None,
+                code: None,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn get_group_authorization_state(
+        &mut self,
+        get: GetGroupAuthorizationStateRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let endpoint = format!(
+            "{}/v1/groups/{}/authorization/state",
+            base.trim_end_matches('/'),
+            urlencoding::encode(&get.group_id)
+        );
+        let group_id = get.group_id.clone();
+        let response = self
+            .runtime
+            .client
+            .get(endpoint)
+            .header(
+                "Authorization",
+                format!("Bearer {}", get.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&get.capability)?)?,
+            )
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
+                        group_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: GetGroupAuthorizationStateResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupAuthorizationStateFetched {
+                    group_id,
+                    manifest: result.manifest,
+                    manifest_hash: result.manifest_hash,
+                    last_transition_id: result.last_transition_id,
+                    phase: result.phase,
+                    materialized: result.materialized,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
+                group_id,
+                retryable: true,
+                status: None,
+                code: None,
                 detail: Some(error.to_string()),
             }]),
         }
@@ -1238,6 +1444,8 @@ impl TransportPort for CoreDriver {
                     return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                         group_id: fetch.group_id,
                         retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
                         detail: Some(body),
                     }]);
                 }
@@ -1252,6 +1460,8 @@ impl TransportPort for CoreDriver {
             Err(error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                 group_id: fetch.group_id,
                 retryable: true,
+                status: None,
+                code: None,
                 detail: Some(error.to_string()),
             }]),
         }
@@ -1292,6 +1502,8 @@ impl TransportPort for CoreDriver {
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
                     retryable: true,
+                    status: None,
+                    code: None,
                     detail: Some(error.to_string()),
                 }]);
             }
@@ -1302,6 +1514,8 @@ impl TransportPort for CoreDriver {
             return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id: get.group_id,
                 retryable: status >= 500,
+                status: Some(status),
+                code: extract_error_code(&body_text),
                 detail: Some(body_text),
             }]);
         }
@@ -1312,6 +1526,8 @@ impl TransportPort for CoreDriver {
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
                     retryable: false,
+                    status: Some(status),
+                    code: None,
                     detail: Some(error.to_string()),
                 }]);
             }
@@ -1319,6 +1535,8 @@ impl TransportPort for CoreDriver {
         Ok(vec![CoreEvent::GroupOutboxHeadFetched {
             group_id: get.group_id,
             head_seq: result.head_seq,
+            current_roster_version: result.current_roster_version,
+            last_commit_message_id: result.last_commit_message_id,
         }])
     }
 
@@ -1623,6 +1841,48 @@ impl TransportPort for CoreDriver {
         }])
     }
 
+    async fn list_group_invites(
+        &mut self,
+        list: ListGroupInvitesRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let response = self
+            .runtime
+            .client
+            .get(format!(
+                "{}/v1/groups/{}/invites",
+                base.trim_end_matches('/'),
+                urlencoding::encode(&list.group_id)
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", list.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&list.capability)?)?,
+            )
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            anyhow::bail!("group invite list failed with status {status}: {body}");
+        }
+        let body = to_snake_case_json_string(&body).unwrap_or(body);
+        let result: ListGroupInvitesResult = serde_json::from_str(&body)?;
+        Ok(vec![CoreEvent::GroupInvitesListed {
+            group_id: list.group_id,
+            revision: result.revision,
+            invites: result.invites,
+        }])
+    }
+
     async fn list_group_join_requests(
         &mut self,
         list: ListGroupJoinRequestsRequest,
@@ -1738,6 +1998,284 @@ impl TransportPort for CoreDriver {
                 group_id: decide.group_id,
                 request_id: decide.request_id,
                 retryable: true,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn claim_group_join_request(
+        &mut self,
+        claim: ClaimGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let response = self
+            .runtime
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/join-requests/{}/claim",
+                base.trim_end_matches('/'),
+                urlencoding::encode(&claim.group_id),
+                urlencoding::encode(&claim.request_id)
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", claim.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&claim)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupJoinClaimFailed {
+                        group_id: claim.group_id,
+                        request_id: claim.request_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: ClaimGroupJoinResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupJoinClaimed {
+                    request: result.request,
+                    lease_token: result.lease_token,
+                    lease_expires_at: result.lease_expires_at,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupJoinClaimFailed {
+                group_id: claim.group_id,
+                request_id: claim.request_id,
+                retryable: true,
+                status: None,
+                code: None,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn complete_group_join_request(
+        &mut self,
+        complete: CompleteGroupJoinRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let response = self
+            .runtime
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/join-requests/{}/complete",
+                base.trim_end_matches('/'),
+                urlencoding::encode(&complete.group_id),
+                urlencoding::encode(&complete.request_id)
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", complete.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(
+                &complete,
+            )?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupJoinCompleteFailed {
+                        group_id: complete.group_id,
+                        request_id: complete.request_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: CompleteGroupJoinResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupJoinCompleted {
+                    request: result.request,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupJoinCompleteFailed {
+                group_id: complete.group_id,
+                request_id: complete.request_id,
+                retryable: true,
+                status: None,
+                code: None,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn submit_group_leave_request(
+        &mut self,
+        submit: SubmitGroupLeaveRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let response = self
+            .runtime
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/leave-requests",
+                base.trim_end_matches('/'),
+                urlencoding::encode(&submit.group_id)
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", submit.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&submit)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
+                        group_id: submit.group_id,
+                        request_id: submit.request.request_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let result: SubmitGroupLeaveResult =
+                    serde_json::from_str(&to_snake_case_json_string(&body).unwrap_or(body))?;
+                Ok(vec![CoreEvent::GroupLeaveRequestSubmitted {
+                    request: result.request,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
+                group_id: submit.group_id,
+                request_id: submit.request.request_id,
+                retryable: true,
+                status: None,
+                code: None,
+                detail: Some(error.to_string()),
+            }]),
+        }
+    }
+
+    async fn list_group_leave_requests(
+        &mut self,
+        list: ListGroupLeaveRequestsRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let response = self
+            .runtime
+            .client
+            .get(format!(
+                "{}/v1/groups/{}/leave-requests",
+                base.trim_end_matches('/'),
+                urlencoding::encode(&list.group_id)
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", list.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&list.capability)?)?,
+            )
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        if !(200..300).contains(&status) {
+            anyhow::bail!("group leave list failed with status {status}: {body}");
+        }
+        let result: ListGroupLeaveRequestsResult =
+            serde_json::from_str(&to_snake_case_json_string(&body)?)?;
+        Ok(vec![CoreEvent::GroupLeaveRequestsListed {
+            group_id: list.group_id,
+            requests: result.requests,
+        }])
+    }
+
+    async fn claim_group_leave_request(
+        &mut self,
+        claim: ClaimGroupLeaveRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let base = self
+            .engine
+            .refresh_snapshot()
+            .deployment
+            .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint)
+            .ok_or_else(|| anyhow!("deployment bundle is missing"))?;
+        let response = self
+            .runtime
+            .client
+            .post(format!(
+                "{}/v1/groups/{}/leave-requests/{}/claim",
+                base.trim_end_matches('/'),
+                urlencoding::encode(&claim.group_id),
+                urlencoding::encode(&claim.request_id)
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", claim.capability.signature),
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&claim)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupLeaveClaimFailed {
+                        group_id: claim.group_id,
+                        request_id: claim.request_id,
+                        retryable: status >= 500,
+                        status: Some(status),
+                        code: extract_error_code(&body),
+                        detail: Some(format!("HTTP {status}: {body}")),
+                    }]);
+                }
+                let result: ClaimGroupLeaveResult =
+                    serde_json::from_str(&to_snake_case_json_string(&body).unwrap_or(body))?;
+                Ok(vec![CoreEvent::GroupLeaveClaimed {
+                    request: result.request,
+                    lease_token: result.lease_token,
+                    lease_expires_at: result.lease_expires_at,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::GroupLeaveClaimFailed {
+                group_id: claim.group_id,
+                request_id: claim.request_id,
+                retryable: true,
+                status: None,
+                code: None,
                 detail: Some(error.to_string()),
             }]),
         }

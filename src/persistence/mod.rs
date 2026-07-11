@@ -5,14 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::attachment_crypto::AttachmentPayloadMetadata;
 use crate::conversation::LocalConversationState;
 use crate::identity::LocalIdentityState;
-use crate::mls_adapter::PublishedKeyPackage;
+use crate::mls_adapter::{MlsConversationPatch, PublishedKeyPackage};
 use crate::model::{
     Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
-    GroupInviteDocument, GroupJoinRequest, GroupManifest, GroupMembershipProof, GroupRole,
-    IdentityBundle, MlsStateSummary, WelcomePickupDescriptor,
+    GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupManifest, GroupMembershipProof,
+    GroupRole, GroupTransitionOperation, GroupTransitionRequestBinding, IdentityBundle,
+    MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
-use crate::transport_contract::{PrepareBlobUploadResult, SealGroupOutboxRequest};
+use crate::transport_contract::{
+    GroupInviteStatus, PrepareBlobUploadResult, PutWelcomePickupRequest, SealGroupOutboxRequest,
+};
 
 fn pending_welcome_pickup_key(group_id: &str, device_id: &str) -> String {
     format!("{group_id}::{device_id}")
@@ -106,6 +109,110 @@ pub struct PersistedGroupState {
     pub dissolved_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_membership_transition: Option<PersistedPendingGroupMembershipTransition>,
+    #[serde(default)]
+    pub consistency_state: GroupConsistencyState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_group_transition: Option<PersistedPendingGroupTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leave_requests: Vec<PersistedGroupLeaveRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupConsistencyState {
+    Ready,
+    Reconciling,
+    BlockedNeedsRebuild,
+    Dissolved,
+}
+
+impl Default for GroupConsistencyState {
+    fn default() -> Self {
+        Self::Reconciling
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingGroupTransitionStage {
+    AwaitingAuthorizationBootstrap,
+    Prepared,
+    Submitting,
+    ReconcilingAfterConflict,
+    AcceptedPublishingWelcomes,
+    CompletingJoin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GroupTransitionIntent {
+    Typed {
+        operation: GroupTransitionOperation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_binding: Option<GroupTransitionRequestBinding>,
+        #[serde(default)]
+        conflict_rebuild_attempted: bool,
+    },
+    /// Snapshot migration only.  Legacy pending transitions are reconciled or
+    /// discarded; they are never submitted again because their target
+    /// parameters cannot be reconstructed safely.
+    LegacyOperation(String),
+}
+
+impl GroupTransitionIntent {
+    pub fn typed(operation: GroupTransitionOperation) -> Self {
+        Self::Typed {
+            operation,
+            request_binding: None,
+            conflict_rebuild_attempted: false,
+        }
+    }
+
+    pub fn operation(&self) -> Option<&GroupTransitionOperation> {
+        match self {
+            Self::Typed { operation, .. } => Some(operation),
+            Self::LegacyOperation(_) => None,
+        }
+    }
+
+    pub fn request_binding(&self) -> Option<&GroupTransitionRequestBinding> {
+        match self {
+            Self::Typed {
+                request_binding, ..
+            } => request_binding.as_ref(),
+            Self::LegacyOperation(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedPendingGroupTransition {
+    pub transition_id: String,
+    #[serde(alias = "operation")]
+    pub intent: GroupTransitionIntent,
+    pub stage: PendingGroupTransitionStage,
+    pub base_manifest_hash: String,
+    pub base_roster_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit_message_id: Option<String>,
+    pub proposed_manifest: GroupManifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mls_patch: Option<MlsConversationPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_mls_state: Option<String>,
+    pub envelopes: Vec<GroupEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_event_plaintext: Option<String>,
+    #[serde(default)]
+    pub welcomes: Vec<PutWelcomePickupRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_request_id: Option<String>,
+    #[serde(default)]
+    pub retries: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +248,20 @@ pub struct PersistedGroupInvite {
     pub invite_id: String,
     pub invite_url: String,
     pub document: GroupInviteDocument,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default = "default_group_invite_status")]
+    pub status: GroupInviteStatus,
+    #[serde(default)]
+    pub uses: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uses: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
+}
+
+fn default_group_invite_status() -> GroupInviteStatus {
+    GroupInviteStatus::Active
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +277,19 @@ pub struct PersistedGroupJoinRequest {
     pub manifest: Option<GroupManifest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_cursor: Option<GroupCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedGroupLeaveRequest {
+    pub request: GroupLeaveRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,6 +1035,10 @@ mod tests {
                     endpoint: "https://example.com/welcome".into(),
                     capability: "capability".into(),
                     expires_at: 999,
+                    start_seq: None,
+                    roster_version: None,
+                    last_commit_message_id: None,
+                    request_id: None,
                 },
                 title: Some("Test group".into()),
                 inviter_user_id: Some("user:bob".into()),
