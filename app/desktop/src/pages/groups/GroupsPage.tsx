@@ -259,9 +259,15 @@ export default function GroupsPage() {
               const snapshot = snapshots[group.group_id];
               const localRole = snapshot?.local_role ?? group.local_role;
               const dissolved = group.dissolved_at != null || snapshot?.dissolved_at != null;
+              const consistencyState = snapshot?.consistency_state ?? "reconciling";
+              const transitionStage = snapshot?.pending_transition_stage ?? null;
+              const governanceReady =
+                consistencyState === "ready" && transitionStage === null && !dissolved;
               const pending = snapshot?.pending_outbox_count ?? 0;
               const pendingJoinRequests =
-                snapshot?.join_requests.filter((request) => request.status === "pending")
+                snapshot?.join_requests.filter(
+                  (request) => request.status === "pending_approval",
+                )
                   .length ?? 0;
               const activeMembers =
                 snapshot?.manifest.members.filter((member) => member.status === "active")
@@ -291,6 +297,21 @@ export default function GroupsPage() {
                             dissolved
                           </span>
                         )}
+                        {!dissolved && consistencyState === "blocked_needs_rebuild" && (
+                          <span className="badge bg-red-500/10 text-[10px] uppercase text-red-500">
+                            rebuild required
+                          </span>
+                        )}
+                        {!dissolved && consistencyState === "reconciling" && (
+                          <span className="badge bg-yellow-500/10 text-[10px] uppercase text-yellow-500">
+                            reconciling
+                          </span>
+                        )}
+                        {!dissolved && transitionStage && (
+                          <span className="badge bg-sky-500/10 text-[10px] uppercase text-sky-500">
+                            {transitionStage.replaceAll("_", " ")}
+                          </span>
+                        )}
                         {pendingJoinRequests > 0 && (
                           <span className="badge bg-yellow-500/10 text-[10px] uppercase text-yellow-500">
                             {pendingJoinRequests} join request
@@ -306,6 +327,7 @@ export default function GroupsPage() {
                         <span>state: {group.conversation_state}</span>
                         <span>cursor: {snapshot?.cursor?.last_fetched_seq ?? 0}</span>
                         {pending > 0 && <span>pending outbox: {pending}</span>}
+                        <span>membership: {consistencyState.replaceAll("_", " ")}</span>
                       </div>
                       <div className="mt-1 truncate font-mono text-xs text-muted-color">
                         {group.group_id}
@@ -340,6 +362,12 @@ export default function GroupsPage() {
                         <button
                           className="btn btn-danger text-xs"
                           onClick={() => void openDissolve(group.group_id)}
+                          disabled={!governanceReady}
+                          title={
+                            governanceReady
+                              ? undefined
+                              : "Membership controls are read-only until the group is ready."
+                          }
                         >
                           <Zap size={14} />
                           Dissolve
@@ -360,6 +388,14 @@ export default function GroupsPage() {
                   {canLeave && (
                     <div className="mt-3 text-xs text-secondary-color">
                       Open Manage to leave this group or review member details.
+                    </div>
+                  )}
+                  {!dissolved && consistencyState === "blocked_needs_rebuild" && (
+                    <div className="mt-3 flex items-start gap-2 rounded-lg bg-red-500/10 p-3 text-xs text-red-500">
+                      <AlertCircle size={14} className="mt-0.5 shrink-0" />
+                      <span>
+                        This group's encrypted membership state could not be verified. Messaging history remains visible, but membership changes are blocked until the group is rebuilt.
+                      </span>
                     </div>
                   )}
                 </section>

@@ -112,5 +112,6 @@ fn format_status_title(status: &tapchat_core::ffi_api::SystemStatus) -> String {
         SystemStatus::ConversationNeedsRebuild => "Conversation".to_string(),
         SystemStatus::MessageQueuedForApproval => "Pending".to_string(),
         SystemStatus::MessageRejectedByPolicy => "Blocked".to_string(),
+        SystemStatus::GroupMembershipRevoked => "Removed from group".to_string(),
     }
 }

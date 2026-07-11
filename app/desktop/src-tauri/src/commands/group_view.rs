@@ -1,5 +1,7 @@
 use tapchat_core::conversation::StoredMessage;
-use tapchat_core::model::{ConversationState, GroupMessageType, MessageType};
+use tapchat_core::model::{
+    ConversationState, GroupMessageType, GroupStateEvent, GroupStateEventKind, MessageType,
+};
 use tapchat_core::persistence::PersistedGroupInvite;
 
 pub(super) fn canonical_group_invite_url(invite: &PersistedGroupInvite) -> String {
@@ -43,6 +45,7 @@ pub(super) fn system_banner_text(message_type: GroupMessageType) -> String {
         GroupMessageType::ControlGroupJoinApproved => "A join request was approved.".into(),
         GroupMessageType::ControlGroupJoinRejected => "A join request was rejected.".into(),
         GroupMessageType::ControlGroupLeaveRequested => "A member requested to leave.".into(),
+        GroupMessageType::ControlGroupStateEvent => "Group state changed.".into(),
         GroupMessageType::ControlConversationNeedsRebuild => {
             "This conversation needs to be rebuilt.".into()
         }
@@ -50,6 +53,32 @@ pub(super) fn system_banner_text(message_type: GroupMessageType) -> String {
         // a neutral label rather than panicking so an unexpected code
         // path does not crash the UI thread.
         other => format!("{:?}", other),
+    }
+}
+
+pub(super) fn group_state_event_text(plaintext: Option<&str>) -> String {
+    let Some(event) =
+        plaintext.and_then(|value| serde_json::from_str::<GroupStateEvent>(value).ok())
+    else {
+        return "Group state changed.".into();
+    };
+    let subjects = if event.subject_user_ids.is_empty() {
+        "the group".to_string()
+    } else {
+        event.subject_user_ids.join(", ")
+    };
+    match event.kind {
+        GroupStateEventKind::MemberJoined => format!("{subjects} joined the group."),
+        GroupStateEventKind::MemberLeft => format!("{subjects} left the group."),
+        GroupStateEventKind::MemberRemoved => {
+            format!("{} removed {subjects} from the group.", event.actor_user_id)
+        }
+        GroupStateEventKind::RoleChanged => format!("{subjects}'s group role changed."),
+        GroupStateEventKind::OwnershipTransferred => {
+            format!("Group ownership was transferred to {subjects}.")
+        }
+        GroupStateEventKind::GroupMetadataChanged => "Group details were updated.".into(),
+        GroupStateEventKind::GroupDissolved => "This group has been dissolved by the owner.".into(),
     }
 }
 

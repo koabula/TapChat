@@ -5,6 +5,7 @@ import { X, Link2, AlertCircle, Loader } from "lucide-react";
 import {
   getGroupJoinRequestStatus,
   submitGroupJoinRequest,
+  type GroupJoinStatus,
   type SubmitGroupJoinRequestResult,
 } from "@/lib/tauri";
 import { useConversationsStore } from "@/store/conversations";
@@ -46,9 +47,7 @@ export default function GroupJoinByLinkDialog({
   const [submitting, setSubmitting] = useState(false);
   const [pending, setPending] = useState<SubmitGroupJoinRequestResult | null>(null);
   const [submittedHost, setSubmittedHost] = useState<string | null>(null);
-  const [status, setStatus] = useState<
-    "idle" | "pending" | "approved" | "rejected" | "error"
-  >("idle");
+  const [status, setStatus] = useState<"idle" | "error" | GroupJoinStatus>("idle");
   const [error, setError] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -88,12 +87,12 @@ export default function GroupJoinByLinkDialog({
       const result = await submitGroupJoinRequest(trimmed);
       setPending(result);
       setSubmittedHost(inviteHost(trimmed));
-      if (result.status === "approved") {
-        setStatus("approved");
+      if (result.status === "joined" || (result.status as string) === "approved") {
+        setStatus("joined");
         handleApproved(result.group_id);
         return;
       }
-      setStatus("pending");
+      setStatus(result.status);
       startPolling(result.group_id, result.request_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -116,15 +115,18 @@ export default function GroupJoinByLinkDialog({
   const tick = async (groupId: string, requestId: string) => {
     try {
       const view = await getGroupJoinRequestStatus(groupId, requestId);
-      if (view.status === "approved" && view.group_imported) {
-        setStatus("approved");
+      if (
+        (view.status === "joined" || (view.status as string) === "approved") &&
+        view.group_imported
+      ) {
+        setStatus("joined");
         stopPolling();
         handleApproved(groupId);
-      } else if (view.status === "rejected") {
-        setStatus("rejected");
+      } else if (["rejected", "expired", "revoked"].includes(view.status)) {
+        setStatus(view.status);
         stopPolling();
       } else {
-        setStatus("pending");
+        setStatus(view.status);
       }
     } catch (err) {
       // Transient errors are non-fatal; log and keep polling.
@@ -144,7 +146,7 @@ export default function GroupJoinByLinkDialog({
     } else {
       // Keep the dialog open with an "Open group" CTA and let the
       // user click once the store settles.
-      setStatus("approved");
+      setStatus("joined");
     }
   };
 
@@ -189,19 +191,15 @@ export default function GroupJoinByLinkDialog({
               placeholder="https://.../v1/group-invite/... or tapchat://welcome-pickup/..."
               value={inviteUrl}
               onChange={(e) => setInviteUrl(e.target.value)}
-              disabled={submitting || status === "pending"}
+              disabled={submitting || isJoinInProgress(status)}
             />
           </label>
 
-          {status === "pending" && (
+          {isJoinInProgress(status) && (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-surface-elevated text-sm text-secondary-color">
               <Loader size={14} className="animate-spin" />
               <div>
-                <div>
-                  Waiting for approval… you can close this dialog and
-                  check back later. The request remains pending
-                  server-side.
-                </div>
+                <div>{joinStatusMessage(status)}</div>
                 {submittedHost && (
                   <div className="text-xs text-muted-color mt-1">
                     Runtime: {submittedHost}
@@ -211,7 +209,7 @@ export default function GroupJoinByLinkDialog({
             </div>
           )}
 
-          {status === "approved" && pending && (
+          {status === "joined" && pending && (
             <div className="flex items-center justify-between gap-2 p-3 rounded-lg bg-green-500/10 text-sm text-green-500">
               <span>Joined! Opening group…</span>
               {resolveConversationId(pending.group_id) && (
@@ -231,13 +229,13 @@ export default function GroupJoinByLinkDialog({
             </div>
           )}
 
-          {status === "rejected" && (
+          {["rejected", "expired", "revoked"].includes(status) && (
             <div
               role="alert"
               className="flex items-start gap-2 p-3 rounded-lg bg-red-500/10 text-sm text-red-500"
             >
               <AlertCircle size={16} className="shrink-0 mt-0.5" />
-              <div>Your join request was rejected.</div>
+              <div>{joinStatusMessage(status)}</div>
             </div>
           )}
 
@@ -259,7 +257,7 @@ export default function GroupJoinByLinkDialog({
           <button
             className="btn btn-primary"
             onClick={handleSubmit}
-            disabled={submitting || status === "pending"}
+            disabled={submitting || isJoinInProgress(status)}
           >
             {submitting ? "Submitting..." : "Submit join request"}
           </button>
@@ -267,6 +265,36 @@ export default function GroupJoinByLinkDialog({
       </div>
     </div>
   );
+}
+
+function isJoinInProgress(status: string): status is GroupJoinStatus {
+  return [
+    "pending_approval",
+    "waiting_for_group_commit",
+    "transition_in_progress",
+    "welcome_available",
+  ].includes(status);
+}
+
+function joinStatusMessage(status: string): string {
+  switch (status) {
+    case "pending_approval":
+      return "Waiting for a group administrator to approve this request.";
+    case "waiting_for_group_commit":
+      return "Waiting for the group to complete the encrypted membership update.";
+    case "transition_in_progress":
+      return "Securely adding this device to the group…";
+    case "welcome_available":
+      return "Membership confirmed. Importing the encrypted group state…";
+    case "expired":
+      return "This join request expired. Submit the invite link again.";
+    case "revoked":
+      return "This invite or join request was revoked.";
+    case "rejected":
+      return "Your join request was rejected.";
+    default:
+      return "Waiting for the group membership update.";
+  }
 }
 
 function inviteHost(value: string): string | null {

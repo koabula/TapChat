@@ -80,6 +80,8 @@ const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
     "message_requests",
     "short_group_invite",
     "group_member_subscribe",
+    "group_authorization_v2",
+    "group_membership_fsm_v2",
 ];
 
 fn status_from_features(
@@ -99,12 +101,20 @@ fn status_from_features(
     let has_group_member_subscribe = features
         .iter()
         .any(|feature| feature == "group_member_subscribe");
+    let has_group_authorization_v2 = features
+        .iter()
+        .any(|feature| feature == "group_authorization_v2");
+    let has_group_membership_fsm_v2 = features
+        .iter()
+        .any(|feature| feature == "group_membership_fsm_v2");
     let needs_upgrade = bound
         && !(supports_group_outbox
             && supports_welcome_pickup
             && has_message_requests
             && has_short_group_invite
-            && has_group_member_subscribe);
+            && has_group_member_subscribe
+            && has_group_authorization_v2
+            && has_group_membership_fsm_v2);
     let (state, action, details) = if !bound {
         (
             "missing".to_string(),
@@ -265,6 +275,8 @@ mod tests {
                 "welcome_pickup_mvp".into(),
                 "short_group_invite".into(),
                 "group_member_subscribe".into(),
+                "group_authorization_v2".into(),
+                "group_membership_fsm_v2".into(),
             ],
             None,
         );

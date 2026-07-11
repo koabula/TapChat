@@ -142,7 +142,9 @@ export default function ChatView() {
     isGroup && (groupSnapshot?.pending_outbox_count ?? 0) > 0;
   const pendingJoinRequests =
     isGroup
-      ? groupSnapshot?.join_requests.filter((request) => request.status === "pending")
+      ? groupSnapshot?.join_requests.filter(
+          (request) => request.status === "pending_approval",
+        )
           .length ?? 0
       : 0;
   const composerDisabled =
@@ -515,15 +517,19 @@ export default function ChatView() {
    */
   const buildGroupMessageList = () => {
     if (groupMessages.length === 0) return null;
-    return groupMessages.map((message) => {
+    const seenTransitions = new Set<string>();
+    return groupMessages.flatMap((message) => {
       if (message.kind === "system_banner") {
+        const eventKey = message.transition_id || message.message_id;
+        if (seenTransitions.has(eventKey)) return [];
+        seenTransitions.add(eventKey);
         return (
           <div
             key={message.message_id}
             className="date-separator"
             data-raw-type={message.raw_message_type}
           >
-            <span>{message.text}</span>
+            <span>{formatGroupStateEvent(message, resolveGroupName)}</span>
           </div>
         );
       }
@@ -943,6 +949,35 @@ export default function ChatView() {
       )}
     </div>
   );
+}
+
+function formatGroupStateEvent(
+  message: Extract<GroupMessageView, { kind: "system_banner" }>,
+  resolveName: (input: { userId?: string | null; deviceId?: string | null }) => string,
+): string {
+  if (!message.event_kind) return message.text;
+  const actor = message.actor_user_id
+    ? resolveName({ userId: message.actor_user_id })
+    : "A group administrator";
+  const subjects = (message.subject_user_ids ?? [])
+    .map((userId) => resolveName({ userId }))
+    .join(", ");
+  switch (message.event_kind) {
+    case "member_joined":
+      return `${subjects || "A member"} joined the group.`;
+    case "member_left":
+      return `${subjects || "A member"} left the group.`;
+    case "member_removed":
+      return `${actor} removed ${subjects || "a member"} from the group.`;
+    case "role_changed":
+      return `${actor} changed ${subjects || "a member"} from ${message.old_role ?? "their previous role"} to ${message.new_role ?? "a new role"}.`;
+    case "ownership_transferred":
+      return `${actor} transferred ownership to ${subjects || "another member"}.`;
+    case "group_metadata_changed":
+      return `${actor} updated the group details.`;
+    case "group_dissolved":
+      return `${actor} dissolved the group.`;
+  }
 }
 
 function formatRecoveryMessage(reason?: string, detail?: string, lastError?: string): string {

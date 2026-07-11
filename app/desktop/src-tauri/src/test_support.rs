@@ -36,13 +36,14 @@ pub use crate::lifecycle::{drive_core_without_handle, CoreInput};
 // Re-export all group Tauri command `_impl` functions so integration
 // tests can call them as plain async functions.
 pub use crate::commands::group::{
-    approve_group_join_impl, create_group_conversation_impl, create_group_invite_link_impl,
-    dissolve_group_impl, get_group_join_request_status_impl, get_group_messages_impl,
-    get_group_snapshot_impl, invite_to_group_impl, leave_group_impl, list_group_conversations_impl,
-    list_group_invites_impl, list_group_join_requests_impl, reject_group_join_impl,
-    remove_group_member_impl, revoke_group_invite_link_impl, send_group_text_message_impl,
-    set_group_admin_impl, submit_group_join_request_impl, sync_group_outbox_impl,
-    transfer_group_ownership_impl, update_group_metadata_impl,
+    approve_group_join_impl, approve_group_leave_impl, create_group_conversation_impl,
+    create_group_invite_link_impl, dissolve_group_impl, get_group_join_request_status_impl,
+    get_group_messages_impl, get_group_snapshot_impl, invite_to_group_impl, leave_group_impl,
+    list_group_conversations_impl, list_group_invites_impl, list_group_join_requests_impl,
+    list_group_leave_requests_impl, reject_group_join_impl, remove_group_member_impl,
+    revoke_group_invite_link_impl, send_group_text_message_impl, set_group_admin_impl,
+    submit_group_join_request_impl, sync_group_outbox_impl, transfer_group_ownership_impl,
+    update_group_metadata_impl,
 };
 pub use crate::commands::message::{download_attachment_impl, send_attachment_impl};
 
@@ -52,9 +53,10 @@ pub use crate::commands::message::{download_attachment_impl, send_attachment_imp
 pub use crate::commands::group::{
     ApproveGroupJoinResult, CreateGroupConversationResult, CreateGroupInviteLinkResult,
     DissolveGroupResult, GroupConversationSummary, GroupInviteView, GroupJoinRequestView,
-    GroupJoinStatusView, GroupMessageView, GroupSnapshotView, InviteToGroupResult,
-    RevokeGroupInviteLinkResult, SendGroupTextResult, SubmitGroupJoinRequestResult,
-    SyncGroupOutboxResult, UpdateGroupMetadataResult, WelcomePickupShareable,
+    GroupJoinStatusView, GroupLeaveRequestView, GroupMessageView, GroupSnapshotView,
+    InviteToGroupResult, RevokeGroupInviteLinkResult, SendGroupTextResult,
+    SubmitGroupJoinRequestResult, SyncGroupOutboxResult, UpdateGroupMetadataResult,
+    WelcomePickupShareable,
 };
 
 /// Construct an [`AppState`] bound to an existing on-disk profile.

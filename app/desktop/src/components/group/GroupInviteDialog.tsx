@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { writeText as clipboardWriteText } from "@tauri-apps/plugin-clipboard-manager";
 import { Copy, Check, X, AlertCircle, Link2, Trash2 } from "lucide-react";
 
@@ -6,11 +7,13 @@ import {
   createGroupInviteLink,
   getGroupSnapshot,
   listGroupInvites,
+  normalizeGroupInvite,
   revokeGroupInviteLink,
   type GroupInviteView,
 } from "@/lib/tauri";
 import { blockedInviteCreationReason } from "@/lib/groupInvitePolicy";
 import type { GroupJoinPolicy } from "@/lib/types";
+import type { CoreUpdateEvent } from "@/lib/types";
 
 interface GroupInviteDialogProps {
   open: boolean;
@@ -63,6 +66,21 @@ export default function GroupInviteDialog({
       void refreshDialogState();
     }
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
+      const authoritative = event.payload.view_model?.group_invites;
+      if (!authoritative) return;
+      const rows = authoritative
+        .map(normalizeGroupInvite)
+        .filter((invite) => invite.group_id === groupId);
+      setInvites(rows);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [open, groupId]);
 
   const refreshDialogState = async () => {
     await Promise.all([refreshInvites(), refreshJoinPolicy()]);
@@ -227,7 +245,7 @@ export default function GroupInviteDialog({
 
           {/* Invite list */}
           <section className="p-4">
-            <h3 className="text-sm font-medium text-primary-color mb-2">Active invites</h3>
+            <h3 className="text-sm font-medium text-primary-color mb-2">Invite history</h3>
             {invites.length === 0 ? (
               <div className="text-center py-4 text-muted-color text-sm">
                 No invites yet.
@@ -241,12 +259,13 @@ export default function GroupInviteDialog({
                   >
                     <div className="flex items-center justify-between gap-2 mb-2">
                       <div className="text-xs text-muted-color">
-                        {invite.join_policy} · expires {formatExpiresAt(invite.expires_at)}
-                        {invite.max_uses !== null && ` · ${invite.max_uses} uses`}
+                        {invite.status} · {invite.join_policy} · expires {formatExpiresAt(invite.expires_at)}
+                        {` · used ${invite.uses}${invite.max_uses === null ? " / unlimited" : ` / ${invite.max_uses}`}`}
                       </div>
                       <button
                         className="btn btn-ghost px-2 text-red-500"
                         onClick={() => void handleRevoke(invite)}
+                        disabled={invite.status !== "active"}
                         aria-label={`Revoke invite ${invite.invite_id}`}
                       >
                         <Trash2 size={14} />
@@ -261,11 +280,13 @@ export default function GroupInviteDialog({
                         readOnly
                         className="input flex-1 text-xs font-mono"
                         value={invite.invite_url}
+                        disabled={invite.status !== "active"}
                         onClick={(e) => e.currentTarget.select()}
                       />
                       <button
                         className="btn btn-secondary text-xs"
                         onClick={() => void handleCopy(invite)}
+                        disabled={invite.status !== "active"}
                       >
                         {copiedId === invite.invite_id ? (
                           <>

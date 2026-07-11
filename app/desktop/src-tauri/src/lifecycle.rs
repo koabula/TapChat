@@ -396,8 +396,7 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
                 }
 
                 if let Err(error) =
-                    drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppForegrounded))
-                        .await
+                    drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppForegrounded)).await
                 {
                     log::warn!("foreground sync failed: {}", error);
                 }
@@ -571,6 +570,8 @@ fn merge_view_models(base: &mut CoreViewModel, mut next: CoreViewModel) {
     base.group_invites.append(&mut next.group_invites);
     base.group_join_requests
         .append(&mut next.group_join_requests);
+    base.group_leave_requests
+        .append(&mut next.group_leave_requests);
     base.welcome_pickups.append(&mut next.welcome_pickups);
     if next.group_sync_results.is_some() {
         base.group_sync_results = next.group_sync_results;
@@ -627,7 +628,9 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
 
     // Show main window and notify only that frontend so onboarding cannot route into the app shell.
     if let Some(main_window) = app.get_webview_window("main") {
-        main_window.set_title("TapChat").map_err(|e| e.to_string())?;
+        main_window
+            .set_title("TapChat")
+            .map_err(|e| e.to_string())?;
         let _ = main_window.emit("session-status", session_status.clone());
         main_window.show().map_err(|e| e.to_string())?;
         if let Err(e) = main_window.set_focus() {

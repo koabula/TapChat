@@ -84,7 +84,7 @@ export default function GroupJoinApprovalPanel({
     setLoading(true);
     try {
       const rows = await listGroupJoinRequests(groupId);
-      setRequests(rows.filter((row) => row.status === "pending"));
+      setRequests(rows.filter((row) => row.status === "pending_approval"));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

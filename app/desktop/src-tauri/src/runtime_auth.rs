@@ -163,9 +163,7 @@ pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Res
         let inner = state.inner.read().await;
         inner.profile_manager.clone()
     };
-    let refreshed = {
-        ensure_fresh_device_runtime_auth(&profile_manager).await?
-    };
+    let refreshed = { ensure_fresh_device_runtime_auth(&profile_manager).await? };
 
     let Some(bundle) = refreshed else {
         return Ok(false);

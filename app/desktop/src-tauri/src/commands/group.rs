@@ -30,15 +30,16 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 
 use tapchat_core::model::{
-    GroupCursor, GroupJoinPolicy, GroupJoinRequest, GroupManifest, GroupMemberInvitePolicy,
-    GroupMemberStatus, GroupMessageType, GroupRole, StorageRef, WelcomePickupDescriptor,
+    GroupCursor, GroupJoinPolicy, GroupJoinRequest, GroupLeaveRequest, GroupLeaveRequestStatus,
+    GroupManifest, GroupMemberInvitePolicy, GroupMemberStatus, GroupMessageType, GroupRole,
+    StorageRef, WelcomePickupDescriptor,
 };
 use tapchat_core::persistence::PersistedGroupInvite;
 use tapchat_core::{CoreCommand, CoreEffect, CoreOutput};
 
 use super::group_view::{
     application_message_count, canonical_group_invite_url, conversation_state_string,
-    last_application_preview, system_banner_text,
+    group_state_event_text, last_application_preview, system_banner_text,
 };
 use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
@@ -81,9 +82,13 @@ pub struct GroupSnapshotView {
     pub cursor: Option<GroupCursor>,
     pub invites: Vec<GroupInviteView>,
     pub join_requests: Vec<GroupJoinRequestView>,
+    pub leave_requests: Vec<GroupLeaveRequestView>,
     pub pending_outbox_count: usize,
     pub dissolved_at: Option<u64>,
     pub conversation_state: String,
+    pub consistency_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_transition_stage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +112,18 @@ pub enum GroupMessageView {
         /// Locked UI copy for each visible control message kind.
         text: String,
         raw_message_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transition_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        event_kind: Option<tapchat_core::model::GroupStateEventKind>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actor_user_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        subject_user_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        old_role: Option<GroupRole>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_role: Option<GroupRole>,
     },
 }
 
@@ -145,6 +162,10 @@ pub struct GroupInviteView {
     pub join_policy: GroupJoinPolicy,
     pub expires_at: u64,
     pub max_uses: Option<u64>,
+    pub uses: u64,
+    pub status: tapchat_core::transport_contract::GroupInviteStatus,
+    pub revision: u64,
+    pub revoked_at: Option<u64>,
     pub inviter_user_id: String,
     pub created_at: u64,
 }
@@ -157,7 +178,11 @@ impl From<&PersistedGroupInvite> for GroupInviteView {
             invite_url: canonical_group_invite_url(invite),
             join_policy: invite.document.join_policy,
             expires_at: invite.document.expires_at,
-            max_uses: invite.document.max_uses,
+            max_uses: invite.max_uses.or(invite.document.max_uses),
+            uses: invite.uses,
+            status: invite.status.clone(),
+            revision: invite.revision,
+            revoked_at: invite.revoked_at,
             inviter_user_id: invite.document.inviter_user_id.clone(),
             created_at: invite.document.created_at,
         }
@@ -177,15 +202,90 @@ pub struct GroupJoinRequestView {
 
 impl From<&GroupJoinRequest> for GroupJoinRequestView {
     fn from(request: &GroupJoinRequest) -> Self {
+        let status = group_join_status_str(request.status);
         Self {
             request_id: request.request_id.clone(),
             group_id: request.group_id.clone(),
             joiner_user_id: request.joiner_user_id.clone(),
             joiner_device_id: request.joiner_device_id.clone(),
             requested_at: request.requested_at,
-            status: format!("{:?}", request.status).to_lowercase(),
+            status: status.into(),
             invite_id: request.invite_id.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupLeaveRequestView {
+    pub request_id: String,
+    pub group_id: String,
+    pub leaver_user_id: String,
+    pub leaver_device_id: String,
+    pub requested_at: u64,
+    pub status: String,
+}
+
+impl From<&GroupLeaveRequest> for GroupLeaveRequestView {
+    fn from(request: &GroupLeaveRequest) -> Self {
+        let status = match request.status {
+            GroupLeaveRequestStatus::WaitingForGroupCommit => "waiting_for_group_commit",
+            GroupLeaveRequestStatus::TransitionInProgress => "transition_in_progress",
+            GroupLeaveRequestStatus::Completed => "completed",
+            GroupLeaveRequestStatus::Expired => "expired",
+            GroupLeaveRequestStatus::Revoked => "revoked",
+        };
+        Self {
+            request_id: request.request_id.clone(),
+            group_id: request.group_id.clone(),
+            leaver_user_id: request.leaver_user_id.clone(),
+            leaver_device_id: request.leaver_device_id.clone(),
+            requested_at: request.requested_at,
+            status: status.into(),
+        }
+    }
+}
+
+fn group_join_status_str(status: tapchat_core::model::GroupJoinRequestStatus) -> &'static str {
+    use tapchat_core::model::GroupJoinRequestStatus;
+    match status {
+        GroupJoinRequestStatus::Pending => "pending",
+        GroupJoinRequestStatus::Approved => "approved",
+        GroupJoinRequestStatus::PendingApproval => "pending_approval",
+        GroupJoinRequestStatus::WaitingForGroupCommit => "waiting_for_group_commit",
+        GroupJoinRequestStatus::TransitionInProgress => "transition_in_progress",
+        GroupJoinRequestStatus::WelcomeAvailable => "welcome_available",
+        GroupJoinRequestStatus::Joined => "joined",
+        GroupJoinRequestStatus::Rejected => "rejected",
+        GroupJoinRequestStatus::Expired => "expired",
+        GroupJoinRequestStatus::Revoked => "revoked",
+    }
+}
+
+fn group_consistency_state_str(
+    state: &tapchat_core::persistence::GroupConsistencyState,
+) -> &'static str {
+    use tapchat_core::persistence::GroupConsistencyState;
+    match state {
+        GroupConsistencyState::Ready => "ready",
+        GroupConsistencyState::Reconciling => "reconciling",
+        GroupConsistencyState::BlockedNeedsRebuild => "blocked_needs_rebuild",
+        GroupConsistencyState::Dissolved => "dissolved",
+    }
+}
+
+fn pending_transition_stage_str(
+    stage: &tapchat_core::persistence::PendingGroupTransitionStage,
+) -> &'static str {
+    use tapchat_core::persistence::PendingGroupTransitionStage;
+    match stage {
+        PendingGroupTransitionStage::AwaitingAuthorizationBootstrap => {
+            "awaiting_authorization_bootstrap"
+        }
+        PendingGroupTransitionStage::Prepared => "prepared",
+        PendingGroupTransitionStage::Submitting => "submitting",
+        PendingGroupTransitionStage::ReconcilingAfterConflict => "reconciling_after_conflict",
+        PendingGroupTransitionStage::AcceptedPublishingWelcomes => "accepted_publishing_welcomes",
+        PendingGroupTransitionStage::CompletingJoin => "completing_join",
     }
 }
 
@@ -198,6 +298,7 @@ fn dedupe_pending_join_request_views<'a>(
         let is_pending = matches!(
             request.status,
             tapchat_core::model::GroupJoinRequestStatus::Pending
+                | tapchat_core::model::GroupJoinRequestStatus::PendingApproval
         );
         if is_pending
             && !seen_pending_devices.insert((
@@ -350,6 +451,12 @@ pub async fn get_group_snapshot_impl(
             .map(|persisted| &persisted.request),
     );
 
+    let leave_requests = group
+        .leave_requests
+        .iter()
+        .map(|stored| GroupLeaveRequestView::from(&stored.request))
+        .collect();
+
     let pending_outbox_count = snapshot
         .pending_group_outbox
         .iter()
@@ -371,9 +478,15 @@ pub async fn get_group_snapshot_impl(
         cursor,
         invites,
         join_requests,
+        leave_requests,
         pending_outbox_count,
         dissolved_at: group.dissolved_at,
         conversation_state,
+        consistency_state: group_consistency_state_str(&group.consistency_state).into(),
+        pending_transition_stage: group
+            .pending_group_transition
+            .as_ref()
+            .map(|pending| pending_transition_stage_str(&pending.stage).into()),
     })
 }
 
@@ -453,6 +566,31 @@ pub async fn get_group_messages_impl(
             tapchat_core::model::MessageType::ControlIdentityStateUpdated => {
                 // Same as above — direct conversation concern.
             }
+            tapchat_core::model::MessageType::ControlGroupStateEvent => {
+                let event = message.plaintext.as_deref().and_then(|value| {
+                    serde_json::from_str::<tapchat_core::model::GroupStateEvent>(value).ok()
+                });
+                let raw_message_type = event
+                    .as_ref()
+                    .and_then(|event| serde_json::to_value(event.kind).ok())
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "control_group_state_event".into());
+                out.push(GroupMessageView::SystemBanner {
+                    message_id: message.message_id.clone(),
+                    created_at: message.created_at,
+                    text: group_state_event_text(message.plaintext.as_deref()),
+                    raw_message_type,
+                    transition_id: event.as_ref().map(|event| event.transition_id.clone()),
+                    event_kind: event.as_ref().map(|event| event.kind),
+                    actor_user_id: event.as_ref().map(|event| event.actor_user_id.clone()),
+                    subject_user_ids: event
+                        .as_ref()
+                        .map(|event| event.subject_user_ids.clone())
+                        .unwrap_or_default(),
+                    old_role: event.as_ref().and_then(|event| event.old_role),
+                    new_role: event.as_ref().and_then(|event| event.new_role),
+                });
+            }
             tapchat_core::model::MessageType::ControlContactRemoved => {
                 // Direct relationship lifecycle message.
             }
@@ -479,6 +617,12 @@ pub async fn get_group_messages_impl(
                     } else {
                         "control_conversation_needs_rebuild".into()
                     },
+                    transition_id: None,
+                    event_kind: None,
+                    actor_user_id: None,
+                    subject_user_ids: Vec::new(),
+                    old_role: None,
+                    new_role: None,
                 });
             }
         }
@@ -588,17 +732,30 @@ pub async fn create_group_conversation(
         .ok_or_else(|| "new conversation is missing a group_id".to_string())?;
     let conversation_id = summary.conversation_id.clone();
 
-    let welcome_pickups: Vec<WelcomePickupShareable> = output
-        .view_model
-        .as_ref()
-        .map(|vm| {
-            vm.welcome_pickups
+    let mut welcome_pickups_by_device = BTreeMap::new();
+    if let Some(view_model) = output.view_model.as_ref() {
+        for descriptor in &view_model.welcome_pickups {
+            welcome_pickups_by_device.insert(
+                descriptor.device_id.clone(),
+                WelcomePickupShareable::from(descriptor),
+            );
+        }
+    }
+    let welcome_pickups = welcome_pickups_by_device.into_values().collect();
+
+    let member_count = snapshot
+        .group_states
+        .iter()
+        .find(|state| state.group_id == group_id)
+        .map(|state| {
+            state
+                .manifest
+                .members
                 .iter()
-                .map(WelcomePickupShareable::from)
-                .collect()
+                .filter(|member| member.status == tapchat_core::model::GroupMemberStatus::Active)
+                .count()
         })
         .unwrap_or_default();
-
     let local_role = snapshot
         .group_states
         .iter()
@@ -615,7 +772,7 @@ pub async fn create_group_conversation(
         group_id,
         conversation_id,
         title: summary.title.clone().unwrap_or_default(),
-        member_count: summary.member_count.unwrap_or_default(),
+        member_count,
         local_role,
         welcome_pickups,
         pending_group_outbox,
@@ -652,6 +809,14 @@ pub async fn send_group_text_message(
     )
     .await
     .map_err(|e| e.to_string())?;
+
+    if output
+        .state_update
+        .system_statuses_changed
+        .contains(&tapchat_core::ffi_api::SystemStatus::GroupMembershipRevoked)
+    {
+        return Err("group_membership_revoked".into());
+    }
 
     let message_id = output
         .view_model
@@ -816,16 +981,16 @@ pub async fn invite_to_group(
     .await
     .map_err(|e| e.to_string())?;
 
-    let welcome_pickups: Vec<WelcomePickupShareable> = output
-        .view_model
-        .as_ref()
-        .map(|vm| {
-            vm.welcome_pickups
-                .iter()
-                .map(WelcomePickupShareable::from)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut welcome_pickups_by_device = BTreeMap::new();
+    if let Some(view_model) = output.view_model.as_ref() {
+        for descriptor in &view_model.welcome_pickups {
+            welcome_pickups_by_device.insert(
+                descriptor.device_id.clone(),
+                WelcomePickupShareable::from(descriptor),
+            );
+        }
+    }
+    let welcome_pickups = welcome_pickups_by_device.into_values().collect();
 
     Ok(InviteToGroupResult {
         group_id,
@@ -938,20 +1103,31 @@ pub async fn revoke_group_invite_link(
 
 #[tauri::command]
 pub async fn list_group_invites(
-    state: State<'_, AppState>,
+    app: AppHandle,
     group_id: String,
 ) -> Result<Vec<GroupInviteView>, String> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
-    let inner = state.inner.read().await;
-    let snapshot = inner.engine.refresh_snapshot();
-    let invites = snapshot
-        .group_invites
-        .iter()
-        .filter(|invite| invite.group_id == group_id)
-        .map(GroupInviteView::from)
-        .collect();
+    let output = drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ListGroupInvites {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let invites = output
+        .view_model
+        .map(|view_model| {
+            view_model
+                .group_invites
+                .iter()
+                .filter(|invite| invite.group_id == group_id)
+                .map(GroupInviteView::from)
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(invites)
 }
 
@@ -1075,7 +1251,7 @@ pub async fn submit_group_join_request(
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,
         group_id: request.group_id,
-        status: format!("{:?}", request.status).to_lowercase(),
+        status: group_join_status_str(request.status).into(),
     })
 }
 
@@ -1164,7 +1340,7 @@ pub async fn get_group_join_request_status(
     Ok(GroupJoinStatusView {
         group_id: persisted.group_id.clone(),
         request_id: persisted.request_id.clone(),
-        status: format!("{:?}", persisted.request.status).to_lowercase(),
+        status: group_join_status_str(persisted.request.status).into(),
         group_imported,
         welcome_pickup,
     })
@@ -1224,16 +1400,16 @@ pub async fn approve_group_join(
         }
     };
 
-    let welcome_pickups: Vec<WelcomePickupShareable> = output
-        .view_model
-        .as_ref()
-        .map(|vm| {
-            vm.welcome_pickups
-                .iter()
-                .map(WelcomePickupShareable::from)
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut welcome_pickups_by_device = BTreeMap::new();
+    if let Some(view_model) = output.view_model.as_ref() {
+        for descriptor in &view_model.welcome_pickups {
+            welcome_pickups_by_device.insert(
+                descriptor.device_id.clone(),
+                WelcomePickupShareable::from(descriptor),
+            );
+        }
+    }
+    let welcome_pickups = welcome_pickups_by_device.into_values().collect();
 
     Ok(ApproveGroupJoinResult {
         group_id,
@@ -1305,6 +1481,7 @@ pub async fn process_group_join_requests(
             matches!(
                 persisted.request.status,
                 tapchat_core::model::GroupJoinRequestStatus::Pending
+                    | tapchat_core::model::GroupJoinRequestStatus::WaitingForGroupCommit
             ) && persisted.request.auto_approve.unwrap_or(false)
         })
         .filter(|persisted| {
@@ -1404,6 +1581,60 @@ pub async fn leave_group(app: AppHandle, group_id: String) -> Result<(), String>
     )
     .await
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_group_leave_requests(
+    app: AppHandle,
+    group_id: String,
+) -> Result<Vec<GroupLeaveRequestView>, String> {
+    if group_id.trim().is_empty() {
+        return Err("group_id must not be empty".into());
+    }
+    let output = drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ListGroupLeaveRequests { group_id }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(output
+        .view_model
+        .map(|view| {
+            view.group_leave_requests
+                .iter()
+                .map(GroupLeaveRequestView::from)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn approve_group_leave(
+    app: AppHandle,
+    group_id: String,
+    request_id: String,
+) -> Result<(), String> {
+    if group_id.trim().is_empty() || request_id.trim().is_empty() {
+        return Err("group_id and request_id must not be empty".into());
+    }
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ListGroupLeaveRequests {
+            group_id: group_id.clone(),
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ApproveGroupLeave {
+            group_id,
+            request_id,
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1797,17 +2028,30 @@ pub async fn create_group_conversation_impl(
         .ok_or_else(|| "new conversation is missing a group_id".to_string())?;
     let conversation_id = summary.conversation_id.clone();
 
-    let welcome_pickups: Vec<WelcomePickupShareable> = output
-        .view_model
-        .as_ref()
-        .map(|vm| {
-            vm.welcome_pickups
+    let mut welcome_pickups_by_device = BTreeMap::new();
+    if let Some(view_model) = output.view_model.as_ref() {
+        for descriptor in &view_model.welcome_pickups {
+            welcome_pickups_by_device.insert(
+                descriptor.device_id.clone(),
+                WelcomePickupShareable::from(descriptor),
+            );
+        }
+    }
+    let welcome_pickups = welcome_pickups_by_device.into_values().collect();
+
+    let member_count = snapshot
+        .group_states
+        .iter()
+        .find(|state| state.group_id == group_id)
+        .map(|state| {
+            state
+                .manifest
+                .members
                 .iter()
-                .map(WelcomePickupShareable::from)
-                .collect()
+                .filter(|member| member.status == tapchat_core::model::GroupMemberStatus::Active)
+                .count()
         })
         .unwrap_or_default();
-
     let local_role = snapshot
         .group_states
         .iter()
@@ -1824,7 +2068,7 @@ pub async fn create_group_conversation_impl(
         group_id,
         conversation_id,
         title: summary.title.clone().unwrap_or_default(),
-        member_count: summary.member_count.unwrap_or_default(),
+        member_count,
         local_role,
         welcome_pickups,
         pending_group_outbox,
@@ -1850,6 +2094,14 @@ pub async fn send_group_text_message_impl(
     )
     .await
     .map_err(|e| e.to_string())?;
+
+    if output
+        .state_update
+        .system_statuses_changed
+        .contains(&tapchat_core::ffi_api::SystemStatus::GroupMembershipRevoked)
+    {
+        return Err("group_membership_revoked".into());
+    }
 
     let message_id = output
         .view_model
@@ -2163,7 +2415,7 @@ pub async fn submit_group_join_request_impl(
     Ok(SubmitGroupJoinRequestResult {
         request_id: request.request_id,
         group_id: request.group_id,
-        status: format!("{:?}", request.status).to_lowercase(),
+        status: group_join_status_str(request.status).into(),
     })
 }
 
@@ -2242,7 +2494,7 @@ pub async fn get_group_join_request_status_impl(
     Ok(GroupJoinStatusView {
         group_id: persisted.group_id.clone(),
         request_id: persisted.request_id.clone(),
-        status: format!("{:?}", persisted.request.status).to_lowercase(),
+        status: group_join_status_str(persisted.request.status).into(),
         group_imported,
         welcome_pickup,
     })
@@ -2350,6 +2602,47 @@ pub async fn leave_group_impl(state: &AppState, group_id: String) -> Result<(), 
     )
     .await
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn list_group_leave_requests_impl(
+    state: &AppState,
+    group_id: String,
+) -> Result<Vec<GroupLeaveRequestView>, String> {
+    let output = drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::ListGroupLeaveRequests { group_id }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(output
+        .view_model
+        .map(|view| {
+            view.group_leave_requests
+                .iter()
+                .map(GroupLeaveRequestView::from)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub async fn approve_group_leave_impl(
+    state: &AppState,
+    group_id: String,
+    request_id: String,
+) -> Result<(), String> {
+    list_group_leave_requests_impl(state, group_id.clone()).await?;
+    drive_core_without_handle(
+        state,
+        CoreInput::Command(CoreCommand::ApproveGroupLeave {
+            group_id,
+            request_id,
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 

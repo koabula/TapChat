@@ -270,6 +270,8 @@ pub fn run() {
             commands::group::approve_group_join,
             commands::group::reject_group_join,
             commands::group::leave_group,
+            commands::group::list_group_leave_requests,
+            commands::group::approve_group_leave,
             commands::group::remove_group_member,
             commands::group::transfer_group_ownership,
             commands::group::set_group_admin,

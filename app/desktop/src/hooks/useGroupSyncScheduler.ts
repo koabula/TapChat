@@ -286,30 +286,34 @@ export function useGroupSyncScheduler() {
         markConnected(payload.device_id);
       } else if (payload.event_type === "group_disconnected") {
         markDisconnected(payload.device_id);
-        syncGroupOutbox(payload.device_id, "realtime_disconnected")
-          .then(() => markSynced(payload.device_id))
-          .catch((err) => markSyncFailed(payload.device_id, String(err)));
       } else if (payload.event_type === "group_error") {
         markDisconnected(payload.device_id, payload.data ?? "group websocket error");
-        syncGroupOutbox(payload.device_id, "realtime_error")
-          .then(() => markSynced(payload.device_id))
-          .catch((err) => markSyncFailed(payload.device_id, String(err)));
       } else if (payload.event_type === "group_join_request_available") {
+        // RealtimeManager already delivered this to Core, which refreshes the
+        // authoritative approval queue. Do not start a second list/sync path.
+      } else if (payload.event_type === "group_auto_join_available") {
+        // Open invites are advanced by whichever admin device wins the DO
+        // lease. Core handles claim conflicts and idempotent retries.
         processGroupJoinRequests(payload.device_id)
-          .then(() => syncGroupOutbox(payload.device_id, "realtime"))
           .then(() => getGroupSnapshot(payload.device_id))
           .then((snapshot) => {
             setGroupSnapshot(snapshot);
             markSynced(payload.device_id);
           })
           .catch((err) => markSyncFailed(payload.device_id, String(err)));
+      } else if (payload.event_type === "group_invites_changed") {
+        // Core owns the authority refresh. An open invite dialog refreshes its
+        // projection after that event; no parallel scheduler request is needed.
+      } else if (payload.event_type === "group_leave_request_available") {
+        // Core refreshes the shared leave-request queue. The explicit approval
+        // surface consumes the resulting snapshot when available.
       } else if (
         payload.event_type === "group_head_updated" ||
         payload.event_type === "group_outbox_record_available"
       ) {
-        syncGroupOutbox(payload.device_id, "realtime")
-          .then(() => markSynced(payload.device_id))
-          .catch((err) => markSyncFailed(payload.device_id, String(err)));
+        // RealtimeManager maps these events directly into Rust Core. Core owns
+        // the per-group in-flight fetch guard; firing a second frontend sync
+        // here races the authoritative cursor and can split transition bundles.
       }
     });
     return () => {

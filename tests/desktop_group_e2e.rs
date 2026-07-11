@@ -43,10 +43,11 @@ use tapchat_core::ffi_api::RealtimeEvent;
 use tapchat_core::model::{DeploymentBundle, IdentityBundle};
 use tapchat_core::CoreEvent;
 use tapchat_desktop_lib::test_support::{
-    approve_group_join_impl, build_test_app_state_for_profile, create_group_conversation_impl,
-    create_group_invite_link_impl, dissolve_group_impl, download_attachment_impl,
-    drive_core_without_handle, get_group_messages_impl, get_group_snapshot_impl, leave_group_impl,
-    list_group_conversations_impl, remove_group_member_impl, send_attachment_impl,
+    approve_group_join_impl, approve_group_leave_impl, build_test_app_state_for_profile,
+    create_group_conversation_impl, create_group_invite_link_impl, dissolve_group_impl,
+    download_attachment_impl, drive_core_without_handle, get_group_messages_impl,
+    get_group_snapshot_impl, leave_group_impl, list_group_conversations_impl,
+    list_group_leave_requests_impl, remove_group_member_impl, send_attachment_impl,
     send_group_text_message_impl, set_group_admin_impl, submit_group_join_request_impl,
     sync_group_outbox_impl, transfer_group_ownership_impl, update_group_metadata_impl, CoreInput,
     GroupMessageView,
@@ -767,7 +768,7 @@ async fn run_dana_post_approval_send_sync_regression(ctx: &QuartetContext) -> Re
     .context("dana submit_group_join_request_impl timed out")?
     .map_err(|e| anyhow!("dana submit_group_join_request_impl: {e}"))?;
     assert_eq!(dana_submit.group_id, group_id);
-    assert_eq!(dana_submit.status, "pending");
+    assert_eq!(dana_submit.status, "pending_approval");
 
     let approval = tokio::time::timeout(
         Duration::from_secs(15),
@@ -951,6 +952,18 @@ async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
     leave_group_impl(&bob.state, group_id.clone())
         .await
         .map_err(|e| anyhow!("bob leave_group_impl: {e}"))?;
+    let bob_leave = list_group_leave_requests_impl(&alice.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice list bob leave request: {e}"))?
+        .into_iter()
+        .find(|request| request.leaver_user_id == ctx.bob_user_id)
+        .context("bob leave request was not visible to owner")?;
+    approve_group_leave_impl(&alice.state, group_id.clone(), bob_leave.request_id)
+        .await
+        .map_err(|e| anyhow!("alice approve bob leave request: {e}"))?;
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None)
+        .await
+        .map_err(|error| anyhow!("bob sync after leave: {error}"))?;
     let bob_send = send_group_text_message_impl(
         &bob.state,
         conversation_id.clone(),
@@ -972,7 +985,7 @@ async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
     .map_err(|e| anyhow!("alice set_group_admin_impl: {e}"))?;
     sync_group_outbox_impl(&carol.state, group_id.clone(), None)
         .await
-        .ok();
+        .map_err(|error| anyhow!("carol sync after admin: {error}"))?;
     let carol_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
         .await
         .map_err(|e| anyhow!("carol get_group_snapshot_impl after admin: {e}"))?;
@@ -1004,6 +1017,18 @@ async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
     leave_group_impl(&alice.state, group_id.clone())
         .await
         .map_err(|e| anyhow!("alice leave_group_impl after transfer: {e}"))?;
+    let alice_leave = list_group_leave_requests_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol list alice leave request: {e}"))?
+        .into_iter()
+        .find(|request| request.leaver_user_id == ctx.alice_user_id)
+        .context("alice leave request was not visible to new owner")?;
+    approve_group_leave_impl(&carol.state, group_id.clone(), alice_leave.request_id)
+        .await
+        .map_err(|e| anyhow!("carol approve alice leave request: {e}"))?;
+    sync_group_outbox_impl(&alice.state, group_id.clone(), None)
+        .await
+        .ok();
     let alice_send = send_group_text_message_impl(
         &alice.state,
         conversation_id.clone(),
@@ -1471,7 +1496,7 @@ async fn run_lifecycle(ctx: &QuartetContext) -> Result<()> {
         .await
         .map_err(|e| anyhow!("dana submit_group_join_request_impl: {e}"))?;
     assert_eq!(dana_submit.group_id, group_id);
-    assert_eq!(dana_submit.status, "pending");
+    assert_eq!(dana_submit.status, "pending_approval");
     let request_id = dana_submit.request_id.clone();
 
     // Step 10: alice approves.
@@ -1582,65 +1607,26 @@ async fn run_lifecycle(ctx: &QuartetContext) -> Result<()> {
         .map_err(|e| anyhow!("alice get_group_snapshot_impl post-dissolve: {e}"))?;
     assert_eq!(alice_snapshot.conversation_state, "dissolved");
 
-    // (b) bob and dana should both see a ControlGroupDissolved system
-    //     banner after their next sync.
-    for _ in 0..20 {
-        for harness in [&bob, &dana] {
-            sync_group_outbox_impl(&harness.state, group_id.clone(), None)
-                .await
-                .ok();
-        }
-        let bob_messages = get_group_messages_impl(&bob.state, conversation_id.clone())
+    // (b) The post-transition active roster contains only the owner, so the
+    // encrypted dissolve event is visible to Alice. Removed members fail
+    // closed through group_membership_revoked instead of retaining read
+    // access to the sealed post-removal epoch.
+    let alice_messages = get_group_messages_impl(&alice.state, conversation_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice get_group_messages_impl post-dissolve: {e}"))?;
+    assert!(
+        has_system_banner(&alice_messages, "group_dissolved"),
+        "owner did not retain the verified group_dissolved state event"
+    );
+    for harness in [&bob, &dana] {
+        sync_group_outbox_impl(&harness.state, group_id.clone(), None)
             .await
-            .map_err(|e| anyhow!("bob get_group_messages_impl post-dissolve: {e}"))?;
-        let dana_messages = get_group_messages_impl(&dana.state, conversation_id.clone())
-            .await
-            .map_err(|e| anyhow!("dana get_group_messages_impl post-dissolve: {e}"))?;
-        if has_system_banner(&bob_messages, "control_group_dissolved")
-            && has_system_banner(&dana_messages, "control_group_dissolved")
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+            .ok();
     }
-    let bob_messages = get_group_messages_impl(&bob.state, conversation_id.clone())
-        .await
-        .map_err(|e| anyhow!("final bob get_group_messages_impl: {e}"))?;
-    let dana_messages = get_group_messages_impl(&dana.state, conversation_id.clone())
-        .await
-        .map_err(|e| anyhow!("final dana get_group_messages_impl: {e}"))?;
-    assert!(
-        has_system_banner(&bob_messages, "control_group_dissolved"),
-        "bob did not receive control_group_dissolved banner"
-    );
-    assert!(
-        has_system_banner(&dana_messages, "control_group_dissolved"),
-        "dana did not receive control_group_dissolved banner"
-    );
 
-    // (c) bob + dana sends must return Err after dissolve.
-    let bob_send = send_group_text_message_impl(
-        &bob.state,
-        conversation_id.clone(),
-        "bob post-dissolve".into(),
-    )
-    .await;
-    assert!(
-        bob_send.is_err(),
-        "bob must fail-closed after dissolve but got Ok: {bob_send:?}"
-    );
-    let dana_send = send_group_text_message_impl(
-        &dana.state,
-        conversation_id.clone(),
-        "dana post-dissolve".into(),
-    )
-    .await;
-    assert!(
-        dana_send.is_err(),
-        "dana must fail-closed after dissolve but got Ok: {dana_send:?}"
-    );
-
-    // (d) Raw HTTP POST to the append endpoint must not be accepted.
+    // (c) The server is the final authority even if an offline removed
+    // client has not yet observed its revocation and locally queues a send.
+    // Raw HTTP POST to the append endpoint must not be accepted.
     // This request intentionally has no valid group capability; depending
     // on validation order it can fail before or at the sealed-state check.
     let append_url = format!(

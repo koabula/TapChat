@@ -370,9 +370,23 @@ export interface GroupInviteView {
   join_policy: GroupJoinPolicy;
   expires_at: number;
   max_uses: number | null;
+  uses: number;
+  status: "active" | "revoked" | "expired" | "exhausted";
+  revision: number;
+  revoked_at: number | null;
   inviter_user_id: string;
   created_at: number;
 }
+
+export type GroupJoinStatus =
+  | "pending_approval"
+  | "waiting_for_group_commit"
+  | "transition_in_progress"
+  | "welcome_available"
+  | "joined"
+  | "rejected"
+  | "expired"
+  | "revoked";
 
 export interface GroupJoinRequestView {
   request_id: string;
@@ -380,8 +394,24 @@ export interface GroupJoinRequestView {
   joiner_user_id: string;
   joiner_device_id: string;
   requested_at: number;
-  status: "pending" | "approved" | "rejected" | string;
+  status: GroupJoinStatus;
   invite_id: string;
+}
+
+export type GroupLeaveStatus =
+  | "waiting_for_group_commit"
+  | "transition_in_progress"
+  | "completed"
+  | "expired"
+  | "revoked";
+
+export interface GroupLeaveRequestView {
+  request_id: string;
+  group_id: string;
+  leaver_user_id: string;
+  leaver_device_id: string;
+  requested_at: number;
+  status: GroupLeaveStatus;
 }
 
 export interface GroupSnapshotView {
@@ -392,9 +422,19 @@ export interface GroupSnapshotView {
   cursor: GroupCursor | null;
   invites: GroupInviteView[];
   join_requests: GroupJoinRequestView[];
+  leave_requests: GroupLeaveRequestView[];
   pending_outbox_count: number;
   dissolved_at: number | null;
   conversation_state: "active" | "needs_rebuild" | "dissolved" | string;
+  consistency_state: "ready" | "reconciling" | "blocked_needs_rebuild" | "dissolved";
+  pending_transition_stage:
+    | "awaiting_authorization_bootstrap"
+    | "prepared"
+    | "submitting"
+    | "reconciling_after_conflict"
+    | "accepted_publishing_welcomes"
+    | "completing_join"
+    | null;
 }
 
 /**
@@ -419,6 +459,19 @@ export type GroupMessageView =
       created_at: number;
       text: string;
       raw_message_type: string;
+      transition_id?: string | null;
+      event_kind?:
+        | "member_joined"
+        | "member_left"
+        | "member_removed"
+        | "role_changed"
+        | "ownership_transferred"
+        | "group_metadata_changed"
+        | "group_dissolved";
+      actor_user_id?: string | null;
+      subject_user_ids?: string[];
+      old_role?: GroupRole | null;
+      new_role?: GroupRole | null;
     };
 
 export interface CreateGroupConversationResult {
@@ -469,13 +522,13 @@ export interface RevokeGroupInviteLinkResult {
 export interface SubmitGroupJoinRequestResult {
   request_id: string;
   group_id: string;
-  status: "pending" | "approved" | "rejected" | string;
+  status: GroupJoinStatus;
 }
 
 export interface GroupJoinStatusView {
   group_id: string;
   request_id: string;
-  status: "pending" | "approved" | "rejected" | string;
+  status: GroupJoinStatus;
   group_imported: boolean;
   welcome_pickup: WelcomePickupShareable | null;
 }
@@ -483,7 +536,7 @@ export interface GroupJoinStatusView {
 export interface ApproveGroupJoinResult {
   group_id: string;
   request_id: string;
-  status: "approved" | "already_member" | "failed" | string;
+  status: GroupJoinStatus | "already_member" | "failed";
   welcome_pickups: WelcomePickupShareable[];
 }
 
@@ -572,15 +625,38 @@ function normalizeGroupCursor(cursor: unknown): GroupCursor | null {
 
 export function normalizeGroupInvite(invite: unknown): GroupInviteView {
   const wire = invite as WireObject;
+  const document = ((wire.document ?? {}) as WireObject);
   return {
-    group_id: pick<string>(wire, "group_id", "groupId"),
-    invite_id: pick<string>(wire, "invite_id", "inviteId"),
+    group_id:
+      (wire.group_id ?? wire.groupId ?? document.group_id ?? document.groupId) as string,
+    invite_id:
+      (wire.invite_id ?? wire.inviteId ?? document.invite_id ?? document.inviteId) as string,
     invite_url: pick<string>(wire, "invite_url", "inviteUrl"),
-    join_policy: pick<GroupJoinPolicy>(wire, "join_policy", "joinPolicy"),
-    expires_at: pick<number>(wire, "expires_at", "expiresAt"),
-    max_uses: (wire.max_uses ?? wire.maxUses ?? null) as number | null,
-    inviter_user_id: pick<string>(wire, "inviter_user_id", "inviterUserId"),
-    created_at: pick<number>(wire, "created_at", "createdAt"),
+    join_policy: (wire.join_policy ??
+      wire.joinPolicy ??
+      document.join_policy ??
+      document.joinPolicy) as GroupJoinPolicy,
+    expires_at: (wire.expires_at ??
+      wire.expiresAt ??
+      document.expires_at ??
+      document.expiresAt) as number,
+    max_uses: (wire.max_uses ??
+      wire.maxUses ??
+      document.max_uses ??
+      document.maxUses ??
+      null) as number | null,
+    uses: (wire.uses ?? 0) as number,
+    status: (wire.status ?? "active") as GroupInviteView["status"],
+    revision: (wire.revision ?? 0) as number,
+    revoked_at: (wire.revoked_at ?? wire.revokedAt ?? null) as number | null,
+    inviter_user_id: (wire.inviter_user_id ??
+      wire.inviterUserId ??
+      document.inviter_user_id ??
+      document.inviterUserId) as string,
+    created_at: (wire.created_at ??
+      wire.createdAt ??
+      document.created_at ??
+      document.createdAt) as number,
   };
 }
 
@@ -609,6 +685,9 @@ export function normalizeGroupSnapshot(snapshot: unknown): GroupSnapshotView {
     join_requests: ((wire.join_requests ?? wire.joinRequests ?? []) as unknown[]).map(
       normalizeGroupJoinRequest,
     ),
+    leave_requests: ((wire.leave_requests ?? wire.leaveRequests ?? []) as unknown[]).map(
+      normalizeGroupLeaveRequest,
+    ),
     pending_outbox_count: pick<number>(
       wire,
       "pending_outbox_count",
@@ -620,6 +699,24 @@ export function normalizeGroupSnapshot(snapshot: unknown): GroupSnapshotView {
       "conversation_state",
       "conversationState",
     ),
+    consistency_state: (wire.consistency_state ??
+      wire.consistencyState ??
+      "reconciling") as GroupSnapshotView["consistency_state"],
+    pending_transition_stage: (wire.pending_transition_stage ??
+      wire.pendingTransitionStage ??
+      null) as GroupSnapshotView["pending_transition_stage"],
+  };
+}
+
+export function normalizeGroupLeaveRequest(request: unknown): GroupLeaveRequestView {
+  const wire = request as WireObject;
+  return {
+    request_id: pick<string>(wire, "request_id", "requestId"),
+    group_id: pick<string>(wire, "group_id", "groupId"),
+    leaver_user_id: pick<string>(wire, "leaver_user_id", "leaverUserId"),
+    leaver_device_id: pick<string>(wire, "leaver_device_id", "leaverDeviceId"),
+    requested_at: pick<number>(wire, "requested_at", "requestedAt"),
+    status: wire.status as GroupLeaveRequestView["status"],
   };
 }
 
@@ -748,6 +845,20 @@ export async function rejectGroupJoin(
 
 export async function leaveGroup(groupId: string): Promise<void> {
   return invoke("leave_group", { groupId });
+}
+
+export async function listGroupLeaveRequests(
+  groupId: string,
+): Promise<GroupLeaveRequestView[]> {
+  const rows = await invoke<unknown[]>("list_group_leave_requests", { groupId });
+  return rows.map(normalizeGroupLeaveRequest);
+}
+
+export async function approveGroupLeave(
+  groupId: string,
+  requestId: string,
+): Promise<void> {
+  return invoke("approve_group_leave", { groupId, requestId });
 }
 
 export async function removeGroupMember(

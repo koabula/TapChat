@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router";
 import {
   X,
   Crown,
@@ -19,6 +18,7 @@ import { useGroupsStore } from "@/store/groups";
 import { useContactsStore } from "@/store/contacts";
 import { useSessionStore } from "@/store/session";
 import {
+  approveGroupLeave,
   getGroupSnapshot,
   leaveGroup,
   removeGroupMember,
@@ -56,7 +56,6 @@ export default function GroupMemberDrawer({
   localUserId,
   onClose,
 }: GroupMemberDrawerProps) {
-  const navigate = useNavigate();
   const snapshot = useGroupsStore((s) => s.snapshots[groupId] ?? null);
   const setSnapshot = useGroupsStore((s) => s.setSnapshot);
   const contacts = useContactsStore((s) => s.contacts);
@@ -97,6 +96,10 @@ export default function GroupMemberDrawer({
   const localRole = snapshot?.local_role ?? null;
   const isOwner = localRole === "owner";
   const dissolved = snapshot?.dissolved_at != null;
+  const governanceReady =
+    snapshot?.consistency_state === "ready" &&
+    snapshot.pending_transition_stage === null &&
+    !dissolved;
 
   const members = useMemo(() => snapshot?.manifest.members ?? [], [snapshot]);
   const resolveGroupName = useMemo(
@@ -114,18 +117,27 @@ export default function GroupMemberDrawer({
     [members],
   );
   const canLeave = useMemo(() => {
-    if (!snapshot) return false;
+    if (!snapshot || !governanceReady) return false;
     return canPerform("leave", {
       manifest: snapshot.manifest,
       localRole,
       localUserId,
       dissolvedAt: snapshot.dissolved_at ?? null,
     });
-  }, [snapshot, localRole, localUserId]);
+  }, [snapshot, localRole, localUserId, governanceReady]);
 
   const canDissolve = useMemo(() => {
-    return snapshot != null && localRole === "owner" && !dissolved;
-  }, [snapshot, localRole, dissolved]);
+    return snapshot != null && localRole === "owner" && governanceReady;
+  }, [snapshot, localRole, governanceReady]);
+
+  useEffect(() => {
+    if (!governanceReady) {
+      setInviteOpen(false);
+      setApprovalOpen(false);
+      setSettingsOpen(false);
+      setDissolveOpen(false);
+    }
+  }, [governanceReady]);
 
   const runCommand = async (
     id: string,
@@ -171,24 +183,26 @@ export default function GroupMemberDrawer({
 
   const handleLeave = () => {
     const confirm = window.confirm(
-      "Leave this group? You will stop receiving new messages.",
+      "Request to leave this group? An owner or admin must complete the encrypted membership update.",
     );
     if (!confirm) return;
-    void runCommand(
-      "leave",
-      () => leaveGroup(groupId),
-      { refreshOnSuccess: true },
-    ).then((ok) => {
-      if (ok) {
-        navigate("/groups");
-        onClose();
-      }
-    });
+    void runCommand("leave", () => leaveGroup(groupId));
   };
 
+  const handleApproveLeave = (requestId: string) =>
+    runCommand(`approve-leave:${requestId}`, () => approveGroupLeave(groupId, requestId));
+
   const pendingJoinCount = snapshot?.join_requests.filter(
-    (request) => request.status === "pending",
+    (request) => request.status === "pending_approval",
   ).length ?? 0;
+  const pendingLeaveRequests = snapshot?.leave_requests.filter(
+    (request) =>
+      request.status === "waiting_for_group_commit" ||
+      request.status === "transition_in_progress",
+  ) ?? [];
+  const localLeaveRequest = pendingLeaveRequests.find(
+    (request) => request.leaver_user_id === localUserId,
+  );
 
   if (!open) return null;
 
@@ -222,6 +236,7 @@ export default function GroupMemberDrawer({
           <button
             className="btn btn-ghost text-xs flex-1"
             onClick={() => setInviteOpen(true)}
+            disabled={!governanceReady}
             title="Manage invite links"
           >
             <Link2 size={14} /> Invites
@@ -229,6 +244,7 @@ export default function GroupMemberDrawer({
           <button
             className="btn btn-ghost text-xs flex-1 relative"
             onClick={() => setApprovalOpen(true)}
+            disabled={!governanceReady}
             title="Review join requests"
           >
             <UserCheck size={14} /> Requests
@@ -241,6 +257,7 @@ export default function GroupMemberDrawer({
           <button
             className="btn btn-ghost text-xs flex-1"
             onClick={() => setSettingsOpen(true)}
+            disabled={!governanceReady}
             title="Group settings"
           >
             <SettingsIcon size={14} /> Settings
@@ -249,6 +266,27 @@ export default function GroupMemberDrawer({
       )}
 
       <div className="flex-1 overflow-y-auto">
+        {snapshot && !governanceReady && (
+          <div
+            className={`m-3 flex items-start gap-2 rounded-lg p-3 text-sm ${
+              snapshot.consistency_state === "blocked_needs_rebuild"
+                ? "bg-red-500/10 text-red-500"
+                : "bg-yellow-500/10 text-yellow-500"
+            }`}
+            role="status"
+          >
+            <AlertCircle size={16} className="mt-0.5 shrink-0" />
+            <div>
+              {snapshot.consistency_state === "blocked_needs_rebuild"
+                ? "This group's encrypted membership state cannot be verified. Governance is disabled until you explicitly rebuild the group."
+                : snapshot.pending_transition_stage === "awaiting_authorization_bootstrap"
+                  ? "This group is still being securely created. Membership controls will unlock after authorization is initialized."
+                  : snapshot.pending_transition_stage
+                    ? "A membership change is in progress. Wait for it to finish before starting another change."
+                    : "The group is reconciling its authoritative membership state. Membership controls are temporarily read-only."}
+            </div>
+          </div>
+        )}
         {!snapshot ? (
           <div className="text-center py-8 text-muted-color text-sm">Loading group...</div>
         ) : (
@@ -257,12 +295,44 @@ export default function GroupMemberDrawer({
             localUserId={localUserId}
             localRole={localRole}
             dissolved={dissolved}
+            governanceReady={governanceReady}
             busy={busy}
             onRemove={handleRemove}
             onToggleAdmin={handleToggleAdmin}
             onTransfer={handleTransfer}
             resolveName={resolveGroupName}
           />
+        )}
+
+        {(isOwner || localRole === "admin") && pendingLeaveRequests.length > 0 && (
+          <section className="m-3 rounded-lg border border-subtle p-3" aria-label="Leave requests">
+            <h3 className="text-sm font-semibold text-primary-color">Leave requests</h3>
+            <div className="mt-2 space-y-2">
+              {pendingLeaveRequests.map((request) => (
+                <div key={request.request_id} className="flex items-center justify-between gap-3">
+                  <div className="min-w-0 text-sm">
+                    <div className="truncate text-primary-color">
+                      {resolveGroupName({ userId: request.leaver_user_id })}
+                    </div>
+                    <div className="text-xs text-muted-color">
+                      {request.status === "transition_in_progress"
+                        ? "Encrypted membership update in progress"
+                        : "Waiting for confirmation"}
+                    </div>
+                  </div>
+                  {request.status === "waiting_for_group_commit" && (
+                    <button
+                      className="btn btn-secondary text-xs shrink-0"
+                      onClick={() => void handleApproveLeave(request.request_id)}
+                      disabled={!governanceReady || busy !== null}
+                    >
+                      Confirm exit
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </section>
         )}
 
         {error && (
@@ -277,12 +347,25 @@ export default function GroupMemberDrawer({
       </div>
 
       <footer className="p-3 border-t border-default space-y-2">
+        {localLeaveRequest && !isOwner && (
+          <div className="rounded-lg bg-yellow-500/10 p-3 text-xs text-yellow-600" role="status">
+            {localLeaveRequest.status === "transition_in_progress"
+              ? "Your encrypted membership update is in progress."
+              : "Waiting for an owner or admin to complete the encrypted membership update."}
+          </div>
+        )}
         {!isOwner && (
           <button
             className="btn btn-ghost w-full justify-start text-sm"
             onClick={handleLeave}
-            disabled={!canLeave || busy !== null}
-            title={!canLeave && dissolved ? "You are no longer a member of this group." : undefined}
+            disabled={!canLeave || busy !== null || localLeaveRequest != null}
+            title={
+              !canLeave
+                ? dissolved
+                  ? "You are no longer a member of this group."
+                  : "Wait for the current group membership state to become ready."
+                : undefined
+            }
           >
             <LogOut size={16} /> Leave group
           </button>
@@ -343,6 +426,7 @@ interface MemberListProps {
   localUserId: string;
   localRole: GroupRole | null;
   dissolved: boolean;
+  governanceReady: boolean;
   busy: string | null;
   onRemove: (member: GroupMember) => void;
   onToggleAdmin: (member: GroupMember) => void;
@@ -355,6 +439,7 @@ function MemberList({
   localUserId,
   localRole,
   dissolved,
+  governanceReady,
   busy,
   onRemove,
   onToggleAdmin,
@@ -421,9 +506,9 @@ function MemberList({
           dissolvedAt: dissolved ? Date.now() : null,
           target: member,
         };
-        const canRemove = canPerform("remove_member", gateCtx);
-        const canToggleAdmin = canPerform("set_admin", gateCtx);
-        const canTransfer = canPerform("transfer_ownership", gateCtx);
+        const canRemove = governanceReady && canPerform("remove_member", gateCtx);
+        const canToggleAdmin = governanceReady && canPerform("set_admin", gateCtx);
+        const canTransfer = governanceReady && canPerform("transfer_ownership", gateCtx);
         const memberName = resolveName({ userId: member.user_id });
 
         return (

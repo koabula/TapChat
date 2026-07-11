@@ -24,6 +24,7 @@ export interface CoreViewModel {
   banners: SystemBanner[];
   message_requests: MessageRequestItem[];
   allowlist?: AllowlistDocument;
+  group_invites?: unknown[];
 }
 
 export interface LocalIdentitySummary {
@@ -423,6 +424,9 @@ export interface SessionStatus {
 // Realtime WebSocket event payload
 export interface RealtimeEventPayload {
   device_id: string;
+  group_id?: string;
+  request_id?: string;
+  revision?: number;
   event_type:
     | "connected"
     | "disconnected"
@@ -435,6 +439,9 @@ export interface RealtimeEventPayload {
     | "group_head_updated"
     | "group_outbox_record_available"
     | "group_join_request_available"
+    | "group_auto_join_available"
+    | "group_invites_changed"
+    | "group_leave_request_available"
     | "group_error";
   data?: string;
 }
@@ -453,8 +460,14 @@ export type CoreEffect =
   | { type: "open_group_realtime_connection"; subscription: GroupRealtimeSubscriptionRequest }
   | { type: "close_realtime_connection"; device_id: string }
   | { type: "append_group_envelope"; append: AppendGroupEnvelopeRequest }
+  | { type: "initialize_group_authorization"; initialize: InitializeGroupAuthorizationRequest }
+  | { type: "append_group_transition"; append: AppendGroupTransitionRequest }
+  | { type: "get_group_authorization_state"; get: GetGroupAuthorizationStateRequest }
   | { type: "fetch_group_outbox"; fetch: FetchGroupOutboxRequest }
   | { type: "get_group_outbox_head"; get: GetGroupOutboxHeadRequest }
+  | { type: "list_group_invites"; list: ListGroupInvitesRequest }
+  | { type: "claim_group_join_request"; claim: ClaimGroupJoinRequest }
+  | { type: "complete_group_join_request"; complete: CompleteGroupJoinRequest }
   | { type: "seal_group_outbox"; seal: SealGroupOutboxRequest }
   | { type: "fetch_welcome_pickup"; fetch: FetchWelcomePickupRequest }
   | { type: "put_welcome_pickup"; put: PutWelcomePickupRequest }
@@ -501,11 +514,76 @@ interface GroupRealtimeSubscriptionRequest {
   headers: Record<string, string>;
 }
 
+interface IdentityBundle {
+  version: string;
+  user_id: string;
+  devices: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
 interface AppendGroupEnvelopeRequest {
   version: string;
   group_id: string;
   envelope: GroupEnvelope;
   capability: GroupCapability;
+  authorization_update?: {
+    manifest: GroupManifest;
+    identity_bundles: IdentityBundle[];
+  };
+}
+
+interface InitializeGroupAuthorizationRequest {
+  version: string;
+  group_id: string;
+  manifest: GroupManifest;
+  identity_bundles: IdentityBundle[];
+  headers: Record<string, string>;
+}
+
+interface GroupAuthorizationUpdate {
+  manifest: GroupManifest;
+  identity_bundles: IdentityBundle[];
+}
+
+interface AppendGroupTransitionRequest {
+  version: string;
+  group_id: string;
+  transition_id: string;
+  operation: string;
+  expected_previous_roster_version: number;
+  expected_previous_commit_message_id?: string;
+  envelopes: GroupEnvelope[];
+  authorization_update: GroupAuthorizationUpdate;
+  capability: GroupCapability;
+}
+
+interface GetGroupAuthorizationStateRequest {
+  group_id: string;
+  capability: GroupCapability;
+}
+
+interface ListGroupInvitesRequest {
+  group_id: string;
+  capability: GroupCapability;
+}
+
+interface ClaimGroupJoinRequest {
+  version: string;
+  group_id: string;
+  request_id: string;
+  capability: GroupCapability;
+}
+
+interface CompleteGroupJoinRequest {
+  version: string;
+  group_id: string;
+  request_id: string;
+  capability: GroupCapability;
+  lease_token: string;
+  transition_id: string;
+  welcome_pickup: WelcomePickupDescriptor;
+  manifest: GroupManifest;
+  start_cursor: GroupCursor;
 }
 
 interface FetchGroupOutboxRequest {

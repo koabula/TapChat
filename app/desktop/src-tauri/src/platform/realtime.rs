@@ -130,6 +130,23 @@ pub enum WsServerEvent {
         #[serde(rename = "requestId")]
         request_id: String,
     },
+    GroupAutoJoinAvailable {
+        #[serde(rename = "groupId")]
+        group_id: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    GroupInvitesChanged {
+        #[serde(rename = "groupId")]
+        group_id: String,
+        revision: u64,
+    },
+    GroupLeaveRequestAvailable {
+        #[serde(rename = "groupId")]
+        group_id: String,
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
 }
 
 impl RealtimeManager {
@@ -928,6 +945,9 @@ impl RealtimeManager {
                                     WsServerEvent::GroupHeadUpdated { .. } => {}
                                     WsServerEvent::GroupOutboxRecordAvailable { .. } => {}
                                     WsServerEvent::GroupJoinRequestAvailable { .. } => {}
+                                    WsServerEvent::GroupAutoJoinAvailable { .. } => {}
+                                    WsServerEvent::GroupInvitesChanged { .. } => {}
+                                    WsServerEvent::GroupLeaveRequestAvailable { .. } => {}
                                 }
 
                                 // Emit to frontend
@@ -1080,6 +1100,9 @@ impl WsServerEvent {
             WsServerEvent::GroupHeadUpdated { .. } => "group_head_updated",
             WsServerEvent::GroupOutboxRecordAvailable { .. } => "group_outbox_record_available",
             WsServerEvent::GroupJoinRequestAvailable { .. } => "group_join_request_available",
+            WsServerEvent::GroupAutoJoinAvailable { .. } => "group_auto_join_available",
+            WsServerEvent::GroupInvitesChanged { .. } => "group_invites_changed",
+            WsServerEvent::GroupLeaveRequestAvailable { .. } => "group_leave_request_available",
         }
         .to_string()
     }
@@ -1111,6 +1134,47 @@ fn group_core_event_from_ws_event(
                 },
             })
         }
+        WsServerEvent::GroupInvitesChanged { group_id, revision }
+            if group_id == subscribed_group_id =>
+        {
+            Some(CoreEvent::GroupRealtimeEventReceived {
+                group_id: group_id.clone(),
+                event: RealtimeEvent::GroupInvitesChanged {
+                    group_id: group_id.clone(),
+                    revision: *revision,
+                },
+            })
+        }
+        WsServerEvent::GroupAutoJoinAvailable {
+            group_id,
+            request_id,
+        } if group_id == subscribed_group_id => Some(CoreEvent::GroupRealtimeEventReceived {
+            group_id: group_id.clone(),
+            event: RealtimeEvent::GroupAutoJoinAvailable {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+            },
+        }),
+        WsServerEvent::GroupJoinRequestAvailable {
+            group_id,
+            request_id,
+        } if group_id == subscribed_group_id => Some(CoreEvent::GroupRealtimeEventReceived {
+            group_id: group_id.clone(),
+            event: RealtimeEvent::GroupJoinRequestAvailable {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+            },
+        }),
+        WsServerEvent::GroupLeaveRequestAvailable {
+            group_id,
+            request_id,
+        } if group_id == subscribed_group_id => Some(CoreEvent::GroupRealtimeEventReceived {
+            group_id: group_id.clone(),
+            event: RealtimeEvent::GroupLeaveRequestAvailable {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+            },
+        }),
         _ => None,
     }
 }
@@ -1203,6 +1267,32 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
         } => {
             format!(
                 "group_id={} type=group_join_request_available request_id={}",
+                redact_id("group", group_id),
+                redact_id("request", request_id)
+            )
+        }
+        WsServerEvent::GroupAutoJoinAvailable {
+            group_id,
+            request_id,
+        } => {
+            format!(
+                "group_id={} type=group_auto_join_available request_id={}",
+                redact_id("group", group_id),
+                redact_id("request", request_id)
+            )
+        }
+        WsServerEvent::GroupInvitesChanged { group_id, revision } => {
+            format!(
+                "group_id={} type=group_invites_changed revision={revision}",
+                redact_id("group", group_id)
+            )
+        }
+        WsServerEvent::GroupLeaveRequestAvailable {
+            group_id,
+            request_id,
+        } => {
+            format!(
+                "group_id={} type=group_leave_request_available request_id={}",
                 redact_id("group", group_id),
                 redact_id("request", request_id)
             )
@@ -1403,6 +1493,39 @@ mod tests {
                 }
             }) if group_id == "group:alpha" && event_group_id == "group:alpha"
         ));
+    }
+
+    #[test]
+    fn group_governance_ws_events_map_to_authoritative_core_events() {
+        let group_id = "group:alpha";
+        let cases = [
+            WsServerEvent::GroupInvitesChanged {
+                group_id: group_id.into(),
+                revision: 7,
+            },
+            WsServerEvent::GroupAutoJoinAvailable {
+                group_id: group_id.into(),
+                request_id: "join:auto".into(),
+            },
+            WsServerEvent::GroupJoinRequestAvailable {
+                group_id: group_id.into(),
+                request_id: "join:approval".into(),
+            },
+            WsServerEvent::GroupLeaveRequestAvailable {
+                group_id: group_id.into(),
+                request_id: "leave:member".into(),
+            },
+        ];
+
+        for event in cases {
+            assert!(matches!(
+                group_core_event_from_ws_event(group_id, &event),
+                Some(CoreEvent::GroupRealtimeEventReceived {
+                    group_id: mapped_group_id,
+                    ..
+                }) if mapped_group_id == group_id
+            ));
+        }
     }
 
     #[test]
