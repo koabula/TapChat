@@ -9,6 +9,8 @@ import type {
   DeviceRuntimeToken,
   GroupCapability,
   GroupCapabilityOperation,
+  GroupManifest,
+  GroupMembershipProof,
   GroupMessageType,
   IdentityBundle,
   InboxAppendCapability,
@@ -23,11 +25,13 @@ import type { SharedStateService } from "../storage/shared-state";
 export class HttpError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly details?: Record<string, unknown>;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -210,7 +214,7 @@ function keyPackageRefValue(device: DeviceContactProfile): string {
   return keypackage.ref ?? keypackage.objectRef ?? "";
 }
 
-function verifyIdentityBundle(bundle: IdentityBundle): boolean {
+export function verifyIdentityBundle(bundle: IdentityBundle): boolean {
   if (bundle.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
@@ -220,7 +224,7 @@ function verifyIdentityBundle(bundle: IdentityBundle): boolean {
   );
 }
 
-function verifyDeviceBinding(userPublicKey: string, binding: DeviceBinding): boolean {
+export function verifyDeviceBinding(userPublicKey: string, binding: DeviceBinding): boolean {
   if (binding.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
@@ -231,12 +235,103 @@ function verifyInboxAppendCapability(capability: InboxAppendCapability, devicePu
   return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
 }
 
-function verifyEd25519(publicKeyHex: string, signatureHex: string, payload: string): boolean {
+export function verifyEd25519(publicKeyHex: string, signatureHex: string, payload: string | Uint8Array): boolean {
   try {
-    return ed25519.verify(hexToBytes(signatureHex), new TextEncoder().encode(payload), hexToBytes(publicKeyHex));
+    const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+    return ed25519.verify(hexToBytes(signatureHex), encoded, hexToBytes(publicKeyHex));
   } catch {
     return false;
   }
+}
+
+export function groupCapabilitySigningPayload(capability: GroupCapability): string {
+  const operations = Array.from(new Set(capability.operations)).sort().join(",");
+  return [
+    "tapchat.group_capability.v2",
+    `version=${capability.version}`,
+    `service=${capability.service}`,
+    `group_id=${capability.groupId}`,
+    `user_id=${capability.userId}`,
+    `device_id=${capability.deviceId}`,
+    `role=${capability.role}`,
+    `operations=${operations}`,
+    `expires_at=${capability.expiresAt}`
+  ].join("\n");
+}
+
+function unsignedGroupManifest(manifest: GroupManifest): Record<string, unknown> {
+  return {
+    version: manifest.version,
+    groupId: manifest.groupId,
+    conversationId: manifest.conversationId,
+    title: manifest.title,
+    ownerUserId: manifest.ownerUserId,
+    admins: manifest.admins,
+    members: manifest.members.map((member) => ({
+      userId: member.userId,
+      role: member.role,
+      status: member.status
+    })),
+    ...(manifest.memberDevices?.length
+      ? {
+          memberDevices: manifest.memberDevices.map((device) => ({
+            userId: device.userId,
+            deviceId: device.deviceId,
+            status: device.status
+          }))
+        }
+      : {}),
+    joinPolicy: manifest.joinPolicy,
+    memberInvitePolicy: manifest.memberInvitePolicy,
+    rosterVersion: manifest.rosterVersion,
+    mlsEpochHint: manifest.mlsEpochHint,
+    ...(manifest.lastCommitMessageId ? { lastCommitMessageId: manifest.lastCommitMessageId } : {}),
+    outbox: {
+      endpoint: manifest.outbox.endpoint,
+      ...(manifest.outbox.subscribeEndpoint
+        ? { subscribeEndpoint: manifest.outbox.subscribeEndpoint }
+        : {})
+    },
+    updatedAt: manifest.updatedAt,
+    signerUserId: manifest.signerUserId,
+    signerDeviceId: manifest.signerDeviceId,
+    signature: ""
+  };
+}
+
+export function groupManifestSigningPayload(manifest: GroupManifest): Uint8Array {
+  const prefix = new TextEncoder().encode("tapchat.group_manifest.v1\n");
+  const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
+  const payload = new Uint8Array(prefix.length + body.length);
+  payload.set(prefix);
+  payload.set(body, prefix.length);
+  return payload;
+}
+
+export function groupMembershipProofSigningPayload(proof: GroupMembershipProof): string {
+  const fields = [
+    "tapchat.group.membership.v1",
+    `proof_type=${proof.type}`,
+    `operation=${proof.operation}`,
+    `signer_user_id=${proof.signerUserId}`,
+    `signer_device_id=${proof.signerDeviceId}`,
+    `previous_roster_version=${proof.previousRosterVersion}`,
+    `new_roster_version=${proof.newRosterVersion}`,
+    `previous_commit_message_id=${proof.previousCommitMessageId ?? ""}`,
+    `commit_message_id=${proof.commitMessageId}`,
+    `control_message_id=${proof.controlMessageId}`,
+    `new_manifest_sha256=${proof.newManifestSha256}`
+  ];
+  if (proof.stateEventMessageId) {
+    fields.push(`state_event_message_id=${proof.stateEventMessageId}`);
+  }
+  return fields.join("\n");
+}
+
+export async function groupManifestSha256(manifest: GroupManifest): Promise<string> {
+  const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
+  const digest = await crypto.subtle.digest("SHA-256", body);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function hexToBytes(input: string): Uint8Array {
@@ -377,12 +472,13 @@ function validateGroupCapabilityBase(
   }
 }
 
-function requiredGroupAppendOperations(messageType: GroupMessageType): GroupCapabilityOperation[] {
+export function requiredGroupAppendOperations(messageType: GroupMessageType): GroupCapabilityOperation[] {
   switch (messageType) {
     case "mls_application":
       return ["append_application"];
     case "mls_commit":
     case "control_group_membership_changed":
+    case "control_group_state_event":
       return ["append_membership"];
     case "control_group_metadata_updated":
       return ["update_group_metadata"];
@@ -398,10 +494,11 @@ function requiredGroupAppendOperations(messageType: GroupMessageType): GroupCapa
   }
 }
 
-function allowedGroupAppendRoles(messageType: GroupMessageType): Array<GroupCapability["role"]> {
+export function allowedGroupAppendRoles(messageType: GroupMessageType): Array<GroupCapability["role"]> {
   switch (messageType) {
     case "mls_commit":
     case "control_group_membership_changed":
+    case "control_group_state_event":
     case "control_group_metadata_updated":
     case "control_group_join_approved":
     case "control_group_join_rejected":

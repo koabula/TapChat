@@ -7,6 +7,8 @@
     "check": "tsc --noEmit",
     "test": "tsx --test test/cloudflare.test.ts",
     "test:integration": "tsx --test test/*.integration.test.ts",
+    "build:embedded": "node scripts/build-embedded-worker.mjs",
+    "check:embedded": "node scripts/build-embedded-worker.mjs --check",
     "transport:runtime": "node scripts/transport-runtime.mjs",
     "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
     "cleanup:cloudflare": "node scripts/cleanup-cloudflare.mjs"

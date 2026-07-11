@@ -2,14 +2,10 @@ import {
   HttpError,
   APPEND_AUTH_CONTEXT_HEADER,
   APPEND_AUTH_REASON_HEADER,
-  readGroupCapabilityHeader,
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
   validateBootstrapAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
-  validateGroupAppendAuthorization,
-  validateGroupOperationAuthorization,
-  validateGroupReadAuthorization,
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization,
   validateWelcomePickupAuthorization
@@ -28,7 +24,6 @@ import {
   type DeploymentBundle,
   type DeviceRuntimeAuth,
   type DeviceStatusDocument,
-  type GroupCapability,
   type GroupInviteTokenPayload,
   type IdentityBundle,
   type KeyPackageRefsDocument,
@@ -132,6 +127,7 @@ function runtimeScopes(): DeviceRuntimeAuth["scopes"] {
     "inbox_ack",
     "inbox_subscribe",
     "inbox_manage",
+    "group_authorization_bootstrap",
     "storage_prepare_upload",
     "shared_state_write",
     "keypackage_write"
@@ -184,7 +180,9 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "group_outbox_mvp",
         "welcome_pickup_mvp",
         "short_group_invite",
-        "group_member_subscribe"
+        "group_member_subscribe",
+        "group_authorization_v2",
+        "group_membership_fsm_v2"
       ]
     }
   };
@@ -298,45 +296,34 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return stub.fetch(request);
     }
 
-    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|head|seal|subscribe)$/);
+    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|transitions|head|seal|subscribe)$/);
     if (groupOutboxMatch) {
       const groupId = decodeURIComponent(groupOutboxMatch[1]);
       const operation = groupOutboxMatch[2];
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       const stub = env.GROUP_OUTBOX.get(objectId);
 
-      if (request.method === "POST" && operation === "messages") {
+      if (request.method === "POST" && (operation === "messages" || operation === "transitions")) {
         const bodyText = await request.text();
-        const body = JSON.parse(bodyText) as AppendGroupEnvelopeRequest;
-        validateGroupAppendAuthorization(request, groupId, body, now);
         return await stub.fetch(forwardRequestWithBody(request, bodyText));
-      } else if (request.method === "POST" && operation === "seal") {
-        // Owner-only seal capability check happens twice: once at the
-        // worker boundary (here) to fail fast before we wake up the
-        // durable object, and once inside the durable object so that
-        // the storage-side invariant is never bypassed.
-        validateGroupOperationAuthorization(
-          request,
-          groupId,
-          readGroupCapabilityHeader(request),
-          now,
-          "seal_group",
-          ["owner"]
-        );
-      } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
-        validateGroupReadAuthorization(request, groupId, readGroupCapabilityHeader(request), now);
-      } else if (operation === "subscribe") {
-        validateGroupOperationAuthorization(
-          request,
-          groupId,
-          readGroupCapabilityHeader(request),
-          now,
-          "subscribe",
-          ["owner", "admin", "member"]
-        );
       }
 
       return stub.fetch(request);
+    }
+
+    const groupAuthorizationMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/authorization\/bootstrap$/);
+    if (groupAuthorizationMatch && request.method === "POST") {
+      const groupId = decodeURIComponent(groupAuthorizationMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      const bodyText = await request.text();
+      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+    }
+
+    const groupAuthorizationStateMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/authorization\/state$/);
+    if (groupAuthorizationStateMatch && request.method === "GET") {
+      const groupId = decodeURIComponent(groupAuthorizationStateMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
 
     const shortPublicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
@@ -367,13 +354,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     const groupInviteMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/invites(?:\/([^/]+)\/revoke)?$/);
-    if (groupInviteMatch && request.method === "POST") {
+    if (groupInviteMatch && (request.method === "POST" || (request.method === "GET" && !groupInviteMatch[2]))) {
       const groupId = decodeURIComponent(groupInviteMatch[1]);
-      const bodyText = await request.text();
-      const body = JSON.parse(bodyText) as { capability?: GroupCapability };
-      validateGroupOperationAuthorization(request, groupId, body.capability as GroupCapability, now, "manage_invites");
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+      if (request.method === "POST") {
+        const bodyText = await request.text();
+        return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
 
     const joinCollectionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests$/);
@@ -398,8 +386,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         if (payload.service !== "group_invite" || payload.groupId !== groupId) {
           throw new HttpError(403, "invalid_capability", "group invite token scope does not match request");
         }
-      } else if (request.method === "GET") {
-        validateGroupOperationAuthorization(request, groupId, readGroupCapabilityHeader(request), now, "approve_join");
       }
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
@@ -409,8 +395,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (joinDecisionMatch && request.method === "POST") {
       const groupId = decodeURIComponent(joinDecisionMatch[1]);
       const bodyText = await request.text();
-      const body = JSON.parse(bodyText) as { capability?: GroupCapability };
-      validateGroupOperationAuthorization(request, groupId, body.capability as GroupCapability, now, "approve_join");
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+    }
+
+    const joinLeaseMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/(claim|complete)$/);
+    if (joinLeaseMatch && request.method === "POST") {
+      const groupId = decodeURIComponent(joinLeaseMatch[1]);
+      const bodyText = await request.text();
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
@@ -422,6 +414,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
 
+    const leaveRequestMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/leave-requests(?:\/([^/]+)\/claim)?$/);
+    if (leaveRequestMatch && (request.method === "GET" || request.method === "POST")) {
+      const groupId = decodeURIComponent(leaveRequestMatch[1]);
+      const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+      if (request.method === "POST") {
+        const bodyText = await request.text();
+        return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+    }
+
     const welcomePickupMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/welcome-pickup\/([^/]+)$/);
     if (welcomePickupMatch) {
       const groupId = decodeURIComponent(welcomePickupMatch[1]);
@@ -429,6 +432,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "PUT") {
         const body = (await request.json()) as PutWelcomePickupRequest;
         validateWelcomePickupAuthorization(request, groupId, deviceId, body.descriptor, now);
+        if (body.descriptor.requestId) {
+          const authorized = await env.GROUP_OUTBOX.get(env.GROUP_OUTBOX.idFromName(groupId)).fetch(
+            new Request(`${url.origin}/v1/groups/${encodeURIComponent(groupId)}/internal/welcome-authorize`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Tapchat-Internal-Secret": env.SHARING_TOKEN_SECRET ?? "replace-me" },
+              body: JSON.stringify({ deviceId, requestId: body.descriptor.requestId, capability: body.descriptor.capability })
+            })
+          );
+          if (!authorized.ok) throw new HttpError(409, "group_transition_invalid", "welcome upload is not authorized by a committed join transition");
+        }
         return jsonResponse(await welcomePickup.put(body, now));
       }
       if (request.method === "GET") {
@@ -443,7 +456,24 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           throw new HttpError(400, "invalid_capability", "X-Tapchat-Welcome-Pickup is not valid JSON");
         }
         validateWelcomePickupAuthorization(request, groupId, deviceId, descriptor, now);
-        return jsonResponse(await welcomePickup.fetch(descriptor, now));
+        const result = await welcomePickup.fetch(descriptor, now);
+        if (descriptor.requestId) {
+          const objectId = env.GROUP_OUTBOX.idFromName(groupId);
+          const marked = await env.GROUP_OUTBOX.get(objectId).fetch(
+            new Request(`${url.origin}/v1/groups/${encodeURIComponent(groupId)}/internal/welcome-claimed`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Tapchat-Internal-Secret": env.SHARING_TOKEN_SECRET ?? "replace-me"
+              },
+              body: JSON.stringify({ deviceId, requestId: descriptor.requestId, capability: descriptor.capability })
+            })
+          );
+          if (!marked.ok) {
+            throw new HttpError(500, "temporary_unavailable", "failed to finalize joined group state");
+          }
+        }
+        return jsonResponse(result);
       }
     }
 
@@ -593,7 +623,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return jsonResponse({ error: "not_found", message: "route not found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.code, message: error.message }, error.status);
+      return jsonResponse({ error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) }, error.status);
     }
     const runtimeError = error as { message?: string };
     const message = runtimeError.message ?? "internal error";

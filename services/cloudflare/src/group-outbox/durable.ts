@@ -1,15 +1,28 @@
-import { HttpError, readGroupCapabilityHeader, validateGroupOperationAuthorization } from "../auth/capability";
+import {
+  allowedGroupAppendRoles,
+  getBearerToken,
+  HttpError,
+  readGroupCapabilityHeader,
+  requiredGroupAppendOperations,
+  validateAnyDeviceRuntimeAuthorization
+} from "../auth/capability";
 import { GroupOutboxService } from "./service";
-import { getBearerToken } from "../auth/capability";
+import { GroupAuthorizationService } from "./authorization";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
 import type {
   AppendGroupEnvelopeRequest,
+  AppendGroupTransitionRequest,
+  ClaimGroupJoinRequest,
+  ClaimGroupLeaveRequest,
+  CompleteGroupJoinRequest,
   CreateGroupInviteRequest,
   DecideGroupJoinRequest,
   FetchGroupOutboxRequest,
+  InitializeGroupAuthorizationRequest,
   GroupInviteTokenPayload,
   RevokeGroupInviteRequest,
   SubmitGroupJoinRequest
+  ,SubmitGroupLeaveRequest
 } from "../types/contracts";
 import type { DurableObjectStorageLike, Env, JsonBlobStore, SessionSink } from "../types/runtime";
 
@@ -26,6 +39,10 @@ class DurableObjectStorageAdapter implements DurableObjectStorageLike {
 
   async put<T>(key: string, value: T): Promise<void> {
     await this.storage.put(key, value);
+  }
+
+  async putEntries(entries: Record<string, unknown>): Promise<void> {
+    await (this.storage.put as unknown as (values: Record<string, unknown>) => Promise<void>)(entries);
   }
 
   async delete(key: string): Promise<void> {
@@ -127,29 +144,130 @@ export async function handleGroupOutboxDurableRequest(
     retentionDays: deps.retentionDays,
     maxInlineBytes: deps.maxInlineBytes
   }, deps.sessions);
+  const authorization = new GroupAuthorizationService(deps.groupId, deps.state);
 
   try {
-    if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
-      validateGroupOperationAuthorization(
+    if (url.pathname.endsWith("/authorization/bootstrap") && request.method === "POST") {
+      const runtimeToken = await validateAnyDeviceRuntimeAuthorization(
         request,
-        deps.groupId,
+        deps.sharingSecret,
+        "group_authorization_bootstrap",
+        now
+      );
+      const body = (await request.json()) as InitializeGroupAuthorizationRequest;
+      return jsonResponse(await authorization.initialize(body, runtimeToken, now));
+    }
+
+    if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
+      await authorization.authorize(
+        request,
         readGroupCapabilityHeader(request),
-        now,
         "subscribe",
-        ["owner", "admin", "member"]
+        ["owner", "admin", "member"],
+        now
       );
       return deps.onUpgrade();
     }
 
+    if (url.pathname.endsWith("/outbox/transitions") && request.method === "POST") {
+      const body = (await request.json()) as AppendGroupTransitionRequest;
+      if (!body.capability || body.groupId !== deps.groupId) {
+        throw new HttpError(403, "invalid_capability", "missing or mismatched group transition capability");
+      }
+      let authState;
+      const isCreate = body.operation?.type === "create";
+      for (const envelope of body.envelopes ?? []) {
+        if (
+          envelope.senderUserId !== body.capability.userId ||
+          envelope.senderDeviceId !== body.capability.deviceId
+        ) {
+          throw new HttpError(403, "invalid_capability", "group capability does not match transition sender");
+        }
+        for (const operation of requiredGroupAppendOperations(envelope.messageType)) {
+          authState = await authorization.authorize(
+            request,
+            body.capability,
+            operation,
+            allowedGroupAppendRoles(envelope.messageType),
+            now,
+            false,
+            isCreate
+          );
+        }
+      }
+      if (!authState) {
+        throw new HttpError(400, "invalid_input", "group transition contains no envelopes");
+      }
+      if (isCreate && authState.role !== "owner") {
+        throw new HttpError(403, "invalid_capability", "only the current owner may commit group genesis");
+      }
+      const proof = body.envelopes.find((envelope) => envelope.membershipProof)?.membershipProof;
+      const preparedUpdate = await authorization.prepareUpdate(
+        authState.state,
+        body.authorizationUpdate,
+        proof,
+        now,
+        body.operation
+      );
+      if (!preparedUpdate) {
+        throw new HttpError(409, "group_transition_invalid", "group transition did not produce an authorization update");
+      }
+      return jsonResponse(await service.appendTransition(body, preparedUpdate, now));
+    }
+
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = (await request.json()) as AppendGroupEnvelopeRequest;
-      return jsonResponse(await service.appendEnvelope(body, now));
+      await service.assertWritable();
+      if (!body?.envelope) {
+        throw new HttpError(400, "invalid_input", "group append envelope is required");
+      }
+      if (body.envelope.membershipProof) {
+        throw new HttpError(409, "group_transition_required", "membership operations must use the atomic transition endpoint");
+      }
+      if (!body.capability) {
+        throw new HttpError(403, "invalid_capability", "missing group capability");
+      }
+      if (
+        body.envelope.senderUserId !== body.capability.userId ||
+        body.envelope.senderDeviceId !== body.capability.deviceId
+      ) {
+        throw new HttpError(403, "invalid_capability", "group capability does not match envelope sender");
+      }
+      const requiredOperations = requiredGroupAppendOperations(body.envelope.messageType);
+      let authState;
+      for (const operation of requiredOperations) {
+        authState = await authorization.authorize(
+          request,
+          body.capability,
+          operation,
+          allowedGroupAppendRoles(body.envelope.messageType),
+          now
+        );
+      }
+      const preparedUpdate = await authorization.prepareUpdate(
+        authState!.state,
+        body.authorizationUpdate,
+        body.envelope.membershipProof,
+        now
+      );
+      const result = await service.appendEnvelope(body, now);
+      await authorization.commitPreparedUpdate(preparedUpdate);
+      return jsonResponse(result);
     }
 
     if (url.pathname.endsWith("/messages") && request.method === "GET") {
       const fromSeq = Number(url.searchParams.get("fromSeq") ?? "1");
       const limit = Number(url.searchParams.get("limit") ?? "100");
       const capability = JSON.parse(request.headers.get("X-Tapchat-Group-Capability") ?? "{}");
+      const sealed = (await service.getSealStatus()).sealed;
+      await authorization.authorize(
+        request,
+        capability,
+        "read",
+        ["owner", "admin", "member"],
+        now,
+        sealed
+      );
       return jsonResponse(await service.fetchOutbox({
         groupId: deps.groupId,
         fromSeq,
@@ -159,7 +277,34 @@ export async function handleGroupOutboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/head") && request.method === "GET") {
-      return jsonResponse(await service.getHead());
+      const sealed = (await service.getSealStatus()).sealed;
+      const auth = await authorization.authorize(
+        request,
+        readGroupCapabilityHeader(request),
+        "read",
+        ["owner", "admin", "member"],
+        now,
+        sealed
+      );
+      const head = await service.getHead();
+      return jsonResponse({
+        ...head,
+        currentRosterVersion: auth.state.manifest.rosterVersion,
+        lastCommitMessageId: auth.state.manifest.lastCommitMessageId
+      });
+    }
+
+    if (url.pathname.endsWith("/authorization/state") && request.method === "GET") {
+      await authorization.authorize(
+        request,
+        readGroupCapabilityHeader(request),
+        "read",
+        ["owner", "admin", "member"],
+        now,
+        false,
+        true
+      );
+      return jsonResponse(await authorization.getPublicState());
     }
 
     if (url.pathname.endsWith("/outbox/seal") && request.method === "POST") {
@@ -167,14 +312,13 @@ export async function handleGroupOutboxDurableRequest(
       // PROTOCOL_GROUP_CN.md §10.4 the seal is irreversible: a follow-up
       // request will receive 409 `already_sealed`.
       const capability = readGroupCapabilityHeader(request);
-      validateGroupOperationAuthorization(request, deps.groupId, capability, now, "seal_group", [
-        "owner"
-      ]);
+      await authorization.authorize(request, capability, "seal_group", ["owner"], now);
       return jsonResponse(await service.sealOutbox(now));
     }
 
     if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "POST") {
       const body = (await request.json()) as CreateGroupInviteRequest;
+      await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
       const token = await signSharingPayload(deps.sharingSecret, {
         version: body.document.version,
         service: "group_invite",
@@ -196,6 +340,18 @@ export async function handleGroupOutboxDurableRequest(
       );
     }
 
+
+    if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "GET") {
+      await authorization.authorize(
+        request,
+        readGroupCapabilityHeader(request),
+        "manage_invites",
+        ["owner", "admin"],
+        now
+      );
+      return jsonResponse(await service.listInvites(now));
+    }
+
     const shortInviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
     if (shortInviteFetchMatch && request.method === "GET") {
       const routeGroupId = decodeURIComponent(shortInviteFetchMatch[1]);
@@ -214,6 +370,7 @@ export async function handleGroupOutboxDurableRequest(
     const revokeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);
     if (revokeMatch && request.method === "POST") {
       const body = (await request.json()) as RevokeGroupInviteRequest;
+      await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
       return jsonResponse(
         await service.revokeInvite(
           {
@@ -236,6 +393,13 @@ export async function handleGroupOutboxDurableRequest(
     }
 
     if (joinCollectionMatch && request.method === "GET") {
+      await authorization.authorize(
+        request,
+        readGroupCapabilityHeader(request),
+        "approve_join",
+        ["owner", "admin"],
+        now
+      );
       return jsonResponse(await service.listJoinRequests());
     }
 
@@ -244,9 +408,73 @@ export async function handleGroupOutboxDurableRequest(
       return jsonResponse(await service.getJoinRequestStatus(decodeURIComponent(joinStatusMatch[1]), getBearerToken(request)));
     }
 
+    const leaveCollectionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests$/);
+    if (leaveCollectionMatch && request.method === "POST") {
+      const body = (await request.json()) as SubmitGroupLeaveRequest;
+      await authorization.authorize(request, body.capability, "append_control", ["admin", "member"], now);
+      return jsonResponse(await service.submitLeaveRequest(body, now));
+    }
+    if (leaveCollectionMatch && request.method === "GET") {
+      await authorization.authorize(request, readGroupCapabilityHeader(request), "approve_join", ["owner", "admin"], now);
+      return jsonResponse(await service.listLeaveRequests());
+    }
+    const leaveClaimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests\/([^/]+)\/claim$/);
+    if (leaveClaimMatch && request.method === "POST") {
+      const body = (await request.json()) as ClaimGroupLeaveRequest;
+      await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
+      return jsonResponse(await service.claimLeaveRequest({ ...body, groupId: deps.groupId, requestId: decodeURIComponent(leaveClaimMatch[1]) }, now));
+    }
+
+    const claimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/claim$/);
+    if (claimMatch && request.method === "POST") {
+      const body = (await request.json()) as ClaimGroupJoinRequest;
+      await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
+      return jsonResponse(
+        await service.claimJoinRequest(
+          { ...body, groupId: deps.groupId, requestId: decodeURIComponent(claimMatch[1]) },
+          now
+        )
+      );
+    }
+
+    const completeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/complete$/);
+    if (completeMatch && request.method === "POST") {
+      const body = (await request.json()) as CompleteGroupJoinRequest;
+      await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
+      return jsonResponse(
+        await service.completeJoinRequest(
+          { ...body, groupId: deps.groupId, requestId: decodeURIComponent(completeMatch[1]) },
+          now
+        )
+      );
+    }
+
+    if (url.pathname.endsWith("/internal/welcome-claimed") && request.method === "POST") {
+      if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
+        throw new HttpError(403, "invalid_capability", "internal welcome claim authorization failed");
+      }
+      const body = (await request.json()) as { deviceId?: string; requestId?: string; capability?: string };
+      if (!body.deviceId || !body.requestId || !body.capability) {
+        throw new HttpError(400, "invalid_input", "welcome claim request, device and capability are required");
+      }
+      await service.markWelcomeClaimed(body.requestId, body.deviceId, body.capability);
+      return jsonResponse({ accepted: true });
+    }
+
+    if (url.pathname.endsWith("/internal/welcome-authorize") && request.method === "POST") {
+      if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
+        throw new HttpError(403, "invalid_capability", "internal welcome authorization failed");
+      }
+      const body = (await request.json()) as { deviceId?: string; requestId?: string; capability?: string };
+      if (!body.deviceId || !body.requestId || !body.capability) throw new HttpError(400, "invalid_input", "welcome authorization binding is required");
+      await service.authorizeWelcomeUpload(body.requestId, body.deviceId, body.capability);
+      return jsonResponse({ accepted: true });
+    }
+
     const decisionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/decision$/);
     if (decisionMatch && request.method === "POST") {
       const body = (await request.json()) as DecideGroupJoinRequest;
+      await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.decideJoinRequest({
           ...body,
@@ -259,7 +487,7 @@ export async function handleGroupOutboxDurableRequest(
     return jsonResponse({ error: "not_found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.code, message: error.message }, error.status);
+      return jsonResponse({ error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) }, error.status);
     }
     const runtimeError = error as { message?: string };
     const message = runtimeError.message ?? "internal error";
@@ -314,6 +542,7 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
   private readonly sessions = new Map<string, ManagedSession>();
   private readonly stateRef: DurableObjectState;
   private readonly envRef: Env;
+  private groupIdRef?: string;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -325,6 +554,8 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
     const url = new URL(request.url);
     const sharingSecret = this.envRef.SHARING_TOKEN_SECRET ?? "replace-me";
     const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
+    this.groupIdRef = groupId;
+    await this.stateRef.storage.put("durable-group-id", groupId);
 
     return handleGroupOutboxDurableRequest(request, {
       groupId,
@@ -363,16 +594,17 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
     });
   }
 
-  // Cloudflare's runtime requires any durable object that calls `setAlarm()`
-  // to expose a matching `alarm()` handler. We currently rely on alarms as a
-  // best-effort cleanup hook for expired invites and old outbox records; the
-  // service itself is responsible for deleting stale entries at read/write
-  // time, so the alarm body is intentionally a no-op for now.
   async alarm(): Promise<void> {
-    // Intentional no-op. Future cleanup (e.g. invite garbage collection, TTL
-    // enforcement on outbox records) can be wired here once the group outbox
-    // service exposes an explicit cleanup method analogous to
-    // `InboxService.cleanExpiredRecords`.
+    const groupId = this.groupIdRef ?? await this.stateRef.storage.get<string>("durable-group-id");
+    if (!groupId) return;
+    const service = new GroupOutboxService(
+      groupId,
+      new DurableObjectStorageAdapter(this.stateRef.storage),
+      new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
+      { headSeq: 0, retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"), maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096") },
+      Array.from(this.sessions.values()).map((session) => ({ send: (payload: string) => session.send(payload) }))
+    );
+    await service.processAlarm(Date.now());
   }
 }
 

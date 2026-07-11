@@ -68,6 +68,7 @@ const RECORD_PREFIX = "record:";
 const ALLOWLIST_KEY = "allowlist";
 const MESSAGE_REQUEST_PREFIX = "message-request:";
 const RATE_LIMIT_PREFIX = "rate-limit:";
+const CLEANUP_BATCH_SIZE = 128;
 
 export class InboxService {
   private readonly deviceId: string;
@@ -147,19 +148,33 @@ export class InboxService {
     for (let seq = input.fromSeq; seq <= upper; seq += 1) {
       const index = await this.state.get<StoredRecordIndex>(`${RECORD_PREFIX}${seq}`);
       if (!index) {
-        continue;
+        // Records at or below the acknowledged cursor may already have been
+        // removed by retention cleanup. A gap above that cursor is never
+        // legitimate and must not be hidden from the client.
+        if (seq <= meta.ackedSeq) {
+          continue;
+        }
+        throw new HttpError(500, "storage_integrity_error", `inbox record index is missing at seq ${seq}`);
       }
+      this.validateStoredRecordIndex(index, seq);
       if (index.inlineRecord) {
+        this.validateMaterializedRecord(index.inlineRecord, index, seq);
         records.push(index.inlineRecord);
         continue;
       }
       if (!index.payloadRef) {
-        throw new HttpError(500, "temporary_unavailable", "record payload reference is missing");
+        throw new HttpError(500, "storage_integrity_error", `inbox record payload reference is missing at seq ${seq}`);
       }
-      const record = await this.spillStore.getJson<InboxRecord>(index.payloadRef);
+      let record: InboxRecord | null;
+      try {
+        record = await this.spillStore.getJson<InboxRecord>(index.payloadRef);
+      } catch {
+        throw new HttpError(500, "storage_integrity_error", `inbox spill payload is invalid at seq ${seq}`);
+      }
       if (!record) {
-        continue;
+        throw new HttpError(500, "storage_integrity_error", `inbox spill payload is missing at seq ${seq}`);
       }
+      this.validateMaterializedRecord(record, index, seq);
       records.push(record);
     }
     return {
@@ -173,12 +188,20 @@ export class InboxService {
       throw new HttpError(400, "invalid_input", "ack device_id does not match inbox route");
     }
     const meta = await this.getMeta();
+    if (!Number.isSafeInteger(input.ack.ackSeq) || input.ack.ackSeq < 0) {
+      throw new HttpError(400, "invalid_ack", "ack_seq must be a non-negative safe integer");
+    }
     if (input.ack.ackSeq < meta.ackedSeq) {
       throw new HttpError(409, "invalid_ack", "ack_seq must not move backwards");
     }
-    const ackSeq = Math.max(meta.ackedSeq, input.ack.ackSeq);
-    await this.state.put(META_KEY, { ...meta, ackedSeq: ackSeq });
-    await this.state.setAlarm(Date.now());
+    if (input.ack.ackSeq > meta.headSeq) {
+      throw new HttpError(409, "invalid_ack", "ack_seq must not move beyond inbox head_seq");
+    }
+    const ackSeq = input.ack.ackSeq;
+    if (ackSeq > meta.ackedSeq) {
+      await this.state.put(META_KEY, { ...meta, ackedSeq: ackSeq });
+      await this.state.setAlarm(Date.now());
+    }
     return { accepted: true, ackSeq };
   }
 
@@ -301,17 +324,39 @@ export class InboxService {
 
   async cleanExpiredRecords(now: number): Promise<void> {
     const meta = await this.getMeta();
-    for (let seq = 1; seq <= meta.ackedSeq; seq += 1) {
-      const key = `${RECORD_PREFIX}${seq}`;
-      const index = await this.state.get<StoredRecordIndex>(key);
-      if (!index || index.expiresAt === undefined || index.expiresAt > now) {
-        continue;
-      }
+    const stored = await this.state.list<StoredRecordIndex>({ prefix: RECORD_PREFIX });
+    const eligible = Array.from(stored.entries())
+      .filter(([, index]) => index.seq <= meta.ackedSeq && index.expiresAt !== undefined && index.expiresAt <= now)
+      .sort((left, right) => left[1].seq - right[1].seq);
+
+    for (const [key, index] of eligible.slice(0, CLEANUP_BATCH_SIZE)) {
       if (index.payloadRef) {
         await this.spillStore.delete(index.payloadRef);
       }
       await this.state.delete(key);
       await this.state.delete(`${IDEMPOTENCY_PREFIX}${index.messageId}`);
+    }
+
+    if (eligible.length > CLEANUP_BATCH_SIZE) {
+      await this.state.setAlarm(now + 1);
+    }
+  }
+
+  private validateStoredRecordIndex(index: StoredRecordIndex, seq: number): void {
+    if (index.seq !== seq || index.recipientDeviceId !== this.deviceId || !index.messageId) {
+      throw new HttpError(500, "storage_integrity_error", `inbox record index does not match seq ${seq}`);
+    }
+  }
+
+  private validateMaterializedRecord(record: InboxRecord, index: StoredRecordIndex, seq: number): void {
+    if (
+      record.seq !== seq ||
+      record.seq !== index.seq ||
+      record.messageId !== index.messageId ||
+      record.recipientDeviceId !== this.deviceId ||
+      record.recipientDeviceId !== index.recipientDeviceId
+    ) {
+      throw new HttpError(500, "storage_integrity_error", `inbox record payload does not match index at seq ${seq}`);
     }
   }
 

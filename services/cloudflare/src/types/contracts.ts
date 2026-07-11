@@ -138,6 +138,7 @@ export type GroupMessageType =
   | "control_group_join_rejected"
   | "control_group_leave_requested"
   | "control_group_dissolved"
+  | "control_group_state_event"
   | "control_conversation_needs_rebuild";
 
 export type GroupEnvelopeVisibility = "visible" | "protocol";
@@ -156,6 +157,7 @@ export interface GroupEnvelope {
   storageRefs?: StorageRef[];
   senderProof: SenderProof;
   membershipProof?: GroupMembershipProof;
+  transitionId?: string;
 }
 
 export interface GroupMembershipProof {
@@ -168,8 +170,32 @@ export interface GroupMembershipProof {
   previousCommitMessageId?: string;
   commitMessageId: string;
   controlMessageId: string;
+  stateEventMessageId?: string;
   newManifestSha256: string;
   signature: string;
+}
+
+export type GroupStateEventKind =
+  | "member_joined"
+  | "member_left"
+  | "member_removed"
+  | "role_changed"
+  | "ownership_transferred"
+  | "group_metadata_changed"
+  | "group_dissolved";
+
+export interface GroupStateEvent {
+  version: string;
+  eventId: string;
+  transitionId: string;
+  kind: GroupStateEventKind;
+  actorUserId: string;
+  subjectUserIds: string[];
+  oldRole?: GroupRole;
+  newRole?: GroupRole;
+  rosterVersion: number;
+  manifestHash: string;
+  occurredAt: number;
 }
 
 export interface GroupOutboxRecord {
@@ -180,6 +206,25 @@ export interface GroupOutboxRecord {
   expiresAt?: number;
   state: "available";
   envelope: GroupEnvelope;
+}
+
+export interface GroupAuthorizationUpdate {
+  manifest: GroupManifest;
+  identityBundles: IdentityBundle[];
+}
+
+export interface InitializeGroupAuthorizationRequest {
+  version: string;
+  groupId: string;
+  manifest: GroupManifest;
+  identityBundles: IdentityBundle[];
+}
+
+export interface InitializeGroupAuthorizationResult {
+  initialized: boolean;
+  alreadyInitialized: boolean;
+  rosterVersion: number;
+  lastCommitMessageId?: string;
 }
 
 export interface GroupCursor {
@@ -194,13 +239,35 @@ export interface WelcomePickupDescriptor {
   endpoint: string;
   capability: string;
   expiresAt: number;
+  startSeq?: number;
+  rosterVersion?: number;
+  lastCommitMessageId?: string;
+  requestId?: string;
 }
+
+export type GroupTransitionOperation =
+  | { type: "create" }
+  | { type: "invite_members"; userIds: string[] }
+  | { type: "approve_join"; requestId: string; userId: string; deviceId: string }
+  | { type: "approve_leave"; requestId: string; userId: string; deviceId: string }
+  | { type: "remove_member"; userId: string }
+  | { type: "transfer_ownership"; userId: string }
+  | { type: "set_admin"; userId: string; isAdmin: boolean }
+  | { type: "update_metadata" }
+  | { type: "dissolve" }
+  | { type: "add_device"; userId: string; deviceId: string }
+  | { type: "remove_device"; userId: string; deviceId: string };
+
+export type GroupTransitionRequestBinding =
+  | { type: "join"; requestId: string; leaseToken: string }
+  | { type: "leave"; requestId: string; leaseToken: string };
 
 export interface AppendGroupEnvelopeRequest {
   version: string;
   groupId: string;
   envelope: GroupEnvelope;
   capability: GroupCapability;
+  authorizationUpdate?: GroupAuthorizationUpdate;
   expectedPreviousRosterVersion?: number;
   expectedPreviousCommitMessageId?: string;
 }
@@ -208,6 +275,36 @@ export interface AppendGroupEnvelopeRequest {
 export interface AppendGroupEnvelopeResult {
   accepted: boolean;
   seq: number;
+}
+
+export interface AppendGroupTransitionRequest {
+  version: string;
+  groupId: string;
+  transitionId: string;
+  operation: GroupTransitionOperation;
+  expectedPreviousRosterVersion: number;
+  expectedPreviousCommitMessageId?: string;
+  envelopes: GroupEnvelope[];
+  authorizationUpdate: GroupAuthorizationUpdate;
+  capability: GroupCapability;
+  requestBinding?: GroupTransitionRequestBinding;
+}
+
+export interface AppendGroupTransitionResult {
+  accepted: boolean;
+  transitionId: string;
+  firstSeq: number;
+  lastSeq: number;
+  rosterVersion: number;
+  lastCommitMessageId?: string;
+}
+
+export interface GetGroupAuthorizationStateResult {
+  manifest: GroupManifest;
+  manifestHash: string;
+  lastTransitionId?: string;
+  phase: "provisioning" | "active";
+  materialized: boolean;
 }
 
 export interface FetchGroupOutboxRequest {
@@ -305,7 +402,17 @@ export interface GroupInviteDocument {
   signature: string;
 }
 
-export type GroupJoinRequestStatus = "pending" | "approved" | "rejected" | "expired" | "revoked";
+export type GroupJoinRequestStatus =
+  | "pending"
+  | "approved"
+  | "pending_approval"
+  | "waiting_for_group_commit"
+  | "transition_in_progress"
+  | "welcome_available"
+  | "joined"
+  | "rejected"
+  | "expired"
+  | "revoked";
 
 export interface GroupJoinRequest {
   version: string;
@@ -333,6 +440,24 @@ export interface CreateGroupInviteRequest {
 export interface CreateGroupInviteResult {
   inviteUrl: string;
   invite: GroupInviteDocument;
+}
+
+export type GroupInviteStatus = "active" | "revoked" | "expired" | "exhausted";
+
+export interface GroupInviteSummary {
+  inviteUrl: string;
+  invite: GroupInviteDocument;
+  status: GroupInviteStatus;
+  uses: number;
+  maxUses?: number;
+  revokedAt?: number;
+  expiredAt?: number;
+  exhaustedAt?: number;
+}
+
+export interface ListGroupInvitesResult {
+  revision: number;
+  invites: GroupInviteSummary[];
 }
 
 export interface RevokeGroupInviteRequest {
@@ -392,6 +517,78 @@ export interface DecideGroupJoinRequest {
 export interface DecideGroupJoinResult {
   accepted: boolean;
   request: GroupJoinRequest;
+}
+
+export interface ClaimGroupJoinRequest {
+  version: string;
+  groupId: string;
+  requestId: string;
+  capability: GroupCapability;
+}
+
+export interface ClaimGroupJoinResult {
+  accepted: boolean;
+  request: GroupJoinRequest;
+  leaseToken: string;
+  leaseExpiresAt: number;
+}
+
+export interface CompleteGroupJoinRequest {
+  version: string;
+  groupId: string;
+  requestId: string;
+  capability: GroupCapability;
+  leaseToken: string;
+  transitionId: string;
+  welcomePickup: WelcomePickupDescriptor;
+  manifest: GroupManifest;
+  startCursor: GroupCursor;
+}
+
+export interface CompleteGroupJoinResult {
+  accepted: boolean;
+  request: GroupJoinRequest;
+}
+
+export type GroupLeaveRequestStatus =
+  | "waiting_for_group_commit"
+  | "transition_in_progress"
+  | "completed"
+  | "expired"
+  | "revoked";
+
+export interface GroupLeaveRequest {
+  version: string;
+  requestId: string;
+  groupId: string;
+  leaverUserId: string;
+  leaverDeviceId: string;
+  requestedAt: number;
+  requestCapability: string;
+  signature: string;
+  status: GroupLeaveRequestStatus;
+}
+
+export interface SubmitGroupLeaveRequest {
+  version: string;
+  groupId: string;
+  request: GroupLeaveRequest;
+  capability: GroupCapability;
+}
+
+export interface SubmitGroupLeaveResult { accepted: boolean; request: GroupLeaveRequest }
+export interface ListGroupLeaveRequestsResult { requests: GroupLeaveRequest[] }
+export interface ClaimGroupLeaveRequest {
+  version: string;
+  groupId: string;
+  requestId: string;
+  capability: GroupCapability;
+}
+export interface ClaimGroupLeaveResult {
+  accepted: boolean;
+  request: GroupLeaveRequest;
+  leaseToken: string;
+  leaseExpiresAt: number;
 }
 
 export interface Ack {
@@ -470,6 +667,9 @@ export interface BlobDownloadGrant {
   authorizeEndpoint: string;
   token: string;
   expiresAt: number;
+  startSeq?: number;
+  rosterVersion?: number;
+  lastCommitMessageId?: string;
 }
 
 export interface AuthorizeBlobDownloadRequest {
@@ -503,6 +703,7 @@ export type DeviceRuntimeScope =
   | "inbox_ack"
   | "inbox_subscribe"
   | "inbox_manage"
+  | "group_authorization_bootstrap"
   | "storage_prepare_upload"
   | "shared_state_write"
   | "keypackage_write";

@@ -13,6 +13,8 @@ import {
   type DeviceBinding,
   type GroupCapability,
   type GroupCapabilityOperation,
+  type GroupManifest,
+  type GroupMembershipProof,
   type GroupMessageType,
   type IdentityBundle,
   type InboxAppendCapability,
@@ -32,6 +34,12 @@ import type {
   SessionSink
 } from "../src/types/runtime";
 import { signSharingPayload } from "../src/storage/sharing";
+import {
+  groupCapabilitySigningPayload,
+  groupManifestSigningPayload,
+  groupMembershipProofSigningPayload
+} from "../src/auth/capability";
+import { GroupAuthorizationService } from "../src/group-outbox/authorization";
 
 class TestDurableObject {}
 class TestSocket {
@@ -50,6 +58,40 @@ const { handleRequest } = await import("../src/routes/http");
 const { handleInboxDurableRequest } = await import("../src/inbox/durable");
 const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl } = await import("../src/group-outbox/durable");
 const { InboxService } = await import("../src/inbox/service");
+const { GroupOutboxService } = await import("../src/group-outbox/service");
+
+test("group membership proof payload matches the Rust canonical field order", () => {
+  const proof: GroupMembershipProof = {
+    type: "membership_signature",
+    operation: "create",
+    signerUserId: "user:owner",
+    signerDeviceId: "device:owner",
+    previousRosterVersion: 0,
+    newRosterVersion: 1,
+    commitMessageId: "msg:commit",
+    controlMessageId: "msg:control",
+    stateEventMessageId: "msg:event",
+    newManifestSha256: "manifest-hash",
+    signature: "signature"
+  };
+  assert.equal(
+    groupMembershipProofSigningPayload(proof),
+    [
+      "tapchat.group.membership.v1",
+      "proof_type=membership_signature",
+      "operation=create",
+      "signer_user_id=user:owner",
+      "signer_device_id=device:owner",
+      "previous_roster_version=0",
+      "new_roster_version=1",
+      "previous_commit_message_id=",
+      "commit_message_id=msg:commit",
+      "control_message_id=msg:control",
+      "new_manifest_sha256=manifest-hash",
+      "state_event_message_id=msg:event"
+    ].join("\n")
+  );
+});
 
 class MemoryState implements DurableObjectStorageLike {
   private readonly map = new Map<string, unknown>();
@@ -61,6 +103,12 @@ class MemoryState implements DurableObjectStorageLike {
 
   async put<T>(key: string, value: T): Promise<void> {
     this.map.set(key, value);
+  }
+
+  async putEntries(entries: Record<string, unknown>): Promise<void> {
+    for (const [key, value] of Object.entries(entries)) {
+      this.map.set(key, value);
+    }
   }
 
   async delete(key: string): Promise<void> {
@@ -212,6 +260,10 @@ class FakeGroupOutboxStub implements DurableObjectStub {
 
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = input instanceof Request ? input : new Request(input, init);
+    const authorization = new GroupAuthorizationService(this.groupId, this.state);
+    if (!(await authorization.getState())) {
+      await initializeGroupState(this.state, this.groupId);
+    }
     return handleGroupOutboxDurableRequest(request, {
       groupId: this.groupId,
       state: this.state,
@@ -455,8 +507,9 @@ function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boole
   return parts.join("|");
 }
 
-function signHex(secretKey: Uint8Array, payload: string): string {
-  return bytesToHex(ed25519.sign(new TextEncoder().encode(payload), secretKey));
+function signHex(secretKey: Uint8Array, payload: string | Uint8Array): string {
+  const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+  return bytesToHex(ed25519.sign(encoded, secretKey));
 }
 
 function bytesToHex(input: Uint8Array): string {
@@ -468,17 +521,20 @@ function sampleGroupCapability(
   operations: GroupCapabilityOperation[] = ["read", "append_application", "append_control", "append_membership"],
   role: GroupCapability["role"] = "owner"
 ): GroupCapability {
-  return {
+  const identity = groupIdentityForRole(role);
+  const capability: GroupCapability = {
     version: CURRENT_MODEL_VERSION,
     service: "group_outbox",
     groupId,
-    userId: "user:alice",
-    deviceId: "device:alice:phone",
+    userId: identity.userId,
+    deviceId: identity.deviceId,
     operations,
     role,
-    expiresAt: Date.now() + 60_000,
-    signature: "group-cap-sig"
+    expiresAt: 61_000,
+    signature: ""
   };
+  capability.signature = signHex(identity.deviceSecret, groupCapabilitySigningPayload(capability));
+  return capability;
 }
 
 function sampleGroupAppend(
@@ -495,8 +551,8 @@ function sampleGroupAppend(
       messageId,
       groupId,
       conversationId: `conv:${groupId}`,
-      senderUserId: "user:alice",
-      senderDeviceId: "device:alice:phone",
+      senderUserId: capability.userId,
+      senderDeviceId: capability.deviceId,
       createdAt: 1,
       messageType,
       visibility: "visible",
@@ -510,6 +566,178 @@ function sampleGroupAppend(
     capability
   };
 }
+
+interface GroupIdentityFixture {
+  userId: string;
+  deviceId: string;
+  userSecret: Uint8Array;
+  deviceSecret: Uint8Array;
+  bundle: IdentityBundle;
+}
+
+function groupIdentity(userId: string, deviceId: string, userByte: number, deviceByte: number): GroupIdentityFixture {
+  const userSecret = new Uint8Array(32).fill(userByte);
+  const deviceSecret = new Uint8Array(32).fill(deviceByte);
+  const userPublicKey = bytesToHex(ed25519.getPublicKey(userSecret));
+  const devicePublicKey = bytesToHex(ed25519.getPublicKey(deviceSecret));
+  const inboxCapability: InboxAppendCapability = {
+    version: CURRENT_MODEL_VERSION,
+    service: "inbox",
+    userId,
+    targetDeviceId: deviceId,
+    endpoint: `https://example.com/v1/inbox/${deviceId}/messages`,
+    operations: ["append"],
+    expiresAt: 61_000,
+    signature: ""
+  };
+  inboxCapability.signature = signHex(deviceSecret, capabilityPayload(inboxCapability));
+  const binding: DeviceBinding = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    deviceId,
+    devicePublicKey,
+    createdAt: 1_000,
+    signature: ""
+  };
+  binding.signature = signHex(userSecret, bindingPayload(binding));
+  const bundle: IdentityBundle = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    userPublicKey,
+    updatedAt: 1_000,
+    devices: [{
+      version: CURRENT_MODEL_VERSION,
+      deviceId,
+      devicePublicKey,
+      binding,
+      status: "active",
+      inboxAppendCapability: inboxCapability,
+      keypackageRef: {
+        version: CURRENT_MODEL_VERSION,
+        userId,
+        deviceId,
+        ref: `https://example.com/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/kp1`,
+        expiresAt: 61_000
+      }
+    }],
+    signature: ""
+  };
+  bundle.signature = signHex(userSecret, identityBundlePayload(bundle, true));
+  return { userId, deviceId, userSecret, deviceSecret, bundle };
+}
+
+const GROUP_IDENTITIES = {
+  owner: groupIdentity("user:alice", "device:alice:phone", 3, 4),
+  admin: groupIdentity("user:bob", "device:bob:phone", 5, 6),
+  member: groupIdentity("user:carol", "device:carol:phone", 7, 8)
+} as const;
+
+function groupIdentityForRole(role: GroupCapability["role"]): GroupIdentityFixture {
+  return GROUP_IDENTITIES[role];
+}
+
+function sampleGroupManifest(groupId = "group:project"): GroupManifest {
+  const manifest: GroupManifest = {
+    version: CURRENT_MODEL_VERSION,
+    groupId,
+    conversationId: `conv:${groupId}`,
+    title: "Project",
+    ownerUserId: GROUP_IDENTITIES.owner.userId,
+    admins: [GROUP_IDENTITIES.admin.userId],
+    members: [
+      { userId: GROUP_IDENTITIES.owner.userId, role: "owner", status: "active" },
+      { userId: GROUP_IDENTITIES.admin.userId, role: "admin", status: "active" },
+      { userId: GROUP_IDENTITIES.member.userId, role: "member", status: "active" }
+    ],
+    memberDevices: Object.values(GROUP_IDENTITIES).map((identity) => ({
+      userId: identity.userId,
+      deviceId: identity.deviceId,
+      status: "active"
+    })),
+    joinPolicy: "approval_required",
+    memberInvitePolicy: "owner_admin_only",
+    rosterVersion: 1,
+    mlsEpochHint: 1,
+    outbox: {
+      endpoint: `https://example.com/v1/groups/${encodeURIComponent(groupId)}/outbox/messages`,
+      subscribeEndpoint: `wss://example.com/v1/groups/${encodeURIComponent(groupId)}/outbox/subscribe`
+    },
+    updatedAt: 1_000,
+    signerUserId: GROUP_IDENTITIES.owner.userId,
+    signerDeviceId: GROUP_IDENTITIES.owner.deviceId,
+    signature: ""
+  };
+  manifest.signature = signHex(GROUP_IDENTITIES.owner.deviceSecret, groupManifestSigningPayload(manifest));
+  return manifest;
+}
+
+async function initializeGroupState(state: MemoryState, groupId = "group:project"): Promise<void> {
+  const service = new GroupAuthorizationService(groupId, state);
+  const manifest = sampleGroupManifest(groupId);
+  await service.initialize(
+    {
+      version: CURRENT_MODEL_VERSION,
+      groupId,
+      manifest,
+      identityBundles: Object.values(GROUP_IDENTITIES).map((identity) => identity.bundle)
+    },
+    {
+      version: CURRENT_MODEL_VERSION,
+      service: "device_runtime",
+      userId: GROUP_IDENTITIES.owner.userId,
+      deviceId: GROUP_IDENTITIES.owner.deviceId,
+      scopes: ["group_authorization_bootstrap"],
+      expiresAt: 61_000
+    },
+    1_000
+  );
+}
+
+test("group authorization provisions owner-only roster zero and rejects bootstrap conflicts", async () => {
+  const state = new MemoryState();
+  const service = new GroupAuthorizationService("group:provisioning", state);
+  const base = sampleGroupManifest("group:provisioning");
+  const manifest: GroupManifest = {
+    ...base,
+    admins: [],
+    members: [base.members[0]],
+    memberDevices: [base.memberDevices![0]],
+    rosterVersion: 0,
+    mlsEpochHint: 0,
+    lastCommitMessageId: undefined,
+    signature: ""
+  };
+  manifest.signature = signHex(GROUP_IDENTITIES.owner.deviceSecret, groupManifestSigningPayload(manifest));
+  const runtime = {
+    version: CURRENT_MODEL_VERSION,
+    service: "device_runtime" as const,
+    userId: GROUP_IDENTITIES.owner.userId,
+    deviceId: GROUP_IDENTITIES.owner.deviceId,
+    scopes: ["group_authorization_bootstrap" as const],
+    expiresAt: 61_000
+  };
+  const initialized = await service.initialize({ version: CURRENT_MODEL_VERSION, groupId: manifest.groupId, manifest, identityBundles: [GROUP_IDENTITIES.owner.bundle] }, runtime, 1_000);
+  assert.equal(initialized.alreadyInitialized, false);
+  assert.deepEqual(await service.getPublicState(), {
+    manifest,
+    manifestHash: await (await import("../src/auth/capability")).groupManifestSha256(manifest),
+    lastTransitionId: undefined,
+    phase: "provisioning",
+    materialized: false
+  });
+  const repeated = await service.initialize({ version: CURRENT_MODEL_VERSION, groupId: manifest.groupId, manifest, identityBundles: [GROUP_IDENTITIES.owner.bundle] }, runtime, 1_001);
+  assert.equal(repeated.alreadyInitialized, true);
+  await assert.rejects(
+    () => service.initialize({ version: CURRENT_MODEL_VERSION, groupId: manifest.groupId, manifest: { ...manifest, title: "tampered" }, identityBundles: [GROUP_IDENTITIES.owner.bundle] }, runtime, 1_002),
+    (error: unknown) => (error as { code?: string }).code === "group_authorization_conflict"
+  );
+  const capability = sampleGroupCapability(manifest.groupId, ["append_application"], "owner");
+  const request = new Request("https://example.com", { headers: groupHeaders(capability) });
+  await assert.rejects(
+    () => service.authorize(request, capability, "append_application", ["owner"], 1_000),
+    (error: unknown) => (error as { code?: string }).code === "group_membership_uninitialized"
+  );
+});
 
 function groupHeaders(capability: GroupCapability): Record<string, string> {
   return {
@@ -602,6 +830,7 @@ test("issues device deployment bundle with runtime auth and security features", 
     "inbox_ack",
     "inbox_subscribe",
     "inbox_manage",
+    "group_authorization_bootstrap",
     "storage_prepare_upload",
     "shared_state_write",
     "keypackage_write"
@@ -611,6 +840,7 @@ test("issues device deployment bundle with runtime auth and security features", 
   assert.ok(bundle.runtimeConfig.features.includes("rate_limit"));
   assert.ok(bundle.runtimeConfig.features.includes("group_outbox_mvp"));
   assert.ok(bundle.runtimeConfig.features.includes("welcome_pickup_mvp"));
+  assert.ok(bundle.runtimeConfig.features.includes("group_authorization_v2"));
 });
 
 test("bootstrap rejects expired token", async () => {
@@ -719,11 +949,12 @@ test("tampered append grant stays in message requests even when sender is allowl
   await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
   await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
 
+  const tamperedSignature = `${fixture.capability.signature[0] === "0" ? "1" : "0"}${fixture.capability.signature.slice(1)}`;
   const response = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
       method: "POST",
       headers: {
-        ...authHeaders(`${fixture.capability.signature.slice(0, -2)}00`),
+        ...authHeaders(tamperedSignature),
         "X-Tapchat-Capability": JSON.stringify(fixture.capability),
         "Content-Type": "application/json"
       },
@@ -1054,15 +1285,15 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
       body: JSON.stringify({
         ack: {
           deviceId: "device:bob:phone",
-          ackSeq: 1,
-          ackedMessageIds: ["msg:1"],
+          ackSeq: 0,
+          ackedMessageIds: [],
           ackedAt: 2
         }
       })
     }),
     env
   );
-  assert.deepEqual(await ack.json(), { version: CURRENT_MODEL_VERSION, accepted: true, ackSeq: 1 });
+  assert.deepEqual(await ack.json(), { version: CURRENT_MODEL_VERSION, accepted: true, ackSeq: 0 });
 
   const subscribe = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/subscribe", {
@@ -1327,7 +1558,7 @@ test("group outbox appends fetches and returns head with authorized capability",
     env
   );
   assert.equal(head.status, 200);
-  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 2 });
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 2, currentRosterVersion: 1 });
 
   const empty = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=99&limit=10", {
@@ -1382,7 +1613,7 @@ test("group outbox rejects invalid capabilities and scope mismatches", async () 
     }),
     env
   );
-  assert.equal(missingAuth.status, 401);
+  assert.equal(missingAuth.status, 403);
 
   const invalidJson = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
@@ -1436,7 +1667,7 @@ test("group outbox rejects invalid capabilities and scope mismatches", async () 
     }),
     env
   );
-  assert.equal(bodyMismatch.status, 403);
+  assert.equal(bodyMismatch.status, 400);
 
   const missingBodyCapability = sampleGroupAppend("group:project", "msg:missing-capability");
   delete (missingBodyCapability as Partial<AppendGroupEnvelopeRequest>).capability;
@@ -1451,7 +1682,7 @@ test("group outbox rejects invalid capabilities and scope mismatches", async () 
     }),
     env
   );
-  assert.equal(missingBodyCapabilityResponse.status, 401);
+  assert.equal(missingBodyCapabilityResponse.status, 403);
 });
 
 test("group outbox enforces operation and role permissions", async () => {
@@ -1580,15 +1811,59 @@ test("group outbox enforces operation and role permissions", async () => {
   assert.equal(metadataDenied.status, 403);
 });
 
+test("group outbox fails closed until authorization is initialized", async () => {
+  const capability = sampleGroupCapability();
+  const response = await handleGroupOutboxDurableRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/head", {
+      headers: groupHeaders(capability)
+    }),
+    {
+      groupId: "group:project",
+      state: new MemoryState(),
+      spillStore: new MemoryR2Store(),
+      maxInlineBytes: 128,
+      retentionDays: 30,
+      sharingSecret: "secret",
+      sessions: [],
+      now: 1_000
+    }
+  );
+  assert.equal(response.status, 428);
+  assert.equal(((await response.json()) as { error: string }).error, "group_authorization_uninitialized");
+});
+
+test("group outbox ignores self-reported owner role and rejects forged seal capability", async () => {
+  const { env } = createEnv();
+  const forged = sampleGroupCapability("group:project", ["seal_group"], "member");
+  forged.role = "owner";
+  forged.signature = signHex(
+    GROUP_IDENTITIES.member.deviceSecret,
+    groupCapabilitySigningPayload(forged)
+  );
+
+  const response = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
+      method: "POST",
+      headers: { ...groupHeaders(forged), "Content-Type": "application/json" },
+      body: JSON.stringify({ groupId: "group:project", capability: forged })
+    }),
+    env
+  );
+  assert.equal(response.status, 403);
+  assert.equal(((await response.json()) as { error: string }).error, "invalid_capability");
+});
+
 test("group outbox subscribe allows members with subscribe operation only", async () => {
   const memberSubscribe = sampleGroupCapability("group:project", ["read", "subscribe"], "member");
+  const memberState = new MemoryState();
+  await initializeGroupState(memberState);
   const response = await handleGroupOutboxDurableRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/subscribe", {
       headers: groupHeaders(memberSubscribe)
     }),
     {
       groupId: "group:project",
-      state: new MemoryState(),
+      state: memberState,
       spillStore: new MemoryR2Store(),
       maxInlineBytes: 128,
       retentionDays: 30,
@@ -1601,13 +1876,15 @@ test("group outbox subscribe allows members with subscribe operation only", asyn
   assert.equal(response.status, 200);
 
   const memberMissingSubscribe = sampleGroupCapability("group:project", ["read"], "member");
+  const deniedState = new MemoryState();
+  await initializeGroupState(deniedState);
   const denied = await handleGroupOutboxDurableRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/subscribe", {
       headers: groupHeaders(memberMissingSubscribe)
     }),
     {
       groupId: "group:project",
-      state: new MemoryState(),
+      state: deniedState,
       spillStore: new MemoryR2Store(),
       maxInlineBytes: 128,
       retentionDays: 30,
@@ -1623,6 +1900,7 @@ test("group outbox subscribe allows members with subscribe operation only", asyn
 test("group join decision rejects server-generated approval artifacts on reject", async () => {
   const state = new MemoryState();
   const spillStore = new MemoryR2Store();
+  await initializeGroupState(state);
   await state.put("join-request:req:1", {
     request: {
       version: CURRENT_MODEL_VERSION,
@@ -1640,15 +1918,17 @@ test("group join decision rejects server-generated approval artifacts on reject"
     }
   });
 
+  const decisionCapability = sampleGroupCapability("group:project", ["approve_join"], "owner");
   const response = await handleGroupOutboxDurableRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/join-requests/req%3A1/decision", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...groupHeaders(decisionCapability), "Content-Type": "application/json" },
       body: JSON.stringify({
         version: CURRENT_MODEL_VERSION,
         groupId: "group:project",
         requestId: "req:1",
         decision: "reject",
+        capability: decisionCapability,
         reason: "no",
         welcomePickup: {
           groupId: "group:project",
@@ -1674,6 +1954,165 @@ test("group join decision rejects server-generated approval artifacts on reject"
   );
 
   assert.equal(response.status, 400);
+});
+
+test("group join lease is idempotent, exclusive, expiring, and completes only after transition commit", async () => {
+  const state = new MemoryState();
+  const spillStore = new MemoryR2Store();
+  await initializeGroupState(state);
+  const manifest = sampleGroupManifest();
+  await state.put("join-request:req:lease", {
+    request: {
+      version: CURRENT_MODEL_VERSION,
+      requestId: "req:lease",
+      groupId: "group:project",
+      inviteId: "invite:lease",
+      joinerUserId: "user:dana",
+      joinerDeviceId: "device:dana:phone",
+      joinerContactShareUrl: "https://example.com/contact/dana",
+      requestCapability: "join-capability",
+      requestedAt: 1,
+      autoApprove: true,
+      status: "waiting_for_group_commit",
+      signature: "join-signature"
+    }
+  });
+  const service = new GroupOutboxService(
+    "group:project",
+    state,
+    spillStore,
+    { headSeq: 0, retentionDays: 30, maxInlineBytes: 128 },
+    []
+  );
+  const owner = sampleGroupCapability("group:project", ["approve_join"], "owner");
+  const admin = sampleGroupCapability("group:project", ["approve_join"], "admin");
+  const first = await service.claimJoinRequest({
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    requestId: "req:lease",
+    capability: owner
+  }, 1_000);
+  const repeated = await service.claimJoinRequest({
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    requestId: "req:lease",
+    capability: owner
+  }, 1_001);
+  assert.equal(repeated.leaseToken, first.leaseToken);
+  await assert.rejects(
+    () => service.claimJoinRequest({
+      version: CURRENT_MODEL_VERSION,
+      groupId: "group:project",
+      requestId: "req:lease",
+      capability: admin
+    }, 1_002),
+    (error: unknown) => error instanceof Error && error.message.includes("another administrator")
+  );
+  const takeover = await service.claimJoinRequest({
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    requestId: "req:lease",
+    capability: admin
+  }, first.leaseExpiresAt + 1);
+  assert.notEqual(takeover.leaseToken, first.leaseToken);
+
+  const joinedManifest = {
+    ...manifest,
+    members: [...manifest.members, { userId: "user:dana", role: "member" as const, status: "active" as const }],
+    memberDevices: [...(manifest.memberDevices ?? []), { userId: "user:dana", deviceId: "device:dana:phone", status: "active" as const }]
+  };
+  const authorization = await state.get<Record<string, unknown>>("group-authorization:v2");
+  await state.put("group-authorization:v2", { ...authorization, manifest: joinedManifest, lastTransitionId: "transition:lease" });
+  await state.put("transition:transition:lease", {
+    fingerprint: "fixture",
+    operation: { type: "approve_join", requestId: "req:lease", userId: "user:dana", deviceId: "device:dana:phone" },
+    requestBinding: { type: "join", requestId: "req:lease", leaseToken: takeover.leaseToken },
+    result: { accepted: true, transitionId: "transition:lease", firstSeq: 1, lastSeq: 3, rosterVersion: joinedManifest.rosterVersion, lastCommitMessageId: joinedManifest.lastCommitMessageId }
+  });
+  const claimed = await state.get<Record<string, unknown>>("join-request:req:lease");
+  await state.put("join-request:req:lease", {
+    ...claimed,
+    transitionId: "transition:lease",
+    committedBinding: { transitionId: "transition:lease", leaseToken: takeover.leaseToken, committedAt: takeover.leaseExpiresAt - 2 }
+  });
+  const completed = await service.completeJoinRequest({
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    requestId: "req:lease",
+    capability: admin,
+    leaseToken: takeover.leaseToken,
+    transitionId: "transition:lease",
+    welcomePickup: {
+      groupId: "group:project",
+      deviceId: "device:dana:phone",
+      endpoint: "https://example.com/welcome",
+      capability: "welcome-capability",
+      requestId: "req:lease",
+      expiresAt: takeover.leaseExpiresAt + 60_000,
+      startSeq: 3,
+      rosterVersion: joinedManifest.rosterVersion,
+      lastCommitMessageId: joinedManifest.lastCommitMessageId
+    },
+    manifest: joinedManifest,
+    startCursor: { groupId: "group:project", lastFetchedSeq: 3, updatedAt: 1 }
+  }, takeover.leaseExpiresAt - 1);
+  assert.equal(completed.request.status, "welcome_available");
+  await service.markWelcomeClaimed("req:lease", "device:dana:phone", "welcome-capability");
+  const joined = await service.getJoinRequestStatus("req:lease", "join-capability");
+  assert.equal(joined.request.status, "joined");
+});
+
+test("group invite idempotency and leave lease alarm preserve shared FSM state", async () => {
+  const state = new MemoryState();
+  await initializeGroupState(state);
+  const events: string[] = [];
+  const service = new GroupOutboxService("group:project", state, new MemoryR2Store(), { headSeq: 0, retentionDays: 30, maxInlineBytes: 128 }, [{ send: (payload: string) => events.push(payload) }]);
+  const owner = sampleGroupCapability("group:project", ["manage_invites", "approve_join"], "owner");
+  const document = {
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    title: "Project",
+    inviteId: "invite:idempotent",
+    joinPolicy: "open_by_invite" as const,
+    inviterUserId: owner.userId,
+    inviterDeviceId: owner.deviceId,
+    ownerUserId: owner.userId,
+    joinRequestEndpoint: "https://example.com/v1/groups/group%3Aproject/join-requests",
+    createdAt: 1_000,
+    expiresAt: 2_000,
+    signature: "client-signature"
+  };
+  const create = { version: CURRENT_MODEL_VERSION, groupId: "group:project", document, capability: owner };
+  const first = await service.createInvite(create, "https://example.com/invite", "server-token", 1_000);
+  const repeated = await service.createInvite(create, "https://example.com/ignored", "new-server-token", 1_001);
+  assert.equal(repeated.inviteUrl, first.inviteUrl);
+  assert.equal((await service.listInvites(1_001)).revision, 1);
+  await service.revokeInvite({ version: CURRENT_MODEL_VERSION, groupId: "group:project", inviteId: document.inviteId, capability: owner }, 1_100);
+  await service.revokeInvite({ version: CURRENT_MODEL_VERSION, groupId: "group:project", inviteId: document.inviteId, capability: owner }, 1_101);
+  assert.equal((await service.listInvites(1_101)).revision, 2);
+
+  const member = sampleGroupCapability("group:project", ["append_control"], "member");
+  const leave = await service.submitLeaveRequest({
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    capability: member,
+    request: {
+      version: CURRENT_MODEL_VERSION,
+      requestId: "leave:1",
+      groupId: "group:project",
+      leaverUserId: member.userId,
+      leaverDeviceId: member.deviceId,
+      requestedAt: 1_000,
+      requestCapability: "leave-cap",
+      signature: "leave-signature",
+      status: "waiting_for_group_commit"
+    }
+  }, 1_000);
+  assert.equal(leave.request.status, "waiting_for_group_commit");
+  const claimed = await service.claimLeaveRequest({ version: CURRENT_MODEL_VERSION, groupId: "group:project", requestId: "leave:1", capability: owner }, 1_100);
+  await service.processAlarm(claimed.leaseExpiresAt + 1);
+  assert.equal((await service.listLeaveRequests()).requests[0].status, "waiting_for_group_commit");
+  assert.ok(events.some((payload) => payload.includes("group_leave_request_available")));
 });
 
 test("group outbox spills large records to R2 and fetches them back", async () => {
@@ -1705,6 +2144,16 @@ test("group outbox spills large records to R2 and fetches them back", async () =
   assert.equal(fetch.status, 200);
   const body = await fetch.json() as { records: Array<{ messageId: string }> };
   assert.deepEqual(body.records.map((record) => record.messageId), ["msg:large"]);
+
+  await bucket.delete("group-outbox-payload/group:project/1.json");
+  const missingSpill = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=1&limit=10", {
+      headers: groupHeaders(capability)
+    }),
+    env
+  );
+  assert.equal(missingSpill.status, 500);
+  assert.equal(((await missingSpill.json()) as { error: string }).error, "storage_integrity_error");
 });
 
 test("welcome pickup stores and fetches a device-scoped welcome", async () => {
@@ -1777,6 +2226,37 @@ test("ack semantics reject backwards ack and cleanup only removes expired acked 
   assert.equal(delivered.seq, 1);
   assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), true);
 
+  await assert.rejects(
+    () => service.ack({
+      ack: {
+        deviceId: "device:bob:phone",
+        ackSeq: 2,
+        ackedAt: 1_100
+      }
+    }),
+    /ack_seq must not move beyond inbox head_seq/
+  );
+  await assert.rejects(
+    () => service.ack({
+      ack: {
+        deviceId: "device:bob:phone",
+        ackSeq: -1,
+        ackedAt: 1_100
+      }
+    }),
+    /ack_seq must be a non-negative safe integer/
+  );
+  await assert.rejects(
+    () => service.ack({
+      ack: {
+        deviceId: "device:bob:phone",
+        ackSeq: 0.5,
+        ackedAt: 1_100
+      }
+    }),
+    /ack_seq must be a non-negative safe integer/
+  );
+
   await service.cleanExpiredRecords(1_000 + 2 * 24 * 60 * 60 * 1000);
   const withoutAck = await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 });
   assert.equal(withoutAck.records.length, 1);
@@ -1809,6 +2289,28 @@ test("ack semantics reject backwards ack and cleanup only removes expired acked 
   assert.equal(afterExpiry.records.length, 0);
   assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), false);
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
+});
+
+test("inbox fetch fails closed when an R2 spill payload is missing", async () => {
+  const state = new MemoryState();
+  const spillStore = new MemoryR2Store();
+  const service = new InboxService("device:bob:phone", state, spillStore, [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 1,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+
+  await service.replaceAllowlist(["user:alice"], [], 500);
+  await service.appendEnvelope(sampleAppend(), 1_000);
+  await spillStore.delete("inbox-payload/device:bob:phone/1.json");
+
+  await assert.rejects(
+    () => service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 }),
+    /inbox spill payload is missing at seq 1/
+  );
 });
 
 test("group outbox seal succeeds for owner and records sealed timestamp", async () => {

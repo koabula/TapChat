@@ -13,8 +13,8 @@ interface StoredWelcomePickup {
   storedAt: number;
 }
 
-function pickupKey(groupId: string, deviceId: string): string {
-  return `welcome-pickup/${groupId}/${deviceId}.json`;
+function pickupKey(groupId: string, deviceId: string, requestId?: string): string {
+  return `welcome-pickup/${groupId}/${deviceId}/${requestId ?? "unbound"}.json`;
 }
 
 export class WelcomePickupService {
@@ -29,7 +29,7 @@ export class WelcomePickupService {
     if (!request.welcomeB64?.trim()) {
       throw new HttpError(400, "invalid_input", "welcome_b64 must not be empty");
     }
-    await this.store.putJson(pickupKey(request.descriptor.groupId, request.descriptor.deviceId), {
+    await this.store.putJson(pickupKey(request.descriptor.groupId, request.descriptor.deviceId, request.descriptor.requestId), {
       descriptor: request.descriptor,
       welcomeB64: request.welcomeB64,
       manifest: request.manifest,
@@ -40,7 +40,7 @@ export class WelcomePickupService {
 
   async fetch(descriptor: WelcomePickupDescriptor, now: number): Promise<FetchWelcomePickupResult> {
     this.validateDescriptor(descriptor, now);
-    const stored = await this.store.getJson<StoredWelcomePickup>(pickupKey(descriptor.groupId, descriptor.deviceId));
+    const stored = await this.store.getJson<StoredWelcomePickup>(pickupKey(descriptor.groupId, descriptor.deviceId, descriptor.requestId));
     if (!stored) {
       throw new HttpError(404, "not_found", "welcome pickup not found");
     }

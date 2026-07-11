@@ -5,20 +5,31 @@ import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
+import { ed25519 } from "@noble/curves/ed25519";
 import {
   CURRENT_MODEL_VERSION,
   type BootstrapDeviceRequest,
   type DeploymentBundle,
+  type DeviceBinding,
+  type GroupCapability,
+  type GroupManifest,
+  type IdentityBundle,
   type InboxAppendCapability,
   type MessageRequestListResult,
   type PrepareBlobUploadRequest
 } from "../src/types/contracts";
 import { signSharingPayload } from "../src/storage/sharing";
+import {
+  groupCapabilitySigningPayload,
+  groupManifestSigningPayload,
+  verifyIdentityBundle
+} from "../src/auth/capability";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const TMP_DIR = path.join(os.tmpdir(), "tapchat-cloudflare-test-runtime");
 const WORKER_BUNDLE = path.join(TMP_DIR, "worker.mjs");
 const BASE_URL = "https://example.com";
+const signedFixtures = new Map<string, { bundle: IdentityBundle; capability: InboxAppendCapability }>();
 
 async function ensureWorkerBundle(): Promise<string> {
   await fs.mkdir(TMP_DIR, { recursive: true });
@@ -90,7 +101,20 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
     body: JSON.stringify(requestBody)
   });
   assert.equal(response.status, 200);
-  return (await response.json()) as DeploymentBundle;
+  const deployment = (await response.json()) as DeploymentBundle;
+  const fixture = signedIdentityFixture(userId, deviceId);
+  assert.equal(verifyIdentityBundle(fixture.bundle), true, "generated identity bundle must verify");
+  signedFixtures.set(deviceId, fixture);
+  const publish = await mf.dispatchFetch(`${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`, {
+    method: "PUT",
+    headers: {
+      ...authHeaders(deployment.deviceRuntimeAuth!.token),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(fixture.bundle)
+  });
+  assert.equal(publish.status, 200);
+  return deployment;
 }
 
 function sampleAppend(deviceId: string, messageId: string, ciphertext: string, senderUserId = "user:alice") {
@@ -118,16 +142,172 @@ function sampleAppend(deviceId: string, messageId: string, ciphertext: string, s
 }
 
 function sampleCapability(deviceId: string): InboxAppendCapability {
-  return {
+  const fixture = signedFixtures.get(deviceId);
+  assert.ok(fixture, `signed identity fixture missing for ${deviceId}`);
+  return fixture.capability;
+}
+
+function signedIdentityFixture(userId: string, deviceId: string): { bundle: IdentityBundle; capability: InboxAppendCapability } {
+  const now = Date.now();
+  const userSecret = new Uint8Array(32).fill(11);
+  const deviceSecret = new Uint8Array(32).fill(12);
+  const userPublicKey = bytesToHex(ed25519.getPublicKey(userSecret));
+  const devicePublicKey = bytesToHex(ed25519.getPublicKey(deviceSecret));
+  const capability: InboxAppendCapability = {
     version: CURRENT_MODEL_VERSION,
     service: "inbox",
-    userId: "user:bob",
+    userId,
     targetDeviceId: deviceId,
     endpoint: `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages`,
     operations: ["append"],
     conversationScope: ["conv:alice:bob"],
-    expiresAt: Date.now() + 60_000,
-    signature: "append-cap-sig"
+    expiresAt: now + 60_000,
+    signature: ""
+  };
+  capability.signature = signHex(deviceSecret, capabilityPayload(capability));
+  const binding: DeviceBinding = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    deviceId,
+    devicePublicKey,
+    createdAt: now,
+    signature: ""
+  };
+  binding.signature = signHex(userSecret, `${CURRENT_MODEL_VERSION}:${userId}:${deviceId}:${devicePublicKey}:${now}`);
+  const bundle: IdentityBundle = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    userPublicKey,
+    updatedAt: now,
+    identityBundleRef: `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`,
+    deviceStatusRef: `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/device-status`,
+    devices: [{
+      version: CURRENT_MODEL_VERSION,
+      deviceId,
+      devicePublicKey,
+      binding,
+      status: "active",
+      inboxAppendCapability: capability,
+      keypackageRef: {
+        version: CURRENT_MODEL_VERSION,
+        userId,
+        deviceId,
+        ref: `${BASE_URL}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/kp1`,
+        expiresAt: now + 60_000
+      }
+    }],
+    signature: ""
+  };
+  bundle.signature = signHex(userSecret, identityBundlePayload(bundle));
+  return { bundle, capability };
+}
+
+function capabilityPayload(capability: InboxAppendCapability): string {
+  return [
+    capability.version,
+    "Inbox",
+    capability.userId,
+    capability.targetDeviceId,
+    capability.endpoint,
+    "[Append]",
+    (capability.conversationScope ?? []).join(","),
+    String(capability.expiresAt),
+    ""
+  ].join("|");
+}
+
+function identityBundlePayload(bundle: IdentityBundle): string {
+  const parts = [
+    bundle.version,
+    bundle.userId,
+    bundle.userPublicKey,
+    "",
+    String(bundle.updatedAt),
+    bundle.bundleShareId ?? "",
+    bundle.identityBundleRef ?? "",
+    bundle.deviceStatusRef ?? "",
+    bundle.storageProfile?.baseUrl ?? "",
+    bundle.storageProfile?.profileRef ?? ""
+  ];
+  for (const device of bundle.devices) {
+    parts.push(device.deviceId, device.devicePublicKey, device.binding.signature, device.inboxAppendCapability.signature);
+    parts.push(device.keypackageRef.ref, String(device.keypackageRef.expiresAt));
+  }
+  return parts.join("|");
+}
+
+function signHex(secret: Uint8Array, payload: string | Uint8Array): string {
+  const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+  return bytesToHex(ed25519.sign(encoded, secret));
+}
+
+function bytesToHex(input: Uint8Array): string {
+  return Array.from(input, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+const GROUP_ID = "group:integration";
+const GROUP_OWNER_USER_ID = "user:owner";
+const GROUP_OWNER_DEVICE_ID = "device:owner:desktop";
+const GROUP_OWNER_DEVICE_SECRET = new Uint8Array(32).fill(12);
+
+function groupManifest(now: number): GroupManifest {
+  const manifest: GroupManifest = {
+    version: CURRENT_MODEL_VERSION,
+    groupId: GROUP_ID,
+    conversationId: "conv:group:integration",
+    title: "Integration Group",
+    ownerUserId: GROUP_OWNER_USER_ID,
+    admins: [],
+    members: [{ userId: GROUP_OWNER_USER_ID, role: "owner", status: "active" }],
+    memberDevices: [{ userId: GROUP_OWNER_USER_ID, deviceId: GROUP_OWNER_DEVICE_ID, status: "active" }],
+    joinPolicy: "open_by_invite",
+    memberInvitePolicy: "owner_admin_only",
+    rosterVersion: 1,
+    mlsEpochHint: 1,
+    outbox: {
+      endpoint: `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/outbox/messages`,
+      subscribeEndpoint: `${BASE_URL.replace(/^http/i, "ws")}/v1/groups/${encodeURIComponent(GROUP_ID)}/outbox/subscribe`
+    },
+    updatedAt: now,
+    signerUserId: GROUP_OWNER_USER_ID,
+    signerDeviceId: GROUP_OWNER_DEVICE_ID,
+    signature: ""
+  };
+  manifest.signature = signHex(GROUP_OWNER_DEVICE_SECRET, groupManifestSigningPayload(manifest));
+  return manifest;
+}
+
+function groupCapability(now: number): GroupCapability {
+  const capability: GroupCapability = {
+    version: CURRENT_MODEL_VERSION,
+    service: "group_outbox",
+    groupId: GROUP_ID,
+    userId: GROUP_OWNER_USER_ID,
+    deviceId: GROUP_OWNER_DEVICE_ID,
+    role: "owner",
+    operations: [
+      "read",
+      "subscribe",
+      "append_application",
+      "append_control",
+      "append_membership",
+      "manage_invites",
+      "approve_join",
+      "remove_member",
+      "update_group_metadata",
+      "seal_group"
+    ],
+    expiresAt: now + 60_000,
+    signature: ""
+  };
+  capability.signature = signHex(GROUP_OWNER_DEVICE_SECRET, groupCapabilitySigningPayload(capability));
+  return capability;
+}
+
+function groupHeaders(capability: GroupCapability): Record<string, string> {
+  return {
+    Authorization: `Bearer ${capability.signature}`,
+    "X-Tapchat-Group-Capability": JSON.stringify(capability)
   };
 }
 
@@ -484,7 +664,7 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   const prepared = (await prepareResponse.json()) as {
     blobRef: string;
     uploadTarget: string;
-    downloadTarget: string;
+    downloadGrant: { authorizeEndpoint: string; token: string; expiresAt: number };
   };
 
   const uploadResponse = await mf.dispatchFetch(prepared.uploadTarget, {
@@ -500,10 +680,223 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   const object = await bucket.get(prepared.blobRef);
   assert.ok(object);
 
-  const downloadResponse = await mf.dispatchFetch(prepared.downloadTarget);
+  const authorizeResponse = await mf.dispatchFetch(prepared.downloadGrant.authorizeEndpoint, {
+    method: "POST",
+    headers: {
+      ...authHeaders(prepared.downloadGrant.token),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ version: CURRENT_MODEL_VERSION, blobRef: prepared.blobRef })
+  });
+  assert.equal(authorizeResponse.status, 200);
+  const authorized = (await authorizeResponse.json()) as { downloadTarget: string };
+  const downloadResponse = await mf.dispatchFetch(authorized.downloadTarget);
   assert.equal(downloadResponse.status, 200);
   const bytes = new Uint8Array(await downloadResponse.arrayBuffer());
   assert.deepEqual(Array.from(bytes), [1, 2, 3, 4]);
+});
+
+test("runtime integration: group FSM routes expose open-invite and join lease flow", async (t) => {
+  const mf = await createRuntime();
+  t.after(async () => {
+    await mf.dispose();
+  });
+
+  const now = Date.now();
+  const deployment = await issueDeviceBundle(mf, GROUP_OWNER_USER_ID, GROUP_OWNER_DEVICE_ID);
+  const ownerFixture = signedFixtures.get(GROUP_OWNER_DEVICE_ID);
+  assert.ok(ownerFixture);
+  const manifest = groupManifest(now);
+  const capability = groupCapability(now);
+
+  const bootstrap = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/authorization/bootstrap`,
+    {
+      method: "POST",
+      headers: {
+        ...authHeaders(deployment.deviceRuntimeAuth!.token),
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: GROUP_ID,
+        manifest,
+        identityBundles: [ownerFixture.bundle]
+      })
+    }
+  );
+  assert.equal(bootstrap.status, 200);
+
+  const authorizationState = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/authorization/state`,
+    { headers: groupHeaders(capability) }
+  );
+  assert.equal(authorizationState.status, 200);
+  assert.equal(((await authorizationState.json()) as { manifest: GroupManifest }).manifest.signature, manifest.signature);
+
+  const subscribe = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/outbox/subscribe`,
+    {
+      headers: {
+        ...groupHeaders(capability),
+        Upgrade: "websocket",
+        Connection: "Upgrade"
+      }
+    }
+  );
+  assert.equal(subscribe.status, 101);
+  assert.ok(subscribe.webSocket);
+  const socket = subscribe.webSocket as unknown as RuntimeWebSocket;
+  await waitForSubscribeReady(socket);
+
+  const inviteId = "invite:open-integration";
+  const createInvite = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/invites`,
+    {
+      method: "POST",
+      headers: { ...groupHeaders(capability), "content-type": "application/json" },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: GROUP_ID,
+        capability,
+        maxUses: 2,
+        document: {
+          version: CURRENT_MODEL_VERSION,
+          groupId: GROUP_ID,
+          title: manifest.title,
+          inviteId,
+          joinPolicy: "open_by_invite",
+          inviterUserId: GROUP_OWNER_USER_ID,
+          inviterDeviceId: GROUP_OWNER_DEVICE_ID,
+          ownerUserId: GROUP_OWNER_USER_ID,
+          joinRequestEndpoint: `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/join-requests`,
+          createdAt: now,
+          expiresAt: now + 60_000,
+          maxUses: 2,
+          signature: "unsigned"
+        }
+      })
+    }
+  );
+  assert.equal(createInvite.status, 200);
+  const created = (await createInvite.json()) as { invite: { signature: string } };
+  const inviteCreatedEvent = (await waitForWebSocketMessage(socket)) as { event: string; revision: number };
+  assert.equal(inviteCreatedEvent.event, "group_invites_changed");
+  assert.equal(inviteCreatedEvent.revision, 1);
+
+  const listInvites = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/invites`,
+    { headers: groupHeaders(capability) }
+  );
+  assert.equal(listInvites.status, 200);
+  const inviteList = (await listInvites.json()) as { revision: number; invites: Array<{ uses: number; status: string }> };
+  assert.equal(inviteList.revision, 1);
+  assert.deepEqual(inviteList.invites.map((invite) => [invite.uses, invite.status]), [[0, "active"]]);
+
+  const requestId = "join:open-integration";
+  const joinerDeviceId = "device:joiner:phone";
+  const submitJoin = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/join-requests`,
+    {
+      method: "POST",
+      headers: { ...authHeaders(created.invite.signature), "content-type": "application/json" },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        inviteToken: created.invite.signature,
+        request: {
+          version: CURRENT_MODEL_VERSION,
+          requestId,
+          groupId: GROUP_ID,
+          inviteId,
+          joinerUserId: "user:joiner",
+          joinerDeviceId,
+          joinerContactShareUrl: `${BASE_URL}/contact/joiner`,
+          requestedAt: now,
+          requestCapability: "join-request-capability",
+          signature: "join-request-signature",
+          status: "pending"
+        }
+      })
+    }
+  );
+  assert.equal(submitJoin.status, 200);
+  const submitted = (await submitJoin.json()) as { request: { status: string; autoApprove?: boolean } };
+  assert.equal(submitted.request.status, "waiting_for_group_commit");
+  assert.equal(submitted.request.autoApprove, true);
+
+  const inviteUsedEvent = (await waitForWebSocketMessage(socket)) as { event: string; revision: number };
+  assert.equal(inviteUsedEvent.event, "group_invites_changed");
+  assert.equal(inviteUsedEvent.revision, 2);
+  const autoJoinEvent = (await waitForWebSocketMessage(socket)) as { event: string; requestId: string };
+  assert.equal(autoJoinEvent.event, "group_auto_join_available");
+  assert.equal(autoJoinEvent.requestId, requestId);
+
+  const claim = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/join-requests/${encodeURIComponent(requestId)}/claim`,
+    {
+      method: "POST",
+      headers: { ...groupHeaders(capability), "content-type": "application/json" },
+      body: JSON.stringify({ version: CURRENT_MODEL_VERSION, groupId: GROUP_ID, requestId, capability })
+    }
+  );
+  assert.equal(claim.status, 200);
+  const claimed = (await claim.json()) as {
+    request: { status: string };
+    leaseToken: string;
+    leaseExpiresAt: number;
+  };
+  assert.equal(claimed.request.status, "transition_in_progress");
+  assert.ok(claimed.leaseToken);
+  assert.ok(claimed.leaseExpiresAt > now);
+
+  const incompleteTransition = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/outbox/transitions`,
+    {
+      method: "POST",
+      headers: { ...groupHeaders(capability), "content-type": "application/json" },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: GROUP_ID,
+        transitionId: "transition:route-probe",
+        operation: "add_member",
+        expectedPreviousRosterVersion: manifest.rosterVersion,
+        envelopes: [],
+        authorizationUpdate: { manifest, identityBundles: [] },
+        capability
+      })
+    }
+  );
+  assert.equal(incompleteTransition.status, 400);
+  assert.equal(((await incompleteTransition.json()) as { error: string }).error, "invalid_input");
+
+  const complete = await mf.dispatchFetch(
+    `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/join-requests/${encodeURIComponent(requestId)}/complete`,
+    {
+      method: "POST",
+      headers: { ...groupHeaders(capability), "content-type": "application/json" },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId: GROUP_ID,
+        requestId,
+        capability,
+        leaseToken: claimed.leaseToken,
+        transitionId: "transition:not-committed",
+        welcomePickup: {
+          groupId: GROUP_ID,
+          deviceId: joinerDeviceId,
+          endpoint: `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/welcome-pickup/${encodeURIComponent(joinerDeviceId)}`,
+          capability: "welcome-capability",
+          expiresAt: now + 60_000,
+          startSeq: 1
+        },
+        manifest,
+        startCursor: { groupId: GROUP_ID, lastFetchedSeq: 1, updatedAt: now }
+      })
+    }
+  );
+  assert.equal(complete.status, 409);
+  assert.equal(((await complete.json()) as { error: string }).error, "group_join_lease_invalid");
+  socket.close(1000, "done");
 });
 
 process.on("exit", () => {

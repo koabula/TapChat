@@ -2,6 +2,14 @@ import { HttpError } from "../auth/capability";
 import type {
   AppendGroupEnvelopeRequest,
   AppendGroupEnvelopeResult,
+  AppendGroupTransitionRequest,
+  AppendGroupTransitionResult,
+  ClaimGroupJoinRequest,
+  ClaimGroupJoinResult,
+  ClaimGroupLeaveRequest,
+  ClaimGroupLeaveResult,
+  CompleteGroupJoinRequest,
+  CompleteGroupJoinResult,
   CreateGroupInviteRequest,
   CreateGroupInviteResult,
   DecideGroupJoinRequest,
@@ -15,17 +23,28 @@ import type {
   GroupInviteDocument,
   GroupInviteTokenPayload,
   GroupJoinRequest,
+  GroupLeaveRequest,
   GroupCursor,
   GroupManifest,
   GroupOutboxRecord,
+  ListGroupInvitesResult,
   ListGroupJoinRequestsResult,
+  ListGroupLeaveRequestsResult,
   RevokeGroupInviteRequest,
   RevokeGroupInviteResult,
   SubmitGroupJoinRequest,
   SubmitGroupJoinResult,
+  SubmitGroupLeaveRequest,
+  SubmitGroupLeaveResult,
   WelcomePickupDescriptor
 } from "../types/contracts";
 import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../types/runtime";
+import { groupManifestSha256 } from "../auth/capability";
+import {
+  GROUP_AUTHORIZATION_KEY,
+  groupTransitionProofOperation,
+  type GroupAuthorizationState
+} from "./authorization";
 
 interface GroupOutboxMeta {
   headSeq: number;
@@ -65,6 +84,9 @@ interface StoredGroupRecordIndex {
   state: "available";
   inlineRecord?: GroupOutboxRecord;
   payloadRef?: string;
+  transitionId?: string;
+  transitionStartSeq?: number;
+  transitionEndSeq?: number;
 }
 
 const META_KEY = "meta";
@@ -72,6 +94,18 @@ const IDEMPOTENCY_PREFIX = "idempotency:";
 const RECORD_PREFIX = "record:";
 const INVITE_PREFIX = "invite:";
 const JOIN_REQUEST_PREFIX = "join-request:";
+const JOIN_REQUEST_IDEMPOTENCY_PREFIX = "join-request-idempotency:";
+const LEAVE_REQUEST_PREFIX = "leave-request:";
+const LEAVE_REQUEST_IDEMPOTENCY_PREFIX = "leave-request-idempotency:";
+const TRANSITION_PREFIX = "transition:";
+const INVITE_REVISION_KEY = "invite-revision";
+
+interface StoredGroupTransition {
+  fingerprint: string;
+  operation: AppendGroupTransitionRequest["operation"];
+  requestBinding?: AppendGroupTransitionRequest["requestBinding"];
+  result: AppendGroupTransitionResult;
+}
 
 interface StoredGroupInvite {
   inviteUrl: string;
@@ -80,6 +114,8 @@ interface StoredGroupInvite {
   uses: number;
   maxUses?: number;
   revokedAt?: number;
+  expiredAt?: number;
+  exhaustedAt?: number;
 }
 
 interface StoredGroupJoinRequest {
@@ -88,6 +124,37 @@ interface StoredGroupJoinRequest {
   manifest?: GroupManifest;
   startCursor?: GroupCursor;
   reason?: string;
+  transitionId?: string;
+  lease?: {
+    token: string;
+    userId: string;
+    deviceId: string;
+    expiresAt: number;
+  };
+  committedBinding?: { transitionId: string; leaseToken: string; committedAt: number };
+  completionFingerprint?: string;
+}
+
+interface StoredGroupLeaveRequest {
+  request: GroupLeaveRequest;
+  transitionId?: string;
+  lease?: { token: string; userId: string; deviceId: string; expiresAt: number };
+}
+
+const JOIN_LEASE_MS = 2 * 60 * 1000;
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function transitionFingerprint(input: AppendGroupTransitionRequest): string {
+  const { capability: _capability, ...stable } = input;
+  return canonicalJson(stable);
 }
 
 export class GroupOutboxService {
@@ -121,35 +188,6 @@ export class GroupOutboxService {
     }
 
     const meta = await this.getMeta();
-
-    // Optimistic concurrency: when the caller supplies an expected
-    // previous roster version or commit message id, the server
-    // compares against the last-known values from prior membership
-    // operations. A mismatch means another writer raced ahead and
-    // the caller must re-sync before retrying.
-    // Per PROTOCOL_GROUP_CN.md §5.2 the server only checks linear
-    // write conflicts; signature verification remains the
-    // receiver's responsibility.
-    if (input.expectedPreviousRosterVersion !== undefined) {
-      const storedRosterVersion = meta.currentRosterVersion ?? 0;
-      if (input.expectedPreviousRosterVersion !== storedRosterVersion) {
-        throw new HttpError(
-          409,
-          "roster_version_conflict",
-          `expected previous roster version ${input.expectedPreviousRosterVersion} but current is ${storedRosterVersion}`
-        );
-      }
-    }
-    if (input.expectedPreviousCommitMessageId !== undefined) {
-      const storedCommitMessageId = meta.lastCommitMessageId ?? "";
-      if (input.expectedPreviousCommitMessageId !== storedCommitMessageId) {
-        throw new HttpError(
-          409,
-          "roster_version_conflict",
-          `expected previous commit message id does not match current`
-        );
-      }
-    }
 
     const seq = meta.headSeq + 1;
     const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1000;
@@ -189,29 +227,267 @@ export class GroupOutboxService {
       });
     }
 
-    // Advance the server-tracked roster version and commit chain when
-    // the envelope carries a membership proof. The proof's
-    // newRosterVersion and commitMessageId become the canonical
-    // reference for the next optimistic-concurrency check.
-    let nextMeta = { ...meta, headSeq: seq };
-    const proof = input.envelope.membershipProof;
-    if (proof && proof.type === "membership_signature") {
-      if (typeof proof.newRosterVersion === "number") {
-        nextMeta.currentRosterVersion = proof.newRosterVersion;
-      }
-      if (typeof proof.commitMessageId === "string" && proof.commitMessageId.length > 0) {
-        nextMeta.lastCommitMessageId = proof.commitMessageId;
-      }
-    }
-
     await this.state.put(`${IDEMPOTENCY_PREFIX}${record.messageId}`, seq);
-    await this.state.put(META_KEY, nextMeta);
+    await this.state.put(META_KEY, { ...meta, headSeq: seq });
     await this.state.setAlarm(expiresAt);
 
     this.publish({ event: "group_head_updated", groupId: this.groupId, seq });
     this.publish({ event: "group_outbox_record_available", groupId: this.groupId, seq, record });
 
     return { accepted: true, seq };
+  }
+
+  /** Fail closed before parsing or authorizing an append body on a sealed log. */
+  async assertWritable(): Promise<void> {
+    await this.rejectIfSealed();
+  }
+
+  async appendTransition(
+    input: AppendGroupTransitionRequest,
+    preparedAuthorization: GroupAuthorizationState,
+    now: number
+  ): Promise<AppendGroupTransitionResult> {
+    await this.rejectIfSealed();
+    this.validateTransitionRequest(input);
+
+    const transitionKey = `${TRANSITION_PREFIX}${input.transitionId}`;
+    const fingerprint = transitionFingerprint(input);
+    const existing = await this.state.get<StoredGroupTransition>(transitionKey);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw new HttpError(409, "group_transition_conflict", "transition id already exists with different content");
+      }
+      return existing.result;
+    }
+
+    const meta = await this.getMeta();
+    const authorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
+    if (!authorization) {
+      throw new HttpError(428, "group_authorization_uninitialized", "group authorization has not been initialized");
+    }
+    const storedRosterVersion = authorization.manifest.rosterVersion;
+    const storedCommitMessageId = authorization.manifest.lastCommitMessageId ?? "";
+    if (
+      (meta.currentRosterVersion !== undefined && meta.currentRosterVersion !== storedRosterVersion) ||
+      (meta.lastCommitMessageId !== undefined && meta.lastCommitMessageId !== storedCommitMessageId)
+    ) {
+      throw new HttpError(500, "storage_integrity_error", "group outbox meta does not match authorization state");
+    }
+    const requestBindingEntries = await this.validateAndPrepareRequestBinding(input, now);
+    for (const envelope of input.envelopes) {
+      const existingSeq = await this.state.get<number>(`${IDEMPOTENCY_PREFIX}${envelope.messageId}`);
+      if (existingSeq !== undefined) {
+        throw new HttpError(409, "group_transition_conflict", "transition message id already belongs to another record");
+      }
+    }
+    if (
+      input.expectedPreviousRosterVersion !== storedRosterVersion ||
+      (input.expectedPreviousCommitMessageId ?? "") !== storedCommitMessageId
+    ) {
+      throw new HttpError(409, "roster_version_conflict", "group transition base does not match the authoritative roster");
+    }
+
+    const firstSeq = meta.headSeq + 1;
+    const lastSeq = firstSeq + input.envelopes.length - 1;
+    const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1000;
+    const records = input.envelopes.map<GroupOutboxRecord>((envelope, offset) => ({
+      seq: firstSeq + offset,
+      groupId: this.groupId,
+      messageId: envelope.messageId,
+      receivedAt: now,
+      expiresAt,
+      state: "available",
+      envelope
+    }));
+
+    const indexes: Array<[string, StoredGroupRecordIndex]> = [];
+    for (const record of records) {
+      const serialized = JSON.stringify(record);
+      const index: StoredGroupRecordIndex = {
+        seq: record.seq,
+        groupId: record.groupId,
+        messageId: record.messageId,
+        receivedAt: record.receivedAt,
+        expiresAt,
+        state: record.state,
+        transitionId: input.transitionId,
+        transitionStartSeq: firstSeq,
+        transitionEndSeq: lastSeq
+      };
+      if (new TextEncoder().encode(serialized).byteLength <= meta.maxInlineBytes && record.envelope.inlineCiphertext) {
+        index.inlineRecord = record;
+      } else {
+        const payloadRef = `group-outbox-transition/${this.groupId}/${input.transitionId}/${record.messageId}.json`;
+        await this.spillStore.putJson(payloadRef, record);
+        index.payloadRef = payloadRef;
+      }
+      indexes.push([`${RECORD_PREFIX}${record.seq}`, index]);
+    }
+
+    // External R2 writes above can yield. Re-read the authoritative keys and
+    // reject rather than committing records against a base that raced ahead.
+    const currentMeta = await this.getMeta();
+    const currentAuthorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
+    if (
+      currentMeta.headSeq !== meta.headSeq ||
+      (currentMeta.currentRosterVersion !== undefined && currentMeta.currentRosterVersion !== storedRosterVersion) ||
+      (currentMeta.lastCommitMessageId !== undefined && currentMeta.lastCommitMessageId !== storedCommitMessageId) ||
+      !currentAuthorization ||
+      currentAuthorization.manifest.signature !== authorization.manifest.signature ||
+      currentAuthorization.manifest.rosterVersion !== input.expectedPreviousRosterVersion ||
+      (currentAuthorization.manifest.lastCommitMessageId ?? "") !== storedCommitMessageId
+    ) {
+      throw new HttpError(409, "roster_version_conflict", "group transition base changed while payloads were prepared");
+    }
+
+    const result: AppendGroupTransitionResult = {
+      accepted: true,
+      transitionId: input.transitionId,
+      firstSeq,
+      lastSeq,
+      rosterVersion: preparedAuthorization.manifest.rosterVersion,
+      lastCommitMessageId: preparedAuthorization.manifest.lastCommitMessageId
+    };
+    const entries: Record<string, unknown> = {
+      [META_KEY]: {
+        ...meta,
+        headSeq: lastSeq,
+        currentRosterVersion: preparedAuthorization.manifest.rosterVersion,
+        lastCommitMessageId: preparedAuthorization.manifest.lastCommitMessageId
+      },
+      [GROUP_AUTHORIZATION_KEY]: {
+        ...preparedAuthorization,
+        lastTransitionId: input.transitionId
+      },
+      [transitionKey]: { fingerprint, operation: input.operation, requestBinding: input.requestBinding, result } satisfies StoredGroupTransition,
+      ...requestBindingEntries
+    };
+    for (const [key, index] of indexes) {
+      entries[key] = index;
+      entries[`${IDEMPOTENCY_PREFIX}${index.messageId}`] = index.seq;
+    }
+    await this.state.putEntries(entries);
+    await this.state.setAlarm(expiresAt);
+
+    for (const record of records) {
+      this.publish({ event: "group_head_updated", groupId: this.groupId, seq: record.seq });
+      this.publish({ event: "group_outbox_record_available", groupId: this.groupId, seq: record.seq, record });
+    }
+    return result;
+  }
+
+  private validateTransitionRequest(input: AppendGroupTransitionRequest): void {
+    if (input.groupId !== this.groupId || !input.transitionId || input.envelopes.length < 2 || input.envelopes.length > 3 || !input.operation || typeof input.operation !== "object") {
+      throw new HttpError(400, "invalid_input", "group transition must contain one to three envelopes for this group");
+    }
+    const messageIds = new Set<string>();
+    let proofJson: string | undefined;
+    for (const envelope of input.envelopes) {
+      if (
+        envelope.groupId !== this.groupId ||
+        envelope.transitionId !== input.transitionId ||
+        envelope.senderUserId !== input.capability.userId ||
+        envelope.senderDeviceId !== input.capability.deviceId ||
+        messageIds.has(envelope.messageId)
+      ) {
+        throw new HttpError(409, "group_transition_invalid", "group transition envelope binding is invalid");
+      }
+      messageIds.add(envelope.messageId);
+      if (envelope.membershipProof) {
+        const nextProofJson = JSON.stringify(envelope.membershipProof);
+        if (proofJson && proofJson !== nextProofJson) {
+          throw new HttpError(409, "group_transition_invalid", "group transition envelopes carry different membership proofs");
+        }
+        proofJson = nextProofJson;
+      }
+    }
+    const proof = input.envelopes.find((envelope) => envelope.membershipProof)?.membershipProof;
+    if (
+      !proof ||
+      proof.operation !== groupTransitionProofOperation(input.operation) ||
+      proof.previousRosterVersion !== input.expectedPreviousRosterVersion
+    ) {
+      throw new HttpError(409, "group_transition_invalid", "group transition proof does not match the request base");
+    }
+    const commitIsCurrent = proof.commitMessageId === (input.expectedPreviousCommitMessageId ?? "");
+    if (!messageIds.has(proof.controlMessageId) || (!messageIds.has(proof.commitMessageId) && !commitIsCurrent)) {
+      throw new HttpError(409, "group_transition_invalid", "group transition proof references records outside the bundle");
+    }
+    if (proof.stateEventMessageId && !messageIds.has(proof.stateEventMessageId)) {
+      throw new HttpError(409, "group_transition_invalid", "group state event is not part of the transition bundle");
+    }
+    if (!proof.stateEventMessageId) {
+      throw new HttpError(409, "group_transition_invalid", "group transition must contain a bound state event");
+    }
+    const controls = input.envelopes.filter((envelope) =>
+      envelope.messageId === proof.controlMessageId && envelope.messageType.startsWith("control_group_")
+    );
+    const stateEvents = input.envelopes.filter((envelope) =>
+      envelope.messageId === proof.stateEventMessageId && envelope.messageType === "control_group_state_event"
+    );
+    if (controls.length !== 1 || stateEvents.length !== 1) {
+      throw new HttpError(409, "group_transition_invalid", "group transition control and state event records are invalid");
+    }
+  }
+
+  private async validateAndPrepareRequestBinding(
+    input: AppendGroupTransitionRequest,
+    now: number
+  ): Promise<Record<string, unknown>> {
+    const binding = input.requestBinding;
+    if (input.operation.type === "approve_join") {
+      if (!binding || binding.type !== "join" || binding.requestId !== input.operation.requestId) {
+        throw new HttpError(409, "group_join_lease_invalid", "join transition must bind its claimed join request");
+      }
+      const key = `${JOIN_REQUEST_PREFIX}${binding.requestId}`;
+      const stored = await this.state.get<StoredGroupJoinRequest>(key);
+      const lease = stored?.lease;
+      if (
+        !stored || stored.request.status !== "transition_in_progress" ||
+        stored.request.joinerUserId !== input.operation.userId ||
+        stored.request.joinerDeviceId !== input.operation.deviceId ||
+        !lease || lease.expiresAt <= now || lease.token !== binding.leaseToken ||
+        lease.userId !== input.capability.userId || lease.deviceId !== input.capability.deviceId
+      ) {
+        throw new HttpError(409, "group_join_lease_invalid", "join transition lease is missing, expired, or does not match the joiner");
+      }
+      return {
+        [key]: {
+          ...stored,
+          transitionId: input.transitionId,
+          committedBinding: { transitionId: input.transitionId, leaseToken: binding.leaseToken, committedAt: now }
+        } satisfies StoredGroupJoinRequest
+      };
+    }
+    if (input.operation.type === "approve_leave") {
+      if (!binding || binding.type !== "leave" || binding.requestId !== input.operation.requestId) {
+        throw new HttpError(409, "group_leave_lease_invalid", "leave transition must bind its claimed leave request");
+      }
+      const key = `${LEAVE_REQUEST_PREFIX}${binding.requestId}`;
+      const stored = await this.state.get<StoredGroupLeaveRequest>(key);
+      const lease = stored?.lease;
+      if (
+        !stored || stored.request.status !== "transition_in_progress" ||
+        stored.request.leaverUserId !== input.operation.userId ||
+        stored.request.leaverDeviceId !== input.operation.deviceId ||
+        !lease || lease.expiresAt <= now || lease.token !== binding.leaseToken ||
+        lease.userId !== input.capability.userId || lease.deviceId !== input.capability.deviceId
+      ) {
+        throw new HttpError(409, "group_leave_lease_invalid", "leave transition lease is missing, expired, or does not match the leaver");
+      }
+      return {
+        [key]: {
+          ...stored,
+          request: { ...stored.request, status: "completed" },
+          transitionId: input.transitionId,
+          lease: undefined
+        } satisfies StoredGroupLeaveRequest
+      };
+    }
+    if (binding) {
+      throw new HttpError(409, "group_transition_invalid", "request binding is only valid for join or leave transitions");
+    }
+    return {};
   }
 
   async fetchOutbox(input: FetchGroupOutboxRequest): Promise<FetchGroupOutboxResult> {
@@ -224,23 +500,48 @@ export class GroupOutboxService {
 
     const meta = await this.getMeta();
     const records: GroupOutboxRecord[] = [];
-    const upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
+    const firstIndex = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${input.fromSeq}`);
+    if (
+      firstIndex?.transitionStartSeq !== undefined &&
+      firstIndex.transitionStartSeq !== input.fromSeq
+    ) {
+      throw new HttpError(
+        409,
+        "group_cursor_invalid",
+        "requested cursor falls inside a transition bundle",
+        { bundleStartSeq: firstIndex.transitionStartSeq }
+      );
+    }
+    let upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
+    const boundaryIndex = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${upper}`);
+    if (boundaryIndex?.transitionEndSeq !== undefined) {
+      upper = Math.min(meta.headSeq, Math.max(upper, boundaryIndex.transitionEndSeq));
+    }
     for (let seq = input.fromSeq; seq <= upper; seq += 1) {
       const index = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${seq}`);
       if (!index) {
-        continue;
+        throw new HttpError(500, "storage_integrity_error", `group record index is missing at seq ${seq}`);
       }
+      this.validateStoredRecordIndex(index, seq);
       if (index.inlineRecord) {
+        this.validateMaterializedRecord(index.inlineRecord, index, seq);
         records.push(index.inlineRecord);
         continue;
       }
       if (!index.payloadRef) {
-        throw new HttpError(500, "temporary_unavailable", "group record payload reference is missing");
+        throw new HttpError(500, "storage_integrity_error", `group record payload reference is missing at seq ${seq}`);
       }
-      const record = await this.spillStore.getJson<GroupOutboxRecord>(index.payloadRef);
-      if (record) {
-        records.push(record);
+      let record: GroupOutboxRecord | null;
+      try {
+        record = await this.spillStore.getJson<GroupOutboxRecord>(index.payloadRef);
+      } catch {
+        throw new HttpError(500, "storage_integrity_error", `group spill payload is invalid at seq ${seq}`);
       }
+      if (!record) {
+        throw new HttpError(500, "storage_integrity_error", `group spill payload is missing at seq ${seq}`);
+      }
+      this.validateMaterializedRecord(record, index, seq);
+      records.push(record);
     }
 
     return {
@@ -258,6 +559,24 @@ export class GroupOutboxService {
     };
   }
 
+  private validateStoredRecordIndex(index: StoredGroupRecordIndex, seq: number): void {
+    if (index.seq !== seq || index.groupId !== this.groupId || !index.messageId) {
+      throw new HttpError(500, "storage_integrity_error", `group record index does not match seq ${seq}`);
+    }
+  }
+
+  private validateMaterializedRecord(record: GroupOutboxRecord, index: StoredGroupRecordIndex, seq: number): void {
+    if (
+      record.seq !== seq ||
+      record.seq !== index.seq ||
+      record.messageId !== index.messageId ||
+      record.groupId !== this.groupId ||
+      record.groupId !== index.groupId
+    ) {
+      throw new HttpError(500, "storage_integrity_error", `group record payload does not match index at seq ${seq}`);
+    }
+  }
+
   async createInvite(
     input: CreateGroupInviteRequest,
     inviteUrl: string,
@@ -272,7 +591,10 @@ export class GroupOutboxService {
     const key = `${INVITE_PREFIX}${input.document.inviteId}`;
     const existing = await this.state.get<StoredGroupInvite>(key);
     if (existing) {
-      if (existing.document.signature !== input.document.signature) {
+      const { signature: _storedToken, ...storedDocument } = existing.document;
+      const { signature: _requestedSignature, ...requestedDocument } = input.document;
+      if (canonicalJson(storedDocument) !== canonicalJson(requestedDocument) ||
+          existing.maxUses !== (input.maxUses ?? input.document.maxUses)) {
         throw new HttpError(409, "conflict", "invite id already exists with a different document");
       }
       return { inviteUrl: existing.inviteUrl, invite: existing.document };
@@ -284,9 +606,36 @@ export class GroupOutboxService {
       uses: 0,
       maxUses: input.maxUses ?? input.document.maxUses
     };
-    await this.state.put(key, stored);
-    await this.state.setAlarm(input.document.expiresAt);
+    const revision = (await this.state.get<number>(INVITE_REVISION_KEY)) ?? 0;
+    await this.state.putEntries({ [key]: stored, [INVITE_REVISION_KEY]: revision + 1 });
+    await this.scheduleNextAlarm(now);
+    this.publish({ event: "group_invites_changed", groupId: this.groupId, revision: revision + 1 });
     return { inviteUrl, invite: stored.document };
+  }
+
+  async listInvites(now: number): Promise<ListGroupInvitesResult> {
+    await this.processAlarm(now);
+    const rows = await this.state.list<StoredGroupInvite>({ prefix: INVITE_PREFIX });
+    const invites = Array.from(rows.values())
+      .filter((stored) => stored.document.groupId === this.groupId)
+      .map((stored) => ({
+        inviteUrl: stored.inviteUrl,
+        invite: stored.document,
+        status: stored.revokedAt !== undefined
+          ? "revoked" as const
+          : stored.document.expiresAt <= now
+            ? "expired" as const
+            : stored.maxUses !== undefined && stored.uses >= stored.maxUses
+              ? "exhausted" as const
+              : "active" as const,
+        uses: stored.uses,
+        maxUses: stored.maxUses,
+        revokedAt: stored.revokedAt,
+        expiredAt: stored.expiredAt,
+        exhaustedAt: stored.exhaustedAt
+      }))
+      .sort((left, right) => right.invite.createdAt - left.invite.createdAt);
+    return { revision: (await this.state.get<number>(INVITE_REVISION_KEY)) ?? 0, invites };
   }
 
   async fetchInvite(payload: GroupInviteTokenPayload, now: number): Promise<FetchGroupInviteResult> {
@@ -318,7 +667,16 @@ export class GroupOutboxService {
     if (!stored) {
       throw new HttpError(404, "not_found", "invite not found");
     }
-    await this.state.put(key, { ...stored, revokedAt: now });
+    if (stored.revokedAt !== undefined) {
+      return { accepted: true, inviteId: input.inviteId };
+    }
+    const revision = (await this.state.get<number>(INVITE_REVISION_KEY)) ?? 0;
+    await this.state.putEntries({
+      [key]: { ...stored, revokedAt: now },
+      [INVITE_REVISION_KEY]: revision + 1
+    });
+    this.publish({ event: "group_invites_changed", groupId: this.groupId, revision: revision + 1 });
+    await this.scheduleNextAlarm(now);
     return { accepted: true, inviteId: input.inviteId };
   }
 
@@ -339,6 +697,18 @@ export class GroupOutboxService {
       throw new HttpError(403, "invalid_invite", "invite does not allow link join requests");
     }
     this.validateJoinRequest(input.request, now);
+    const idempotencyKey = `${JOIN_REQUEST_IDEMPOTENCY_PREFIX}${encodeURIComponent(payload.inviteId)}:${encodeURIComponent(input.request.joinerUserId)}:${encodeURIComponent(input.request.joinerDeviceId)}`;
+    const existingRequestId = await this.state.get<string>(idempotencyKey);
+    if (existingRequestId) {
+      const existingByIdentity = await this.state.get<StoredGroupJoinRequest>(`${JOIN_REQUEST_PREFIX}${existingRequestId}`);
+      if (existingByIdentity) {
+        return {
+          accepted: true,
+          request: existingByIdentity.request,
+          autoApprove: existingByIdentity.request.autoApprove
+        };
+      }
+    }
     const key = `${JOIN_REQUEST_PREFIX}${input.request.requestId}`;
     const existing = await this.state.get<StoredGroupJoinRequest>(key);
     if (existing) {
@@ -353,19 +723,29 @@ export class GroupOutboxService {
     }
     const request: GroupJoinRequest = {
       ...input.request,
-      status: "pending",
+      status: invite.document.joinPolicy === "open_by_invite" ? "waiting_for_group_commit" : "pending_approval",
       autoApprove: invite.document.joinPolicy === "open_by_invite"
     };
-    await this.state.put<StoredGroupJoinRequest>(key, { request });
-    await this.state.put<StoredGroupInvite>(`${INVITE_PREFIX}${payload.inviteId}`, {
-      ...invite,
-      uses: invite.uses + 1
+    const inviteRevision = (await this.state.get<number>(INVITE_REVISION_KEY)) ?? 0;
+    const nextUses = invite.uses + 1;
+    const exhaustedAt = invite.maxUses !== undefined && nextUses >= invite.maxUses ? now : invite.exhaustedAt;
+    await this.state.putEntries({
+      [key]: { request } satisfies StoredGroupJoinRequest,
+      [idempotencyKey]: request.requestId,
+      [`${INVITE_PREFIX}${payload.inviteId}`]: {
+        ...invite,
+        uses: nextUses,
+        exhaustedAt
+      } satisfies StoredGroupInvite,
+      [INVITE_REVISION_KEY]: inviteRevision + 1
     });
-    this.publish({
-      event: "group_join_request_available",
-      groupId: this.groupId,
-      requestId: request.requestId
-    });
+    this.publish({ event: "group_invites_changed", groupId: this.groupId, revision: inviteRevision + 1 });
+    this.publish(
+      request.status === "pending_approval"
+        ? { event: "group_join_request_available", groupId: this.groupId, requestId: request.requestId }
+        : { event: "group_auto_join_available", groupId: this.groupId, requestId: request.requestId }
+    );
+    await this.scheduleNextAlarm(now);
     return { accepted: true, request, autoApprove: request.autoApprove };
   }
 
@@ -373,7 +753,10 @@ export class GroupOutboxService {
     const result = await this.state.list<StoredGroupJoinRequest>({ prefix: JOIN_REQUEST_PREFIX });
     const requests = Array.from(result.values())
       .map((stored) => stored.request)
-      .filter((request) => request.groupId === this.groupId && request.status === "pending")
+      .filter((request) =>
+        request.groupId === this.groupId &&
+        ["pending", "pending_approval", "waiting_for_group_commit", "transition_in_progress"].includes(request.status)
+      )
       .sort((a, b) => a.requestedAt - b.requestedAt || a.requestId.localeCompare(b.requestId));
     return { requests };
   }
@@ -389,7 +772,7 @@ export class GroupOutboxService {
     if (stored.request.requestCapability !== requestCapability) {
       throw new HttpError(403, "invalid_capability", "join request capability does not match bearer token");
     }
-    if (stored.request.status !== "approved") {
+    if (!["approved", "welcome_available", "joined"].includes(stored.request.status)) {
       return { request: stored.request };
     }
     return {
@@ -398,6 +781,215 @@ export class GroupOutboxService {
       manifest: stored.manifest,
       startCursor: stored.startCursor
     };
+  }
+
+  async claimJoinRequest(input: ClaimGroupJoinRequest, now: number): Promise<ClaimGroupJoinResult> {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group join route");
+    }
+    await this.rejectIfSealed();
+    const key = `${JOIN_REQUEST_PREFIX}${input.requestId}`;
+    const stored = await this.state.get<StoredGroupJoinRequest>(key);
+    if (!stored || stored.request.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "join request not found");
+    }
+    if (!["waiting_for_group_commit", "transition_in_progress"].includes(stored.request.status)) {
+      throw new HttpError(409, "group_join_terminal", "join request is already terminal");
+    }
+    if (stored.lease && stored.lease.expiresAt > now) {
+      if (
+        stored.lease.userId === input.capability.userId &&
+        stored.lease.deviceId === input.capability.deviceId
+      ) {
+        return {
+          accepted: true,
+          request: stored.request,
+          leaseToken: stored.lease.token,
+          leaseExpiresAt: stored.lease.expiresAt
+        };
+      }
+      throw new HttpError(409, "group_join_claimed", "join request is claimed by another administrator device");
+    }
+    const lease = {
+      token: crypto.randomUUID(),
+      userId: input.capability.userId,
+      deviceId: input.capability.deviceId,
+      expiresAt: now + JOIN_LEASE_MS
+    };
+    const request: GroupJoinRequest = { ...stored.request, status: "transition_in_progress" };
+    await this.state.put(key, { ...stored, request, lease });
+    await this.state.setAlarm(lease.expiresAt);
+    return {
+      accepted: true,
+      request,
+      leaseToken: lease.token,
+      leaseExpiresAt: lease.expiresAt
+    };
+  }
+
+  async completeJoinRequest(
+    input: CompleteGroupJoinRequest,
+    now: number
+  ): Promise<CompleteGroupJoinResult> {
+    if (input.groupId !== this.groupId) {
+      throw new HttpError(400, "invalid_input", "group_id does not match group join route");
+    }
+    await this.rejectIfSealed();
+    const key = `${JOIN_REQUEST_PREFIX}${input.requestId}`;
+    const stored = await this.state.get<StoredGroupJoinRequest>(key);
+    if (!stored || stored.request.groupId !== this.groupId) {
+      throw new HttpError(404, "not_found", "join request not found");
+    }
+    const completionFingerprint = canonicalJson({
+      transitionId: input.transitionId,
+      leaseToken: input.leaseToken,
+      welcomePickup: input.welcomePickup,
+      manifest: input.manifest,
+      startCursor: input.startCursor
+    });
+    if (["welcome_available", "joined"].includes(stored.request.status)) {
+      if (stored.transitionId === input.transitionId && stored.completionFingerprint === completionFingerprint) {
+        return { accepted: true, request: stored.request };
+      }
+      throw new HttpError(409, "group_transition_conflict", "join completion differs from the stored completion");
+    }
+    const lease = stored.lease;
+    const committed = stored.committedBinding;
+    if (
+      stored.request.status !== "transition_in_progress" ||
+      !lease || !committed ||
+      committed.transitionId !== input.transitionId ||
+      committed.leaseToken !== input.leaseToken ||
+      lease.token !== input.leaseToken ||
+      lease.userId !== input.capability.userId ||
+      lease.deviceId !== input.capability.deviceId
+    ) {
+      throw new HttpError(409, "group_join_lease_invalid", "join request lease is missing, expired, or owned by another device");
+    }
+    const authorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
+    const transition = await this.state.get<StoredGroupTransition>(`${TRANSITION_PREFIX}${input.transitionId}`);
+    const manifestHash = await groupManifestSha256(input.manifest);
+    const authorizationHash = authorization ? await groupManifestSha256(authorization.manifest) : "";
+    const member = input.manifest.members.find((item) => item.userId === stored.request.joinerUserId && item.status === "active");
+    const device = (input.manifest.memberDevices ?? []).find((item) =>
+      item.userId === stored.request.joinerUserId && item.deviceId === stored.request.joinerDeviceId && item.status === "active"
+    );
+    if (
+      !authorization ||
+      !transition || transition.requestBinding?.type !== "join" ||
+      transition.requestBinding.requestId !== input.requestId ||
+      transition.requestBinding.leaseToken !== input.leaseToken ||
+      transition.operation.type !== "approve_join" ||
+      authorization.lastTransitionId !== input.transitionId ||
+      authorizationHash !== manifestHash || !member || !device ||
+      input.welcomePickup.groupId !== this.groupId ||
+      input.welcomePickup.deviceId !== stored.request.joinerDeviceId ||
+      input.welcomePickup.requestId !== input.requestId ||
+      input.startCursor.groupId !== this.groupId ||
+      input.startCursor.lastFetchedSeq !== transition.result.lastSeq ||
+      input.startCursor.lastFetchedSeq !== input.welcomePickup.startSeq ||
+      input.welcomePickup.rosterVersion !== transition.result.rosterVersion ||
+      (input.welcomePickup.lastCommitMessageId ?? "") !== (transition.result.lastCommitMessageId ?? "")
+    ) {
+      throw new HttpError(409, "group_transition_invalid", "join completion does not match the committed group transition");
+    }
+    const request: GroupJoinRequest = { ...stored.request, status: "welcome_available" };
+    await this.state.put(key, {
+      ...stored,
+      request,
+      welcomePickup: input.welcomePickup,
+      manifest: input.manifest,
+      startCursor: input.startCursor,
+      transitionId: input.transitionId,
+      lease: undefined,
+      completionFingerprint
+    } satisfies StoredGroupJoinRequest);
+    return { accepted: true, request };
+  }
+
+  async markWelcomeClaimed(requestId: string, deviceId: string, capability: string): Promise<void> {
+    const key = `${JOIN_REQUEST_PREFIX}${requestId}`;
+    const stored = await this.state.get<StoredGroupJoinRequest>(key);
+    if (!stored || stored.request.status !== "welcome_available" ||
+        stored.request.joinerDeviceId !== deviceId ||
+        stored.welcomePickup?.requestId !== requestId || stored.welcomePickup.capability !== capability) {
+      throw new HttpError(409, "group_transition_invalid", "welcome claim does not match the completed join request");
+    }
+    await this.state.put(key, { ...stored, request: { ...stored.request, status: "joined" } } satisfies StoredGroupJoinRequest);
+  }
+
+  async authorizeWelcomeUpload(requestId: string, deviceId: string, capability: string): Promise<void> {
+    const stored = await this.state.get<StoredGroupJoinRequest>(`${JOIN_REQUEST_PREFIX}${requestId}`);
+    if (!stored || stored.request.status !== "transition_in_progress" || !stored.committedBinding ||
+        stored.request.joinerDeviceId !== deviceId || !capability) {
+      throw new HttpError(409, "group_transition_invalid", "welcome upload is not bound to a committed join transition");
+    }
+  }
+
+  async submitLeaveRequest(input: SubmitGroupLeaveRequest, now: number): Promise<SubmitGroupLeaveResult> {
+    if (input.groupId !== this.groupId || input.request.groupId !== this.groupId ||
+        input.request.leaverUserId !== input.capability.userId ||
+        input.request.leaverDeviceId !== input.capability.deviceId) {
+      throw new HttpError(400, "invalid_input", "leave request does not match its route or capability");
+    }
+    await this.rejectIfSealed();
+    if (!input.request.requestId || !input.request.requestCapability || !input.request.signature ||
+        input.request.requestedAt > now + 5 * 60 * 1000) {
+      throw new HttpError(400, "invalid_input", "leave request is malformed");
+    }
+    const authorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
+    if (authorization?.manifest.ownerUserId === input.request.leaverUserId) {
+      throw new HttpError(409, "group_transition_invalid", "group owner must transfer ownership before leaving");
+    }
+    const idempotencyKey = `${LEAVE_REQUEST_IDEMPOTENCY_PREFIX}${encodeURIComponent(input.request.leaverUserId)}:${encodeURIComponent(input.request.leaverDeviceId)}`;
+    const existingId = await this.state.get<string>(idempotencyKey);
+    if (existingId) {
+      const existing = await this.state.get<StoredGroupLeaveRequest>(`${LEAVE_REQUEST_PREFIX}${existingId}`);
+      if (existing) return { accepted: true, request: existing.request };
+    }
+    const key = `${LEAVE_REQUEST_PREFIX}${input.request.requestId}`;
+    const existing = await this.state.get<StoredGroupLeaveRequest>(key);
+    if (existing) {
+      if (canonicalJson(existing.request) !== canonicalJson({ ...input.request, status: existing.request.status })) {
+        throw new HttpError(409, "group_transition_conflict", "leave request id already exists with different content");
+      }
+      return { accepted: true, request: existing.request };
+    }
+    const request: GroupLeaveRequest = { ...input.request, status: "waiting_for_group_commit" };
+    await this.state.putEntries({ [key]: { request } satisfies StoredGroupLeaveRequest, [idempotencyKey]: request.requestId });
+    this.publish({ event: "group_leave_request_available", groupId: this.groupId, requestId: request.requestId });
+    return { accepted: true, request };
+  }
+
+  async listLeaveRequests(): Promise<ListGroupLeaveRequestsResult> {
+    const rows = await this.state.list<StoredGroupLeaveRequest>({ prefix: LEAVE_REQUEST_PREFIX });
+    return {
+      requests: Array.from(rows.values()).map((stored) => stored.request)
+        .filter((request) => request.groupId === this.groupId && ["waiting_for_group_commit", "transition_in_progress"].includes(request.status))
+        .sort((a, b) => a.requestedAt - b.requestedAt || a.requestId.localeCompare(b.requestId))
+    };
+  }
+
+  async claimLeaveRequest(input: ClaimGroupLeaveRequest, now: number): Promise<ClaimGroupLeaveResult> {
+    if (input.groupId !== this.groupId) throw new HttpError(400, "invalid_input", "leave request group does not match route");
+    await this.rejectIfSealed();
+    const key = `${LEAVE_REQUEST_PREFIX}${input.requestId}`;
+    const stored = await this.state.get<StoredGroupLeaveRequest>(key);
+    if (!stored) throw new HttpError(404, "not_found", "leave request not found");
+    if (!["waiting_for_group_commit", "transition_in_progress"].includes(stored.request.status)) {
+      throw new HttpError(409, "group_leave_terminal", "leave request is already terminal");
+    }
+    if (stored.lease && stored.lease.expiresAt > now) {
+      if (stored.lease.userId === input.capability.userId && stored.lease.deviceId === input.capability.deviceId) {
+        return { accepted: true, request: stored.request, leaseToken: stored.lease.token, leaseExpiresAt: stored.lease.expiresAt };
+      }
+      throw new HttpError(409, "group_leave_claimed", "leave request is claimed by another administrator device");
+    }
+    const lease = { token: crypto.randomUUID(), userId: input.capability.userId, deviceId: input.capability.deviceId, expiresAt: now + JOIN_LEASE_MS };
+    const request: GroupLeaveRequest = { ...stored.request, status: "transition_in_progress" };
+    await this.state.put(key, { ...stored, request, lease } satisfies StoredGroupLeaveRequest);
+    await this.scheduleNextAlarm(now);
+    return { accepted: true, request, leaseToken: lease.token, leaseExpiresAt: lease.expiresAt };
   }
 
   async decideJoinRequest(input: DecideGroupJoinRequest): Promise<DecideGroupJoinResult> {
@@ -410,28 +1002,80 @@ export class GroupOutboxService {
     if (!stored || stored.request.groupId !== this.groupId) {
       throw new HttpError(404, "not_found", "join request not found");
     }
-    if (stored.request.status !== "pending") {
+    if (!["pending", "pending_approval"].includes(stored.request.status)) {
       throw new HttpError(409, "conflict", "join request is already terminal");
     }
-    if (input.decision === "approve" && (!input.welcomePickup || !input.manifest || !input.startCursor)) {
-      throw new HttpError(400, "invalid_input", "approved join request requires welcome pickup, manifest, and start cursor");
+    if (input.decision === "approve") {
+      const request: GroupJoinRequest = { ...stored.request, status: "waiting_for_group_commit" };
+      await this.state.put(key, { ...stored, request });
+      this.publish({ event: "group_auto_join_available", groupId: this.groupId, requestId: request.requestId });
+      return { accepted: true, request };
     }
     if (input.decision === "reject" && (input.welcomePickup || input.manifest || input.startCursor)) {
       throw new HttpError(400, "invalid_input", "rejected join request must not include welcome pickup, manifest, or start cursor");
     }
     const request: GroupJoinRequest = {
       ...stored.request,
-      status: input.decision === "approve" ? "approved" : "rejected"
+      status: "rejected"
     };
     const updated: StoredGroupJoinRequest = {
       request,
-      welcomePickup: input.decision === "approve" ? input.welcomePickup : undefined,
-      manifest: input.decision === "approve" ? input.manifest : undefined,
-      startCursor: input.decision === "approve" ? input.startCursor : undefined,
+      welcomePickup: undefined,
+      manifest: undefined,
+      startCursor: undefined,
       reason: input.decision === "reject" ? input.reason : undefined
     };
     await this.state.put(key, updated);
     return { accepted: true, request };
+  }
+
+  async processAlarm(now: number): Promise<void> {
+    const entries: Record<string, unknown> = {};
+    let inviteChanged = false;
+    const invites = await this.state.list<StoredGroupInvite>({ prefix: INVITE_PREFIX });
+    for (const [key, stored] of invites) {
+      if (stored.revokedAt === undefined && stored.expiredAt === undefined && stored.document.expiresAt <= now) {
+        entries[key] = { ...stored, expiredAt: now } satisfies StoredGroupInvite;
+        inviteChanged = true;
+      } else if (stored.revokedAt === undefined && stored.exhaustedAt === undefined && stored.maxUses !== undefined && stored.uses >= stored.maxUses) {
+        entries[key] = { ...stored, exhaustedAt: now } satisfies StoredGroupInvite;
+        inviteChanged = true;
+      }
+    }
+    const joins = await this.state.list<StoredGroupJoinRequest>({ prefix: JOIN_REQUEST_PREFIX });
+    for (const [key, stored] of joins) {
+      if (stored.request.status === "transition_in_progress" && stored.lease && stored.lease.expiresAt <= now && !stored.committedBinding) {
+        entries[key] = { ...stored, request: { ...stored.request, status: "waiting_for_group_commit" }, lease: undefined } satisfies StoredGroupJoinRequest;
+        this.publish({ event: "group_auto_join_available", groupId: this.groupId, requestId: stored.request.requestId });
+      }
+    }
+    const leaves = await this.state.list<StoredGroupLeaveRequest>({ prefix: LEAVE_REQUEST_PREFIX });
+    for (const [key, stored] of leaves) {
+      if (stored.request.status === "transition_in_progress" && stored.lease && stored.lease.expiresAt <= now) {
+        entries[key] = { ...stored, request: { ...stored.request, status: "waiting_for_group_commit" }, lease: undefined } satisfies StoredGroupLeaveRequest;
+        this.publish({ event: "group_leave_request_available", groupId: this.groupId, requestId: stored.request.requestId });
+      }
+    }
+    if (inviteChanged) {
+      const revision = (await this.state.get<number>(INVITE_REVISION_KEY)) ?? 0;
+      entries[INVITE_REVISION_KEY] = revision + 1;
+      this.publish({ event: "group_invites_changed", groupId: this.groupId, revision: revision + 1 });
+    }
+    if (Object.keys(entries).length > 0) await this.state.putEntries(entries);
+    await this.scheduleNextAlarm(now);
+  }
+
+  private async scheduleNextAlarm(now: number): Promise<void> {
+    const deadlines: number[] = [];
+    const invites = await this.state.list<StoredGroupInvite>({ prefix: INVITE_PREFIX });
+    for (const stored of invites.values()) {
+      if (stored.revokedAt === undefined && stored.expiredAt === undefined && stored.document.expiresAt > now) deadlines.push(stored.document.expiresAt);
+    }
+    const joins = await this.state.list<StoredGroupJoinRequest>({ prefix: JOIN_REQUEST_PREFIX });
+    for (const stored of joins.values()) if (stored.lease && !stored.committedBinding && stored.lease.expiresAt > now) deadlines.push(stored.lease.expiresAt);
+    const leaves = await this.state.list<StoredGroupLeaveRequest>({ prefix: LEAVE_REQUEST_PREFIX });
+    for (const stored of leaves.values()) if (stored.lease && stored.lease.expiresAt > now) deadlines.push(stored.lease.expiresAt);
+    if (deadlines.length > 0) await this.state.setAlarm(Math.min(...deadlines));
   }
 
   private async getMeta(): Promise<GroupOutboxMeta> {
@@ -483,6 +1127,7 @@ export class GroupOutboxService {
   }
 
   private async loadUsableInvite(inviteId: string, now: number): Promise<StoredGroupInvite> {
+    await this.processAlarm(now);
     const stored = await this.state.get<StoredGroupInvite>(`${INVITE_PREFIX}${inviteId}`);
     if (!stored || stored.document.groupId !== this.groupId) {
       throw new HttpError(404, "not_found", "invite not found");
@@ -490,10 +1135,10 @@ export class GroupOutboxService {
     if (stored.revokedAt !== undefined) {
       throw new HttpError(403, "invalid_invite", "invite is revoked");
     }
-    if (stored.document.expiresAt <= now) {
+    if (stored.expiredAt !== undefined || stored.document.expiresAt <= now) {
       throw new HttpError(403, "capability_expired", "invite is expired");
     }
-    if (stored.maxUses !== undefined && stored.uses >= stored.maxUses) {
+    if (stored.exhaustedAt !== undefined || (stored.maxUses !== undefined && stored.uses >= stored.maxUses)) {
       throw new HttpError(403, "invalid_invite", "invite max uses exceeded");
     }
     return stored;

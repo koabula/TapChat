@@ -23,6 +23,10 @@ class DurableObjectStorageAdapter implements DurableObjectStorageLike {
     await this.storage.put(key, value);
   }
 
+  async putEntries(entries: Record<string, unknown>): Promise<void> {
+    await (this.storage.put as unknown as (values: Record<string, unknown>) => Promise<void>)(entries);
+  }
+
   async delete(key: string): Promise<void> {
     await this.storage.delete(key);
   }
