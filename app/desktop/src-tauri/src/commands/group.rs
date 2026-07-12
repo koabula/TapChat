@@ -45,6 +45,7 @@ use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
 };
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -681,7 +682,7 @@ pub async fn create_group_conversation(
     for member_user_id in &members {
         log::info!(
             "create_group_conversation: refreshing contact identity before group welcome user_id={}",
-            member_user_id
+            redact_id("user", member_user_id)
         );
         drive_core_with_handle(
             &app,
@@ -690,11 +691,10 @@ pub async fn create_group_conversation(
             }),
         )
         .await
-        .unwrap_or_else(|error| {
+        .unwrap_or_else(|_error| {
             log::warn!(
-                "create_group_conversation: contact identity refresh preflight failed user_id={} error={}",
-                member_user_id,
-                error
+                "create_group_conversation: contact identity refresh preflight failed user_id={} error=1",
+                redact_id("user", member_user_id)
             );
             CoreOutput::default()
         });
@@ -952,7 +952,7 @@ pub async fn invite_to_group(
     for invitee_user_id in &invitees {
         log::info!(
             "invite_to_group: refreshing contact identity before group welcome user_id={}",
-            invitee_user_id
+            redact_id("user", invitee_user_id)
         );
         drive_core_with_handle(
             &app,
@@ -961,11 +961,10 @@ pub async fn invite_to_group(
             }),
         )
         .await
-        .unwrap_or_else(|error| {
+        .unwrap_or_else(|_error| {
             log::warn!(
-                "invite_to_group: contact identity refresh preflight failed user_id={} error={}",
-                invitee_user_id,
-                error
+                "invite_to_group: contact identity refresh preflight failed user_id={} error=1",
+                redact_id("user", invitee_user_id)
             );
             CoreOutput::default()
         });
@@ -1179,7 +1178,7 @@ pub async fn submit_group_join_request(
         } else {
             "group_invite"
         },
-        trimmed
+        sanitize_url_for_log(&trimmed)
     );
 
     let output = drive_core_with_handle(&app, CoreInput::Command(command))
@@ -1216,8 +1215,8 @@ pub async fn submit_group_join_request(
         let detail = notification_error_from_output(&output, "core did not return a join request");
         log::warn!(
             "submit_group_join_request: failed url_kind=group_invite url={} detail={}",
-            trimmed,
-            detail
+            sanitize_url_for_log(&trimmed),
+            "redacted"
         );
         return Err(detail);
     }
@@ -1244,8 +1243,8 @@ pub async fn submit_group_join_request(
     };
     log::info!(
         "submit_group_join_request: submitted group_id={} request_id={} status={:?}",
-        request.group_id,
-        request.request_id,
+        redact_id("group", &request.group_id),
+        redact_id("request", &request.request_id),
         request.status
     );
     Ok(SubmitGroupJoinRequestResult {
@@ -1519,8 +1518,8 @@ pub async fn process_group_join_requests(
                     result.failed += 1;
                     log::warn!(
                         "process_group_join_requests: auto-approve failed group_id={} detail={}",
-                        group_id,
-                        detail
+                        redact_id("group", &group_id),
+                        "redacted"
                     );
                 }
             }

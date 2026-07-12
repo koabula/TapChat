@@ -171,7 +171,11 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(
             tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
+                .level(if cfg!(debug_assertions) {
+                    log::LevelFilter::Info
+                } else {
+                    log::LevelFilter::Warn
+                })
                 .max_file_size(10_000_000)
                 .targets([tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::Folder {
@@ -195,7 +199,10 @@ pub fn run() {
             if config.multi_instance {
                 log::info!("TapChat started in multi-instance mode");
                 if let Some(name) = &config.profile_name {
-                    log::info!("Loading profile: {}", name);
+                    log::info!(
+                        "Loading profile {}",
+                        crate::platform::log_sanitize::redact_id("profile", name)
+                    );
                 }
             }
 

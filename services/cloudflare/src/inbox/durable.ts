@@ -1,4 +1,5 @@
 import { APPEND_AUTH_CONTEXT_HEADER, APPEND_AUTH_REASON_HEADER, HttpError } from "../auth/capability";
+import { CONTROL_JSON_MAX_BYTES, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES, readJsonLimited } from "../auth/runtime-security";
 import { InboxService } from "./service";
 import type {
   AckRequest,
@@ -25,6 +26,17 @@ class DurableObjectStorageAdapter implements DurableObjectStorageLike {
 
   async putEntries(entries: Record<string, unknown>): Promise<void> {
     await (this.storage.put as unknown as (values: Record<string, unknown>) => Promise<void>)(entries);
+  }
+
+  async mutateEntries(entries: Record<string, unknown>, deleteKeys: string[]): Promise<void> {
+    await this.storage.transaction(async (transaction) => {
+      if (Object.keys(entries).length > 0) {
+        await (transaction.put as unknown as (values: Record<string, unknown>) => Promise<void>)(entries);
+      }
+      if (deleteKeys.length > 0) {
+        await transaction.delete(deleteKeys);
+      }
+    });
   }
 
   async delete(key: string): Promise<void> {
@@ -90,11 +102,12 @@ function versionedBody(body: unknown): unknown {
   };
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function jsonResponse(body: unknown, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(versionedBody(body)), {
     status,
     headers: {
-      "content-type": "application/json"
+      "content-type": "application/json",
+      ...headers
     }
   });
 }
@@ -116,6 +129,13 @@ export async function handleInboxDurableRequest(
     retentionDays: number;
     rateLimitPerMinute: number;
     rateLimitPerHour: number;
+    messageRequestMaxBodyBytes?: number;
+    messageRequestMaxPerSender?: number;
+    messageRequestMaxSenders?: number;
+    messageRequestMaxTotalBytes?: number;
+    messageRequestTtlSeconds?: number;
+    messageRequestRateLimitMinute?: number;
+    messageRequestRateLimitHour?: number;
     onUpgrade?: () => Response;
     now?: number;
   }
@@ -128,7 +148,13 @@ export async function handleInboxDurableRequest(
     retentionDays: deps.retentionDays,
     maxInlineBytes: deps.maxInlineBytes,
     rateLimitPerMinute: deps.rateLimitPerMinute,
-    rateLimitPerHour: deps.rateLimitPerHour
+    rateLimitPerHour: deps.rateLimitPerHour,
+    messageRequestMaxPerSender: deps.messageRequestMaxPerSender ?? 16,
+    messageRequestMaxSenders: deps.messageRequestMaxSenders ?? 64,
+    messageRequestMaxTotalBytes: deps.messageRequestMaxTotalBytes ?? 4 * 1024 * 1024,
+    messageRequestTtlSeconds: deps.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60,
+    messageRequestRateLimitMinute: deps.messageRequestRateLimitMinute ?? 30,
+    messageRequestRateLimitHour: deps.messageRequestRateLimitHour ?? 300
   });
 
   try {
@@ -143,7 +169,7 @@ export async function handleInboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/message-requests") && request.method === "GET") {
-      return jsonResponse({ requests: await service.listMessageRequests() });
+      return jsonResponse({ requests: await service.listMessageRequests(now) });
     }
 
     const requestActionMatch = url.pathname.match(/\/message-requests\/([^/]+)\/(accept|reject)$/);
@@ -161,7 +187,7 @@ export async function handleInboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
-      const body = (await request.json()) as Partial<AllowlistDocument>;
+      const body = await readJsonLimited<Partial<AllowlistDocument>>(request, CONTROL_JSON_MAX_BYTES);
       const result = await service.replaceAllowlist(
         body.allowedSenderUserIds ?? [],
         body.rejectedSenderUserIds ?? [],
@@ -171,7 +197,10 @@ export async function handleInboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
-      const body = (await request.json()) as AppendEnvelopeRequest;
+      const body = await readJsonLimited<AppendEnvelopeRequest>(
+        request,
+        deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
+      );
       const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified"
         ? "legacy_unverified"
         : "verified";
@@ -197,7 +226,7 @@ export async function handleInboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/ack") && request.method === "POST") {
-      const body = (await request.json()) as AckRequest;
+      const body = await readJsonLimited<AckRequest>(request, CONTROL_JSON_MAX_BYTES);
       const result = await service.ack(body);
       return jsonResponse({
         accepted: result.accepted,
@@ -213,7 +242,12 @@ export async function handleInboxDurableRequest(
     return jsonResponse({ error: "not_found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.code, message: error.message }, error.status);
+      const retryAfter = error.details?.retryAfterSeconds;
+      return jsonResponse(
+        { error: error.code, message: error.message },
+        error.status,
+        typeof retryAfter === "number" ? { "Retry-After": String(retryAfter) } : undefined
+      );
     }
     const runtimeError = error as { message?: string };
     const message = runtimeError.message ?? "internal error";
@@ -244,8 +278,8 @@ export class InboxDurableObject extends DurableObjectBase {
       sessions: Array.from(this.sessions.values()).map(
         (session) =>
           ({
-            send(payload: string): void {
-              session.send(payload);
+            send(payload: string): boolean {
+              return session.send(payload);
             }
           }) satisfies SessionSink
       ),
@@ -253,19 +287,30 @@ export class InboxDurableObject extends DurableObjectBase {
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
       rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
       rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+      messageRequestMaxBodyBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_BODY_BYTES ?? String(DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES)),
+      messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
+      messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
+      messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
+      messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
+      messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
+      messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300"),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
         const server = pair[1];
         server.accept();
         const sessionId = crypto.randomUUID();
-        const session = new ManagedSession(server);
-        this.sessions.set(sessionId, session);
-        queueMicrotask(() => {
-          session.markReady();
-        });
-        server.addEventListener("close", () => {
+        const removeSession = () => {
           this.sessions.delete(sessionId);
+        };
+        const session = new ManagedSession(server, removeSession);
+        this.sessions.set(sessionId, session);
+        server.addEventListener("close", () => {
+          session.terminate();
+        });
+        server.addEventListener("error", (event: Event) => {
+          event.preventDefault();
+          session.terminate();
         });
         return new Response(null, {
           status: 101,
@@ -287,47 +332,66 @@ export class InboxDurableObject extends DurableObjectBase {
         retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
         maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
         rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
-        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600")
+        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+        messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
+        messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
+        messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
+        messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
+        messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
+        messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300")
       }
     );
     await service.cleanExpiredRecords(Date.now());
   }
 }
 
-class ManagedSession {
+export class ManagedSession {
   private readonly socket: WebSocket;
-  private ready = false;
-  private readonly queuedPayloads: string[] = [];
+  private readonly onClosed: () => void;
+  private closed = false;
 
-  constructor(socket: WebSocket) {
+  constructor(socket: WebSocket, onClosed: () => void) {
     this.socket = socket;
+    this.onClosed = onClosed;
   }
 
-  send(payload: string): void {
-    if (!this.ready) {
-      this.queuedPayloads.push(payload);
-      return;
+  send(payload: string): boolean {
+    if (this.closed) {
+      return false;
     }
-    this.dispatch(payload);
-  }
-
-  markReady(): void {
-    if (this.ready) {
-      return;
+    if (this.socket.readyState !== 1) {
+      this.finish(false);
+      return false;
     }
-    this.ready = true;
-    while (this.queuedPayloads.length > 0) {
-      const payload = this.queuedPayloads.shift();
-      if (payload === undefined) {
-        break;
-      }
-      this.dispatch(payload);
-    }
-  }
-
-  private dispatch(payload: string): void {
-    setTimeout(() => {
+    try {
       this.socket.send(payload);
-    }, 0);
+      return true;
+    } catch {
+      this.close();
+      return false;
+    }
+  }
+
+  close(): void {
+    this.finish(true);
+  }
+
+  terminate(): void {
+    this.finish(false);
+  }
+
+  private finish(closeSocket: boolean): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (closeSocket) {
+      try {
+        this.socket.close(1011, "session closed");
+      } catch {
+        // The peer may already have closed the socket.
+      }
+    }
+    this.onClosed();
   }
 }

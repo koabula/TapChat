@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { clearClipboardIfUnchanged } from "../../lib/clipboardSecurity";
 
 interface LocationState {
   mnemonic: string;
@@ -13,29 +15,88 @@ export default function BackupMnemonic() {
 
   const mnemonic = state?.mnemonic || "";
   const [confirmed, setConfirmed] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const [copyConfirmed, setCopyConfirmed] = useState(false);
+  const [copiedUntil, setCopiedUntil] = useState<number | null>(null);
+  const [secondsUntilClear, setSecondsUntilClear] = useState(0);
+  const [clipboardWarning, setClipboardWarning] = useState<string | null>(null);
 
   const words = mnemonic.split(" ");
 
+  const clearMnemonicIfUnchanged = useCallback(async () => {
+    try {
+      await clearClipboardIfUnchanged(mnemonic);
+    } catch {
+      setClipboardWarning("TapChat could not clear the clipboard. Copy something else before leaving your device unattended.");
+    }
+  }, [mnemonic]);
+
+  useEffect(() => {
+    if (!copiedUntil) {
+      return;
+    }
+    const tick = () => {
+      const remaining = Math.max(0, Math.ceil((copiedUntil - Date.now()) / 1000));
+      setSecondsUntilClear(remaining);
+      if (remaining === 0) {
+        setCopiedUntil(null);
+        void clearMnemonicIfUnchanged();
+      }
+    };
+    tick();
+    const timer = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(timer);
+  }, [clearMnemonicIfUnchanged, copiedUntil]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow().onCloseRequested(async () => {
+      await clearMnemonicIfUnchanged();
+    }).then((dispose) => {
+      unlisten = dispose;
+    }).catch(() => {
+      // Route cleanup below remains the best-effort fallback.
+    });
+    return () => {
+      unlisten?.();
+      void clearMnemonicIfUnchanged();
+    };
+  }, [clearMnemonicIfUnchanged]);
+
+  useEffect(() => {
+    if (!mnemonic) {
+      navigate("/onboarding", { replace: true });
+    }
+  }, [mnemonic, navigate]);
+
   const handleCopy = async () => {
+    if (!copyConfirmed) {
+      const accepted = window.confirm(
+        "Your recovery phrase will be visible to every application that can read the system clipboard. TapChat will clear it after 30 seconds if it has not been replaced. Continue?"
+      );
+      if (!accepted) {
+        return;
+      }
+      setCopyConfirmed(true);
+    }
     try {
       await writeText(mnemonic);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      console.error(`[BackupMnemonic] Failed to copy mnemonic: ${String(err)}`);
+      setClipboardWarning(null);
+      setCopiedUntil(Date.now() + 30_000);
+      setSecondsUntilClear(30);
+    } catch {
+      setClipboardWarning("TapChat could not copy the recovery phrase. Please write it down manually.");
     }
   };
 
-  const handleContinue = () => {
+  const handleContinue = async () => {
     if (confirmed) {
+      await clearMnemonicIfUnchanged();
       navigate("/onboarding/cloudflare");
     }
   };
 
   // If no mnemonic (e.g., direct navigation), redirect to start
   if (!mnemonic) {
-    navigate("/onboarding");
     return null;
   }
 
@@ -45,7 +106,7 @@ export default function BackupMnemonic() {
       <div className="flex items-center mb-8">
         <button
           className="btn btn-ghost px-2"
-          onClick={() => navigate("/onboarding/identity")}
+          onClick={() => { void clearMnemonicIfUnchanged().then(() => navigate("/onboarding/identity")); }}
         >
           ← Back
         </button>
@@ -79,8 +140,17 @@ export default function BackupMnemonic() {
           className="btn btn-ghost mb-4"
           onClick={handleCopy}
         >
-          {copied ? "Copied!" : "Copy to Clipboard"}
+          {copiedUntil ? `Copied · clears in ${secondsUntilClear}s` : "Copy to Clipboard"}
         </button>
+
+        <p className="text-xs text-muted-color text-center mb-4 max-w-sm">
+          Clipboard history and other applications may retain copied recovery phrases. Prefer writing it down.
+        </p>
+        {clipboardWarning && (
+          <p className="status-warning text-sm text-center mb-4 max-w-sm" role="alert">
+            {clipboardWarning}
+          </p>
+        )}
 
         {/* Confirmation checkbox */}
         <label className="flex items-center gap-2 mb-6 cursor-pointer">

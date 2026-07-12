@@ -7,6 +7,7 @@ use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::redact_id;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::AppState;
 
@@ -159,8 +160,8 @@ pub async fn act_on_message_request(
             if action_summary.accepted && conversation_id.is_none() {
                 log::warn!(
                     "[act_on_message_request] accepted request {} from {} but no conversation is available yet",
-                    request_id,
-                    sender_user_id
+                    redact_id("request", &request_id),
+                    redact_id("user", &sender_user_id)
                 );
             }
 

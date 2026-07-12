@@ -151,10 +151,9 @@ impl DesktopTransport {
                 let retryable = e.is_timeout() || e.is_connect();
                 let elapsed_ms = start.elapsed().as_millis();
                 log::warn!(
-                    "HTTP request failed: {} {} - error: {} (retryable: {})",
+                    "HTTP request failed: {} {} - error=request_failed (retryable: {})",
                     method,
                     sanitize_url_for_log(&url_snapshot),
-                    e,
                     retryable
                 );
                 timetest!(

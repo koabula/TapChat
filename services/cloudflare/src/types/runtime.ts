@@ -30,15 +30,23 @@ export interface Env {
   RETENTION_DAYS?: string;
   RATE_LIMIT_PER_MINUTE?: string;
   RATE_LIMIT_PER_HOUR?: string;
+  MESSAGE_REQUEST_MAX_BODY_BYTES?: string;
+  MESSAGE_REQUEST_MAX_PER_SENDER?: string;
+  MESSAGE_REQUEST_MAX_SENDERS?: string;
+  MESSAGE_REQUEST_MAX_TOTAL_BYTES?: string;
+  MESSAGE_REQUEST_TTL_SECONDS?: string;
+  MESSAGE_REQUEST_RATE_LIMIT_MINUTE?: string;
+  MESSAGE_REQUEST_RATE_LIMIT_HOUR?: string;
   ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS?: string;
-  SHARING_TOKEN_SECRET?: string;
-  BOOTSTRAP_TOKEN_SECRET?: string;
+  SHARING_INTERNAL_SECRET?: string;
+  BOOTSTRAP_LINK_SECRET?: string;
 }
 
 export interface DurableObjectStorageLike {
   get<T>(key: string): Promise<T | undefined>;
   put<T>(key: string, value: T): Promise<void>;
   putEntries(entries: Record<string, unknown>): Promise<void>;
+  mutateEntries(entries: Record<string, unknown>, deleteKeys: string[]): Promise<void>;
   delete(key: string): Promise<void>;
   list<T>(options?: { prefix?: string }): Promise<Map<string, T>>;
   setAlarm(epochMillis: number): Promise<void>;
@@ -53,5 +61,5 @@ export interface JsonBlobStore {
 }
 
 export interface SessionSink {
-  send(payload: string): void;
+  send(payload: string): boolean;
 }

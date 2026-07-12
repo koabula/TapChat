@@ -5,6 +5,7 @@ use tauri::AppHandle;
 use tokio::time::{sleep, Duration};
 
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::redact_id;
 
 /// Schedule a timer that will fire after the given delay.
 /// The timer triggers a CoreEvent::TimerTriggered that gets fed back into the core engine.
@@ -12,10 +13,10 @@ pub fn schedule_timer(app_handle: Option<Arc<AppHandle>>, timer_id: String, dela
     tokio::spawn(async move {
         sleep(Duration::from_millis(delay_ms)).await;
 
-        log::info!("Timer triggered: {}", timer_id);
+        log::info!("Timer triggered: {}", redact_id("timer", &timer_id));
 
         if let Some(app) = app_handle {
-            if let Err(error) = drive_core_with_handle(
+            if let Err(_error) = drive_core_with_handle(
                 &app,
                 CoreInput::Event(CoreEvent::TimerTriggered {
                     timer_id: timer_id.clone(),
@@ -23,12 +24,15 @@ pub fn schedule_timer(app_handle: Option<Arc<AppHandle>>, timer_id: String, dela
             )
             .await
             {
-                log::error!("Timer {} failed to drive core: {}", timer_id, error);
+                log::error!(
+                    "Timer {} failed to drive core",
+                    redact_id("timer", &timer_id)
+                );
             }
         } else {
             log::warn!(
                 "Timer {} fired without app handle; dropping event",
-                timer_id
+                redact_id("timer", &timer_id)
             );
         }
     });

@@ -29,6 +29,7 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const TMP_DIR = path.join(os.tmpdir(), "tapchat-cloudflare-test-runtime");
 const WORKER_BUNDLE = path.join(TMP_DIR, "worker.mjs");
 const BASE_URL = "https://example.com";
+const BOOTSTRAP_SECRET = "integration-bootstrap-secret-0123456789abcdef0123456789abcdef";
 const signedFixtures = new Map<string, { bundle: IdentityBundle; capability: InboxAppendCapability }>();
 
 async function ensureWorkerBundle(): Promise<string> {
@@ -58,8 +59,8 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       RETENTION_DAYS: options?.retentionDays ?? "1",
       RATE_LIMIT_PER_MINUTE: options?.rateLimitPerMinute ?? "60",
       RATE_LIMIT_PER_HOUR: options?.rateLimitPerHour ?? "600",
-      SHARING_TOKEN_SECRET: "secret",
-      BOOTSTRAP_TOKEN_SECRET: "bootstrap-secret"
+      SHARING_INTERNAL_SECRET: "integration-sharing-secret-0123456789abcdef0123456789abcdef",
+      BOOTSTRAP_LINK_SECRET: BOOTSTRAP_SECRET
     },
     durableObjects: {
       INBOX: "InboxDurableObject",
@@ -76,7 +77,7 @@ function authHeaders(token: string): Record<string, string> {
 }
 
 async function bootstrapToken(userId: string, deviceId: string): Promise<string> {
-  return signSharingPayload("bootstrap-secret", {
+  return signSharingPayload(BOOTSTRAP_SECRET, {
     version: CURRENT_MODEL_VERSION,
     service: "bootstrap",
     userId,
@@ -748,6 +749,21 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
   assert.ok(subscribe.webSocket);
   const socket = subscribe.webSocket as unknown as RuntimeWebSocket;
   await waitForSubscribeReady(socket);
+  const groupEvents: unknown[] = [];
+  socket.addEventListener("message", (event) => {
+    groupEvents.push(JSON.parse(String(event.data)));
+  });
+  const nextGroupEvent = async (): Promise<unknown> => {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      const next = groupEvents.shift();
+      if (next !== undefined) {
+        return next;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("timed out waiting for queued group websocket message");
+  };
 
   const inviteId = "invite:open-integration";
   const createInvite = await mf.dispatchFetch(
@@ -780,7 +796,7 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
   );
   assert.equal(createInvite.status, 200);
   const created = (await createInvite.json()) as { invite: { signature: string } };
-  const inviteCreatedEvent = (await waitForWebSocketMessage(socket)) as { event: string; revision: number };
+  const inviteCreatedEvent = (await nextGroupEvent()) as { event: string; revision: number };
   assert.equal(inviteCreatedEvent.event, "group_invites_changed");
   assert.equal(inviteCreatedEvent.revision, 1);
 
@@ -824,10 +840,10 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
   assert.equal(submitted.request.status, "waiting_for_group_commit");
   assert.equal(submitted.request.autoApprove, true);
 
-  const inviteUsedEvent = (await waitForWebSocketMessage(socket)) as { event: string; revision: number };
+  const inviteUsedEvent = (await nextGroupEvent()) as { event: string; revision: number };
   assert.equal(inviteUsedEvent.event, "group_invites_changed");
   assert.equal(inviteUsedEvent.revision, 2);
-  const autoJoinEvent = (await waitForWebSocketMessage(socket)) as { event: string; requestId: string };
+  const autoJoinEvent = (await nextGroupEvent()) as { event: string; requestId: string };
   assert.equal(autoJoinEvent.event, "group_auto_join_available");
   assert.equal(autoJoinEvent.requestId, requestId);
 

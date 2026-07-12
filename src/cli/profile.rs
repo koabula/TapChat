@@ -21,6 +21,7 @@ use crate::local_store::{
     active_store, inspect_storage, migrate_snapshot_to_state_db, LocalStoreDiagnostics,
     PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
 };
+use crate::log_sanitize::redact_id;
 use crate::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::profile_crypto::{
@@ -282,8 +283,11 @@ impl Profile {
                                 .map_err(anyhow::Error::from)?,
                         );
                     }
-                    Err(error) if options.passphrase.is_some() => {
-                        log::warn!("OS keychain unavailable for profile {profile_id}: {error}");
+                    Err(_error) if options.passphrase.is_some() => {
+                        log::warn!(
+                            "OS keychain unavailable for profile {}: error=keychain_unavailable",
+                            redact_id("profile", &profile_id)
+                        );
                     }
                     Err(error) => {
                         return Err(error).with_context(keychain_unavailable_create_message);
@@ -1075,10 +1079,10 @@ fn delete_os_keychain_entry(entry_ref: &ProfileKeychainEntryRef) -> Result<Keych
 
 fn rollback_created_keychain_entries(entries: &[ProfileKeychainEntryRef]) {
     for entry_ref in entries {
-        if let Err(error) = delete_os_keychain_entry(entry_ref) {
+        if let Err(_error) = delete_os_keychain_entry(entry_ref) {
             log::warn!(
-                "failed to roll back OS keychain entry {}: {error:#}",
-                entry_ref.account
+                "failed to roll back OS keychain entry {}: rollback_failed",
+                redact_id("keychain-account", &entry_ref.account)
             );
         }
     }

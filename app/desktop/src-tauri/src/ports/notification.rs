@@ -27,7 +27,7 @@ impl NotificationManager {
         let body = &notification.message;
 
         if should_suppress_notification(body) {
-            log::warn!("Suppressed desktop notification: {} - {}", title, body);
+            log::warn!("Suppressed desktop notification containing a known non-actionable status");
             return Ok(());
         }
 
@@ -47,12 +47,12 @@ impl NotificationManager {
                 .show()?;
         } else {
             // Fallback to logging if no app handle
-            log::info!("Notification (no handle): {} - {}", title, body);
+            log::info!("Notification delivery skipped because no app handle is available");
         }
         #[cfg(not(feature = "gui"))]
         {
-            let _ = &self.app_handle;
-            log::info!("Notification (test-support): {} - {}", title, body);
+            let _ = (&self.app_handle, title, body);
+            log::info!("Notification delivery handled by test support");
         }
 
         Ok(())
@@ -76,12 +76,12 @@ impl NotificationManager {
                 .icon(icon_path)
                 .show()?;
         } else {
-            log::info!("Notification (no handle): {} - {}", title, body);
+            log::info!("Notification delivery skipped because no app handle is available");
         }
         #[cfg(not(feature = "gui"))]
         {
-            let _ = (&self.app_handle, icon_path);
-            log::info!("Notification (test-support): {} - {}", title, body);
+            let _ = (&self.app_handle, title, body, icon_path);
+            log::info!("Notification delivery handled by test support");
         }
 
         Ok(())

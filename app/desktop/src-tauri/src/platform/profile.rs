@@ -10,6 +10,8 @@ use tapchat_core::cli::profile::{
 };
 use tapchat_core::persistence::CorePersistenceSnapshot;
 
+use crate::platform::log_sanitize::redact_id;
+
 /// Desktop profile manager - wraps CLI ProfileRegistry and provides
 /// async access for the Tauri app.
 #[derive(Clone)]
@@ -83,9 +85,8 @@ impl ProfileManager {
                 Ok(profile) => (Some(profile), None, None),
                 Err(error) => {
                     log::error!(
-                        "Failed to unlock profile '{}' at {}: {error:#}",
-                        name,
-                        path.display()
+                        "Failed to unlock profile {}: unlock_failed",
+                        redact_id("profile", &format!("{name}:{}", path.display()))
                     );
                     (None, Some(path), Some(error.to_string()))
                 }
@@ -95,14 +96,9 @@ impl ProfileManager {
 
         if profile.is_none() {
             log::warn!(
-                "Profile '{}' not found in registry. Available profiles: {}",
-                name,
-                registry
-                    .profiles
-                    .iter()
-                    .map(|e| e.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "Profile {} not found in registry; available_profile_count={}",
+                redact_id("profile", name),
+                registry.profiles.len()
             );
         }
 
@@ -450,8 +446,8 @@ fn load_registry_active_profile(
         Ok(profile) => (Some(profile), None, None),
         Err(error) => {
             log::error!(
-                "Failed to unlock active profile at {}: {error:#}",
-                path.display()
+                "Failed to unlock active profile {}: unlock_failed",
+                redact_id("profile", &path.to_string_lossy())
             );
             (None, Some(path.clone()), Some(error.to_string()))
         }

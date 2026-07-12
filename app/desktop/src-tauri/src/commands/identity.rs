@@ -7,6 +7,7 @@ use tapchat_core::model::DeviceStatusKind;
 use tapchat_core::{CoreCommand, CoreOutput};
 
 use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
+use crate::platform::log_sanitize::redact_id;
 use crate::platform::profile::ProfileSummary;
 use crate::state::AppState;
 
@@ -43,13 +44,12 @@ pub async fn init_onboarding_profile(
             .to_string()
     })?;
 
-    log::info!("Data dir: {:?}", data_dir);
-
     let path = data_dir
         .join("TapChat")
         .join("profiles")
         .join(&profile_name);
-    log::info!("Creating profile '{}' at path: {:?}", profile_name, path);
+    let profile_ref = redact_id("profile", &profile_name);
+    log::info!("Creating profile {}", profile_ref);
 
     // Create profile
     let summary = {
@@ -57,12 +57,12 @@ pub async fn init_onboarding_profile(
         pm.create_profile(&profile_name, path.clone(), passphrase)
             .await
             .map_err(|e| {
-                log::error!("Failed to create profile at {:?}: {}", path, e);
+                log::error!("Failed to create profile {}", profile_ref);
                 format!("Failed to create profile: {}", e)
             })?
     };
 
-    log::info!("Profile created successfully: {:?}", summary);
+    log::info!("Profile created successfully {}", profile_ref);
 
     // Update profile_path in state
     {

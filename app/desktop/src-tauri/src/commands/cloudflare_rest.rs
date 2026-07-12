@@ -65,6 +65,13 @@ pub struct WorkerDeployConfig {
     pub retention_days: u32,
     pub rate_limit_per_minute: u32,
     pub rate_limit_per_hour: u32,
+    pub message_request_max_body_bytes: u32,
+    pub message_request_max_per_sender: u32,
+    pub message_request_max_senders: u32,
+    pub message_request_max_total_bytes: u32,
+    pub message_request_ttl_seconds: u32,
+    pub message_request_rate_limit_minute: u32,
+    pub message_request_rate_limit_hour: u32,
 }
 
 /// Deployment result
@@ -186,6 +193,41 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
                 "type": "plain_text",
                 "name": "RATE_LIMIT_PER_HOUR",
                 "text": config.rate_limit_per_hour.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_MAX_BODY_BYTES",
+                "text": config.message_request_max_body_bytes.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_MAX_PER_SENDER",
+                "text": config.message_request_max_per_sender.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_MAX_SENDERS",
+                "text": config.message_request_max_senders.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_MAX_TOTAL_BYTES",
+                "text": config.message_request_max_total_bytes.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_TTL_SECONDS",
+                "text": config.message_request_ttl_seconds.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_RATE_LIMIT_MINUTE",
+                "text": config.message_request_rate_limit_minute.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "MESSAGE_REQUEST_RATE_LIMIT_HOUR",
+                "text": config.message_request_rate_limit_hour.to_string(),
             },
         ],
     });
@@ -684,7 +726,7 @@ pub async fn deploy_via_rest_api(
         api_token,
         account_id,
         &config.worker_name,
-        "SHARING_TOKEN_SECRET",
+        "SHARING_INTERNAL_SECRET",
         &config.sharing_token_secret,
     )
     .await?;
@@ -693,7 +735,7 @@ pub async fn deploy_via_rest_api(
         api_token,
         account_id,
         &config.worker_name,
-        "BOOTSTRAP_TOKEN_SECRET",
+        "BOOTSTRAP_LINK_SECRET",
         &config.bootstrap_token_secret,
     )
     .await?;
@@ -847,6 +889,13 @@ mod tests {
             retention_days: 30,
             rate_limit_per_minute: 60,
             rate_limit_per_hour: 600,
+            message_request_max_body_bytes: 327_680,
+            message_request_max_per_sender: 16,
+            message_request_max_senders: 64,
+            message_request_max_total_bytes: 4_194_304,
+            message_request_ttl_seconds: 604_800,
+            message_request_rate_limit_minute: 30,
+            message_request_rate_limit_hour: 300,
         }
     }
 

@@ -6,6 +6,7 @@ resolver = "2"
 name = "TapChat"
 version = "0.1.14"
 edition = "2021"
+publish = false
 
 [lib]
 name = "tapchat_core"

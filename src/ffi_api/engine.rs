@@ -307,7 +307,8 @@ impl CoreEngine {
         match Self::try_from_restored_state(snapshot) {
             Ok(engine) => engine,
             Err(error) => {
-                log::error!("failed to restore core state, starting empty engine: {error}");
+                let _ = error;
+                log::error!("failed to restore core state, starting empty engine: restore_failed");
                 Self::new()
             }
         }
@@ -1427,7 +1428,7 @@ impl CoreEngine {
             } => {
                 log::warn!(
                     "group authorization initialization failed: group_id={} retryable={} status={:?} code={:?} detail={:?}",
-                    group_id,
+                    redact_id("group", &group_id),
                     retryable,
                     status,
                     code,
@@ -3151,8 +3152,8 @@ impl CoreEngine {
             if !invitee_user_by_device.contains_key(&welcome.recipient_device_id) {
                 log::warn!(
                     "create_group_conversation: missing invitee user mapping for welcome recipient_device_id={} group_id={}",
-                    welcome.recipient_device_id,
-                    group_id
+                    redact_id("device", &welcome.recipient_device_id),
+                    redact_id("group", &group_id)
                 );
             }
         }
@@ -6143,8 +6144,8 @@ impl CoreEngine {
                 }
                 Err(error) => log::warn!(
                     "skipping group authorization migration for {}: {}",
-                    group_id,
-                    error
+                    redact_id("group", group_id),
+                    error.code()
                 ),
             }
         }
@@ -8279,37 +8280,49 @@ impl CoreEngine {
         if let Some(pending) = &current_state.pending_membership_transition {
             if pending.control_message_id != record.envelope.message_id {
                 log::warn!(
-                    "rejected manifest control for group {group_id}: control id does not match pending membership transition"
+                    "rejected manifest control for group {}: control id does not match pending membership transition",
+                    redact_id("group", group_id)
                 );
                 return false;
             }
             if record.envelope.membership_proof.as_ref() != Some(&pending.proof) {
                 log::warn!(
-                    "rejected manifest control for group {group_id}: proof does not match pending membership transition"
+                    "rejected manifest control for group {}: proof does not match pending membership transition",
+                    redact_id("group", group_id)
                 );
                 return false;
             }
         }
         if updated.roster_version <= current_state.manifest.roster_version {
             log::warn!(
-                "rejected stale manifest update for group {group_id}: new roster_version {} is not newer than current {}",
+                "rejected stale manifest update for group {}: new roster_version {} is not newer than current {}",
+                redact_id("group", group_id),
                 updated.roster_version,
                 current_state.manifest.roster_version
             );
             return false;
         }
-        if let Err(err) = updated.validate() {
-            log::warn!("rejected invalid manifest update for group {group_id}: {err}");
+        if let Err(_err) = updated.validate() {
+            log::warn!(
+                "rejected invalid manifest update for group {}: validation_failed",
+                redact_id("group", group_id)
+            );
             return false;
         }
         let Some(proof) = record.envelope.membership_proof.as_ref() else {
-            log::warn!("rejected manifest update for group {group_id}: missing membership proof");
+            log::warn!(
+                "rejected manifest update for group {}: missing membership proof",
+                redact_id("group", group_id)
+            );
             return false;
         };
         let manifest_hash = match Self::manifest_sha256(&updated) {
             Ok(hash) => hash,
-            Err(err) => {
-                log::warn!("failed to hash manifest update for group {group_id}: {err}");
+            Err(_err) => {
+                log::warn!(
+                    "failed to hash manifest update for group {}: hash_failed",
+                    redact_id("group", group_id)
+                );
                 return false;
             }
         };
@@ -8326,7 +8339,8 @@ impl CoreEngine {
             || !commit_matches
         {
             log::warn!(
-                "rejected manifest update for group {group_id}: manifest transition does not match proof"
+                "rejected manifest update for group {}: manifest transition does not match proof",
+                redact_id("group", group_id)
             );
             return false;
         }
@@ -8336,15 +8350,17 @@ impl CoreEngine {
             proof,
         ) {
             log::warn!(
-                "rejected invalid manifest transition for group {group_id} at roster_version {} -> {}",
+                "rejected invalid manifest transition for group {} at roster_version {} -> {}",
+                redact_id("group", group_id),
                 current_state.manifest.roster_version,
                 updated.roster_version
             );
             return false;
         }
-        if let Err(err) = self.verify_manifest_signature(&updated) {
+        if let Err(_err) = self.verify_manifest_signature(&updated) {
             log::warn!(
-                "rejected manifest update with invalid signature for group {group_id}: {err}"
+                "rejected manifest update with invalid signature for group {}: signature_invalid",
+                redact_id("group", group_id)
             );
             return false;
         }
@@ -9679,7 +9695,7 @@ impl CoreEngine {
             if conversation_ids.len() > 1 {
                 log::warn!(
                     "contact accept completed for {} with multiple promoted direct conversation ids; selecting one and ignoring superseded ids",
-                    peer_user_id
+                    redact_id("user", peer_user_id)
                 );
             }
             conversation_ids.sort_by_key(|conversation_id| {
@@ -9696,7 +9712,7 @@ impl CoreEngine {
 
         log::warn!(
             "contact accept completed for {} without promoted conversation ids or local active direct conversation; skipping ControlContactAccepted fallback",
-            peer_user_id
+            redact_id("user", peer_user_id)
         );
         Ok(Vec::new())
     }
@@ -11798,11 +11814,7 @@ impl CoreEngine {
                     view_model: None,
                 });
             }
-            if let Some(detail) = detail {
-                log::warn!("attachment download failed: {detail}");
-            } else {
-                log::warn!("attachment download failed");
-            }
+            log::warn!("attachment download failed");
             self.state.pending_blob_downloads.remove(&task_id);
             return Ok(CoreOutput {
                 state_update: CoreStateUpdate {
@@ -12195,16 +12207,16 @@ impl CoreEngine {
                         IngestResult::IgnoredReplay => {
                             log::warn!(
                                 "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
-                                record.message_id,
-                                conversation_id
+                                redact_id("msg", &record.message_id),
+                                redact_id("conversation", &conversation_id)
                             );
                             ackable = true;
                         }
                         IngestResult::PendingRetry => {
                             log::warn!(
                                 "handle_inbox_records: PendingRetry for message {} in conversation {}",
-                                record.message_id,
-                                conversation_id
+                                redact_id("msg", &record.message_id),
+                                redact_id("conversation", &conversation_id)
                             );
                             let reason = self.recovery_reason_for_record(&conversation_id);
                             {
@@ -12226,8 +12238,8 @@ impl CoreEngine {
                         IngestResult::NeedsRebuild => {
                             log::warn!(
                                 "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
-                                record.message_id,
-                                conversation_id
+                                redact_id("msg", &record.message_id),
+                                redact_id("conversation", &conversation_id)
                             );
                             output = merge_outputs(
                                 output,
@@ -12333,8 +12345,8 @@ impl CoreEngine {
                                 } else {
                                     log::warn!(
                                         "handle_inbox_records: Conversation {} not found for message {}",
-                                        conversation_id,
-                                        record.message_id
+                                        redact_id("conversation", &conversation_id),
+                                        redact_id("msg", &record.message_id)
                                     );
                                 }
                                 if let Ok(summary) = self
@@ -12469,16 +12481,16 @@ impl CoreEngine {
                             IngestResult::IgnoredReplay => {
                                 log::warn!(
                                     "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
-                                    record.message_id,
-                                    conversation_id
+                                    redact_id("msg", &record.message_id),
+                                    redact_id("conversation", &conversation_id)
                                 );
                                 ackable = true;
                             }
                             IngestResult::PendingRetry => {
                                 log::warn!(
                                     "handle_inbox_records: PendingRetry for message {} in conversation {}",
-                                    record.message_id,
-                                    conversation_id
+                                    redact_id("msg", &record.message_id),
+                                    redact_id("conversation", &conversation_id)
                                 );
                                 let reason = self.recovery_reason_for_record(&conversation_id);
                                 {
@@ -12502,8 +12514,8 @@ impl CoreEngine {
                             IngestResult::NeedsRebuild => {
                                 log::warn!(
                                     "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
-                                    record.message_id,
-                                    conversation_id
+                                    redact_id("msg", &record.message_id),
+                                    redact_id("conversation", &conversation_id)
                                 );
                                 output = merge_outputs(
                                     output,
@@ -12827,7 +12839,7 @@ impl CoreEngine {
             log::warn!(
                 "handle_inbox_records: clearing pending retry seq {} for conversation {} after later MLS record applied",
                 seq,
-                conversation_id
+                redact_id("conversation", conversation_id)
             );
             SyncEngine::clear_pending_retry(sync_state, seq);
             advance_contiguous_ack(contiguous_ack, deferred_ackable_seqs, seq);
@@ -13284,14 +13296,14 @@ impl CoreEngine {
         let Some(contact) = self.state.contacts.get(&result.sender_user_id) else {
             log::warn!(
                 "message request accept completed for {} but sender contact is missing; skipping contact accepted control",
-                result.sender_user_id
+                redact_id("user", &result.sender_user_id)
             );
             return Ok(CoreOutput::default());
         };
         if Self::relationship_is_removed(&contact.relationship_status) {
             log::info!(
                 "message request accept completed for {} but sender contact is removed; skipping contact accepted control",
-                result.sender_user_id
+                redact_id("user", &result.sender_user_id)
             );
             return Ok(CoreOutput::default());
         }
@@ -13306,7 +13318,7 @@ impl CoreEngine {
         if envelopes.is_empty() {
             log::warn!(
                 "message request accept completed for {} but no active peer devices were available for contact accepted control",
-                result.sender_user_id
+                redact_id("user", &result.sender_user_id)
             );
             return Ok(CoreOutput::default());
         }
@@ -14186,10 +14198,11 @@ impl CoreEngine {
                     Ok(proof) => Some(proof),
                     Err(err) => {
                         log::warn!(
-                            "rejected membership operation from {} ({}) in group {}: {err}",
-                            record.envelope.sender_user_id,
-                            record.envelope.sender_device_id,
-                            group_id
+                            "rejected membership operation from {} ({}) in group {}: {}",
+                            redact_id("user", &record.envelope.sender_user_id),
+                            redact_id("device", &record.envelope.sender_device_id),
+                            redact_id("group", &group_id),
+                            err.code()
                         );
                         let signer_is_privileged =
                             group_state.manifest.members.iter().any(|member| {
@@ -14264,9 +14277,10 @@ impl CoreEngine {
                             && membership_proof.is_some() =>
                     {
                         log::warn!(
-                            "failed to ingest membership commit {} for group {}: {error}",
-                            record.envelope.message_id,
-                            group_id
+                            "failed to ingest membership commit {} for group {}: {}",
+                            redact_id("msg", &record.envelope.message_id),
+                            redact_id("group", &group_id),
+                            error.code()
                         );
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
                         stopped_on_retryable_gap = true;
@@ -14315,8 +14329,8 @@ impl CoreEngine {
                     IngestResult::IgnoredReplay => {
                         log::warn!(
                             "sync_group_outbox: ignoring replay/duplicate MLS record {} for group {}",
-                            record.envelope.message_id,
-                            group_id
+                            redact_id("msg", &record.envelope.message_id),
+                            redact_id("group", &group_id)
                         );
                         last_terminal_seq = record_seq;
                         continue;
@@ -16967,9 +16981,9 @@ impl CoreEngine {
                 );
                 log::warn!(
                     "handle_welcome_pickup_fetched: welcome import failed group_id={} device_id={} error={}",
-                    descriptor.group_id,
-                    descriptor.device_id,
-                    error
+                    redact_id("group", &descriptor.group_id),
+                    redact_id("device", &descriptor.device_id),
+                    error.code()
                 );
                 return Ok(CoreOutput {
                     state_update: CoreStateUpdate {

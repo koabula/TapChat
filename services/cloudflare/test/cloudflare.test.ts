@@ -55,10 +55,13 @@ class TestWebSocketPair {
 (globalThis as Record<string, unknown>).WebSocketPair = TestWebSocketPair;
 
 const { handleRequest } = await import("../src/routes/http");
-const { handleInboxDurableRequest } = await import("../src/inbox/durable");
-const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl } = await import("../src/group-outbox/durable");
+const { handleInboxDurableRequest, ManagedSession: InboxManagedSession } = await import("../src/inbox/durable");
+const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl, ManagedSession: GroupManagedSession } = await import("../src/group-outbox/durable");
 const { InboxService } = await import("../src/inbox/service");
 const { GroupOutboxService } = await import("../src/group-outbox/service");
+
+const TEST_SHARING_SECRET = "test-sharing-secret-0123456789abcdef0123456789abcdef";
+const TEST_BOOTSTRAP_SECRET = "test-bootstrap-secret-0123456789abcdef0123456789abcdef";
 
 test("group membership proof payload matches the Rust canonical field order", () => {
   const proof: GroupMembershipProof = {
@@ -107,6 +110,20 @@ class MemoryState implements DurableObjectStorageLike {
 
   async putEntries(entries: Record<string, unknown>): Promise<void> {
     for (const [key, value] of Object.entries(entries)) {
+      this.map.set(key, value);
+    }
+  }
+
+  async mutateEntries(entries: Record<string, unknown>, deleteKeys: string[]): Promise<void> {
+    const next = new Map(this.map);
+    for (const [key, value] of Object.entries(entries)) {
+      next.set(key, value);
+    }
+    for (const key of deleteKeys) {
+      next.delete(key);
+    }
+    this.map.clear();
+    for (const [key, value] of next) {
       this.map.set(key, value);
     }
   }
@@ -292,8 +309,8 @@ function createEnv(options?: {
   const retentionDays = Number(options?.retentionDays ?? "30");
   const rateLimitPerMinute = Number(options?.rateLimitPerMinute ?? "60");
   const rateLimitPerHour = Number(options?.rateLimitPerHour ?? "600");
-  const sharingSecret = options?.sharingSecret ?? "secret";
-  const bootstrapSecret = options?.bootstrapSecret ?? "bootstrap-secret";
+  const sharingSecret = options?.sharingSecret ?? TEST_SHARING_SECRET;
+  const bootstrapSecret = options?.bootstrapSecret ?? TEST_BOOTSTRAP_SECRET;
 
   const env: Env = {
     PUBLIC_BASE_URL: "https://example.com",
@@ -302,8 +319,8 @@ function createEnv(options?: {
     RETENTION_DAYS: String(retentionDays),
     RATE_LIMIT_PER_MINUTE: String(rateLimitPerMinute),
     RATE_LIMIT_PER_HOUR: String(rateLimitPerHour),
-    SHARING_TOKEN_SECRET: sharingSecret,
-    BOOTSTRAP_TOKEN_SECRET: bootstrapSecret,
+    SHARING_INTERNAL_SECRET: sharingSecret,
+    BOOTSTRAP_LINK_SECRET: bootstrapSecret,
     TAPCHAT_STORAGE: bucket.asBucket(),
     INBOX: {
       idFromName(name: string) {
@@ -751,7 +768,7 @@ function authHeaders(token: string): Record<string, string> {
 }
 
 async function bootstrapToken(userId: string, deviceId: string): Promise<string> {
-  return signSharingPayload("bootstrap-secret", {
+  return signSharingPayload(TEST_BOOTSTRAP_SECRET, {
     version: CURRENT_MODEL_VERSION,
     service: "bootstrap",
     userId,
@@ -845,7 +862,7 @@ test("issues device deployment bundle with runtime auth and security features", 
 
 test("bootstrap rejects expired token", async () => {
   const { env } = createEnv();
-  const token = await signSharingPayload("bootstrap-secret", {
+  const token = await signSharingPayload(TEST_BOOTSTRAP_SECRET, {
     version: CURRENT_MODEL_VERSION,
     service: "bootstrap",
     userId: "user:bob",
@@ -876,7 +893,7 @@ test("bootstrap rejects expired token", async () => {
 test("rotating sharing secret invalidates previously issued device runtime tokens", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
-  const rotated = createEnv({ sharingSecret: "rotated-secret" });
+  const rotated = createEnv({ sharingSecret: "rotated-sharing-secret-0123456789abcdef0123456789abcdef" });
 
   const response = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/head", {
@@ -2066,7 +2083,13 @@ test("group invite idempotency and leave lease alarm preserve shared FSM state",
   const state = new MemoryState();
   await initializeGroupState(state);
   const events: string[] = [];
-  const service = new GroupOutboxService("group:project", state, new MemoryR2Store(), { headSeq: 0, retentionDays: 30, maxInlineBytes: 128 }, [{ send: (payload: string) => events.push(payload) }]);
+  const service = new GroupOutboxService(
+    "group:project",
+    state,
+    new MemoryR2Store(),
+    { headSeq: 0, retentionDays: 30, maxInlineBytes: 128 },
+    [{ send: (payload: string) => { events.push(payload); return true; } }]
+  );
   const owner = sampleGroupCapability("group:project", ["manage_invites", "approve_join"], "owner");
   const document = {
     version: CURRENT_MODEL_VERSION,
@@ -2675,4 +2698,146 @@ test("group outbox durable recovers group id from short invite URL", async () =>
     await groupIdFromGroupOutboxRequestUrl(tokenInviteUrl, "secret", Date.now()),
     "group:token"
   );
+});
+
+test("runtime secrets fail closed when missing, short, or placeholders", async () => {
+  const invalidValues = [undefined, "", "short", "replace-me"];
+  for (const invalid of invalidValues) {
+    const { env } = createEnv();
+    env.SHARING_INTERNAL_SECRET = invalid;
+    const response = await handleRequest(new Request("https://example.com/v1/deployment-bundle"), env);
+    assert.equal(response.status, 503);
+    assert.equal(((await response.json()) as { error: string }).error, "runtime_misconfigured");
+  }
+
+  const { env } = createEnv();
+  env.BOOTSTRAP_LINK_SECRET = "replace-me-bootstrap";
+  const response = await handleRequest(new Request("https://example.com/v1/deployment-bundle"), env);
+  assert.equal(response.status, 503);
+  assert.equal(((await response.json()) as { error: string }).error, "runtime_misconfigured");
+});
+
+test("append request body limit checks actual streamed bytes", async () => {
+  const { env } = createEnv();
+  env.MESSAGE_REQUEST_MAX_BODY_BYTES = "128";
+  const oversized = JSON.stringify({ ...sampleAppend(), padding: "x".repeat(512) });
+  const response = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": "1" },
+      body: oversized
+    }),
+    env
+  );
+  assert.equal(response.status, 413);
+  assert.equal(((await response.json()) as { error: string }).error, "request_too_large");
+});
+
+test("message request quotas, global rate limit, expiry, and capacity recovery work", async () => {
+  const state = new MemoryState();
+  const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 30,
+    maxInlineBytes: 4096,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000,
+    messageRequestMaxPerSender: 2,
+    messageRequestMaxSenders: 1,
+    messageRequestMaxTotalBytes: 1024 * 1024,
+    messageRequestTtlSeconds: 10,
+    messageRequestRateLimitMinute: 100,
+    messageRequestRateLimitHour: 20
+  });
+
+  await service.appendEnvelope(sampleAppend(undefined, "msg:q1", undefined, "user:one"), 1_000, { mode: "legacy_unverified" });
+  await service.appendEnvelope(sampleAppend(undefined, "msg:q2", undefined, "user:one"), 1_001, { mode: "legacy_unverified" });
+  await assert.rejects(
+    () => service.appendEnvelope(sampleAppend(undefined, "msg:q3", undefined, "user:one"), 1_002, { mode: "legacy_unverified" }),
+    (error: unknown) => (error as { code?: string }).code === "message_request_capacity_exceeded"
+  );
+  await assert.rejects(
+    () => service.appendEnvelope(sampleAppend(undefined, "msg:q4", undefined, "user:two"), 1_003, { mode: "legacy_unverified" }),
+    (error: unknown) => (error as { code?: string }).code === "message_request_capacity_exceeded"
+  );
+
+  const queued = await service.listMessageRequests(1_002);
+  assert.equal(queued.length, 1);
+  await service.rejectMessageRequest(queued[0].requestId, 1_004);
+  await service.appendEnvelope(sampleAppend(undefined, "msg:q5", undefined, "user:two"), 1_005, { mode: "legacy_unverified" });
+  assert.equal((await service.listMessageRequests(1_006)).length, 1);
+  assert.equal((await service.listMessageRequests(11_006)).length, 0);
+
+  const rateService = new InboxService("device:bob:phone", new MemoryState(), new MemoryR2Store(), [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 30,
+    maxInlineBytes: 4096,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000,
+    messageRequestMaxPerSender: 16,
+    messageRequestMaxSenders: 64,
+    messageRequestMaxTotalBytes: 1024 * 1024,
+    messageRequestTtlSeconds: 60,
+    messageRequestRateLimitMinute: 2,
+    messageRequestRateLimitHour: 20
+  });
+  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r1", undefined, "user:one"), 1_000, { mode: "legacy_unverified" });
+  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r2", undefined, "user:two"), 1_001, { mode: "legacy_unverified" });
+  await assert.rejects(
+    () => rateService.appendEnvelope(sampleAppend(undefined, "msg:r3", undefined, "user:three"), 1_002, { mode: "legacy_unverified" }),
+    (error: unknown) => (error as { code?: string; details?: { retryAfterSeconds?: number } }).code === "message_request_rate_limited" &&
+      Number((error as { details?: { retryAfterSeconds?: number } }).details?.retryAfterSeconds) > 0
+  );
+});
+
+test("managed websocket sessions contain send failures and clean themselves up", () => {
+  let inboxClosed = 0;
+  let groupClosed = 0;
+  const failingSocket = {
+    readyState: 1,
+    send() { throw new TypeError("socket is closed"); },
+    close() { throw new TypeError("already closed"); }
+  } as unknown as WebSocket;
+
+  const inbox = new InboxManagedSession(failingSocket, () => { inboxClosed += 1; });
+  const group = new GroupManagedSession(failingSocket, () => { groupClosed += 1; });
+  assert.equal(inbox.send("payload"), false);
+  assert.equal(group.send("payload"), false);
+  assert.equal(inboxClosed, 1);
+  assert.equal(groupClosed, 1);
+  assert.equal(inbox.send("payload"), false);
+  assert.equal(group.send("payload"), false);
+});
+
+test("legacy message request entries are migrated lazily and expire", async () => {
+  const state = new MemoryState();
+  const pending = sampleAppend(undefined, "msg:legacy", undefined, "user:legacy");
+  await state.put("message-request:index", ["user:legacy"]);
+  await state.put("message-request:user:legacy", {
+    requestId: "request:user:legacy",
+    recipientDeviceId: "device:bob:phone",
+    senderUserId: "user:legacy",
+    firstSeenAt: 1_000,
+    lastSeenAt: 1_000,
+    messageCount: 1,
+    lastMessageId: "msg:legacy",
+    lastConversationId: pending.envelope.conversationId,
+    pendingRequests: [pending]
+  });
+  const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 30,
+    maxInlineBytes: 4096,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000,
+    messageRequestTtlSeconds: 10
+  });
+
+  assert.equal((await service.listMessageRequests(1_001)).length, 1);
+  const migrated = await state.get<{ byteSize?: number; expiresAt?: number }>("message-request:user:legacy");
+  assert.ok((migrated?.byteSize ?? 0) > 0);
+  assert.equal(migrated?.expiresAt, 11_000);
+  assert.equal((await service.listMessageRequests(11_001)).length, 0);
 });

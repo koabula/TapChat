@@ -69,8 +69,8 @@ Vars:
 
 Secrets:
 
-- `SHARING_TOKEN_SECRET`
-- `BOOTSTRAP_TOKEN_SECRET`
+- `SHARING_INTERNAL_SECRET`
+- `BOOTSTRAP_LINK_SECRET`
 
 Secrets are written with `wrangler secret put` and are not stored in the temporary Wrangler config file.
 
@@ -97,7 +97,7 @@ The bootstrap route returns a deployment bundle that includes:
 
 After deployment:
 
-1. Mint a bootstrap token signed with `BOOTSTRAP_TOKEN_SECRET`.
+1. Mint a bootstrap token signed with `BOOTSTRAP_LINK_SECRET`.
 2. Call `POST /v1/bootstrap/device` with `userId`, `deviceId`, and model `version`.
 3. Import the returned deployment bundle into the client profile.
 4. Publish the local identity bundle, device status, and keypackage refs/objects using `device_runtime_auth`.

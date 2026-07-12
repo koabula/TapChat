@@ -6,6 +6,12 @@ import {
   requiredGroupAppendOperations,
   validateAnyDeviceRuntimeAuthorization
 } from "../auth/capability";
+import {
+  CONTROL_JSON_MAX_BYTES,
+  DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES,
+  readJsonLimited,
+  requireSharingSecret
+} from "../auth/runtime-security";
 import { GroupOutboxService } from "./service";
 import { GroupAuthorizationService } from "./authorization";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
@@ -43,6 +49,17 @@ class DurableObjectStorageAdapter implements DurableObjectStorageLike {
 
   async putEntries(entries: Record<string, unknown>): Promise<void> {
     await (this.storage.put as unknown as (values: Record<string, unknown>) => Promise<void>)(entries);
+  }
+
+  async mutateEntries(entries: Record<string, unknown>, deleteKeys: string[]): Promise<void> {
+    await this.storage.transaction(async (transaction) => {
+      if (Object.keys(entries).length > 0) {
+        await (transaction.put as unknown as (values: Record<string, unknown>) => Promise<void>)(entries);
+      }
+      if (deleteKeys.length > 0) {
+        await transaction.delete(deleteKeys);
+      }
+    });
   }
 
   async delete(key: string): Promise<void> {
@@ -154,7 +171,7 @@ export async function handleGroupOutboxDurableRequest(
         "group_authorization_bootstrap",
         now
       );
-      const body = (await request.json()) as InitializeGroupAuthorizationRequest;
+      const body = await readJsonLimited<InitializeGroupAuthorizationRequest>(request, CONTROL_JSON_MAX_BYTES);
       return jsonResponse(await authorization.initialize(body, runtimeToken, now));
     }
 
@@ -170,7 +187,7 @@ export async function handleGroupOutboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/outbox/transitions") && request.method === "POST") {
-      const body = (await request.json()) as AppendGroupTransitionRequest;
+      const body = await readJsonLimited<AppendGroupTransitionRequest>(request, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
       if (!body.capability || body.groupId !== deps.groupId) {
         throw new HttpError(403, "invalid_capability", "missing or mismatched group transition capability");
       }
@@ -216,7 +233,7 @@ export async function handleGroupOutboxDurableRequest(
     }
 
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
-      const body = (await request.json()) as AppendGroupEnvelopeRequest;
+      const body = await readJsonLimited<AppendGroupEnvelopeRequest>(request, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
       await service.assertWritable();
       if (!body?.envelope) {
         throw new HttpError(400, "invalid_input", "group append envelope is required");
@@ -317,7 +334,7 @@ export async function handleGroupOutboxDurableRequest(
     }
 
     if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "POST") {
-      const body = (await request.json()) as CreateGroupInviteRequest;
+      const body = await readJsonLimited<CreateGroupInviteRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
       const token = await signSharingPayload(deps.sharingSecret, {
         version: body.document.version,
@@ -369,7 +386,7 @@ export async function handleGroupOutboxDurableRequest(
 
     const revokeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);
     if (revokeMatch && request.method === "POST") {
-      const body = (await request.json()) as RevokeGroupInviteRequest;
+      const body = await readJsonLimited<RevokeGroupInviteRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
       return jsonResponse(
         await service.revokeInvite(
@@ -388,7 +405,7 @@ export async function handleGroupOutboxDurableRequest(
     if (joinCollectionMatch && request.method === "POST") {
       const token = getBearerToken(request);
       const payload = await verifyInviteToken(deps.sharingSecret, token, now);
-      const body = (await request.json()) as SubmitGroupJoinRequest;
+      const body = await readJsonLimited<SubmitGroupJoinRequest>(request, CONTROL_JSON_MAX_BYTES);
       return jsonResponse(await service.submitJoinRequest({ ...body, inviteToken: token }, payload, now));
     }
 
@@ -410,7 +427,7 @@ export async function handleGroupOutboxDurableRequest(
 
     const leaveCollectionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests$/);
     if (leaveCollectionMatch && request.method === "POST") {
-      const body = (await request.json()) as SubmitGroupLeaveRequest;
+      const body = await readJsonLimited<SubmitGroupLeaveRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "append_control", ["admin", "member"], now);
       return jsonResponse(await service.submitLeaveRequest(body, now));
     }
@@ -420,14 +437,14 @@ export async function handleGroupOutboxDurableRequest(
     }
     const leaveClaimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests\/([^/]+)\/claim$/);
     if (leaveClaimMatch && request.method === "POST") {
-      const body = (await request.json()) as ClaimGroupLeaveRequest;
+      const body = await readJsonLimited<ClaimGroupLeaveRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(await service.claimLeaveRequest({ ...body, groupId: deps.groupId, requestId: decodeURIComponent(leaveClaimMatch[1]) }, now));
     }
 
     const claimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/claim$/);
     if (claimMatch && request.method === "POST") {
-      const body = (await request.json()) as ClaimGroupJoinRequest;
+      const body = await readJsonLimited<ClaimGroupJoinRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.claimJoinRequest(
@@ -439,7 +456,7 @@ export async function handleGroupOutboxDurableRequest(
 
     const completeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/complete$/);
     if (completeMatch && request.method === "POST") {
-      const body = (await request.json()) as CompleteGroupJoinRequest;
+      const body = await readJsonLimited<CompleteGroupJoinRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.completeJoinRequest(
@@ -453,7 +470,7 @@ export async function handleGroupOutboxDurableRequest(
       if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
         throw new HttpError(403, "invalid_capability", "internal welcome claim authorization failed");
       }
-      const body = (await request.json()) as { deviceId?: string; requestId?: string; capability?: string };
+      const body = await readJsonLimited<{ deviceId?: string; requestId?: string; capability?: string }>(request, CONTROL_JSON_MAX_BYTES);
       if (!body.deviceId || !body.requestId || !body.capability) {
         throw new HttpError(400, "invalid_input", "welcome claim request, device and capability are required");
       }
@@ -465,7 +482,7 @@ export async function handleGroupOutboxDurableRequest(
       if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
         throw new HttpError(403, "invalid_capability", "internal welcome authorization failed");
       }
-      const body = (await request.json()) as { deviceId?: string; requestId?: string; capability?: string };
+      const body = await readJsonLimited<{ deviceId?: string; requestId?: string; capability?: string }>(request, CONTROL_JSON_MAX_BYTES);
       if (!body.deviceId || !body.requestId || !body.capability) throw new HttpError(400, "invalid_input", "welcome authorization binding is required");
       await service.authorizeWelcomeUpload(body.requestId, body.deviceId, body.capability);
       return jsonResponse({ accepted: true });
@@ -473,7 +490,7 @@ export async function handleGroupOutboxDurableRequest(
 
     const decisionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/decision$/);
     if (decisionMatch && request.method === "POST") {
-      const body = (await request.json()) as DecideGroupJoinRequest;
+      const body = await readJsonLimited<DecideGroupJoinRequest>(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.decideJoinRequest({
@@ -552,7 +569,15 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const sharingSecret = this.envRef.SHARING_TOKEN_SECRET ?? "replace-me";
+    let sharingSecret: string;
+    try {
+      sharingSecret = requireSharingSecret(this.envRef);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonResponse({ error: error.code, message: error.message }, error.status);
+      }
+      return jsonResponse({ error: "runtime_misconfigured", message: "sharing secret is invalid" }, 503);
+    }
     const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
     this.groupIdRef = groupId;
     await this.stateRef.storage.put("durable-group-id", groupId);
@@ -564,27 +589,31 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
       sessions: Array.from(this.sessions.values()).map(
         (session) =>
           ({
-            send(payload: string): void {
-              session.send(payload);
+            send(payload: string): boolean {
+              return session.send(payload);
             }
           }) satisfies SessionSink
       ),
       maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
-      sharingSecret: this.envRef.SHARING_TOKEN_SECRET ?? "replace-me",
+      sharingSecret,
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
         const server = pair[1];
         server.accept();
         const sessionId = crypto.randomUUID();
-        const session = new ManagedSession(server);
-        this.sessions.set(sessionId, session);
-        queueMicrotask(() => {
-          session.markReady();
-        });
-        server.addEventListener("close", () => {
+        const removeSession = () => {
           this.sessions.delete(sessionId);
+        };
+        const session = new ManagedSession(server, removeSession);
+        this.sessions.set(sessionId, session);
+        server.addEventListener("close", () => {
+          session.terminate();
+        });
+        server.addEventListener("error", (event: Event) => {
+          event.preventDefault();
+          session.terminate();
         });
         return new Response(null, {
           status: 101,
@@ -608,40 +637,53 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
   }
 }
 
-class ManagedSession {
+export class ManagedSession {
   private readonly socket: WebSocket;
-  private ready = false;
-  private readonly queuedPayloads: string[] = [];
+  private readonly onClosed: () => void;
+  private closed = false;
 
-  constructor(socket: WebSocket) {
+  constructor(socket: WebSocket, onClosed: () => void) {
     this.socket = socket;
+    this.onClosed = onClosed;
   }
 
-  send(payload: string): void {
-    if (!this.ready) {
-      this.queuedPayloads.push(payload);
-      return;
+  send(payload: string): boolean {
+    if (this.closed) {
+      return false;
     }
-    this.dispatch(payload);
-  }
-
-  markReady(): void {
-    if (this.ready) {
-      return;
+    if (this.socket.readyState !== 1) {
+      this.finish(false);
+      return false;
     }
-    this.ready = true;
-    while (this.queuedPayloads.length > 0) {
-      const payload = this.queuedPayloads.shift();
-      if (payload === undefined) {
-        break;
-      }
-      this.dispatch(payload);
-    }
-  }
-
-  private dispatch(payload: string): void {
-    setTimeout(() => {
+    try {
       this.socket.send(payload);
-    }, 0);
+      return true;
+    } catch {
+      this.close();
+      return false;
+    }
+  }
+
+  close(): void {
+    this.finish(true);
+  }
+
+  terminate(): void {
+    this.finish(false);
+  }
+
+  private finish(closeSocket: boolean): void {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (closeSocket) {
+      try {
+        this.socket.close(1011, "session closed");
+      } catch {
+        // The peer may already have closed the socket.
+      }
+    }
+    this.onClosed();
   }
 }

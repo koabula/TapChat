@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{CoreError, CoreResult};
 use crate::identity::LocalIdentityState;
+use crate::log_sanitize::redact_id;
 use crate::model::{MessageType, MlsStateStatus, MlsStateSummary};
 
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
@@ -1158,17 +1159,15 @@ impl MlsAdapter {
             Ok(processed) => processed,
             Err(error) if is_replay_or_duplicate_process_error(&error) => {
                 log::warn!(
-                    "ingest_protocol_message: ignoring replay/duplicate MLS message for conversation {}: {:?}",
-                    conversation_id,
-                    error
+                    "ingest_protocol_message: ignoring replay/duplicate MLS message for conversation {}",
+                    redact_id("conversation", conversation_id)
                 );
                 return Ok(IngestResult::IgnoredReplay);
             }
-            Err(error) => {
+            Err(_error) => {
                 log::warn!(
-                    "ingest_protocol_message: MLS process_message failed for conversation {}: {:?}",
-                    conversation_id,
-                    error
+                    "ingest_protocol_message: MLS process_message failed for conversation {}",
+                    redact_id("conversation", conversation_id)
                 );
                 state.status = MlsStateStatus::NeedsRecovery;
                 return Ok(IngestResult::PendingRetry);

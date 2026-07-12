@@ -4,6 +4,7 @@ use tapchat_core::model::DeploymentBundle;
 use tapchat_core::persistence::PersistedDeployment;
 use tapchat_core::CoreCommand;
 
+use crate::platform::log_sanitize::redact_id;
 use crate::platform::profile::ProfileManager;
 use crate::state::AppState;
 
@@ -101,19 +102,14 @@ pub async fn ensure_fresh_device_runtime_auth(
     log::info!(
         "device runtime auth refresh needed: reason={:?} user_id={} device_id={}",
         reason,
-        user_id,
-        device_id
+        redact_id("user", &user_id),
+        redact_id("device", &device_id)
     );
 
     let refreshed_bundle =
         bootstrap_device_bundle(&base_url, &bootstrap_secret, &user_id, &device_id)
             .await
-            .with_context(|| {
-                format!(
-                    "refresh device runtime auth for user_id={} device_id={} via {}",
-                    user_id, device_id, base_url
-                )
-            })?;
+            .context("refresh device runtime auth")?;
 
     {
         let mut inner = profile_manager.inner.write().await;
@@ -146,8 +142,8 @@ pub async fn ensure_fresh_device_runtime_auth(
 
     log::info!(
         "device runtime auth refreshed successfully for user_id={} device_id={} expires_at={}",
-        user_id,
-        device_id,
+        redact_id("user", &user_id),
+        redact_id("device", &device_id),
         refreshed_bundle
             .device_runtime_auth
             .as_ref()

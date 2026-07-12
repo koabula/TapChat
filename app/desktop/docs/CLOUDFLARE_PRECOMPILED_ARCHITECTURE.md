@@ -195,8 +195,8 @@ pub async fn deploy_worker_rest(
 
     // 3. 写入 Secrets
     for (name, value) in [
-        ("SHARING_TOKEN_SECRET", &config.sharing_secret),
-        ("BOOTSTRAP_TOKEN_SECRET", &config.bootstrap_secret),
+        ("SHARING_INTERNAL_SECRET", &config.sharing_secret),
+        ("BOOTSTRAP_LINK_SECRET", &config.bootstrap_secret),
     ] {
         client.put(format!("{base}/workers/scripts/{worker_name}/secrets/{name}"))
             .header("Authorization", format!("Bearer {api_token}"))

@@ -18,18 +18,20 @@ jobs:
     name: rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt
       - name: Install Linux desktop dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 gnome-keyring libdbus-1-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - run: cargo fmt --all --check
       - run: cargo check --workspace --all-targets
       - run: cargo test --workspace --all-targets -- --test-threads=1
+        env:
+          RUST_MIN_STACK: "67108864"
 
   cloudflare:
     name: cloudflare
@@ -38,13 +40,14 @@ jobs:
       run:
         working-directory: services/cloudflare
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: services/cloudflare/package-lock.json
       - run: npm ci
+      - run: npm audit --registry=https://registry.npmjs.org --omit=dev --audit-level=high
       - run: npm run check
       - run: npm test
       - run: npm run test:integration
@@ -57,16 +60,30 @@ jobs:
       run:
         working-directory: app/desktop
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: app/desktop/package-lock.json
       - run: npm ci
+      - run: npm audit --registry=https://registry.npmjs.org --omit=dev --audit-level=high
       - run: npm test
       - run: npm run build
 
   security-storage:
     name: security-storage
     uses: ./.github/workflows/security-storage.yml
+
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install pinned Rust audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo audit
+      - run: cargo deny check -W unmaintained -W unsound advisories bans licenses sources

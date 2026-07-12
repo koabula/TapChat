@@ -69,8 +69,8 @@ Vars：
 
 Secrets：
 
-- `SHARING_TOKEN_SECRET`
-- `BOOTSTRAP_TOKEN_SECRET`
+- `SHARING_INTERNAL_SECRET`
+- `BOOTSTRAP_LINK_SECRET`
 
 Secrets 通过 `wrangler secret put` 写入，不会进入临时 Wrangler 配置文件。
 
@@ -97,7 +97,7 @@ bootstrap 路由返回的 deployment bundle 包含：
 
 部署完成后：
 
-1. 用 `BOOTSTRAP_TOKEN_SECRET` 签发 bootstrap token。
+1. 用 `BOOTSTRAP_LINK_SECRET` 签发 bootstrap token。
 2. 调用 `POST /v1/bootstrap/device`，传入 `userId`、`deviceId` 和模型 `version`。
 3. 把返回的 deployment bundle 导入客户端 profile。
 4. 使用 `device_runtime_auth` 发布本地 identity bundle、device status 和 keypackage refs/objects。

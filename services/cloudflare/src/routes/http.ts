@@ -10,6 +10,14 @@ import {
   validateSharedStateWriteAuthorization,
   validateWelcomePickupAuthorization
 } from "../auth/capability";
+import {
+  CONTROL_JSON_MAX_BYTES,
+  DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES,
+  readJsonLimited,
+  readRequestTextLimited,
+  requireBootstrapSecret,
+  requireSharingSecret
+} from "../auth/runtime-security";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
 import { SharedStateService } from "../storage/shared-state";
 import { StorageService } from "../storage/service";
@@ -105,7 +113,7 @@ function baseUrl(request: Request, env: Env): string {
 }
 
 function sharedStateSecret(env: Env): string {
-  return env.SHARING_TOKEN_SECRET ?? "replace-me";
+  return requireSharingSecret(env);
 }
 
 function downloadGrantTtlDays(env: Env): number {
@@ -118,7 +126,14 @@ function downloadGrantTtlDays(env: Env): number {
 }
 
 function bootstrapSecret(env: Env): string {
-  return env.BOOTSTRAP_TOKEN_SECRET ?? env.SHARING_TOKEN_SECRET ?? "replace-me";
+  return requireBootstrapSecret(env);
+}
+
+function messageRequestBodyLimit(env: Env): number {
+  const configured = Number(env.MESSAGE_REQUEST_MAX_BODY_BYTES ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES;
 }
 
 function runtimeScopes(): DeviceRuntimeAuth["scopes"] {
@@ -210,18 +225,23 @@ async function authorizeSharedStateWrite(
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const store = new StorageService(
-    new R2JsonBlobStore(env.TAPCHAT_STORAGE),
-    baseUrl(request, env),
-    sharedStateSecret(env),
-    downloadGrantTtlDays(env)
-  );
-  const sharedState = new SharedStateService(new R2JsonBlobStore(env.TAPCHAT_STORAGE), baseUrl(request, env));
-  const welcomePickup = new WelcomePickupService(new R2JsonBlobStore(env.TAPCHAT_STORAGE));
-  const now = Date.now();
-
   try {
+    const url = new URL(request.url);
+    const sharingSecret = sharedStateSecret(env);
+    const bootstrapLinkSecret = bootstrapSecret(env);
+    if (sharingSecret === bootstrapLinkSecret) {
+      throw new HttpError(503, "runtime_misconfigured", "runtime secrets must use independent values");
+    }
+    const store = new StorageService(
+      new R2JsonBlobStore(env.TAPCHAT_STORAGE),
+      baseUrl(request, env),
+      sharingSecret,
+      downloadGrantTtlDays(env)
+    );
+    const sharedState = new SharedStateService(new R2JsonBlobStore(env.TAPCHAT_STORAGE), baseUrl(request, env));
+    const welcomePickup = new WelcomePickupService(new R2JsonBlobStore(env.TAPCHAT_STORAGE));
+    const now = Date.now();
+
     if (request.method === "GET" && url.pathname === "/v1/deployment-bundle") {
       return jsonResponse(publicDeploymentBundle(request, env));
     }
@@ -248,7 +268,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     if (request.method === "POST" && url.pathname === "/v1/bootstrap/device") {
-      const body = (await request.json()) as BootstrapDeviceRequest;
+      const body = await readJsonLimited<BootstrapDeviceRequest>(request, CONTROL_JSON_MAX_BYTES);
       if (body.version !== CURRENT_MODEL_VERSION) {
         throw new HttpError(400, "unsupported_version", "bootstrap request version is not supported");
       }
@@ -270,7 +290,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const stub = env.INBOX.get(objectId);
 
       if (request.method === "POST" && operation === "messages") {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         const body = JSON.parse(bodyText) as AppendEnvelopeRequest;
         const appendAuth = await validateAppendAuthorization(request, deviceId, body, now, sharedState);
         const forwarded = forwardRequestWithBody(request, bodyText);
@@ -293,7 +313,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_manage", now);
       }
 
-      return stub.fetch(request);
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return await stub.fetch(request);
     }
 
     const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|transitions|head|seal|subscribe)$/);
@@ -304,18 +328,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const stub = env.GROUP_OUTBOX.get(objectId);
 
       if (request.method === "POST" && (operation === "messages" || operation === "transitions")) {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         return await stub.fetch(forwardRequestWithBody(request, bodyText));
       }
 
-      return stub.fetch(request);
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return await stub.fetch(request);
     }
 
     const groupAuthorizationMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/authorization\/bootstrap$/);
     if (groupAuthorizationMatch && request.method === "POST") {
       const groupId = decodeURIComponent(groupAuthorizationMatch[1]);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      const bodyText = await request.text();
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
 
@@ -358,7 +386,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const groupId = decodeURIComponent(groupInviteMatch[1]);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       if (request.method === "POST") {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
         return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
       }
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
@@ -388,13 +416,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         }
       }
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+      if (request.method === "POST") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return await env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
 
     const joinDecisionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/decision$/);
     if (joinDecisionMatch && request.method === "POST") {
       const groupId = decodeURIComponent(joinDecisionMatch[1]);
-      const bodyText = await request.text();
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
@@ -402,7 +434,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const joinLeaseMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/(claim|complete)$/);
     if (joinLeaseMatch && request.method === "POST") {
       const groupId = decodeURIComponent(joinLeaseMatch[1]);
-      const bodyText = await request.text();
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
@@ -419,7 +451,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const groupId = decodeURIComponent(leaveRequestMatch[1]);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       if (request.method === "POST") {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
         return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
       }
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
@@ -430,13 +462,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const groupId = decodeURIComponent(welcomePickupMatch[1]);
       const deviceId = decodeURIComponent(welcomePickupMatch[2]);
       if (request.method === "PUT") {
-        const body = (await request.json()) as PutWelcomePickupRequest;
+        const body = await readJsonLimited<PutWelcomePickupRequest>(request, messageRequestBodyLimit(env));
         validateWelcomePickupAuthorization(request, groupId, deviceId, body.descriptor, now);
         if (body.descriptor.requestId) {
           const authorized = await env.GROUP_OUTBOX.get(env.GROUP_OUTBOX.idFromName(groupId)).fetch(
             new Request(`${url.origin}/v1/groups/${encodeURIComponent(groupId)}/internal/welcome-authorize`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", "X-Tapchat-Internal-Secret": env.SHARING_TOKEN_SECRET ?? "replace-me" },
+              headers: { "Content-Type": "application/json", "X-Tapchat-Internal-Secret": sharingSecret },
               body: JSON.stringify({ deviceId, requestId: body.descriptor.requestId, capability: body.descriptor.capability })
             })
           );
@@ -464,7 +496,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
-                "X-Tapchat-Internal-Secret": env.SHARING_TOKEN_SECRET ?? "replace-me"
+                "X-Tapchat-Internal-Secret": sharingSecret
               },
               body: JSON.stringify({ deviceId, requestId: descriptor.requestId, capability: descriptor.capability })
             })
@@ -489,7 +521,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
-        const body = (await request.json()) as IdentityBundle;
+        const body = await readJsonLimited<IdentityBundle>(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putIdentityBundle(userId, body);
         const saved = await sharedState.getIdentityBundle(userId);
         return jsonResponse(saved);
@@ -508,7 +540,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "device_status", now);
-        const body = (await request.json()) as DeviceStatusDocument;
+        const body = await readJsonLimited<DeviceStatusDocument>(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putDeviceStatus(userId, body);
         const saved = await sharedState.getDeviceStatus(userId);
         return jsonResponse(saved);
@@ -538,7 +570,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
       if (request.method === "PUT") {
         await validateKeyPackageWriteAuthorization(request, sharedStateSecret(env), userId, deviceId, undefined, now);
-        const body = (await request.json()) as KeyPackageRefsDocument;
+        const body = await readJsonLimited<KeyPackageRefsDocument>(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putKeyPackageRefs(userId, deviceId, body);
         const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
         return jsonResponse(saved);
@@ -571,7 +603,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
       const auth = await validateAnyDeviceRuntimeAuthorization(request, sharedStateSecret(env), "storage_prepare_upload", now);
-      const body = (await request.json()) as PrepareBlobUploadRequest;
+      const body = await readJsonLimited<PrepareBlobUploadRequest>(request, CONTROL_JSON_MAX_BYTES);
       const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
       return jsonResponse(result);
     }
@@ -585,7 +617,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!token) {
         throw new HttpError(401, "invalid_capability", "download refresh grant must not be empty");
       }
-      const body = (await request.json()) as AuthorizeBlobDownloadRequest;
+      const body = await readJsonLimited<AuthorizeBlobDownloadRequest>(request, CONTROL_JSON_MAX_BYTES);
       if (body.version !== CURRENT_MODEL_VERSION) {
         throw new HttpError(400, "unsupported_version", "authorize download version is not supported");
       }

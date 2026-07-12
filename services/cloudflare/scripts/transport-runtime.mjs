@@ -2,8 +2,8 @@ import { unstable_dev } from "wrangler";
 
 const port = Number(process.env.TAPCHAT_TRANSPORT_PORT ?? "0");
 const persistTo = process.env.TAPCHAT_TRANSPORT_PERSIST_TO;
-const sharingSecret = process.env.TAPCHAT_TRANSPORT_SHARING_SECRET ?? "transport-sharing-secret";
-const bootstrapSecret = process.env.TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET ?? "transport-bootstrap-secret";
+const sharingSecret = process.env.TAPCHAT_TRANSPORT_SHARING_SECRET ?? "transport-sharing-secret-0123456789abcdef0123456789abcdef";
+const bootstrapSecret = process.env.TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET ?? "transport-bootstrap-secret-0123456789abcdef0123456789abcdef";
 const maxInlineBytes = process.env.MAX_INLINE_BYTES;
 const retentionDays = process.env.RETENTION_DAYS;
 const rateLimitPerMinute = process.env.RATE_LIMIT_PER_MINUTE;
@@ -21,8 +21,8 @@ const worker = await unstable_dev("src/index.ts", {
   vars: {
     PUBLIC_BASE_URL: baseUrl,
     DEPLOYMENT_REGION: "local-transport",
-    SHARING_TOKEN_SECRET: sharingSecret,
-    BOOTSTRAP_TOKEN_SECRET: bootstrapSecret,
+    SHARING_INTERNAL_SECRET: sharingSecret,
+    BOOTSTRAP_LINK_SECRET: bootstrapSecret,
     ...(maxInlineBytes ? { MAX_INLINE_BYTES: maxInlineBytes } : {}),
     ...(retentionDays ? { RETENTION_DAYS: retentionDays } : {}),
     ...(rateLimitPerMinute ? { RATE_LIMIT_PER_MINUTE: rateLimitPerMinute } : {}),

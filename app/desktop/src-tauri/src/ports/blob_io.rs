@@ -40,9 +40,8 @@ pub async fn read_attachment_bytes(
         }
         Err(e) => {
             log::error!(
-                "Failed to read attachment {}: {:?}",
-                redact_id("attachment", &read.attachment_id),
-                e
+                "Failed to read attachment {}: read_failed",
+                redact_id("attachment", &read.attachment_id)
             );
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: read.task_id,
@@ -151,9 +150,8 @@ pub async fn upload_blob_with_progress(
         }
         Err(e) => {
             log::error!(
-                "Blob upload error: task_id={} {:?}",
-                redact_id("task", &upload.task_id),
-                e
+                "Blob upload error: task_id={} error=request_failed",
+                redact_id("task", &upload.task_id)
             );
             let retryable = e.is_timeout() || e.is_connect();
 
@@ -229,9 +227,8 @@ pub async fn download_blob(download: BlobDownloadRequest) -> Result<Vec<CoreEven
         }
         Err(e) => {
             log::error!(
-                "Blob download error: task_id={} {:?}",
-                redact_id("task", &download.task_id),
-                e
+                "Blob download error: task_id={} error=request_failed",
+                redact_id("task", &download.task_id)
             );
             let retryable = e.is_timeout() || e.is_connect();
             Ok(vec![CoreEvent::BlobTransferFailed {

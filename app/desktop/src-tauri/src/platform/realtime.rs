@@ -72,7 +72,8 @@ struct RealtimeSession {
 fn spawn_core_event(app: Arc<AppHandle>, event: CoreEvent, context: &'static str) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = drive_core_with_handle(app.as_ref(), CoreInput::Event(event)).await {
-            log::warn!("RealtimeManager: failed to drive core from {context}: {error}");
+            let _ = error;
+            log::warn!("RealtimeManager: failed to drive core from {context}: drive_failed");
         }
     });
 }
@@ -741,7 +742,7 @@ impl RealtimeManager {
                             break;
                         }
                         Some(Err(e)) => {
-                            log::error!("Group WS error for {}: {:?}", group_ref, e);
+                            log::error!("Group WS error for {}: websocket_failed", group_ref);
                             let error_detail = e.to_string();
 
                             let should_emit = {
@@ -1022,7 +1023,7 @@ impl RealtimeManager {
                             break;
                         }
                         Some(Err(e)) => {
-                            log::error!("WS error for {}: {:?}", device_ref, e);
+                            log::error!("WS error for {}: websocket_failed", device_ref);
                             timetest!("ws_error device_id={} error=1 ts={}", device_ref, crate::ts_ms());
                             let error_detail = e.to_string();
 

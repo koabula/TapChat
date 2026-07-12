@@ -2,6 +2,7 @@
 name = "tapchat_transport_adapter"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow = "1"
@@ -10,6 +11,7 @@ futures-util = "0.3"
 hmac = "0.12"
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

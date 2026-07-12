@@ -9,6 +9,12 @@ declare class DurableObjectState {
     delete(key: string): Promise<void>;
     list<T>(options?: { prefix?: string }): Promise<Map<string, T>>;
     setAlarm(epochMillis: number | Date): Promise<void>;
+    transaction<T>(
+      callback: (transaction: {
+        put(values: Record<string, unknown>): Promise<void>;
+        delete(keys: string[]): Promise<unknown>;
+      }) => Promise<T>
+    ): Promise<T>;
   };
 }
 

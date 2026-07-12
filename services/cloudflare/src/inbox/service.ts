@@ -21,6 +21,12 @@ interface InboxMeta {
   maxInlineBytes: number;
   rateLimitPerMinute: number;
   rateLimitPerHour: number;
+  messageRequestMaxPerSender?: number;
+  messageRequestMaxSenders?: number;
+  messageRequestMaxTotalBytes?: number;
+  messageRequestTtlSeconds?: number;
+  messageRequestRateLimitMinute?: number;
+  messageRequestRateLimitHour?: number;
 }
 
 interface StoredRecordIndex {
@@ -47,6 +53,14 @@ interface MessageRequestEntry {
   lastMessageId: string;
   lastConversationId: string;
   pendingRequests: AppendEnvelopeRequest[];
+  byteSize?: number;
+  expiresAt?: number;
+}
+
+interface MessageRequestQueueMeta {
+  version: 1;
+  totalBytes: number;
+  senderCount: number;
 }
 
 interface RateLimitState {
@@ -68,6 +82,8 @@ const RECORD_PREFIX = "record:";
 const ALLOWLIST_KEY = "allowlist";
 const MESSAGE_REQUEST_PREFIX = "message-request:";
 const RATE_LIMIT_PREFIX = "rate-limit:";
+const MESSAGE_REQUEST_META_KEY = `${MESSAGE_REQUEST_PREFIX}meta`;
+const MESSAGE_REQUEST_RATE_LIMIT_KEY = `${MESSAGE_REQUEST_PREFIX}rate-limit`;
 const CLEANUP_BATCH_SIZE = 128;
 
 export class InboxService {
@@ -118,7 +134,7 @@ export class InboxService {
     }
 
     if (authContext.mode !== "verified") {
-      const request = await this.queueMessageRequest(input, now);
+      const request = await this.queueMessageRequestWithLimit(input, now);
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
       return request;
     }
@@ -129,7 +145,7 @@ export class InboxService {
       return delivered;
     }
 
-    const request = await this.queueMessageRequest(input, now);
+    const request = await this.queueMessageRequestWithLimit(input, now);
     await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
     return request;
   }
@@ -232,7 +248,9 @@ export class InboxService {
     return document;
   }
 
-  async listMessageRequests(): Promise<MessageRequestItem[]> {
+  async listMessageRequests(now = Date.now()): Promise<MessageRequestItem[]> {
+    await this.pruneExpiredMessageRequests(now);
+    await this.scheduleNextAlarm(now);
     const requests = await this.state.get<string[]>(this.messageRequestIndexKey());
     if (!requests?.length) {
       return [];
@@ -250,7 +268,7 @@ export class InboxService {
   }
 
   async acceptMessageRequest(requestId: string, now: number): Promise<MessageRequestActionResult> {
-    const entry = await this.findMessageRequest(requestId);
+    const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
@@ -286,6 +304,7 @@ export class InboxService {
       }
     }
     await this.deleteMessageRequest(entry.senderUserId, "accepted");
+    await this.scheduleNextAlarm(now);
     return {
       accepted: true,
       requestId: entry.requestId,
@@ -299,7 +318,7 @@ export class InboxService {
   }
 
   async rejectMessageRequest(requestId: string, now: number): Promise<MessageRequestActionResult> {
-    const entry = await this.findMessageRequest(requestId);
+    const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
@@ -310,6 +329,7 @@ export class InboxService {
       now
     );
     await this.deleteMessageRequest(entry.senderUserId, "rejected");
+    await this.scheduleNextAlarm(now);
     return {
       accepted: true,
       requestId: entry.requestId,
@@ -323,6 +343,7 @@ export class InboxService {
   }
 
   async cleanExpiredRecords(now: number): Promise<void> {
+    await this.pruneExpiredMessageRequests(now);
     const meta = await this.getMeta();
     const stored = await this.state.list<StoredRecordIndex>({ prefix: RECORD_PREFIX });
     const eligible = Array.from(stored.entries())
@@ -339,7 +360,9 @@ export class InboxService {
 
     if (eligible.length > CLEANUP_BATCH_SIZE) {
       await this.state.setAlarm(now + 1);
+      return;
     }
+    await this.scheduleNextAlarm(now);
   }
 
   private validateStoredRecordIndex(index: StoredRecordIndex, seq: number): void {
@@ -413,8 +436,6 @@ export class InboxService {
 
     await this.state.put(`${IDEMPOTENCY_PREFIX}${record.messageId}`, seq);
     await this.state.put(META_KEY, { ...meta, headSeq: seq });
-    await this.state.setAlarm(expiresAt);
-
     this.publish({
       event: "head_updated",
       deviceId: this.deviceId,
@@ -430,11 +451,33 @@ export class InboxService {
     return { accepted: true, seq, deliveredTo: "inbox" };
   }
 
-  private async queueMessageRequest(input: AppendEnvelopeRequest, now: number): Promise<AppendEnvelopeResult> {
+  private async queueMessageRequestWithLimit(input: AppendEnvelopeRequest, now: number): Promise<AppendEnvelopeResult> {
+    await this.enforceMessageRequestRateLimit(now);
+    await this.pruneExpiredMessageRequests(now);
+
+    const limits = await this.getMeta();
     const senderUserId = input.envelope.senderUserId;
     const key = this.messageRequestKey(senderUserId);
     const requestId = this.requestIdForSender(senderUserId);
     const existing = await this.state.get<MessageRequestEntry>(key);
+    const index = (await this.state.get<string[]>(this.messageRequestIndexKey())) ?? [];
+    const queueMeta = (await this.state.get<MessageRequestQueueMeta>(MESSAGE_REQUEST_META_KEY)) ?? {
+      version: 1,
+      totalBytes: 0,
+      senderCount: index.length
+    };
+    const requestBytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
+
+    if (existing && existing.pendingRequests.length >= (limits.messageRequestMaxPerSender ?? 16)) {
+      this.messageRequestCapacityExceeded("message request sender quota exceeded");
+    }
+    if (!existing && index.length >= (limits.messageRequestMaxSenders ?? 64)) {
+      this.messageRequestCapacityExceeded("message request sender capacity exceeded");
+    }
+    if (queueMeta.totalBytes + requestBytes > (limits.messageRequestMaxTotalBytes ?? 4 * 1024 * 1024)) {
+      this.messageRequestCapacityExceeded("message request byte capacity exceeded");
+    }
+
     const entry: MessageRequestEntry = existing ?? {
       requestId,
       recipientDeviceId: this.deviceId,
@@ -447,7 +490,9 @@ export class InboxService {
       messageCount: 0,
       lastMessageId: input.envelope.messageId,
       lastConversationId: input.envelope.conversationId,
-      pendingRequests: []
+      pendingRequests: [],
+      byteSize: 0,
+      expiresAt: now + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1000
     };
     entry.senderBundleShareUrl ??= input.senderBundleShareUrl;
     entry.senderBundleHash ??= input.senderBundleHash;
@@ -457,8 +502,23 @@ export class InboxService {
     entry.lastMessageId = input.envelope.messageId;
     entry.lastConversationId = input.envelope.conversationId;
     entry.pendingRequests.push(input);
-    await this.state.put(key, entry);
-    await this.addMessageRequestIndex(senderUserId);
+    entry.byteSize = (entry.byteSize ?? this.messageRequestEntryBytes(entry) - requestBytes) + requestBytes;
+    entry.expiresAt ??= entry.firstSeenAt + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1000;
+
+    const nextIndex = index.includes(senderUserId)
+      ? index
+      : [...index, senderUserId].sort();
+    const nextQueueMeta: MessageRequestQueueMeta = {
+      version: 1,
+      totalBytes: queueMeta.totalBytes + requestBytes,
+      senderCount: nextIndex.length
+    };
+    await this.state.putEntries({
+      [key]: entry,
+      [this.messageRequestIndexKey()]: nextIndex,
+      [MESSAGE_REQUEST_META_KEY]: nextQueueMeta
+    });
+    await this.scheduleNextAlarm(now);
     this.publish({
       event: "message_request_changed",
       deviceId: this.deviceId,
@@ -473,6 +533,10 @@ export class InboxService {
       queuedAsRequest: true,
       requestId
     };
+  }
+
+  private messageRequestCapacityExceeded(message: string): never {
+    throw new HttpError(429, "message_request_capacity_exceeded", message);
   }
 
   private messageRequestsToPromote(entry: MessageRequestEntry): AppendEnvelopeRequest[] {
@@ -537,6 +601,47 @@ export class InboxService {
     await this.state.put(key, state);
   }
 
+  private async enforceMessageRequestRateLimit(now: number): Promise<void> {
+    const meta = await this.getMeta();
+    const minuteLimit = meta.messageRequestRateLimitMinute ?? 30;
+    const hourLimit = meta.messageRequestRateLimitHour ?? 300;
+    const minuteWindowStart = Math.floor(now / 60_000) * 60_000;
+    const hourWindowStart = Math.floor(now / 3_600_000) * 3_600_000;
+    const state = (await this.state.get<RateLimitState>(MESSAGE_REQUEST_RATE_LIMIT_KEY)) ?? {
+      minuteWindowStart,
+      minuteCount: 0,
+      hourWindowStart,
+      hourCount: 0
+    };
+    if (state.minuteWindowStart !== minuteWindowStart) {
+      state.minuteWindowStart = minuteWindowStart;
+      state.minuteCount = 0;
+    }
+    if (state.hourWindowStart !== hourWindowStart) {
+      state.hourWindowStart = hourWindowStart;
+      state.hourCount = 0;
+    }
+    if (minuteLimit > 0 && state.minuteCount >= minuteLimit) {
+      throw new HttpError(
+        429,
+        "message_request_rate_limited",
+        "message request rate limit exceeded for minute window",
+        { retryAfterSeconds: Math.max(1, Math.ceil((minuteWindowStart + 60_000 - now) / 1000)) }
+      );
+    }
+    if (hourLimit > 0 && state.hourCount >= hourLimit) {
+      throw new HttpError(
+        429,
+        "message_request_rate_limited",
+        "message request rate limit exceeded for hour window",
+        { retryAfterSeconds: Math.max(1, Math.ceil((hourWindowStart + 3_600_000 - now) / 1000)) }
+      );
+    }
+    state.minuteCount += 1;
+    state.hourCount += 1;
+    await this.state.put(MESSAGE_REQUEST_RATE_LIMIT_KEY, state);
+  }
+
   private publish(event: RealtimeEvent): void {
     const payload = JSON.stringify(event);
     for (const session of this.sessions) {
@@ -573,26 +678,26 @@ export class InboxService {
     return `${MESSAGE_REQUEST_PREFIX}index`;
   }
 
-  private async addMessageRequestIndex(senderUserId: string): Promise<void> {
-    const index = (await this.state.get<string[]>(this.messageRequestIndexKey())) ?? [];
-    if (!index.includes(senderUserId)) {
-      index.push(senderUserId);
-      index.sort();
-      await this.state.put(this.messageRequestIndexKey(), index);
-    }
-  }
-
   private async deleteMessageRequest(
     senderUserId: string,
     change: "accepted" | "rejected"
   ): Promise<void> {
     const existing = await this.state.get<MessageRequestEntry>(this.messageRequestKey(senderUserId));
-    await this.state.delete(this.messageRequestKey(senderUserId));
     const index = (await this.state.get<string[]>(this.messageRequestIndexKey())) ?? [];
-    await this.state.put(
-      this.messageRequestIndexKey(),
-      index.filter((entry) => entry !== senderUserId)
-    );
+    const nextIndex = index.filter((entry) => entry !== senderUserId);
+    const queueMeta = (await this.state.get<MessageRequestQueueMeta>(MESSAGE_REQUEST_META_KEY)) ?? {
+      version: 1,
+      totalBytes: 0,
+      senderCount: index.length
+    };
+    await this.state.mutateEntries({
+      [this.messageRequestIndexKey()]: nextIndex,
+      [MESSAGE_REQUEST_META_KEY]: {
+        version: 1,
+        totalBytes: Math.max(0, queueMeta.totalBytes - (existing ? this.messageRequestEntryBytes(existing) : 0)),
+        senderCount: nextIndex.length
+      } satisfies MessageRequestQueueMeta
+    }, [this.messageRequestKey(senderUserId)]);
     if (existing) {
       this.publish({
         event: "message_request_changed",
@@ -604,13 +709,90 @@ export class InboxService {
     }
   }
 
-  private async findMessageRequest(requestId: string): Promise<MessageRequestEntry | null> {
-    const requests = await this.listMessageRequests();
+  private async findMessageRequest(requestId: string, now: number): Promise<MessageRequestEntry | null> {
+    const requests = await this.listMessageRequests(now);
     const match = requests.find((request) => request.requestId === requestId);
     if (!match) {
       return null;
     }
     return (await this.state.get<MessageRequestEntry>(this.messageRequestKey(match.senderUserId))) ?? null;
+  }
+
+  private messageRequestEntryBytes(entry: MessageRequestEntry): number {
+    if (entry.byteSize !== undefined && Number.isSafeInteger(entry.byteSize) && entry.byteSize >= 0) {
+      return entry.byteSize;
+    }
+    return entry.pendingRequests.reduce(
+      (total, request) => total + new TextEncoder().encode(JSON.stringify(request)).byteLength,
+      0
+    );
+  }
+
+  private async pruneExpiredMessageRequests(now: number): Promise<void> {
+    const limits = await this.getMeta();
+    const index = (await this.state.get<string[]>(this.messageRequestIndexKey())) ?? [];
+    const retained: string[] = [];
+    const updates: Record<string, unknown> = {};
+    const deleteKeys: string[] = [];
+    let totalBytes = 0;
+
+    for (const senderUserId of index) {
+      const key = this.messageRequestKey(senderUserId);
+      const entry = await this.state.get<MessageRequestEntry>(key);
+      if (!entry) {
+        continue;
+      }
+      const byteSize = this.messageRequestEntryBytes(entry);
+      const expiresAt = entry.expiresAt ?? entry.firstSeenAt + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1000;
+      if (expiresAt <= now) {
+        deleteKeys.push(key);
+        for (const pending of entry.pendingRequests) {
+          deleteKeys.push(`${APPEND_RESULT_PREFIX}${pending.envelope.messageId}`);
+        }
+        continue;
+      }
+      retained.push(senderUserId);
+      totalBytes += byteSize;
+      if (entry.byteSize !== byteSize || entry.expiresAt !== expiresAt || entry.messageCount !== entry.pendingRequests.length) {
+        updates[key] = {
+          ...entry,
+          byteSize,
+          expiresAt,
+          messageCount: entry.pendingRequests.length
+        } satisfies MessageRequestEntry;
+      }
+    }
+
+    updates[this.messageRequestIndexKey()] = retained.sort();
+    updates[MESSAGE_REQUEST_META_KEY] = {
+      version: 1,
+      totalBytes,
+      senderCount: retained.length
+    } satisfies MessageRequestQueueMeta;
+    await this.state.mutateEntries(updates, deleteKeys);
+  }
+
+  private async scheduleNextAlarm(now: number): Promise<void> {
+    const meta = await this.getMeta();
+    const records = await this.state.list<StoredRecordIndex>({ prefix: RECORD_PREFIX });
+    const messageRequestSenders = (await this.state.get<string[]>(this.messageRequestIndexKey())) ?? [];
+    let nextAt: number | undefined;
+
+    for (const record of records.values()) {
+      if (record.seq > meta.ackedSeq || record.expiresAt === undefined) {
+        continue;
+      }
+      nextAt = nextAt === undefined ? record.expiresAt : Math.min(nextAt, record.expiresAt);
+    }
+    for (const senderUserId of messageRequestSenders) {
+      const entry = await this.state.get<MessageRequestEntry>(this.messageRequestKey(senderUserId));
+      if (entry?.expiresAt !== undefined) {
+        nextAt = nextAt === undefined ? entry.expiresAt : Math.min(nextAt, entry.expiresAt);
+      }
+    }
+    if (nextAt !== undefined) {
+      await this.state.setAlarm(Math.max(now + 1, nextAt));
+    }
   }
 
   private toMessageRequestItem(entry: MessageRequestEntry): MessageRequestItem {

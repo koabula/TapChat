@@ -82,11 +82,8 @@ impl DesktopPlatformPorts {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
-                .unwrap_or_else(|error| {
-                    log::warn!(
-                        "Failed to build timeout-configured desktop HTTP client: {}",
-                        error
-                    );
+                .unwrap_or_else(|_error| {
+                    log::warn!("Failed to build timeout-configured desktop HTTP client");
                     reqwest::Client::new()
                 }),
             app_handle: None,
@@ -123,8 +120,8 @@ impl DesktopPlatformPorts {
         // Load runtime metadata
         let runtime = match profile.load_runtime_metadata() {
             Ok(r) => r,
-            Err(e) => {
-                log::warn!("Failed to load runtime metadata: {}", e);
+            Err(_error) => {
+                log::warn!("Failed to load runtime metadata: load_failed");
                 return Ok(None);
             }
         };
@@ -146,8 +143,8 @@ impl DesktopPlatformPorts {
         // Get local bundle from persistence
         let snapshot = match profile.load_snapshot() {
             Ok(s) => s,
-            Err(e) => {
-                log::warn!("Failed to load snapshot: {}", e);
+            Err(_error) => {
+                log::warn!("Failed to load snapshot: load_failed");
                 return Ok(None);
             }
         };
@@ -678,11 +675,10 @@ impl TransportPort for DesktopPlatformPorts {
             }
             Err(error) => {
                 log::warn!(
-                    "[TransportPort] fetch_group_outbox request failed group_id={} from_seq={} endpoint={} error={}",
+                    "[TransportPort] fetch_group_outbox request failed group_id={} from_seq={} endpoint={} error=request_failed",
                     group_ref,
                     fetch.from_seq,
-                    endpoint,
-                    error
+                    endpoint
                 );
                 Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                     group_id: fetch.group_id,
@@ -724,10 +720,9 @@ impl TransportPort for DesktopPlatformPorts {
             Ok(response) => response,
             Err(error) => {
                 log::warn!(
-                    "[TransportPort] get_group_outbox_head request failed group_id={} endpoint={} error={}",
+                    "[TransportPort] get_group_outbox_head request failed group_id={} endpoint={} error=request_failed",
                     group_ref,
-                    endpoint,
-                    error
+                    endpoint
                 );
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
@@ -760,10 +755,9 @@ impl TransportPort for DesktopPlatformPorts {
             Ok(result) => result,
             Err(error) => {
                 log::warn!(
-                    "[TransportPort] get_group_outbox_head decode failed group_id={} endpoint={} error={}",
+                    "[TransportPort] get_group_outbox_head decode failed group_id={} endpoint={} error=decode_failed",
                     group_ref,
-                    endpoint,
-                    error
+                    endpoint
                 );
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
@@ -903,10 +897,9 @@ impl TransportPort for DesktopPlatformPorts {
             }
             Err(error) => {
                 log::warn!(
-                    "[TransportPort] fetch_welcome_pickup transport error group_id={} device_id={} error={}",
+                    "[TransportPort] fetch_welcome_pickup transport error group_id={} device_id={} error=request_failed",
                     group_ref,
-                    device_ref,
-                    error
+                    device_ref
                 );
                 Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                     descriptor: fetch.descriptor,
@@ -1749,8 +1742,8 @@ impl NotificationPort for DesktopPlatformPorts {
         &mut self,
         notification: UserNotificationEffect,
     ) -> Result<Vec<CoreEvent>> {
-        if let Err(e) = self.notification.emit_user_notification(notification) {
-            log::error!("Notification error: {:?}", e);
+        if let Err(_error) = self.notification.emit_user_notification(notification) {
+            log::error!("Notification error: delivery_failed");
         }
         Ok(Vec::new())
     }

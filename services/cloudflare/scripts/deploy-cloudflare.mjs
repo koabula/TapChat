@@ -34,7 +34,14 @@ const DEFAULTS = {
   maxInlineBytes: "4096",
   retentionDays: "30",
   rateLimitPerMinute: "60",
-  rateLimitPerHour: "600"
+  rateLimitPerHour: "600",
+  messageRequestMaxBodyBytes: "327680",
+  messageRequestMaxPerSender: "16",
+  messageRequestMaxSenders: "64",
+  messageRequestMaxTotalBytes: "4194304",
+  messageRequestTtlSeconds: "604800",
+  messageRequestRateLimitMinute: "30",
+  messageRequestRateLimitHour: "300"
 };
 
 function printUsage() {
@@ -109,6 +116,16 @@ function generateSecret() {
   return randomBytes(32).toString("hex");
 }
 
+function validateSecret(value, label) {
+  const normalized = String(value ?? "").trim();
+  if (
+    Buffer.byteLength(normalized, "utf8") < 32 ||
+    ["replace-me", "replace-me-bootstrap", "changeme", "change-me", "secret"].includes(normalized.toLowerCase())
+  ) {
+    throw new Error(`${label} must be an independently generated secret of at least 32 bytes.`);
+  }
+}
+
 async function runCommand(command, args, options = {}) {
   const {
     cwd = SERVICE_DIR,
@@ -172,6 +189,8 @@ async function runCommand(command, args, options = {}) {
 }
 
 function coerceResolvedConfig(config) {
+  const configuredSharingSecret = config.sharing_internal_secret ?? config.sharing_token_secret ?? config.sharingTokenSecret;
+  const configuredBootstrapSecret = config.bootstrap_link_secret ?? config.bootstrap_token_secret ?? config.bootstrapTokenSecret;
   return {
     workerName: config.worker_name ?? config.workerName,
     publicBaseUrl: normalizeBaseUrl(config.public_base_url ?? config.publicBaseUrl ?? ""),
@@ -180,13 +199,20 @@ function coerceResolvedConfig(config) {
     retentionDays: String(config.retention_days ?? config.retentionDays ?? DEFAULTS.retentionDays),
     rateLimitPerMinute: String(config.rate_limit_per_minute ?? config.rateLimitPerMinute ?? DEFAULTS.rateLimitPerMinute),
     rateLimitPerHour: String(config.rate_limit_per_hour ?? config.rateLimitPerHour ?? DEFAULTS.rateLimitPerHour),
+    messageRequestMaxBodyBytes: String(config.message_request_max_body_bytes ?? config.messageRequestMaxBodyBytes ?? DEFAULTS.messageRequestMaxBodyBytes),
+    messageRequestMaxPerSender: String(config.message_request_max_per_sender ?? config.messageRequestMaxPerSender ?? DEFAULTS.messageRequestMaxPerSender),
+    messageRequestMaxSenders: String(config.message_request_max_senders ?? config.messageRequestMaxSenders ?? DEFAULTS.messageRequestMaxSenders),
+    messageRequestMaxTotalBytes: String(config.message_request_max_total_bytes ?? config.messageRequestMaxTotalBytes ?? DEFAULTS.messageRequestMaxTotalBytes),
+    messageRequestTtlSeconds: String(config.message_request_ttl_seconds ?? config.messageRequestTtlSeconds ?? DEFAULTS.messageRequestTtlSeconds),
+    messageRequestRateLimitMinute: String(config.message_request_rate_limit_minute ?? config.messageRequestRateLimitMinute ?? DEFAULTS.messageRequestRateLimitMinute),
+    messageRequestRateLimitHour: String(config.message_request_rate_limit_hour ?? config.messageRequestRateLimitHour ?? DEFAULTS.messageRequestRateLimitHour),
     bucketName: config.bucket_name ?? config.bucketName,
     previewBucketName: config.preview_bucket_name ?? config.previewBucketName,
-    sharingTokenSecret: config.sharing_token_secret ?? config.sharingTokenSecret,
-    bootstrapTokenSecret: config.bootstrap_token_secret ?? config.bootstrapTokenSecret,
+    sharingTokenSecret: configuredSharingSecret ?? generateSecret(),
+    bootstrapTokenSecret: configuredBootstrapSecret ?? generateSecret(),
     generatedPublicBaseUrl: !normalizeBaseUrl(config.public_base_url ?? config.publicBaseUrl ?? ""),
-    generatedSharingSecret: false,
-    generatedBootstrapSecret: false
+    generatedSharingSecret: !configuredSharingSecret,
+    generatedBootstrapSecret: !configuredBootstrapSecret
   };
 }
 
@@ -229,10 +255,10 @@ async function collectInputs() {
     const generatedSharingSecret = generateSecret();
     const generatedBootstrapSecret = generateSecret();
     const sharingTokenSecret = (
-      await rl.question(`SHARING_TOKEN_SECRET [press Enter to auto-generate]: `)
+      await rl.question(`SHARING_INTERNAL_SECRET [press Enter to auto-generate]: `)
     ).trim() || generatedSharingSecret;
     const bootstrapTokenSecret = (
-      await rl.question(`BOOTSTRAP_TOKEN_SECRET [press Enter to auto-generate]: `)
+      await rl.question(`BOOTSTRAP_LINK_SECRET [press Enter to auto-generate]: `)
     ).trim() || generatedBootstrapSecret;
 
     return {
@@ -243,6 +269,13 @@ async function collectInputs() {
       retentionDays,
       rateLimitPerMinute,
       rateLimitPerHour,
+      messageRequestMaxBodyBytes: DEFAULTS.messageRequestMaxBodyBytes,
+      messageRequestMaxPerSender: DEFAULTS.messageRequestMaxPerSender,
+      messageRequestMaxSenders: DEFAULTS.messageRequestMaxSenders,
+      messageRequestMaxTotalBytes: DEFAULTS.messageRequestMaxTotalBytes,
+      messageRequestTtlSeconds: DEFAULTS.messageRequestTtlSeconds,
+      messageRequestRateLimitMinute: DEFAULTS.messageRequestRateLimitMinute,
+      messageRequestRateLimitHour: DEFAULTS.messageRequestRateLimitHour,
       bucketName,
       previewBucketName,
       sharingTokenSecret,
@@ -265,6 +298,13 @@ function renderVarsBlock(config) {
     `RETENTION_DAYS = \"${config.retentionDays}\"`,
     `RATE_LIMIT_PER_MINUTE = \"${config.rateLimitPerMinute}\"`,
     `RATE_LIMIT_PER_HOUR = \"${config.rateLimitPerHour}\"`,
+    `MESSAGE_REQUEST_MAX_BODY_BYTES = \"${config.messageRequestMaxBodyBytes}\"`,
+    `MESSAGE_REQUEST_MAX_PER_SENDER = \"${config.messageRequestMaxPerSender}\"`,
+    `MESSAGE_REQUEST_MAX_SENDERS = \"${config.messageRequestMaxSenders}\"`,
+    `MESSAGE_REQUEST_MAX_TOTAL_BYTES = \"${config.messageRequestMaxTotalBytes}\"`,
+    `MESSAGE_REQUEST_TTL_SECONDS = \"${config.messageRequestTtlSeconds}\"`,
+    `MESSAGE_REQUEST_RATE_LIMIT_MINUTE = \"${config.messageRequestRateLimitMinute}\"`,
+    `MESSAGE_REQUEST_RATE_LIMIT_HOUR = \"${config.messageRequestRateLimitHour}\"`,
     ""
   ].join("\n");
 }
@@ -375,6 +415,29 @@ function validateDeployUrl(publicBaseUrl, deployUrl) {
   };
 }
 
+async function verifyRuntimeConfiguration(baseUrl) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/v1/deployment-bundle`, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" }
+    });
+    if (!response.ok) {
+      let errorCode = "unknown";
+      try {
+        const body = await response.json();
+        errorCode = body?.error ?? errorCode;
+      } catch {
+        // Do not include response text because it may contain deployment metadata.
+      }
+      throw new Error(`Runtime configuration health check failed with HTTP ${response.status} (${errorCode}).`);
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function printStructuredResult(result) {
   stdout.write(`${JSON.stringify(result)}\n`);
 }
@@ -435,6 +498,11 @@ async function main() {
 
   logStep("Collecting deployment settings");
   const config = await collectInputs();
+  validateSecret(config.sharingTokenSecret, "SHARING_INTERNAL_SECRET");
+  validateSecret(config.bootstrapTokenSecret, "BOOTSTRAP_LINK_SECRET");
+  if (config.sharingTokenSecret === config.bootstrapTokenSecret) {
+    throw new Error("Sharing and bootstrap secrets must be independent values.");
+  }
   const baseConfig = await readFile(CONFIG_PATH, "utf8");
   const renderedConfig = updateConfig(baseConfig, config);
 
@@ -447,8 +515,8 @@ async function main() {
     await ensureBuckets(tempConfigPath, [config.bucketName, config.previewBucketName]);
 
     logStep("Writing Cloudflare secrets");
-    await putSecret(tempConfigPath, "SHARING_TOKEN_SECRET", config.sharingTokenSecret);
-    await putSecret(tempConfigPath, "BOOTSTRAP_TOKEN_SECRET", config.bootstrapTokenSecret);
+    await putSecret(tempConfigPath, "SHARING_INTERNAL_SECRET", config.sharingTokenSecret);
+    await putSecret(tempConfigPath, "BOOTSTRAP_LINK_SECRET", config.bootstrapTokenSecret);
 
     if (DESKTOP_BUNDLED) {
       logStep("Skipping pre-deploy checks in desktop bundled mode");
@@ -491,6 +559,9 @@ async function main() {
       stdout.write(`${validation.warning}\n`);
     }
 
+    logStep("Verifying runtime security configuration");
+    await verifyRuntimeConfiguration(validation.effectiveBaseUrl ?? deployUrl);
+
     const structuredResult = {
       success: true,
       worker_name: config.workerName,
@@ -515,8 +586,8 @@ async function main() {
           `Storage bucket: ${config.bucketName}`,
           `Preview bucket: ${config.previewBucketName}`,
           config.generatedPublicBaseUrl ? "PUBLIC_BASE_URL was left blank, so the deployed Worker URL will be used at runtime via request origin fallback." : "PUBLIC_BASE_URL was explicitly configured.",
-          config.generatedSharingSecret ? "SHARING_TOKEN_SECRET was auto-generated for this deployment." : "SHARING_TOKEN_SECRET was provided manually.",
-          config.generatedBootstrapSecret ? "BOOTSTRAP_TOKEN_SECRET was auto-generated for this deployment." : "BOOTSTRAP_TOKEN_SECRET was provided manually.",
+          config.generatedSharingSecret ? "SHARING_INTERNAL_SECRET was auto-generated for this deployment." : "SHARING_INTERNAL_SECRET was provided manually.",
+          config.generatedBootstrapSecret ? "BOOTSTRAP_LINK_SECRET was auto-generated for this deployment." : "BOOTSTRAP_LINK_SECRET was provided manually.",
           "Next step: issue a bootstrap token, call POST /v1/bootstrap/device, and import the returned deployment bundle into the TapChat profile."
         ].join("\n") + "\n"
       );

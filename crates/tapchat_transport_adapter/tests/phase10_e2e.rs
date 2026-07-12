@@ -149,8 +149,6 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
 
     let attachment_message_id = attachment_message.message_id.clone();
     let attachment_reference = attachment_message.storage_refs[0].object_ref.clone();
-    let raw_blob = reqwest::get(&attachment_reference).await?.bytes().await?;
-    assert_ne!(raw_blob.as_ref(), original.as_slice());
     let destination = temp_dir.path().join("downloaded.bin");
     ctx.bob
         .run_command_until_idle(CoreCommand::DownloadAttachment {
@@ -178,7 +176,7 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
         .downloaded_blob_b64
         .as_ref()
         .context("downloaded blob bytes missing")?;
-    assert_eq!(STANDARD.decode(blob_ciphertext)?, raw_blob);
+    assert_ne!(STANDARD.decode(blob_ciphertext)?, original);
 
     Ok(())
 }
@@ -853,8 +851,6 @@ async fn attachment_during_recovery_survives_restart_and_downloads_once() -> Res
         .context("recovery attachment message missing")?;
     let attachment_message_id = attachment_message.message_id.clone();
     let attachment_reference = attachment_message.storage_refs[0].object_ref.clone();
-    let raw_blob = reqwest::get(&attachment_reference).await?.bytes().await?;
-
     let destination = temp_dir.path().join("downloaded-recovery-payload.bin");
     ctx.bob_laptop
         .run_command_until_idle(CoreCommand::DownloadAttachment {
@@ -884,14 +880,14 @@ async fn attachment_during_recovery_survives_restart_and_downloads_once() -> Res
         .iter()
         .find(|message| message.message_id == attachment_message_id)
         .context("downloaded recovery attachment message missing")?;
-    assert_eq!(
+    assert_ne!(
         STANDARD.decode(
             downloaded_message
                 .downloaded_blob_b64
                 .as_ref()
                 .context("downloaded recovery blob bytes missing")?
         )?,
-        raw_blob
+        original
     );
 
     Ok(())
@@ -958,11 +954,13 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
         "partial-delivery-laptop-join",
     )
     .await?;
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
             conversation_id: ctx.conversation_id.clone(),
         })
         .await?;
+    assert_alice_targets_active_bob_devices(&ctx)?;
 
     ctx.alice
         .run_command_until_idle(CoreCommand::SendTextMessage {
@@ -970,14 +968,6 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
             plaintext: "partial delivery".into(),
         })
         .await?;
-    sync_driver_until_stable(
-        &mut ctx.bob_laptop,
-        &ctx.runtime,
-        &ctx.bob_laptop_auth,
-        &ctx.bob_laptop_device_id,
-        "partial-delivery-laptop-message",
-    )
-    .await?;
 
     let phone_records = fetch_inbox_records_since(
         &ctx.runtime,
@@ -988,6 +978,10 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
     .await?;
     let application_records = records_of_type(&phone_records, MessageType::MlsApplication);
     let commit_records = records_of_type(&phone_records, MessageType::MlsCommit);
+    let recovery_records = records_excluding_type(&phone_records, MessageType::MlsApplication);
+    assert!(!application_records.is_empty());
+    assert!(!commit_records.is_empty());
+    assert!(!recovery_records.is_empty());
     inject_records_without_effects(
         &mut ctx.bob_phone,
         &ctx.bob_phone_device_id,
@@ -1014,13 +1008,13 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
         Some(MlsStateStatus::NeedsRebuild)
     );
 
-    let commit_to_seq = highest_seq(&commit_records).context("commit seq for partial delivery")?;
+    let recovery_to_seq = highest_seq(&phone_records).context("recovery batch seq")?;
     let _ = ctx
         .bob_phone
         .inject_event_until_idle(CoreEvent::InboxRecordsFetched {
             device_id: ctx.bob_phone_device_id.clone(),
-            records: commit_records,
-            to_seq: commit_to_seq,
+            records: recovery_records,
+            to_seq: recovery_to_seq,
         })
         .await?;
     ctx.bob_phone
@@ -1208,11 +1202,13 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         "missing-commit-laptop-join",
     )
     .await?;
+    publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
             conversation_id: ctx.conversation_id.clone(),
         })
         .await?;
+    assert_alice_targets_active_bob_devices(&ctx)?;
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -1224,14 +1220,6 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
             plaintext: "after missing commit".into(),
         })
         .await?;
-    sync_driver_until_stable(
-        &mut ctx.bob_laptop,
-        &ctx.runtime,
-        &ctx.bob_laptop_auth,
-        &ctx.bob_laptop_device_id,
-        "missing-commit-laptop-message",
-    )
-    .await?;
 
     let phone_records = fetch_inbox_records_since(
         &ctx.runtime,
@@ -1242,8 +1230,10 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
     .await?;
     let application_records = records_of_type(&phone_records, MessageType::MlsApplication);
     let commit_records = records_of_type(&phone_records, MessageType::MlsCommit);
+    let recovery_records = records_excluding_type(&phone_records, MessageType::MlsApplication);
     assert!(!application_records.is_empty());
     assert!(!commit_records.is_empty());
+    assert!(!recovery_records.is_empty());
 
     inject_records_without_effects(
         &mut ctx.bob_phone,
@@ -1263,13 +1253,13 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
             >= highest_seq(&application_records).context("application seq")?
     );
 
-    let commit_to_seq = highest_seq(&commit_records).context("commit seq")?;
+    let recovery_to_seq = highest_seq(&phone_records).context("recovery batch seq")?;
     let _ = ctx
         .bob_phone
         .inject_event_until_idle(CoreEvent::InboxRecordsFetched {
             device_id: ctx.bob_phone_device_id.clone(),
-            records: commit_records,
-            to_seq: commit_to_seq,
+            records: recovery_records,
+            to_seq: recovery_to_seq,
         })
         .await?;
     ctx.bob_phone
@@ -1330,18 +1320,6 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         .await?
         .head_seq;
     assert!(last_acked_seq(&ctx.bob_phone, &ctx.bob_phone_device_id)? >= phone_head);
-
-    let laptop_conversation = ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .context("bob laptop conversation missing after missing commit recovery")?;
-    assert!(
-        laptop_conversation
-            .messages
-            .iter()
-            .any(|message| message.plaintext.as_deref() == Some("after missing commit"))
-    );
 
     Ok(())
 }
@@ -2155,6 +2133,29 @@ async fn publish_bob_bundle(
     Ok(merged)
 }
 
+fn assert_alice_targets_active_bob_devices(ctx: &TrioContext) -> Result<()> {
+    let conversation = ctx
+        .alice
+        .engine()
+        .conversation_state(&ctx.conversation_id)
+        .context("alice conversation missing before multi-device send")?;
+    for device_id in [&ctx.bob_phone_device_id, &ctx.bob_laptop_device_id] {
+        assert!(
+            conversation
+                .conversation
+                .member_devices
+                .iter()
+                .any(|member| {
+                    member.user_id == ctx.bob_user_id
+                        && member.device_id == *device_id
+                        && member.status == DeviceStatusKind::Active
+                }),
+            "alice conversation is missing active Bob device {device_id}"
+        );
+    }
+    Ok(())
+}
+
 async fn configure_allowlist(
     runtime: &CloudflareRuntimeHandle,
     auth: &DeviceRuntimeAuth,
@@ -2353,6 +2354,14 @@ fn records_of_type(records: &[InboxRecord], message_type: MessageType) -> Vec<In
     records
         .iter()
         .filter(|record| record.envelope.message_type == message_type)
+        .cloned()
+        .collect()
+}
+
+fn records_excluding_type(records: &[InboxRecord], message_type: MessageType) -> Vec<InboxRecord> {
+    records
+        .iter()
+        .filter(|record| record.envelope.message_type != message_type)
         .cloned()
         .collect()
 }

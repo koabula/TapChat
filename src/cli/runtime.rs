@@ -141,8 +141,8 @@ pub fn start_local_runtime(
     let service_root = service_root.as_ref().to_path_buf();
     let port = reserve_port()?;
     let base_url = format!("http://127.0.0.1:{port}");
-    let bootstrap_secret = format!("transport-bootstrap-{port}");
-    let sharing_secret = format!("transport-sharing-{port}");
+    let bootstrap_secret = generate_hex_secret();
+    let sharing_secret = generate_hex_secret();
     let persist_to = persist_to.as_ref();
 
     #[cfg(windows)]

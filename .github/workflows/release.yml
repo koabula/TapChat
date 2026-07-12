@@ -28,11 +28,11 @@ jobs:
       release_version: ${{ steps.release-version.outputs.release_version }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
 
@@ -66,7 +66,7 @@ jobs:
 
       - name: Install desktop dependencies for signing validation
         working-directory: app/desktop
-        run: npm install
+        run: npm ci
 
       - name: Validate updater signing secrets
         shell: bash
@@ -138,13 +138,13 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
 
@@ -214,13 +214,13 @@ jobs:
         if: matrix.target != ''
         run: rustup target add ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           workspaces: |
             .
             app/desktop/src-tauri
 
-      - run: cd app/desktop && npm install
+      - run: cd app/desktop && npm ci
 
       - name: Prepare Tauri updater signing key
         id: tauri-signing-key
@@ -256,7 +256,7 @@ jobs:
 
           "path=$keyPath" >> $env:GITHUB_OUTPUT
 
-      - uses: tauri-apps/tauri-action@v0
+      - uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         with:
           projectPath: app/desktop
           tagName: ${{ needs.validate.outputs.release_tag }}

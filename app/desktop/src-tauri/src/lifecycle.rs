@@ -43,14 +43,18 @@ pub async fn on_app_ready(app: &AppHandle) {
         startup_check_started_at.elapsed().as_millis()
     );
 
-    log::info!("Session startup check: {:?}", startup_check);
+    log::info!(
+        "Session startup check: active_profile={} identity={} runtime_bound={} needs_onboarding={} locked={}",
+        startup_check.has_active_profile,
+        startup_check.has_identity,
+        startup_check.has_runtime_binding,
+        startup_check.needs_onboarding,
+        startup_check.unlock_error.is_some()
+    );
 
     if let Some(unlock_error) = startup_check.unlock_error.clone() {
         let lock_reason = lock_reason_from_startup(startup_check.lock_reason.as_deref());
-        log::warn!(
-            "Active profile is locked or failed to unlock: {}",
-            unlock_error
-        );
+        log::warn!("Active profile is locked or failed to unlock");
         {
             let mut inner = state.inner.write().await;
             inner.session = SessionState::Locked {
@@ -77,8 +81,8 @@ pub async fn on_app_ready(app: &AppHandle) {
             },
         );
         if let Some(main_window) = app.get_webview_window("main") {
-            if let Err(error) = main_window.show() {
-                log::error!("Failed to show main window: {}", error);
+            if let Err(_error) = main_window.show() {
+                log::error!("Failed to show main window");
             }
             let _ = main_window.set_focus();
         }
@@ -120,7 +124,7 @@ pub async fn on_app_ready(app: &AppHandle) {
         let _ = app.emit("session-status", session_status);
 
         // Open onboarding window
-        if let Err(error) =
+        if let Err(_error) =
             WebviewWindowBuilder::new(app, "onboarding", WebviewUrl::App("/onboarding".into()))
                 .title("TapChat Setup")
                 .inner_size(1080.0, 720.0)
@@ -129,7 +133,7 @@ pub async fn on_app_ready(app: &AppHandle) {
                 .center()
                 .build()
         {
-            log::error!("Failed to create onboarding window: {}", error);
+            log::error!("Failed to create onboarding window");
         }
     } else {
         log::info!("Session ready, loading snapshot and showing main window");
@@ -150,11 +154,10 @@ pub async fn on_app_ready(app: &AppHandle) {
                         refresh_started_at.elapsed().as_millis()
                     );
                 }
-                Err(error) => {
+                Err(_error) => {
                     log::warn!(
-                        "on_app_ready: device runtime auth refresh failed in {}ms: {}",
-                        refresh_started_at.elapsed().as_millis(),
-                        error
+                        "on_app_ready: device runtime auth refresh failed in {}ms",
+                        refresh_started_at.elapsed().as_millis()
                     );
                 }
             }
@@ -272,8 +275,8 @@ pub async fn on_app_ready(app: &AppHandle) {
         // Show main window (created hidden in tauri.conf.json)
         let show_window_started_at = Instant::now();
         if let Some(main_window) = app.get_webview_window("main") {
-            if let Err(error) = main_window.show() {
-                log::error!("Failed to show main window: {}", error);
+            if let Err(_error) = main_window.show() {
+                log::error!("Failed to show main window");
             }
         }
         log::info!(
@@ -286,10 +289,10 @@ pub async fn on_app_ready(app: &AppHandle) {
         tauri::async_runtime::spawn(async move {
             let app_started_at = Instant::now();
             // Fire AppStarted to kick off sync
-            if let Err(e) =
+            if let Err(_error) =
                 drive_core_with_handle(&app_clone, CoreInput::Event(CoreEvent::AppStarted)).await
             {
-                log::error!("Failed to start session: {}", e);
+                log::error!("Failed to start session");
             }
             log::info!(
                 "on_app_ready: AppStarted finished in {}ms",
@@ -361,8 +364,8 @@ async fn enter_locked_session(
         },
     );
     if let Some(main_window) = app.get_webview_window("main") {
-        if let Err(error) = main_window.show() {
-            log::error!("Failed to show main window: {}", error);
+        if let Err(_error) = main_window.show() {
+            log::error!("Failed to show main window");
         }
         let _ = main_window.set_focus();
     }
@@ -395,10 +398,10 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
                     gate.last_triggered_at = Some(now);
                 }
 
-                if let Err(error) =
+                if let Err(_error) =
                     drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppForegrounded)).await
                 {
-                    log::warn!("foreground sync failed: {}", error);
+                    log::warn!("foreground sync failed");
                 }
             });
         }
@@ -610,8 +613,8 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
 
         // Persist the current snapshot to profile
         let snapshot = inner.engine.refresh_snapshot();
-        if let Err(e) = inner.profile_manager.save_snapshot(&snapshot).await {
-            log::error!("Failed to save snapshot: {}", e);
+        if let Err(_error) = inner.profile_manager.save_snapshot(&snapshot).await {
+            log::error!("Failed to save snapshot");
         }
     }
 
@@ -633,8 +636,8 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let _ = main_window.emit("session-status", session_status.clone());
         main_window.show().map_err(|e| e.to_string())?;
-        if let Err(e) = main_window.set_focus() {
-            log::error!("Failed to focus main window: {}", e);
+        if let Err(_error) = main_window.set_focus() {
+            log::error!("Failed to focus main window");
         }
     } else {
         let _ = app.emit("session-status", session_status);

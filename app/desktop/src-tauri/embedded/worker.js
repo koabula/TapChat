@@ -2477,6 +2477,83 @@ async function validateKeyPackageWriteAuthorization(request, secret, userId, dev
   return token;
 }
 
+// src/auth/runtime-security.ts
+var CONTROL_JSON_MAX_BYTES = 64 * 1024;
+var DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES = 320 * 1024;
+var MIN_SECRET_BYTES = 32;
+var PLACEHOLDER_SECRETS = /* @__PURE__ */ new Set([
+  "replace-me",
+  "replace-me-bootstrap",
+  "changeme",
+  "change-me",
+  "secret"
+]);
+function requireSecretValue(value, label) {
+  const secret = value?.trim();
+  if (!secret || new TextEncoder().encode(secret).byteLength < MIN_SECRET_BYTES || PLACEHOLDER_SECRETS.has(secret.toLowerCase())) {
+    throw new HttpError(
+      503,
+      "runtime_misconfigured",
+      `${label} is missing or invalid`
+    );
+  }
+  return secret;
+}
+function requireSharingSecret(env) {
+  return requireSecretValue(env.SHARING_INTERNAL_SECRET, "SHARING_INTERNAL_SECRET");
+}
+function requireBootstrapSecret(env) {
+  return requireSecretValue(env.BOOTSTRAP_LINK_SECRET, "BOOTSTRAP_LINK_SECRET");
+}
+async function readRequestTextLimited(request, maxBytes) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new HttpError(500, "runtime_misconfigured", "request body limit is invalid");
+  }
+  const declaredLength = request.headers.get("Content-Length");
+  if (declaredLength !== null) {
+    const parsed = Number(declaredLength);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new HttpError(400, "invalid_input", "Content-Length is invalid");
+    }
+    if (parsed > maxBytes) {
+      throw new HttpError(413, "request_too_large", "request body exceeds the configured limit");
+    }
+  }
+  if (!request.body) {
+    return "";
+  }
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let byteLength = 0;
+  let body = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      byteLength += value.byteLength;
+      if (byteLength > maxBytes) {
+        await reader.cancel("request body exceeds configured limit");
+        throw new HttpError(413, "request_too_large", "request body exceeds the configured limit");
+      }
+      body += decoder.decode(value, { stream: true });
+    }
+    body += decoder.decode();
+    return body;
+  } finally {
+    reader.releaseLock();
+  }
+}
+async function readJsonLimited(request, maxBytes) {
+  const body = await readRequestTextLimited(request, maxBytes);
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new HttpError(400, "invalid_input", "request body is not valid JSON");
+  }
+}
+
 // src/group-outbox/authorization.ts
 var GROUP_AUTHORIZATION_KEY = "group-authorization:v2";
 var MAX_CAPABILITY_TTL_MS = 24 * 60 * 60 * 1e3 + 5 * 60 * 1e3;
@@ -3999,6 +4076,16 @@ var DurableObjectStorageAdapter = class {
   async putEntries(entries) {
     await this.storage.put(entries);
   }
+  async mutateEntries(entries, deleteKeys) {
+    await this.storage.transaction(async (transaction) => {
+      if (Object.keys(entries).length > 0) {
+        await transaction.put(entries);
+      }
+      if (deleteKeys.length > 0) {
+        await transaction.delete(deleteKeys);
+      }
+    });
+  }
   async delete(key) {
     await this.storage.delete(key);
   }
@@ -4080,7 +4167,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         "group_authorization_bootstrap",
         now
       );
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       return jsonResponse(await authorization.initialize(body, runtimeToken, now));
     }
     if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
@@ -4094,7 +4181,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       return deps.onUpgrade();
     }
     if (url.pathname.endsWith("/outbox/transitions") && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
       if (!body.capability || body.groupId !== deps.groupId) {
         throw new HttpError(403, "invalid_capability", "missing or mismatched group transition capability");
       }
@@ -4136,7 +4223,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       return jsonResponse(await service.appendTransition(body, preparedUpdate, now));
     }
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
       await service.assertWritable();
       if (!body?.envelope) {
         throw new HttpError(400, "invalid_input", "group append envelope is required");
@@ -4226,7 +4313,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       return jsonResponse(await service.sealOutbox(now));
     }
     if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
       const token = await signSharingPayload(deps.sharingSecret, {
         version: body.document.version,
@@ -4273,7 +4360,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     }
     const revokeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);
     if (revokeMatch && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
       return jsonResponse(
         await service.revokeInvite(
@@ -4291,7 +4378,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     if (joinCollectionMatch && request.method === "POST") {
       const token = getBearerToken(request);
       const payload = await verifyInviteToken(deps.sharingSecret, token, now);
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       return jsonResponse(await service.submitJoinRequest({ ...body, inviteToken: token }, payload, now));
     }
     if (joinCollectionMatch && request.method === "GET") {
@@ -4310,7 +4397,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     }
     const leaveCollectionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests$/);
     if (leaveCollectionMatch && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "append_control", ["admin", "member"], now);
       return jsonResponse(await service.submitLeaveRequest(body, now));
     }
@@ -4320,13 +4407,13 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     }
     const leaveClaimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests\/([^/]+)\/claim$/);
     if (leaveClaimMatch && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(await service.claimLeaveRequest({ ...body, groupId: deps.groupId, requestId: decodeURIComponent(leaveClaimMatch[1]) }, now));
     }
     const claimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/claim$/);
     if (claimMatch && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.claimJoinRequest(
@@ -4337,7 +4424,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     }
     const completeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/complete$/);
     if (completeMatch && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.completeJoinRequest(
@@ -4350,7 +4437,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
         throw new HttpError(403, "invalid_capability", "internal welcome claim authorization failed");
       }
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       if (!body.deviceId || !body.requestId || !body.capability) {
         throw new HttpError(400, "invalid_input", "welcome claim request, device and capability are required");
       }
@@ -4361,14 +4448,14 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
         throw new HttpError(403, "invalid_capability", "internal welcome authorization failed");
       }
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       if (!body.deviceId || !body.requestId || !body.capability) throw new HttpError(400, "invalid_input", "welcome authorization binding is required");
       await service.authorizeWelcomeUpload(body.requestId, body.deviceId, body.capability);
       return jsonResponse({ accepted: true });
     }
     const decisionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/decision$/);
     if (decisionMatch && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
       return jsonResponse(
         await service.decideJoinRequest({
@@ -4437,7 +4524,15 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
   }
   async fetch(request) {
     const url = new URL(request.url);
-    const sharingSecret = this.envRef.SHARING_TOKEN_SECRET ?? "replace-me";
+    let sharingSecret;
+    try {
+      sharingSecret = requireSharingSecret(this.envRef);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonResponse({ error: error.code, message: error.message }, error.status);
+      }
+      return jsonResponse({ error: "runtime_misconfigured", message: "sharing secret is invalid" }, 503);
+    }
     const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
     this.groupIdRef = groupId;
     await this.stateRef.storage.put("durable-group-id", groupId);
@@ -4448,26 +4543,30 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
       sessions: Array.from(this.sessions.values()).map(
         (session) => ({
           send(payload) {
-            session.send(payload);
+            return session.send(payload);
           }
         })
       ),
       maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
-      sharingSecret: this.envRef.SHARING_TOKEN_SECRET ?? "replace-me",
+      sharingSecret,
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
         const server = pair[1];
         server.accept();
         const sessionId = crypto.randomUUID();
-        const session = new ManagedSession(server);
-        this.sessions.set(sessionId, session);
-        queueMicrotask(() => {
-          session.markReady();
-        });
-        server.addEventListener("close", () => {
+        const removeSession = () => {
           this.sessions.delete(sessionId);
+        };
+        const session = new ManagedSession(server, removeSession);
+        this.sessions.set(sessionId, session);
+        server.addEventListener("close", () => {
+          session.terminate();
+        });
+        server.addEventListener("error", (event) => {
+          event.preventDefault();
+          session.terminate();
         });
         return new Response(null, {
           status: 101,
@@ -4491,35 +4590,46 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
 };
 var ManagedSession = class {
   socket;
-  ready = false;
-  queuedPayloads = [];
-  constructor(socket) {
+  onClosed;
+  closed = false;
+  constructor(socket, onClosed) {
     this.socket = socket;
+    this.onClosed = onClosed;
   }
   send(payload) {
-    if (!this.ready) {
-      this.queuedPayloads.push(payload);
-      return;
+    if (this.closed) {
+      return false;
     }
-    this.dispatch(payload);
-  }
-  markReady() {
-    if (this.ready) {
-      return;
+    if (this.socket.readyState !== 1) {
+      this.finish(false);
+      return false;
     }
-    this.ready = true;
-    while (this.queuedPayloads.length > 0) {
-      const payload = this.queuedPayloads.shift();
-      if (payload === void 0) {
-        break;
-      }
-      this.dispatch(payload);
-    }
-  }
-  dispatch(payload) {
-    setTimeout(() => {
+    try {
       this.socket.send(payload);
-    }, 0);
+      return true;
+    } catch {
+      this.close();
+      return false;
+    }
+  }
+  close() {
+    this.finish(true);
+  }
+  terminate() {
+    this.finish(false);
+  }
+  finish(closeSocket) {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (closeSocket) {
+      try {
+        this.socket.close(1011, "session closed");
+      } catch {
+      }
+    }
+    this.onClosed();
   }
 };
 
@@ -4531,6 +4641,8 @@ var RECORD_PREFIX2 = "record:";
 var ALLOWLIST_KEY = "allowlist";
 var MESSAGE_REQUEST_PREFIX = "message-request:";
 var RATE_LIMIT_PREFIX = "rate-limit:";
+var MESSAGE_REQUEST_META_KEY = `${MESSAGE_REQUEST_PREFIX}meta`;
+var MESSAGE_REQUEST_RATE_LIMIT_KEY = `${MESSAGE_REQUEST_PREFIX}rate-limit`;
 var CLEANUP_BATCH_SIZE = 128;
 var InboxService = class {
   deviceId;
@@ -4564,7 +4676,7 @@ var InboxService = class {
       return rejected;
     }
     if (authContext.mode !== "verified") {
-      const request2 = await this.queueMessageRequest(input, now);
+      const request2 = await this.queueMessageRequestWithLimit(input, now);
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request2);
       return request2;
     }
@@ -4573,7 +4685,7 @@ var InboxService = class {
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, delivered);
       return delivered;
     }
-    const request = await this.queueMessageRequest(input, now);
+    const request = await this.queueMessageRequestWithLimit(input, now);
     await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
     return request;
   }
@@ -4666,7 +4778,9 @@ var InboxService = class {
     await this.state.put(ALLOWLIST_KEY, document);
     return document;
   }
-  async listMessageRequests() {
+  async listMessageRequests(now = Date.now()) {
+    await this.pruneExpiredMessageRequests(now);
+    await this.scheduleNextAlarm(now);
     const requests = await this.state.get(this.messageRequestIndexKey());
     if (!requests?.length) {
       return [];
@@ -4683,7 +4797,7 @@ var InboxService = class {
     return items;
   }
   async acceptMessageRequest(requestId, now) {
-    const entry = await this.findMessageRequest(requestId);
+    const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
@@ -4717,6 +4831,7 @@ var InboxService = class {
       }
     }
     await this.deleteMessageRequest(entry.senderUserId, "accepted");
+    await this.scheduleNextAlarm(now);
     return {
       accepted: true,
       requestId: entry.requestId,
@@ -4729,7 +4844,7 @@ var InboxService = class {
     };
   }
   async rejectMessageRequest(requestId, now) {
-    const entry = await this.findMessageRequest(requestId);
+    const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
@@ -4740,6 +4855,7 @@ var InboxService = class {
       now
     );
     await this.deleteMessageRequest(entry.senderUserId, "rejected");
+    await this.scheduleNextAlarm(now);
     return {
       accepted: true,
       requestId: entry.requestId,
@@ -4752,6 +4868,7 @@ var InboxService = class {
     };
   }
   async cleanExpiredRecords(now) {
+    await this.pruneExpiredMessageRequests(now);
     const meta = await this.getMeta();
     const stored = await this.state.list({ prefix: RECORD_PREFIX2 });
     const eligible = Array.from(stored.entries()).filter(([, index]) => index.seq <= meta.ackedSeq && index.expiresAt !== void 0 && index.expiresAt <= now).sort((left, right) => left[1].seq - right[1].seq);
@@ -4764,7 +4881,9 @@ var InboxService = class {
     }
     if (eligible.length > CLEANUP_BATCH_SIZE) {
       await this.state.setAlarm(now + 1);
+      return;
     }
+    await this.scheduleNextAlarm(now);
   }
   validateStoredRecordIndex(index, seq) {
     if (index.seq !== seq || index.recipientDeviceId !== this.deviceId || !index.messageId) {
@@ -4825,7 +4944,6 @@ var InboxService = class {
     }
     await this.state.put(`${IDEMPOTENCY_PREFIX2}${record.messageId}`, seq);
     await this.state.put(META_KEY2, { ...meta, headSeq: seq });
-    await this.state.setAlarm(expiresAt);
     this.publish({
       event: "head_updated",
       deviceId: this.deviceId,
@@ -4839,11 +4957,30 @@ var InboxService = class {
     });
     return { accepted: true, seq, deliveredTo: "inbox" };
   }
-  async queueMessageRequest(input, now) {
+  async queueMessageRequestWithLimit(input, now) {
+    await this.enforceMessageRequestRateLimit(now);
+    await this.pruneExpiredMessageRequests(now);
+    const limits = await this.getMeta();
     const senderUserId = input.envelope.senderUserId;
     const key = this.messageRequestKey(senderUserId);
     const requestId = this.requestIdForSender(senderUserId);
     const existing = await this.state.get(key);
+    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    const queueMeta = await this.state.get(MESSAGE_REQUEST_META_KEY) ?? {
+      version: 1,
+      totalBytes: 0,
+      senderCount: index.length
+    };
+    const requestBytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
+    if (existing && existing.pendingRequests.length >= (limits.messageRequestMaxPerSender ?? 16)) {
+      this.messageRequestCapacityExceeded("message request sender quota exceeded");
+    }
+    if (!existing && index.length >= (limits.messageRequestMaxSenders ?? 64)) {
+      this.messageRequestCapacityExceeded("message request sender capacity exceeded");
+    }
+    if (queueMeta.totalBytes + requestBytes > (limits.messageRequestMaxTotalBytes ?? 4 * 1024 * 1024)) {
+      this.messageRequestCapacityExceeded("message request byte capacity exceeded");
+    }
     const entry = existing ?? {
       requestId,
       recipientDeviceId: this.deviceId,
@@ -4856,7 +4993,9 @@ var InboxService = class {
       messageCount: 0,
       lastMessageId: input.envelope.messageId,
       lastConversationId: input.envelope.conversationId,
-      pendingRequests: []
+      pendingRequests: [],
+      byteSize: 0,
+      expiresAt: now + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1e3
     };
     entry.senderBundleShareUrl ??= input.senderBundleShareUrl;
     entry.senderBundleHash ??= input.senderBundleHash;
@@ -4866,8 +5005,20 @@ var InboxService = class {
     entry.lastMessageId = input.envelope.messageId;
     entry.lastConversationId = input.envelope.conversationId;
     entry.pendingRequests.push(input);
-    await this.state.put(key, entry);
-    await this.addMessageRequestIndex(senderUserId);
+    entry.byteSize = (entry.byteSize ?? this.messageRequestEntryBytes(entry) - requestBytes) + requestBytes;
+    entry.expiresAt ??= entry.firstSeenAt + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1e3;
+    const nextIndex = index.includes(senderUserId) ? index : [...index, senderUserId].sort();
+    const nextQueueMeta = {
+      version: 1,
+      totalBytes: queueMeta.totalBytes + requestBytes,
+      senderCount: nextIndex.length
+    };
+    await this.state.putEntries({
+      [key]: entry,
+      [this.messageRequestIndexKey()]: nextIndex,
+      [MESSAGE_REQUEST_META_KEY]: nextQueueMeta
+    });
+    await this.scheduleNextAlarm(now);
     this.publish({
       event: "message_request_changed",
       deviceId: this.deviceId,
@@ -4882,6 +5033,9 @@ var InboxService = class {
       queuedAsRequest: true,
       requestId
     };
+  }
+  messageRequestCapacityExceeded(message) {
+    throw new HttpError(429, "message_request_capacity_exceeded", message);
   }
   messageRequestsToPromote(entry) {
     if (this.groupInviteMetadata(entry)) {
@@ -4937,6 +5091,46 @@ var InboxService = class {
     state.hourCount += 1;
     await this.state.put(key, state);
   }
+  async enforceMessageRequestRateLimit(now) {
+    const meta = await this.getMeta();
+    const minuteLimit = meta.messageRequestRateLimitMinute ?? 30;
+    const hourLimit = meta.messageRequestRateLimitHour ?? 300;
+    const minuteWindowStart = Math.floor(now / 6e4) * 6e4;
+    const hourWindowStart = Math.floor(now / 36e5) * 36e5;
+    const state = await this.state.get(MESSAGE_REQUEST_RATE_LIMIT_KEY) ?? {
+      minuteWindowStart,
+      minuteCount: 0,
+      hourWindowStart,
+      hourCount: 0
+    };
+    if (state.minuteWindowStart !== minuteWindowStart) {
+      state.minuteWindowStart = minuteWindowStart;
+      state.minuteCount = 0;
+    }
+    if (state.hourWindowStart !== hourWindowStart) {
+      state.hourWindowStart = hourWindowStart;
+      state.hourCount = 0;
+    }
+    if (minuteLimit > 0 && state.minuteCount >= minuteLimit) {
+      throw new HttpError(
+        429,
+        "message_request_rate_limited",
+        "message request rate limit exceeded for minute window",
+        { retryAfterSeconds: Math.max(1, Math.ceil((minuteWindowStart + 6e4 - now) / 1e3)) }
+      );
+    }
+    if (hourLimit > 0 && state.hourCount >= hourLimit) {
+      throw new HttpError(
+        429,
+        "message_request_rate_limited",
+        "message request rate limit exceeded for hour window",
+        { retryAfterSeconds: Math.max(1, Math.ceil((hourWindowStart + 36e5 - now) / 1e3)) }
+      );
+    }
+    state.minuteCount += 1;
+    state.hourCount += 1;
+    await this.state.put(MESSAGE_REQUEST_RATE_LIMIT_KEY, state);
+  }
   publish(event) {
     const payload = JSON.stringify(event);
     for (const session of this.sessions) {
@@ -4968,22 +5162,23 @@ var InboxService = class {
   messageRequestIndexKey() {
     return `${MESSAGE_REQUEST_PREFIX}index`;
   }
-  async addMessageRequestIndex(senderUserId) {
-    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
-    if (!index.includes(senderUserId)) {
-      index.push(senderUserId);
-      index.sort();
-      await this.state.put(this.messageRequestIndexKey(), index);
-    }
-  }
   async deleteMessageRequest(senderUserId, change) {
     const existing = await this.state.get(this.messageRequestKey(senderUserId));
-    await this.state.delete(this.messageRequestKey(senderUserId));
     const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
-    await this.state.put(
-      this.messageRequestIndexKey(),
-      index.filter((entry) => entry !== senderUserId)
-    );
+    const nextIndex = index.filter((entry) => entry !== senderUserId);
+    const queueMeta = await this.state.get(MESSAGE_REQUEST_META_KEY) ?? {
+      version: 1,
+      totalBytes: 0,
+      senderCount: index.length
+    };
+    await this.state.mutateEntries({
+      [this.messageRequestIndexKey()]: nextIndex,
+      [MESSAGE_REQUEST_META_KEY]: {
+        version: 1,
+        totalBytes: Math.max(0, queueMeta.totalBytes - (existing ? this.messageRequestEntryBytes(existing) : 0)),
+        senderCount: nextIndex.length
+      }
+    }, [this.messageRequestKey(senderUserId)]);
     if (existing) {
       this.publish({
         event: "message_request_changed",
@@ -4994,13 +5189,84 @@ var InboxService = class {
       });
     }
   }
-  async findMessageRequest(requestId) {
-    const requests = await this.listMessageRequests();
+  async findMessageRequest(requestId, now) {
+    const requests = await this.listMessageRequests(now);
     const match = requests.find((request) => request.requestId === requestId);
     if (!match) {
       return null;
     }
     return await this.state.get(this.messageRequestKey(match.senderUserId)) ?? null;
+  }
+  messageRequestEntryBytes(entry) {
+    if (entry.byteSize !== void 0 && Number.isSafeInteger(entry.byteSize) && entry.byteSize >= 0) {
+      return entry.byteSize;
+    }
+    return entry.pendingRequests.reduce(
+      (total, request) => total + new TextEncoder().encode(JSON.stringify(request)).byteLength,
+      0
+    );
+  }
+  async pruneExpiredMessageRequests(now) {
+    const limits = await this.getMeta();
+    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    const retained = [];
+    const updates = {};
+    const deleteKeys = [];
+    let totalBytes = 0;
+    for (const senderUserId of index) {
+      const key = this.messageRequestKey(senderUserId);
+      const entry = await this.state.get(key);
+      if (!entry) {
+        continue;
+      }
+      const byteSize = this.messageRequestEntryBytes(entry);
+      const expiresAt = entry.expiresAt ?? entry.firstSeenAt + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1e3;
+      if (expiresAt <= now) {
+        deleteKeys.push(key);
+        for (const pending of entry.pendingRequests) {
+          deleteKeys.push(`${APPEND_RESULT_PREFIX}${pending.envelope.messageId}`);
+        }
+        continue;
+      }
+      retained.push(senderUserId);
+      totalBytes += byteSize;
+      if (entry.byteSize !== byteSize || entry.expiresAt !== expiresAt || entry.messageCount !== entry.pendingRequests.length) {
+        updates[key] = {
+          ...entry,
+          byteSize,
+          expiresAt,
+          messageCount: entry.pendingRequests.length
+        };
+      }
+    }
+    updates[this.messageRequestIndexKey()] = retained.sort();
+    updates[MESSAGE_REQUEST_META_KEY] = {
+      version: 1,
+      totalBytes,
+      senderCount: retained.length
+    };
+    await this.state.mutateEntries(updates, deleteKeys);
+  }
+  async scheduleNextAlarm(now) {
+    const meta = await this.getMeta();
+    const records = await this.state.list({ prefix: RECORD_PREFIX2 });
+    const messageRequestSenders = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    let nextAt;
+    for (const record of records.values()) {
+      if (record.seq > meta.ackedSeq || record.expiresAt === void 0) {
+        continue;
+      }
+      nextAt = nextAt === void 0 ? record.expiresAt : Math.min(nextAt, record.expiresAt);
+    }
+    for (const senderUserId of messageRequestSenders) {
+      const entry = await this.state.get(this.messageRequestKey(senderUserId));
+      if (entry?.expiresAt !== void 0) {
+        nextAt = nextAt === void 0 ? entry.expiresAt : Math.min(nextAt, entry.expiresAt);
+      }
+    }
+    if (nextAt !== void 0) {
+      await this.state.setAlarm(Math.max(now + 1, nextAt));
+    }
   }
   toMessageRequestItem(entry) {
     const groupInvite = this.groupInviteMetadata(entry);
@@ -5059,6 +5325,16 @@ var DurableObjectStorageAdapter2 = class {
   async putEntries(entries) {
     await this.storage.put(entries);
   }
+  async mutateEntries(entries, deleteKeys) {
+    await this.storage.transaction(async (transaction) => {
+      if (Object.keys(entries).length > 0) {
+        await transaction.put(entries);
+      }
+      if (deleteKeys.length > 0) {
+        await transaction.delete(deleteKeys);
+      }
+    });
+  }
   async delete(key) {
     await this.storage.delete(key);
   }
@@ -5111,11 +5387,12 @@ function versionedBody2(body) {
     ...record
   };
 }
-function jsonResponse2(body, status = 200) {
+function jsonResponse2(body, status = 200, headers) {
   return new Response(JSON.stringify(versionedBody2(body)), {
     status,
     headers: {
-      "content-type": "application/json"
+      "content-type": "application/json",
+      ...headers
     }
   });
 }
@@ -5132,7 +5409,13 @@ async function handleInboxDurableRequest(request, deps) {
     retentionDays: deps.retentionDays,
     maxInlineBytes: deps.maxInlineBytes,
     rateLimitPerMinute: deps.rateLimitPerMinute,
-    rateLimitPerHour: deps.rateLimitPerHour
+    rateLimitPerHour: deps.rateLimitPerHour,
+    messageRequestMaxPerSender: deps.messageRequestMaxPerSender ?? 16,
+    messageRequestMaxSenders: deps.messageRequestMaxSenders ?? 64,
+    messageRequestMaxTotalBytes: deps.messageRequestMaxTotalBytes ?? 4 * 1024 * 1024,
+    messageRequestTtlSeconds: deps.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60,
+    messageRequestRateLimitMinute: deps.messageRequestRateLimitMinute ?? 30,
+    messageRequestRateLimitHour: deps.messageRequestRateLimitHour ?? 300
   });
   try {
     if (url.pathname.endsWith("/subscribe")) {
@@ -5145,7 +5428,7 @@ async function handleInboxDurableRequest(request, deps) {
       return deps.onUpgrade();
     }
     if (url.pathname.endsWith("/message-requests") && request.method === "GET") {
-      return jsonResponse2({ requests: await service.listMessageRequests() });
+      return jsonResponse2({ requests: await service.listMessageRequests(now) });
     }
     const requestActionMatch = url.pathname.match(/\/message-requests\/([^/]+)\/(accept|reject)$/);
     if (requestActionMatch && request.method === "POST") {
@@ -5158,7 +5441,7 @@ async function handleInboxDurableRequest(request, deps) {
       return jsonResponse2(await service.getAllowlist(now));
     }
     if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       const result = await service.replaceAllowlist(
         body.allowedSenderUserIds ?? [],
         body.rejectedSenderUserIds ?? [],
@@ -5167,7 +5450,10 @@ async function handleInboxDurableRequest(request, deps) {
       return jsonResponse2(result);
     }
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(
+        request,
+        deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
+      );
       const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified" ? "legacy_unverified" : "verified";
       const result = await service.appendEnvelope(body, now, {
         mode,
@@ -5189,7 +5475,7 @@ async function handleInboxDurableRequest(request, deps) {
       });
     }
     if (url.pathname.endsWith("/ack") && request.method === "POST") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       const result = await service.ack(body);
       return jsonResponse2({
         accepted: result.accepted,
@@ -5203,7 +5489,12 @@ async function handleInboxDurableRequest(request, deps) {
     return jsonResponse2({ error: "not_found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse2({ error: error.code, message: error.message }, error.status);
+      const retryAfter = error.details?.retryAfterSeconds;
+      return jsonResponse2(
+        { error: error.code, message: error.message },
+        error.status,
+        typeof retryAfter === "number" ? { "Retry-After": String(retryAfter) } : void 0
+      );
     }
     const runtimeError = error;
     const message = runtimeError.message ?? "internal error";
@@ -5230,7 +5521,7 @@ var InboxDurableObject = class extends DurableObjectBase2 {
       sessions: Array.from(this.sessions.values()).map(
         (session) => ({
           send(payload) {
-            session.send(payload);
+            return session.send(payload);
           }
         })
       ),
@@ -5238,19 +5529,30 @@ var InboxDurableObject = class extends DurableObjectBase2 {
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
       rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
       rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+      messageRequestMaxBodyBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_BODY_BYTES ?? String(DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES)),
+      messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
+      messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
+      messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
+      messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
+      messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
+      messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300"),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
         const server = pair[1];
         server.accept();
         const sessionId = crypto.randomUUID();
-        const session = new ManagedSession2(server);
-        this.sessions.set(sessionId, session);
-        queueMicrotask(() => {
-          session.markReady();
-        });
-        server.addEventListener("close", () => {
+        const removeSession = () => {
           this.sessions.delete(sessionId);
+        };
+        const session = new ManagedSession2(server, removeSession);
+        this.sessions.set(sessionId, session);
+        server.addEventListener("close", () => {
+          session.terminate();
+        });
+        server.addEventListener("error", (event) => {
+          event.preventDefault();
+          session.terminate();
         });
         return new Response(null, {
           status: 101,
@@ -5271,7 +5573,13 @@ var InboxDurableObject = class extends DurableObjectBase2 {
         retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
         maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
         rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
-        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600")
+        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+        messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
+        messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
+        messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
+        messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
+        messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
+        messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300")
       }
     );
     await service.cleanExpiredRecords(Date.now());
@@ -5279,35 +5587,46 @@ var InboxDurableObject = class extends DurableObjectBase2 {
 };
 var ManagedSession2 = class {
   socket;
-  ready = false;
-  queuedPayloads = [];
-  constructor(socket) {
+  onClosed;
+  closed = false;
+  constructor(socket, onClosed) {
     this.socket = socket;
+    this.onClosed = onClosed;
   }
   send(payload) {
-    if (!this.ready) {
-      this.queuedPayloads.push(payload);
-      return;
+    if (this.closed) {
+      return false;
     }
-    this.dispatch(payload);
-  }
-  markReady() {
-    if (this.ready) {
-      return;
+    if (this.socket.readyState !== 1) {
+      this.finish(false);
+      return false;
     }
-    this.ready = true;
-    while (this.queuedPayloads.length > 0) {
-      const payload = this.queuedPayloads.shift();
-      if (payload === void 0) {
-        break;
-      }
-      this.dispatch(payload);
-    }
-  }
-  dispatch(payload) {
-    setTimeout(() => {
+    try {
       this.socket.send(payload);
-    }, 0);
+      return true;
+    } catch {
+      this.close();
+      return false;
+    }
+  }
+  close() {
+    this.finish(true);
+  }
+  terminate() {
+    this.finish(false);
+  }
+  finish(closeSocket) {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (closeSocket) {
+      try {
+        this.socket.close(1011, "session closed");
+      } catch {
+      }
+    }
+    this.onClosed();
   }
 };
 
@@ -5704,7 +6023,7 @@ function baseUrl(request, env) {
   return env.PUBLIC_BASE_URL?.trim().replace(/\/+$/, "") ?? new URL(request.url).origin;
 }
 function sharedStateSecret(env) {
-  return env.SHARING_TOKEN_SECRET ?? "replace-me";
+  return requireSharingSecret(env);
 }
 function downloadGrantTtlDays(env) {
   const raw = env.ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS?.trim();
@@ -5715,7 +6034,11 @@ function downloadGrantTtlDays(env) {
   return Number.isFinite(parsed) ? parsed : 365;
 }
 function bootstrapSecret(env) {
-  return env.BOOTSTRAP_TOKEN_SECRET ?? env.SHARING_TOKEN_SECRET ?? "replace-me";
+  return requireBootstrapSecret(env);
+}
+function messageRequestBodyLimit(env) {
+  const configured = Number(env.MESSAGE_REQUEST_MAX_BODY_BYTES ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
+  return Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES;
 }
 function runtimeScopes() {
   return [
@@ -5796,17 +6119,22 @@ async function authorizeSharedStateWrite(request, env, userId, objectKind, now) 
   await validateSharedStateWriteAuthorization(request, sharedStateSecret(env), userId, "", objectKind, now);
 }
 async function handleRequest(request, env) {
-  const url = new URL(request.url);
-  const store = new StorageService(
-    new R2JsonBlobStore3(env.TAPCHAT_STORAGE),
-    baseUrl(request, env),
-    sharedStateSecret(env),
-    downloadGrantTtlDays(env)
-  );
-  const sharedState = new SharedStateService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE), baseUrl(request, env));
-  const welcomePickup = new WelcomePickupService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE));
-  const now = Date.now();
   try {
+    const url = new URL(request.url);
+    const sharingSecret = sharedStateSecret(env);
+    const bootstrapLinkSecret = bootstrapSecret(env);
+    if (sharingSecret === bootstrapLinkSecret) {
+      throw new HttpError(503, "runtime_misconfigured", "runtime secrets must use independent values");
+    }
+    const store = new StorageService(
+      new R2JsonBlobStore3(env.TAPCHAT_STORAGE),
+      baseUrl(request, env),
+      sharingSecret,
+      downloadGrantTtlDays(env)
+    );
+    const sharedState = new SharedStateService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE), baseUrl(request, env));
+    const welcomePickup = new WelcomePickupService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE));
+    const now = Date.now();
     if (request.method === "GET" && url.pathname === "/v1/deployment-bundle") {
       return jsonResponse3(publicDeploymentBundle(request, env));
     }
@@ -5824,7 +6152,7 @@ async function handleRequest(request, env) {
       return jsonResponse3(bundle);
     }
     if (request.method === "POST" && url.pathname === "/v1/bootstrap/device") {
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       if (body.version !== CURRENT_MODEL_VERSION) {
         throw new HttpError(400, "unsupported_version", "bootstrap request version is not supported");
       }
@@ -5844,7 +6172,7 @@ async function handleRequest(request, env) {
       const objectId = env.INBOX.idFromName(deviceId);
       const stub = env.INBOX.get(objectId);
       if (request.method === "POST" && operation === "messages") {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         const body = JSON.parse(bodyText);
         const appendAuth = await validateAppendAuthorization(request, deviceId, body, now, sharedState);
         const forwarded = forwardRequestWithBody(request, bodyText);
@@ -5862,7 +6190,11 @@ async function handleRequest(request, env) {
       } else if (operation === "allowlist" || operation === "message-requests" || operation.startsWith("message-requests/")) {
         await validateDeviceRuntimeAuthorizationForDevice(request, sharedStateSecret(env), deviceId, "inbox_manage", now);
       }
-      return stub.fetch(request);
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return await stub.fetch(request);
     }
     const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|transitions|head|seal|subscribe)$/);
     if (groupOutboxMatch) {
@@ -5871,16 +6203,20 @@ async function handleRequest(request, env) {
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       const stub = env.GROUP_OUTBOX.get(objectId);
       if (request.method === "POST" && (operation === "messages" || operation === "transitions")) {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         return await stub.fetch(forwardRequestWithBody(request, bodyText));
       }
-      return stub.fetch(request);
+      if (request.method !== "GET" && request.method !== "HEAD") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await stub.fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return await stub.fetch(request);
     }
     const groupAuthorizationMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/authorization\/bootstrap$/);
     if (groupAuthorizationMatch && request.method === "POST") {
       const groupId = decodeURIComponent(groupAuthorizationMatch[1]);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      const bodyText = await request.text();
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
     const groupAuthorizationStateMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/authorization\/state$/);
@@ -5919,7 +6255,7 @@ async function handleRequest(request, env) {
       const groupId = decodeURIComponent(groupInviteMatch[1]);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       if (request.method === "POST") {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
         return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
       }
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
@@ -5948,19 +6284,23 @@ async function handleRequest(request, env) {
         }
       }
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
-      return env.GROUP_OUTBOX.get(objectId).fetch(request);
+      if (request.method === "POST") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
+      }
+      return await env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
     const joinDecisionMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/decision$/);
     if (joinDecisionMatch && request.method === "POST") {
       const groupId = decodeURIComponent(joinDecisionMatch[1]);
-      const bodyText = await request.text();
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
     const joinLeaseMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/join-requests\/([^/]+)\/(claim|complete)$/);
     if (joinLeaseMatch && request.method === "POST") {
       const groupId = decodeURIComponent(joinLeaseMatch[1]);
-      const bodyText = await request.text();
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
     }
@@ -5975,7 +6315,7 @@ async function handleRequest(request, env) {
       const groupId = decodeURIComponent(leaveRequestMatch[1]);
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       if (request.method === "POST") {
-        const bodyText = await request.text();
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
         return await env.GROUP_OUTBOX.get(objectId).fetch(forwardRequestWithBody(request, bodyText));
       }
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
@@ -5985,13 +6325,13 @@ async function handleRequest(request, env) {
       const groupId = decodeURIComponent(welcomePickupMatch[1]);
       const deviceId = decodeURIComponent(welcomePickupMatch[2]);
       if (request.method === "PUT") {
-        const body = await request.json();
+        const body = await readJsonLimited(request, messageRequestBodyLimit(env));
         validateWelcomePickupAuthorization(request, groupId, deviceId, body.descriptor, now);
         if (body.descriptor.requestId) {
           const authorized = await env.GROUP_OUTBOX.get(env.GROUP_OUTBOX.idFromName(groupId)).fetch(
             new Request(`${url.origin}/v1/groups/${encodeURIComponent(groupId)}/internal/welcome-authorize`, {
               method: "POST",
-              headers: { "Content-Type": "application/json", "X-Tapchat-Internal-Secret": env.SHARING_TOKEN_SECRET ?? "replace-me" },
+              headers: { "Content-Type": "application/json", "X-Tapchat-Internal-Secret": sharingSecret },
               body: JSON.stringify({ deviceId, requestId: body.descriptor.requestId, capability: body.descriptor.capability })
             })
           );
@@ -6019,7 +6359,7 @@ async function handleRequest(request, env) {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
-                "X-Tapchat-Internal-Secret": env.SHARING_TOKEN_SECRET ?? "replace-me"
+                "X-Tapchat-Internal-Secret": sharingSecret
               },
               body: JSON.stringify({ deviceId, requestId: descriptor.requestId, capability: descriptor.capability })
             })
@@ -6043,7 +6383,7 @@ async function handleRequest(request, env) {
       }
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
-        const body = await request.json();
+        const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putIdentityBundle(userId, body);
         const saved = await sharedState.getIdentityBundle(userId);
         return jsonResponse3(saved);
@@ -6061,7 +6401,7 @@ async function handleRequest(request, env) {
       }
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "device_status", now);
-        const body = await request.json();
+        const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putDeviceStatus(userId, body);
         const saved = await sharedState.getDeviceStatus(userId);
         return jsonResponse3(saved);
@@ -6089,7 +6429,7 @@ async function handleRequest(request, env) {
       }
       if (request.method === "PUT") {
         await validateKeyPackageWriteAuthorization(request, sharedStateSecret(env), userId, deviceId, void 0, now);
-        const body = await request.json();
+        const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putKeyPackageRefs(userId, deviceId, body);
         const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
         return jsonResponse3(saved);
@@ -6120,7 +6460,7 @@ async function handleRequest(request, env) {
     }
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
       const auth = await validateAnyDeviceRuntimeAuthorization(request, sharedStateSecret(env), "storage_prepare_upload", now);
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
       return jsonResponse3(result);
     }
@@ -6133,7 +6473,7 @@ async function handleRequest(request, env) {
       if (!token) {
         throw new HttpError(401, "invalid_capability", "download refresh grant must not be empty");
       }
-      const body = await request.json();
+      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       if (body.version !== CURRENT_MODEL_VERSION) {
         throw new HttpError(400, "unsupported_version", "authorize download version is not supported");
       }

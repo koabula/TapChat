@@ -6,6 +6,7 @@ use tapchat_core::CoreEngine;
 
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::ProfileSummary;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, LockReason, SessionState};
@@ -15,16 +16,6 @@ pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileSumm
     let pm = &state.inner.read().await.profile_manager;
     let profiles = pm.list_profiles().await;
     log::info!("list_profiles: returning {} profiles", profiles.len());
-    for p in &profiles {
-        log::info!(
-            "list_profiles: profile '{}' at {}, is_active={}, user_id={}, device_id={}",
-            p.name,
-            p.path.display(),
-            p.is_active,
-            p.user_id.as_deref().unwrap_or("None"),
-            p.device_id.as_deref().unwrap_or("None")
-        );
-    }
     Ok(profiles)
 }
 
@@ -65,8 +56,8 @@ pub async fn start_new_profile_onboarding(
             let ports = state.ports.lock().await;
             ports.realtime.clone()
         };
-        if let Err(e) = realtime.close_all_silent().await {
-            log::warn!("Failed to close realtime before onboarding: {}", e);
+        if let Err(_error) = realtime.close_all_silent().await {
+            log::warn!("Failed to close realtime before onboarding");
         }
     }
 
@@ -107,7 +98,10 @@ pub async fn activate_profile(
     path: PathBuf,
     passphrase: Option<String>,
 ) -> Result<(), String> {
-    log::info!("activate_profile: activating profile at {}", path.display());
+    log::info!(
+        "activate_profile: activating {}",
+        redact_id("profile-path", &path.to_string_lossy())
+    );
 
     // Activate the profile
     {
@@ -131,8 +125,8 @@ pub async fn select_profile_for_restart(
     passphrase: Option<String>,
 ) -> Result<(), String> {
     log::info!(
-        "select_profile_for_restart: selecting profile at {} for next launch",
-        path.display()
+        "select_profile_for_restart: selecting {} for next launch",
+        redact_id("profile-path", &path.to_string_lossy())
     );
     let pm = &state.inner.read().await.profile_manager;
     pm.select_profile_for_restart(&path, passphrase)
@@ -245,8 +239,8 @@ async fn reload_engine_from_profile(
             let ports = state.ports.lock().await;
             ports.realtime.clone()
         };
-        if let Err(e) = realtime.close_all_silent().await {
-            log::warn!("Failed to close realtime connections silently: {}", e);
+        if let Err(_error) = realtime.close_all_silent().await {
+            log::warn!("Failed to close realtime connections silently");
         }
     }
 
@@ -306,8 +300,8 @@ async fn reload_engine_from_profile(
     if let Some(deployment) = &snapshot.deployment {
         log::info!(
             "reload_engine_from_profile: deployment_bundle has inbox_websocket_endpoint={}, inbox_http_endpoint={}",
-            deployment.deployment_bundle.inbox_websocket_endpoint,
-            deployment.deployment_bundle.inbox_http_endpoint
+            sanitize_url_for_log(&deployment.deployment_bundle.inbox_websocket_endpoint),
+            sanitize_url_for_log(&deployment.deployment_bundle.inbox_http_endpoint)
         );
     }
 
@@ -322,7 +316,10 @@ async fn reload_engine_from_profile(
             .unwrap_or_else(|| "unknown-device".to_string())
     };
 
-    log::info!("reload_engine_from_profile: device_id={}", device_id);
+    log::info!(
+        "reload_engine_from_profile: device_id={}",
+        redact_id("device", &device_id)
+    );
 
     // Step 5: Reinitialize engine from snapshot
     let restored_engine = match CoreEngine::try_from_restored_state(snapshot) {
@@ -375,13 +372,10 @@ async fn reload_engine_from_profile(
 
     // Step 8: Start session with AppStarted event - this will establish new websocket
     // If websocket connect fails, profile switch still succeeded, just realtime failed
-    if let Err(e) =
+    if let Err(_error) =
         drive_core_with_handle(app, CoreInput::Event(tapchat_core::CoreEvent::AppStarted)).await
     {
-        log::warn!(
-            "Failed to start realtime session after profile switch: {}",
-            e
-        );
+        log::warn!("Failed to start realtime session after profile switch");
         // Return success anyway - profile switch is complete, just realtime failed
     }
 
@@ -405,8 +399,8 @@ async fn set_locked_session(
             let ports = state.ports.lock().await;
             ports.realtime.clone()
         };
-        if let Err(error) = realtime.close_all_silent().await {
-            log::warn!("Failed to close realtime after profile lock: {}", error);
+        if let Err(_error) = realtime.close_all_silent().await {
+            log::warn!("Failed to close realtime after profile lock: close_failed");
         }
     }
     {

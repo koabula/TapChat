@@ -12,6 +12,7 @@ const ATTACHMENT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(any(test, feature = "test-support"))]
 use crate::lifecycle::drive_core_without_handle;
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::redact_id;
 use crate::state::AppState;
 use crate::timetest;
 
@@ -231,16 +232,15 @@ pub async fn get_attachment_preview(
 
     let thumbnail = generate_thumbnail(&file_path).await.map_err(|e| {
         log::warn!(
-            "get_attachment_preview: thumbnail generation failed for {}: {}",
-            file_path.display(),
-            e
+            "get_attachment_preview: thumbnail generation failed for {}: generation_failed",
+            redact_id("attachment", &file_path.to_string_lossy())
         );
         format!("Failed to generate thumbnail: {}", e)
     })?;
     if thumbnail.is_some() {
         log::debug!(
             "get_attachment_preview: thumbnail generated for {}",
-            file_path.display()
+            redact_id("attachment", &file_path.to_string_lossy())
         );
     }
     Ok(thumbnail)

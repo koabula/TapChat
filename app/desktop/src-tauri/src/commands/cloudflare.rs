@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -21,11 +22,49 @@ use crate::commands::cloudflare_rest::{
 };
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::platform::log_sanitize::sanitize_url_for_log;
 use crate::state::AppState;
 use crate::state::SessionState;
 use crate::timetest;
 
 static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+fn valid_worker_secret(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.as_bytes().len() >= 32
+        && !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "replace-me" | "replace-me-bootstrap" | "changeme" | "change-me" | "secret"
+        )
+}
+
+fn repair_worker_secret(candidate: Option<String>) -> (String, bool) {
+    if let Some(secret) = candidate.filter(|secret| valid_worker_secret(secret)) {
+        return (secret, false);
+    }
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let generated = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    (generated, true)
+}
+
+fn repair_worker_secrets(
+    sharing_candidate: Option<String>,
+    bootstrap_candidate: Option<String>,
+) -> (String, bool, String, bool) {
+    let (sharing_secret, repaired_sharing) = repair_worker_secret(sharing_candidate);
+    let (mut bootstrap_secret, mut repaired_bootstrap) = repair_worker_secret(bootstrap_candidate);
+    if bootstrap_secret == sharing_secret {
+        (bootstrap_secret, _) = repair_worker_secret(None);
+        repaired_bootstrap = true;
+    }
+    (
+        sharing_secret,
+        repaired_sharing,
+        bootstrap_secret,
+        repaired_bootstrap,
+    )
+}
 
 /// Preflight check result
 #[derive(Debug, Clone, Serialize)]
@@ -250,7 +289,23 @@ pub fn runtime_missing_group_outbox_message(status: &CloudflareRuntimeStatus) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_missing_group_outbox_message, status_from_features};
+    use super::{
+        repair_worker_secrets, runtime_missing_group_outbox_message, status_from_features,
+        valid_worker_secret,
+    };
+
+    #[test]
+    fn worker_secrets_are_valid_and_independent() {
+        let same = "same-runtime-secret-0123456789abcdef0123456789abcdef".to_string();
+        let (sharing, repaired_sharing, bootstrap, repaired_bootstrap) =
+            repair_worker_secrets(Some(same.clone()), Some(same));
+
+        assert!(!repaired_sharing);
+        assert!(repaired_bootstrap);
+        assert!(valid_worker_secret(&sharing));
+        assert!(valid_worker_secret(&bootstrap));
+        assert_ne!(sharing, bootstrap);
+    }
 
     #[test]
     fn runtime_status_requires_group_features_for_upgrade_clearance() {
@@ -543,6 +598,21 @@ pub async fn cloudflare_deploy(
         let inner = state.inner.read().await;
         inner.profile_manager.get_runtime_metadata().await
     };
+    let (
+        sharing_token_secret,
+        repaired_sharing_secret,
+        bootstrap_token_secret,
+        repaired_bootstrap_secret,
+    ) = repair_worker_secrets(
+        existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.sharing_secret.clone())
+            .or_else(|| Some(defaults.sharing_token_secret.clone())),
+        existing_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.bootstrap_secret.clone())
+            .or_else(|| Some(defaults.bootstrap_token_secret.clone())),
+    );
 
     let config = WorkerDeployConfig {
         worker_name: existing_runtime
@@ -565,19 +635,31 @@ pub async fn cloudflare_deploy(
             .as_ref()
             .and_then(|runtime| runtime.preview_bucket_name.clone())
             .unwrap_or(defaults.preview_bucket_name),
-        sharing_token_secret: existing_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.sharing_secret.clone())
-            .unwrap_or(defaults.sharing_token_secret),
-        bootstrap_token_secret: existing_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.bootstrap_secret.clone())
-            .unwrap_or(defaults.bootstrap_token_secret),
+        sharing_token_secret,
+        bootstrap_token_secret,
         max_inline_bytes: 4096,
         retention_days: 30,
         rate_limit_per_minute: 60,
         rate_limit_per_hour: 600,
+        message_request_max_body_bytes: 327_680,
+        message_request_max_per_sender: 16,
+        message_request_max_senders: 64,
+        message_request_max_total_bytes: 4_194_304,
+        message_request_ttl_seconds: 604_800,
+        message_request_rate_limit_minute: 30,
+        message_request_rate_limit_hour: 300,
     };
+
+    if repaired_sharing_secret || repaired_bootstrap_secret {
+        let _ = app.emit(
+            "cloudflare-progress",
+            DeployProgress {
+                phase: DeployPhase::Preflight,
+                message: "Invalid or missing runtime secrets were rotated. Unused legacy invite or bootstrap links may no longer work.".into(),
+                progress_percent: 20,
+            },
+        );
+    }
 
     // Deploy via REST API
     let result = cloudflare_rest::deploy_via_rest_api(
@@ -734,7 +816,7 @@ pub async fn cloudflare_deploy(
     let elapsed_secs = deploy_start.elapsed().as_secs_f64();
     timetest!(
         "deploy_done success=true worker_url={} elapsed_secs={:.1} ts={}",
-        result.worker_url,
+        sanitize_url_for_log(&result.worker_url),
         elapsed_secs,
         abs_start + ((elapsed_secs * 1000.0) as u128)
     );
@@ -826,8 +908,8 @@ async fn restart_runtime_session_after_deploy(
             let ports = state.ports.lock().await;
             ports.realtime.clone()
         };
-        if let Err(error) = realtime.close_all_silent().await {
-            log::warn!("cloudflare_deploy: failed to close old realtime sessions: {error}");
+        if let Err(_error) = realtime.close_all_silent().await {
+            log::warn!("cloudflare_deploy: failed to close old realtime sessions");
         }
     }
     set_ws_connection_snapshot(state, Some(device_id.to_string()), false).await;
@@ -851,8 +933,9 @@ async fn restart_runtime_session_after_deploy(
     if let Ok(status) = cloudflare_status_impl(state).await {
         let _ = app.emit("runtime-status-changed", status);
     }
-    if let Err(error) = drive_core_with_handle(app, CoreInput::Event(CoreEvent::AppStarted)).await {
-        log::warn!("cloudflare_deploy: runtime deployed but AppStarted failed: {error}");
+    if let Err(_error) = drive_core_with_handle(app, CoreInput::Event(CoreEvent::AppStarted)).await
+    {
+        log::warn!("cloudflare_deploy: runtime deployed but AppStarted failed");
     }
 }
 

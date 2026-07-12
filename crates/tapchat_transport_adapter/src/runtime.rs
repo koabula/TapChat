@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow, bail};
+use rand::RngCore;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -78,8 +79,8 @@ impl CloudflareRuntimeHandle {
         let port = reserve_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let websocket_base_url = format!("ws://127.0.0.1:{port}");
-        let bootstrap_secret = format!("transport-bootstrap-{port}");
-        let sharing_secret = format!("transport-sharing-{port}");
+        let bootstrap_secret = generate_hex_secret();
+        let sharing_secret = generate_hex_secret();
 
         let mut child = Command::new("node");
         child
@@ -487,4 +488,10 @@ fn reserve_port() -> Result<u16> {
     let port = listener.local_addr().context("get local addr")?.port();
     drop(listener);
     Ok(port)
+}
+
+fn generate_hex_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
