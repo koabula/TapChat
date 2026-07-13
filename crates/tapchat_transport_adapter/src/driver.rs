@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
@@ -6,6 +6,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tapchat_core::conversation::RecoveryStatus;
+use tapchat_core::external_fetch::{
+    ExternalResourceKind, ExternalUrlApproval, ExternalUrlAssessment, assess_external_url,
+    fetch_external_json,
+};
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
@@ -47,6 +51,7 @@ pub struct DriverRuntime {
     recent_messages: Vec<(String, MessageType)>,
     injected_identity_fetch_failures: BTreeMap<String, Vec<bool>>,
     injected_sync_fetch_failures: BTreeMap<String, Vec<bool>>,
+    external_url_approvals: VecDeque<ExternalUrlApproval>,
 }
 
 pub struct CoreDriver {
@@ -84,8 +89,10 @@ impl CoreDriver {
     ) -> Result<Self> {
         let latest_snapshot = snapshot.clone();
         let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
+        let engine = CoreEngine::try_from_restored_state(snapshot)
+            .map_err(|error| anyhow!("restore_failed: {}", error.message()))?;
         Ok(Self {
-            engine: CoreEngine::from_restored_state(snapshot),
+            engine,
             runtime: DriverRuntime {
                 client: Client::builder()
                     .build()
@@ -103,6 +110,7 @@ impl CoreDriver {
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
                 injected_sync_fetch_failures: BTreeMap::new(),
+                external_url_approvals: VecDeque::new(),
             },
         })
     }
@@ -128,12 +136,29 @@ impl CoreDriver {
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
                 injected_sync_fetch_failures: BTreeMap::new(),
+                external_url_approvals: VecDeque::new(),
             },
         })
     }
 
     pub fn engine(&self) -> &CoreEngine {
         &self.engine
+    }
+
+    pub async fn assess_external_url(
+        &self,
+        url: &str,
+        purpose: ExternalResourceKind,
+    ) -> Result<ExternalUrlAssessment> {
+        assess_external_url(url, purpose)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn approve_external_url_once(&mut self, assessment: ExternalUrlAssessment) {
+        self.runtime
+            .external_url_approvals
+            .push_back(assessment.approve());
     }
 
     pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
@@ -581,9 +606,9 @@ impl CoreDriver {
         let reference = fetch
             .reference
             .ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
-        match self.runtime.client.get(reference).send().await {
-            Ok(response) if response.status().is_success() => {
-                let body = response.text().await?;
+        let approval = self.runtime.external_url_approvals.pop_front();
+        match fetch_external_json(&reference, ExternalResourceKind::ContactShare, approval).await {
+            Ok(body) => {
                 let bundle: IdentityBundle =
                     serde_json::from_str(&to_snake_case_json_string(&body)?)?;
                 Ok(vec![CoreEvent::IdentityBundleFetched {
@@ -591,14 +616,9 @@ impl CoreDriver {
                     bundle,
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
-                user_id: fetch.user_id,
-                retryable: false,
-                detail: Some(format!("status {}", response.status())),
-            }]),
             Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
-                retryable: true,
+                retryable: error.code() == "external_fetch_timeout",
                 detail: Some(error.to_string()),
             }]),
         }
@@ -1227,7 +1247,29 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_realtime_event;
+    use super::{CoreDriver, parse_realtime_event};
+
+    #[test]
+    fn driver_restore_failure_does_not_create_empty_engine() {
+        let mut snapshot = tapchat_core::persistence::CorePersistenceSnapshot::default();
+        snapshot
+            .mls_states
+            .push(tapchat_core::persistence::PersistedMlsState {
+                conversation_id: "conv:corrupt".into(),
+                summary: tapchat_core::model::MlsStateSummary {
+                    conversation_id: "conv:corrupt".into(),
+                    epoch: 1,
+                    member_device_ids: vec!["device:local".into()],
+                    status: tapchat_core::model::MlsStateStatus::Active,
+                    updated_at: 1,
+                },
+                serialized_group_state: Some("{broken".into()),
+            });
+        let error = CoreDriver::from_snapshot(snapshot, None)
+            .err()
+            .expect("corrupt snapshot must fail");
+        assert!(error.to_string().contains("restore_failed"));
+    }
 
     #[test]
     fn websocket_payload_maps_to_core_event() {

@@ -1,0 +1,54 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tapchat-cloudflare",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-09",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "PUBLIC_BASE_URL": "https://example.com",
+    "DEPLOYMENT_REGION": "local",
+    "MAX_INLINE_BYTES": "4096",
+    "RETENTION_DAYS": "30",
+    "RATE_LIMIT_PER_MINUTE": "60",
+    "RATE_LIMIT_PER_HOUR": "600",
+    "MESSAGE_REQUEST_MAX_BODY_BYTES": "327680",
+    "MESSAGE_REQUEST_MAX_PER_SENDER": "16",
+    "MESSAGE_REQUEST_MAX_SENDERS": "64",
+    "MESSAGE_REQUEST_MAX_TOTAL_BYTES": "4194304",
+    "MESSAGE_REQUEST_TTL_SECONDS": "604800",
+    "MESSAGE_REQUEST_RATE_LIMIT_MINUTE": "30",
+    "MESSAGE_REQUEST_RATE_LIMIT_HOUR": "300",
+    "ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS": "365"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "INBOX", "class_name": "InboxDurableObject" },
+      { "name": "GROUP_OUTBOX", "class_name": "GroupOutboxDurableObject" }
+    ]
+  },
+  "r2_buckets": [
+    {
+      "binding": "TAPCHAT_STORAGE",
+      "bucket_name": "tapchat-storage",
+      "preview_bucket_name": "tapchat-storage-preview"
+    }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["InboxDurableObject"] },
+    { "tag": "v2", "new_sqlite_classes": ["GroupOutboxDurableObject"] }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 0.01,
+      "invocation_logs": false,
+      "persist": true
+    },
+    "traces": {
+      "enabled": false,
+      "head_sampling_rate": 0,
+      "persist": false
+    }
+  }
+}

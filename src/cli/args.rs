@@ -211,6 +211,9 @@ pub enum ContactRequestsSubcommand {
         profile: Option<PathBuf>,
         #[arg(long)]
         request_id: String,
+        /// Explicitly allow the one contact-share fetch to access a private origin.
+        #[arg(long)]
+        allow_private_url: bool,
     },
     Reject {
         #[arg(long)]
@@ -542,6 +545,9 @@ pub enum GroupJoinSubcommand {
         profile: Option<PathBuf>,
         #[arg(long)]
         invite_url: String,
+        /// Explicitly allow this invite fetch to access a private origin.
+        #[arg(long)]
+        allow_private_url: bool,
     },
     /// Import a group from a welcome pickup URL handed out by the owner/admin
     ByPickup {

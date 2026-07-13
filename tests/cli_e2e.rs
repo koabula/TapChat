@@ -684,6 +684,7 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
         &bob_profile.to_string_lossy(),
         "--request-id",
         &requests[0].request_id,
+        "--allow-private-url",
     ])?;
     assert_eq!(accepted["accepted"], Value::Bool(true));
     assert_eq!(
@@ -5010,6 +5011,7 @@ fn cli_group_three_party_invite_remove_e2e_work() -> Result<()> {
         &ctx.dana_profile.to_string_lossy(),
         "--invite-url",
         &invite_url,
+        "--allow-private-url",
     ])?;
     assert_eq!(submit["submitted"], Value::Bool(true));
     assert_eq!(submit["group_id"].as_str(), Some(group_id.as_str()));

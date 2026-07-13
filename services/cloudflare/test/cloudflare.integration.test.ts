@@ -51,7 +51,7 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
   const mf = new Miniflare({
     scriptPath,
     modules: true,
-    compatibilityDate: "2026-03-30",
+    compatibilityDate: "2026-07-09",
     bindings: {
       PUBLIC_BASE_URL: BASE_URL,
       DEPLOYMENT_REGION: "local",

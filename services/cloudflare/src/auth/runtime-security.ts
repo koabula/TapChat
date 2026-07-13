@@ -1,5 +1,5 @@
 import { HttpError } from "./capability";
-import type { Env } from "../types/runtime";
+import type { Env } from "../types/env";
 
 export const CONTROL_JSON_MAX_BYTES = 64 * 1024;
 export const DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES = 320 * 1024;

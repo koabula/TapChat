@@ -12,6 +12,7 @@ use keyring::{credential::CredentialPersistence, default};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -404,6 +405,40 @@ impl Profile {
 
     pub fn metadata(&self) -> &ProfileMetadata {
         &self.meta
+    }
+
+    pub fn has_passphrase_wrapper(&self) -> bool {
+        self.meta.encryption.as_ref().is_some_and(|encryption| {
+            encryption
+                .wrappers
+                .iter()
+                .any(|wrapper| wrapper.kind == ProfileKeyWrapperKind::PassphraseArgon2id)
+        })
+    }
+
+    /// Verify a profile passphrase without changing the active profile,
+    /// registry, or encryption wrappers.
+    pub fn verify_passphrase(&self, passphrase: &str) -> Result<()> {
+        if passphrase.is_empty() {
+            bail!("profile passphrase verification failed");
+        }
+        let encryption = self
+            .meta
+            .encryption
+            .as_ref()
+            .ok_or_else(|| anyhow!("profile passphrase verification failed"))?;
+        let wrapper = encryption
+            .wrappers
+            .iter()
+            .find(|wrapper| wrapper.kind == ProfileKeyWrapperKind::PassphraseArgon2id)
+            .ok_or_else(|| anyhow!("profile passphrase verification is unavailable"))?;
+        let candidate = unwrap_with_passphrase(&self.meta.profile_id, wrapper, passphrase)
+            .map_err(|_| anyhow!("profile passphrase verification failed"))?;
+        if candidate.as_slice().ct_eq(self.pdek.as_slice()).into() {
+            Ok(())
+        } else {
+            bail!("profile passphrase verification failed")
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -1526,6 +1561,35 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock")
+    }
+
+    #[test]
+    fn profile_passphrase_can_be_verified_without_reopening_or_mutating_profile() {
+        let _guard = env_lock();
+        let dir = tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var(
+                "TAPCHAT_PROFILE_REGISTRY_PATH",
+                dir.path().join("config").join("profiles.json"),
+            );
+        }
+        let profile = Profile::init_with_options(
+            "reauth",
+            dir.path().join("profile"),
+            ProfileInitOptions {
+                passphrase: Some("correct horse battery staple".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("profile");
+        assert!(profile.has_passphrase_wrapper());
+        profile
+            .verify_passphrase("correct horse battery staple")
+            .expect("correct passphrase");
+        assert!(profile.verify_passphrase("wrong passphrase").is_err());
+        unsafe {
+            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
+        }
     }
 
     #[test]

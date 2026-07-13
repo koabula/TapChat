@@ -6517,13 +6517,49 @@ async function handleRequest(request, env) {
 }
 
 // src/index.ts
+function routeFamilyForObservability(rawUrl) {
+  let path = "/";
+  try {
+    path = new URL(rawUrl).pathname;
+  } catch {
+    return "invalid_url";
+  }
+  if (path === "/v1/deployment-bundle") return "deployment_bundle";
+  if (path === "/v1/bootstrap/device") return "device_bootstrap";
+  if (path.startsWith("/v1/inbox/")) return "inbox";
+  if (path.startsWith("/v1/groups/")) return "group_outbox";
+  if (path.startsWith("/v1/group-invite/")) return "group_invite";
+  if (path.startsWith("/v1/contact-share/")) return "contact_share";
+  if (path.startsWith("/v1/shared-state/")) return "shared_state";
+  if (path.startsWith("/v1/storage/")) return "storage";
+  if (path.startsWith("/v1/welcome-pickup/")) return "welcome_pickup";
+  return "unknown";
+}
+function logServerFailure(request, status) {
+  console.error(JSON.stringify({
+    event: "worker_request_failed",
+    route_family: routeFamilyForObservability(request.url),
+    method: request.method,
+    status
+  }));
+}
 var index_default = {
   async fetch(request, env) {
-    return handleRequest(request, env);
+    try {
+      const response = await handleRequest(request, env);
+      if (response.status >= 500) {
+        logServerFailure(request, response.status);
+      }
+      return response;
+    } catch {
+      logServerFailure(request, 500);
+      return Response.json({ error: "internal_error" }, { status: 500 });
+    }
   }
 };
 export {
   GroupOutboxDurableObject,
   InboxDurableObject,
-  index_default as default
+  index_default as default,
+  routeFamilyForObservability
 };

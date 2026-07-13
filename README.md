@@ -21,7 +21,7 @@ Most messaging systems still depend on a central service for message delivery, a
 - message history is synchronized by cursor, not by best-effort push state
 - attachments are encrypted locally before being uploaded as blobs
 
-This does not remove all metadata. Network timing, account-level Cloudflare metadata, and contact graph hints can still exist. The goal is to reduce centralized control and metadata concentration while keeping the app usable.
+This does not remove all metadata. Network timing, account-level Cloudflare metadata, and contact graph hints can still exist. The goal is to reduce centralized control and cross-user metadata concentration while keeping the app usable. In the current group protocol, the Group Outbox holds a complete signed membership/role manifest and can observe a single group's roster. See the [threat model](./doc/THREAT_MODEL.md).
 
 ## How it works
 
@@ -121,6 +121,7 @@ npm run tauri:dev
 - Plaintext messages should only exist in the client.
 - The Cloudflare reference transport stores and routes encrypted envelopes and encrypted blobs; it should not be able to decrypt message contents.
 - TapChat still exposes some metadata through network timing, endpoint access, account-level infrastructure, and user-controlled deployment choices.
+- “Metadata-private” does not currently mean anonymous messaging or hiding a group's membership from its Group Outbox provider.
 - The project has not received a third-party security audit.
 - Do not use this alpha for high-risk or life-critical communication.
 

@@ -5,6 +5,7 @@ pub mod realtime;
 pub mod timer;
 pub mod transport;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,9 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use tapchat_core::external_fetch::{
+    fetch_external_json, ExternalResourceKind, ExternalUrlApproval,
+};
 use tapchat_core::ffi_api::{
     CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect, ReadAttachmentBytesEffect,
     UserNotificationEffect, WriteDownloadedAttachmentEffect,
@@ -68,6 +72,8 @@ pub struct DesktopPlatformPorts {
     app_handle: Option<Arc<AppHandle>>,
     /// Current conversation ID for upload progress context
     current_conversation_id: Option<String>,
+    pending_external_url_approvals: HashMap<String, (ExternalResourceKind, ExternalUrlApproval)>,
+    active_external_url_approvals: HashMap<ExternalResourceKind, ExternalUrlApproval>,
     // Timer uses spawn directly
 }
 
@@ -88,6 +94,8 @@ impl DesktopPlatformPorts {
                 }),
             app_handle: None,
             current_conversation_id: None,
+            pending_external_url_approvals: HashMap::new(),
+            active_external_url_approvals: HashMap::new(),
         }
     }
 
@@ -104,6 +112,32 @@ impl DesktopPlatformPorts {
     /// Set the current conversation ID for upload progress context
     pub fn set_conversation_context(&mut self, conversation_id: String) {
         self.current_conversation_id = Some(conversation_id);
+    }
+
+    pub fn stage_external_url_approval(
+        &mut self,
+        approval_id: String,
+        purpose: ExternalResourceKind,
+        approval: ExternalUrlApproval,
+    ) {
+        self.pending_external_url_approvals
+            .insert(approval_id, (purpose, approval));
+    }
+
+    pub fn activate_external_url_approval(&mut self, approval_id: &str) -> bool {
+        let Some((purpose, approval)) = self.pending_external_url_approvals.remove(approval_id)
+        else {
+            return false;
+        };
+        self.active_external_url_approvals.insert(purpose, approval);
+        true
+    }
+
+    pub fn take_external_url_approval(
+        &mut self,
+        purpose: ExternalResourceKind,
+    ) -> Option<ExternalUrlApproval> {
+        self.active_external_url_approvals.remove(&purpose)
     }
 
     /// Build contact share URL for sender identification in message requests.
@@ -346,12 +380,26 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         fetch: FetchIdentityBundleRequest,
     ) -> Result<Vec<CoreEvent>> {
-        // The fetch request has user_id which is the share URL
-        let bundle = self.transport.fetch_identity_bundle(fetch.clone()).await?;
-        Ok(vec![CoreEvent::IdentityBundleFetched {
-            user_id: fetch.user_id,
-            bundle,
-        }])
+        let reference = fetch
+            .reference
+            .as_deref()
+            .context("identity bundle fetch missing reference")?;
+        let approval = self.take_external_url_approval(ExternalResourceKind::ContactShare);
+        match fetch_external_json(reference, ExternalResourceKind::ContactShare, approval).await {
+            Ok(body) => {
+                let normalized = to_snake_case_json_string(&body)?;
+                let bundle = serde_json::from_str(&normalized)?;
+                Ok(vec![CoreEvent::IdentityBundleFetched {
+                    user_id: fetch.user_id,
+                    bundle,
+                }])
+            }
+            Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
+                user_id: fetch.user_id,
+                retryable: error.code() == "external_fetch_timeout",
+                detail: Some(error.to_string()),
+            }]),
+        }
     }
 
     async fn fetch_message_requests(
@@ -1029,18 +1077,15 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         fetch: FetchGroupInviteRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let response = self.client.get(&fetch.invite_url).send().await;
-        match response {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                if !(200..300).contains(&status) {
-                    return Ok(vec![CoreEvent::GroupInviteFetchFailed {
-                        invite_url: fetch.invite_url,
-                        retryable: status >= 500,
-                        detail: Some(format!("HTTP {status}")),
-                    }]);
-                }
+        let approval = self.take_external_url_approval(ExternalResourceKind::GroupInvite);
+        match fetch_external_json(
+            &fetch.invite_url,
+            ExternalResourceKind::GroupInvite,
+            approval,
+        )
+        .await
+        {
+            Ok(body) => {
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupInviteResult = serde_json::from_str(&body)?;
                 Ok(vec![CoreEvent::GroupInviteFetched {
@@ -1050,7 +1095,7 @@ impl TransportPort for DesktopPlatformPorts {
             }
             Err(error) => Ok(vec![CoreEvent::GroupInviteFetchFailed {
                 invite_url: fetch.invite_url,
-                retryable: true,
+                retryable: error.code() == "external_fetch_timeout",
                 detail: Some(error.to_string()),
             }]),
         }

@@ -13,7 +13,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: tauriMocks.listen,
 }));
 
-import { createOrLoadIdentity, selectProfileForRestart, setLocalDisplayName } from "../tauri";
+import {
+  beginRecoveryPhraseReveal,
+  completeRecoveryPhraseReveal,
+  createOrLoadIdentity,
+  selectProfileForRestart,
+  setLocalDisplayName,
+} from "../tauri";
 
 describe("tauri identity wrappers", () => {
   beforeEach(() => {
@@ -40,6 +46,32 @@ describe("tauri identity wrappers", () => {
     expect(tauriMocks.invoke).toHaveBeenCalledWith("set_local_display_name", {
       displayName: null,
     });
+  });
+
+  it("uses the explicit sensitive IPC flow to reveal a recovery phrase", async () => {
+    tauriMocks.invoke.mockResolvedValueOnce({
+      challenge_id: "challenge",
+      auth_mode: "passphrase",
+      expires_at: 123,
+    });
+    tauriMocks.invoke.mockResolvedValueOnce({ mnemonic: "recovery words" });
+
+    await beginRecoveryPhraseReveal();
+    await completeRecoveryPhraseReveal("challenge", "profile password", true);
+
+    expect(tauriMocks.invoke).toHaveBeenNthCalledWith(
+      1,
+      "begin_recovery_phrase_reveal",
+    );
+    expect(tauriMocks.invoke).toHaveBeenNthCalledWith(
+      2,
+      "complete_recovery_phrase_reveal",
+      {
+        challengeId: "challenge",
+        passphrase: "profile password",
+        confirmed: true,
+      },
+    );
   });
 
   it("selects a profile for restart without invoking the hot-switch command", async () => {

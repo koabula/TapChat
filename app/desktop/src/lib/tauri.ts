@@ -15,6 +15,9 @@ import type {
   ProfileSummary,
   StartDirectChatResult,
   AppMetadata,
+  RecoveryPhraseRevealChallenge,
+  RecoveryPhraseRevealResult,
+  ExternalUrlPreflight,
 } from "./types";
 
 // Re-export Tauri primitives
@@ -33,6 +36,22 @@ export async function createOrLoadIdentity(
 
 export async function getIdentityInfo(): Promise<IdentityInfo | null> {
   return invoke("get_identity_info");
+}
+
+export async function beginRecoveryPhraseReveal(): Promise<RecoveryPhraseRevealChallenge> {
+  return invoke("begin_recovery_phrase_reveal");
+}
+
+export async function completeRecoveryPhraseReveal(
+  challengeId: string,
+  passphrase: string | null,
+  confirmed: boolean,
+): Promise<RecoveryPhraseRevealResult> {
+  return invoke("complete_recovery_phrase_reveal", {
+    challengeId,
+    passphrase,
+    confirmed,
+  });
 }
 
 export async function getShareLink(): Promise<string | null> {
@@ -376,6 +395,27 @@ export interface GroupInviteView {
   revoked_at: number | null;
   inviter_user_id: string;
   created_at: number;
+}
+
+export async function prepareExternalUrlAccess(
+  url: string,
+  purpose: "contact_share" | "group_invite",
+): Promise<void> {
+  const preflight = await invoke<ExternalUrlPreflight>("preflight_external_url", {
+    url,
+    purpose,
+  });
+  if (!preflight.requires_confirmation) return;
+  const transportWarning = preflight.insecure_http
+    ? " This connection uses unencrypted HTTP, so the URL and response may be visible on the local network."
+    : "";
+  const confirmed = window.confirm(
+    `Allow this one request to private origin ${preflight.origin}?${transportWarning}`,
+  );
+  if (!confirmed || !preflight.approval_id) {
+    throw new Error("Private network access was not approved.");
+  }
+  await invoke("approve_external_url", { approvalId: preflight.approval_id });
 }
 
 export type GroupJoinStatus =

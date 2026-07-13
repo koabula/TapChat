@@ -11,7 +11,7 @@ const rateLimitPerHour = process.env.RATE_LIMIT_PER_HOUR;
 const baseUrl = `http://127.0.0.1:${port}`;
 
 const worker = await unstable_dev("src/index.ts", {
-  config: "wrangler.toml",
+  config: "wrangler.jsonc",
   local: true,
   ip: "127.0.0.1",
   port,

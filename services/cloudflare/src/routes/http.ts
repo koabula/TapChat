@@ -39,7 +39,7 @@ import {
   type PutWelcomePickupRequest,
   type WelcomePickupDescriptor
 } from "../types/contracts";
-import type { Env } from "../types/runtime";
+import type { Env } from "../types/env";
 
 function versionedBody(body: unknown): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) {

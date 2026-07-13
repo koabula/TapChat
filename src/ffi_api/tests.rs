@@ -71,7 +71,7 @@ mod tests {
         let snapshot = engine.refresh_snapshot();
         assert_eq!(snapshot.local_display_name.as_deref(), Some("Alice"));
 
-        let restored = CoreEngine::from_restored_state(snapshot);
+        let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert_eq!(restored.local_display_name().as_deref(), Some("Alice"));
         assert_eq!(
             restored
@@ -112,7 +112,8 @@ mod tests {
             "display name update should advance bundle updated_at"
         );
 
-        let restored = CoreEngine::from_restored_state(engine.refresh_snapshot());
+        let restored = CoreEngine::try_from_restored_state(engine.refresh_snapshot())
+            .expect("restore snapshot");
         assert_eq!(
             restored.local_display_name().as_deref(),
             Some("Alice Prime")
@@ -823,7 +824,7 @@ mod tests {
         for item in &mut snapshot.pending_group_outbox {
             item.capability = None;
         }
-        let restored = CoreEngine::from_restored_state(snapshot);
+        let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(
             restored.state.pending_group_outbox.is_empty(),
             "pending group sends without a local role must not regain member capability"
@@ -1813,7 +1814,7 @@ mod tests {
             .iter()
             .any(|item| item.group_id == group_id));
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(restored.state.group_states.contains_key(&group_id));
         assert!(restored.state.conversations.contains_key(&conversation_id));
         assert_eq!(group_cursor_engine(&restored, &group_id), bob_cursor);
@@ -1989,7 +1990,7 @@ mod tests {
             .pending_group_seal
             .iter()
             .any(|seal| seal.group_id == group_id));
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(restored.state.pending_group_seal.contains_key(&group_id));
         let resumed = restored
             .handle_event(CoreEvent::AppStarted)
@@ -2036,7 +2037,7 @@ mod tests {
         let snapshot = bob.engine.refresh_snapshot();
         assert_eq!(snapshot.pending_blob_transfers.len(), 1);
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
@@ -4001,7 +4002,7 @@ mod tests {
             Some("refresh-long-idle")
         );
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let download = restored
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id,
@@ -4664,7 +4665,7 @@ mod tests {
             .expect("send");
         let snapshot = extract_snapshot(&output);
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
@@ -4950,7 +4951,7 @@ mod tests {
             .pending_outbox
             .iter()
             .any(|item| item.message_id == pending_message_id));
-        let restored = CoreEngine::from_restored_state(snapshot);
+        let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let conversation = restored
             .conversation_state(&conversation_id)
             .expect("restored conversation");
@@ -5161,7 +5162,7 @@ mod tests {
                 retries: 0,
             });
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
@@ -5225,7 +5226,7 @@ mod tests {
             panic!("missing persisted upload task");
         }
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
@@ -5237,7 +5238,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_mls_snapshot_marks_only_affected_conversation_for_rebuild() {
+    fn corrupted_mls_snapshot_fails_restore_closed() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -5250,89 +5251,13 @@ mod tests {
         let mut snapshot = extract_snapshot(&output);
         snapshot.mls_states[0].serialized_group_state = Some("{broken".into());
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
-
-        assert_eq!(
-            restored
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .conversation
-                .state,
-            crate::model::ConversationState::NeedsRebuild
-        );
-        assert_eq!(
-            restored
-                .state
-                .mls_summaries
-                .get(&conversation_id)
-                .expect("summary")
-                .status,
-            crate::model::MlsStateStatus::NeedsRebuild
-        );
-        let recovery = restored
-            .recovery_context_snapshot(&conversation_id)
-            .expect("recovery context");
-        assert_eq!(
-            recovery.phase,
-            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
-        );
-        assert_eq!(
-            recovery.escalation_reason,
-            Some(crate::ffi_api::RecoveryEscalationReason::MlsMarkedUnrecoverable)
-        );
-        assert_eq!(
-            recovery.restore_failure_reason.as_deref(),
-            Some("invalid_serialized_state")
-        );
-        assert!(recovery
-            .restore_failure_detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("failed to parse")));
-
-        let diagnostics = restored.recovery_conversations_snapshot();
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].conversation_id, conversation_id);
-        assert_eq!(
-            diagnostics[0].restore_failure_reason.as_deref(),
-            Some("invalid_serialized_state")
-        );
-        assert!(diagnostics[0].recoverable);
-        assert_eq!(
-            diagnostics[0].suggested_action,
-            "reconcile_conversation_membership"
-        );
-
-        let started = restored
-            .handle_event(CoreEvent::AppStarted)
-            .expect("app started");
-        assert!(started.state_update.conversations_changed);
-        assert!(started
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
-        assert!(started.view_model.as_ref().is_some_and(|view| {
-            view.banners.iter().any(|banner| {
-                banner.status == crate::ffi_api::SystemStatus::ConversationNeedsRebuild
-            }) && view
-                .conversations
-                .iter()
-                .any(|conversation| conversation.conversation_id == conversation_id)
-        }));
-        assert!(started.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::PersistState { persist }
-                if persist.ops.iter().any(|op| matches!(
-                    op,
-                    PersistOp::SaveRecoveryContext { conversation_id: saved }
-                        if saved == &conversation_id
-                ))
-        )));
+        let error = CoreEngine::try_from_restored_state(snapshot)
+            .expect_err("corrupted MLS state must fail closed");
+        assert_eq!(error.code(), "restore_failed");
     }
 
     #[test]
-    fn corrupted_closed_mls_snapshot_does_not_surface_restore_recovery() {
+    fn corrupted_closed_mls_snapshot_also_fails_restore_closed() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -5353,15 +5278,9 @@ mod tests {
             .state = crate::model::ConversationState::Archived;
         snapshot.mls_states[0].serialized_group_state = Some("{broken".into());
 
-        let restored = CoreEngine::from_restored_state(snapshot);
-
-        assert!(restored
-            .recovery_context_snapshot(&conversation_id)
-            .is_none());
-        assert!(
-            restored.mls_summary(&conversation_id).is_none(),
-            "archived corrupted MLS state should be dropped from active summaries"
-        );
+        let error = CoreEngine::try_from_restored_state(snapshot)
+            .expect_err("archived corrupted MLS state must fail closed");
+        assert_eq!(error.code(), "restore_failed");
     }
 
     #[test]
@@ -5584,7 +5503,7 @@ mod tests {
             .pending_acks
             .iter()
             .any(|ack| ack.device_id == bob_device_id));
-        let restored = CoreEngine::from_restored_state(snapshot);
+        let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(restored.mls_summary(&conversation_id).is_some());
         let restored_conversation = restored
             .conversation_state(&conversation_id)
@@ -5823,7 +5742,7 @@ mod tests {
             })
             .expect("rebuild conversation");
         let snapshot = extract_snapshot(&rebuild_output);
-        let restored = CoreEngine::from_restored_state(snapshot);
+        let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
 
         let recovery = restored
             .recovery_context_snapshot(&conversation_id)
@@ -6246,7 +6165,7 @@ mod tests {
             .map(|item| item.envelope.clone())
             .expect("welcome for laptop");
 
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let result = restored
             .state
             .mls_adapter
@@ -6683,7 +6602,7 @@ mod tests {
         let pending_after_refresh = alice.state.pending_outbox.len();
 
         let snapshot = extract_snapshot(&refresh_output);
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         restored
             .handle_command(CoreCommand::ReconcileConversationMembership {
                 conversation_id: conversation_id.clone(),
@@ -6710,8 +6629,18 @@ mod tests {
             .mls_states
             .first_mut()
             .expect("mls state")
-            .serialized_group_state = Some("{broken".into());
-        let mut restored = CoreEngine::from_restored_state(snapshot);
+            .summary
+            .status = crate::model::MlsStateStatus::NeedsRebuild;
+        let persisted_conversation = snapshot
+            .conversations
+            .iter_mut()
+            .find(|entry| entry.conversation_id == conversation_id)
+            .expect("persisted conversation");
+        persisted_conversation.state.conversation.state =
+            crate::model::ConversationState::NeedsRebuild;
+        persisted_conversation.state.recovery_status =
+            crate::conversation::RecoveryStatus::NeedsRebuild;
+        let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let pending_before = restored.state.pending_outbox.len();
 
         let output = restored

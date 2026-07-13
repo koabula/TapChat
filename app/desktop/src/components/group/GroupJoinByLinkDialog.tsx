@@ -5,6 +5,7 @@ import { X, Link2, AlertCircle, Loader } from "lucide-react";
 import {
   getGroupJoinRequestStatus,
   submitGroupJoinRequest,
+  prepareExternalUrlAccess,
   type GroupJoinStatus,
   type SubmitGroupJoinRequestResult,
 } from "@/lib/tauri";
@@ -84,6 +85,9 @@ export default function GroupJoinByLinkDialog({
     stopPolling();
 
     try {
+      if (/^https?:\/\//i.test(trimmed)) {
+        await prepareExternalUrlAccess(trimmed, "group_invite");
+      }
       const result = await submitGroupJoinRequest(trimmed);
       setPending(result);
       setSubmittedHost(inviteHost(trimmed));

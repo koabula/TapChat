@@ -60,9 +60,11 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 hmac = "0.12"
 sha2 = "0.10"
+subtle = "2"
 uuid = { version = "1", features = ["v4"] }
 open = "5"
 rand = "0.8"
+zeroize = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }

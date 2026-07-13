@@ -39,6 +39,7 @@ use common::{
 };
 use reqwest::StatusCode;
 use serde_json::Value;
+use tapchat_core::external_fetch::{assess_external_url, ExternalResourceKind};
 use tapchat_core::ffi_api::RealtimeEvent;
 use tapchat_core::model::{DeploymentBundle, IdentityBundle};
 use tapchat_core::CoreEvent;
@@ -55,6 +56,24 @@ use tapchat_desktop_lib::test_support::{
 use tapchat_desktop_lib::AppState;
 use tapchat_transport_adapter::CloudflareRuntimeHandle;
 use tempfile::TempDir;
+
+async fn approve_test_group_invite_url(state: &AppState, invite_url: &str) -> Result<()> {
+    let approval = assess_external_url(invite_url, ExternalResourceKind::GroupInvite)
+        .await
+        .map_err(|error| anyhow!(error.to_string()))?
+        .approve();
+    let mut ports = state.ports.lock().await;
+    let approval_id = "desktop-group-e2e-private-invite";
+    ports.stage_external_url_approval(
+        approval_id.into(),
+        ExternalResourceKind::GroupInvite,
+        approval,
+    );
+    if !ports.activate_external_url_approval(approval_id) {
+        return Err(anyhow!("failed to activate test invite approval"));
+    }
+    Ok(())
+}
 
 // Mnemonics mirror the ones used by `tests/cli_e2e.rs` so the
 // bootstrap runtime produces identical device ids across test
@@ -760,6 +779,7 @@ async fn run_dana_post_approval_send_sync_regression(ctx: &QuartetContext) -> Re
     .map_err(|e| anyhow!("alice create_group_invite_link_impl: {e}"))?;
 
     let dana = DesktopHarness::new(&ctx.dana_profile).await?;
+    approve_test_group_invite_url(&dana.state, &invite.invite_url).await?;
     let dana_submit = tokio::time::timeout(
         Duration::from_secs(15),
         submit_group_join_request_impl(&dana.state, invite.invite_url.clone()),
@@ -1492,6 +1512,7 @@ async fn run_lifecycle(ctx: &QuartetContext) -> Result<()> {
     assert!(invite.invite_url.contains("/v1/group-invite/"));
 
     let dana = DesktopHarness::new(&ctx.dana_profile).await?;
+    approve_test_group_invite_url(&dana.state, &invite.invite_url).await?;
     let dana_submit = submit_group_join_request_impl(&dana.state, invite.invite_url.clone())
         .await
         .map_err(|e| anyhow!("dana submit_group_join_request_impl: {e}"))?;

@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "tsc --noEmit",
+    "types": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --env-interface CloudflareBindings --include-runtime --no-strict-vars",
+    "types:check": "wrangler types --config wrangler.jsonc --env-interface CloudflareBindings --include-runtime --no-strict-vars --check",
+    "check": "npm run types:check && tsc --noEmit",
     "test": "tsx --test test/cloudflare.test.ts",
     "test:integration": "tsx --test test/*.integration.test.ts",
     "build:embedded": "node scripts/build-embedded-worker.mjs",
@@ -19,9 +21,10 @@
   "devDependencies": {
     "@types/node": "^22.15.30",
     "esbuild": "^0.27.4",
+    "jsonc-parser": "^3.3.1",
     "miniflare": "^4.20260317.3",
     "tsx": "^4.21.0",
     "typescript": "^5.8.3",
-    "wrangler": "^4.78.0"
+    "wrangler": "^4.110.0"
   }
 }

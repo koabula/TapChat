@@ -28,6 +28,7 @@ pub struct AppState {
     pub sync_gate: Arc<Mutex<SyncGateState>>,
     pub ws_status: Arc<RwLock<WsStatusSnapshot>>,
     pub foreground_sync_gate: Arc<Mutex<ForegroundSyncGate>>,
+    pub recovery_phrase_gate: Arc<Mutex<RecoveryPhraseGate>>,
 }
 
 pub struct AppStateInner {
@@ -102,6 +103,24 @@ pub struct WsStatusSnapshot {
     pub last_known_device_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryPhraseAuthMode {
+    Passphrase,
+    ConfirmationOnly,
+}
+
+pub struct RecoveryPhraseChallenge {
+    pub challenge_id: String,
+    pub profile_path: PathBuf,
+    pub auth_mode: RecoveryPhraseAuthMode,
+    pub expires_at: Instant,
+}
+
+#[derive(Default)]
+pub struct RecoveryPhraseGate {
+    pub pending: Option<RecoveryPhraseChallenge>,
+}
+
 impl AppState {
     pub fn new() -> Self {
         let profile_manager = ProfileManager::new();
@@ -119,6 +138,7 @@ impl AppState {
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
             foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
+            recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
         }
     }
 
@@ -139,6 +159,7 @@ impl AppState {
             sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
             foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
+            recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
         }
     }
 

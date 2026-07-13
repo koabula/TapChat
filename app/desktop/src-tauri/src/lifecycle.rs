@@ -248,7 +248,7 @@ pub async fn on_app_ready(app: &AppHandle) {
             inner.startup_phase = StartupPhase::Ready; // Backend is fully ready
         }
         log::info!(
-            "on_app_ready: CoreEngine::from_restored_state completed in {}ms",
+            "on_app_ready: CoreEngine::try_from_restored_state completed in {}ms",
             restore_engine_started_at.elapsed().as_millis()
         );
 

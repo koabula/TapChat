@@ -33,6 +33,10 @@ impl CoreError {
         Self::new("temporary_failure", message)
     }
 
+    pub fn restore_failed(message: impl Into<String>) -> Self {
+        Self::new("restore_failed", message)
+    }
+
     pub fn code(&self) -> &'static str {
         self.code
     }

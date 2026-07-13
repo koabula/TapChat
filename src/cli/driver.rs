@@ -11,6 +11,10 @@ use tokio::time::{timeout, Duration, Instant};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
+use crate::external_fetch::{
+    assess_external_url, fetch_external_json, ExternalResourceKind, ExternalUrlApproval,
+    ExternalUrlAssessment,
+};
 use crate::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, RecoveryDiagnostics,
@@ -59,6 +63,7 @@ pub struct DriverRuntime {
     contact_share_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
+    external_url_approval: Option<ExternalUrlApproval>,
 }
 
 pub struct CoreDriver {
@@ -105,8 +110,10 @@ impl CoreDriver {
     ) -> Result<Self> {
         let latest_snapshot = snapshot.clone();
         let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
+        let engine = CoreEngine::try_from_restored_state(snapshot)
+            .map_err(|error| anyhow!("restore_failed: {}", error.message()))?;
         Ok(Self {
-            engine: CoreEngine::from_restored_state(snapshot),
+            engine,
             runtime: DriverRuntime {
                 client: Client::builder()
                     .build()
@@ -123,6 +130,7 @@ impl CoreDriver {
                 contact_share_url,
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
+                external_url_approval: None,
             },
             suppress_realtime: false,
         })
@@ -130,6 +138,24 @@ impl CoreDriver {
 
     pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
         self.runtime.latest_snapshot.as_ref()
+    }
+
+    pub async fn assess_external_url(
+        &self,
+        url: &str,
+        purpose: ExternalResourceKind,
+    ) -> Result<ExternalUrlAssessment> {
+        assess_external_url(url, purpose)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn approve_external_url_once(&mut self, assessment: ExternalUrlAssessment) {
+        self.runtime.external_url_approval = Some(assessment.approve());
+    }
+
+    pub fn take_external_url_approval(&mut self) -> Option<ExternalUrlApproval> {
+        self.runtime.external_url_approval.take()
     }
 
     pub fn notifications(&self) -> &[String] {
@@ -645,9 +671,9 @@ impl CoreDriver {
         let reference = fetch
             .reference
             .ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
-        match self.runtime.client.get(reference).send().await {
-            Ok(response) if response.status().is_success() => {
-                let body = response.text().await?;
+        let approval = self.runtime.external_url_approval.take();
+        match fetch_external_json(&reference, ExternalResourceKind::ContactShare, approval).await {
+            Ok(body) => {
                 let bundle: IdentityBundle =
                     serde_json::from_str(&to_snake_case_json_string(&body)?)?;
                 Ok(vec![CoreEvent::IdentityBundleFetched {
@@ -655,14 +681,9 @@ impl CoreDriver {
                     bundle,
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
-                user_id: fetch.user_id,
-                retryable: false,
-                detail: Some(format!("status {}", response.status())),
-            }]),
             Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
-                retryable: true,
+                retryable: error.code() == "external_fetch_timeout",
                 detail: Some(error.to_string()),
             }]),
         }
@@ -1738,18 +1759,15 @@ impl TransportPort for CoreDriver {
         &mut self,
         fetch: FetchGroupInviteRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let response = self.runtime.client.get(&fetch.invite_url).send().await;
-        match response {
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                if !(200..300).contains(&status) {
-                    return Ok(vec![CoreEvent::GroupInviteFetchFailed {
-                        invite_url: fetch.invite_url,
-                        retryable: status >= 500,
-                        detail: Some(body),
-                    }]);
-                }
+        let approval = self.runtime.external_url_approval.take();
+        match fetch_external_json(
+            &fetch.invite_url,
+            ExternalResourceKind::GroupInvite,
+            approval,
+        )
+        .await
+        {
+            Ok(body) => {
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupInviteResult = serde_json::from_str(&body)?;
                 Ok(vec![CoreEvent::GroupInviteFetched {
@@ -1759,7 +1777,7 @@ impl TransportPort for CoreDriver {
             }
             Err(error) => Ok(vec![CoreEvent::GroupInviteFetchFailed {
                 invite_url: fetch.invite_url,
-                retryable: true,
+                retryable: error.code() == "external_fetch_timeout",
                 detail: Some(error.to_string()),
             }]),
         }
@@ -2545,8 +2563,30 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_realtime_event, ScheduledTimer};
+    use super::{parse_realtime_event, CoreDriver, ScheduledTimer};
     use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn driver_restore_failure_does_not_create_empty_engine() {
+        let mut snapshot = crate::persistence::CorePersistenceSnapshot::default();
+        snapshot
+            .mls_states
+            .push(crate::persistence::PersistedMlsState {
+                conversation_id: "conv:corrupt".into(),
+                summary: crate::model::MlsStateSummary {
+                    conversation_id: "conv:corrupt".into(),
+                    epoch: 1,
+                    member_device_ids: vec!["device:local".into()],
+                    status: crate::model::MlsStateStatus::Active,
+                    updated_at: 1,
+                },
+                serialized_group_state: Some("{broken".into()),
+            });
+        let error = CoreDriver::from_snapshot(snapshot, None, None)
+            .err()
+            .expect("corrupt snapshot must fail");
+        assert!(error.to_string().contains("restore_failed"));
+    }
 
     #[test]
     fn websocket_payload_maps_to_core_event() {

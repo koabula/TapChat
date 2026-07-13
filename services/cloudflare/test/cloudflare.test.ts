@@ -23,16 +23,18 @@ import {
   type SubmitGroupJoinRequest
 } from "../src/types/contracts";
 import type {
-  DurableObjectId,
-  DurableObjectNamespace,
   DurableObjectStorageLike,
-  DurableObjectStub,
-  Env,
   JsonBlobStore,
-  R2Bucket,
-  R2ObjectBody,
   SessionSink
 } from "../src/types/runtime";
+import type { Env } from "../src/types/env";
+import type {
+  DurableObjectId,
+  DurableObjectNamespace,
+  DurableObjectStub,
+  R2Bucket,
+  R2ObjectBody
+} from "./runtime-types";
 import { signSharingPayload } from "../src/storage/sharing";
 import {
   groupCapabilitySigningPayload,
@@ -59,9 +61,25 @@ const { handleInboxDurableRequest, ManagedSession: InboxManagedSession } = await
 const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl, ManagedSession: GroupManagedSession } = await import("../src/group-outbox/durable");
 const { InboxService } = await import("../src/inbox/service");
 const { GroupOutboxService } = await import("../src/group-outbox/service");
+const { routeFamilyForObservability } = await import("../src/index");
 
 const TEST_SHARING_SECRET = "test-sharing-secret-0123456789abcdef0123456789abcdef";
 const TEST_BOOTSTRAP_SECRET = "test-bootstrap-secret-0123456789abcdef0123456789abcdef";
+
+test("observability route families never include stable path identifiers", () => {
+  assert.equal(
+    routeFamilyForObservability("https://worker.example/v1/groups/group:secret/outbox/messages"),
+    "group_outbox"
+  );
+  assert.equal(
+    routeFamilyForObservability("https://worker.example/v1/inbox/device:secret/messages"),
+    "inbox"
+  );
+  assert.equal(
+    routeFamilyForObservability("https://worker.example/v1/contact-share/capability-secret"),
+    "contact_share"
+  );
+});
 
 test("group membership proof payload matches the Rust canonical field order", () => {
   const proof: GroupMembershipProof = {
@@ -312,7 +330,7 @@ function createEnv(options?: {
   const sharingSecret = options?.sharingSecret ?? TEST_SHARING_SECRET;
   const bootstrapSecret = options?.bootstrapSecret ?? TEST_BOOTSTRAP_SECRET;
 
-  const env: Env = {
+  const env = {
     PUBLIC_BASE_URL: "https://example.com",
     DEPLOYMENT_REGION: "local",
     MAX_INLINE_BYTES: String(maxInlineBytes),
@@ -363,7 +381,9 @@ function createEnv(options?: {
     } satisfies DurableObjectNamespace
   };
 
-  return { env, bucket };
+  // Node tests use in-memory structural adapters rather than real branded
+  // Workers bindings. Keep the unsafe conversion at this single boundary.
+  return { env: env as unknown as Env, bucket };
 }
 
 function sampleAppend(deviceId = "device:bob:phone", messageId = "msg:1", conversationId = "conv:alice:bob", senderUserId = "user:alice"): AppendEnvelopeRequest {

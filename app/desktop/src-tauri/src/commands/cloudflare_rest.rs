@@ -11,7 +11,7 @@ use std::path::Path;
 
 /// Cloudflare API base URL
 const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
-const WORKER_COMPATIBILITY_DATE: &str = "2026-03-30";
+const WORKER_COMPATIBILITY_DATE: &str = "2026-07-09";
 
 /// OAuth login result from login.mjs
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +152,21 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
     let mut metadata = serde_json::json!({
         "main_module": "worker.js",
         "compatibility_date": WORKER_COMPATIBILITY_DATE,
-        "compatibility_flags": ["nodejs_compat_v2"],
+        "compatibility_flags": ["nodejs_compat"],
+        "observability": {
+            "enabled": true,
+            "logs": {
+                "enabled": true,
+                "head_sampling_rate": 0.01,
+                "invocation_logs": false,
+                "persist": true,
+            },
+            "traces": {
+                "enabled": false,
+                "head_sampling_rate": 0.0,
+                "persist": false,
+            },
+        },
         "bindings": [
             {
                 "type": "durable_object_namespace",
@@ -906,6 +920,14 @@ mod tests {
             metadata["compatibility_date"].as_str(),
             Some(WORKER_COMPATIBILITY_DATE)
         );
+        assert_eq!(metadata["compatibility_flags"][0], "nodejs_compat");
+        assert_eq!(metadata["observability"]["logs"]["enabled"], true);
+        assert_eq!(
+            metadata["observability"]["logs"]["head_sampling_rate"],
+            0.01
+        );
+        assert_eq!(metadata["observability"]["logs"]["invocation_logs"], false);
+        assert_eq!(metadata["observability"]["traces"]["enabled"], false);
 
         let bindings = metadata["bindings"].as_array().expect("bindings");
         assert!(bindings.iter().any(|binding| {

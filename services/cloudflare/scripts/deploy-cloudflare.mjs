@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { stdin, stdout } from "node:process";
+import { parse } from "jsonc-parser";
 
 const EXIT_CODES = {
   environment: 2,
@@ -17,13 +18,13 @@ const EXIT_CODES = {
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SERVICE_DIR = path.resolve(SCRIPT_DIR, "..");
-const CONFIG_PATH = path.join(SERVICE_DIR, "wrangler.toml");
+const CONFIG_PATH = path.join(SERVICE_DIR, "wrangler.jsonc");
 const WRANGLER_ENTRY = path.join(SERVICE_DIR, "node_modules", "wrangler", "bin", "wrangler.js");
 const NODE_COMMAND = process.execPath;
 const NPM_EXEC_PATH = process.env.npm_execpath;
 const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 const TEMP_DIR_PREFIX = path.join(os.tmpdir(), "tapchat-cloudflare-deploy-");
-const TEMP_CONFIG_NAME = ".wrangler.deploy.toml";
+const TEMP_CONFIG_NAME = ".wrangler.deploy.jsonc";
 const NON_INTERACTIVE_CONFIG = process.env.TAPCHAT_CLOUDFLARE_DEPLOY_CONFIG_JSON;
 const JSON_OUTPUT = process.env.TAPCHAT_CLOUDFLARE_DEPLOY_OUTPUT === "json";
 const DESKTOP_BUNDLED = process.env.TAPCHAT_DESKTOP_BUNDLED === "1";
@@ -289,40 +290,45 @@ async function collectInputs() {
   }
 }
 
-function renderVarsBlock(config) {
-  return [
-    "[vars]",
-    ...(config.publicBaseUrl ? [`PUBLIC_BASE_URL = \"${config.publicBaseUrl}\"`] : []),
-    `DEPLOYMENT_REGION = \"${config.deploymentRegion}\"`,
-    `MAX_INLINE_BYTES = \"${config.maxInlineBytes}\"`,
-    `RETENTION_DAYS = \"${config.retentionDays}\"`,
-    `RATE_LIMIT_PER_MINUTE = \"${config.rateLimitPerMinute}\"`,
-    `RATE_LIMIT_PER_HOUR = \"${config.rateLimitPerHour}\"`,
-    `MESSAGE_REQUEST_MAX_BODY_BYTES = \"${config.messageRequestMaxBodyBytes}\"`,
-    `MESSAGE_REQUEST_MAX_PER_SENDER = \"${config.messageRequestMaxPerSender}\"`,
-    `MESSAGE_REQUEST_MAX_SENDERS = \"${config.messageRequestMaxSenders}\"`,
-    `MESSAGE_REQUEST_MAX_TOTAL_BYTES = \"${config.messageRequestMaxTotalBytes}\"`,
-    `MESSAGE_REQUEST_TTL_SECONDS = \"${config.messageRequestTtlSeconds}\"`,
-    `MESSAGE_REQUEST_RATE_LIMIT_MINUTE = \"${config.messageRequestRateLimitMinute}\"`,
-    `MESSAGE_REQUEST_RATE_LIMIT_HOUR = \"${config.messageRequestRateLimitHour}\"`,
-    ""
-  ].join("\n");
-}
-
 function updateConfig(baseConfig, config) {
   const entryPoint = path.join(SERVICE_DIR, "src", "index.ts").replace(/\\/g, "/");
-  let rendered = baseConfig.replace(/^name\s*=\s*".*"$/m, `name = "${config.workerName}"`);
-  rendered = rendered.replace(/^main\s*=\s*".*"$/m, `main = "${entryPoint}"`);
-  rendered = rendered.replace(
-    /\[vars\][\s\S]*?\n(?=\[\[durable_objects\.bindings\]\])/m,
-    `${renderVarsBlock(config)}`
+  const parseErrors = [];
+  const rendered = parse(baseConfig, parseErrors, { allowTrailingComma: true });
+  if (!rendered || parseErrors.length > 0) {
+    throw new Error("wrangler.jsonc is invalid and cannot be used for deployment");
+  }
+  rendered.name = config.workerName;
+  rendered.main = entryPoint;
+  rendered.vars = {
+    ...rendered.vars,
+    DEPLOYMENT_REGION: config.deploymentRegion,
+    MAX_INLINE_BYTES: config.maxInlineBytes,
+    RETENTION_DAYS: config.retentionDays,
+    RATE_LIMIT_PER_MINUTE: config.rateLimitPerMinute,
+    RATE_LIMIT_PER_HOUR: config.rateLimitPerHour,
+    MESSAGE_REQUEST_MAX_BODY_BYTES: config.messageRequestMaxBodyBytes,
+    MESSAGE_REQUEST_MAX_PER_SENDER: config.messageRequestMaxPerSender,
+    MESSAGE_REQUEST_MAX_SENDERS: config.messageRequestMaxSenders,
+    MESSAGE_REQUEST_MAX_TOTAL_BYTES: config.messageRequestMaxTotalBytes,
+    MESSAGE_REQUEST_TTL_SECONDS: config.messageRequestTtlSeconds,
+    MESSAGE_REQUEST_RATE_LIMIT_MINUTE: config.messageRequestRateLimitMinute,
+    MESSAGE_REQUEST_RATE_LIMIT_HOUR: config.messageRequestRateLimitHour
+  };
+  if (config.publicBaseUrl) {
+    rendered.vars.PUBLIC_BASE_URL = config.publicBaseUrl;
+  } else {
+    delete rendered.vars.PUBLIC_BASE_URL;
+  }
+  rendered.r2_buckets = rendered.r2_buckets.map((bucket) =>
+    bucket.binding === "TAPCHAT_STORAGE"
+      ? {
+          ...bucket,
+          bucket_name: config.bucketName,
+          preview_bucket_name: config.previewBucketName
+        }
+      : bucket
   );
-  rendered = rendered.replace(/bucket_name\s*=\s*".*"$/m, `bucket_name = "${config.bucketName}"`);
-  rendered = rendered.replace(
-    /preview_bucket_name\s*=\s*".*"$/m,
-    `preview_bucket_name = "${config.previewBucketName}"`
-  );
-  return rendered;
+  return `${JSON.stringify(rendered, null, 2)}\n`;
 }
 
 async function ensureBuckets(configPath, bucketNames) {

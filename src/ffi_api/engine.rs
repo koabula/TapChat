@@ -303,17 +303,6 @@ impl CoreEngine {
             .map(|identity| identity.device_identity.device_id.as_str())
     }
 
-    pub fn from_restored_state(snapshot: CorePersistenceSnapshot) -> Self {
-        match Self::try_from_restored_state(snapshot) {
-            Ok(engine) => engine,
-            Err(error) => {
-                let _ = error;
-                log::error!("failed to restore core state, starting empty engine: restore_failed");
-                Self::new()
-            }
-        }
-    }
-
     pub fn try_from_restored_state(snapshot: CorePersistenceSnapshot) -> CoreResult<Self> {
         let restored_mls = MlsAdapter::restore_from_persisted_states(
             &snapshot
@@ -328,6 +317,11 @@ impl CoreEngine {
                 })
                 .collect::<Vec<_>>(),
         )?;
+        if !restored_mls.failures.is_empty() {
+            return Err(CoreError::restore_failed(
+                "persisted MLS state failed integrity validation",
+            ));
+        }
         let mut contacts = BTreeMap::new();
         for contact in snapshot.contacts {
             contacts.insert(

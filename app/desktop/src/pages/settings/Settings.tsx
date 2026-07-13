@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 
 import { useManualUpdate } from "@/hooks/useAutoUpdate";
+import { clearClipboardIfUnchanged } from "@/lib/clipboardSecurity";
 import { THEME_OPTIONS, type ResolvedTheme } from "@/lib/theme";
 import { useThemeStore } from "@/store/theme";
 import Devices from "./Devices";
@@ -41,8 +42,15 @@ import {
   setDebugMode,
   getDebugMode,
   getAppMetadata,
+  beginRecoveryPhraseReveal,
+  completeRecoveryPhraseReveal,
 } from "@/lib/tauri";
-import type { AppMetadata, IdentityInfo, ProfileSummary } from "@/lib/types";
+import type {
+  AppMetadata,
+  IdentityInfo,
+  ProfileSummary,
+  RecoveryPhraseRevealChallenge,
+} from "@/lib/types";
 
 export type SettingsSection =
   | "account"
@@ -92,7 +100,14 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
   const [identity, setIdentity] = useState<IdentityInfo | null>(null);
   const [appMetadata, setAppMetadata] = useState<AppMetadata | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
-  const [showMnemonic, setShowMnemonic] = useState(false);
+  const [recoveryChallenge, setRecoveryChallenge] =
+    useState<RecoveryPhraseRevealChallenge | null>(null);
+  const [recoveryPassphrase, setRecoveryPassphrase] = useState("");
+  const [recoveryConfirmed, setRecoveryConfirmed] = useState(false);
+  const [recoveryPhrase, setRecoveryPhrase] = useState<string | null>(null);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [recoveryLoading, setRecoveryLoading] = useState(false);
+  const [recoveryPhraseCopied, setRecoveryPhraseCopied] = useState(false);
   const [newAllowlistUser, setNewAllowlistUser] = useState("");
   const [allowlist, setAllowlist] = useState<string[]>([]);
   const [debugMode, setDebugModeState] = useState(false);
@@ -117,6 +132,13 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
 
   useEffect(() => {
     setActiveSection(initialSection);
+    setRecoveryChallenge(null);
+    setRecoveryPassphrase("");
+    setRecoveryConfirmed(false);
+    setRecoveryPhrase(null);
+    setRecoveryError(null);
+    setRecoveryLoading(false);
+    setRecoveryPhraseCopied(false);
   }, [initialSection]);
 
   useEffect(() => {
@@ -149,6 +171,17 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
     void loadAllowlist();
     void loadDebugMode();
   }, [activeSection, developerMode]);
+
+  useEffect(() => {
+    if (!recoveryPhrase) return;
+    const hide = () => closeRecoveryPhraseDialog();
+    const timeoutId = window.setTimeout(hide, 60_000);
+    window.addEventListener("blur", hide);
+    return () => {
+      window.clearTimeout(timeoutId);
+      window.removeEventListener("blur", hide);
+    };
+  }, [recoveryPhrase]);
 
   const navItems = useMemo<SettingsNavItem[]>(() => {
     const items: SettingsNavItem[] = [
@@ -272,6 +305,64 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       console.error(`[Settings] Failed to rotate share link: ${String(err)}`);
       alert(String(err));
     }
+  };
+
+  const closeRecoveryPhraseDialog = () => {
+    setRecoveryChallenge(null);
+    setRecoveryPassphrase("");
+    setRecoveryConfirmed(false);
+    setRecoveryPhrase(null);
+    setRecoveryError(null);
+    setRecoveryLoading(false);
+    setRecoveryPhraseCopied(false);
+  };
+
+  const handleBeginRecoveryPhraseReveal = async () => {
+    setRecoveryLoading(true);
+    setRecoveryError(null);
+    try {
+      setRecoveryChallenge(await beginRecoveryPhraseReveal());
+    } catch {
+      setRecoveryError("Recovery phrase access is unavailable while this profile is locked.");
+    } finally {
+      setRecoveryLoading(false);
+    }
+  };
+
+  const handleCompleteRecoveryPhraseReveal = async () => {
+    if (!recoveryChallenge) return;
+    setRecoveryLoading(true);
+    setRecoveryError(null);
+    try {
+      const result = await completeRecoveryPhraseReveal(
+        recoveryChallenge.challenge_id,
+        recoveryChallenge.auth_mode === "passphrase" ? recoveryPassphrase : null,
+        recoveryChallenge.auth_mode === "confirmation_only" && recoveryConfirmed,
+      );
+      setRecoveryPassphrase("");
+      setRecoveryPhrase(result.mnemonic);
+    } catch (error) {
+      setRecoveryChallenge(null);
+      setRecoveryPassphrase("");
+      setRecoveryConfirmed(false);
+      setRecoveryError(
+        String(error).includes("auth_failed")
+          ? "The profile passphrase is incorrect. Start again to retry."
+          : "The sensitive-action challenge expired. Start again to retry.",
+      );
+    } finally {
+      setRecoveryLoading(false);
+    }
+  };
+
+  const handleCopyRecoveryPhrase = async () => {
+    if (!recoveryPhrase) return;
+    await writeText(recoveryPhrase);
+    setRecoveryPhraseCopied(true);
+    window.setTimeout(() => setRecoveryPhraseCopied(false), 2_000);
+    window.setTimeout(() => {
+      void clearClipboardIfUnchanged(recoveryPhrase);
+    }, 60_000);
   };
 
   const handleAddAllowlist = async () => {
@@ -415,7 +506,10 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
                     ? "bg-primary/10 text-primary-color"
                     : "text-secondary-color hover:bg-surface-elevated hover:text-primary-color"
                 }`}
-                onClick={() => setActiveSection(item.id)}
+                onClick={() => {
+                  closeRecoveryPhraseDialog();
+                  setActiveSection(item.id);
+                }}
               >
                 <item.Icon size={17} />
                 <span className="min-w-0">
@@ -707,27 +801,133 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
 
         <section className="card">
           <h3 className="mb-3 font-medium text-primary-color">Recovery Phrase</h3>
-          {showMnemonic ? (
-            <div className="space-y-2">
-              <p className="status-warning text-sm">Keep this secret. Never share it.</p>
-              <div className="grid grid-cols-3 gap-1 rounded bg-surface-elevated p-2">
-                {identity?.mnemonic?.split(" ").map((word, index) => (
-                  <div key={index} className="flex items-center gap-1">
-                    <span className="text-xs text-muted-color">{index + 1}.</span>
-                    <span className="text-sm text-primary-color">{word}</span>
-                  </div>
-                ))}
-              </div>
-              <button className="btn btn-ghost w-full" onClick={() => setShowMnemonic(false)}>
-                Hide
-              </button>
-            </div>
-          ) : (
-            <button className="btn btn-secondary w-full" onClick={() => setShowMnemonic(true)}>
-              Show Recovery Phrase
-            </button>
+          <p className="mb-3 text-sm text-muted-color">
+            Viewing this secret requires an explicit sensitive action. It is never returned by
+            normal identity queries.
+          </p>
+          <button
+            className="btn btn-secondary w-full"
+            onClick={() => void handleBeginRecoveryPhraseReveal()}
+            disabled={!identity || recoveryLoading}
+          >
+            {recoveryLoading ? "Preparing..." : "Show Recovery Phrase"}
+          </button>
+          {recoveryError && !recoveryChallenge && (
+            <p role="alert" className="status-error mt-2 text-sm">
+              {recoveryError}
+            </p>
           )}
         </section>
+
+        {(recoveryChallenge || recoveryPhrase) && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="recovery-phrase-dialog-title"
+          >
+            <div className="w-full max-w-lg rounded-lg border border-default bg-surface p-5 shadow-xl">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <h3 id="recovery-phrase-dialog-title" className="font-semibold text-primary-color">
+                  Recovery Phrase
+                </h3>
+                <button
+                  className="btn btn-ghost px-2"
+                  onClick={closeRecoveryPhraseDialog}
+                  aria-label="Close recovery phrase dialog"
+                >
+                  <X size={18} />
+                </button>
+              </div>
+
+              {!recoveryPhrase && recoveryChallenge?.auth_mode === "passphrase" && (
+                <label className="block">
+                  <span className="mb-1 block text-sm text-secondary-color">
+                    Enter the active profile passphrase
+                  </span>
+                  <input
+                    className="input w-full"
+                    type="password"
+                    autoComplete="current-password"
+                    value={recoveryPassphrase}
+                    onChange={(event) => setRecoveryPassphrase(event.target.value)}
+                    autoFocus
+                  />
+                </label>
+              )}
+
+              {!recoveryPhrase && recoveryChallenge?.auth_mode === "confirmation_only" && (
+                <div className="space-y-3">
+                  <p className="status-warning text-sm">
+                    This profile has no passphrase. This confirmation is not Windows Hello,
+                    Touch ID, or other system-level re-authentication. Anyone controlling this
+                    unlocked app session may be able to reveal the phrase.
+                  </p>
+                  <label className="flex items-start gap-2 text-sm text-secondary-color">
+                    <input
+                      type="checkbox"
+                      checked={recoveryConfirmed}
+                      onChange={(event) => setRecoveryConfirmed(event.target.checked)}
+                    />
+                    <span>I understand the risk and want to reveal the recovery phrase.</span>
+                  </label>
+                </div>
+              )}
+
+              {recoveryError && (
+                <p role="alert" className="status-error mt-3 text-sm">
+                  {recoveryError}
+                </p>
+              )}
+
+              {recoveryPhrase ? (
+                <div className="space-y-4">
+                  <p className="status-warning text-sm">
+                    Keep this secret. It will be hidden after 60 seconds or when the window loses
+                    focus.
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 rounded bg-surface-elevated p-3">
+                    {recoveryPhrase.split(" ").map((word, index) => (
+                      <div key={index} className="flex items-center gap-1">
+                        <span className="text-xs text-muted-color">{index + 1}.</span>
+                        <span className="text-sm text-primary-color">{word}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      className="btn btn-secondary flex-1"
+                      onClick={() => void handleCopyRecoveryPhrase()}
+                    >
+                      {recoveryPhraseCopied ? "Copied" : "Copy for 60 seconds"}
+                    </button>
+                    <button className="btn btn-primary flex-1" onClick={closeRecoveryPhraseDialog}>
+                      Hide now
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-4 flex justify-end gap-2">
+                  <button className="btn btn-ghost" onClick={closeRecoveryPhraseDialog}>
+                    Cancel
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => void handleCompleteRecoveryPhraseReveal()}
+                    disabled={
+                      recoveryLoading ||
+                      (recoveryChallenge?.auth_mode === "passphrase"
+                        ? !recoveryPassphrase
+                        : !recoveryConfirmed)
+                    }
+                  >
+                    {recoveryLoading ? "Verifying..." : "Reveal"}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {renderAboutCard()}
       </div>

@@ -23,8 +23,8 @@ use tapchat_core::CoreEngine;
 use crate::platform::profile::{ProfileManager, ProfileManagerInner};
 use crate::ports::DesktopPlatformPorts;
 use crate::state::{
-    AppState, AppStateInner, ForegroundSyncGate, SessionState, StartupPhase, SyncGateState,
-    WsStatusSnapshot,
+    AppState, AppStateInner, ForegroundSyncGate, RecoveryPhraseGate, SessionState, StartupPhase,
+    SyncGateState, WsStatusSnapshot,
 };
 
 // Re-export the no-handle driver so integration tests can drive the
@@ -130,6 +130,7 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
         ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
         foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
+        recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
     })
 }
 

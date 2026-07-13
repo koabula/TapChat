@@ -1,7 +1,12 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand::RngCore;
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 use tauri::{AppHandle, Manager, State};
+use zeroize::Zeroizing;
 
 use tapchat_core::model::DeviceStatusKind;
 use tapchat_core::{CoreCommand, CoreOutput};
@@ -9,15 +14,35 @@ use tapchat_core::{CoreCommand, CoreOutput};
 use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
 use crate::platform::log_sanitize::redact_id;
 use crate::platform::profile::ProfileSummary;
-use crate::state::AppState;
+use crate::state::{
+    AppState, RecoveryPhraseAuthMode, RecoveryPhraseChallenge, RecoveryPhraseGate, SessionState,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IdentityInfo {
     pub user_id: String,
     pub device_id: String,
-    pub mnemonic: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPhraseAuthModeView {
+    Passphrase,
+    ConfirmationOnly,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryPhraseRevealChallenge {
+    pub challenge_id: String,
+    pub auth_mode: RecoveryPhraseAuthModeView,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecoveryPhraseRevealResult {
+    pub mnemonic: String,
 }
 
 /// Result of identity creation/recovery
@@ -82,6 +107,8 @@ pub async fn create_or_load_identity(
     device_name: Option<String>,
     display_name: Option<String>,
 ) -> Result<CreateIdentityResult, String> {
+    let supplied_mnemonic = mnemonic.is_some();
+    let had_identity = state.inner.read().await.engine.local_identity().is_some();
     // First ensure profile exists
     {
         let inner = state.inner.read().await;
@@ -129,7 +156,7 @@ pub async fn create_or_load_identity(
         Some(id) => {
             let user_id = id.user_identity.user_id.clone();
             let device_id = id.device_identity.device_id.clone();
-            let mnemonic = id.mnemonic.clone();
+            let mnemonic = (!had_identity && !supplied_mnemonic).then(|| id.mnemonic.clone());
 
             // Update profile metadata with identity info
             drop(inner);
@@ -156,7 +183,7 @@ pub async fn create_or_load_identity(
             CreateIdentityResult {
                 user_id,
                 device_id,
-                mnemonic: Some(mnemonic),
+                mnemonic,
             }
         }
         None => Err("Identity creation failed - no local identity found".to_string())?,
@@ -177,17 +204,138 @@ pub async fn get_identity_info(state: State<'_, AppState>) -> Result<Option<Iden
         (Some(id), Some(b)) => Ok(Some(IdentityInfo {
             user_id: b.user_id.clone(),
             device_id: id.device_identity.device_id.clone(),
-            mnemonic: id.mnemonic.clone(),
             display_name: local_display_name,
         })),
         (Some(id), None) => Ok(Some(IdentityInfo {
             user_id: id.user_identity.user_id.clone(),
             device_id: id.device_identity.device_id.clone(),
-            mnemonic: id.mnemonic.clone(),
             display_name: local_display_name,
         })),
         _ => Ok(None),
     }
+}
+
+#[tauri::command]
+pub async fn begin_recovery_phrase_reveal(
+    state: State<'_, AppState>,
+) -> Result<RecoveryPhraseRevealChallenge, String> {
+    const CHALLENGE_TTL: Duration = Duration::from_secs(60);
+
+    let (profile_path, auth_mode) = {
+        let inner = state.inner.read().await;
+        if !matches!(inner.session, SessionState::Active { .. }) {
+            return Err("recovery_phrase_auth_required".into());
+        }
+        let profile_inner = inner.profile_manager.inner.read().await;
+        let profile = profile_inner
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "recovery_phrase_auth_required".to_string())?;
+        let mode = if profile.has_passphrase_wrapper() {
+            RecoveryPhraseAuthMode::Passphrase
+        } else {
+            RecoveryPhraseAuthMode::ConfirmationOnly
+        };
+        (profile.root().to_path_buf(), mode)
+    };
+
+    let mut challenge_bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut challenge_bytes);
+    let challenge_id = URL_SAFE_NO_PAD.encode(challenge_bytes);
+    let expires_at_instant = Instant::now() + CHALLENGE_TTL;
+    let expires_at = SystemTime::now()
+        .checked_add(CHALLENGE_TTL)
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64)
+        .ok_or_else(|| "recovery_phrase_challenge_failed".to_string())?;
+
+    state.recovery_phrase_gate.lock().await.pending = Some(RecoveryPhraseChallenge {
+        challenge_id: challenge_id.clone(),
+        profile_path,
+        auth_mode,
+        expires_at: expires_at_instant,
+    });
+
+    Ok(RecoveryPhraseRevealChallenge {
+        challenge_id,
+        auth_mode: match auth_mode {
+            RecoveryPhraseAuthMode::Passphrase => RecoveryPhraseAuthModeView::Passphrase,
+            RecoveryPhraseAuthMode::ConfirmationOnly => {
+                RecoveryPhraseAuthModeView::ConfirmationOnly
+            }
+        },
+        expires_at,
+    })
+}
+
+#[tauri::command]
+pub async fn complete_recovery_phrase_reveal(
+    state: State<'_, AppState>,
+    challenge_id: String,
+    passphrase: Option<String>,
+    confirmed: bool,
+) -> Result<RecoveryPhraseRevealResult, String> {
+    let challenge = {
+        let mut gate = state.recovery_phrase_gate.lock().await;
+        consume_recovery_phrase_challenge(&mut *gate, &challenge_id, Instant::now())?
+    };
+
+    let passphrase = passphrase.map(Zeroizing::new);
+    let mnemonic = {
+        let inner = state.inner.read().await;
+        if !matches!(inner.session, SessionState::Active { .. }) {
+            return Err("recovery_phrase_auth_required".into());
+        }
+        let profile_inner = inner.profile_manager.inner.read().await;
+        let profile = profile_inner
+            .active_profile
+            .as_ref()
+            .filter(|profile| profile.root() == challenge.profile_path)
+            .ok_or_else(|| "recovery_phrase_auth_required".to_string())?;
+
+        match challenge.auth_mode {
+            RecoveryPhraseAuthMode::Passphrase => {
+                let supplied = passphrase
+                    .as_deref()
+                    .ok_or_else(|| "recovery_phrase_auth_required".to_string())?;
+                profile
+                    .verify_passphrase(supplied)
+                    .map_err(|_| "recovery_phrase_auth_failed".to_string())?;
+            }
+            RecoveryPhraseAuthMode::ConfirmationOnly if !confirmed => {
+                return Err("recovery_phrase_confirmation_required".into());
+            }
+            RecoveryPhraseAuthMode::ConfirmationOnly => {}
+        }
+
+        inner
+            .engine
+            .local_identity()
+            .map(|identity| identity.mnemonic.clone())
+            .ok_or_else(|| "recovery_phrase_unavailable".to_string())?
+    };
+
+    Ok(RecoveryPhraseRevealResult { mnemonic })
+}
+
+fn consume_recovery_phrase_challenge(
+    gate: &mut RecoveryPhraseGate,
+    candidate_id: &str,
+    now: Instant,
+) -> Result<RecoveryPhraseChallenge, String> {
+    let challenge = gate
+        .pending
+        .take()
+        .ok_or_else(|| "recovery_phrase_challenge_expired".to_string())?;
+    let matches = candidate_id
+        .as_bytes()
+        .ct_eq(challenge.challenge_id.as_bytes())
+        .unwrap_u8()
+        == 1;
+    if challenge.expires_at <= now || !matches {
+        return Err("recovery_phrase_challenge_expired".into());
+    }
+    Ok(challenge)
 }
 
 #[tauri::command]
@@ -324,4 +472,63 @@ pub async fn set_local_display_name(
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn challenge(expires_at: Instant) -> RecoveryPhraseChallenge {
+        RecoveryPhraseChallenge {
+            challenge_id: "challenge-value".into(),
+            profile_path: PathBuf::from("profile"),
+            auth_mode: RecoveryPhraseAuthMode::ConfirmationOnly,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn recovery_phrase_challenge_is_single_use() {
+        let now = Instant::now();
+        let mut gate = RecoveryPhraseGate {
+            pending: Some(challenge(now + Duration::from_secs(60))),
+        };
+
+        consume_recovery_phrase_challenge(&mut gate, "challenge-value", now)
+            .expect("first use succeeds");
+        assert_eq!(
+            consume_recovery_phrase_challenge(&mut gate, "challenge-value", now)
+                .err()
+                .expect("replay fails"),
+            "recovery_phrase_challenge_expired"
+        );
+    }
+
+    #[test]
+    fn expired_or_mismatched_recovery_phrase_challenge_is_consumed() {
+        let now = Instant::now();
+        let mut expired = RecoveryPhraseGate {
+            pending: Some(challenge(now)),
+        };
+        assert!(consume_recovery_phrase_challenge(&mut expired, "challenge-value", now).is_err());
+        assert!(expired.pending.is_none());
+
+        let mut mismatched = RecoveryPhraseGate {
+            pending: Some(challenge(now + Duration::from_secs(60))),
+        };
+        assert!(consume_recovery_phrase_challenge(&mut mismatched, "other", now).is_err());
+        assert!(mismatched.pending.is_none());
+    }
+
+    #[test]
+    fn regular_identity_info_serialization_never_contains_mnemonic() {
+        let value = serde_json::to_value(IdentityInfo {
+            user_id: "user".into(),
+            device_id: "device".into(),
+            display_name: Some("Alice".into()),
+        })
+        .expect("serialize identity info");
+
+        assert!(value.get("mnemonic").is_none());
+    }
 }

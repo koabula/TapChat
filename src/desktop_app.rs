@@ -49,7 +49,13 @@ pub struct IdentitySummaryView {
     pub display_name: Option<String>,
     pub device_status: String,
     pub profile_path: PathBuf,
-    pub mnemonic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IdentityCreationView {
+    pub identity: IdentitySummaryView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mnemonic: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -559,7 +565,7 @@ pub fn profile_open_or_import(root_dir: impl AsRef<Path>) -> Result<ProfileSumma
 pub async fn identity_create(
     profile_path: impl AsRef<Path>,
     device_name: &str,
-) -> Result<IdentitySummaryView> {
+) -> Result<IdentityCreationView> {
     run_identity_command(profile_path.as_ref(), device_name, None, false).await
 }
 
@@ -567,7 +573,7 @@ pub async fn identity_recover(
     profile_path: impl AsRef<Path>,
     device_name: &str,
     mnemonic: String,
-) -> Result<IdentitySummaryView> {
+) -> Result<IdentityCreationView> {
     run_identity_command(profile_path.as_ref(), device_name, Some(mnemonic), false).await
 }
 
@@ -1755,7 +1761,6 @@ fn identity_summary_from_profile(profile: &Profile) -> Result<Option<IdentitySum
         display_name: driver.local_display_name(),
         device_status: format!("{:?}", identity.device_status.status).to_lowercase(),
         profile_path: profile.root().to_path_buf(),
-        mnemonic: identity.mnemonic.clone(),
     }))
 }
 
@@ -2066,9 +2071,11 @@ async fn run_identity_command(
     device_name: &str,
     mnemonic: Option<String>,
     additional: bool,
-) -> Result<IdentitySummaryView> {
+) -> Result<IdentityCreationView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
+    let supplied_mnemonic = mnemonic.is_some();
+    let had_identity = driver.local_identity().is_some();
     let command = if additional {
         CoreCommand::CreateAdditionalDeviceIdentity {
             mnemonic,
@@ -2087,13 +2094,16 @@ async fn run_identity_command(
     let identity = driver
         .local_identity()
         .ok_or_else(|| anyhow!("identity creation did not persist local identity"))?;
-    Ok(IdentitySummaryView {
-        user_id: identity.user_identity.user_id.clone(),
-        device_id: identity.device_identity.device_id.clone(),
-        display_name: driver.local_display_name(),
-        device_status: format!("{:?}", identity.device_status.status).to_lowercase(),
-        profile_path: profile.root().to_path_buf(),
-        mnemonic: identity.mnemonic.clone(),
+    Ok(IdentityCreationView {
+        mnemonic: (!additional && !had_identity && !supplied_mnemonic)
+            .then(|| identity.mnemonic.clone()),
+        identity: IdentitySummaryView {
+            user_id: identity.user_identity.user_id.clone(),
+            device_id: identity.device_identity.device_id.clone(),
+            display_name: driver.local_display_name(),
+            device_status: format!("{:?}", identity.device_status.status).to_lowercase(),
+            profile_path: profile.root().to_path_buf(),
+        },
     })
 }
 

@@ -5,6 +5,7 @@ pub mod contact_workflows;
 pub mod conversation;
 pub mod desktop_app;
 pub mod error;
+pub mod external_fetch;
 pub mod ffi_api;
 pub(crate) mod fs_util;
 pub mod identity;

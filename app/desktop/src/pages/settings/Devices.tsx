@@ -14,7 +14,6 @@ interface Device {
 interface IdentityInfo {
   user_id: string;
   device_id: string;
-  mnemonic: string;
 }
 
 interface DevicesProps {
@@ -26,7 +25,6 @@ export default function Devices({ embedded = false }: DevicesProps) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [identityInfo, setIdentityInfo] = useState<IdentityInfo | null>(null);
   const [loading, setLoading] = useState(true);
-  const [showMnemonic, setShowMnemonic] = useState(false);
   const [revokingDevice, setRevokingDevice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -132,27 +130,6 @@ export default function Devices({ embedded = false }: DevicesProps) {
                   </span>
                 </div>
               </div>
-            </div>
-
-            {/* Recovery phrase */}
-            <div className="card mb-4">
-              <h2 className="text-sm font-medium text-muted-color mb-2">Recovery Phrase</h2>
-              <div className="flex items-center justify-between">
-                <span className="text-secondary-color text-sm">
-                  {showMnemonic ? identityInfo.mnemonic : "••••••••••••"}
-                </span>
-                <button
-                  className="btn btn-ghost text-sm"
-                  onClick={() => setShowMnemonic(!showMnemonic)}
-                >
-                  {showMnemonic ? "Hide" : "Show"}
-                </button>
-              </div>
-              {showMnemonic && (
-                <p className="status-warning text-sm mt-2">
-                  Keep this phrase secret! It's the only way to recover your identity.
-                </p>
-              )}
             </div>
 
             {/* Device list */}

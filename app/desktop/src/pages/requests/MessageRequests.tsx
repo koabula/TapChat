@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 
-import { listGroupConversations } from "@/lib/tauri";
+import { listGroupConversations, prepareExternalUrlAccess } from "@/lib/tauri";
 import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
 import { useSessionStore } from "@/store/session";
@@ -91,6 +91,9 @@ export default function MessageRequests() {
     setActing(requestId);
     setActionNotice(null);
     try {
+      if (action === "accept" && request.sender_bundle_share_url) {
+        await prepareExternalUrlAccess(request.sender_bundle_share_url, "contact_share");
+      }
       const result = await invoke<MessageRequestActionOutput>("act_on_message_request", {
         requestId,
         action,

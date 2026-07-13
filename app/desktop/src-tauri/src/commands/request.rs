@@ -80,11 +80,16 @@ pub async fn act_on_message_request(
                 }
             };
 
-            let sender_bundle = tapchat_core::contact_workflows::fetch_identity_bundle_from_url(
-                &sender_bundle_share_url,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let approval = state.ports.lock().await.take_external_url_approval(
+                tapchat_core::external_fetch::ExternalResourceKind::ContactShare,
+            );
+            let sender_bundle =
+                tapchat_core::contact_workflows::fetch_identity_bundle_from_url_with_approval(
+                    &sender_bundle_share_url,
+                    approval,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             let imported_sender_user_id = sender_bundle.user_id.clone();
 
             drive_core_with_handle(

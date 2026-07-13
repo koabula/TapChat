@@ -1,4 +1,5 @@
 import { APPEND_AUTH_CONTEXT_HEADER, APPEND_AUTH_REASON_HEADER, HttpError } from "../auth/capability";
+import type { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import { CONTROL_JSON_MAX_BYTES, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES, readJsonLimited } from "../auth/runtime-security";
 import { InboxService } from "./service";
 import type {
@@ -7,7 +8,8 @@ import type {
   AppendEnvelopeRequest,
   FetchMessagesRequest
 } from "../types/contracts";
-import type { DurableObjectStorageLike, Env, JsonBlobStore, SessionSink } from "../types/runtime";
+import type { Env } from "../types/env";
+import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../types/runtime";
 
 class DurableObjectStorageAdapter implements DurableObjectStorageLike {
   private readonly storage: DurableObjectState["storage"];
@@ -112,11 +114,11 @@ function jsonResponse(body: unknown, status = 200, headers?: Record<string, stri
   });
 }
 
-const DurableObjectBase: typeof DurableObject =
-  (globalThis as { DurableObject?: typeof DurableObject }).DurableObject ??
+const DurableObjectBase: typeof CloudflareDurableObject<Env> =
+  (globalThis as { DurableObject?: typeof CloudflareDurableObject<Env> }).DurableObject ??
   (class {
     constructor(_state: DurableObjectState, _env: Env) {}
-  } as unknown as typeof DurableObject);
+  } as unknown as typeof CloudflareDurableObject<Env>);
 
 export async function handleInboxDurableRequest(
   request: Request,

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::conversation::RecoveryStatus;
+use tapchat_core::external_fetch::ExternalResourceKind;
 use tapchat_core::ffi_api::{
     AttachmentDescriptor, CoreCommand, CoreEvent, MAX_TRANSPORT_RETRIES, RecoveryReason,
 };
@@ -533,6 +534,7 @@ async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_s
         .fail_next_identity_fetch(&ctx.bob_user_id, true, 2);
     let _ = ctx.alice.take_scheduled_timers();
 
+    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
@@ -987,6 +989,7 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
         &ctx.bob_phone_device_id,
         application_records.clone(),
     )?;
+    approve_local_identity_fetch(&mut ctx.bob_phone, &ctx.runtime).await?;
     ctx.bob_phone
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.alice_user_id.clone(),
@@ -1009,6 +1012,7 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
     );
 
     let recovery_to_seq = highest_seq(&phone_records).context("recovery batch seq")?;
+    approve_local_identity_fetch(&mut ctx.bob_phone, &ctx.runtime).await?;
     let _ = ctx
         .bob_phone
         .inject_event_until_idle(CoreEvent::InboxRecordsFetched {
@@ -1017,6 +1021,7 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
             to_seq: recovery_to_seq,
         })
         .await?;
+    approve_local_identity_fetch(&mut ctx.bob_phone, &ctx.runtime).await?;
     ctx.bob_phone
         .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
             conversation_id: ctx.conversation_id.clone(),
@@ -1053,6 +1058,7 @@ async fn exhausted_identity_refresh_retry_caps_once_and_stops_scheduling() -> Re
     );
     let _ = ctx.alice.take_scheduled_timers();
 
+    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
@@ -1361,6 +1367,7 @@ async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
         .await?;
 
     for _ in 0..3 {
+        approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
         let _ = ctx
             .alice
             .run_command_until_idle(CoreCommand::RefreshIdentityState {
@@ -1702,7 +1709,7 @@ async fn restart_during_recovery_preserves_context_and_converges() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupted_snapshot_marks_conversation_needs_rebuild_in_runtime() -> Result<()> {
+async fn corrupted_snapshot_fails_closed_without_starting_runtime() -> Result<()> {
     let mut ctx = setup_pair().await?;
 
     ctx.alice
@@ -1724,20 +1731,12 @@ async fn corrupted_snapshot_marks_conversation_needs_rebuild_in_runtime() -> Res
         .context("missing persisted mls state")?
         .serialized_group_state = Some("{broken".into());
 
-    let restored = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
-    assert_eq!(
-        restored.conversation_recovery_status(&ctx.conversation_id),
-        Some(RecoveryStatus::NeedsRebuild)
-    );
-    assert_eq!(
-        restored
-            .engine()
-            .conversation_state(&ctx.conversation_id)
-            .context("conversation missing after corruption restore")?
-            .conversation
-            .state,
-        tapchat_core::model::ConversationState::NeedsRebuild
-    );
+    let error = match CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))
+    {
+        Ok(_) => bail!("corrupted MLS snapshot unexpectedly restored"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("restore_failed"));
 
     Ok(())
 }
@@ -1763,7 +1762,16 @@ async fn rebuild_command_recreates_direct_conversation_and_recovers() -> Result<
         .mls_states
         .first_mut()
         .context("missing persisted mls state")?
-        .serialized_group_state = Some("{broken".into());
+        .summary
+        .status = MlsStateStatus::NeedsRebuild;
+    let persisted_conversation = snapshot
+        .conversations
+        .iter_mut()
+        .find(|entry| entry.conversation_id == ctx.conversation_id)
+        .context("missing persisted conversation")?;
+    persisted_conversation.state.conversation.state =
+        tapchat_core::model::ConversationState::NeedsRebuild;
+    persisted_conversation.state.recovery_status = RecoveryStatus::NeedsRebuild;
     ctx.alice = CoreDriver::from_snapshot(snapshot, Some(ctx.runtime.base_url().to_string()))?;
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
@@ -1785,6 +1793,7 @@ async fn rebuild_command_recreates_direct_conversation_and_recovers() -> Result<
     ctx.runtime
         .put_identity_bundle(&ctx.bob_auth, &refreshed_bob_bundle)
         .await?;
+    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
@@ -2086,11 +2095,28 @@ async fn add_bob_laptop_to_conversation(ctx: &mut TrioContext) -> Result<()> {
 }
 
 async fn refresh_alice_contact(ctx: &mut TrioContext) -> Result<()> {
+    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
         })
         .await?;
+    Ok(())
+}
+
+async fn approve_local_identity_fetch(
+    driver: &mut CoreDriver,
+    runtime: &CloudflareRuntimeHandle,
+) -> Result<()> {
+    // One core operation can legitimately schedule several identity refresh
+    // effects. Model a host explicitly approving each loopback fetch while
+    // keeping every approval individually DNS-bound, expiring and one-shot.
+    for _ in 0..8 {
+        let assessment = driver
+            .assess_external_url(runtime.base_url(), ExternalResourceKind::ContactShare)
+            .await?;
+        driver.approve_external_url_once(assessment);
+    }
     Ok(())
 }
 
@@ -2267,6 +2293,9 @@ async fn sync_driver_until_stable(
     reason: &str,
 ) -> Result<()> {
     for attempt in 0..6 {
+        // The test runtime is intentionally loopback HTTP. Model the embedding
+        // host's per-fetch approval before a sync that may drive identity refresh.
+        approve_local_identity_fetch(driver, runtime).await?;
         driver
             .run_command_until_idle(CoreCommand::SyncInbox {
                 device_id: device_id.to_string(),

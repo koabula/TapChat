@@ -37,8 +37,26 @@ export interface LocalIdentitySummary {
 export interface IdentityInfo {
   user_id: string;
   device_id: string;
-  mnemonic: string;
   display_name?: string | null;
+}
+
+export interface RecoveryPhraseRevealChallenge {
+  challenge_id: string;
+  auth_mode: "passphrase" | "confirmation_only";
+  expires_at: number;
+}
+
+export interface RecoveryPhraseRevealResult {
+  mnemonic: string;
+}
+
+export interface ExternalUrlPreflight {
+  purpose: "contact_share" | "group_invite";
+  origin: string;
+  requires_confirmation: boolean;
+  insecure_http: boolean;
+  approval_id?: string;
+  expires_at?: number;
 }
 
 // Profiles - matches backend ProfileSummary struct

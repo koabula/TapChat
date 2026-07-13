@@ -6,6 +6,7 @@ import {
   listContacts,
   previewContactLink,
   startDirectChatFromLink,
+  prepareExternalUrlAccess,
 } from "@/lib/tauri";
 import type {
   ContactLinkPreview,
@@ -67,6 +68,7 @@ export default function ContactList() {
     setPreviewing(true);
     setError(null);
     try {
+      await prepareExternalUrlAccess(shareLinkInput, "contact_share");
       const nextPreview = await previewContactLink(shareLinkInput);
       setPreview(nextPreview);
     } catch (err) {
@@ -85,6 +87,7 @@ export default function ContactList() {
     setStartingChat(true);
     setError(null);
     try {
+      await prepareExternalUrlAccess(link, "contact_share");
       const result = await startDirectChatFromLink(link);
       setShareLinkInput("");
       setPreview(null);
