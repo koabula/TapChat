@@ -104,9 +104,10 @@ export async function startNewProfileOnboarding(): Promise<void> {
 
 export async function initOnboardingProfile(
   profileName: string,
-  passphrase?: string
+  passphrase?: string,
+  protectionMode?: "keychain_and_passphrase" | "keychain_only" | "passphrase_only",
 ): Promise<ProfileSummary> {
-  return invoke("init_onboarding_profile", { profileName, passphrase });
+  return invoke("init_onboarding_profile", { profileName, passphrase, protectionMode });
 }
 
 // Conversations

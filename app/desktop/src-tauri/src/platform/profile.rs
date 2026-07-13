@@ -40,6 +40,48 @@ pub struct ProfileSummary {
     pub runtime_bound: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileProtectionMode {
+    KeychainAndPassphrase,
+    KeychainOnly,
+    PassphraseOnly,
+}
+
+impl ProfileProtectionMode {
+    fn init_options(self, passphrase: Option<String>) -> Result<ProfileInitOptions> {
+        let passphrase = passphrase.filter(|value| !value.is_empty());
+        match self {
+            Self::KeychainAndPassphrase => {
+                if passphrase.is_none() {
+                    return Err(anyhow!(
+                        "profile_passphrase_required: enter a passphrase for keychain backup protection"
+                    ));
+                }
+                Ok(ProfileInitOptions {
+                    passphrase,
+                    use_keychain: true,
+                })
+            }
+            Self::KeychainOnly => Ok(ProfileInitOptions {
+                passphrase: None,
+                use_keychain: true,
+            }),
+            Self::PassphraseOnly => {
+                if passphrase.is_none() {
+                    return Err(anyhow!(
+                        "profile_passphrase_required: enter a passphrase for passphrase-only protection"
+                    ));
+                }
+                Ok(ProfileInitOptions {
+                    passphrase,
+                    use_keychain: false,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStartupCheck {
     pub has_active_profile: bool,
@@ -239,19 +281,14 @@ impl ProfileManager {
         name: &str,
         root: PathBuf,
         passphrase: Option<String>,
+        protection_mode: ProfileProtectionMode,
     ) -> Result<ProfileSummary> {
         let mut inner = self.inner.write().await;
+        let init_options = protection_mode.init_options(passphrase)?;
 
         // Profile::init calls sync_registry_entry which saves registry to disk.
         // We need to reload the registry from disk to sync our in-memory state.
-        let profile = Profile::init_with_options(
-            name,
-            &root,
-            ProfileInitOptions {
-                passphrase,
-                use_keychain: true,
-            },
-        )?;
+        let profile = Profile::init_with_options(name, &root, init_options)?;
 
         // Reload registry to get the entry that was just saved by sync_registry_entry
         inner.registry = tapchat_core::cli::profile::ProfileRegistry::load()
@@ -463,17 +500,34 @@ impl Default for ProfileManager {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    use tapchat_core::cli::profile::{Profile, ProfileInitOptions, ProfileRegistry};
+    use tapchat_core::cli::profile::{
+        override_profile_registry_path_for_test, Profile, ProfileInitOptions, ProfileRegistry,
+    };
 
-    use super::ProfileManager;
+    use super::{ProfileManager, ProfileProtectionMode};
 
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
+    #[test]
+    fn profile_protection_modes_require_the_expected_passphrase_and_keychain() {
+        let dual = ProfileProtectionMode::KeychainAndPassphrase
+            .init_options(Some("secret".into()))
+            .expect("dual protection");
+        assert!(dual.use_keychain);
+        assert_eq!(dual.passphrase.as_deref(), Some("secret"));
+
+        let passphrase_only = ProfileProtectionMode::PassphraseOnly
+            .init_options(Some("secret".into()))
+            .expect("passphrase protection");
+        assert!(!passphrase_only.use_keychain);
+        assert!(ProfileProtectionMode::PassphraseOnly
+            .init_options(None)
+            .is_err());
+
+        let keychain_only = ProfileProtectionMode::KeychainOnly
+            .init_options(Some("ignored".into()))
+            .expect("keychain protection");
+        assert!(keychain_only.use_keychain);
+        assert!(keychain_only.passphrase.is_none());
     }
 
     fn test_dir() -> PathBuf {
@@ -487,12 +541,9 @@ mod tests {
 
     #[tokio::test]
     async fn select_profile_for_restart_rejects_wrong_passphrase_without_saving_active_profile() {
-        let _guard = env_lock();
         let dir = test_dir();
         let registry_path = dir.join("config").join("profiles.json");
-        unsafe {
-            std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
-        }
+        let _registry_override = override_profile_registry_path_for_test(&registry_path);
 
         let alice_root = dir.join("alice");
         let bob_root = dir.join("bob");
@@ -532,20 +583,14 @@ mod tests {
             Some(alice_root.as_path())
         );
 
-        unsafe {
-            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn select_profile_for_restart_saves_target_as_next_active_profile() {
-        let _guard = env_lock();
         let dir = test_dir();
         let registry_path = dir.join("config").join("profiles.json");
-        unsafe {
-            std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
-        }
+        let _registry_override = override_profile_registry_path_for_test(&registry_path);
 
         let alice_root = dir.join("alice");
         let bob_root = dir.join("bob");
@@ -579,9 +624,6 @@ mod tests {
         let registry = ProfileRegistry::load().expect("load registry");
         assert_eq!(registry.active_profile.as_deref(), Some(bob_root.as_path()));
 
-        unsafe {
-            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

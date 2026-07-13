@@ -154,6 +154,10 @@ impl CoreDriver {
         self.runtime.external_url_approval = Some(assessment.approve());
     }
 
+    pub fn provide_external_url_approval_once(&mut self, approval: ExternalUrlApproval) {
+        self.runtime.external_url_approval = Some(approval);
+    }
+
     pub fn take_external_url_approval(&mut self) -> Option<ExternalUrlApproval> {
         self.runtime.external_url_approval.take()
     }

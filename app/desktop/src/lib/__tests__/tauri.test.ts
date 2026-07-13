@@ -17,6 +17,7 @@ import {
   beginRecoveryPhraseReveal,
   completeRecoveryPhraseReveal,
   createOrLoadIdentity,
+  initOnboardingProfile,
   selectProfileForRestart,
   setLocalDisplayName,
 } from "../tauri";
@@ -45,6 +46,18 @@ describe("tauri identity wrappers", () => {
 
     expect(tauriMocks.invoke).toHaveBeenCalledWith("set_local_display_name", {
       displayName: null,
+    });
+  });
+
+  it("forwards the explicit profile protection mode during onboarding", async () => {
+    tauriMocks.invoke.mockResolvedValueOnce({});
+
+    await initOnboardingProfile("default", "profile password", "passphrase_only");
+
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("init_onboarding_profile", {
+      profileName: "default",
+      passphrase: "profile password",
+      protectionMode: "passphrase_only",
     });
   });
 

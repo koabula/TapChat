@@ -139,6 +139,7 @@ fn bootstrap_quartet(suffix: &str) -> Result<QuartetContext> {
             [
                 "profile",
                 "init",
+                "--no-keychain",
                 "--name",
                 name,
                 "--root",

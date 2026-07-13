@@ -46,14 +46,18 @@ function updateJsonVersion(relativePath, version) {
 
 function updateCargoTomlVersion(relativePath, version) {
   const text = read(relativePath);
+  const packageVersionPattern =
+    /^(\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/m;
+  if (!packageVersionPattern.test(text)) {
+    fail(`could not locate [package] version in ${relativePath}`);
+  }
   const updated = text.replace(
-    /^(\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/m,
+    packageVersionPattern,
     `$1${version}$3`,
   );
-  if (updated === text) {
-    fail(`could not update [package] version in ${relativePath}`);
+  if (updated !== text) {
+    write(relativePath, updated);
   }
-  write(relativePath, updated);
 }
 
 function updateCargoLockPackageVersion(packageName, version) {
@@ -64,10 +68,12 @@ function updateCargoLockPackageVersion(packageName, version) {
     `(\\[\\[package\\]\\]\\r?\\nname = "${escapedName}"\\r?\\nversion = ")[^"]+(")`,
   );
   const updated = text.replace(packagePattern, `$1${version}$2`);
-  if (updated === text) {
-    fail(`could not update ${packageName} in Cargo.lock`);
+  if (updated === text && !text.includes(`name = "${packageName}"`)) {
+    fail(`could not locate ${packageName} in Cargo.lock`);
   }
-  write(relativePath, updated);
+  if (updated !== text) {
+    write(relativePath, updated);
+  }
 }
 
 const version = normalizeVersion(process.argv[2]);

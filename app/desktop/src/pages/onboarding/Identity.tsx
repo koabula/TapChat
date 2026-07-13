@@ -17,12 +17,19 @@ interface CreateIdentityResult {
   mnemonic: string | null;
 }
 
+type ProfileProtectionMode =
+  | "keychain_and_passphrase"
+  | "keychain_only"
+  | "passphrase_only";
+
 export default function Identity() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const isRecover = searchParams.get("mode") === "recover";
 
   const [profileName, setProfileName] = useState("default");
+  const [protectionMode, setProtectionMode] =
+    useState<ProfileProtectionMode>("keychain_and_passphrase");
   const [profilePassphrase, setProfilePassphrase] = useState("");
   const [confirmProfilePassphrase, setConfirmProfilePassphrase] = useState("");
   const [weakPassphraseAccepted, setWeakPassphraseAccepted] = useState(false);
@@ -31,17 +38,19 @@ export default function Identity() {
   const [mnemonic, setMnemonic] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [step, setStep] = useState<"profile" | "identity">(isRecover ? "identity" : "profile");
+  const [step, setStep] = useState<"profile" | "identity">("profile");
   const passphraseStrength = evaluatePassphraseStrength(profilePassphrase, profileName);
   const trimmedPassphrase = profilePassphrase.trim();
   const trimmedConfirmPassphrase = confirmProfilePassphrase.trim();
   const hasAnyPassphraseInput = Boolean(trimmedPassphrase || trimmedConfirmPassphrase);
+  const requiresPassphrase = protectionMode !== "keychain_only";
   const passphrasesMatch = !hasAnyPassphraseInput || trimmedPassphrase === trimmedConfirmPassphrase;
   const mustConfirmWeakPassphrase =
     Boolean(trimmedPassphrase) && passphraseStrength.requiresConfirmation;
   const canContinueProfile =
     !loading &&
     Boolean(profileName.trim()) &&
+    (!requiresPassphrase || Boolean(trimmedPassphrase)) &&
     passphrasesMatch &&
     (!mustConfirmWeakPassphrase || weakPassphraseAccepted);
   const passphraseStrengthWidth =
@@ -67,7 +76,8 @@ export default function Identity() {
       // Initialize profile first
       const result = await invoke<ProfileSummary>("init_onboarding_profile", {
         profileName,
-        passphrase: trimmedPassphrase || null,
+        passphrase: requiresPassphrase ? trimmedPassphrase || null : null,
+        protectionMode,
       });
 
       console.debug(
@@ -120,7 +130,7 @@ export default function Identity() {
       <div className="flex items-center mb-8">
         <button
           className="btn btn-ghost px-2"
-          onClick={() => step === "identity" && !isRecover ? setStep("profile") : navigate("/onboarding")}
+          onClick={() => step === "identity" ? setStep("profile") : navigate("/onboarding")}
         >
           ← Back
         </button>
@@ -129,13 +139,14 @@ export default function Identity() {
 
       {/* Content */}
       <div className="flex flex-col items-center justify-center flex-1">
-        {step === "profile" && !isRecover && (
+        {step === "profile" && (
           <>
             <h2 className="text-xl font-semibold text-primary-color mb-2">
-              Create Your Profile
+              {isRecover ? "Create a Profile for Recovery" : "Create Your Profile"}
             </h2>
             <p className="text-secondary-color text-center mb-6 max-w-md">
-              Your profile stores all your messages and contacts locally. Choose a name for your profile.
+              Your profile stores encrypted messages and contacts locally. Choose how its local
+              encryption key is protected.
             </p>
 
             <div className="w-full max-w-sm space-y-4">
@@ -152,11 +163,38 @@ export default function Identity() {
                 />
               </div>
 
-              <div>
+              <fieldset className="space-y-2">
+                <legend className="text-sm text-muted-color mb-1">Protection</legend>
+                <ProtectionOption
+                  checked={protectionMode === "keychain_and_passphrase"}
+                  title="System keychain + passphrase"
+                  description="Recommended. The passphrase remains a backup if the system keychain becomes unavailable."
+                  onChange={() => setProtectionMode("keychain_and_passphrase")}
+                />
+                <ProtectionOption
+                  checked={protectionMode === "passphrase_only"}
+                  title="Passphrase only"
+                  description="Does not use Windows Credential Manager. You must enter the passphrase after restart."
+                  onChange={() => setProtectionMode("passphrase_only")}
+                />
+                <ProtectionOption
+                  checked={protectionMode === "keychain_only"}
+                  title="System keychain only"
+                  description="Convenient, but losing the system credential can make local profile data unrecoverable."
+                  onChange={() => {
+                    setProtectionMode("keychain_only");
+                    setProfilePassphrase("");
+                    setConfirmProfilePassphrase("");
+                    setWeakPassphraseAccepted(false);
+                  }}
+                />
+              </fieldset>
+
+              {requiresPassphrase && <div>
                 <label className="text-sm text-muted-color mb-1 block">Profile passphrase</label>
                 <input
                   className="input"
-                  placeholder="Optional"
+                  placeholder="Required"
                   type="password"
                   value={profilePassphrase}
                   onChange={(e) => {
@@ -175,13 +213,13 @@ export default function Identity() {
                     {passphraseStrength.label}: {passphraseStrength.message}
                   </p>
                 </div>
-              </div>
+              </div>}
 
-              <div>
+              {requiresPassphrase && <div>
                 <label className="text-sm text-muted-color mb-1 block">Confirm passphrase</label>
                 <input
                   className="input"
-                  placeholder="Optional"
+                  placeholder="Required"
                   type="password"
                   value={confirmProfilePassphrase}
                   onChange={(e) => setConfirmProfilePassphrase(e.target.value)}
@@ -189,7 +227,7 @@ export default function Identity() {
                 {!passphrasesMatch && (
                   <p className="status-error text-xs mt-1">Profile passphrases do not match.</p>
                 )}
-              </div>
+              </div>}
 
               {mustConfirmWeakPassphrase && (
                 <label className="flex items-start gap-2 text-sm text-secondary-color">
@@ -283,6 +321,34 @@ export default function Identity() {
         )}
       </div>
     </div>
+  );
+}
+
+function ProtectionOption({
+  checked,
+  title,
+  description,
+  onChange,
+}: {
+  checked: boolean;
+  title: string;
+  description: string;
+  onChange: () => void;
+}) {
+  return (
+    <label className="flex items-start gap-3 rounded-lg border border-default p-3 cursor-pointer">
+      <input
+        className="mt-1 accent-primary"
+        type="radio"
+        name="profile-protection"
+        checked={checked}
+        onChange={onChange}
+      />
+      <span>
+        <span className="block text-sm font-medium text-primary-color">{title}</span>
+        <span className="block text-xs text-muted-color mt-1">{description}</span>
+      </span>
+    </label>
   );
 }
 

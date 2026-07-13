@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -13,7 +12,7 @@ use tapchat_core::{CoreCommand, CoreOutput};
 
 use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
 use crate::platform::log_sanitize::redact_id;
-use crate::platform::profile::ProfileSummary;
+use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::state::{
     AppState, RecoveryPhraseAuthMode, RecoveryPhraseChallenge, RecoveryPhraseGate, SessionState,
 };
@@ -61,6 +60,7 @@ pub async fn init_onboarding_profile(
     state: State<'_, AppState>,
     profile_name: String,
     passphrase: Option<String>,
+    protection_mode: Option<ProfileProtectionMode>,
 ) -> Result<ProfileSummary, String> {
     // Use default path: APPDATA/TapChat/profiles/{profile_name}
     let data_dir = dirs::data_dir().ok_or_else(|| {
@@ -79,7 +79,14 @@ pub async fn init_onboarding_profile(
     // Create profile
     let summary = {
         let pm = &state.inner.read().await.profile_manager;
-        pm.create_profile(&profile_name, path.clone(), passphrase)
+        let protection_mode = protection_mode.unwrap_or_else(|| {
+            if passphrase.as_deref().is_some_and(|value| !value.is_empty()) {
+                ProfileProtectionMode::KeychainAndPassphrase
+            } else {
+                ProfileProtectionMode::KeychainOnly
+            }
+        });
+        pm.create_profile(&profile_name, path.clone(), passphrase, protection_mode)
             .await
             .map_err(|e| {
                 log::error!("Failed to create profile {}", profile_ref);
@@ -113,26 +120,10 @@ pub async fn create_or_load_identity(
     {
         let inner = state.inner.read().await;
         if inner.profile_manager.get_active_metadata().await.is_none() {
-            // No profile - create default one
-            drop(inner);
-
-            let default_path = dirs::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("TapChat")
-                .join("profiles")
-                .join("default");
-
-            state
-                .inner
-                .read()
-                .await
-                .profile_manager
-                .create_profile("default", default_path.clone(), None)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let mut inner = state.inner.write().await;
-            inner.profile_path = Some(default_path);
+            return Err(
+                "profile_required: create a protected profile before creating or recovering an identity"
+                    .to_string(),
+            );
         }
     }
 
@@ -476,6 +467,8 @@ pub async fn set_local_display_name(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     fn challenge(expires_at: Instant) -> RecoveryPhraseChallenge {

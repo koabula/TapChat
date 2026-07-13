@@ -7,7 +7,7 @@ use tapchat_core::CoreEngine;
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
-use crate::platform::profile::ProfileSummary;
+use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, LockReason, SessionState};
 
@@ -24,6 +24,7 @@ pub async fn create_profile(
     state: State<'_, AppState>,
     name: String,
     passphrase: Option<String>,
+    protection_mode: Option<ProfileProtectionMode>,
 ) -> Result<ProfileSummary, String> {
     // Use default path: APPDATA/TapChat/profiles/{name}
     let data_dir =
@@ -38,7 +39,14 @@ pub async fn create_profile(
         return Err(format!("Profile '{}' already exists", name));
     }
 
-    pm.create_profile(&name, path.clone(), passphrase)
+    let protection_mode = protection_mode.unwrap_or_else(|| {
+        if passphrase.as_deref().is_some_and(|value| !value.is_empty()) {
+            ProfileProtectionMode::KeychainAndPassphrase
+        } else {
+            ProfileProtectionMode::KeychainOnly
+        }
+    });
+    pm.create_profile(&name, path.clone(), passphrase, protection_mode)
         .await
         .map_err(|e| e.to_string())
 }

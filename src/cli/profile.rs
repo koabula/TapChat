@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -240,6 +241,48 @@ pub struct ProfileKeychainCleanupReport {
     pub errors: Vec<String>,
 }
 
+/// Process-wide guard used by tests that need an isolated profile registry.
+///
+/// Environment variables are process-global. Keeping the mutex guard for the
+/// full lifetime of the override prevents parallel tests from temporarily
+/// falling back to the real user registry.
+#[doc(hidden)]
+pub struct ProfileRegistryPathOverride {
+    previous: Option<OsString>,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl Drop for ProfileRegistryPathOverride {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(previous) => env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", previous),
+                None => env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH"),
+            }
+        }
+    }
+}
+
+static PROFILE_REGISTRY_PATH_OVERRIDE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn override_profile_registry_path_for_test(
+    path: impl AsRef<Path>,
+) -> ProfileRegistryPathOverride {
+    let guard = PROFILE_REGISTRY_PATH_OVERRIDE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("profile registry path override lock");
+    let previous = env::var_os("TAPCHAT_PROFILE_REGISTRY_PATH");
+    unsafe {
+        env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", path.as_ref());
+    }
+    ProfileRegistryPathOverride {
+        previous,
+        _guard: guard,
+    }
+}
+
 impl Profile {
     pub fn init(name: &str, root: impl AsRef<Path>) -> Result<Self> {
         Self::init_with_options(
@@ -262,6 +305,12 @@ impl Profile {
         let init_result = (|| -> Result<Self> {
             fs::create_dir_all(&root).context("create profile root")?;
             let profile_lock = ProfileLockGuard::acquire(&root)?;
+            if root.join(PROFILE_METADATA_FILE_NAME).exists() {
+                bail!(
+                    "profile_already_exists: profile metadata already exists at {}",
+                    root.display()
+                );
+            }
             if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
                 bail!(
                     "insecure plaintext snapshot.json exists at {}; recreate the profile before using encrypted snapshots",
@@ -284,14 +333,22 @@ impl Profile {
                                 .map_err(anyhow::Error::from)?,
                         );
                     }
-                    Err(_error) if options.passphrase.is_some() => {
+                    Err(error) if options.passphrase.is_some() => {
+                        let code = profile_keychain_error_code(&error);
                         log::warn!(
-                            "OS keychain unavailable for profile {}: error=keychain_unavailable",
-                            redact_id("profile", &profile_id)
+                            "OS keychain unavailable for profile {}: error_code={}",
+                            redact_id("profile", &profile_id),
+                            code
                         );
                     }
                     Err(error) => {
-                        return Err(error).with_context(keychain_unavailable_create_message);
+                        let code = profile_keychain_error_code(&error);
+                        log::error!(
+                            "OS keychain failed while creating profile {}: error_code={}",
+                            redact_id("profile", &profile_id),
+                            code
+                        );
+                        bail!("{}", keychain_unavailable_create_message(code));
                     }
                 }
             }
@@ -777,7 +834,16 @@ impl ProfileRegistry {
     }
 
     pub fn save(&self) -> Result<()> {
-        write_atomic_unique(&profile_registry_path()?, &serde_json::to_vec_pretty(self)?)
+        let path = profile_registry_path()?;
+        if path.exists() {
+            let previous = fs::read(&path).context("read previous profile registry for backup")?;
+            if !previous.is_empty() {
+                let backup_path = path.with_extension("json.bak");
+                write_atomic_unique(&backup_path, &previous)
+                    .context("write profile registry backup")?;
+            }
+        }
+        write_atomic_unique(&path, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn upsert(&mut self, entry: ProfileRegistryEntry) {
@@ -1054,6 +1120,47 @@ enum KeychainDeleteOutcome {
     NoEntry,
 }
 
+#[derive(Debug)]
+struct ProfileKeychainOperationError {
+    code: &'static str,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl std::fmt::Display for ProfileKeychainOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for ProfileKeychainOperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+fn profile_keychain_error(
+    code: &'static str,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> anyhow::Error {
+    anyhow::Error::new(ProfileKeychainOperationError {
+        code,
+        source: Some(Box::new(source)),
+    })
+}
+
+fn profile_keychain_error_without_source(code: &'static str) -> anyhow::Error {
+    anyhow::Error::new(ProfileKeychainOperationError { code, source: None })
+}
+
+fn profile_keychain_error_code(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<ProfileKeychainOperationError>()
+        .map(|error| error.code)
+        .unwrap_or("keychain_unknown_failure")
+}
+
 fn keychain_ref_for_wrapper(profile_id: &str, wrapper_id: &str) -> ProfileKeychainEntryRef {
     ProfileKeychainEntryRef {
         service: OS_KEYCHAIN_SERVICE.into(),
@@ -1080,21 +1187,20 @@ fn keychain_ref_from_wrapper(
 fn store_os_kek_entry(entry_ref: &ProfileKeychainEntryRef, key: &[u8]) -> Result<()> {
     ensure_persistent_os_keychain()?;
     let entry = keyring::Entry::new(&entry_ref.service, &entry_ref.account)
-        .with_context(|| format!("create OS keychain entry for {}", entry_ref.account))?;
-    entry.set_password(&STANDARD.encode(key)).with_context(|| {
-        format!(
-            "OS keychain cannot save new credentials for {}",
-            entry_ref.account
-        )
-    })?;
+        .map_err(|error| profile_keychain_error("keychain_entry_create_failed", error))?;
+    entry
+        .set_password(&STANDARD.encode(key))
+        .map_err(|error| profile_keychain_error("keychain_write_failed", error))?;
     let stored = entry
         .get_password()
-        .with_context(|| format!("verify OS keychain entry for {}", entry_ref.account))?;
+        .map_err(|error| profile_keychain_error("keychain_readback_failed", error))?;
     let stored = STANDARD
         .decode(stored)
-        .context("decode OS keychain verification secret")?;
+        .map_err(|error| profile_keychain_error("keychain_verification_decode_failed", error))?;
     if stored != key {
-        bail!("OS keychain verification failed for {}", entry_ref.account);
+        return Err(profile_keychain_error_without_source(
+            "keychain_verification_failed",
+        ));
     }
     Ok(())
 }
@@ -1237,26 +1343,60 @@ fn cleanup_profile_keychain_entries(root: &Path) -> Result<ProfileKeychainCleanu
 
 fn collect_registered_os_keychain_refs() -> Result<RegisteredProfileKeychainRefs> {
     let registry = ProfileRegistry::load()?;
-    let mut result = RegisteredProfileKeychainRefs {
-        registered_profiles: registry.profiles.len(),
-        ..RegisteredProfileKeychainRefs::default()
-    };
-    for entry in registry.profiles {
-        match read_profile_metadata_if_present(&entry.root_dir) {
+    let mut result = RegisteredProfileKeychainRefs::default();
+    let mut profile_roots: BTreeSet<PathBuf> = registry
+        .profiles
+        .into_iter()
+        .map(|entry| entry.root_dir)
+        .collect();
+
+    // Protect profiles in the standard on-disk profile directory even if the
+    // registry is stale or damaged. Cleanup must never classify a live
+    // profile's credential as orphaned solely because profiles.json is wrong.
+    let registry_path = profile_registry_path()?;
+    if let Some(config_dir) = registry_path.parent() {
+        let default_profiles_dir = config_dir.join("profiles");
+        if default_profiles_dir.exists() {
+            match fs::read_dir(&default_profiles_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) if entry.path().is_dir() => {
+                                if entry.path().join(PROFILE_METADATA_FILE_NAME).exists() {
+                                    profile_roots.insert(entry.path());
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => result.errors.push(format!(
+                                "failed to inspect default profile directory entry: {error}"
+                            )),
+                        }
+                    }
+                }
+                Err(error) => result.errors.push(format!(
+                    "failed to inspect default profile directory: {error}"
+                )),
+            }
+        }
+    }
+
+    result.registered_profiles = profile_roots.len();
+    for root_dir in profile_roots {
+        match read_profile_metadata_if_present(&root_dir) {
             Ok(Some(meta)) => match os_keychain_refs_from_metadata(&meta) {
                 Ok(refs) => result.refs.extend(refs),
                 Err(error) => result.errors.push(format!(
                     "failed to inspect OS keychain wrappers in {}: {error:#}",
-                    entry.root_dir.display()
+                    root_dir.display()
                 )),
             },
             Ok(None) => result.errors.push(format!(
                 "registered profile {} has no profile.json",
-                entry.root_dir.display()
+                root_dir.display()
             )),
             Err(error) => result.errors.push(format!(
                 "failed to read registered profile metadata at {}: {error:#}",
-                entry.root_dir.display()
+                root_dir.display()
             )),
         }
     }
@@ -1483,18 +1623,16 @@ fn enumerate_tapchat_keychain_accounts() -> Result<Vec<String>> {
 fn ensure_persistent_os_keychain() -> Result<()> {
     let persistence = default::default_credential_builder().persistence();
     if !matches!(persistence, CredentialPersistence::UntilDelete) {
-        bail!(
-            "OS keychain backend is not persistent ({})",
-            credential_persistence_label(&persistence)
-        );
+        return Err(profile_keychain_error_without_source(
+            "keychain_backend_not_persistent",
+        ));
     }
     Ok(())
 }
 
-fn keychain_unavailable_create_message() -> String {
+fn keychain_unavailable_create_message(code: &str) -> String {
     format!(
-        "OS keychain is unavailable; provide a passphrase to create this profile, or create a passphrase-only profile with --no-keychain. {}",
-        keychain_unlock_hint()
+        "OS keychain could not protect this profile (error_code={code}). Choose passphrase protection and retry; no profile data was created."
     )
 }
 
@@ -1526,17 +1664,22 @@ fn load_os_kek(
     let account = wrapper
         .keychain_account
         .as_deref()
-        .ok_or_else(|| anyhow!("OS keychain wrapper is missing account"))?;
+        .ok_or_else(|| profile_keychain_error_without_source("keychain_wrapper_invalid"))?;
     let entry = keyring::Entry::new(service, account)
-        .with_context(|| format!("create OS keychain entry for {account}"))?;
-    let encoded = entry
-        .get_password()
-        .with_context(|| format!("read OS keychain entry for {account}"))?;
+        .map_err(|error| profile_keychain_error("keychain_entry_create_failed", error))?;
+    let encoded = entry.get_password().map_err(|error| match error {
+        keyring::Error::NoEntry => {
+            profile_keychain_error("keychain_entry_missing", keyring::Error::NoEntry)
+        }
+        other => profile_keychain_error("keychain_read_failed", other),
+    })?;
     let key = STANDARD
         .decode(encoded)
-        .context("decode OS keychain secret")?;
+        .map_err(|error| profile_keychain_error("keychain_secret_decode_failed", error))?;
     if key.len() != PDEK_LEN {
-        bail!("OS keychain secret has invalid length");
+        return Err(profile_keychain_error_without_source(
+            "keychain_secret_invalid_length",
+        ));
     }
     Ok(Zeroizing::new(key))
 }
@@ -1544,7 +1687,7 @@ fn load_os_kek(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
 
     use tempfile::tempdir;
 
@@ -1557,8 +1700,8 @@ mod tests {
     use crate::profile_crypto::OS_KEYCHAIN_SERVICE;
 
     fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        super::PROFILE_REGISTRY_PATH_OVERRIDE_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .expect("env lock")
     }
@@ -2019,5 +2162,145 @@ mod tests {
             super::profile_lock_error_message(dir.path(), " lock holder pid=12345.", "locked");
         assert!(message.contains("already in use"));
         assert!(message.contains("lock holder pid=12345"));
+    }
+
+    #[test]
+    fn registry_save_keeps_the_previous_version_as_backup() {
+        let dir = tempdir().expect("tempdir");
+        let registry_path = dir.path().join("config").join("profiles.json");
+        let _registry_override = super::override_profile_registry_path_for_test(&registry_path);
+        let alice_root = dir.path().join("alice");
+        let bob_root = dir.path().join("bob");
+
+        let first = ProfileRegistry {
+            active_profile: Some(alice_root.clone()),
+            profiles: vec![super::ProfileRegistryEntry {
+                name: "alice".into(),
+                root_dir: alice_root,
+                user_id: None,
+                device_id: None,
+            }],
+        };
+        first.save().expect("save first registry");
+
+        let second = ProfileRegistry {
+            active_profile: Some(bob_root.clone()),
+            profiles: vec![super::ProfileRegistryEntry {
+                name: "bob".into(),
+                root_dir: bob_root,
+                user_id: None,
+                device_id: None,
+            }],
+        };
+        second.save().expect("save second registry");
+
+        let backup: ProfileRegistry = serde_json::from_slice(
+            &std::fs::read(registry_path.with_extension("json.bak")).expect("read registry backup"),
+        )
+        .expect("decode registry backup");
+        assert_eq!(backup, first);
+        assert_eq!(
+            ProfileRegistry::load().expect("load current registry"),
+            second
+        );
+    }
+
+    #[test]
+    fn keychain_failures_expose_only_stable_error_codes() {
+        let error = super::profile_keychain_error_without_source("keychain_write_failed");
+        assert_eq!(
+            super::profile_keychain_error_code(&error),
+            "keychain_write_failed"
+        );
+        assert_eq!(error.to_string(), "keychain_write_failed");
+    }
+
+    #[test]
+    fn profile_init_never_overwrites_existing_profile_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let registry_path = dir.path().join("config").join("profiles.json");
+        let _registry_override = super::override_profile_registry_path_for_test(&registry_path);
+        let root = dir.path().join("existing");
+        let profile = Profile::init_with_options(
+            "existing",
+            &root,
+            ProfileInitOptions {
+                passphrase: Some("original passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("create original profile");
+        drop(profile);
+        let metadata_before = std::fs::read(root.join("profile.json")).expect("read metadata");
+
+        let error = match Profile::init_with_options(
+            "replacement",
+            &root,
+            ProfileInitOptions {
+                passphrase: Some("replacement passphrase".into()),
+                use_keychain: false,
+            },
+        ) {
+            Ok(_) => panic!("existing profile must not be overwritten"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("profile_already_exists"));
+        assert_eq!(
+            std::fs::read(root.join("profile.json")).expect("read unchanged metadata"),
+            metadata_before
+        );
+    }
+
+    #[test]
+    fn keychain_cleanup_protects_unregistered_profiles_in_default_directory() {
+        let dir = tempdir().expect("tempdir");
+        let config_dir = dir.path().join("config");
+        let registry_path = config_dir.join("profiles.json");
+        let _registry_override = super::override_profile_registry_path_for_test(&registry_path);
+        ProfileRegistry::default()
+            .save()
+            .expect("save empty damaged registry");
+
+        let root = config_dir.join("profiles").join("unregistered");
+        std::fs::create_dir_all(&root).expect("create profile directory");
+        let profile_id = "profile:unregistered";
+        let wrapper_id = "wrapper:protected";
+        let encryption = crate::profile_crypto::default_encryption_metadata(vec![
+            crate::profile_crypto::build_os_keychain_wrapper(
+                profile_id,
+                wrapper_id,
+                &[7_u8; crate::profile_crypto::PDEK_LEN],
+                &[9_u8; crate::profile_crypto::PDEK_LEN],
+            )
+            .expect("build wrapper"),
+        ]);
+        let metadata = super::ProfileMetadata {
+            name: "unregistered".into(),
+            profile_id: profile_id.into(),
+            root_dir: root.clone(),
+            bundles_dir: root.join("bundles"),
+            inbox_attachments_dir: root.join("attachments"),
+            outbox_attachments_dir: root.join("attachments"),
+            attachments_dir: root.join("attachments"),
+            runtime_dir: root.join("runtime"),
+            user_id: None,
+            device_id: None,
+            deployment_bundle_path: None,
+            encryption: Some(encryption),
+        };
+        std::fs::write(
+            root.join("profile.json"),
+            serde_json::to_vec_pretty(&metadata).expect("encode metadata"),
+        )
+        .expect("write metadata");
+
+        let collected = super::collect_registered_os_keychain_refs().expect("collect wrappers");
+        assert!(collected.errors.is_empty());
+        assert_eq!(collected.registered_profiles, 1);
+        assert!(collected.refs.contains(&super::ProfileKeychainEntryRef {
+            service: crate::profile_crypto::OS_KEYCHAIN_SERVICE.into(),
+            account: crate::profile_crypto::generate_keychain_account(profile_id, wrapper_id),
+        }));
     }
 }

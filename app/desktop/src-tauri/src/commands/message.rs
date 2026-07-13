@@ -821,7 +821,9 @@ async fn generate_thumbnail(path: &std::path::Path) -> anyhow::Result<Option<Str
 mod tests {
     use super::*;
     use tapchat_core::attachment_crypto::encrypt_blob;
-    use tapchat_core::cli::profile::{Profile, ProfileInitOptions};
+    use tapchat_core::cli::profile::{
+        override_profile_registry_path_for_test, Profile, ProfileInitOptions,
+    };
 
     #[test]
     fn encrypted_attachment_cache_round_trips_without_plaintext_at_rest() {
@@ -837,12 +839,8 @@ mod tests {
         let downloaded_blob_b64 = BASE64.encode(encrypted.ciphertext);
         let temp_dir =
             std::env::temp_dir().join(format!("tapchat-cache-test-{}", uuid::Uuid::new_v4()));
-        unsafe {
-            std::env::set_var(
-                "TAPCHAT_PROFILE_REGISTRY_PATH",
-                temp_dir.join("config").join("profiles.json"),
-            );
-        }
+        let _registry_override =
+            override_profile_registry_path_for_test(temp_dir.join("config").join("profiles.json"));
         let profile = Profile::init_with_options(
             "alice",
             temp_dir.join("profile"),
@@ -871,9 +869,6 @@ mod tests {
             .decrypt_profile_document(&attachment_cache_document_kind(cache_id), &bytes)
             .expect("decrypt cache");
         assert_eq!(round_trip, plaintext);
-        unsafe {
-            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
-        }
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

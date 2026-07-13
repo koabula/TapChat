@@ -137,19 +137,12 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    use tapchat_core::cli::profile::{Profile, ProfileInitOptions};
+    use tapchat_core::cli::profile::{
+        override_profile_registry_path_for_test, Profile, ProfileInitOptions,
+    };
     use uuid::Uuid;
 
     use super::build_test_app_state_for_profile;
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock")
-    }
 
     fn test_profile_root() -> PathBuf {
         let root = std::env::temp_dir()
@@ -161,7 +154,6 @@ mod tests {
 
     #[tokio::test]
     async fn build_test_app_state_for_profile_rejects_corrupt_snapshot_store() {
-        let _guard = env_lock();
         let root = test_profile_root();
         let passphrase = "test-passphrase";
         let registry_path = root
@@ -169,9 +161,7 @@ mod tests {
             .expect("profile test parent")
             .join("config")
             .join("profiles.json");
-        unsafe {
-            std::env::set_var("TAPCHAT_PROFILE_REGISTRY_PATH", &registry_path);
-        }
+        let _registry_override = override_profile_registry_path_for_test(&registry_path);
         let profile = Profile::init_with_options(
             "broken",
             &root,
@@ -194,7 +184,6 @@ mod tests {
         };
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_PASSPHRASE");
-            std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
         }
 
         let message = format!("{error:#}");
