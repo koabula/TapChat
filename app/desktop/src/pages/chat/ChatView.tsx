@@ -47,6 +47,7 @@ interface SendMessageResult {
   sender_device_id: string;
   plaintext: string;
   created_at: number;
+  delivery_state?: "sending" | "sent" | "failed";
 }
 
 export default function ChatView() {
@@ -425,6 +426,29 @@ export default function ChatView() {
 
   const handleSentMessage = (sentMsg?: SendMessageResult) => {
     if (!sentMsg || !conversationId) return;
+    if (isGroup) {
+      setGroupMessages((previous) => {
+        if (previous.some((message) => message.message_id === sentMsg.message_id)) {
+          return previous;
+        }
+        return [
+          ...previous,
+          {
+            kind: "bubble",
+            message_id: sentMsg.message_id,
+            sender_user_id: sentMsg.sender_user_id ?? localUserId,
+            sender_device_id: sentMsg.sender_device_id,
+            created_at: sentMsg.created_at,
+            plaintext: sentMsg.plaintext,
+            has_attachment: false,
+            storage_refs: [],
+            raw_message_type: "mls_application",
+            delivery_state: sentMsg.delivery_state ?? "sending",
+          },
+        ];
+      });
+      return;
+    }
     const tempMessage: Message = {
       message_id: sentMsg.message_id,
       sender_device_id: sentMsg.sender_device_id,
@@ -434,6 +458,7 @@ export default function ChatView() {
       plaintext: sentMsg.plaintext,
       has_attachment: false,
       storage_refs: [],
+      delivery_state: sentMsg.delivery_state ?? "sending",
     };
     setMessages((prev) => {
       if (prev.some((m) => m.message_id === sentMsg.message_id)) return prev;
@@ -571,6 +596,8 @@ export default function ChatView() {
           </span>
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(message.created_at)}
+            {sent && message.delivery_state === "sending" ? " · Sending…" : ""}
+            {sent && message.delivery_state === "failed" ? " · Failed" : ""}
           </span>
         </div>
       );
@@ -624,6 +651,8 @@ export default function ChatView() {
           </span>
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(msg.created_at)}
+            {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
+            {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
           </span>
         </div>
       );
@@ -637,6 +666,8 @@ export default function ChatView() {
         {renderAttachmentStack(msg.message_id, attachmentRefs)}
         <span className="block text-xs text-right mt-1 opacity-60">
           {formatTime(msg.created_at)}
+          {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
+          {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
         </span>
       </div>
     );

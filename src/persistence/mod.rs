@@ -1188,6 +1188,7 @@ mod tests {
                         user_id: "user:alice".into(),
                         device_id: "device:alice:phone".into(),
                         scopes: vec!["inbox_read".into(), "inbox_ack".into()],
+                        key_id: None,
                     }),
                     expected_user_id: Some("user:alice".into()),
                     expected_device_id: Some("device:alice:phone".into()),

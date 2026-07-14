@@ -53,6 +53,30 @@ jobs:
       - run: npm run test:integration
       - run: npm run check:embedded
 
+  group-e2e:
+    name: group-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: services/cloudflare/package-lock.json
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 gnome-keyring libdbus-1-dev
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - run: npm ci
+        working-directory: services/cloudflare
+      - name: Run the three isolated group lifecycle stories in parallel
+        run: cargo test --test desktop_group_e2e -- --ignored
+        env:
+          RUST_MIN_STACK: "67108864"
+
   desktop:
     name: desktop
     runs-on: ubuntu-latest

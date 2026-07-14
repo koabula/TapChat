@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use tapchat_core::cli::runtime::bootstrap_device_bundle;
-use tapchat_core::model::DeploymentBundle;
+use tapchat_core::cli::runtime::bootstrap_device_bundle_with_key_id;
+use tapchat_core::model::{
+    DeploymentBundle, DeviceRuntimeAuth, DeviceRuntimeRefreshChallenge, DeviceRuntimeRefreshProof,
+};
 use tapchat_core::persistence::PersistedDeployment;
 use tapchat_core::CoreCommand;
 
@@ -36,10 +38,74 @@ fn now_ms() -> Result<u64> {
     u64::try_from(millis).context("current time does not fit in u64")
 }
 
+async fn refresh_device_runtime_auth_with_proof(
+    base_url: &str,
+    user_id: &str,
+    device_id: &str,
+    identity: &tapchat_core::identity::LocalIdentityState,
+) -> Result<DeviceRuntimeAuth> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RefreshResponse {
+        device_runtime_auth: DeviceRuntimeAuth,
+    }
+
+    let client = reqwest::Client::builder()
+        .build()
+        .context("build runtime refresh client")?;
+    let base_url = base_url.trim_end_matches('/');
+    let challenge = client
+        .post(format!("{base_url}/v1/runtime-auth/challenge"))
+        .json(&serde_json::json!({
+            "userId": user_id,
+            "deviceId": device_id,
+        }))
+        .send()
+        .await
+        .context("request runtime auth challenge")?
+        .error_for_status()
+        .context("runtime auth challenge rejected")?
+        .json::<DeviceRuntimeRefreshChallenge>()
+        .await
+        .context("decode runtime auth challenge")?;
+    if challenge.user_id != user_id
+        || challenge.device_id != device_id
+        || challenge.expires_at <= now_ms()?
+        || challenge.origin != url::Url::parse(base_url)?.origin().ascii_serialization()
+    {
+        return Err(anyhow!("runtime auth challenge scope is invalid"));
+    }
+    let proof = DeviceRuntimeRefreshProof {
+        signature: identity.sign_sender_proof(challenge.signing_payload().as_bytes()),
+        challenge,
+    };
+    let response = client
+        .post(format!("{base_url}/v1/runtime-auth/refresh"))
+        .json(&proof)
+        .send()
+        .await
+        .context("submit runtime auth refresh proof")?
+        .error_for_status()
+        .context("runtime auth refresh proof rejected")?
+        .json::<RefreshResponse>()
+        .await
+        .context("decode refreshed runtime auth")?;
+    Ok(response.device_runtime_auth)
+}
+
 pub async fn ensure_fresh_device_runtime_auth(
     profile_manager: &ProfileManager,
 ) -> Result<Option<DeploymentBundle>> {
-    let (base_url, bootstrap_secret, user_id, device_id, reason) = {
+    let (
+        base_url,
+        bootstrap_secret,
+        bootstrap_key_id,
+        user_id,
+        device_id,
+        reason,
+        mut current_bundle,
+        local_identity,
+    ) = {
         let inner = profile_manager.inner.read().await;
         let profile = match inner.active_profile.as_ref() {
             Some(profile) => profile,
@@ -63,6 +129,10 @@ pub async fn ensure_fresh_device_runtime_auth(
         let Some(bootstrap_secret) = runtime.bootstrap_secret.clone() else {
             return Ok(None);
         };
+        let bootstrap_key_id = profile
+            .load_runtime_secrets()
+            .context("load private runtime secrets for device runtime refresh")?
+            .bootstrap_key_id;
         let user_id = profile
             .metadata()
             .user_id
@@ -96,7 +166,21 @@ pub async fn ensure_fresh_device_runtime_auth(
             return Ok(None);
         };
 
-        (base_url, bootstrap_secret, user_id, device_id, reason)
+        let local_identity = snapshot
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.state.clone())
+            .ok_or_else(|| anyhow!("active profile missing local identity for runtime refresh"))?;
+        (
+            base_url,
+            bootstrap_secret,
+            bootstrap_key_id,
+            user_id,
+            device_id,
+            reason,
+            deployment.deployment_bundle.clone(),
+            local_identity,
+        )
     };
 
     log::info!(
@@ -106,10 +190,34 @@ pub async fn ensure_fresh_device_runtime_auth(
         redact_id("device", &device_id)
     );
 
-    let refreshed_bundle =
-        bootstrap_device_bundle(&base_url, &bootstrap_secret, &user_id, &device_id)
+    let refreshed_bundle = if current_bundle
+        .runtime_config
+        .features
+        .iter()
+        .any(|feature| feature == "device_runtime_refresh_v1")
+    {
+        current_bundle.device_runtime_auth = Some(
+            refresh_device_runtime_auth_with_proof(
+                &base_url,
+                &user_id,
+                &device_id,
+                &local_identity,
+            )
             .await
-            .context("refresh device runtime auth")?;
+            .context("refresh device runtime auth with device proof")?,
+        );
+        current_bundle
+    } else {
+        bootstrap_device_bundle_with_key_id(
+            &base_url,
+            &bootstrap_secret,
+            bootstrap_key_id.as_deref(),
+            &user_id,
+            &device_id,
+        )
+        .await
+        .context("refresh legacy device runtime auth")?
+    };
 
     {
         let mut inner = profile_manager.inner.write().await;

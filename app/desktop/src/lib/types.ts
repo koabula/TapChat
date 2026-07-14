@@ -247,6 +247,7 @@ export interface Message {
   plaintext: string | null;
   has_attachment: boolean;
   storage_refs?: StorageRef[]; // attachment references with full metadata
+  delivery_state?: "sending" | "sent" | "failed";
 }
 
 // Contacts - matches backend ContactSummary
@@ -418,6 +419,13 @@ export interface CloudflareStatus {
     | null
     | string;
   details?: string | null;
+  secret_rotation?: {
+    phase: "stable" | "prepared" | "deploying" | "grace" | "pending_authorization" | "failed";
+    last_rotated_at_ms?: number | null;
+    next_rotation_at_ms?: number | null;
+    grace_until_ms?: number | null;
+    last_error?: string | null;
+  } | null;
 }
 
 export interface AppMetadata {

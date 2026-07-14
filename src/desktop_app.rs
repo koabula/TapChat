@@ -6,10 +6,14 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::driver::{ContactDeviceSnapshot, CoreDriver};
-use crate::cli::profile::{Profile, ProfileRegistry, RuntimeMetadata};
+use crate::cli::profile::{
+    Profile, ProfileRegistry, RuntimeMetadata, RuntimeSecretRotationMetadata,
+    RuntimeSecretRotationPhase, RuntimeSecrets,
+};
 use crate::cli::runtime::{
-    bootstrap_device_bundle, cloudflare_preflight as runtime_cloudflare_preflight,
+    bootstrap_device_bundle_with_key_id, cloudflare_preflight as runtime_cloudflare_preflight,
     deploy_cloudflare_runtime, derive_cloudflare_defaults, ensure_cloudflare_runtime_metadata,
+    prepare_legacy_runtime_secret_migration, prepare_runtime_secret_rotation,
     rebuild_cloudflare_config, resolve_cloudflare_config, resolve_service_root,
     wait_until_bootstrap_ready, CloudflareDeployOverrides, CloudflarePreflight,
     ResolvedCloudflareDeployConfig,
@@ -684,7 +688,7 @@ pub async fn cloudflare_redeploy(
     profile_path: impl AsRef<Path>,
 ) -> Result<CloudflareActionResultView> {
     let mut profile = Profile::open(profile_path)?;
-    let runtime = profile.load_runtime_metadata()?;
+    let mut runtime = profile.load_runtime_metadata()?;
     ensure_cloudflare_runtime_metadata(&runtime)?;
     let mut driver = load_driver(&profile)?;
     let identity = driver
@@ -692,7 +696,9 @@ pub async fn cloudflare_redeploy(
         .cloned()
         .ok_or_else(|| anyhow!("local identity is not initialized"))?;
     let service_root = resolve_service_root(None, Some(profile.metadata().root_dir.as_path()))?;
-    let config = rebuild_cloudflare_config(&runtime)?;
+    let mut secrets = profile.load_runtime_secrets()?;
+    prepare_legacy_runtime_secret_migration(&profile, &mut runtime, &mut secrets)?;
+    let config = rebuild_cloudflare_config(&runtime, &secrets)?;
     provision_cloudflare_action(
         "redeploy",
         &mut profile,
@@ -709,31 +715,17 @@ pub async fn cloudflare_rotate_secrets(
     profile_path: impl AsRef<Path>,
 ) -> Result<CloudflareActionResultView> {
     let mut profile = Profile::open(profile_path)?;
-    let runtime = profile.load_runtime_metadata()?;
+    let mut runtime = profile.load_runtime_metadata()?;
     ensure_cloudflare_runtime_metadata(&runtime)?;
+    let mut secrets = profile.load_runtime_secrets()?;
+    prepare_runtime_secret_rotation(&profile, &mut runtime, &mut secrets)?;
     let mut driver = load_driver(&profile)?;
     let identity = driver
         .local_identity()
         .cloned()
         .ok_or_else(|| anyhow!("local identity is not initialized"))?;
     let service_root = resolve_service_root(None, Some(profile.metadata().root_dir.as_path()))?;
-    let mut defaults = derive_cloudflare_defaults(
-        &profile.metadata().name,
-        &identity.user_identity.user_id,
-        &identity.device_identity.device_id,
-    );
-    defaults.worker_name = runtime.worker_name.clone().unwrap_or(defaults.worker_name);
-    defaults.public_base_url = runtime.public_base_url.clone().unwrap_or_default();
-    defaults.deployment_region = runtime
-        .deployment_region
-        .clone()
-        .unwrap_or(defaults.deployment_region);
-    defaults.bucket_name = runtime.bucket_name.clone().unwrap_or(defaults.bucket_name);
-    defaults.preview_bucket_name = runtime
-        .preview_bucket_name
-        .clone()
-        .unwrap_or(defaults.preview_bucket_name);
-    let config = resolve_cloudflare_config(&defaults, &CloudflareDeployOverrides::default());
+    let config = rebuild_cloudflare_config(&runtime, &secrets)?;
     provision_cloudflare_action(
         "rotate_secrets",
         &mut profile,
@@ -2139,6 +2131,11 @@ async fn provision_cloudflare_profile_with_progress<F>(
 where
     F: FnMut(&str, Option<&crate::cli::runtime::CloudflareDeploymentResult>),
 {
+    let prior_rotation = profile
+        .load_runtime_metadata()
+        .ok()
+        .map(|runtime| runtime.secret_rotation)
+        .unwrap_or_default();
     update("deploying", None);
     let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
     update("bootstrapping", Some(&deployment));
@@ -2150,9 +2147,10 @@ where
         device_id,
     )
     .await?;
-    let bundle = bootstrap_device_bundle(
+    let bundle = bootstrap_device_bundle_with_key_id(
         &deployment.effective_public_base_url,
         &config.bootstrap_token_secret,
+        Some(&config.bootstrap_token_key_id),
         user_id,
         device_id,
     )
@@ -2164,7 +2162,14 @@ where
         })
         .await?;
     profile.save_deployment_bundle(&bundle)?;
-    profile.save_runtime_metadata(&RuntimeMetadata {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let has_previous = config.device_runtime_previous_secret.is_some()
+        || config.bootstrap_previous_secret.is_some();
+    let runtime_metadata = RuntimeMetadata {
         pid: None,
         base_url: Some(deployment.effective_public_base_url.clone()),
         websocket_base_url: None,
@@ -2180,7 +2185,43 @@ where
         bucket_name: Some(deployment.bucket_name.clone()),
         preview_bucket_name: Some(deployment.preview_bucket_name.clone()),
         last_deployed_at: Some(format!("{:?}", std::time::SystemTime::now())),
-    })?;
+        secret_rotation: RuntimeSecretRotationMetadata {
+            phase: if has_previous {
+                RuntimeSecretRotationPhase::Grace
+            } else {
+                RuntimeSecretRotationPhase::Stable
+            },
+            current_key_id: Some(config.device_runtime_key_id.clone()),
+            previous_key_id: config.device_runtime_previous_key_id.clone(),
+            prepared_at_ms: None,
+            last_rotated_at_ms: if has_previous {
+                Some(now_ms)
+            } else {
+                prior_rotation.last_rotated_at_ms.or(Some(now_ms))
+            },
+            next_rotation_at_ms: if has_previous {
+                Some(now_ms.saturating_add(90 * 24 * 60 * 60 * 1_000))
+            } else {
+                prior_rotation
+                    .next_rotation_at_ms
+                    .or(Some(now_ms.saturating_add(90 * 24 * 60 * 60 * 1_000)))
+            },
+            grace_until_ms: config.auth_rotation_grace_until_ms,
+            last_error: None,
+        },
+    };
+    let runtime_secrets = RuntimeSecrets {
+        sharing_secret: Some(config.sharing_token_secret.clone()),
+        bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
+        bootstrap_key_id: Some(config.bootstrap_token_key_id.clone()),
+        previous_bootstrap_secret: config.bootstrap_previous_secret.clone(),
+        previous_bootstrap_key_id: config.bootstrap_previous_key_id.clone(),
+        device_runtime_secret: Some(config.device_runtime_secret.clone()),
+        device_runtime_key_id: Some(config.device_runtime_key_id.clone()),
+        previous_device_runtime_secret: config.device_runtime_previous_secret.clone(),
+        previous_device_runtime_key_id: config.device_runtime_previous_key_id.clone(),
+    };
+    profile.save_runtime_rotation_state(&runtime_metadata, &runtime_secrets)?;
     persist_driver(profile, driver)?;
     let identity = identity_summary_from_profile(profile)?
         .ok_or_else(|| anyhow!("local identity is not available after provision"))?;

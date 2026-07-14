@@ -8,11 +8,11 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WindowEvent};
 
 use tapchat_core::ffi_api::CoreViewModel;
 use tapchat_core::platform_ports::execute_platform_effect;
-use tapchat_core::{CoreCommand, CoreEngine, CoreEvent, CoreOutput};
+use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput};
 
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth;
-use crate::state::{AppState, LockReason, SessionState, StartupPhase};
+use crate::state::{AppState, DeferredTransportBatch, LockReason, SessionState, StartupPhase};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
 pub enum CoreInput {
@@ -294,6 +294,11 @@ pub async fn on_app_ready(app: &AppHandle) {
             {
                 log::error!("Failed to start session");
             }
+            if let Err(_error) =
+                crate::commands::cloudflare::maybe_run_due_secret_rotation(&app_clone).await
+            {
+                log::warn!("automatic runtime secret rotation check failed");
+            }
             log::info!(
                 "on_app_ready: AppStarted finished in {}ms",
                 app_started_at.elapsed().as_millis()
@@ -403,6 +408,11 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
                 {
                     log::warn!("foreground sync failed");
                 }
+                if let Err(_error) =
+                    crate::commands::cloudflare::maybe_run_due_secret_rotation(&app).await
+                {
+                    log::warn!("foreground runtime secret rotation check failed");
+                }
             });
         }
     }
@@ -487,6 +497,225 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
     }
 
     Ok(output)
+}
+
+/// Send-only driver: commit all leading persistence effects before returning,
+/// then dispatch the remaining transport effects through one bounded FIFO.
+/// This preserves MLS serialization and persistence-before-network while
+/// removing network latency from the Tauri command response.
+pub async fn drive_core_persist_then_defer_transport(
+    app: &AppHandle,
+    input: CoreInput,
+) -> Result<CoreOutput> {
+    let core_started_at = Instant::now();
+    let state = app.state::<AppState>();
+    let _send_order = state.deferred_send_gate.lock().await;
+    let app_arc = Arc::new(app.clone());
+    let mut output = {
+        let mut inner = state.inner.write().await;
+        match input {
+            CoreInput::Command(cmd) => inner.engine.handle_command(cmd)?,
+            CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
+        }
+    };
+    crate::timetest!(
+        "deferred_send_core elapsed_ms={}",
+        core_started_at.elapsed().as_millis()
+    );
+
+    let (persistence_effects, transport_effects) = split_persistence_prefix(output.effects.clone());
+    if persistence_effects.is_empty() || transport_effects.is_empty() {
+        emit_core_update(app, &output);
+        // Unexpected effect shapes retain the established synchronous behavior.
+        for effect in persistence_effects.into_iter().chain(transport_effects) {
+            execute_effect_with_handle(app, &app_arc, &mut output, effect).await?;
+        }
+        return Ok(output);
+    }
+
+    let persistence_started_at = Instant::now();
+    for effect in persistence_effects {
+        execute_effect_with_handle(app, &app_arc, &mut output, effect).await?;
+    }
+    crate::timetest!(
+        "deferred_send_persistence elapsed_ms={}",
+        persistence_started_at.elapsed().as_millis()
+    );
+    emit_core_update(app, &output);
+
+    ensure_deferred_transport_worker(app).await;
+    let profile_path = state.inner.read().await.profile_path.clone();
+    state
+        .deferred_transport_tx
+        .send(DeferredTransportBatch {
+            effects: transport_effects,
+            profile_path,
+            enqueued_at: Instant::now(),
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("deferred transport queue is unavailable"))?;
+
+    Ok(output)
+}
+
+fn split_persistence_prefix(effects: Vec<CoreEffect>) -> (Vec<CoreEffect>, Vec<CoreEffect>) {
+    let prefix_len = effects
+        .iter()
+        .take_while(|effect| matches!(effect, CoreEffect::PersistState { .. }))
+        .count();
+    let mut effects = effects;
+    let transport = effects.split_off(prefix_len);
+    (effects, transport)
+}
+
+#[cfg(test)]
+mod deferred_send_tests {
+    use super::split_persistence_prefix;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tapchat_core::ffi_api::{PersistStateEffect, TimerEffect};
+    use tapchat_core::CoreEffect;
+    use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+
+    #[test]
+    fn persistence_prefix_is_removed_without_reordering_transport() {
+        let persist = || CoreEffect::PersistState {
+            persist: PersistStateEffect {
+                ops: Vec::new(),
+                snapshot: None,
+            },
+        };
+        let timer = |id: &str| CoreEffect::ScheduleTimer {
+            timer: TimerEffect {
+                timer_id: id.into(),
+                delay_ms: 1,
+            },
+        };
+        let (persistence, transport) =
+            split_persistence_prefix(vec![persist(), persist(), timer("first"), timer("second")]);
+
+        assert_eq!(persistence.len(), 2);
+        assert!(matches!(
+            &transport[0],
+            CoreEffect::ScheduleTimer { timer } if timer.timer_id == "first"
+        ));
+        assert!(matches!(
+            &transport[1],
+            CoreEffect::ScheduleTimer { timer } if timer.timer_id == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn persisted_commands_return_before_blocked_fake_transport_and_keep_fifo() {
+        let (tx, mut rx) = mpsc::channel::<u8>(2);
+        let release_network = Arc::new(Notify::new());
+        let (network_started_tx, network_started_rx) = oneshot::channel();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let worker_order = order.clone();
+        let worker_release = release_network.clone();
+        let worker = tokio::spawn(async move {
+            let mut network_started_tx = Some(network_started_tx);
+            while let Some(id) = rx.recv().await {
+                if let Some(started) = network_started_tx.take() {
+                    let _ = started.send(());
+                    worker_release.notified().await;
+                }
+                worker_order.lock().await.push(format!("network:{id}"));
+            }
+        });
+
+        // Model the production boundary: persistence completes synchronously,
+        // then the command only waits for bounded-queue admission.
+        order.lock().await.push("persist:1".into());
+        tokio::time::timeout(Duration::from_millis(100), tx.send(1))
+            .await
+            .expect("first command must return before fake network release")
+            .expect("queue first command");
+        tokio::time::timeout(Duration::from_millis(100), network_started_rx)
+            .await
+            .expect("fake transport should start")
+            .expect("fake transport start signal");
+
+        order.lock().await.push("persist:2".into());
+        tx.send(2).await.expect("queue second command");
+        release_network.notify_one();
+        drop(tx);
+        worker.await.expect("join fake transport worker");
+
+        assert_eq!(
+            *order.lock().await,
+            ["persist:1", "persist:2", "network:1", "network:2"]
+        );
+    }
+}
+
+fn emit_core_update(app: &AppHandle, output: &CoreOutput) {
+    let has_updates = output.view_model.is_some()
+        || output.state_update.conversations_changed
+        || output.state_update.messages_changed
+        || output.state_update.contacts_changed
+        || output.state_update.identity_changed
+        || output.state_update.checkpoints_changed
+        || !output.state_update.system_statuses_changed.is_empty();
+    if has_updates {
+        let _ = app.emit("core-update", output);
+    }
+}
+
+async fn execute_effect_with_handle(
+    app: &AppHandle,
+    app_arc: &Arc<AppHandle>,
+    output: &mut CoreOutput,
+    effect: CoreEffect,
+) -> Result<()> {
+    let state = app.state::<AppState>();
+    let events = {
+        let mut ports = state.ports.lock().await;
+        ports.set_app_handle(app_arc.clone());
+        execute_platform_effect(&mut *ports, effect).await?
+    };
+    for event in events {
+        let event_output = Box::pin(drive_core_with_handle(app, CoreInput::Event(event))).await?;
+        merge_core_outputs(output, event_output);
+    }
+    Ok(())
+}
+
+async fn ensure_deferred_transport_worker(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let Some(mut receiver) = state.deferred_transport_rx.lock().await.take() else {
+        return;
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(batch) = receiver.recv().await {
+            crate::timetest!(
+                "deferred_send_queue elapsed_ms={}",
+                batch.enqueued_at.elapsed().as_millis()
+            );
+            let state = app.state::<AppState>();
+            if state.inner.read().await.profile_path != batch.profile_path {
+                log::info!("skipping deferred transport batch after profile switch");
+                continue;
+            }
+
+            let app_arc = Arc::new(app.clone());
+            let http_started_at = Instant::now();
+            let mut background_output = CoreOutput::default();
+            for effect in batch.effects {
+                if let Err(_error) =
+                    execute_effect_with_handle(&app, &app_arc, &mut background_output, effect).await
+                {
+                    log::warn!("deferred transport effect failed");
+                    break;
+                }
+            }
+            crate::timetest!(
+                "deferred_send_http elapsed_ms={}",
+                http_started_at.elapsed().as_millis()
+            );
+        }
+    });
 }
 
 /// Test-only sibling of [`drive_core_with_handle`] that does NOT require

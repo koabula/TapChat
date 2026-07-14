@@ -10,7 +10,9 @@ use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use tapchat_core::cli::profile::RuntimeMetadata;
+use tapchat_core::cli::profile::{
+    RuntimeMetadata, RuntimeSecretRotationMetadata, RuntimeSecretRotationPhase, RuntimeSecrets,
+};
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
 use tapchat_core::cli::util::to_snake_case_json_string;
 use tapchat_core::model::DeploymentBundle;
@@ -28,6 +30,15 @@ use crate::state::SessionState;
 use crate::timetest;
 
 static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+const AUTH_ROTATION_GRACE_MS: u64 = 48 * 60 * 60 * 1000;
+const AUTH_ROTATION_INTERVAL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+fn generate_runtime_key_id(prefix: &str) -> String {
+    let mut bytes = [0_u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{prefix}-{suffix}")
+}
 
 fn valid_worker_secret(value: &str) -> bool {
     let trimmed = value.trim();
@@ -111,6 +122,7 @@ pub struct CloudflareRuntimeStatus {
     pub state: String,
     pub action: Option<String>,
     pub details: Option<String>,
+    pub secret_rotation: Option<RuntimeSecretRotationMetadata>,
 }
 
 const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
@@ -121,6 +133,8 @@ const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
     "group_member_subscribe",
     "group_authorization_v2",
     "group_membership_fsm_v2",
+    "runtime_secret_rotation_v1",
+    "device_runtime_refresh_v1",
 ];
 
 fn status_from_features(
@@ -186,6 +200,7 @@ fn status_from_features(
         state,
         action,
         details,
+        secret_rotation: None,
     }
 }
 
@@ -598,6 +613,15 @@ pub async fn cloudflare_deploy(
         let inner = state.inner.read().await;
         inner.profile_manager.get_runtime_metadata().await
     };
+    let existing_secrets = {
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        pm_inner
+            .active_profile
+            .as_ref()
+            .and_then(|profile| profile.load_runtime_secrets().ok())
+            .unwrap_or_default()
+    };
     let (
         sharing_token_secret,
         repaired_sharing_secret,
@@ -606,13 +630,88 @@ pub async fn cloudflare_deploy(
     ) = repair_worker_secrets(
         existing_runtime
             .as_ref()
-            .and_then(|runtime| runtime.sharing_secret.clone())
+            .and_then(|_| existing_secrets.sharing_secret.clone())
+            .or_else(|| {
+                existing_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.sharing_secret.clone())
+            })
             .or_else(|| Some(defaults.sharing_token_secret.clone())),
-        existing_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.bootstrap_secret.clone())
+        existing_secrets
+            .bootstrap_secret
+            .clone()
+            .or_else(|| {
+                existing_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.bootstrap_secret.clone())
+            })
             .or_else(|| Some(defaults.bootstrap_token_secret.clone())),
     );
+
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let (device_runtime_secret, generated_device_runtime_secret) =
+        repair_worker_secret(existing_secrets.device_runtime_secret.clone());
+    let device_runtime_key_id = existing_secrets
+        .device_runtime_key_id
+        .clone()
+        .unwrap_or_else(|| generate_runtime_key_id("runtime"));
+    let bootstrap_key_id = existing_secrets
+        .bootstrap_key_id
+        .clone()
+        .unwrap_or_else(|| generate_runtime_key_id("bootstrap"));
+    let first_keyed_deploy = existing_secrets.device_runtime_secret.is_none();
+    let previous_device_runtime_secret = existing_secrets
+        .previous_device_runtime_secret
+        .clone()
+        .or_else(|| first_keyed_deploy.then(|| sharing_token_secret.clone()));
+    let previous_device_runtime_key_id = existing_secrets.previous_device_runtime_key_id.clone();
+    let previous_bootstrap_secret = existing_secrets
+        .previous_bootstrap_secret
+        .clone()
+        .or_else(|| first_keyed_deploy.then(|| bootstrap_token_secret.clone()));
+    let previous_bootstrap_key_id = existing_secrets.previous_bootstrap_key_id.clone();
+    let grace_until_ms = existing_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.secret_rotation.grace_until_ms)
+        .or_else(|| first_keyed_deploy.then_some(now_ms.saturating_add(AUTH_ROTATION_GRACE_MS)));
+    let prepared_secrets = RuntimeSecrets {
+        bootstrap_secret: Some(bootstrap_token_secret.clone()),
+        sharing_secret: Some(sharing_token_secret.clone()),
+        device_runtime_secret: Some(device_runtime_secret.clone()),
+        device_runtime_key_id: Some(device_runtime_key_id.clone()),
+        previous_device_runtime_secret: previous_device_runtime_secret.clone(),
+        previous_device_runtime_key_id: previous_device_runtime_key_id.clone(),
+        bootstrap_key_id: Some(bootstrap_key_id.clone()),
+        previous_bootstrap_secret: previous_bootstrap_secret.clone(),
+        previous_bootstrap_key_id: previous_bootstrap_key_id.clone(),
+    };
+    {
+        // Transaction phase 1: persist exactly one prepared key set before any
+        // Worker mutation. A retry reuses this state and cannot create a third key.
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        let profile = pm_inner
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "active profile is missing".to_string())?;
+        if let Some(mut runtime) = existing_runtime.clone() {
+            runtime.secret_rotation = RuntimeSecretRotationMetadata {
+                phase: RuntimeSecretRotationPhase::Prepared,
+                current_key_id: Some(device_runtime_key_id.clone()),
+                previous_key_id: previous_device_runtime_key_id.clone(),
+                prepared_at_ms: Some(now_ms),
+                grace_until_ms,
+                ..runtime.secret_rotation
+            };
+            profile
+                .save_runtime_rotation_state(&runtime, &prepared_secrets)
+                .map_err(|error| format!("failed to persist prepared rotation state: {error}"))?;
+        } else {
+            profile
+                .save_runtime_secrets(&prepared_secrets)
+                .map_err(|error| format!("failed to persist prepared runtime secrets: {error}"))?;
+        }
+    }
 
     let config = WorkerDeployConfig {
         worker_name: existing_runtime
@@ -637,6 +736,14 @@ pub async fn cloudflare_deploy(
             .unwrap_or(defaults.preview_bucket_name),
         sharing_token_secret,
         bootstrap_token_secret,
+        bootstrap_key_id: bootstrap_key_id.clone(),
+        previous_bootstrap_secret,
+        previous_bootstrap_key_id,
+        device_runtime_secret,
+        device_runtime_key_id: device_runtime_key_id.clone(),
+        previous_device_runtime_secret,
+        previous_device_runtime_key_id: previous_device_runtime_key_id.clone(),
+        auth_rotation_grace_until_ms: grace_until_ms,
         max_inline_bytes: 4096,
         retention_days: 30,
         rate_limit_per_minute: 60,
@@ -650,7 +757,7 @@ pub async fn cloudflare_deploy(
         message_request_rate_limit_hour: 300,
     };
 
-    if repaired_sharing_secret || repaired_bootstrap_secret {
+    if repaired_sharing_secret || repaired_bootstrap_secret || generated_device_runtime_secret {
         let _ = app.emit(
             "cloudflare-progress",
             DeployProgress {
@@ -799,6 +906,20 @@ pub async fn cloudflare_deploy(
             bucket_name: Some(config.bucket_name.clone()),
             preview_bucket_name: Some(config.preview_bucket_name.clone()),
             last_deployed_at: Some(chrono::Utc::now().to_rfc3339()),
+            secret_rotation: RuntimeSecretRotationMetadata {
+                phase: if grace_until_ms.is_some() {
+                    RuntimeSecretRotationPhase::Grace
+                } else {
+                    RuntimeSecretRotationPhase::Stable
+                },
+                current_key_id: Some(device_runtime_key_id),
+                previous_key_id: previous_device_runtime_key_id,
+                prepared_at_ms: None,
+                last_rotated_at_ms: Some(now_ms),
+                next_rotation_at_ms: Some(now_ms.saturating_add(AUTH_ROTATION_INTERVAL_MS)),
+                grace_until_ms,
+                last_error: None,
+            },
         };
 
         persist_runtime_writeback(&state, &deployment_bundle, &runtime, &result.worker_url).await?;
@@ -824,6 +945,241 @@ pub async fn cloudflare_deploy(
     restart_runtime_session_after_deploy(&app, &state, &device_id).await;
 
     Ok(result)
+}
+
+async fn prepare_runtime_secret_rotation(state: &State<'_, AppState>) -> Result<(), String> {
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let inner = state.inner.read().await;
+    let pm_inner = inner.profile_manager.inner.read().await;
+    let profile = pm_inner
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile is loaded.".to_string())?;
+    let mut runtime = profile.load_runtime_metadata().map_err(|e| e.to_string())?;
+    let mut secrets = profile.load_runtime_secrets().map_err(|e| e.to_string())?;
+
+    match runtime.secret_rotation.phase {
+        RuntimeSecretRotationPhase::Prepared
+        | RuntimeSecretRotationPhase::Deploying
+        | RuntimeSecretRotationPhase::Failed => return Ok(()),
+        RuntimeSecretRotationPhase::Grace => {
+            return Err(
+                "The current rotation is still in grace; finalize it before rotating again.".into(),
+            )
+        }
+        RuntimeSecretRotationPhase::PendingAuthorization
+            if secrets.previous_device_runtime_secret.is_some()
+                || secrets.previous_bootstrap_secret.is_some() =>
+        {
+            // Authorization expired after preparation. Reuse the exact prepared
+            // key set instead of creating a third generation.
+            return Ok(());
+        }
+        RuntimeSecretRotationPhase::Stable | RuntimeSecretRotationPhase::PendingAuthorization => {}
+    }
+
+    let old_runtime_secret = secrets
+        .device_runtime_secret
+        .clone()
+        .or_else(|| secrets.sharing_secret.clone())
+        .ok_or_else(|| "Current device runtime secret is missing.".to_string())?;
+    let old_runtime_key_id = secrets.device_runtime_key_id.clone();
+    let old_bootstrap_secret = secrets
+        .bootstrap_secret
+        .clone()
+        .ok_or_else(|| "Current bootstrap secret is missing.".to_string())?;
+    let old_bootstrap_key_id = secrets.bootstrap_key_id.clone();
+    let (new_runtime_secret, _) = repair_worker_secret(None);
+    let (new_bootstrap_secret, _) = repair_worker_secret(None);
+    let new_runtime_key_id = generate_runtime_key_id("runtime");
+    let new_bootstrap_key_id = generate_runtime_key_id("bootstrap");
+    let grace_until_ms = now_ms.saturating_add(AUTH_ROTATION_GRACE_MS);
+
+    secrets.previous_device_runtime_secret = Some(old_runtime_secret);
+    secrets.previous_device_runtime_key_id = old_runtime_key_id.clone();
+    secrets.device_runtime_secret = Some(new_runtime_secret);
+    secrets.device_runtime_key_id = Some(new_runtime_key_id.clone());
+    secrets.previous_bootstrap_secret = Some(old_bootstrap_secret);
+    secrets.previous_bootstrap_key_id = old_bootstrap_key_id;
+    secrets.bootstrap_secret = Some(new_bootstrap_secret);
+    secrets.bootstrap_key_id = Some(new_bootstrap_key_id);
+
+    runtime.secret_rotation = RuntimeSecretRotationMetadata {
+        phase: RuntimeSecretRotationPhase::Prepared,
+        current_key_id: Some(new_runtime_key_id),
+        previous_key_id: old_runtime_key_id,
+        prepared_at_ms: Some(now_ms),
+        last_rotated_at_ms: runtime.secret_rotation.last_rotated_at_ms,
+        next_rotation_at_ms: runtime.secret_rotation.next_rotation_at_ms,
+        grace_until_ms: Some(grace_until_ms),
+        last_error: None,
+    };
+    profile
+        .save_runtime_rotation_state(&runtime, &secrets)
+        .map_err(|error| format!("Failed to persist prepared rotation state: {error}"))
+}
+
+#[tauri::command]
+pub async fn cloudflare_rotate_runtime_secrets(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeployResult, String> {
+    prepare_runtime_secret_rotation(&state).await?;
+    cloudflare_deploy(app, state).await
+}
+
+#[tauri::command]
+pub async fn cloudflare_resume_secret_rotation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeployResult, String> {
+    cloudflare_deploy(app, state).await
+}
+
+#[tauri::command]
+pub async fn cloudflare_finalize_secret_rotation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DeployResult, String> {
+    let worker_name = {
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        let profile = pm_inner
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "No active profile is loaded.".to_string())?;
+        let mut runtime = profile.load_runtime_metadata().map_err(|e| e.to_string())?;
+        let mut secrets = profile.load_runtime_secrets().map_err(|e| e.to_string())?;
+        let worker_name = runtime
+            .worker_name
+            .clone()
+            .ok_or_else(|| "Cloudflare worker name is missing.".to_string())?;
+        secrets.previous_device_runtime_secret = None;
+        secrets.previous_device_runtime_key_id = None;
+        secrets.previous_bootstrap_secret = None;
+        secrets.previous_bootstrap_key_id = None;
+        runtime.secret_rotation.phase = RuntimeSecretRotationPhase::Stable;
+        runtime.secret_rotation.previous_key_id = None;
+        runtime.secret_rotation.grace_until_ms = None;
+        runtime.secret_rotation.last_error = None;
+        profile
+            .save_runtime_rotation_state(&runtime, &secrets)
+            .map_err(|error| format!("Failed to finalize rotation state: {error}"))?;
+        worker_name
+    };
+
+    let result = cloudflare_deploy(app, state).await?;
+    if result.success {
+        if let (Ok(whoami), Ok(api_token)) = (
+            crate::commands::cloudflare_oauth::whoami().await,
+            crate::commands::cloudflare_oauth::load_access_token(),
+        ) {
+            if let Some(account_id) = whoami
+                .active_account_id
+                .or_else(|| whoami.accounts.first().map(|item| item.account_id.clone()))
+            {
+                let client = reqwest::Client::new();
+                // Rejection no longer depends on deletion: the deployed grace
+                // deadline is cleared first. Deletion is best-effort cleanup.
+                let _ = cloudflare_rest::delete_worker_secret(
+                    &client,
+                    &api_token,
+                    &account_id,
+                    &worker_name,
+                    "DEVICE_RUNTIME_SECRET_PREVIOUS",
+                )
+                .await;
+                let _ = cloudflare_rest::delete_worker_secret(
+                    &client,
+                    &api_token,
+                    &account_id,
+                    &worker_name,
+                    "BOOTSTRAP_LINK_SECRET_PREVIOUS",
+                )
+                .await;
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub async fn maybe_run_due_secret_rotation(app: &AppHandle) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let (phase, next_rotation_at_ms, grace_until_ms, prepared_at_ms, has_previous) = {
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        let Some(profile) = pm_inner.active_profile.as_ref() else {
+            return Ok(false);
+        };
+        let runtime = profile.load_runtime_metadata().map_err(|e| e.to_string())?;
+        let secrets = profile.load_runtime_secrets().map_err(|e| e.to_string())?;
+        (
+            runtime.secret_rotation.phase,
+            runtime.secret_rotation.next_rotation_at_ms,
+            runtime.secret_rotation.grace_until_ms,
+            runtime.secret_rotation.prepared_at_ms,
+            secrets.previous_device_runtime_secret.is_some()
+                || secrets.previous_bootstrap_secret.is_some(),
+        )
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let due = match phase {
+        RuntimeSecretRotationPhase::Stable => next_rotation_at_ms.is_some_and(|due| due <= now_ms),
+        RuntimeSecretRotationPhase::Prepared
+        | RuntimeSecretRotationPhase::Deploying
+        | RuntimeSecretRotationPhase::Failed => true,
+        RuntimeSecretRotationPhase::Grace => grace_until_ms.is_some_and(|until| until <= now_ms),
+        RuntimeSecretRotationPhase::PendingAuthorization => true,
+    };
+    if !due {
+        return Ok(false);
+    }
+
+    let whoami = crate::commands::cloudflare_oauth::whoami()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !whoami.authenticated {
+        let inner = state.inner.read().await;
+        let pm_inner = inner.profile_manager.inner.read().await;
+        if let Some(profile) = pm_inner.active_profile.as_ref() {
+            let mut runtime = profile.load_runtime_metadata().map_err(|e| e.to_string())?;
+            runtime.secret_rotation.phase = RuntimeSecretRotationPhase::PendingAuthorization;
+            runtime.secret_rotation.last_error =
+                Some("Cloudflare authorization is required to continue secret rotation.".into());
+            profile
+                .save_runtime_metadata(&runtime)
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(false);
+    }
+
+    let result = match phase {
+        RuntimeSecretRotationPhase::Stable => {
+            cloudflare_rotate_runtime_secrets(app.clone(), state).await?
+        }
+        RuntimeSecretRotationPhase::PendingAuthorization
+            if has_previous && grace_until_ms.is_some_and(|until| until <= now_ms) =>
+        {
+            cloudflare_finalize_secret_rotation(app.clone(), state).await?
+        }
+        RuntimeSecretRotationPhase::PendingAuthorization
+            if has_previous || prepared_at_ms.is_some() =>
+        {
+            cloudflare_resume_secret_rotation(app.clone(), state).await?
+        }
+        RuntimeSecretRotationPhase::PendingAuthorization => {
+            cloudflare_rotate_runtime_secrets(app.clone(), state).await?
+        }
+        RuntimeSecretRotationPhase::Grace => {
+            cloudflare_finalize_secret_rotation(app.clone(), state).await?
+        }
+        RuntimeSecretRotationPhase::Prepared
+        | RuntimeSecretRotationPhase::Deploying
+        | RuntimeSecretRotationPhase::Failed => {
+            cloudflare_resume_secret_rotation(app.clone(), state).await?
+        }
+    };
+    Ok(result.success)
 }
 
 struct DeployProgressGuard;
@@ -1021,6 +1377,22 @@ async fn cloudflare_status_impl(
     }
 
     let mut status = runtime_status_for_deployment(Some(deployment.clone())).await;
+    status.secret_rotation = Some(runtime.secret_rotation.clone());
+    match runtime.secret_rotation.phase {
+        RuntimeSecretRotationPhase::Prepared | RuntimeSecretRotationPhase::Deploying => {
+            status.action = Some("resume_secret_rotation".into());
+        }
+        RuntimeSecretRotationPhase::Grace => {
+            status.action = Some("finalize_secret_rotation".into());
+        }
+        RuntimeSecretRotationPhase::PendingAuthorization => {
+            status.action = Some("cloudflare_login".into());
+        }
+        RuntimeSecretRotationPhase::Failed => {
+            status.action = Some("resume_secret_rotation".into());
+        }
+        RuntimeSecretRotationPhase::Stable => {}
+    }
     if status.state == "ready" && device_runtime_auth_expired(&deployment) {
         status.state = "auth_expired".into();
         status.action = Some("refresh_auth".into());

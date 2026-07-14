@@ -61,6 +61,14 @@ pub struct WorkerDeployConfig {
     pub preview_bucket_name: String,
     pub sharing_token_secret: String,
     pub bootstrap_token_secret: String,
+    pub bootstrap_key_id: String,
+    pub previous_bootstrap_secret: Option<String>,
+    pub previous_bootstrap_key_id: Option<String>,
+    pub device_runtime_secret: String,
+    pub device_runtime_key_id: String,
+    pub previous_device_runtime_secret: Option<String>,
+    pub previous_device_runtime_key_id: Option<String>,
+    pub auth_rotation_grace_until_ms: Option<u64>,
     pub max_inline_bytes: u32,
     pub retention_days: u32,
     pub rate_limit_per_minute: u32,
@@ -242,6 +250,31 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
                 "type": "plain_text",
                 "name": "MESSAGE_REQUEST_RATE_LIMIT_HOUR",
                 "text": config.message_request_rate_limit_hour.to_string(),
+            },
+            {
+                "type": "plain_text",
+                "name": "BOOTSTRAP_LINK_SECRET_KEY_ID",
+                "text": config.bootstrap_key_id,
+            },
+            {
+                "type": "plain_text",
+                "name": "BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID",
+                "text": config.previous_bootstrap_key_id.clone().unwrap_or_default(),
+            },
+            {
+                "type": "plain_text",
+                "name": "DEVICE_RUNTIME_SECRET_KEY_ID",
+                "text": config.device_runtime_key_id,
+            },
+            {
+                "type": "plain_text",
+                "name": "DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID",
+                "text": config.previous_device_runtime_key_id.clone().unwrap_or_default(),
+            },
+            {
+                "type": "plain_text",
+                "name": "AUTH_ROTATION_GRACE_UNTIL_MS",
+                "text": config.auth_rotation_grace_until_ms.map(|value| value.to_string()).unwrap_or_default(),
             },
         ],
     });
@@ -487,6 +520,32 @@ pub async fn write_worker_secret(
     }
 
     Ok(())
+}
+
+pub async fn delete_worker_secret(
+    client: &Client,
+    api_token: &str,
+    account_id: &str,
+    worker_name: &str,
+    secret_name: &str,
+) -> Result<(), String> {
+    let url = format!(
+        "{}/accounts/{}/workers/scripts/{}/secrets/{}",
+        CF_API_BASE, account_id, worker_name, secret_name
+    );
+    let response = client
+        .delete(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|error| format!("Secret delete request failed: {error}"))?;
+    if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(format!(
+        "Failed to delete secret {secret_name}: HTTP {}",
+        response.status()
+    ))
 }
 
 /// Enable workers.dev subdomain routing for a Worker
@@ -744,6 +803,37 @@ pub async fn deploy_via_rest_api(
         &config.sharing_token_secret,
     )
     .await?;
+    if let Some(previous) = &config.previous_bootstrap_secret {
+        write_worker_secret(
+            &client,
+            api_token,
+            account_id,
+            &config.worker_name,
+            "BOOTSTRAP_LINK_SECRET_PREVIOUS",
+            previous,
+        )
+        .await?;
+    }
+    write_worker_secret(
+        &client,
+        api_token,
+        account_id,
+        &config.worker_name,
+        "DEVICE_RUNTIME_SECRET",
+        &config.device_runtime_secret,
+    )
+    .await?;
+    if let Some(previous) = &config.previous_device_runtime_secret {
+        write_worker_secret(
+            &client,
+            api_token,
+            account_id,
+            &config.worker_name,
+            "DEVICE_RUNTIME_SECRET_PREVIOUS",
+            previous,
+        )
+        .await?;
+    }
     write_worker_secret(
         &client,
         api_token,
@@ -899,6 +989,14 @@ mod tests {
             preview_bucket_name: "tapchat-storage-preview".into(),
             sharing_token_secret: "sharing".into(),
             bootstrap_token_secret: "bootstrap".into(),
+            bootstrap_key_id: "bootstrap-key".into(),
+            previous_bootstrap_secret: None,
+            previous_bootstrap_key_id: None,
+            device_runtime_secret: "runtime".into(),
+            device_runtime_key_id: "runtime-key".into(),
+            previous_device_runtime_secret: None,
+            previous_device_runtime_key_id: None,
+            auth_rotation_grace_until_ms: None,
             max_inline_bytes: 4096,
             retention_days: 30,
             rate_limit_per_minute: 60,

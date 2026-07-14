@@ -220,6 +220,17 @@ export async function handleGroupOutboxDurableRequest(
       if (isCreate && authState.role !== "owner") {
         throw new HttpError(403, "invalid_capability", "only the current owner may commit group genesis");
       }
+      const authoritativeManifest = authState.state.manifest;
+      if (
+        body.expectedPreviousRosterVersion !== authoritativeManifest.rosterVersion ||
+        (body.expectedPreviousCommitMessageId ?? "") !== (authoritativeManifest.lastCommitMessageId ?? "")
+      ) {
+        // Classify a stale optimistic-concurrency base before validating the
+        // proposed proof against the newer manifest. Otherwise a legitimate
+        // race is reported as terminal group_transition_invalid and clients
+        // cannot enter their reconciliation FSM.
+        throw new HttpError(409, "roster_version_conflict", "group transition base does not match the authoritative roster");
+      }
       const proof = body.envelopes.find((envelope) => envelope.membershipProof)?.membershipProof;
       const preparedUpdate = await authorization.prepareUpdate(
         authState.state,

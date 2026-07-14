@@ -327,6 +327,9 @@ pub fn run() {
             commands::cloudflare::cloudflare_import_legacy_wrangler_token,
             commands::cloudflare::cloudflare_deploy,
             commands::cloudflare::cloudflare_status,
+            commands::cloudflare::cloudflare_rotate_runtime_secrets,
+            commands::cloudflare::cloudflare_resume_secret_rotation,
+            commands::cloudflare::cloudflare_finalize_secret_rotation,
             // Session
             commands::session::start_realtime_session,
             commands::session::stop_realtime_session,

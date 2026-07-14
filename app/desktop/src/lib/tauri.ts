@@ -493,6 +493,7 @@ export type GroupMessageView =
       has_attachment: boolean;
       storage_refs: StorageRef[];
       raw_message_type: string;
+      delivery_state?: "sending" | "sent" | "failed";
     }
   | {
       kind: "system_banner";
@@ -533,6 +534,7 @@ export interface SendGroupTextResult {
   plaintext: string;
   created_at: number;
   pending_group_outbox: number;
+  delivery_state?: "sending" | "sent" | "failed";
 }
 
 export interface SyncGroupOutboxResult {

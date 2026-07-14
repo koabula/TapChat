@@ -1644,6 +1644,40 @@ pub struct DeviceRuntimeAuth {
     pub user_id: String,
     pub device_id: String,
     pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRuntimeRefreshChallenge {
+    pub version: String,
+    pub origin: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub nonce: String,
+    pub expires_at: u64,
+}
+
+impl DeviceRuntimeRefreshChallenge {
+    pub fn signing_payload(&self) -> String {
+        [
+            "tapchat.device_runtime_refresh.v1".to_string(),
+            format!("origin={}", self.origin),
+            format!("user_id={}", self.user_id),
+            format!("device_id={}", self.device_id),
+            format!("nonce={}", self.nonce),
+            format!("expires_at={}", self.expires_at),
+        ]
+        .join("\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRuntimeRefreshProof {
+    pub challenge: DeviceRuntimeRefreshChallenge,
+    pub signature: String,
 }
 
 impl Validate for DeviceRuntimeAuth {
@@ -2379,6 +2413,7 @@ mod tests {
                     "shared_state_write".into(),
                     "keypackage_write".into(),
                 ],
+                key_id: None,
             }),
             expected_user_id: Some("user:alice".into()),
             expected_device_id: Some("device:alice:phone".into()),
@@ -2407,6 +2442,7 @@ mod tests {
                 user_id: "user:alice".into(),
                 device_id: "device:alice:phone".into(),
                 scopes: vec!["inbox_read".into()],
+                key_id: None,
             }),
             expected_user_id: None,
             expected_device_id: None,

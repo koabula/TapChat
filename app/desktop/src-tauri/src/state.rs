@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tapchat_core::CoreEngine;
-use tokio::sync::{Mutex, RwLock};
+use tapchat_core::{CoreEffect, CoreEngine};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;
@@ -29,7 +29,20 @@ pub struct AppState {
     pub ws_status: Arc<RwLock<WsStatusSnapshot>>,
     pub foreground_sync_gate: Arc<Mutex<ForegroundSyncGate>>,
     pub recovery_phrase_gate: Arc<Mutex<RecoveryPhraseGate>>,
+    pub deferred_transport_tx: mpsc::Sender<DeferredTransportBatch>,
+    pub deferred_transport_rx: Arc<Mutex<Option<mpsc::Receiver<DeferredTransportBatch>>>>,
+    pub deferred_send_gate: Arc<Mutex<()>>,
 }
+
+/// A persisted batch waiting for serialized network dispatch. The profile path
+/// prevents a queued send from borrowing credentials after a profile switch.
+pub struct DeferredTransportBatch {
+    pub effects: Vec<CoreEffect>,
+    pub profile_path: Option<PathBuf>,
+    pub enqueued_at: Instant,
+}
+
+const DEFERRED_TRANSPORT_QUEUE_CAPACITY: usize = 128;
 
 pub struct AppStateInner {
     pub engine: CoreEngine,
@@ -126,6 +139,8 @@ impl AppState {
         let profile_manager = ProfileManager::new();
         let inner_arc = profile_manager.inner_arc();
         let ports = DesktopPlatformPorts::new(inner_arc);
+        let (deferred_transport_tx, deferred_transport_rx) =
+            mpsc::channel(DEFERRED_TRANSPORT_QUEUE_CAPACITY);
         Self {
             inner: Arc::new(RwLock::new(AppStateInner {
                 engine: CoreEngine::new(),
@@ -139,6 +154,9 @@ impl AppState {
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
             foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
             recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
+            deferred_transport_tx,
+            deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
+            deferred_send_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -147,6 +165,8 @@ impl AppState {
         let profile_manager = ProfileManager::with_profile_name(name);
         let inner_arc = profile_manager.inner_arc();
         let ports = DesktopPlatformPorts::new(inner_arc);
+        let (deferred_transport_tx, deferred_transport_rx) =
+            mpsc::channel(DEFERRED_TRANSPORT_QUEUE_CAPACITY);
         Self {
             inner: Arc::new(RwLock::new(AppStateInner {
                 engine: CoreEngine::new(),
@@ -160,6 +180,9 @@ impl AppState {
             ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
             foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
             recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
+            deferred_transport_tx,
+            deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
+            deferred_send_gate: Arc::new(Mutex::new(())),
         }
     }
 

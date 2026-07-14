@@ -63,3 +63,9 @@ keyring = { version = "3", default-features = false, features = ["linux-native-s
 tapchat_transport_adapter = { path = "crates/tapchat_transport_adapter" }
 tapchat-desktop = { path = "app/desktop/src-tauri", default-features = false, features = ["test-support"] }
 proptest = "1.11"
+
+# hpke-rs 0.6.1 lists its optional libcrux provider in Cargo.lock even though
+# TapChat uses only the RustCrypto provider. Pin the upstream provider manifest
+# that upgrades the vulnerable libcrux-aead 0.0.7 chain to 0.0.8.
+[patch.crates-io]
+hpke-rs-libcrux = { git = "https://github.com/cryspen/hpke-rs.git", rev = "0a4aa953e157111b9a00c9cfc586e9c6a2778e9f" }

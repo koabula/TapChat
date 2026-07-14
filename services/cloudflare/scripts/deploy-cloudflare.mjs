@@ -117,6 +117,10 @@ function generateSecret() {
   return randomBytes(32).toString("hex");
 }
 
+function generateKeyId() {
+  return `key-${randomBytes(8).toString("hex")}`;
+}
+
 function validateSecret(value, label) {
   const normalized = String(value ?? "").trim();
   if (
@@ -192,6 +196,7 @@ async function runCommand(command, args, options = {}) {
 function coerceResolvedConfig(config) {
   const configuredSharingSecret = config.sharing_internal_secret ?? config.sharing_token_secret ?? config.sharingTokenSecret;
   const configuredBootstrapSecret = config.bootstrap_link_secret ?? config.bootstrap_token_secret ?? config.bootstrapTokenSecret;
+  const configuredRuntimeSecret = config.device_runtime_secret ?? config.deviceRuntimeSecret;
   return {
     workerName: config.worker_name ?? config.workerName,
     publicBaseUrl: normalizeBaseUrl(config.public_base_url ?? config.publicBaseUrl ?? ""),
@@ -211,6 +216,14 @@ function coerceResolvedConfig(config) {
     previewBucketName: config.preview_bucket_name ?? config.previewBucketName,
     sharingTokenSecret: configuredSharingSecret ?? generateSecret(),
     bootstrapTokenSecret: configuredBootstrapSecret ?? generateSecret(),
+    bootstrapTokenKeyId: config.bootstrap_token_key_id ?? config.bootstrapTokenKeyId ?? generateKeyId(),
+    bootstrapPreviousSecret: config.bootstrap_previous_secret ?? config.bootstrapPreviousSecret,
+    bootstrapPreviousKeyId: config.bootstrap_previous_key_id ?? config.bootstrapPreviousKeyId,
+    deviceRuntimeSecret: configuredRuntimeSecret ?? generateSecret(),
+    deviceRuntimeKeyId: config.device_runtime_key_id ?? config.deviceRuntimeKeyId ?? generateKeyId(),
+    deviceRuntimePreviousSecret: config.device_runtime_previous_secret ?? config.deviceRuntimePreviousSecret,
+    deviceRuntimePreviousKeyId: config.device_runtime_previous_key_id ?? config.deviceRuntimePreviousKeyId,
+    authRotationGraceUntilMs: config.auth_rotation_grace_until_ms ?? config.authRotationGraceUntilMs,
     generatedPublicBaseUrl: !normalizeBaseUrl(config.public_base_url ?? config.publicBaseUrl ?? ""),
     generatedSharingSecret: !configuredSharingSecret,
     generatedBootstrapSecret: !configuredBootstrapSecret
@@ -255,6 +268,7 @@ async function collectInputs() {
 
     const generatedSharingSecret = generateSecret();
     const generatedBootstrapSecret = generateSecret();
+    const generatedRuntimeSecret = generateSecret();
     const sharingTokenSecret = (
       await rl.question(`SHARING_INTERNAL_SECRET [press Enter to auto-generate]: `)
     ).trim() || generatedSharingSecret;
@@ -281,6 +295,14 @@ async function collectInputs() {
       previewBucketName,
       sharingTokenSecret,
       bootstrapTokenSecret,
+      bootstrapTokenKeyId: generateKeyId(),
+      bootstrapPreviousSecret: undefined,
+      bootstrapPreviousKeyId: undefined,
+      deviceRuntimeSecret: generatedRuntimeSecret,
+      deviceRuntimeKeyId: generateKeyId(),
+      deviceRuntimePreviousSecret: undefined,
+      deviceRuntimePreviousKeyId: undefined,
+      authRotationGraceUntilMs: undefined,
       generatedPublicBaseUrl: !publicBaseUrl,
       generatedSharingSecret: sharingTokenSecret === generatedSharingSecret,
       generatedBootstrapSecret: bootstrapTokenSecret === generatedBootstrapSecret
@@ -314,6 +336,23 @@ function updateConfig(baseConfig, config) {
     MESSAGE_REQUEST_RATE_LIMIT_MINUTE: config.messageRequestRateLimitMinute,
     MESSAGE_REQUEST_RATE_LIMIT_HOUR: config.messageRequestRateLimitHour
   };
+  rendered.vars.BOOTSTRAP_LINK_SECRET_KEY_ID = config.bootstrapTokenKeyId;
+  rendered.vars.DEVICE_RUNTIME_SECRET_KEY_ID = config.deviceRuntimeKeyId;
+  if (config.bootstrapPreviousKeyId) {
+    rendered.vars.BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID = config.bootstrapPreviousKeyId;
+  } else {
+    delete rendered.vars.BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID;
+  }
+  if (config.deviceRuntimePreviousKeyId) {
+    rendered.vars.DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID = config.deviceRuntimePreviousKeyId;
+  } else {
+    delete rendered.vars.DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID;
+  }
+  if (config.authRotationGraceUntilMs != null) {
+    rendered.vars.AUTH_ROTATION_GRACE_UNTIL_MS = String(config.authRotationGraceUntilMs);
+  } else {
+    delete rendered.vars.AUTH_ROTATION_GRACE_UNTIL_MS;
+  }
   if (config.publicBaseUrl) {
     rendered.vars.PUBLIC_BASE_URL = config.publicBaseUrl;
   } else {
@@ -421,6 +460,14 @@ function validateDeployUrl(publicBaseUrl, deployUrl) {
   };
 }
 
+async function deleteSecretBestEffort(configPath, name) {
+  await runCommand(NODE_COMMAND, wranglerArgs("secret", "delete", name, "--config", configPath), {
+    input: "y\n",
+    capture: true,
+    allowFailure: true
+  });
+}
+
 async function verifyRuntimeConfiguration(baseUrl) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
@@ -506,8 +553,9 @@ async function main() {
   const config = await collectInputs();
   validateSecret(config.sharingTokenSecret, "SHARING_INTERNAL_SECRET");
   validateSecret(config.bootstrapTokenSecret, "BOOTSTRAP_LINK_SECRET");
-  if (config.sharingTokenSecret === config.bootstrapTokenSecret) {
-    throw new Error("Sharing and bootstrap secrets must be independent values.");
+  validateSecret(config.deviceRuntimeSecret, "DEVICE_RUNTIME_SECRET");
+  if (new Set([config.sharingTokenSecret, config.bootstrapTokenSecret, config.deviceRuntimeSecret]).size !== 3) {
+    throw new Error("Sharing, bootstrap, and device runtime secrets must be independent values.");
   }
   const baseConfig = await readFile(CONFIG_PATH, "utf8");
   const renderedConfig = updateConfig(baseConfig, config);
@@ -522,7 +570,14 @@ async function main() {
 
     logStep("Writing Cloudflare secrets");
     await putSecret(tempConfigPath, "SHARING_INTERNAL_SECRET", config.sharingTokenSecret);
+    if (config.bootstrapPreviousSecret) {
+      await putSecret(tempConfigPath, "BOOTSTRAP_LINK_SECRET_PREVIOUS", config.bootstrapPreviousSecret);
+    }
+    if (config.deviceRuntimePreviousSecret) {
+      await putSecret(tempConfigPath, "DEVICE_RUNTIME_SECRET_PREVIOUS", config.deviceRuntimePreviousSecret);
+    }
     await putSecret(tempConfigPath, "BOOTSTRAP_LINK_SECRET", config.bootstrapTokenSecret);
+    await putSecret(tempConfigPath, "DEVICE_RUNTIME_SECRET", config.deviceRuntimeSecret);
 
     if (DESKTOP_BUNDLED) {
       logStep("Skipping pre-deploy checks in desktop bundled mode");
@@ -567,6 +622,12 @@ async function main() {
 
     logStep("Verifying runtime security configuration");
     await verifyRuntimeConfiguration(validation.effectiveBaseUrl ?? deployUrl);
+    if (!config.bootstrapPreviousSecret) {
+      await deleteSecretBestEffort(tempConfigPath, "BOOTSTRAP_LINK_SECRET_PREVIOUS");
+    }
+    if (!config.deviceRuntimePreviousSecret) {
+      await deleteSecretBestEffort(tempConfigPath, "DEVICE_RUNTIME_SECRET_PREVIOUS");
+    }
 
     const structuredResult = {
       success: true,

@@ -1208,12 +1208,13 @@ impl TransportPort for CoreDriver {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    let code = extract_error_code(&body);
                     return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                         group_id: append.group_id,
                         message_id: append.envelope.message_id,
-                        retryable: status >= 500,
+                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
                         status: Some(status),
-                        code: extract_error_code(&body),
+                        code,
                         detail: Some(body),
                     }]);
                 }
@@ -1337,12 +1338,13 @@ impl TransportPort for CoreDriver {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    let code = extract_error_code(&body);
                     return Ok(vec![CoreEvent::GroupTransitionAppendFailed {
                         group_id,
                         transition_id,
-                        retryable: status >= 500,
+                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
                         status: Some(status),
-                        code: extract_error_code(&body),
+                        code,
                         detail: Some(format!("HTTP {status}: {body}")),
                     }]);
                 }

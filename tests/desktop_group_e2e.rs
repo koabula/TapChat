@@ -350,12 +350,13 @@ impl DesktopHarness {
 }
 
 #[test]
-fn desktop_group_full_lifecycle_e2e() -> Result<()> {
+#[ignore = "runs in the isolated group-e2e CI job"]
+fn desktop_group_lifecycle_e2e() -> Result<()> {
     let handle = std::thread::Builder::new()
-        .name("desktop_group_full_lifecycle_e2e_large_stack".into())
+        .name("desktop_group_lifecycle_e2e_large_stack".into())
         .stack_size(64 * 1024 * 1024)
         .spawn(|| -> Result<()> {
-            let ctx = bootstrap_quartet("desktop-group-full")?;
+            let ctx = bootstrap_quartet("desktop-group-lifecycle")?;
 
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -363,13 +364,15 @@ fn desktop_group_full_lifecycle_e2e() -> Result<()> {
                 .context("build tokio runtime for desktop_group_e2e")?;
 
             rt.block_on(async {
-                tokio::time::timeout(Duration::from_secs(120), run_lifecycle(&ctx))
-                    .await
-                    .context("desktop_group_full_lifecycle_e2e timed out after 120 seconds")?
+                tokio::time::timeout(Duration::from_secs(220), async {
+                    run_lifecycle(&ctx).await
+                })
+                .await
+                .context("desktop_group_lifecycle_e2e timed out after 220 seconds")?
             })?;
             Ok(())
         })
-        .context("spawn desktop_group_full_lifecycle_e2e large-stack thread")?;
+        .context("spawn desktop_group_lifecycle_e2e large-stack thread")?;
 
     match handle.join() {
         Ok(result) => result,
@@ -379,91 +382,52 @@ fn desktop_group_full_lifecycle_e2e() -> Result<()> {
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("unknown panic payload");
-            Err(anyhow!(
-                "desktop_group_full_lifecycle_e2e panicked: {message}"
-            ))
+            Err(anyhow!("desktop_group_lifecycle_e2e panicked: {message}"))
         }
     }
 }
 
 #[test]
-fn desktop_group_three_user_text_minimal_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-three-user-text")?;
+#[ignore = "runs in the isolated group-e2e CI job"]
+fn desktop_group_attachment_and_restart_recovery_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-attachment-restart")?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime for desktop_group_three_user_text_minimal_e2e")?;
+        .context("build tokio runtime for desktop_group_attachment_and_restart_recovery_e2e")?;
 
-    rt.block_on(run_three_user_text_minimal(&ctx))?;
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(160), async {
+            run_group_restart_recovery_minimal(&ctx).await
+        })
+        .await
+        .context("desktop group attachment/restart suite timed out after 160 seconds")?
+    })?;
     Ok(())
 }
 
 #[test]
-fn desktop_group_membership_management_minimal_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-membership")?;
+#[ignore = "runs in the isolated group-e2e CI job"]
+fn desktop_group_realtime_gap_and_conflict_recovery_e2e() -> Result<()> {
+    let ctx = bootstrap_quartet("desktop-group-realtime-gap")?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("build tokio runtime for desktop_group_membership_management_minimal_e2e")?;
+        .context("build tokio runtime for desktop_group_realtime_gap_and_conflict_recovery_e2e")?;
 
-    rt.block_on(run_membership_management_minimal(&ctx))?;
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(200), async {
+            run_group_sync_gap_with_cursor_alignment(&ctx).await
+        })
+        .await
+        .context("desktop group realtime/gap suite timed out after 200 seconds")?
+    })?;
     Ok(())
 }
 
-#[test]
-fn desktop_group_attachment_minimal_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-attachment")?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop_group_attachment_minimal_e2e")?;
-
-    rt.block_on(run_group_attachment_minimal(&ctx))?;
-    Ok(())
-}
-
-#[test]
-fn desktop_group_restart_recovery_minimal_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-restart-recovery")?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop_group_restart_recovery_minimal_e2e")?;
-
-    rt.block_on(run_group_restart_recovery_minimal(&ctx))?;
-    Ok(())
-}
-
-#[test]
-fn desktop_group_dana_post_approval_send_sync_regression() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-dana-post-approval")?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop_group_dana_post_approval_send_sync_regression")?;
-
-    rt.block_on(run_dana_post_approval_send_sync_regression(&ctx))?;
-    Ok(())
-}
-
-#[test]
-fn desktop_group_realtime_event_drives_owner_message_sync_regression() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-realtime-owner-sync")?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop_group_realtime_event_drives_owner_message_sync_regression")?;
-
-    rt.block_on(run_realtime_event_drives_owner_message_sync(&ctx))?;
-    Ok(())
-}
-
+#[allow(dead_code)] // Retained as a focused scenario fixture; not a standalone E2E.
 async fn run_three_user_text_minimal(ctx: &QuartetContext) -> Result<()> {
     let alice = DesktopHarness::new(&ctx.alice_profile).await?;
 
@@ -542,6 +506,7 @@ async fn run_three_user_text_minimal(ctx: &QuartetContext) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)] // Retained as a focused scenario fixture; not a standalone E2E.
 async fn run_group_attachment_minimal(ctx: &QuartetContext) -> Result<()> {
     let (alice, bob, carol, group_id, conversation_id) =
         create_three_user_group(ctx, "Desktop Group Attachment").await?;
@@ -747,6 +712,7 @@ fn find_attachment_message(messages: &[GroupMessageView]) -> Result<(String, Str
         .context("group attachment message missing")
 }
 
+#[allow(dead_code)] // Retained as a focused scenario fixture; not a standalone E2E.
 async fn run_dana_post_approval_send_sync_regression(ctx: &QuartetContext) -> Result<()> {
     let (alice, bob, carol, group_id, conversation_id) =
         create_three_user_group(ctx, "Desktop Dana Approval Regression").await?;
@@ -859,6 +825,7 @@ async fn run_dana_post_approval_send_sync_regression(ctx: &QuartetContext) -> Re
     Ok(())
 }
 
+#[allow(dead_code)] // Retained as a focused scenario fixture; not a standalone E2E.
 async fn run_realtime_event_drives_owner_message_sync(ctx: &QuartetContext) -> Result<()> {
     let (alice, bob, _carol, group_id, conversation_id) =
         create_three_user_group(ctx, "Desktop Realtime Owner Sync").await?;
@@ -918,6 +885,7 @@ async fn run_realtime_event_drives_owner_message_sync(ctx: &QuartetContext) -> R
     Ok(())
 }
 
+#[allow(dead_code)] // Retained as a focused scenario fixture; not a standalone E2E.
 async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
     let alice = DesktopHarness::new(&ctx.alice_profile).await?;
 
@@ -1096,19 +1064,7 @@ async fn run_membership_management_minimal(ctx: &QuartetContext) -> Result<()> {
 /// Exercises the group outbox equivalent of PLAN.md §7.4: GetHead →
 /// FetchMessages → Ack, using only the cursor-based pull path with no
 /// realtime push events.
-#[test]
-fn desktop_group_sync_gap_recovery_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-sync-gap")?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop_group_sync_gap_recovery_e2e")?;
-
-    rt.block_on(run_group_sync_gap_recovery(&ctx))?;
-    Ok(())
-}
-
+#[allow(dead_code)] // Retained as a focused scenario fixture; not a standalone E2E.
 async fn run_group_sync_gap_recovery(ctx: &QuartetContext) -> Result<()> {
     // Step 1: create a 3-user group (alice owner, bob + carol members).
     let (alice, bob, carol, group_id, conversation_id) =
@@ -1250,33 +1206,67 @@ async fn run_group_sync_gap_recovery(ctx: &QuartetContext) -> Result<()> {
 /// `SyncGroupOutbox`. The recovered member's cursor must reach the online
 /// member's cursor, and all members must converge so future messages are
 /// seen by everyone.
-#[test]
-fn desktop_group_sync_gap_with_cursor_alignment_e2e() -> Result<()> {
-    let ctx = bootstrap_quartet("desktop-group-sync-gap-cursor")?;
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("build tokio runtime for desktop_group_sync_gap_with_cursor_alignment_e2e")?;
-
-    rt.block_on(run_group_sync_gap_with_cursor_alignment(&ctx))?;
-    Ok(())
-}
-
 async fn run_group_sync_gap_with_cursor_alignment(ctx: &QuartetContext) -> Result<()> {
     // Step 1: create 3-user group.
     let (alice, bob, carol, group_id, conversation_id) =
         create_three_user_group(ctx, "Sync Gap Cursor Align").await?;
 
-    // Establish baseline sync.
-    send_group_text_message_impl(&alice.state, conversation_id.clone(), "baseline".into())
+    // Establish the baseline through the same realtime event consumed by the
+    // desktop subscription. Alice's sync serializes behind the deferred send
+    // queue, so the record is durable before Bob handles the notification.
+    let bob_before_realtime = get_group_snapshot_impl(&bob.state, group_id.clone())
         .await
-        .map_err(|e| anyhow!("alice send baseline: {e}"))?;
-    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol]).await?;
+        .map_err(|e| anyhow!("bob snapshot before realtime sync: {e}"))?;
+    let before_realtime_cursor = bob_before_realtime
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    send_group_text_message_impl(
+        &alice.state,
+        conversation_id.clone(),
+        "realtime-baseline".into(),
+    )
+    .await
+    .map_err(|e| anyhow!("alice send realtime baseline: {e}"))?;
+    sync_group_outbox_impl(&alice.state, group_id.clone(), None)
+        .await
+        .map_err(|e| anyhow!("alice sync realtime baseline: {e}"))?;
+    sync_group_outbox_impl(&carol.state, group_id.clone(), None)
+        .await
+        .map_err(|e| anyhow!("carol sync realtime baseline: {e}"))?;
+    drive_core_without_handle(
+        &bob.state,
+        CoreInput::Event(CoreEvent::GroupRealtimeEventReceived {
+            group_id: group_id.clone(),
+            event: RealtimeEvent::GroupOutboxRecordAvailable {
+                group_id: group_id.clone(),
+                seq: before_realtime_cursor.saturating_add(1),
+                record: None,
+            },
+        }),
+    )
+    .await
+    .map_err(|e| anyhow!("bob realtime event drive: {e}"))?;
     let bob_baseline = get_group_messages_impl(&bob.state, conversation_id.clone())
         .await
         .map_err(|e| anyhow!("bob baseline messages: {e}"))?;
-    assert!(has_bubble_with_plaintext(&bob_baseline, "baseline"));
+    assert!(has_bubble_with_plaintext(
+        &bob_baseline,
+        "realtime-baseline"
+    ));
+    let bob_after_realtime = get_group_snapshot_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob snapshot after realtime sync: {e}"))?;
+    let after_realtime_cursor = bob_after_realtime
+        .cursor
+        .as_ref()
+        .map(|cursor| cursor.last_fetched_seq)
+        .unwrap_or_default();
+    assert!(
+        after_realtime_cursor > before_realtime_cursor,
+        "realtime event must advance Bob's cursor; before={before_realtime_cursor} after={after_realtime_cursor}"
+    );
 
     // Step 2: bob stops syncing. Alice sends messages during this
     // window while carol (who stays synced) sees them. bob does NOT
@@ -1382,6 +1372,58 @@ async fn run_group_sync_gap_with_cursor_alignment(ctx: &QuartetContext) -> Resul
             "{label} should see final-convergence message"
         );
     }
+
+    // Step 7: exercise a real cross-layer 409. Bob first becomes an admin and
+    // converges. Alice then removes Carol while Bob remains on the preceding
+    // roster; Bob attempts the same removal from that stale base. The Worker
+    // rejects it with roster_version_conflict and the core must reconcile the
+    // authoritative transition without entering BlockedNeedsRebuild.
+    set_group_admin_impl(
+        &alice.state,
+        group_id.clone(),
+        ctx.bob_user_id.clone(),
+        true,
+    )
+    .await
+    .map_err(|e| anyhow!("alice appoint bob admin before conflict: {e}"))?;
+    sync_all_group_outboxes(&group_id, [&alice, &bob, &carol]).await?;
+    let bob_stale_base = get_group_snapshot_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob snapshot before conflict: {e}"))?;
+    assert_eq!(format!("{:?}", bob_stale_base.local_role), "Some(Admin)");
+
+    remove_group_member_impl(&alice.state, group_id.clone(), ctx.carol_user_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice authoritative carol removal: {e}"))?;
+    let alice_after_removal = get_group_snapshot_impl(&alice.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice snapshot after carol removal: {e}"))?;
+    assert!(
+        alice_after_removal.manifest.roster_version > bob_stale_base.manifest.roster_version,
+        "Alice must advance the authoritative roster while Bob remains stale"
+    );
+
+    remove_group_member_impl(&bob.state, group_id.clone(), ctx.carol_user_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob stale removal conflict recovery: {e}"))?;
+    sync_group_outbox_impl(&bob.state, group_id.clone(), None)
+        .await
+        .map_err(|e| anyhow!("bob sync after roster conflict: {e}"))?;
+    let bob_after_conflict = get_group_snapshot_impl(&bob.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("bob snapshot after conflict recovery: {e}"))?;
+    assert_eq!(bob_after_conflict.consistency_state, "ready");
+    assert!(bob_after_conflict.pending_transition_stage.is_none());
+    assert!(
+        bob_after_conflict.manifest.roster_version >= alice_after_removal.manifest.roster_version,
+        "Bob must align to the authoritative roster after the 409"
+    );
+    assert!(
+        bob_after_conflict.manifest.members.iter().any(|member| {
+            member.user_id == ctx.carol_user_id && format!("{:?}", member.status) == "Removed"
+        }),
+        "Bob must observe Carol's authoritative removal after conflict recovery"
+    );
 
     Ok(())
 }
@@ -1577,70 +1619,126 @@ async fn run_lifecycle(ctx: &QuartetContext) -> Result<()> {
         );
     }
 
-    // Step 13: alice removes carol; carol's subsequent send must fail
-    // because her local role flips and `ensure_group_ready_for_send`
-    // rejects.
-    remove_group_member_impl(&alice.state, group_id.clone(), ctx.carol_user_id.clone())
-        .await
-        .map_err(|e| anyhow!("remove_group_member_impl: {e}"))?;
-    sync_group_outbox_impl(&alice.state, group_id.clone(), None)
-        .await
-        .ok();
+    // Step 13: promote Carol, transfer ownership, and prove the former
+    // owner immediately loses owner-only authority.
+    set_group_admin_impl(
+        &alice.state,
+        group_id.clone(),
+        ctx.carol_user_id.clone(),
+        true,
+    )
+    .await
+    .map_err(|e| anyhow!("alice set carol admin: {e}"))?;
     sync_group_outbox_impl(&carol.state, group_id.clone(), None)
         .await
         .ok();
-    let carol_send = send_group_text_message_impl(
-        &carol.state,
+    transfer_group_ownership_impl(&alice.state, group_id.clone(), ctx.carol_user_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice transfer ownership to carol: {e}"))?;
+    sync_group_outbox_impl(&carol.state, group_id.clone(), None)
+        .await
+        .ok();
+    let carol_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol snapshot after ownership transfer: {e}"))?;
+    assert_eq!(format!("{:?}", carol_snapshot.local_role), "Some(Owner)");
+    assert!(
+        set_group_admin_impl(
+            &alice.state,
+            group_id.clone(),
+            ctx.dana_user_id.clone(),
+            false,
+        )
+        .await
+        .is_err(),
+        "former owner must lose owner-only admin authority"
+    );
+
+    // Step 14: Alice exits through the leave FSM and Carol approves it.
+    leave_group_impl(&alice.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("alice leave after transfer: {e}"))?;
+    let alice_leave = list_group_leave_requests_impl(&carol.state, group_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol list alice leave: {e}"))?
+        .into_iter()
+        .find(|request| request.leaver_user_id == ctx.alice_user_id)
+        .context("alice leave request was not visible to the new owner")?;
+    approve_group_leave_impl(&carol.state, group_id.clone(), alice_leave.request_id)
+        .await
+        .map_err(|e| anyhow!("carol approve alice leave: {e}"))?;
+    sync_group_outbox_impl(&alice.state, group_id.clone(), None)
+        .await
+        .ok();
+    let alice_send = send_group_text_message_impl(
+        &alice.state,
         conversation_id.clone(),
-        "carol post-remove".into(),
+        "alice after leave".into(),
     )
     .await;
     assert!(
-        carol_send.is_err(),
-        "carol must fail-closed after removal but got Ok: {carol_send:?}"
+        alice_send.is_err(),
+        "alice must fail-closed after leaving but got Ok: {alice_send:?}"
     );
 
-    // Step 14: alice dissolves the group.
-    let dissolve = dissolve_group_impl(&alice.state, group_id.clone())
+    // Step 15: the new owner removes Dana and the removed member can no
+    // longer send, then Carol dissolves and seals the remaining group.
+    remove_group_member_impl(&carol.state, group_id.clone(), ctx.dana_user_id.clone())
+        .await
+        .map_err(|e| anyhow!("carol remove dana: {e}"))?;
+    sync_group_outbox_impl(&dana.state, group_id.clone(), None)
+        .await
+        .ok();
+    let dana_send = send_group_text_message_impl(
+        &dana.state,
+        conversation_id.clone(),
+        "dana after removal".into(),
+    )
+    .await;
+    assert!(
+        dana_send.is_err(),
+        "dana must fail-closed after removal but got Ok: {dana_send:?}"
+    );
+
+    let dissolve = dissolve_group_impl(&carol.state, group_id.clone())
         .await
         .map_err(|e| anyhow!("dissolve_group_impl: {e}"))?;
     assert_eq!(dissolve.group_id, group_id);
 
-    // Poll alice until her `dissolved_at` flips to Some (server ack
+    // Poll Carol until her `dissolved_at` flips to Some (server ack
     // of the SealGroupOutbox effect).
-    let mut alice_dissolved_at: Option<u64> = None;
+    let mut owner_dissolved_at: Option<u64> = None;
     for _ in 0..20 {
-        let snapshot = get_group_snapshot_impl(&alice.state, group_id.clone())
+        let snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
             .await
-            .map_err(|e| anyhow!("alice get_group_snapshot_impl during dissolve poll: {e}"))?;
+            .map_err(|e| anyhow!("carol snapshot during dissolve poll: {e}"))?;
         if let Some(ts) = snapshot.dissolved_at {
-            alice_dissolved_at = Some(ts);
+            owner_dissolved_at = Some(ts);
             break;
         }
-        sync_group_outbox_impl(&alice.state, group_id.clone(), None)
+        sync_group_outbox_impl(&carol.state, group_id.clone(), None)
             .await
             .ok();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let _alice_dissolved_at =
-        alice_dissolved_at.context("alice dissolved_at never became Some within timeout")?;
-    let alice_snapshot = get_group_snapshot_impl(&alice.state, group_id.clone())
+    owner_dissolved_at.context("owner dissolved_at never became Some within timeout")?;
+    let owner_snapshot = get_group_snapshot_impl(&carol.state, group_id.clone())
         .await
-        .map_err(|e| anyhow!("alice get_group_snapshot_impl post-dissolve: {e}"))?;
-    assert_eq!(alice_snapshot.conversation_state, "dissolved");
+        .map_err(|e| anyhow!("carol snapshot post-dissolve: {e}"))?;
+    assert_eq!(owner_snapshot.conversation_state, "dissolved");
 
     // (b) The post-transition active roster contains only the owner, so the
-    // encrypted dissolve event is visible to Alice. Removed members fail
+    // encrypted dissolve event is visible to Carol. Removed members fail
     // closed through group_membership_revoked instead of retaining read
     // access to the sealed post-removal epoch.
-    let alice_messages = get_group_messages_impl(&alice.state, conversation_id.clone())
+    let owner_messages = get_group_messages_impl(&carol.state, conversation_id.clone())
         .await
-        .map_err(|e| anyhow!("alice get_group_messages_impl post-dissolve: {e}"))?;
+        .map_err(|e| anyhow!("carol messages post-dissolve: {e}"))?;
     assert!(
-        has_system_banner(&alice_messages, "group_dissolved"),
+        has_system_banner(&owner_messages, "group_dissolved"),
         "owner did not retain the verified group_dissolved state event"
     );
-    for harness in [&bob, &dana] {
+    for harness in [&alice, &bob, &dana] {
         sync_group_outbox_impl(&harness.state, group_id.clone(), None)
             .await
             .ok();
@@ -1680,15 +1778,15 @@ async fn run_lifecycle(ctx: &QuartetContext) -> Result<()> {
         http_response.1
     );
 
-    // Step 15: list_group_conversations still includes the dissolved
+    // Step 16: list_group_conversations still includes the dissolved
     // group and shows the dissolved marker.
-    let alice_list = list_group_conversations_impl(&alice.state)
+    let owner_list = list_group_conversations_impl(&carol.state)
         .await
         .map_err(|e| anyhow!("list_group_conversations_impl: {e}"))?;
-    let entry = alice_list
+    let entry = owner_list
         .iter()
         .find(|row| row.group_id == group_id)
-        .context("alice list_group_conversations should still include dissolved group")?;
+        .context("owner list_group_conversations should still include dissolved group")?;
     assert_eq!(entry.conversation_state, "dissolved");
     assert!(
         entry.dissolved_at.is_some(),

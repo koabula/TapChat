@@ -6,10 +6,12 @@ import {
   type AllowlistDocument,
   type AppendEnvelopeRequest,
   type AppendGroupEnvelopeRequest,
+  type AppendGroupTransitionRequest,
   type BootstrapDeviceRequest,
   type CreateGroupInviteRequest,
   type DecideGroupJoinRequest,
   type DeploymentBundle,
+  type DeviceRuntimeRefreshChallenge,
   type DeviceBinding,
   type GroupCapability,
   type GroupCapabilityOperation,
@@ -57,7 +59,13 @@ class TestWebSocketPair {
 (globalThis as Record<string, unknown>).WebSocketPair = TestWebSocketPair;
 
 const { handleRequest } = await import("../src/routes/http");
-const { handleInboxDurableRequest, ManagedSession: InboxManagedSession } = await import("../src/inbox/durable");
+const {
+  deviceRuntimeRefreshSigningPayload,
+  handleInboxDurableRequest,
+  issueDeviceRuntimeAuthChallenge,
+  verifyAndConsumeDeviceRuntimeAuthChallenge,
+  ManagedSession: InboxManagedSession
+} = await import("../src/inbox/durable");
 const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl, ManagedSession: GroupManagedSession } = await import("../src/group-outbox/durable");
 const { InboxService } = await import("../src/inbox/service");
 const { GroupOutboxService } = await import("../src/group-outbox/service");
@@ -162,6 +170,13 @@ class MemoryState implements DurableObjectStorageLike {
 
   async setAlarm(epochMillis: number): Promise<void> {
     this.alarmAt = epochMillis;
+  }
+
+  async consumeIfEqual<T>(key: string, expected: T): Promise<boolean> {
+    const current = this.map.get(key);
+    if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
+    this.map.delete(key);
+    return true;
   }
 }
 
@@ -319,6 +334,14 @@ function createEnv(options?: {
   maxInlineBytes?: string;
   sharingSecret?: string;
   bootstrapSecret?: string;
+  bootstrapKeyId?: string;
+  previousBootstrapSecret?: string;
+  previousBootstrapKeyId?: string;
+  deviceRuntimeSecret?: string;
+  deviceRuntimeKeyId?: string;
+  previousDeviceRuntimeSecret?: string;
+  previousDeviceRuntimeKeyId?: string;
+  authRotationGraceUntilMs?: string;
 }) {
   const bucket = new MemoryR2Store();
   const inboxes = new Map<string, FakeInboxStub>();
@@ -339,6 +362,14 @@ function createEnv(options?: {
     RATE_LIMIT_PER_HOUR: String(rateLimitPerHour),
     SHARING_INTERNAL_SECRET: sharingSecret,
     BOOTSTRAP_LINK_SECRET: bootstrapSecret,
+    BOOTSTRAP_LINK_SECRET_KEY_ID: options?.bootstrapKeyId,
+    BOOTSTRAP_LINK_SECRET_PREVIOUS: options?.previousBootstrapSecret,
+    BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID: options?.previousBootstrapKeyId,
+    DEVICE_RUNTIME_SECRET: options?.deviceRuntimeSecret,
+    DEVICE_RUNTIME_SECRET_KEY_ID: options?.deviceRuntimeKeyId,
+    DEVICE_RUNTIME_SECRET_PREVIOUS: options?.previousDeviceRuntimeSecret,
+    DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID: options?.previousDeviceRuntimeKeyId,
+    AUTH_ROTATION_GRACE_UNTIL_MS: options?.authRotationGraceUntilMs,
     TAPCHAT_STORAGE: bucket.asBucket(),
     INBOX: {
       idFromName(name: string) {
@@ -496,7 +527,7 @@ function signedIdentityFixture(options?: {
     signature: ""
   };
   bundle.signature = signHex(userSecret, identityBundlePayload(bundle, true));
-  return { bundle, capability, deviceId, userId };
+  return { bundle, capability, deviceId, userId, deviceSecret, userSecret };
 }
 
 function capabilityPayload(capability: InboxAppendCapability): string {
@@ -603,6 +634,63 @@ function sampleGroupAppend(
     capability
   };
 }
+
+test("stale group transitions are classified as roster conflicts before proof validation", async () => {
+  const { env } = createEnv();
+  const groupId = "group:stale-transition";
+  const capability = sampleGroupCapability(
+    groupId,
+    ["read", "append_control", "append_membership", "update_group_metadata"],
+    "admin"
+  );
+  const envelope = sampleGroupAppend(
+    groupId,
+    "msg:stale-transition",
+    "control_group_metadata_updated",
+    capability
+  ).envelope;
+  envelope.membershipProof = {
+    type: "membership_signature",
+    operation: "update_metadata",
+    signerUserId: capability.userId,
+    signerDeviceId: capability.deviceId,
+    previousRosterVersion: 0,
+    newRosterVersion: 1,
+    commitMessageId: envelope.messageId,
+    controlMessageId: envelope.messageId,
+    stateEventMessageId: "msg:stale-event",
+    newManifestSha256: "deliberately-not-validated",
+    signature: "deliberately-not-validated"
+  };
+  const request: AppendGroupTransitionRequest = {
+    version: CURRENT_MODEL_VERSION,
+    groupId,
+    transitionId: "transition:stale",
+    operation: { type: "update_metadata" },
+    expectedPreviousRosterVersion: 0,
+    envelopes: [envelope],
+    authorizationUpdate: {
+      manifest: sampleGroupManifest(groupId),
+      identityBundles: []
+    },
+    capability
+  };
+
+  const response = await handleRequest(
+    new Request(`https://example.com/v1/groups/${encodeURIComponent(groupId)}/outbox/transitions`, {
+      method: "POST",
+      headers: {
+        ...groupHeaders(capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(request)
+    }),
+    env
+  );
+  const responseBody = await response.text();
+  assert.equal(response.status, 409, responseBody);
+  assert.equal((JSON.parse(responseBody) as { error?: string }).error, "roster_version_conflict");
+});
 
 interface GroupIdentityFixture {
   userId: string;
@@ -923,6 +1011,160 @@ test("rotating sharing secret invalidates previously issued device runtime token
   );
 
   assert.equal(response.status, 403);
+});
+
+test("device runtime current and previous keys obey the hard grace deadline", async () => {
+  const currentSecret = "runtime-current-secret-0123456789abcdef0123456789abcdef";
+  const previousSecret = "runtime-previous-secret-0123456789abcdef0123456789abcdef";
+  const graceUntil = Date.now() + 60_000;
+  const { env } = createEnv({
+    deviceRuntimeSecret: currentSecret,
+    deviceRuntimeKeyId: "runtime-current",
+    previousDeviceRuntimeSecret: previousSecret,
+    previousDeviceRuntimeKeyId: "runtime-previous",
+    authRotationGraceUntilMs: String(graceUntil)
+  });
+  const payload = {
+    version: CURRENT_MODEL_VERSION,
+    service: "device_runtime",
+    userId: "user:bob",
+    deviceId: "device:bob:phone",
+    scopes: ["inbox_read"],
+    expiresAt: Date.now() + 60_000
+  };
+  const current = await signSharingPayload(currentSecret, { ...payload, keyId: "runtime-current" });
+  const previous = await signSharingPayload(previousSecret, { ...payload, keyId: "runtime-previous" });
+  const unkeyedLegacy = await signSharingPayload(previousSecret, payload);
+  for (const token of [current, previous, unkeyedLegacy]) {
+    const response = await handleRequest(
+      new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(token) }),
+      env
+    );
+    assert.equal(response.status, 200);
+  }
+
+  const expired = createEnv({
+    deviceRuntimeSecret: currentSecret,
+    deviceRuntimeKeyId: "runtime-current",
+    previousDeviceRuntimeSecret: previousSecret,
+    previousDeviceRuntimeKeyId: "runtime-previous",
+    authRotationGraceUntilMs: String(Date.now() - 1)
+  });
+  for (const token of [previous, unkeyedLegacy]) {
+    const response = await handleRequest(
+      new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(token) }),
+      expired.env
+    );
+    assert.equal(response.status, 403);
+  }
+  const currentAfterGrace = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(current) }),
+    expired.env
+  );
+  assert.equal(currentAfterGrace.status, 200);
+});
+
+test("device-signed runtime refresh consumes challenges once and rejects tampering or revoked devices", async () => {
+  const runtimeSecret = "runtime-refresh-secret-0123456789abcdef0123456789abcdef";
+  const { env, bucket } = createEnv({
+    deviceRuntimeSecret: runtimeSecret,
+    deviceRuntimeKeyId: "runtime-refresh"
+  });
+  const fixture = signedIdentityFixture();
+  await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+
+  const challengeResponse = await handleRequest(
+    new Request("https://example.com/v1/runtime-auth/challenge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userId: fixture.userId, deviceId: fixture.deviceId })
+    }),
+    env
+  );
+  assert.equal(challengeResponse.status, 200);
+  const challenge = (await challengeResponse.json()) as DeviceRuntimeRefreshChallenge;
+  const proof = {
+    challenge,
+    signature: signHex(fixture.deviceSecret, deviceRuntimeRefreshSigningPayload(challenge))
+  };
+  const refreshRequest = () =>
+    new Request("https://example.com/v1/runtime-auth/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(proof)
+    });
+  const refreshed = await handleRequest(refreshRequest(), env);
+  assert.equal(refreshed.status, 200);
+  const refreshedBody = (await refreshed.json()) as { deviceRuntimeAuth: { keyId?: string; token: string } };
+  assert.equal(refreshedBody.deviceRuntimeAuth.keyId, "runtime-refresh");
+  assert.ok(refreshedBody.deviceRuntimeAuth.token.length > 32);
+
+  const replay = await handleRequest(refreshRequest(), env);
+  assert.equal(replay.status, 403);
+  assert.equal((await replay.json() as { error: string }).error, "challenge_replayed");
+
+  const tampered = await handleRequest(
+    new Request("https://example.com/v1/runtime-auth/refresh", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge: { ...challenge, nonce: `${challenge.nonce}00` },
+        signature: proof.signature
+      })
+    }),
+    env
+  );
+  assert.equal(tampered.status, 403);
+
+  const revokedBundle = structuredClone(fixture.bundle);
+  revokedBundle.devices[0].status = "revoked";
+  revokedBundle.signature = signHex(fixture.userSecret, identityBundlePayload(revokedBundle, true));
+  await bucket.putJson("shared-state/user:bob/identity_bundle.json", revokedBundle);
+  const revoked = await handleRequest(
+    new Request("https://example.com/v1/runtime-auth/challenge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userId: fixture.userId, deviceId: fixture.deviceId })
+    }),
+    env
+  );
+  assert.equal(revoked.status, 403);
+  assert.equal((await revoked.json() as { error: string }).error, "device_revoked");
+});
+
+test("device runtime refresh rejects an expired challenge", async () => {
+  const state = new MemoryState();
+  const bucket = new MemoryR2Store();
+  const fixture = signedIdentityFixture();
+  await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
+  const issued = await issueDeviceRuntimeAuthChallenge(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/runtime-auth-challenge`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ userId: fixture.userId, deviceId: fixture.deviceId })
+    }),
+    fixture.deviceId,
+    state,
+    bucket,
+    1_000
+  );
+  const challenge = (await issued.json()) as DeviceRuntimeRefreshChallenge;
+  const expired = await verifyAndConsumeDeviceRuntimeAuthChallenge(
+    new Request(`https://example.com/v1/inbox/${fixture.deviceId}/runtime-auth-refresh`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challenge,
+        signature: signHex(fixture.deviceSecret, deviceRuntimeRefreshSigningPayload(challenge))
+      })
+    }),
+    fixture.deviceId,
+    state,
+    bucket,
+    challenge.expiresAt + 1
+  );
+  assert.equal(expired.status, 403);
+  assert.equal((await expired.json() as { error: string }).error, "invalid_challenge");
 });
 
 test("accepts append requests only with explicit capability header", async () => {

@@ -714,6 +714,14 @@ pub enum CloudflareRuntimeSubcommand {
         #[arg(long)]
         profile: Option<PathBuf>,
     },
+    ResumeSecrets {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    FinalizeSecrets {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
     Detach {
         #[arg(long)]
         profile: Option<PathBuf>,

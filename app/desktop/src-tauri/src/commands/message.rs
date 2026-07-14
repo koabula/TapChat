@@ -11,7 +11,9 @@ const ATTACHMENT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::lifecycle::drive_core_without_handle;
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{
+    drive_core_persist_then_defer_transport, drive_core_with_handle, CoreInput,
+};
 use crate::platform::log_sanitize::redact_id;
 use crate::state::AppState;
 use crate::timetest;
@@ -24,6 +26,7 @@ pub struct SendMessageResult {
     pub sender_device_id: String,
     pub plaintext: String,
     pub created_at: u64,
+    pub delivery_state: String,
 }
 
 fn normalize_direct_send_error(error: &str) -> String {
@@ -48,7 +51,7 @@ pub async fn send_text(
         abs_start
     );
 
-    let output = drive_core_with_handle(
+    let output = drive_core_persist_then_defer_transport(
         &app,
         CoreInput::Command(CoreCommand::SendTextMessage {
             conversation_id: conversation_id.clone(),
@@ -88,6 +91,7 @@ pub async fn send_text(
         sender_device_id,
         plaintext,
         created_at: crate::ts_ms().min(u64::MAX as u128) as u64,
+        delivery_state: "sending".into(),
     })
 }
 

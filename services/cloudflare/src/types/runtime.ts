@@ -6,6 +6,7 @@ export interface DurableObjectStorageLike {
   delete(key: string): Promise<void>;
   list<T>(options?: { prefix?: string }): Promise<Map<string, T>>;
   setAlarm(epochMillis: number): Promise<void>;
+  consumeIfEqual?<T>(key: string, expected: T): Promise<boolean>;
 }
 
 export interface JsonBlobStore {

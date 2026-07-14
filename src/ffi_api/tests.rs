@@ -16,9 +16,10 @@ mod tests {
         CapabilityService, ConversationKind, ConversationState, DeliveryClass, DeploymentBundle,
         DeviceRuntimeAuth, Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
         GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
-        GroupMemberStatus, GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
-        IdentityBundle, InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo,
-        WakeHint, WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
+        GroupManifest, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
+        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord,
+        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
+        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{
         ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp,
@@ -191,6 +192,96 @@ mod tests {
     }
 
     #[test]
+    fn direct_send_characterization_keeps_snapshot_output_and_effect_order_stable() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("import bob");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id);
+        let pending_before_send = alice.state.pending_outbox.len();
+
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "characterization".into(),
+            })
+            .expect("send text");
+
+        assert_eq!(
+            output
+                .effects
+                .iter()
+                .map(|effect| match effect {
+                    CoreEffect::PersistState { .. } => "persist_state",
+                    CoreEffect::ExecuteHttpRequest { .. } => "execute_http_request",
+                    _ => "unexpected",
+                })
+                .collect::<Vec<_>>(),
+            vec!["persist_state", "execute_http_request"]
+        );
+        assert!(output.state_update.messages_changed);
+        assert_eq!(
+            output
+                .view_model
+                .as_ref()
+                .expect("view model")
+                .messages
+                .len(),
+            1
+        );
+
+        let persisted = extract_snapshot(&output);
+        assert_eq!(persisted.pending_outbox.len(), pending_before_send + 1);
+        assert_eq!(
+            persisted
+                .pending_outbox
+                .last()
+                .expect("new pending envelope")
+                .plaintext_cache
+                .as_deref(),
+            Some("characterization")
+        );
+        assert_eq!(persisted.pending_outbox.last().expect("pending").retries, 0);
+        assert!(
+            alice
+                .state
+                .pending_outbox
+                .last()
+                .expect("pending")
+                .in_flight
+        );
+        assert_eq!(
+            alice.state.pending_outbox.last().expect("pending").retries,
+            0
+        );
+
+        let restored =
+            CoreEngine::try_from_restored_state(persisted).expect("restore persisted send");
+        assert_eq!(restored.state.pending_outbox.len(), pending_before_send + 1);
+        assert!(
+            !restored
+                .state
+                .pending_outbox
+                .last()
+                .expect("restored pending")
+                .in_flight
+        );
+
+        let before_invalid = alice.refresh_snapshot();
+        let error = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "   ".into(),
+            })
+            .expect_err("blank text must fail");
+        assert_eq!(error.code(), "invalid_input");
+        assert_eq!(alice.refresh_snapshot(), before_invalid);
+    }
+
+    #[test]
     fn identity_bundle_verification_accepts_legacy_display_name_signature() {
         let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
@@ -246,6 +337,46 @@ mod tests {
             assert!(json.contains("group"));
             let decoded: CoreCommand = serde_json::from_str(&json).expect("deserialize command");
             assert_eq!(decoded, command);
+        }
+    }
+
+    #[test]
+    fn shared_group_protocol_fixture_matches_wire_hash_payload_and_role_matrix() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test-fixtures/group-protocol-v1.json"))
+                .expect("group protocol fixture");
+        let manifest: GroupManifest =
+            serde_json::from_value(fixture["manifest"].clone()).expect("manifest fixture");
+        let proof: GroupMembershipProof =
+            serde_json::from_value(fixture["membershipProof"].clone())
+                .expect("membership proof fixture");
+
+        assert_eq!(
+            CoreEngine::manifest_sha256(&manifest).expect("manifest hash"),
+            fixture["expected"]["manifestSha256"]
+                .as_str()
+                .expect("expected hash")
+        );
+        assert_eq!(
+            String::from_utf8(CoreEngine::membership_proof_payload(&proof))
+                .expect("membership payload utf8"),
+            fixture["expected"]["membershipProofPayload"]
+                .as_str()
+                .expect("expected payload")
+        );
+        let encoded = serde_json::to_value(&manifest).expect("manifest json");
+        assert!(encoded.get("groupId").is_some());
+        assert!(encoded.get("group_id").is_none());
+
+        for (role, key) in [
+            (GroupRole::Owner, "owner"),
+            (GroupRole::Admin, "admin"),
+            (GroupRole::Member, "member"),
+        ] {
+            let expected: Vec<GroupCapabilityOperation> =
+                serde_json::from_value(fixture["roleOperations"][key].clone())
+                    .expect("role operations fixture");
+            assert_eq!(groups::test_group_capability_operations(role), expected);
         }
     }
 
@@ -829,6 +960,139 @@ mod tests {
             restored.state.pending_group_outbox.is_empty(),
             "pending group sends without a local role must not regain member capability"
         );
+    }
+
+    #[test]
+    fn capability_expired_resigns_and_retries_group_append() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
+        let summary = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+        let conversation_id = summary.conversation_id.clone();
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+
+        let sent = alice
+            .handle_command(CoreCommand::SendGroupTextMessage {
+                conversation_id,
+                plaintext: "retry me".into(),
+            })
+            .expect("send group text");
+        let (message_id, initial_expiry) = sent
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::AppendGroupEnvelope { append } => Some((
+                    append.envelope.message_id.clone(),
+                    append.capability.expires_at,
+                )),
+                _ => None,
+            })
+            .expect("initial group append");
+        let failed = alice
+            .handle_event(CoreEvent::GroupEnvelopeAppendFailed {
+                group_id: group_id.clone(),
+                message_id: message_id.clone(),
+                retryable: true,
+                status: Some(403),
+                code: Some("capability_expired".into()),
+                detail: None,
+            })
+            .expect("expired capability is retryable");
+        assert!(failed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ScheduleTimer { timer }
+                if timer.timer_id == format!("retry_group_append:{message_id}")
+        )));
+
+        let retried = alice
+            .handle_event(CoreEvent::TimerTriggered {
+                timer_id: format!("retry_group_append:{message_id}"),
+            })
+            .expect("retry group append");
+        assert!(retried.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::AppendGroupEnvelope { append }
+                if append.envelope.message_id == message_id
+                    && append.capability.expires_at >= initial_expiry
+        )));
+    }
+
+    #[test]
+    fn membership_revoked_clears_every_pending_group_send() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
+        let summary = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+        let conversation_id = summary.conversation_id.clone();
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        for plaintext in ["first pending", "second pending"] {
+            alice
+                .handle_command(CoreCommand::SendGroupTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: plaintext.into(),
+                })
+                .expect("send group text");
+        }
+        let pending_ids: Vec<String> = alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| item.envelope.group_id == group_id)
+            .map(|item| item.envelope.message_id.clone())
+            .collect();
+        assert_eq!(pending_ids.len(), 2);
+
+        let revoked = alice
+            .handle_event(CoreEvent::GroupEnvelopeAppendFailed {
+                group_id: group_id.clone(),
+                message_id: pending_ids[0].clone(),
+                retryable: false,
+                status: Some(403),
+                code: Some("group_membership_revoked".into()),
+                detail: None,
+            })
+            .expect("membership revoked is terminal");
+
+        assert!(!alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .any(|item| item.envelope.group_id == group_id));
+        assert_eq!(alice.state.group_states[&group_id].local_role, None);
+        assert_eq!(
+            alice.state.conversations[&conversation_id]
+                .conversation
+                .state,
+            crate::model::ConversationState::Closed
+        );
+        let deleted: BTreeSet<String> = persist_ops(&revoked)
+            .into_iter()
+            .filter_map(|op| match op {
+                PersistOp::DeleteOutgoingGroupEnvelope { message_id } => Some(message_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, pending_ids.into_iter().collect());
     }
 
     #[test]
@@ -8134,6 +8398,7 @@ mod tests {
                     "inbox_subscribe".into(),
                     "storage_prepare_upload".into(),
                 ],
+                key_id: None,
             }),
             expected_user_id: None,
             expected_device_id: None,

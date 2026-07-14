@@ -457,6 +457,7 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    let code = extract_error_code(&body);
                     let detail = if status == 404 {
                         "Cloudflare runtime does not support group outbox. Upgrade runtime."
                             .to_string()
@@ -466,9 +467,9 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                         group_id: append.group_id,
                         message_id: append.envelope.message_id,
-                        retryable: status >= 500,
+                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
                         status: Some(status),
-                        code: extract_error_code(&body),
+                        code,
                         detail: Some(detail),
                     }]);
                 }
@@ -569,12 +570,13 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
+                    let code = extract_error_code(&body);
                     return Ok(vec![CoreEvent::GroupTransitionAppendFailed {
                         group_id,
                         transition_id,
-                        retryable: status >= 500,
+                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
                         status: Some(status),
-                        code: extract_error_code(&body),
+                        code,
                         detail: Some(format!("HTTP {status}: {body}")),
                     }]);
                 }

@@ -696,6 +696,7 @@ export interface DeviceRuntimeAuth {
   userId: string;
   deviceId: string;
   scopes: DeviceRuntimeScope[];
+  keyId?: string;
 }
 
 export type DeviceRuntimeScope =
@@ -862,6 +863,7 @@ export interface BootstrapToken {
   deviceId: string;
   operations: Array<"issue_device_bundle">;
   expiresAt: number;
+  keyId?: string;
 }
 
 export interface DeviceRuntimeToken {
@@ -871,6 +873,21 @@ export interface DeviceRuntimeToken {
   deviceId: string;
   scopes: DeviceRuntimeScope[];
   expiresAt: number;
+  keyId?: string;
+}
+
+export interface DeviceRuntimeRefreshChallenge {
+  version: string;
+  origin: string;
+  userId: string;
+  deviceId: string;
+  nonce: string;
+  expiresAt: number;
+}
+
+export interface DeviceRuntimeRefreshProof {
+  challenge: DeviceRuntimeRefreshChallenge;
+  signature: string;
 }
 
 export interface RealtimeEvent {

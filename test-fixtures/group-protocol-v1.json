@@ -1,0 +1,63 @@
+{
+  "manifest": {
+    "version": "0.1",
+    "groupId": "group:fixture",
+    "conversationId": "conversation:fixture",
+    "title": "Fixture Group",
+    "ownerUserId": "user:alice",
+    "admins": [],
+    "members": [
+      { "userId": "user:alice", "role": "owner", "status": "active" }
+    ],
+    "memberDevices": [
+      { "userId": "user:alice", "deviceId": "device:alice:laptop", "status": "active" }
+    ],
+    "joinPolicy": "open_by_invite",
+    "memberInvitePolicy": "owner_admin_only",
+    "rosterVersion": 1,
+    "mlsEpochHint": 1,
+    "lastCommitMessageId": "message:commit:1",
+    "outbox": {
+      "endpoint": "https://fixture.invalid/v1/groups/group%3Afixture/outbox",
+      "subscribeEndpoint": "https://fixture.invalid/v1/groups/group%3Afixture/subscribe"
+    },
+    "updatedAt": 1775004800000,
+    "signerUserId": "user:alice",
+    "signerDeviceId": "device:alice:laptop",
+    "signature": "fixture-signature"
+  },
+  "capability": {
+    "version": "0.1",
+    "service": "group_outbox",
+    "groupId": "group:fixture",
+    "userId": "user:alice",
+    "deviceId": "device:alice:laptop",
+    "operations": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
+    "role": "owner",
+    "expiresAt": 1775091200000,
+    "signature": "fixture-capability-signature"
+  },
+  "membershipProof": {
+    "type": "membership_signature",
+    "operation": "remove_member",
+    "signerUserId": "user:alice",
+    "signerDeviceId": "device:alice:laptop",
+    "previousRosterVersion": 1,
+    "newRosterVersion": 2,
+    "previousCommitMessageId": "message:commit:1",
+    "commitMessageId": "message:commit:2",
+    "controlMessageId": "message:control:2",
+    "stateEventMessageId": "message:event:2",
+    "newManifestSha256": "fixture-next-manifest-hash",
+    "signature": "fixture-proof-signature"
+  },
+  "expected": {
+    "manifestSha256": "d76e4c085c8be2da751ceb9325f8e300102afceea92848df7e9988ff952e2d52",
+    "membershipProofPayload": "tapchat.group.membership.v1\nproof_type=membership_signature\noperation=remove_member\nsigner_user_id=user:alice\nsigner_device_id=device:alice:laptop\nprevious_roster_version=1\nnew_roster_version=2\nprevious_commit_message_id=message:commit:1\ncommit_message_id=message:commit:2\ncontrol_message_id=message:control:2\nnew_manifest_sha256=fixture-next-manifest-hash\nstate_event_message_id=message:event:2"
+  },
+  "roleOperations": {
+    "owner": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
+    "admin": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata"],
+    "member": ["read", "subscribe", "append_application", "append_control"]
+  }
+}

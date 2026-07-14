@@ -96,6 +96,7 @@ export default function MessageInput({ conversationId, conversationKind = "direc
     sender_device_id: string;
     plaintext: string;
     created_at: number;
+    delivery_state?: "sending" | "sent" | "failed";
   }
 
   // Extended onSent callback with message info for immediate display

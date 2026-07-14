@@ -43,6 +43,9 @@ pub struct CloudflareDeployDefaults {
     pub preview_bucket_name: String,
     pub sharing_token_secret: String,
     pub bootstrap_token_secret: String,
+    pub bootstrap_token_key_id: String,
+    pub device_runtime_secret: String,
+    pub device_runtime_key_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -80,6 +83,19 @@ pub struct ResolvedCloudflareDeployConfig {
     pub preview_bucket_name: String,
     pub sharing_token_secret: String,
     pub bootstrap_token_secret: String,
+    pub bootstrap_token_key_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_previous_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_previous_key_id: Option<String>,
+    pub device_runtime_secret: String,
+    pub device_runtime_key_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_runtime_previous_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_runtime_previous_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_rotation_grace_until_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +246,9 @@ pub fn derive_cloudflare_defaults(
             .unwrap_or_else(|_| generate_hex_secret()),
         bootstrap_token_secret: std::env::var("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET")
             .unwrap_or_else(|_| generate_hex_secret()),
+        bootstrap_token_key_id: generate_secret_key_id(),
+        device_runtime_secret: generate_hex_secret(),
+        device_runtime_key_id: generate_secret_key_id(),
     }
 }
 
@@ -276,6 +295,14 @@ pub fn resolve_cloudflare_config(
             .unwrap_or_else(|| defaults.preview_bucket_name.clone()),
         sharing_token_secret: defaults.sharing_token_secret.clone(),
         bootstrap_token_secret: defaults.bootstrap_token_secret.clone(),
+        bootstrap_token_key_id: defaults.bootstrap_token_key_id.clone(),
+        bootstrap_previous_secret: None,
+        bootstrap_previous_key_id: None,
+        device_runtime_secret: defaults.device_runtime_secret.clone(),
+        device_runtime_key_id: defaults.device_runtime_key_id.clone(),
+        device_runtime_previous_secret: None,
+        device_runtime_previous_key_id: None,
+        auth_rotation_grace_until_ms: None,
     }
 }
 
@@ -702,17 +729,28 @@ pub async fn bootstrap_device_bundle(
     user_id: &str,
     device_id: &str,
 ) -> Result<DeploymentBundle> {
-    let token = sign_hmac_token(
-        bootstrap_secret,
-        &json!({
-            "version": CURRENT_MODEL_VERSION,
-            "service": "bootstrap",
-            "userId": user_id,
-            "deviceId": device_id,
-            "operations": ["issue_device_bundle"],
-            "expiresAt": 4_102_444_800_000u64,
-        }),
-    )?;
+    bootstrap_device_bundle_with_key_id(base_url, bootstrap_secret, None, user_id, device_id).await
+}
+
+pub async fn bootstrap_device_bundle_with_key_id(
+    base_url: &str,
+    bootstrap_secret: &str,
+    bootstrap_key_id: Option<&str>,
+    user_id: &str,
+    device_id: &str,
+) -> Result<DeploymentBundle> {
+    let mut token_payload = json!({
+        "version": CURRENT_MODEL_VERSION,
+        "service": "bootstrap",
+        "userId": user_id,
+        "deviceId": device_id,
+        "operations": ["issue_device_bundle"],
+        "expiresAt": 4_102_444_800_000u64,
+    });
+    if let Some(key_id) = bootstrap_key_id {
+        token_payload["keyId"] = json!(key_id);
+    }
+    let token = sign_hmac_token(bootstrap_secret, &token_payload)?;
     let client = Client::builder().build().context("build reqwest client")?;
     let bootstrap_url = format!("{base_url}/v1/bootstrap/device");
     let max_attempts: u32 = BOOTSTRAP_MAX_ATTEMPTS;
@@ -820,8 +858,127 @@ pub fn ensure_cloudflare_runtime_metadata(
     Ok(())
 }
 
+/// Prepare the first keyed deployment for a legacy profile without rotating
+/// the long-lived sharing secret. The exact two-slot state is persisted before
+/// any deployment command, so a retry cannot create a third key generation.
+pub fn prepare_legacy_runtime_secret_migration(
+    profile: &crate::cli::profile::Profile,
+    runtime: &mut crate::cli::profile::RuntimeMetadata,
+    secrets: &mut crate::cli::profile::RuntimeSecrets,
+) -> Result<bool> {
+    let needs_runtime_key =
+        secrets.device_runtime_secret.is_none() || secrets.device_runtime_key_id.is_none();
+    let needs_bootstrap_key = secrets.bootstrap_key_id.is_none();
+    if !needs_runtime_key && !needs_bootstrap_key {
+        return Ok(false);
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let grace_until_ms = now_ms.saturating_add(48 * 60 * 60 * 1_000);
+    if needs_runtime_key {
+        let sharing = secrets
+            .sharing_secret
+            .clone()
+            .or_else(|| runtime.sharing_secret.clone())
+            .ok_or_else(|| anyhow::anyhow!("cloudflare sharing_secret is not recorded"))?;
+        secrets.previous_device_runtime_secret = Some(sharing);
+        secrets.previous_device_runtime_key_id = None;
+        secrets.device_runtime_secret = Some(generate_hex_secret());
+        secrets.device_runtime_key_id = Some(generate_secret_key_id());
+    }
+    if needs_bootstrap_key {
+        let bootstrap = secrets
+            .bootstrap_secret
+            .clone()
+            .or_else(|| runtime.bootstrap_secret.clone())
+            .ok_or_else(|| anyhow::anyhow!("cloudflare bootstrap_secret is not recorded"))?;
+        secrets.previous_bootstrap_secret = Some(bootstrap);
+        secrets.previous_bootstrap_key_id = None;
+        secrets.bootstrap_key_id = Some(generate_secret_key_id());
+    }
+    runtime.secret_rotation = crate::cli::profile::RuntimeSecretRotationMetadata {
+        phase: crate::cli::profile::RuntimeSecretRotationPhase::Prepared,
+        current_key_id: secrets.device_runtime_key_id.clone(),
+        previous_key_id: secrets.previous_device_runtime_key_id.clone(),
+        prepared_at_ms: Some(now_ms),
+        last_rotated_at_ms: runtime.secret_rotation.last_rotated_at_ms,
+        next_rotation_at_ms: runtime.secret_rotation.next_rotation_at_ms,
+        grace_until_ms: Some(grace_until_ms),
+        last_error: None,
+    };
+    profile.save_runtime_rotation_state(runtime, secrets)?;
+    Ok(true)
+}
+
+pub fn prepare_runtime_secret_rotation(
+    profile: &crate::cli::profile::Profile,
+    runtime: &mut crate::cli::profile::RuntimeMetadata,
+    secrets: &mut crate::cli::profile::RuntimeSecrets,
+) -> Result<()> {
+    use crate::cli::profile::{RuntimeSecretRotationMetadata, RuntimeSecretRotationPhase};
+
+    match runtime.secret_rotation.phase {
+        RuntimeSecretRotationPhase::Prepared
+        | RuntimeSecretRotationPhase::Deploying
+        | RuntimeSecretRotationPhase::Failed => return Ok(()),
+        RuntimeSecretRotationPhase::Grace => {
+            bail!("the previous secret rotation must be finalized before starting another")
+        }
+        RuntimeSecretRotationPhase::PendingAuthorization
+            if secrets.previous_device_runtime_secret.is_some()
+                || secrets.previous_bootstrap_secret.is_some() =>
+        {
+            return Ok(())
+        }
+        RuntimeSecretRotationPhase::Stable | RuntimeSecretRotationPhase::PendingAuthorization => {}
+    }
+
+    let old_runtime_secret = secrets
+        .device_runtime_secret
+        .clone()
+        .or_else(|| secrets.sharing_secret.clone())
+        .or_else(|| runtime.sharing_secret.clone())
+        .ok_or_else(|| anyhow::anyhow!("device runtime secret is not recorded"))?;
+    let old_bootstrap_secret = secrets
+        .bootstrap_secret
+        .clone()
+        .or_else(|| runtime.bootstrap_secret.clone())
+        .ok_or_else(|| anyhow::anyhow!("bootstrap secret is not recorded"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let new_runtime_key_id = generate_secret_key_id();
+    secrets.previous_device_runtime_secret = Some(old_runtime_secret);
+    secrets.previous_device_runtime_key_id = secrets.device_runtime_key_id.clone();
+    secrets.device_runtime_secret = Some(generate_hex_secret());
+    secrets.device_runtime_key_id = Some(new_runtime_key_id.clone());
+    secrets.previous_bootstrap_secret = Some(old_bootstrap_secret);
+    secrets.previous_bootstrap_key_id = secrets.bootstrap_key_id.clone();
+    secrets.bootstrap_secret = Some(generate_hex_secret());
+    secrets.bootstrap_key_id = Some(generate_secret_key_id());
+    runtime.secret_rotation = RuntimeSecretRotationMetadata {
+        phase: RuntimeSecretRotationPhase::Prepared,
+        current_key_id: Some(new_runtime_key_id),
+        previous_key_id: secrets.previous_device_runtime_key_id.clone(),
+        prepared_at_ms: Some(now_ms),
+        last_rotated_at_ms: runtime.secret_rotation.last_rotated_at_ms,
+        next_rotation_at_ms: runtime.secret_rotation.next_rotation_at_ms,
+        grace_until_ms: Some(now_ms.saturating_add(48 * 60 * 60 * 1_000)),
+        last_error: None,
+    };
+    profile.save_runtime_rotation_state(runtime, secrets)?;
+    Ok(())
+}
+
 pub fn rebuild_cloudflare_config(
     runtime: &crate::cli::profile::RuntimeMetadata,
+    secrets: &crate::cli::profile::RuntimeSecrets,
 ) -> Result<ResolvedCloudflareDeployConfig> {
     Ok(ResolvedCloudflareDeployConfig {
         worker_name: runtime
@@ -845,14 +1002,35 @@ pub fn rebuild_cloudflare_config(
             .preview_bucket_name
             .clone()
             .ok_or_else(|| anyhow::anyhow!("cloudflare preview_bucket_name is not recorded"))?,
-        sharing_token_secret: runtime
+        sharing_token_secret: secrets
             .sharing_secret
             .clone()
+            .or_else(|| runtime.sharing_secret.clone())
             .ok_or_else(|| anyhow::anyhow!("cloudflare sharing_secret is not recorded"))?,
-        bootstrap_token_secret: runtime
+        bootstrap_token_secret: secrets
             .bootstrap_secret
             .clone()
+            .or_else(|| runtime.bootstrap_secret.clone())
             .ok_or_else(|| anyhow::anyhow!("cloudflare bootstrap_secret is not recorded"))?,
+        bootstrap_token_key_id: secrets
+            .bootstrap_key_id
+            .clone()
+            .unwrap_or_else(|| "legacy-bootstrap".into()),
+        bootstrap_previous_secret: secrets.previous_bootstrap_secret.clone(),
+        bootstrap_previous_key_id: secrets.previous_bootstrap_key_id.clone(),
+        device_runtime_secret: secrets.device_runtime_secret.clone().unwrap_or_else(|| {
+            runtime
+                .sharing_secret
+                .clone()
+                .unwrap_or_else(generate_hex_secret)
+        }),
+        device_runtime_key_id: secrets
+            .device_runtime_key_id
+            .clone()
+            .unwrap_or_else(|| "legacy-runtime".into()),
+        device_runtime_previous_secret: secrets.previous_device_runtime_secret.clone(),
+        device_runtime_previous_key_id: secrets.previous_device_runtime_key_id.clone(),
+        auth_rotation_grace_until_ms: runtime.secret_rotation.grace_until_ms,
     })
 }
 
@@ -1172,10 +1350,14 @@ fn display_default(value: &str) -> &str {
     }
 }
 
-fn generate_hex_secret() -> String {
+pub fn generate_hex_secret() -> String {
     let mut bytes = [0_u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn generate_secret_key_id() -> String {
+    format!("key-{}", &generate_hex_secret()[..16])
 }
 
 fn short_identifier(value: &str, max_len: usize) -> String {

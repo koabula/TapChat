@@ -1,4 +1,10 @@
-import { APPEND_AUTH_CONTEXT_HEADER, APPEND_AUTH_REASON_HEADER, HttpError } from "../auth/capability";
+import {
+  APPEND_AUTH_CONTEXT_HEADER,
+  APPEND_AUTH_REASON_HEADER,
+  HttpError,
+  verifyEd25519,
+  verifyIdentityBundle
+} from "../auth/capability";
 import type { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import { CONTROL_JSON_MAX_BYTES, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES, readJsonLimited } from "../auth/runtime-security";
 import { InboxService } from "./service";
@@ -6,10 +12,33 @@ import type {
   AckRequest,
   AllowlistDocument,
   AppendEnvelopeRequest,
+  DeviceRuntimeRefreshChallenge,
+  DeviceRuntimeRefreshProof,
   FetchMessagesRequest
 } from "../types/contracts";
 import type { Env } from "../types/env";
 import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../types/runtime";
+import { SharedStateService } from "../storage/shared-state";
+
+const RUNTIME_AUTH_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const RUNTIME_AUTH_CHALLENGE_PREFIX = "runtime-auth-challenge:";
+const MAX_ACTIVE_RUNTIME_AUTH_CHALLENGES = 8;
+
+export function deviceRuntimeRefreshSigningPayload(challenge: DeviceRuntimeRefreshChallenge): string {
+  return [
+    "tapchat.device_runtime_refresh.v1",
+    `origin=${challenge.origin}`,
+    `user_id=${challenge.userId}`,
+    `device_id=${challenge.deviceId}`,
+    `nonce=${challenge.nonce}`,
+    `expires_at=${challenge.expiresAt}`
+  ].join("\n");
+}
+
+function randomChallengeNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 class DurableObjectStorageAdapter implements DurableObjectStorageLike {
   private readonly storage: DurableObjectState["storage"];
@@ -51,6 +80,114 @@ class DurableObjectStorageAdapter implements DurableObjectStorageLike {
 
   async setAlarm(epochMillis: number): Promise<void> {
     await this.storage.setAlarm(epochMillis);
+  }
+
+  async consumeIfEqual<T>(key: string, expected: T): Promise<boolean> {
+    return this.storage.transaction(async (transaction) => {
+      const current = await transaction.get<T>(key);
+      if (!current || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+      await transaction.delete(key);
+      return true;
+    });
+  }
+}
+
+function runtimeAuthError(error: unknown): Response {
+  if (error instanceof HttpError) {
+    return jsonResponse({ error: error.code, message: error.message }, error.status);
+  }
+  return jsonResponse({ error: "temporary_unavailable", message: "runtime auth refresh failed" }, 500);
+}
+
+export async function issueDeviceRuntimeAuthChallenge(
+  request: Request,
+  deviceId: string,
+  state: DurableObjectStorageLike,
+  spillStore: JsonBlobStore,
+  now = Date.now()
+): Promise<Response> {
+  try {
+    const body = await readJsonLimited<{ userId?: string; deviceId?: string }>(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.userId || body.deviceId !== deviceId) {
+      throw new HttpError(400, "invalid_input", "challenge scope is invalid");
+    }
+    const sharedState = new SharedStateService(spillStore, new URL(request.url).origin);
+    const bundle = await sharedState.getIdentityBundle(body.userId);
+    const device = bundle?.devices.find((item) => item.deviceId === deviceId);
+    if (!bundle || !verifyIdentityBundle(bundle) || device?.status !== "active") {
+      throw new HttpError(403, "device_revoked", "device is not active");
+    }
+    const existing = await state.list<DeviceRuntimeRefreshChallenge>({ prefix: RUNTIME_AUTH_CHALLENGE_PREFIX });
+    const expired = Array.from(existing.entries())
+      .filter(([, challenge]) => challenge.expiresAt <= now)
+      .map(([key]) => key);
+    if (expired.length > 0) await state.mutateEntries({}, expired);
+    if (existing.size - expired.length >= MAX_ACTIVE_RUNTIME_AUTH_CHALLENGES) {
+      throw new HttpError(429, "rate_limited", "too many active runtime auth challenges");
+    }
+    const challenge: DeviceRuntimeRefreshChallenge = {
+      version: "0.1",
+      origin: new URL(request.url).origin,
+      userId: body.userId,
+      deviceId,
+      nonce: randomChallengeNonce(),
+      expiresAt: now + RUNTIME_AUTH_CHALLENGE_TTL_MS
+    };
+    await state.put(`${RUNTIME_AUTH_CHALLENGE_PREFIX}${challenge.nonce}`, challenge);
+    return jsonResponse(challenge);
+  } catch (error) {
+    return runtimeAuthError(error);
+  }
+}
+
+export async function verifyAndConsumeDeviceRuntimeAuthChallenge(
+  request: Request,
+  deviceId: string,
+  state: DurableObjectStorageLike,
+  spillStore: JsonBlobStore,
+  now = Date.now()
+): Promise<Response> {
+  try {
+    const proof = await readJsonLimited<DeviceRuntimeRefreshProof>(request, CONTROL_JSON_MAX_BYTES);
+    const challenge = proof.challenge;
+    if (
+      !challenge ||
+      challenge.version !== "0.1" ||
+      challenge.deviceId !== deviceId ||
+      challenge.origin !== new URL(request.url).origin ||
+      challenge.expiresAt <= now ||
+      !proof.signature
+    ) {
+      throw new HttpError(403, "invalid_challenge", "runtime auth challenge is invalid or expired");
+    }
+    const key = `${RUNTIME_AUTH_CHALLENGE_PREFIX}${challenge.nonce}`;
+    const stored = await state.get<DeviceRuntimeRefreshChallenge>(key);
+    if (!stored || JSON.stringify(stored) !== JSON.stringify(challenge)) {
+      throw new HttpError(403, "challenge_replayed", "runtime auth challenge was already consumed");
+    }
+    const sharedState = new SharedStateService(spillStore, challenge.origin);
+    const bundle = await sharedState.getIdentityBundle(challenge.userId);
+    const device = bundle?.devices.find((item) => item.deviceId === deviceId);
+    if (!bundle || !verifyIdentityBundle(bundle) || !device || device.status !== "active") {
+      throw new HttpError(403, "device_revoked", "device is not active");
+    }
+    if (!verifyEd25519(device.devicePublicKey, proof.signature, deviceRuntimeRefreshSigningPayload(challenge))) {
+      throw new HttpError(403, "invalid_proof", "runtime auth refresh signature is invalid");
+    }
+    const consumed = state.consumeIfEqual
+      ? await state.consumeIfEqual(key, challenge)
+      : await (async () => {
+          const current = await state.get<DeviceRuntimeRefreshChallenge>(key);
+          if (!current || JSON.stringify(current) !== JSON.stringify(challenge)) return false;
+          await state.delete(key);
+          return true;
+        })();
+    if (!consumed) {
+      throw new HttpError(403, "challenge_replayed", "runtime auth challenge was already consumed");
+    }
+    return jsonResponse({ verified: true });
+  } catch (error) {
+    return runtimeAuthError(error);
   }
 }
 
@@ -160,6 +297,12 @@ export async function handleInboxDurableRequest(
   });
 
   try {
+    if (url.pathname.endsWith("/runtime-auth-challenge") && request.method === "POST") {
+      return issueDeviceRuntimeAuthChallenge(request, deps.deviceId, deps.state, deps.spillStore, now);
+    }
+    if (url.pathname.endsWith("/runtime-auth-refresh") && request.method === "POST") {
+      return verifyAndConsumeDeviceRuntimeAuthChallenge(request, deps.deviceId, deps.state, deps.spillStore, now);
+    }
     if (url.pathname.endsWith("/subscribe")) {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         throw new HttpError(400, "invalid_input", "subscribe requires websocket upgrade");
@@ -272,6 +415,23 @@ export class InboxDurableObject extends DurableObjectBase {
     const url = new URL(request.url);
     const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
     const deviceId = decodeURIComponent(match?.[1] ?? "");
+
+    if (url.pathname.endsWith("/runtime-auth-challenge") && request.method === "POST") {
+      return issueDeviceRuntimeAuthChallenge(
+        request,
+        deviceId,
+        new DurableObjectStorageAdapter(this.stateRef.storage),
+        new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE)
+      );
+    }
+    if (url.pathname.endsWith("/runtime-auth-refresh") && request.method === "POST") {
+      return verifyAndConsumeDeviceRuntimeAuthChallenge(
+        request,
+        deviceId,
+        new DurableObjectStorageAdapter(this.stateRef.storage),
+        new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE)
+      );
+    }
 
     return handleInboxDurableRequest(request, {
       deviceId,

@@ -209,6 +209,7 @@ pub async fn get_messages(
                         "plaintext": msg.plaintext,
                         "has_attachment": !msg.storage_refs.is_empty(),
                         "storage_refs": msg.storage_refs,
+                        "delivery_state": if direction == "sent" { Some("sent") } else { None },
                     })
                 })
                 .collect()
@@ -247,6 +248,11 @@ pub async fn get_messages(
                 "plaintext": env.plaintext_cache, // Use cached plaintext if available
                 "has_attachment": !env.envelope.storage_refs.is_empty(),
                 "storage_refs": env.envelope.storage_refs,
+                "delivery_state": if env.retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES {
+                    "failed"
+                } else {
+                    "sending"
+                },
             }))
         })
         .collect();

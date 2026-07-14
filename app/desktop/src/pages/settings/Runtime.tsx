@@ -15,6 +15,15 @@ interface RuntimeStatus {
   state: string;
   action: string | null;
   details: string | null;
+  secret_rotation?: RuntimeSecretRotation | null;
+}
+
+interface RuntimeSecretRotation {
+  phase: "stable" | "prepared" | "deploying" | "grace" | "pending_authorization" | "failed";
+  last_rotated_at_ms?: number | null;
+  next_rotation_at_ms?: number | null;
+  grace_until_ms?: number | null;
+  last_error?: string | null;
 }
 
 interface AccountInfo {
@@ -142,6 +151,26 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
       } else {
         await loadStatus();
       }
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setDeploying(false);
+    }
+  };
+
+  const handleSecretAction = async (
+    command:
+      | "cloudflare_rotate_runtime_secrets"
+      | "cloudflare_resume_secret_rotation"
+      | "cloudflare_finalize_secret_rotation",
+  ) => {
+    setError(null);
+    setDeploying(true);
+    try {
+      const result = await invoke<DeployResult>(command);
+      setDeployResult(result);
+      if (!result.success) setError(result.error || "Secret rotation failed");
+      await loadStatus();
     } catch (err) {
       setError(String(err));
     } finally {
@@ -346,6 +375,62 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
                 end-to-end - Cloudflare cannot read your messages.
               </p>
             </div>
+
+            {status?.bound && status.secret_rotation && (
+              <div className="card mb-4 animate-fade-in-up">
+                <h2 className="text-sm font-medium text-muted-color mb-3">
+                  Runtime Authentication Keys
+                </h2>
+                <div className="space-y-2 text-sm">
+                  <CapabilityRow label="Rotation state" ok={status.secret_rotation.phase === "stable"} />
+                  <RuntimeDate label="Last rotated" value={status.secret_rotation.last_rotated_at_ms} />
+                  <RuntimeDate label="Next rotation" value={status.secret_rotation.next_rotation_at_ms} />
+                  {status.secret_rotation.grace_until_ms && (
+                    <RuntimeDate label="Old key accepted until" value={status.secret_rotation.grace_until_ms} />
+                  )}
+                  {status.secret_rotation.last_error && (
+                    <div className="rounded bg-error/10 px-3 py-2 text-error break-words">
+                      {status.secret_rotation.last_error}
+                    </div>
+                  )}
+                </div>
+                <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                  {(["prepared", "deploying", "failed"] as const).includes(
+                    status.secret_rotation.phase as "prepared" | "deploying" | "failed",
+                  ) ? (
+                    <button
+                      className="btn btn-primary transition-fast"
+                      disabled={deploying}
+                      onClick={() => handleSecretAction("cloudflare_resume_secret_rotation")}
+                    >
+                      Continue recovery
+                    </button>
+                  ) : (
+                    <button
+                      className="btn btn-secondary transition-fast"
+                      disabled={deploying || status.secret_rotation.phase === "grace"}
+                      onClick={() => handleSecretAction("cloudflare_rotate_runtime_secrets")}
+                    >
+                      Rotate now
+                    </button>
+                  )}
+                  {status.secret_rotation.phase === "grace" && (
+                    <button
+                      className="btn btn-secondary transition-fast"
+                      disabled={deploying}
+                      onClick={() => handleSecretAction("cloudflare_finalize_secret_rotation")}
+                    >
+                      Revoke old keys now
+                    </button>
+                  )}
+                </div>
+                {status.secret_rotation.phase === "pending_authorization" && (
+                  <p className="mt-3 text-xs text-yellow-500">
+                    Cloudflare authorization is required. TapChat will not open OAuth automatically.
+                  </p>
+                )}
+              </div>
+            )}
           </>
         )}
     </>
@@ -412,6 +497,17 @@ function CapabilityRow({ label, ok }: { label: string; ok: boolean }) {
       <span className="text-secondary-color">{label}</span>
       <span className={ok ? "text-primary-color" : "text-yellow-500"}>
         {ok ? "Ready" : "Missing"}
+      </span>
+    </div>
+  );
+}
+
+function RuntimeDate({ label, value }: { label: string; value?: number | null }) {
+  return (
+    <div className="flex items-center justify-between gap-4">
+      <span className="text-secondary-color">{label}</span>
+      <span className="text-primary-color text-right">
+        {value ? new Date(value).toLocaleString() : "Not recorded"}
       </span>
     </div>
   );

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use tapchat_core::cli::profile::Profile;
 use tapchat_core::CoreEngine;
@@ -117,6 +117,7 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
     let engine = CoreEngine::try_from_restored_state(snapshot)
         .context("restore desktop test profile snapshot")?;
     let ports = DesktopPlatformPorts::new(inner_lock.clone());
+    let (deferred_transport_tx, deferred_transport_rx) = mpsc::channel(128);
 
     Ok(AppState {
         inner: Arc::new(RwLock::new(AppStateInner {
@@ -131,6 +132,9 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
         foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
         recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
+        deferred_transport_tx,
+        deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
+        deferred_send_gate: Arc::new(Mutex::new(())),
     })
 }
 

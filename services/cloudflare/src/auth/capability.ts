@@ -21,6 +21,7 @@ import type {
 import { CURRENT_MODEL_VERSION } from "../types/contracts";
 import { verifySharingPayload } from "../storage/sharing";
 import type { SharedStateService } from "../storage/shared-state";
+import type { RotatingSecretSet } from "./runtime-security";
 
 export class HttpError extends Error {
   readonly status: number;
@@ -508,21 +509,59 @@ export function allowedGroupAppendRoles(messageType: GroupMessageType): Array<Gr
   }
 }
 
-async function verifySignedToken<T>(secret: string, request: Request, now: number): Promise<T> {
-  const token = getBearerToken(request);
+function tokenKeyId(token: string): string | undefined {
   try {
-    return await verifySharingPayload<T>(secret, token, now);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "invalid signed token";
-    if (message.includes("expired")) {
-      throw new HttpError(403, "capability_expired", message);
-    }
-    throw new HttpError(403, "invalid_capability", message);
+    const payloadPart = token.split(".")[0];
+    if (!payloadPart) return undefined;
+    const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const payload = JSON.parse(atob(padded)) as { keyId?: unknown };
+    return typeof payload.keyId === "string" && payload.keyId.trim() ? payload.keyId : undefined;
+  } catch {
+    return undefined;
   }
 }
 
-async function verifyDeviceRuntimeToken(request: Request, secret: string, now: number): Promise<DeviceRuntimeToken> {
-  const token = await verifySignedToken<DeviceRuntimeToken>(secret, request, now);
+async function verifySignedToken<T>(secrets: string | RotatingSecretSet, request: Request, now: number): Promise<T> {
+  const token = getBearerToken(request);
+  const candidates = typeof secrets === "string"
+    ? [secrets]
+    : (() => {
+        const keyId = tokenKeyId(token);
+        if (keyId) {
+          if (keyId === secrets.current.keyId) return [secrets.current.secret];
+          if (
+            secrets.previous?.keyId === keyId &&
+            secrets.graceUntilMs !== undefined &&
+            now < secrets.graceUntilMs
+          ) return [secrets.previous.secret];
+          return [];
+        }
+        const unkeyed: string[] = [];
+        if (secrets.allowUnkeyedCurrent) unkeyed.push(secrets.current.secret);
+        if (
+          secrets.previous &&
+          secrets.graceUntilMs !== undefined &&
+          now < secrets.graceUntilMs
+        ) unkeyed.push(secrets.previous.secret);
+        return unkeyed;
+      })();
+  let lastMessage = "invalid signed token";
+  for (const secret of candidates) {
+    try {
+      return await verifySharingPayload<T>(secret, token, now);
+    } catch (error) {
+      lastMessage = error instanceof Error ? error.message : lastMessage;
+    }
+  }
+  if (lastMessage.includes("expired")) {
+    throw new HttpError(403, "capability_expired", lastMessage);
+  }
+  throw new HttpError(403, "invalid_capability", lastMessage);
+}
+
+async function verifyDeviceRuntimeToken(request: Request, secrets: string | RotatingSecretSet, now: number): Promise<DeviceRuntimeToken> {
+  const token = await verifySignedToken<DeviceRuntimeToken>(secrets, request, now);
   if (token.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "device runtime token version is not supported");
   }
@@ -537,7 +576,7 @@ async function verifyDeviceRuntimeToken(request: Request, secret: string, now: n
 
 export async function validateBootstrapAuthorization(
   request: Request,
-  secret: string,
+  secret: string | RotatingSecretSet,
   userId: string,
   deviceId: string,
   now: number
@@ -560,7 +599,7 @@ export async function validateBootstrapAuthorization(
 
 export async function validateAnyDeviceRuntimeAuthorization(
   request: Request,
-  secret: string,
+  secret: string | RotatingSecretSet,
   scope: DeviceRuntimeScope,
   now: number
 ): Promise<DeviceRuntimeToken> {
@@ -573,7 +612,7 @@ export async function validateAnyDeviceRuntimeAuthorization(
 
 export async function validateDeviceRuntimeAuthorization(
   request: Request,
-  secret: string,
+  secret: string | RotatingSecretSet,
   userId: string,
   deviceId: string,
   scope: DeviceRuntimeScope,
@@ -588,7 +627,7 @@ export async function validateDeviceRuntimeAuthorization(
 
 export async function validateDeviceRuntimeAuthorizationForDevice(
   request: Request,
-  secret: string,
+  secret: string | RotatingSecretSet,
   deviceId: string,
   scope: DeviceRuntimeScope,
   now: number
@@ -634,11 +673,12 @@ export async function validateSharedStateWriteAuthorization(
 
 export async function validateKeyPackageWriteAuthorization(
   request: Request,
-  secret: string,
+  secret: string | RotatingSecretSet,
   userId: string,
   deviceId: string,
   keyPackageId: string | undefined,
-  now: number
+  now: number,
+  legacySecret?: string
 ): Promise<KeyPackageWriteToken | DeviceRuntimeToken> {
   try {
     return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
@@ -648,7 +688,7 @@ export async function validateKeyPackageWriteAuthorization(
     }
   }
 
-  const token = await verifySignedToken<KeyPackageWriteToken>(secret, request, now);
+  const token = await verifySignedToken<KeyPackageWriteToken>(legacySecret ?? secret, request, now);
   if (token.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "keypackage token version is not supported");
   }

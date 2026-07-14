@@ -37,6 +37,80 @@ export function requireBootstrapSecret(env: Env): string {
   return requireSecretValue(env.BOOTSTRAP_LINK_SECRET, "BOOTSTRAP_LINK_SECRET");
 }
 
+export interface RotatingSecretSet {
+  current: { secret: string; keyId?: string };
+  previous?: { secret: string; keyId?: string };
+  graceUntilMs?: number;
+  allowUnkeyedCurrent: boolean;
+}
+
+function optionalKeyId(value: string | undefined): string | undefined {
+  const keyId = value?.trim();
+  return keyId || undefined;
+}
+
+function rotationGraceUntilMs(env: Env): number | undefined {
+  const raw = env.AUTH_ROTATION_GRACE_UNTIL_MS?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new HttpError(503, "runtime_misconfigured", "AUTH_ROTATION_GRACE_UNTIL_MS is invalid");
+  }
+  return value;
+}
+
+export function requireDeviceRuntimeSecrets(env: Env): RotatingSecretSet {
+  // Backward-compatible deployments continue using the sharing secret until
+  // their first explicit rotation. New deployments always set the dedicated
+  // runtime secret and key id.
+  if (!env.DEVICE_RUNTIME_SECRET?.trim()) {
+    return {
+      current: { secret: requireSharingSecret(env) },
+      allowUnkeyedCurrent: true
+    };
+  }
+  const currentKeyId = optionalKeyId(env.DEVICE_RUNTIME_SECRET_KEY_ID);
+  if (!currentKeyId) {
+    throw new HttpError(503, "runtime_misconfigured", "DEVICE_RUNTIME_SECRET_KEY_ID is missing");
+  }
+  const previousSecret = env.DEVICE_RUNTIME_SECRET_PREVIOUS?.trim();
+  return {
+    current: {
+      secret: requireSecretValue(env.DEVICE_RUNTIME_SECRET, "DEVICE_RUNTIME_SECRET"),
+      keyId: currentKeyId
+    },
+    previous: previousSecret
+      ? {
+          secret: requireSecretValue(previousSecret, "DEVICE_RUNTIME_SECRET_PREVIOUS"),
+          keyId: optionalKeyId(env.DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID)
+        }
+      : undefined,
+    graceUntilMs: rotationGraceUntilMs(env),
+    allowUnkeyedCurrent: false
+  };
+}
+
+export function requireBootstrapSecrets(env: Env): RotatingSecretSet {
+  const currentKeyId = optionalKeyId(env.BOOTSTRAP_LINK_SECRET_KEY_ID);
+  const previousSecret = env.BOOTSTRAP_LINK_SECRET_PREVIOUS?.trim();
+  return {
+    current: {
+      secret: requireBootstrapSecret(env),
+      keyId: currentKeyId
+    },
+    previous: previousSecret
+      ? {
+          secret: requireSecretValue(previousSecret, "BOOTSTRAP_LINK_SECRET_PREVIOUS"),
+          keyId: optionalKeyId(env.BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID)
+        }
+      : undefined,
+    graceUntilMs: rotationGraceUntilMs(env),
+    // Legacy bootstrap links have no key id. They remain valid on a deployment
+    // that has not entered keyed rotation yet.
+    allowUnkeyedCurrent: !currentKeyId
+  };
+}
+
 export async function readRequestTextLimited(request: Request, maxBytes: number): Promise<string> {
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
     throw new HttpError(500, "runtime_misconfigured", "request body limit is invalid");

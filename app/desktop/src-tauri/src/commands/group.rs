@@ -106,6 +106,8 @@ pub enum GroupMessageView {
         storage_refs: Vec<StorageRef>,
         /// Original GroupEnvelope.message_type for debugging.
         raw_message_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delivery_state: Option<String>,
     },
     SystemBanner {
         message_id: String,
@@ -540,7 +542,8 @@ pub async fn get_group_messages_impl(
         })
         .unwrap_or_default();
 
-    let mut out = Vec::with_capacity(conversation.state.messages.len());
+    let mut out =
+        Vec::with_capacity(conversation.state.messages.len() + snapshot.pending_group_outbox.len());
     for message in &conversation.state.messages {
         match message.message_type {
             tapchat_core::model::MessageType::MlsApplication => {
@@ -557,6 +560,10 @@ pub async fn get_group_messages_impl(
                     has_attachment: !message.storage_refs.is_empty(),
                     storage_refs: message.storage_refs.clone(),
                     raw_message_type: "mls_application".into(),
+                    delivery_state: snapshot.local_identity.as_ref().and_then(|identity| {
+                        (identity.state.device_identity.device_id == message.sender_device_id)
+                            .then(|| "sent".to_string())
+                    }),
                 });
             }
             tapchat_core::model::MessageType::ControlDeviceMembershipChanged => {
@@ -628,6 +635,42 @@ pub async fn get_group_messages_impl(
             }
         }
     }
+
+    let existing_message_ids: BTreeSet<String> = out
+        .iter()
+        .map(|message| match message {
+            GroupMessageView::Bubble { message_id, .. }
+            | GroupMessageView::SystemBanner { message_id, .. } => message_id.clone(),
+        })
+        .collect();
+    for pending in snapshot.pending_group_outbox.iter().filter(|pending| {
+        pending.envelope.conversation_id == conversation_id
+            && pending.envelope.message_type == GroupMessageType::MlsApplication
+            && !existing_message_ids.contains(&pending.envelope.message_id)
+    }) {
+        out.push(GroupMessageView::Bubble {
+            message_id: pending.envelope.message_id.clone(),
+            sender_user_id: Some(pending.envelope.sender_user_id.clone()),
+            sender_device_id: pending.envelope.sender_device_id.clone(),
+            created_at: pending.envelope.created_at,
+            plaintext: pending.plaintext_cache.clone(),
+            has_attachment: !pending.envelope.storage_refs.is_empty(),
+            storage_refs: pending.envelope.storage_refs.clone(),
+            raw_message_type: "mls_application".into(),
+            delivery_state: Some(
+                if pending.retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES {
+                    "failed"
+                } else {
+                    "sending"
+                }
+                .into(),
+            ),
+        });
+    }
+    out.sort_by_key(|message| match message {
+        GroupMessageView::Bubble { created_at, .. }
+        | GroupMessageView::SystemBanner { created_at, .. } => *created_at,
+    });
 
     // Also surface visible group control messages that are recorded in
     // the engine's stored group records. These arrive with
@@ -717,15 +760,13 @@ pub async fn create_group_conversation(
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
 
-    // The first `conversations` entry in the returned view model is the
-    // newly-created group (the core places it there explicitly).
-    let summary = output
-        .view_model
-        .as_ref()
-        .and_then(|vm| vm.conversations.first())
-        .ok_or_else(|| {
-            "core did not return a conversation summary for the new group".to_string()
-        })?;
+    // Effect responses may append other conversation projections while the
+    // authorization transition drains. Bind the result to the group carried
+    // by the newly generated welcome descriptors instead of relying on list
+    // position; this remains correct when a profile already owns groups.
+    let summary = created_group_summary(&output).ok_or_else(|| {
+        "core did not return a conversation summary for the new group".to_string()
+    })?;
     let group_id = summary
         .group_id
         .clone()
@@ -734,7 +775,11 @@ pub async fn create_group_conversation(
 
     let mut welcome_pickups_by_device = BTreeMap::new();
     if let Some(view_model) = output.view_model.as_ref() {
-        for descriptor in &view_model.welcome_pickups {
+        for descriptor in view_model
+            .welcome_pickups
+            .iter()
+            .filter(|descriptor| descriptor.group_id == group_id)
+        {
             welcome_pickups_by_device.insert(
                 descriptor.device_id.clone(),
                 WelcomePickupShareable::from(descriptor),
@@ -788,6 +833,7 @@ pub struct SendGroupTextResult {
     pub plaintext: String,
     pub created_at: u64,
     pub pending_group_outbox: usize,
+    pub delivery_state: String,
 }
 
 #[tauri::command]
@@ -800,7 +846,7 @@ pub async fn send_group_text_message(
         return Err("plaintext must not be empty".into());
     }
 
-    let output = drive_core_with_handle(
+    let output = crate::lifecycle::drive_core_persist_then_defer_transport(
         &app,
         CoreInput::Command(CoreCommand::SendGroupTextMessage {
             conversation_id: conversation_id.clone(),
@@ -869,6 +915,7 @@ pub async fn send_group_text_message(
             .unwrap_or_default()
             .as_millis() as u64,
         pending_group_outbox,
+        delivery_state: "sending".into(),
     })
 }
 
@@ -1161,6 +1208,11 @@ pub async fn submit_group_join_request(
     // `RequestJoinGroup` (which directly imports the group) rather than
     // through the invite-link submit pipeline.
     let is_welcome_pickup = trimmed.starts_with("tapchat://welcome-pickup/");
+    let welcome_group_id = is_welcome_pickup
+        .then(|| WelcomePickupDescriptor::from_welcome_pickup_url(&trimmed))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .map(|descriptor| descriptor.group_id);
     let command = if is_welcome_pickup {
         CoreCommand::RequestJoinGroup {
             invite_url: trimmed.clone(),
@@ -1192,16 +1244,12 @@ pub async fn submit_group_join_request(
         let state = app.state::<AppState>();
         let inner = state.inner.read().await;
         let snapshot = inner.engine.refresh_snapshot();
-        let group = output
-            .view_model
-            .as_ref()
-            .and_then(|vm| vm.conversations.first())
-            .and_then(|summary| summary.group_id.clone())
-            .or_else(|| {
+        let group = welcome_group_id
+            .filter(|group_id| {
                 snapshot
                     .group_states
-                    .last()
-                    .map(|state| state.group_id.clone())
+                    .iter()
+                    .any(|state| state.group_id == *group_id)
             })
             .ok_or_else(|| "welcome pickup did not import a group".to_string())?;
         return Ok(SubmitGroupJoinRequestResult {
@@ -1937,6 +1985,24 @@ pub(crate) fn normalize_create_group_inputs(
     Ok((trimmed_title, members))
 }
 
+fn created_group_summary(
+    output: &CoreOutput,
+) -> Option<&tapchat_core::ffi_api::ConversationSummary> {
+    let view_model = output.view_model.as_ref()?;
+    let created_group_id = view_model
+        .welcome_pickups
+        .first()
+        .map(|descriptor| descriptor.group_id.as_str());
+    created_group_id
+        .and_then(|group_id| {
+            view_model
+                .conversations
+                .iter()
+                .find(|summary| summary.group_id.as_deref() == Some(group_id))
+        })
+        .or_else(|| (view_model.conversations.len() == 1).then(|| &view_model.conversations[0]))
+}
+
 // ---------------------------------------------------------------------------
 // Test-accessible `_impl` siblings for every write-path Tauri command.
 //
@@ -2014,13 +2080,9 @@ pub async fn create_group_conversation_impl(
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
 
-    let summary = output
-        .view_model
-        .as_ref()
-        .and_then(|vm| vm.conversations.first())
-        .ok_or_else(|| {
-            "core did not return a conversation summary for the new group".to_string()
-        })?;
+    let summary = created_group_summary(&output).ok_or_else(|| {
+        "core did not return a conversation summary for the new group".to_string()
+    })?;
     let group_id = summary
         .group_id
         .clone()
@@ -2029,7 +2091,11 @@ pub async fn create_group_conversation_impl(
 
     let mut welcome_pickups_by_device = BTreeMap::new();
     if let Some(view_model) = output.view_model.as_ref() {
-        for descriptor in &view_model.welcome_pickups {
+        for descriptor in view_model
+            .welcome_pickups
+            .iter()
+            .filter(|descriptor| descriptor.group_id == group_id)
+        {
             welcome_pickups_by_device.insert(
                 descriptor.device_id.clone(),
                 WelcomePickupShareable::from(descriptor),
@@ -2149,6 +2215,7 @@ pub async fn send_group_text_message_impl(
             .unwrap_or_default()
             .as_millis() as u64,
         pending_group_outbox,
+        delivery_state: "sent".into(),
     })
 }
 
@@ -2361,6 +2428,11 @@ pub async fn submit_group_join_request_impl(
     }
 
     let is_welcome_pickup = trimmed.starts_with("tapchat://welcome-pickup/");
+    let welcome_group_id = is_welcome_pickup
+        .then(|| WelcomePickupDescriptor::from_welcome_pickup_url(&trimmed))
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .map(|descriptor| descriptor.group_id);
     let command = if is_welcome_pickup {
         CoreCommand::RequestJoinGroup {
             invite_url: trimmed.clone(),
@@ -2378,12 +2450,13 @@ pub async fn submit_group_join_request_impl(
     if is_welcome_pickup {
         let inner = state.inner.read().await;
         let snapshot = inner.engine.refresh_snapshot();
-        let group = output
-            .view_model
-            .as_ref()
-            .and_then(|vm| vm.conversations.first())
-            .and_then(|summary| summary.group_id.clone())
-            .or_else(|| snapshot.group_states.last().map(|st| st.group_id.clone()))
+        let group = welcome_group_id
+            .filter(|group_id| {
+                snapshot
+                    .group_states
+                    .iter()
+                    .any(|group| group.group_id == *group_id)
+            })
             .ok_or_else(|| "welcome pickup did not import a group".to_string())?;
         return Ok(SubmitGroupJoinRequestResult {
             request_id: format!("pickup:{group}"),

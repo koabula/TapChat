@@ -95,6 +95,8 @@ pub struct RuntimeMetadata {
     pub preview_bucket_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_deployed_at: Option<String>,
+    #[serde(default)]
+    pub secret_rotation: RuntimeSecretRotationMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +104,8 @@ pub struct ProfilePrivateState {
     pub version: u32,
     #[serde(default)]
     pub runtime_secrets: RuntimeSecrets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_secret_rotation: Option<RuntimeSecretRotationMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_runtime_auth: Option<DeviceRuntimeAuth>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -116,6 +120,52 @@ pub struct RuntimeSecrets {
     pub bootstrap_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharing_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_runtime_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_runtime_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_device_runtime_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_device_runtime_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_bootstrap_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_bootstrap_key_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSecretRotationPhase {
+    #[default]
+    Stable,
+    Prepared,
+    Deploying,
+    Grace,
+    PendingAuthorization,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RuntimeSecretRotationMetadata {
+    #[serde(default)]
+    pub phase: RuntimeSecretRotationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotated_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_rotation_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_until_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -134,6 +184,7 @@ impl Default for ProfilePrivateState {
         Self {
             version: 1,
             runtime_secrets: RuntimeSecrets::default(),
+            runtime_secret_rotation: None,
             deployment_runtime_auth: None,
             settings: BTreeMap::new(),
             attachment_cache: BTreeMap::new(),
@@ -629,6 +680,9 @@ impl Profile {
             self.save_private_state(&private)?;
             write_atomic_unique(&path, &serde_json::to_vec_pretty(&runtime)?)?;
         }
+        if let Some(rotation) = private.runtime_secret_rotation.clone() {
+            runtime.secret_rotation = rotation;
+        }
         runtime.bootstrap_secret = private.runtime_secrets.bootstrap_secret;
         runtime.sharing_secret = private.runtime_secrets.sharing_secret;
         Ok(runtime)
@@ -638,6 +692,41 @@ impl Profile {
         let mut private = self.load_private_state()?;
         private.runtime_secrets.bootstrap_secret = runtime.bootstrap_secret.clone();
         private.runtime_secrets.sharing_secret = runtime.sharing_secret.clone();
+        private.runtime_secret_rotation = Some(runtime.secret_rotation.clone());
+        self.save_private_state(&private)?;
+
+        let mut public_runtime = runtime.clone();
+        public_runtime.bootstrap_secret = None;
+        public_runtime.sharing_secret = None;
+        write_atomic_unique(
+            &self.runtime_meta_path(),
+            &serde_json::to_vec_pretty(&public_runtime)?,
+        )
+    }
+
+    pub fn load_runtime_secrets(&self) -> Result<RuntimeSecrets> {
+        Ok(self.load_private_state()?.runtime_secrets)
+    }
+
+    pub fn save_runtime_secrets(&self, runtime_secrets: &RuntimeSecrets) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private.runtime_secrets = runtime_secrets.clone();
+        self.save_private_state(&private)
+    }
+
+    /// Atomically journal the rotation phase and its exact current/previous
+    /// key set in encrypted private state before updating the public status
+    /// projection. If the process exits between those writes, loading runtime
+    /// metadata recovers the authoritative private journal and cannot stage a
+    /// third generation of keys.
+    pub fn save_runtime_rotation_state(
+        &self,
+        runtime: &RuntimeMetadata,
+        runtime_secrets: &RuntimeSecrets,
+    ) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private.runtime_secrets = runtime_secrets.clone();
+        private.runtime_secret_rotation = Some(runtime.secret_rotation.clone());
         self.save_private_state(&private)?;
 
         let mut public_runtime = runtime.clone();
@@ -656,6 +745,7 @@ impl Profile {
         }
         let mut private = self.load_private_state()?;
         private.runtime_secrets = RuntimeSecrets::default();
+        private.runtime_secret_rotation = None;
         self.save_private_state(&private)?;
         Ok(())
     }
@@ -1695,6 +1785,7 @@ mod tests {
 
     use super::{
         Profile, ProfileInitOptions, ProfileKeychainEntryRef, ProfileRegistry, RuntimeMetadata,
+        RuntimeSecretRotationMetadata, RuntimeSecretRotationPhase, RuntimeSecrets,
     };
     use crate::persistence::CorePersistenceSnapshot;
     use crate::profile_crypto::OS_KEYCHAIN_SERVICE;
@@ -1911,28 +2002,77 @@ mod tests {
             },
         )
         .expect("init profile");
+        let runtime = RuntimeMetadata {
+            base_url: Some("https://example.test".into()),
+            bootstrap_secret: Some("bootstrap-visible-marker".into()),
+            sharing_secret: Some("sharing-visible-marker".into()),
+            secret_rotation: RuntimeSecretRotationMetadata {
+                phase: RuntimeSecretRotationPhase::Prepared,
+                current_key_id: Some("runtime-key-current".into()),
+                previous_key_id: Some("runtime-key-previous".into()),
+                prepared_at_ms: Some(100),
+                grace_until_ms: Some(200),
+                ..RuntimeSecretRotationMetadata::default()
+            },
+            ..RuntimeMetadata::default()
+        };
+        let prepared = RuntimeSecrets {
+            bootstrap_secret: Some("bootstrap-current-marker".into()),
+            sharing_secret: Some("sharing-visible-marker".into()),
+            device_runtime_secret: Some("runtime-current-marker".into()),
+            device_runtime_key_id: Some("runtime-key-current".into()),
+            previous_device_runtime_secret: Some("runtime-previous-marker".into()),
+            previous_device_runtime_key_id: Some("runtime-key-previous".into()),
+            bootstrap_key_id: Some("bootstrap-key-current".into()),
+            previous_bootstrap_secret: Some("bootstrap-previous-marker".into()),
+            previous_bootstrap_key_id: Some("bootstrap-key-previous".into()),
+        };
         profile
-            .save_runtime_metadata(&RuntimeMetadata {
-                base_url: Some("https://example.test".into()),
-                bootstrap_secret: Some("bootstrap-visible-marker".into()),
-                sharing_secret: Some("sharing-visible-marker".into()),
-                ..RuntimeMetadata::default()
-            })
-            .expect("save runtime");
+            .save_runtime_rotation_state(&runtime, &prepared)
+            .expect("save prepared rotation state");
+
+        // Simulate an exit after the encrypted journal commit but before the
+        // public status projection is replaced. The private journal must win
+        // on reload so resuming cannot generate a third key generation.
+        let stale_public = RuntimeMetadata {
+            base_url: Some("https://example.test".into()),
+            secret_rotation: RuntimeSecretRotationMetadata::default(),
+            ..RuntimeMetadata::default()
+        };
+        std::fs::write(
+            profile.runtime_meta_path(),
+            serde_json::to_vec_pretty(&stale_public).expect("encode stale public runtime"),
+        )
+        .expect("write stale public runtime projection");
 
         let runtime_json =
             std::fs::read_to_string(profile.runtime_meta_path()).expect("read runtime metadata");
         assert!(runtime_json.contains("https://example.test"));
         assert!(!runtime_json.contains("bootstrap-visible-marker"));
         assert!(!runtime_json.contains("sharing-visible-marker"));
+        assert!(!runtime_json.contains("runtime-current-marker"));
+        assert!(!runtime_json.contains("runtime-previous-marker"));
+        assert!(!runtime_json.contains("bootstrap-current-marker"));
+        assert!(!runtime_json.contains("bootstrap-previous-marker"));
         let loaded = profile.load_runtime_metadata().expect("load runtime");
         assert_eq!(
             loaded.bootstrap_secret.as_deref(),
-            Some("bootstrap-visible-marker")
+            Some("bootstrap-current-marker")
         );
         assert_eq!(
             loaded.sharing_secret.as_deref(),
             Some("sharing-visible-marker")
+        );
+        assert_eq!(
+            loaded.secret_rotation.phase,
+            RuntimeSecretRotationPhase::Prepared
+        );
+        assert_eq!(
+            profile
+                .load_runtime_secrets()
+                .expect("reload prepared secrets"),
+            prepared,
+            "an interrupted prepared rotation must reload the exact two-slot key set"
         );
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
@@ -1975,6 +2115,7 @@ mod tests {
                 user_id: "user:alice".into(),
                 device_id: "device:alice".into(),
                 scopes: vec!["inbox:append".into()],
+                key_id: None,
             }),
             expected_user_id: None,
             expected_device_id: None,
