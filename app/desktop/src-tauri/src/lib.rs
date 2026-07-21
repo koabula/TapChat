@@ -254,8 +254,6 @@ pub fn run() {
             commands::identity::sync_groups_for_new_device,
             commands::identity::sync_groups_for_removed_device,
             commands::identity::set_local_display_name,
-            commands::external_url::preflight_external_url,
-            commands::external_url::approve_external_url,
             // Conversations
             commands::conversation::list_conversations,
             commands::conversation::create_conversation,

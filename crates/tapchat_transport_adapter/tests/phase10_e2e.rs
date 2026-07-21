@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::external_fetch::ExternalResourceKind;
 use tapchat_core::ffi_api::{
     AttachmentDescriptor, CoreCommand, CoreEvent, MAX_TRANSPORT_RETRIES, RecoveryReason,
 };
@@ -534,7 +533,6 @@ async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_s
         .fail_next_identity_fetch(&ctx.bob_user_id, true, 2);
     let _ = ctx.alice.take_scheduled_timers();
 
-    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
@@ -989,7 +987,6 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
         &ctx.bob_phone_device_id,
         application_records.clone(),
     )?;
-    approve_local_identity_fetch(&mut ctx.bob_phone, &ctx.runtime).await?;
     ctx.bob_phone
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.alice_user_id.clone(),
@@ -1012,7 +1009,6 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
     );
 
     let recovery_to_seq = highest_seq(&phone_records).context("recovery batch seq")?;
-    approve_local_identity_fetch(&mut ctx.bob_phone, &ctx.runtime).await?;
     let _ = ctx
         .bob_phone
         .inject_event_until_idle(CoreEvent::InboxRecordsFetched {
@@ -1021,7 +1017,6 @@ async fn needs_recovery_persists_without_premature_rebuild_under_partial_deliver
             to_seq: recovery_to_seq,
         })
         .await?;
-    approve_local_identity_fetch(&mut ctx.bob_phone, &ctx.runtime).await?;
     ctx.bob_phone
         .run_command_until_idle(CoreCommand::ReconcileConversationMembership {
             conversation_id: ctx.conversation_id.clone(),
@@ -1058,7 +1053,6 @@ async fn exhausted_identity_refresh_retry_caps_once_and_stops_scheduling() -> Re
     );
     let _ = ctx.alice.take_scheduled_timers();
 
-    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
@@ -1367,7 +1361,6 @@ async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
         .await?;
 
     for _ in 0..3 {
-        approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
         let _ = ctx
             .alice
             .run_command_until_idle(CoreCommand::RefreshIdentityState {
@@ -1793,7 +1786,6 @@ async fn rebuild_command_recreates_direct_conversation_and_recovers() -> Result<
     ctx.runtime
         .put_identity_bundle(&ctx.bob_auth, &refreshed_bob_bundle)
         .await?;
-    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
@@ -2095,28 +2087,11 @@ async fn add_bob_laptop_to_conversation(ctx: &mut TrioContext) -> Result<()> {
 }
 
 async fn refresh_alice_contact(ctx: &mut TrioContext) -> Result<()> {
-    approve_local_identity_fetch(&mut ctx.alice, &ctx.runtime).await?;
     ctx.alice
         .run_command_until_idle(CoreCommand::RefreshIdentityState {
             user_id: ctx.bob_user_id.clone(),
         })
         .await?;
-    Ok(())
-}
-
-async fn approve_local_identity_fetch(
-    driver: &mut CoreDriver,
-    runtime: &CloudflareRuntimeHandle,
-) -> Result<()> {
-    // One core operation can legitimately schedule several identity refresh
-    // effects. Model a host explicitly approving each loopback fetch while
-    // keeping every approval individually DNS-bound, expiring and one-shot.
-    for _ in 0..8 {
-        let assessment = driver
-            .assess_external_url(runtime.base_url(), ExternalResourceKind::ContactShare)
-            .await?;
-        driver.approve_external_url_once(assessment);
-    }
     Ok(())
 }
 
@@ -2293,9 +2268,6 @@ async fn sync_driver_until_stable(
     reason: &str,
 ) -> Result<()> {
     for attempt in 0..6 {
-        // The test runtime is intentionally loopback HTTP. Model the embedding
-        // host's per-fetch approval before a sync that may drive identity refresh.
-        approve_local_identity_fetch(driver, runtime).await?;
         driver
             .run_command_until_idle(CoreCommand::SyncInbox {
                 device_id: device_id.to_string(),

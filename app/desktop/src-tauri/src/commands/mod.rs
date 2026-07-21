@@ -5,7 +5,6 @@ pub mod cloudflare_rest;
 pub mod contact;
 pub mod conversation;
 mod conversation_view;
-pub mod external_url;
 pub mod group;
 pub mod group_sync_settings;
 mod group_view;

@@ -4246,7 +4246,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     if (url.pathname.endsWith("/authorization/bootstrap") && request.method === "POST") {
       const runtimeToken = await validateAnyDeviceRuntimeAuthorization(
         request,
-        deps.sharingSecret,
+        deps.deviceRuntimeSecrets,
         "group_authorization_bootstrap",
         now
       );
@@ -4612,8 +4612,10 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
   async fetch(request) {
     const url = new URL(request.url);
     let sharingSecret;
+    let deviceRuntimeSecrets2;
     try {
       sharingSecret = requireSharingSecret(this.envRef);
+      deviceRuntimeSecrets2 = requireDeviceRuntimeSecrets(this.envRef);
     } catch (error) {
       if (error instanceof HttpError) {
         return jsonResponse({ error: error.code, message: error.message }, error.status);
@@ -4637,6 +4639,7 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
       maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
       sharingSecret,
+      deviceRuntimeSecrets: deviceRuntimeSecrets2,
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];

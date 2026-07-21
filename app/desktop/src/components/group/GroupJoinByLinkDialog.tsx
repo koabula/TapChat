@@ -5,7 +5,6 @@ import { X, Link2, AlertCircle, Loader } from "lucide-react";
 import {
   getGroupJoinRequestStatus,
   submitGroupJoinRequest,
-  prepareExternalUrlAccess,
   type GroupJoinStatus,
   type SubmitGroupJoinRequestResult,
 } from "@/lib/tauri";
@@ -85,9 +84,6 @@ export default function GroupJoinByLinkDialog({
     stopPolling();
 
     try {
-      if (/^https?:\/\//i.test(trimmed)) {
-        await prepareExternalUrlAccess(trimmed, "group_invite");
-      }
       const result = await submitGroupJoinRequest(trimmed);
       setPending(result);
       setSubmittedHost(inviteHost(trimmed));
@@ -198,6 +194,11 @@ export default function GroupJoinByLinkDialog({
               disabled={submitting || isJoinInProgress(status)}
             />
           </label>
+          {isPlainHttpInvite(inviteUrl) && (
+            <p className="text-xs text-yellow-500">
+              This invite uses unencrypted HTTP. Only use it on a network you trust.
+            </p>
+          )}
 
           {isJoinInProgress(status) && (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-surface-elevated text-sm text-secondary-color">
@@ -306,5 +307,13 @@ function inviteHost(value: string): string | null {
     return new URL(value).host || null;
   } catch {
     return null;
+  }
+}
+
+function isPlainHttpInvite(value: string): boolean {
+  try {
+    return new URL(value.trim()).protocol === "http:";
+  } catch {
+    return false;
   }
 }

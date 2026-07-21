@@ -1,24 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
-import Welcome from "./pages/onboarding/Welcome";
-import Identity from "./pages/onboarding/Identity";
-import BackupMnemonic from "./pages/onboarding/BackupMnemonic";
-import CloudflareSetup from "./pages/onboarding/CloudflareSetup";
-import Complete from "./pages/onboarding/Complete";
-
 import AppShell from "./pages/shell/AppShell";
-import ChatView from "./pages/chat/ChatView";
 import GroupsPage from "./pages/groups/GroupsPage";
 
 import ContactList from "./pages/contacts/ContactList";
 import ContactDetail from "./pages/contacts/ContactDetail";
 
 import MessageRequests from "./pages/requests/MessageRequests";
-
-import Settings from "./pages/settings/Settings";
 
 import SystemBanner from "./components/SystemBanner";
 
@@ -45,6 +36,28 @@ import { useThemeStore } from "./store/theme";
 
 import type { ProfileSummary, SessionStatus, RealtimeEventPayload } from "./lib/types";
 import type { MessageRequestItem } from "./store/requests";
+
+const Welcome = lazy(() => import("./pages/onboarding/Welcome"));
+const Identity = lazy(() => import("./pages/onboarding/Identity"));
+const BackupMnemonic = lazy(() => import("./pages/onboarding/BackupMnemonic"));
+const CloudflareSetup = lazy(() => import("./pages/onboarding/CloudflareSetup"));
+const Complete = lazy(() => import("./pages/onboarding/Complete"));
+const ChatView = lazy(() => import("./pages/chat/ChatView"));
+const Settings = lazy(() => import("./pages/settings/Settings"));
+
+function RouteSuspense({ children }: { children: ReactNode }) {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-0 flex-1 items-center justify-center bg-base p-6">
+          <span className="text-sm text-muted-color" role="status">Loading view...</span>
+        </div>
+      }
+    >
+      {children}
+    </Suspense>
+  );
+}
 
 function summarizeSessionStatus(status: SessionStatus): string {
   return `state=${status.state} ws_connected=${status.ws_connected} device_id=${status.device_id ?? "none"} lock_reason=${status.lock_reason ?? "none"} error=${status.error ?? "none"}`;
@@ -247,11 +260,11 @@ function AppInner({ startupError }: { startupError: string | null }) {
         {/* Onboarding routes - accessible only when not active */}
         {isOnboarding && (
           <>
-            <Route path="/onboarding" element={<Welcome />} />
-            <Route path="/onboarding/identity" element={<Identity />} />
-            <Route path="/onboarding/backup" element={<BackupMnemonic />} />
-            <Route path="/onboarding/cloudflare" element={<CloudflareSetup />} />
-            <Route path="/onboarding/complete" element={<Complete />} />
+            <Route path="/onboarding" element={<RouteSuspense><Welcome /></RouteSuspense>} />
+            <Route path="/onboarding/identity" element={<RouteSuspense><Identity /></RouteSuspense>} />
+            <Route path="/onboarding/backup" element={<RouteSuspense><BackupMnemonic /></RouteSuspense>} />
+            <Route path="/onboarding/cloudflare" element={<RouteSuspense><CloudflareSetup /></RouteSuspense>} />
+            <Route path="/onboarding/complete" element={<RouteSuspense><Complete /></RouteSuspense>} />
             <Route path="*" element={<Navigate to={onboardingDefaultRoute} replace />} />
           </>
         )}
@@ -260,15 +273,15 @@ function AppInner({ startupError }: { startupError: string | null }) {
         {!isOnboarding && (
           <>
             <Route path="/" element={<AppShell />}>
-              <Route index element={<ChatView />} />
-              <Route path="chat/:id" element={<ChatView />} />
+              <Route index element={<RouteSuspense><ChatView /></RouteSuspense>} />
+              <Route path="chat/:id" element={<RouteSuspense><ChatView /></RouteSuspense>} />
               <Route path="groups" element={<GroupsPage />} />
               <Route path="contacts" element={<ContactList />} />
               <Route path="contacts/:id" element={<ContactDetail />} />
               <Route path="requests" element={<MessageRequests />} />
-              <Route path="settings" element={<Settings />} />
-              <Route path="settings/devices" element={<Settings initialSection="devices" />} />
-              <Route path="settings/runtime" element={<Settings initialSection="runtime" />} />
+              <Route path="settings" element={<RouteSuspense><Settings /></RouteSuspense>} />
+              <Route path="settings/devices" element={<RouteSuspense><Settings initialSection="devices" /></RouteSuspense>} />
+              <Route path="settings/runtime" element={<RouteSuspense><Settings initialSection="runtime" /></RouteSuspense>} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </>

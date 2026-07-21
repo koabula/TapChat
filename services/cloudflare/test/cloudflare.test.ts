@@ -30,6 +30,8 @@ import type {
   SessionSink
 } from "../src/types/runtime";
 import type { Env } from "../src/types/env";
+import { requireDeviceRuntimeSecrets } from "../src/auth/runtime-security";
+import type { RotatingSecretSet } from "../src/auth/runtime-security";
 import type {
   DurableObjectId,
   DurableObjectNamespace,
@@ -73,6 +75,8 @@ const { routeFamilyForObservability } = await import("../src/index");
 
 const TEST_SHARING_SECRET = "test-sharing-secret-0123456789abcdef0123456789abcdef";
 const TEST_BOOTSTRAP_SECRET = "test-bootstrap-secret-0123456789abcdef0123456789abcdef";
+const TEST_DEVICE_RUNTIME_SECRET = "test-runtime-secret-0123456789abcdef0123456789abcdef";
+const TEST_DEVICE_RUNTIME_KEY_ID = "test-runtime-current";
 
 test("observability route families never include stable path identifiers", () => {
   assert.equal(
@@ -294,13 +298,23 @@ class FakeGroupOutboxStub implements DurableObjectStub {
   private readonly groupId: string;
   private readonly state: MemoryState;
   private readonly spillStore: MemoryR2Store;
-  private readonly env: { maxInlineBytes: number; retentionDays: number; sharingSecret: string };
+  private readonly env: {
+    maxInlineBytes: number;
+    retentionDays: number;
+    sharingSecret: string;
+    deviceRuntimeSecrets: RotatingSecretSet;
+  };
 
   constructor(
     groupId: string,
     state: MemoryState,
     spillStore: MemoryR2Store,
-    env: { maxInlineBytes: number; retentionDays: number; sharingSecret: string }
+    env: {
+      maxInlineBytes: number;
+      retentionDays: number;
+      sharingSecret: string;
+      deviceRuntimeSecrets: RotatingSecretSet;
+    }
   ) {
     this.groupId = groupId;
     this.state = state;
@@ -311,7 +325,10 @@ class FakeGroupOutboxStub implements DurableObjectStub {
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = input instanceof Request ? input : new Request(input, init);
     const authorization = new GroupAuthorizationService(this.groupId, this.state);
-    if (!(await authorization.getState())) {
+    const isAuthorizationBootstrap =
+      new URL(request.url).pathname.endsWith("/authorization/bootstrap") &&
+      request.method === "POST";
+    if (!isAuthorizationBootstrap && !(await authorization.getState())) {
       await initializeGroupState(this.state, this.groupId);
     }
     return handleGroupOutboxDurableRequest(request, {
@@ -321,6 +338,7 @@ class FakeGroupOutboxStub implements DurableObjectStub {
       maxInlineBytes: this.env.maxInlineBytes,
       retentionDays: this.env.retentionDays,
       sharingSecret: this.env.sharingSecret,
+      deviceRuntimeSecrets: this.env.deviceRuntimeSecrets,
       sessions: [],
       now: 1_000
     });
@@ -342,6 +360,7 @@ function createEnv(options?: {
   previousDeviceRuntimeSecret?: string;
   previousDeviceRuntimeKeyId?: string;
   authRotationGraceUntilMs?: string;
+  useLegacyDeviceRuntimeSecret?: boolean;
 }) {
   const bucket = new MemoryR2Store();
   const inboxes = new Map<string, FakeInboxStub>();
@@ -352,6 +371,20 @@ function createEnv(options?: {
   const rateLimitPerHour = Number(options?.rateLimitPerHour ?? "600");
   const sharingSecret = options?.sharingSecret ?? TEST_SHARING_SECRET;
   const bootstrapSecret = options?.bootstrapSecret ?? TEST_BOOTSTRAP_SECRET;
+  const deviceRuntimeSecret = options?.useLegacyDeviceRuntimeSecret
+    ? undefined
+    : options?.deviceRuntimeSecret ?? TEST_DEVICE_RUNTIME_SECRET;
+  const deviceRuntimeKeyId = options?.useLegacyDeviceRuntimeSecret
+    ? undefined
+    : options?.deviceRuntimeKeyId ?? TEST_DEVICE_RUNTIME_KEY_ID;
+  const deviceRuntimeSecrets = requireDeviceRuntimeSecrets({
+    SHARING_INTERNAL_SECRET: sharingSecret,
+    DEVICE_RUNTIME_SECRET: deviceRuntimeSecret,
+    DEVICE_RUNTIME_SECRET_KEY_ID: deviceRuntimeKeyId,
+    DEVICE_RUNTIME_SECRET_PREVIOUS: options?.previousDeviceRuntimeSecret,
+    DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID: options?.previousDeviceRuntimeKeyId,
+    AUTH_ROTATION_GRACE_UNTIL_MS: options?.authRotationGraceUntilMs
+  } as Env);
 
   const env = {
     PUBLIC_BASE_URL: "https://example.com",
@@ -365,8 +398,8 @@ function createEnv(options?: {
     BOOTSTRAP_LINK_SECRET_KEY_ID: options?.bootstrapKeyId,
     BOOTSTRAP_LINK_SECRET_PREVIOUS: options?.previousBootstrapSecret,
     BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID: options?.previousBootstrapKeyId,
-    DEVICE_RUNTIME_SECRET: options?.deviceRuntimeSecret,
-    DEVICE_RUNTIME_SECRET_KEY_ID: options?.deviceRuntimeKeyId,
+    DEVICE_RUNTIME_SECRET: deviceRuntimeSecret,
+    DEVICE_RUNTIME_SECRET_KEY_ID: deviceRuntimeKeyId,
     DEVICE_RUNTIME_SECRET_PREVIOUS: options?.previousDeviceRuntimeSecret,
     DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID: options?.previousDeviceRuntimeKeyId,
     AUTH_ROTATION_GRACE_UNTIL_MS: options?.authRotationGraceUntilMs,
@@ -403,7 +436,8 @@ function createEnv(options?: {
             new FakeGroupOutboxStub(groupId, new MemoryState(), bucket, {
               maxInlineBytes,
               retentionDays,
-              sharingSecret
+              sharingSecret,
+              deviceRuntimeSecrets
             })
           );
         }
@@ -796,6 +830,48 @@ function sampleGroupManifest(groupId = "group:project"): GroupManifest {
   return manifest;
 }
 
+function sampleProvisioningGroupManifest(groupId: string): GroupManifest {
+  const base = sampleGroupManifest(groupId);
+  const manifest: GroupManifest = {
+    ...base,
+    admins: [],
+    members: [base.members[0]],
+    memberDevices: [base.memberDevices![0]],
+    rosterVersion: 0,
+    mlsEpochHint: 0,
+    lastCommitMessageId: undefined,
+    signature: ""
+  };
+  manifest.signature = signHex(
+    GROUP_IDENTITIES.owner.deviceSecret,
+    groupManifestSigningPayload(manifest)
+  );
+  return manifest;
+}
+
+async function bootstrapGroupAuthorization(
+  env: Env,
+  groupId: string,
+  token: string
+): Promise<Response> {
+  return handleRequest(
+    new Request(`https://example.com/v1/groups/${encodeURIComponent(groupId)}/authorization/bootstrap`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(token),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        groupId,
+        manifest: sampleProvisioningGroupManifest(groupId),
+        identityBundles: [GROUP_IDENTITIES.owner.bundle]
+      })
+    }),
+    env
+  );
+}
+
 async function initializeGroupState(state: MemoryState, groupId = "group:project"): Promise<void> {
   const service = new GroupAuthorizationService(groupId, state);
   const manifest = sampleGroupManifest(groupId);
@@ -968,6 +1044,77 @@ test("issues device deployment bundle with runtime auth and security features", 
   assert.ok(bundle.runtimeConfig.features.includes("group_authorization_v2"));
 });
 
+test("group authorization bootstrap uses dedicated rotating device runtime secrets", async () => {
+  const currentSecret = "group-runtime-current-0123456789abcdef0123456789abcdef";
+  const previousSecret = "group-runtime-previous-0123456789abcdef0123456789abcdef";
+  const currentKeyId = "group-runtime-current";
+  const previousKeyId = "group-runtime-previous";
+  const graceUntil = Date.now() + 60_000;
+  const { env } = createEnv({
+    deviceRuntimeSecret: currentSecret,
+    deviceRuntimeKeyId: currentKeyId,
+    previousDeviceRuntimeSecret: previousSecret,
+    previousDeviceRuntimeKeyId: previousKeyId,
+    authRotationGraceUntilMs: String(graceUntil)
+  });
+
+  const runtimePayload = {
+    version: CURRENT_MODEL_VERSION,
+    service: "device_runtime" as const,
+    userId: GROUP_IDENTITIES.owner.userId,
+    deviceId: GROUP_IDENTITIES.owner.deviceId,
+    scopes: ["group_authorization_bootstrap" as const],
+    expiresAt: Date.now() + 60_000
+  };
+  const forgedWithSharingSecret = await signSharingPayload(TEST_SHARING_SECRET, {
+    ...runtimePayload,
+    keyId: currentKeyId
+  });
+  assert.equal(
+    (await bootstrapGroupAuthorization(env, "group:dedicated-forged", forgedWithSharingSecret)).status,
+    403
+  );
+  const forgedWithBootstrapSecret = await signSharingPayload(TEST_BOOTSTRAP_SECRET, {
+    ...runtimePayload,
+    keyId: currentKeyId
+  });
+  assert.equal(
+    (await bootstrapGroupAuthorization(env, "group:dedicated-bootstrap-forged", forgedWithBootstrapSecret)).status,
+    403
+  );
+
+  const bundle = await issueDeviceBundle(
+    env,
+    GROUP_IDENTITIES.owner.userId,
+    GROUP_IDENTITIES.owner.deviceId
+  );
+  assert.equal(
+    (await bootstrapGroupAuthorization(env, "group:dedicated-current", bundle.deviceRuntimeAuth!.token)).status,
+    200
+  );
+
+  const previousToken = await signSharingPayload(previousSecret, {
+    ...runtimePayload,
+    keyId: previousKeyId
+  });
+  assert.equal(
+    (await bootstrapGroupAuthorization(env, "group:dedicated-previous", previousToken)).status,
+    200
+  );
+
+  const expired = createEnv({
+    deviceRuntimeSecret: currentSecret,
+    deviceRuntimeKeyId: currentKeyId,
+    previousDeviceRuntimeSecret: previousSecret,
+    previousDeviceRuntimeKeyId: previousKeyId,
+    authRotationGraceUntilMs: "999"
+  });
+  assert.equal(
+    (await bootstrapGroupAuthorization(expired.env, "group:dedicated-expired", previousToken)).status,
+    403
+  );
+});
+
 test("bootstrap rejects expired token", async () => {
   const { env } = createEnv();
   const token = await signSharingPayload(TEST_BOOTSTRAP_SECRET, {
@@ -998,10 +1145,13 @@ test("bootstrap rejects expired token", async () => {
   assert.equal(response.status, 403);
 });
 
-test("rotating sharing secret invalidates previously issued device runtime tokens", async () => {
-  const { env } = createEnv();
+test("legacy sharing-secret fallback invalidates runtime tokens after sharing rotation", async () => {
+  const { env } = createEnv({ useLegacyDeviceRuntimeSecret: true });
   const bundle = await issueDeviceBundle(env);
-  const rotated = createEnv({ sharingSecret: "rotated-sharing-secret-0123456789abcdef0123456789abcdef" });
+  const rotated = createEnv({
+    sharingSecret: "rotated-sharing-secret-0123456789abcdef0123456789abcdef",
+    useLegacyDeviceRuntimeSecret: true
+  });
 
   const response = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/head", {
@@ -2103,6 +2253,10 @@ test("group outbox fails closed until authorization is initialized", async () =>
       maxInlineBytes: 128,
       retentionDays: 30,
       sharingSecret: "secret",
+      deviceRuntimeSecrets: {
+        current: { secret: "secret" },
+        allowUnkeyedCurrent: true
+      },
       sessions: [],
       now: 1_000
     }
@@ -2147,6 +2301,10 @@ test("group outbox subscribe allows members with subscribe operation only", asyn
       maxInlineBytes: 128,
       retentionDays: 30,
       sharingSecret: "secret",
+      deviceRuntimeSecrets: {
+        current: { secret: "secret" },
+        allowUnkeyedCurrent: true
+      },
       sessions: [],
       now: 1_000,
       onUpgrade: () => new Response(null, { status: 200 })
@@ -2168,6 +2326,10 @@ test("group outbox subscribe allows members with subscribe operation only", asyn
       maxInlineBytes: 128,
       retentionDays: 30,
       sharingSecret: "secret",
+      deviceRuntimeSecrets: {
+        current: { secret: "secret" },
+        allowUnkeyedCurrent: true
+      },
       sessions: [],
       now: 1_000,
       onUpgrade: () => new Response(null, { status: 200 })
@@ -2227,6 +2389,10 @@ test("group join decision rejects server-generated approval artifacts on reject"
       maxInlineBytes: 128,
       retentionDays: 30,
       sharingSecret: "secret",
+      deviceRuntimeSecrets: {
+        current: { secret: "secret" },
+        allowUnkeyedCurrent: true
+      },
       sessions: [],
       now: 1_000
     }

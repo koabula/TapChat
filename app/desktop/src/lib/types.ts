@@ -50,15 +50,6 @@ export interface RecoveryPhraseRevealResult {
   mnemonic: string;
 }
 
-export interface ExternalUrlPreflight {
-  purpose: "contact_share" | "group_invite";
-  origin: string;
-  requires_confirmation: boolean;
-  insecure_http: boolean;
-  approval_id?: string;
-  expires_at?: number;
-}
-
 // Profiles - matches backend ProfileSummary struct
 export interface ProfileSummary {
   name: string;

@@ -3,7 +3,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::cli::driver::CoreDriver;
 use crate::cli::profile::Profile;
 use crate::cli::util::to_snake_case_json_string;
-use crate::external_fetch::{fetch_external_json, ExternalResourceKind, ExternalUrlApproval};
+use crate::external_fetch::{fetch_external_json, ExternalResourceKind};
 use crate::ffi_api::{CoreCommand, CoreOutput, MessageRequestActionSummary};
 use crate::identity::IdentityManager;
 use crate::model::{IdentityBundle, Validate};
@@ -49,9 +49,7 @@ pub async fn accept_message_request_with_bundle_import(
             "sender bundle share url is missing; the request did not include an importable identity bundle"
         )
     })?;
-    let approval = driver.take_external_url_approval();
-    let bundle =
-        fetch_identity_bundle_from_url_with_approval(&sender_bundle_share_url, approval).await?;
+    let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
     import_identity_bundle_into_profile(profile, driver, bundle).await?;
     let output = driver
         .run_command_until_idle(CoreCommand::ActOnMessageRequest {
@@ -64,14 +62,7 @@ pub async fn accept_message_request_with_bundle_import(
 }
 
 pub async fn fetch_identity_bundle_from_url(url: &str) -> Result<IdentityBundle> {
-    fetch_identity_bundle_from_url_with_approval(url, None).await
-}
-
-pub async fn fetch_identity_bundle_from_url_with_approval(
-    url: &str,
-    approval: Option<ExternalUrlApproval>,
-) -> Result<IdentityBundle> {
-    let body = fetch_external_json(url, ExternalResourceKind::ContactShare, approval)
+    let body = fetch_external_json(url, ExternalResourceKind::ContactShare)
         .await
         .map_err(anyhow::Error::from)?;
     let normalized = to_snake_case_json_string(&body).context("normalize contact share json")?;

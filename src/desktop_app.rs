@@ -21,11 +21,10 @@ use crate::cli::runtime::{
 use crate::cli::util::sign_hmac_token;
 use crate::contact_workflows::{
     accept_message_request_with_bundle_import, fetch_identity_bundle_from_url,
-    fetch_identity_bundle_from_url_with_approval, import_identity_bundle_into_profile,
-    list_message_requests, message_request_action_from_output, persist_driver,
+    import_identity_bundle_into_profile, list_message_requests, message_request_action_from_output,
+    persist_driver,
 };
 use crate::conversation::StoredMessage;
-use crate::external_fetch::ExternalUrlApproval;
 use crate::ffi_api::{
     AppendResultSummary, AttachmentDescriptor, CoreCommand, CoreEvent, CoreOutput,
     RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
@@ -965,16 +964,8 @@ pub async fn contact_start_direct_from_share_link(
     profile_path: impl AsRef<Path>,
     url: &str,
 ) -> Result<ConversationDetailView> {
-    contact_start_direct_from_share_link_with_approval(profile_path, url, None).await
-}
-
-pub async fn contact_start_direct_from_share_link_with_approval(
-    profile_path: impl AsRef<Path>,
-    url: &str,
-    approval: Option<ExternalUrlApproval>,
-) -> Result<ConversationDetailView> {
     let mut profile = Profile::open(profile_path)?;
-    let bundle = fetch_identity_bundle_from_url_with_approval(url, approval).await?;
+    let bundle = fetch_identity_bundle_from_url(url).await?;
     let user_id = bundle.user_id.clone();
     let mut driver = load_driver(&profile)?;
     driver
@@ -1106,19 +1097,8 @@ pub async fn message_request_accept(
     profile_path: impl AsRef<Path>,
     request_id: &str,
 ) -> Result<MessageRequestActionView> {
-    message_request_accept_with_approval(profile_path, request_id, None).await
-}
-
-pub async fn message_request_accept_with_approval(
-    profile_path: impl AsRef<Path>,
-    request_id: &str,
-    approval: Option<ExternalUrlApproval>,
-) -> Result<MessageRequestActionView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
-    if let Some(approval) = approval {
-        driver.provide_external_url_approval_once(approval);
-    }
     let conversation_peer_ids_before = driver
         .latest_snapshot()
         .as_ref()

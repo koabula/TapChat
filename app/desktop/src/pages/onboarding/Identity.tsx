@@ -125,9 +125,9 @@ export default function Identity() {
   };
 
   return (
-    <div className="flex flex-col h-screen bg-base p-8">
+    <div className="flex h-screen min-h-0 flex-col overflow-hidden bg-base p-8">
       {/* Header */}
-      <div className="flex items-center mb-8">
+      <div className="mb-4 flex shrink-0 items-center">
         <button
           className="btn btn-ghost px-2"
           onClick={() => step === "identity" ? setStep("profile") : navigate("/onboarding")}
@@ -138,7 +138,12 @@ export default function Identity() {
       </div>
 
       {/* Content */}
-      <div className="flex flex-col items-center justify-center flex-1">
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div
+          className={`flex min-h-full flex-col items-center px-2 py-4 ${
+            step === "identity" ? "justify-center" : ""
+          }`}
+        >
         {step === "profile" && (
           <>
             <h2 className="text-xl font-semibold text-primary-color mb-2">
@@ -149,7 +154,7 @@ export default function Identity() {
               encryption key is protected.
             </p>
 
-            <div className="w-full max-w-sm space-y-4">
+            <div className="w-full max-w-sm space-y-3 pb-4">
               <div>
                 <label className="text-sm text-muted-color mb-1 block">Profile name</label>
                 <input
@@ -168,19 +173,19 @@ export default function Identity() {
                 <ProtectionOption
                   checked={protectionMode === "keychain_and_passphrase"}
                   title="System keychain + passphrase"
-                  description="Recommended. The passphrase remains a backup if the system keychain becomes unavailable."
+                  description="Recommended. The passphrase is a backup if the keychain is unavailable."
                   onChange={() => setProtectionMode("keychain_and_passphrase")}
                 />
                 <ProtectionOption
                   checked={protectionMode === "passphrase_only"}
                   title="Passphrase only"
-                  description="Does not use Windows Credential Manager. You must enter the passphrase after restart."
+                  description="Enter the passphrase after each app restart."
                   onChange={() => setProtectionMode("passphrase_only")}
                 />
                 <ProtectionOption
                   checked={protectionMode === "keychain_only"}
                   title="System keychain only"
-                  description="Convenient, but losing the system credential can make local profile data unrecoverable."
+                  description="Convenient, but losing the keychain entry may make local data unrecoverable."
                   onChange={() => {
                     setProtectionMode("keychain_only");
                     setProfilePassphrase("");
@@ -285,10 +290,11 @@ export default function Identity() {
               )}
 
               <div>
-                <label className="text-sm text-muted-color mb-1 block">Display name</label>
+                <label className="text-sm text-muted-color mb-1 block">
+                  Display name (optional)
+                </label>
                 <input
                   className="input"
-                  placeholder="Alice"
                   value={displayName}
                   maxLength={64}
                   onChange={(e) => setDisplayName(e.target.value)}
@@ -319,6 +325,7 @@ export default function Identity() {
             </div>
           </>
         )}
+        </div>
       </div>
     </div>
   );
@@ -336,7 +343,7 @@ function ProtectionOption({
   onChange: () => void;
 }) {
   return (
-    <label className="flex items-start gap-3 rounded-lg border border-default p-3 cursor-pointer">
+    <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-default px-3 py-2">
       <input
         className="mt-1 accent-primary"
         type="radio"

@@ -381,8 +381,14 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
                 <h2 className="text-sm font-medium text-muted-color mb-3">
                   Runtime Authentication Keys
                 </h2>
+                <p className="mb-3 text-sm text-secondary-color">
+                  These keys let this device authenticate to your personal Cloudflare Runtime for
+                  bootstrap and runtime requests. They do not encrypt messages or replace your
+                  recovery phrase or profile passphrase. During rotation, the old key remains
+                  accepted briefly to avoid interruptions.
+                </p>
                 <div className="space-y-2 text-sm">
-                  <CapabilityRow label="Rotation state" ok={status.secret_rotation.phase === "stable"} />
+                  <RotationStateRow phase={status.secret_rotation.phase} />
                   <RuntimeDate label="Last rotated" value={status.secret_rotation.last_rotated_at_ms} />
                   <RuntimeDate label="Next rotation" value={status.secret_rotation.next_rotation_at_ms} />
                   {status.secret_rotation.grace_until_ms && (
@@ -394,24 +400,25 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
                     </div>
                   )}
                 </div>
-                <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {status.secret_rotation.phase === "stable" && (
+                    <button
+                      className="btn btn-secondary transition-fast"
+                      disabled={deploying}
+                      onClick={() => handleSecretAction("cloudflare_rotate_runtime_secrets")}
+                    >
+                      Rotate now
+                    </button>
+                  )}
                   {(["prepared", "deploying", "failed"] as const).includes(
                     status.secret_rotation.phase as "prepared" | "deploying" | "failed",
-                  ) ? (
+                  ) && (
                     <button
                       className="btn btn-primary transition-fast"
                       disabled={deploying}
                       onClick={() => handleSecretAction("cloudflare_resume_secret_rotation")}
                     >
-                      Continue recovery
-                    </button>
-                  ) : (
-                    <button
-                      className="btn btn-secondary transition-fast"
-                      disabled={deploying || status.secret_rotation.phase === "grace"}
-                      onClick={() => handleSecretAction("cloudflare_rotate_runtime_secrets")}
-                    >
-                      Rotate now
+                      Continue rotation
                     </button>
                   )}
                   {status.secret_rotation.phase === "grace" && (
@@ -500,6 +507,34 @@ function CapabilityRow({ label, ok }: { label: string; ok: boolean }) {
       </span>
     </div>
   );
+}
+
+function RotationStateRow({ phase }: { phase: RuntimeSecretRotation["phase"] }) {
+  const label = rotationStateLabel(phase);
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-secondary-color">Rotation state</span>
+      <span className={phase === "stable" ? "text-primary-color" : phase === "failed" ? "text-error" : "text-yellow-500"}>
+        {label}
+      </span>
+    </div>
+  );
+}
+
+function rotationStateLabel(phase: RuntimeSecretRotation["phase"]): string {
+  switch (phase) {
+    case "stable":
+      return "Healthy";
+    case "prepared":
+    case "deploying":
+      return "Rotation in progress";
+    case "grace":
+      return "Grace period";
+    case "pending_authorization":
+      return "Authorization required";
+    case "failed":
+      return "Rotation failed";
+  }
 }
 
 function RuntimeDate({ label, value }: { label: string; value?: number | null }) {

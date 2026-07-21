@@ -37,29 +37,20 @@ fn contact_summary(persisted: &PersistedContact) -> ContactSummary {
 }
 
 async fn fetch_contact_bundle(
-    state: &State<'_, AppState>,
     share_link: &str,
 ) -> Result<tapchat_core::model::IdentityBundle, String> {
-    let approval = state.ports.lock().await.take_external_url_approval(
-        tapchat_core::external_fetch::ExternalResourceKind::ContactShare,
-    );
-    tapchat_core::contact_workflows::fetch_identity_bundle_from_url_with_approval(
-        share_link, approval,
-    )
-    .await
-    .map_err(|error| error.to_string())
+    tapchat_core::contact_workflows::fetch_identity_bundle_from_url(share_link)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub async fn preview_contact_link(
-    state: State<'_, AppState>,
-    share_link: String,
-) -> Result<ContactLinkPreview, String> {
+pub async fn preview_contact_link(share_link: String) -> Result<ContactLinkPreview, String> {
     let link = share_link.trim().to_string();
     if link.is_empty() {
         return Err("share link must not be empty".into());
     }
-    let bundle = fetch_contact_bundle(&state, &link).await?;
+    let bundle = fetch_contact_bundle(&link).await?;
     Ok(ContactLinkPreview {
         user_id: bundle.user_id,
         display_name: bundle.display_name,
@@ -78,7 +69,7 @@ pub async fn start_direct_chat_from_link(
     if link.is_empty() {
         return Err("share link must not be empty".into());
     }
-    let bundle = fetch_contact_bundle(&state, &link).await?;
+    let bundle = fetch_contact_bundle(&link).await?;
     let user_id = bundle.user_id.clone();
 
     drive_core_with_handle(
@@ -130,14 +121,13 @@ pub async fn start_direct_chat_from_link(
 #[tauri::command]
 pub async fn import_contact_by_link(
     app: tauri::AppHandle,
-    state: State<'_, AppState>,
     share_link: String,
 ) -> Result<CoreOutput, String> {
     let link = share_link.trim().to_string();
     if link.is_empty() {
         return Err("share link must not be empty".into());
     }
-    let bundle = fetch_contact_bundle(&state, &link).await?;
+    let bundle = fetch_contact_bundle(&link).await?;
 
     drive_core_with_handle(
         &app,

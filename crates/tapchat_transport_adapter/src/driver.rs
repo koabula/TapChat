@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
@@ -6,10 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::external_fetch::{
-    ExternalResourceKind, ExternalUrlApproval, ExternalUrlAssessment, assess_external_url,
-    fetch_external_json,
-};
+use tapchat_core::external_fetch::{ExternalResourceKind, fetch_external_json};
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
@@ -51,7 +48,6 @@ pub struct DriverRuntime {
     recent_messages: Vec<(String, MessageType)>,
     injected_identity_fetch_failures: BTreeMap<String, Vec<bool>>,
     injected_sync_fetch_failures: BTreeMap<String, Vec<bool>>,
-    external_url_approvals: VecDeque<ExternalUrlApproval>,
 }
 
 pub struct CoreDriver {
@@ -110,7 +106,6 @@ impl CoreDriver {
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
                 injected_sync_fetch_failures: BTreeMap::new(),
-                external_url_approvals: VecDeque::new(),
             },
         })
     }
@@ -136,29 +131,12 @@ impl CoreDriver {
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
                 injected_sync_fetch_failures: BTreeMap::new(),
-                external_url_approvals: VecDeque::new(),
             },
         })
     }
 
     pub fn engine(&self) -> &CoreEngine {
         &self.engine
-    }
-
-    pub async fn assess_external_url(
-        &self,
-        url: &str,
-        purpose: ExternalResourceKind,
-    ) -> Result<ExternalUrlAssessment> {
-        assess_external_url(url, purpose)
-            .await
-            .map_err(anyhow::Error::from)
-    }
-
-    pub fn approve_external_url_once(&mut self, assessment: ExternalUrlAssessment) {
-        self.runtime
-            .external_url_approvals
-            .push_back(assessment.approve());
     }
 
     pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
@@ -606,8 +584,7 @@ impl CoreDriver {
         let reference = fetch
             .reference
             .ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
-        let approval = self.runtime.external_url_approvals.pop_front();
-        match fetch_external_json(&reference, ExternalResourceKind::ContactShare, approval).await {
+        match fetch_external_json(&reference, ExternalResourceKind::ContactShare).await {
             Ok(body) => {
                 let bundle: IdentityBundle =
                     serde_json::from_str(&to_snake_case_json_string(&body)?)?;

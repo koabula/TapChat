@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import { useNavigate } from "react-router";
 
 import { useContactsStore } from "@/store/contacts";
@@ -6,7 +6,6 @@ import {
   listContacts,
   previewContactLink,
   startDirectChatFromLink,
-  prepareExternalUrlAccess,
 } from "@/lib/tauri";
 import type {
   ContactLinkPreview,
@@ -62,13 +61,13 @@ export default function ContactList() {
   // Use contacts from store, show empty state if none
   const displayContacts = storeContacts;
 
-  const handlePreviewByLink = async () => {
+  const handlePreviewByLink = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
     if (!shareLinkInput.trim()) return;
 
     setPreviewing(true);
     setError(null);
     try {
-      await prepareExternalUrlAccess(shareLinkInput, "contact_share");
       const nextPreview = await previewContactLink(shareLinkInput);
       setPreview(nextPreview);
     } catch (err) {
@@ -87,7 +86,6 @@ export default function ContactList() {
     setStartingChat(true);
     setError(null);
     try {
-      await prepareExternalUrlAccess(link, "contact_share");
       const result = await startDirectChatFromLink(link);
       setShareLinkInput("");
       setPreview(null);
@@ -119,7 +117,7 @@ export default function ContactList() {
 
         {/* Add contact */}
         <div className="p-3 border-b border-default">
-          <div className="flex items-center gap-2">
+          <form className="flex items-center gap-2" onSubmit={handlePreviewByLink}>
             <input
               className="input flex-1"
               placeholder="Paste a share link..."
@@ -132,13 +130,18 @@ export default function ContactList() {
               disabled={previewing || startingChat}
             />
             <button
+              type="submit"
               className="btn btn-primary px-3"
-              onClick={handlePreviewByLink}
               disabled={previewing || startingChat || !shareLinkInput.trim()}
             >
               {previewing ? "Checking..." : "Add"}
             </button>
-          </div>
+          </form>
+          {isPlainHttpUrl(shareLinkInput) && (
+            <p className="mt-2 text-xs text-yellow-500">
+              This link uses unencrypted HTTP. Only use it on a network you trust.
+            </p>
+          )}
           {preview && (
             <div className="mt-3 p-3 rounded border border-default bg-surface">
               <div className="flex items-center gap-3">
@@ -154,6 +157,7 @@ export default function ContactList() {
                   </div>
                 </div>
                 <button
+                  type="button"
                   className="btn btn-primary px-3"
                   onClick={handleStartChat}
                   disabled={startingChat}
@@ -172,6 +176,7 @@ export default function ContactList() {
             const statusLabel = relationshipLabel(contact.relationship_status);
             return (
               <button
+                type="button"
                 key={contact.user_id}
                 className="w-full flex items-center gap-3 p-3 hover:bg-surface-elevated border-b border-subtle"
                 onClick={() => navigate(`/contacts/${contact.user_id}`)}
@@ -201,4 +206,12 @@ export default function ContactList() {
       </div>
     </div>
   );
+}
+
+function isPlainHttpUrl(value: string): boolean {
+  try {
+    return new URL(value.trim()).protocol === "http:";
+  } catch {
+    return false;
+  }
 }

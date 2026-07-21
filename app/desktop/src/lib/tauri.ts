@@ -17,7 +17,6 @@ import type {
   AppMetadata,
   RecoveryPhraseRevealChallenge,
   RecoveryPhraseRevealResult,
-  ExternalUrlPreflight,
 } from "./types";
 
 // Re-export Tauri primitives
@@ -396,27 +395,6 @@ export interface GroupInviteView {
   revoked_at: number | null;
   inviter_user_id: string;
   created_at: number;
-}
-
-export async function prepareExternalUrlAccess(
-  url: string,
-  purpose: "contact_share" | "group_invite",
-): Promise<void> {
-  const preflight = await invoke<ExternalUrlPreflight>("preflight_external_url", {
-    url,
-    purpose,
-  });
-  if (!preflight.requires_confirmation) return;
-  const transportWarning = preflight.insecure_http
-    ? " This connection uses unencrypted HTTP, so the URL and response may be visible on the local network."
-    : "";
-  const confirmed = window.confirm(
-    `Allow this one request to private origin ${preflight.origin}?${transportWarning}`,
-  );
-  if (!confirmed || !preflight.approval_id) {
-    throw new Error("Private network access was not approved.");
-  }
-  await invoke("approve_external_url", { approvalId: preflight.approval_id });
 }
 
 export type GroupJoinStatus =

@@ -8,10 +8,8 @@ use serde::Serialize;
 
 use crate::contact_workflows::{
     accept_message_request_with_bundle_import, import_identity_bundle_into_profile,
-    list_message_requests, message_request_action_from_output, message_requests_from_output,
-    persist_driver,
+    message_request_action_from_output, message_requests_from_output, persist_driver,
 };
-use crate::external_fetch::{ExternalNetworkClass, ExternalResourceKind};
 use crate::ffi_api::{AttachmentDescriptor, CoreCommand, CoreEvent};
 use crate::model::{ConversationKind, DeploymentBundle, DeviceStatusKind, Validate};
 use crate::passphrase_strength::evaluate_passphrase_strength;
@@ -407,23 +405,9 @@ impl CliApp {
             ContactRequestsSubcommand::Accept {
                 profile,
                 request_id,
-                allow_private_url,
             } => {
                 let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
-                let share_url = list_message_requests(&mut driver)
-                    .await?
-                    .into_iter()
-                    .find(|request| request.request_id == request_id)
-                    .and_then(|request| request.sender_bundle_share_url)
-                    .ok_or_else(|| anyhow!("sender bundle share url is missing"))?;
-                self.prepare_external_url(
-                    &mut driver,
-                    &share_url,
-                    ExternalResourceKind::ContactShare,
-                    allow_private_url,
-                )
-                .await?;
                 let result = accept_message_request_with_bundle_import(
                     &mut profile,
                     &mut driver,
@@ -1237,44 +1221,6 @@ impl CliApp {
         }))
     }
 
-    async fn prepare_external_url(
-        &self,
-        driver: &mut CoreDriver,
-        url: &str,
-        purpose: ExternalResourceKind,
-        allow_private_url: bool,
-    ) -> Result<()> {
-        use std::io::{BufRead, Write};
-
-        let assessment = driver.assess_external_url(url, purpose).await?;
-        if assessment.network_class() == ExternalNetworkClass::Public {
-            return Ok(());
-        }
-        if !allow_private_url {
-            let mut stdout = std::io::stdout().lock();
-            write!(
-                stdout,
-                "Allow one {} request to private origin {}{}? [y/N]: ",
-                purpose.as_str(),
-                assessment.origin(),
-                if assessment.insecure_http() {
-                    " over unencrypted HTTP"
-                } else {
-                    ""
-                }
-            )?;
-            stdout.flush()?;
-            drop(stdout);
-            let mut line = String::new();
-            let bytes_read = std::io::stdin().lock().read_line(&mut line)?;
-            if !dissolve_confirmation_accepted(bytes_read, &line) {
-                bail!("private_network_approval_required");
-            }
-        }
-        driver.approve_external_url_once(assessment);
-        Ok(())
-    }
-
     async fn run_group_invite(&self, command: GroupInviteCommand) -> Result<()> {
         match command.command {
             GroupInviteSubcommand::Create {
@@ -1386,17 +1332,9 @@ impl CliApp {
             GroupJoinSubcommand::Submit {
                 profile,
                 invite_url,
-                allow_private_url,
             } => {
                 let mut profile = Profile::open(resolve_profile_path(profile)?)?;
                 let mut driver = load_driver(&profile)?;
-                self.prepare_external_url(
-                    &mut driver,
-                    &invite_url,
-                    ExternalResourceKind::GroupInvite,
-                    allow_private_url,
-                )
-                .await?;
                 let notification_offset = driver.notifications().len();
                 let output = driver
                     .run_command_until_idle(CoreCommand::FetchGroupInvite {

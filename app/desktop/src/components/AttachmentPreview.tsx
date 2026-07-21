@@ -1,7 +1,5 @@
-import { useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { save } from "@tauri-apps/plugin-dialog";
 import {
   Image,
   Music,
@@ -14,6 +12,8 @@ import {
   File,
 } from "lucide-react";
 import AttachmentCard from "./AttachmentCard";
+import { useAttachmentDownload } from "@/hooks/useAttachmentDownload";
+import { formatAttachmentDownloadError } from "@/lib/attachmentDownload";
 
 export interface AttachmentPreviewProps {
   messageId: string;
@@ -35,26 +35,20 @@ export default function AttachmentPreview({
   sizeBytes,
   downloaded = false,
 }: AttachmentPreviewProps) {
-  const [downloading, setDownloading] = useState(false);
-  const [downloadedPath, setDownloadedPath] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const formatAttachmentError = (err: unknown): string => {
-    const text = String(err);
-    const lower = text.toLowerCase();
-    if (
-      lower.includes("capability_expired") ||
-      lower.includes("sharing token expired") ||
-      lower.includes("http 403") ||
-      lower.includes("link may have expired")
-    ) {
-      return "Attachment link expired";
-    }
-    if (lower.includes("metadata is missing") || lower.includes("attachment metadata missing")) {
-      return "Attachment metadata missing";
-    }
-    return text;
-  };
+  const {
+    downloading,
+    downloadedPath,
+    error,
+    setDownloadedPath,
+    setError,
+    download: handleDownload,
+  } = useAttachmentDownload({
+    conversationId,
+    messageId,
+    reference,
+    fileName,
+    mimeType,
+  });
 
   const getFileIcon = (): ReactNode => {
     const cls = (color: string) => `w-6 h-6 ${color}`;
@@ -83,70 +77,6 @@ export default function AttachmentPreview({
     return "File";
   };
 
-  const handleDownload = async () => {
-    setDownloading(true);
-    setError(null);
-
-    try {
-      const defaultFileName = fileName || `attachment${getExtensionFromMimeType(mimeType)}`;
-      const settings = await invoke<{ always_ask_save_path: boolean }>("get_attachment_settings");
-
-      if (settings.always_ask_save_path) {
-        const savePath = await save({
-          title: "Save attachment",
-          defaultPath: defaultFileName,
-        });
-
-        if (!savePath) {
-          setDownloading(false);
-          return null;
-        }
-
-        await invoke("download_attachment", {
-          conversationId,
-          messageId,
-          reference,
-          destination: savePath,
-        });
-
-        setDownloadedPath(savePath);
-        return savePath;
-      }
-
-      const defaultPath = await invoke<string>("download_attachment_to_default_path", {
-        conversationId,
-        messageId,
-        reference,
-        fileName: defaultFileName,
-        mimeType,
-      });
-
-      setDownloadedPath(defaultPath);
-      return defaultPath;
-    } catch (err) {
-      setError(formatAttachmentError(err));
-      return null;
-    } finally {
-      setDownloading(false);
-    }
-  };
-
-  const getExtensionFromMimeType = (mime: string): string => {
-    const mimeToExt: Record<string, string> = {
-      "image/jpeg": ".jpg",
-      "image/png": ".png",
-      "image/gif": ".gif",
-      "image/webp": ".webp",
-      "application/pdf": ".pdf",
-      "audio/mpeg": ".mp3",
-      "audio/wav": ".wav",
-      "video/mp4": ".mp4",
-      "application/zip": ".zip",
-      "text/plain": ".txt",
-    };
-    return mimeToExt[mime] || "";
-  };
-
   const handleOpen = async () => {
     if (!downloadedPath) {
       await handleDownload();
@@ -164,7 +94,7 @@ export default function AttachmentPreview({
       }
       await invoke("open_file", { path: downloadedPath });
     } catch (err) {
-      setError(formatAttachmentError(err));
+      setError(formatAttachmentDownloadError(err));
     }
   };
 

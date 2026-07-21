@@ -1,16 +1,13 @@
-import { useState, useEffect, useMemo, useRef } from "react";
-import { useParams } from "react-router";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { useNavigate, useParams } from "react-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   Clapperboard,
-  EllipsisVertical,
   Loader,
   MessageCircle,
   Music,
-  RefreshCw,
-  Search,
   UserX,
   Users,
 } from "lucide-react";
@@ -21,6 +18,8 @@ import ImageGrid from "@/components/ImageGrid";
 import MediaLightbox, { type MediaItem } from "@/components/MediaLightbox";
 import GroupMemberDrawer from "@/components/group/GroupMemberDrawer";
 import GroupSyncIndicator from "@/components/group/GroupSyncIndicator";
+import ChatHeaderActions from "@/components/chat/ChatHeaderActions";
+import ChatSearchBar from "@/components/chat/ChatSearchBar";
 import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
 import { useSessionStore } from "@/store/session";
@@ -33,12 +32,15 @@ import {
   cloudflareStatus,
   getGroupMessages,
   getGroupSnapshot,
+  listContacts,
   listConversations,
+  refreshContact,
   syncGroupOutbox,
   type GroupMessageView,
 } from "@/lib/tauri";
 import type { Message, CoreUpdateEvent, CloudflareStatus, StorageRef } from "@/lib/types";
 import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
+import { findMessageMatches, moveSearchIndex } from "@/lib/messageSearch";
 
 interface SendMessageResult {
   message_id: string;
@@ -52,6 +54,7 @@ interface SendMessageResult {
 
 export default function ChatView() {
   const { id: conversationId } = useParams();
+  const navigate = useNavigate();
   const [messages, setMessages] = useState<Message[]>([]);
   const [groupMessages, setGroupMessages] = useState<GroupMessageView[]>([]);
   const [loading, setLoading] = useState(false);
@@ -63,12 +66,16 @@ export default function ChatView() {
   const [recoveryBusy, setRecoveryBusy] = useState(false);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchIndex, setSearchIndex] = useState(-1);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
+  const messageRefs = useRef(new Map<string, HTMLDivElement>());
 
-  const { contacts } = useContactsStore();
+  const { contacts, setContacts } = useContactsStore();
   const { conversations, mergeConversationSnapshot, setActiveConversation } =
     useConversationsStore();
   const { deviceId, displayName: localDisplayName } = useSessionStore();
@@ -118,6 +125,63 @@ export default function ChatView() {
       : directClosed
         ? "This chat is closed."
         : undefined;
+
+  const searchMatches = useMemo(
+    () => (isGroup ? [] : findMessageMatches(messages, searchQuery)),
+    [isGroup, messages, searchQuery],
+  );
+  const activeSearchMessageId =
+    searchIndex >= 0 && searchIndex < searchMatches.length
+      ? searchMatches[searchIndex]
+      : null;
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchIndex(-1);
+  }, []);
+
+  const navigateSearch = useCallback(
+    (direction: 1 | -1) => {
+      setSearchIndex((current) => moveSearchIndex(current, searchMatches.length, direction));
+    },
+    [searchMatches.length],
+  );
+
+  useEffect(() => {
+    setSearchIndex(searchMatches.length > 0 ? 0 : -1);
+  }, [searchMatches]);
+
+  useEffect(() => {
+    closeSearch();
+    messageRefs.current.clear();
+  }, [closeSearch, conversationId, isGroup]);
+
+  useEffect(() => {
+    if (isGroup) return;
+    const handleSearchShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        event.stopPropagation();
+        setSearchOpen(true);
+      } else if (event.key === "Escape" && searchOpen) {
+        event.preventDefault();
+        event.stopPropagation();
+        closeSearch();
+      }
+    };
+    window.addEventListener("keydown", handleSearchShortcut, true);
+    return () => window.removeEventListener("keydown", handleSearchShortcut, true);
+  }, [closeSearch, isGroup, searchOpen]);
+
+  useEffect(() => {
+    if (!activeSearchMessageId) return;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    messageRefs.current.get(activeSearchMessageId)?.scrollIntoView({
+      behavior: reducedMotion ? "auto" : "smooth",
+      block: "center",
+    });
+  }, [activeSearchMessageId]);
 
   // Determine the local user's current status in this group so we can
   // fail-closed the composer when they have been removed / left /
@@ -229,8 +293,9 @@ export default function ChatView() {
   };
 
   const scrollToBottom = (behavior: "smooth" | "instant" = "smooth") => {
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
     messagesEndRef.current?.scrollIntoView({
-      behavior: behavior === "smooth" ? "smooth" : "auto",
+      behavior: behavior === "smooth" && !reducedMotion ? "smooth" : "auto",
       block: "end",
     });
   };
@@ -325,7 +390,7 @@ export default function ChatView() {
 
   const syncCurrentGroup = async (reason: string, showBusy = false) => {
     const groupId = activeConversation?.group_id;
-    if (!groupId) return;
+    if (!groupId) return false;
     if (showBusy) {
       setManualSyncBusy(true);
       setTransportError(null);
@@ -335,21 +400,40 @@ export default function ChatView() {
       markGroupSynced(groupId);
       await refreshCurrentGroupSnapshot();
       await refreshMessages();
+      return true;
     } catch (err) {
       markGroupSyncFailed(groupId, String(err));
       if (showBusy) {
         setTransportError(err instanceof Error ? err.message : String(err));
       }
+      return false;
     } finally {
       if (showBusy) setManualSyncBusy(false);
     }
   };
 
   useEffect(() => {
-    if (!loading && messages.length > 0) {
+    if (!searchOpen && !loading && messages.length > 0) {
       scrollToBottom(shouldAutoScrollRef.current ? "smooth" : "instant");
     }
-  }, [messages, loading]);
+  }, [messages, loading, searchOpen]);
+
+  const handleRefreshDirectContact = async () => {
+    const userId =
+      activeConversation?.kind === "direct" ? activeConversation.peer_user_id : undefined;
+    if (!userId) throw new Error("Contact is unavailable");
+    await refreshContact(userId);
+    const refreshedContacts = await listContacts();
+    setContacts(
+      refreshedContacts.map((contact) => ({
+        user_id: contact.user_id,
+        display_name: contact.display_name ?? null,
+        device_count: contact.device_count,
+        last_refresh: Date.now(),
+        relationship_status: contact.relationship_status ?? "available",
+      })),
+    );
+  };
 
   useEffect(() => {
     setActiveConversation(conversationId ?? null);
@@ -512,7 +596,13 @@ export default function ChatView() {
         result.push(
           <div
             key={msg.message_id}
-            className="date-separator"
+            ref={(element) => {
+              if (element) messageRefs.current.set(msg.message_id, element);
+              else messageRefs.current.delete(msg.message_id);
+            }}
+            className={`date-separator ${
+              activeSearchMessageId === msg.message_id ? "search-result-active" : ""
+            }`}
             data-raw-type={msg.raw_message_type}
           >
             <span>{msg.plaintext ?? "Conversation updated"}</span>
@@ -524,7 +614,13 @@ export default function ChatView() {
       result.push(
         <div
           key={msg.message_id}
-          className={`flex ${isMyMessage(msg) ? "justify-end" : "justify-start"}`}
+          ref={(element) => {
+            if (element) messageRefs.current.set(msg.message_id, element);
+            else messageRefs.current.delete(msg.message_id);
+          }}
+          className={`flex ${isMyMessage(msg) ? "justify-end" : "justify-start"} ${
+            activeSearchMessageId === msg.message_id ? "search-result-active" : ""
+          }`}
         >
           {renderMessageBubble(msg)}
         </div>,
@@ -813,36 +909,36 @@ export default function ChatView() {
             )}
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          {isGroup && (
-            <button
-              className="btn btn-ghost px-2 transition-fast"
-              title="Sync group messages"
-              onClick={() => void syncCurrentGroup("manual", true)}
-              disabled={manualSyncBusy}
-            >
-              <RefreshCw size={18} className={manualSyncBusy ? "animate-spin" : ""} />
-            </button>
-          )}
-          {isGroup && (
-            <button
-              className="btn btn-ghost px-2 transition-fast"
-              title="Members"
-              onClick={() => setMemberDrawerOpen(true)}
-            >
-              <Users size={18} />
-            </button>
-          )}
-          {!isGroup && (
-            <button className="btn btn-ghost px-2 transition-fast" title="Search messages">
-              <Search size={18} />
-            </button>
-          )}
-          <button className="btn btn-ghost px-2 transition-fast" title="More options">
-            <EllipsisVertical size={18} />
-          </button>
-        </div>
+        <ChatHeaderActions
+          key={conversationId}
+          isGroup={Boolean(isGroup)}
+          searchOpen={searchOpen}
+          syncBusy={manualSyncBusy}
+          onToggleSearch={() => {
+            if (searchOpen) closeSearch();
+            else setSearchOpen(true);
+          }}
+          onOpenContactDetails={() => {
+            const userId = activeConversation?.peer_user_id;
+            if (userId) navigate(`/contacts/${encodeURIComponent(userId)}`);
+          }}
+          onRefreshContact={handleRefreshDirectContact}
+          onOpenMembers={() => setMemberDrawerOpen(true)}
+          onSyncGroup={() => syncCurrentGroup("manual", true)}
+        />
       </header>
+
+      {searchOpen && !isGroup && (
+        <ChatSearchBar
+          query={searchQuery}
+          currentIndex={searchIndex}
+          resultCount={searchMatches.length}
+          onQueryChange={setSearchQuery}
+          onPrevious={() => navigateSearch(-1)}
+          onNext={() => navigateSearch(1)}
+          onClose={closeSearch}
+        />
+      )}
 
       {conversationRecovery && (
         <div className="border-b border-subtle bg-surface px-4 py-3">

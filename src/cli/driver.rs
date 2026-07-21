@@ -12,8 +12,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 use crate::external_fetch::{
-    assess_external_url, fetch_external_json, ExternalResourceKind, ExternalUrlApproval,
-    ExternalUrlAssessment,
+    fetch_external_json, validate_group_invite_transport_binding, ExternalResourceKind,
 };
 use crate::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
@@ -63,7 +62,6 @@ pub struct DriverRuntime {
     contact_share_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
-    external_url_approval: Option<ExternalUrlApproval>,
 }
 
 pub struct CoreDriver {
@@ -130,7 +128,6 @@ impl CoreDriver {
                 contact_share_url,
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
-                external_url_approval: None,
             },
             suppress_realtime: false,
         })
@@ -138,28 +135,6 @@ impl CoreDriver {
 
     pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
         self.runtime.latest_snapshot.as_ref()
-    }
-
-    pub async fn assess_external_url(
-        &self,
-        url: &str,
-        purpose: ExternalResourceKind,
-    ) -> Result<ExternalUrlAssessment> {
-        assess_external_url(url, purpose)
-            .await
-            .map_err(anyhow::Error::from)
-    }
-
-    pub fn approve_external_url_once(&mut self, assessment: ExternalUrlAssessment) {
-        self.runtime.external_url_approval = Some(assessment.approve());
-    }
-
-    pub fn provide_external_url_approval_once(&mut self, approval: ExternalUrlApproval) {
-        self.runtime.external_url_approval = Some(approval);
-    }
-
-    pub fn take_external_url_approval(&mut self) -> Option<ExternalUrlApproval> {
-        self.runtime.external_url_approval.take()
     }
 
     pub fn notifications(&self) -> &[String] {
@@ -675,8 +650,7 @@ impl CoreDriver {
         let reference = fetch
             .reference
             .ok_or_else(|| anyhow!("identity bundle fetch missing reference"))?;
-        let approval = self.runtime.external_url_approval.take();
-        match fetch_external_json(&reference, ExternalResourceKind::ContactShare, approval).await {
+        match fetch_external_json(&reference, ExternalResourceKind::ContactShare).await {
             Ok(body) => {
                 let bundle: IdentityBundle =
                     serde_json::from_str(&to_snake_case_json_string(&body)?)?;
@@ -1765,17 +1739,19 @@ impl TransportPort for CoreDriver {
         &mut self,
         fetch: FetchGroupInviteRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let approval = self.runtime.external_url_approval.take();
-        match fetch_external_json(
-            &fetch.invite_url,
-            ExternalResourceKind::GroupInvite,
-            approval,
-        )
-        .await
-        {
+        match fetch_external_json(&fetch.invite_url, ExternalResourceKind::GroupInvite).await {
             Ok(body) => {
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupInviteResult = serde_json::from_str(&body)?;
+                if let Err(error) =
+                    validate_group_invite_transport_binding(&fetch.invite_url, &result.invite)
+                {
+                    return Ok(vec![CoreEvent::GroupInviteFetchFailed {
+                        invite_url: fetch.invite_url,
+                        retryable: false,
+                        detail: Some(error.to_string()),
+                    }]);
+                }
                 Ok(vec![CoreEvent::GroupInviteFetched {
                     invite_url: fetch.invite_url,
                     invite: result.invite,

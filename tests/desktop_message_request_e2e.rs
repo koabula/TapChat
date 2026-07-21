@@ -7,7 +7,6 @@ use common::{
 };
 use tapchat_core::cli::profile::{Profile, RuntimeMetadata};
 use tapchat_core::desktop_app;
-use tapchat_core::external_fetch::{assess_external_url, ExternalResourceKind};
 use tapchat_core::model::{IdentityBundle, MessageType};
 use tapchat_transport_adapter::CloudflareRuntimeHandle;
 
@@ -194,25 +193,8 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
     let requests = with_tokio(|| async { desktop_app::message_requests_list(&bob_profile).await })?;
     assert_eq!(requests.len(), 1);
     let request_id = requests[0].request_id.clone();
-    let request_share_url = requests[0]
-        .sender_bundle_share_url
-        .as_deref()
-        .context("initial message request must include a sender share URL")?;
-    let request_approval = with_tokio(|| async {
-        Ok::<_, anyhow::Error>(
-            assess_external_url(request_share_url, ExternalResourceKind::ContactShare)
-                .await?
-                .approve(),
-        )
-    })?;
-
     let accept = with_tokio(|| async {
-        desktop_app::message_request_accept_with_approval(
-            &bob_profile,
-            &request_id,
-            Some(request_approval),
-        )
-        .await
+        desktop_app::message_request_accept(&bob_profile, &request_id).await
     })?;
     assert!(accept.accepted);
     assert!(accept.contact_available);
@@ -252,20 +234,8 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
 
     let alice_share_link =
         with_tokio(|| async { desktop_app::contact_share_link_get(&alice_profile).await })?;
-    let share_approval = with_tokio(|| async {
-        Ok::<_, anyhow::Error>(
-            assess_external_url(&alice_share_link.url, ExternalResourceKind::ContactShare)
-                .await?
-                .approve(),
-        )
-    })?;
     let bob_readd_conversation = with_tokio(|| async {
-        desktop_app::contact_start_direct_from_share_link_with_approval(
-            &bob_profile,
-            &alice_share_link.url,
-            Some(share_approval),
-        )
-        .await
+        desktop_app::contact_start_direct_from_share_link(&bob_profile, &alice_share_link.url).await
     })?;
     let bob_readd_conversation_id = bob_readd_conversation.conversation_id.clone();
 
@@ -297,25 +267,8 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
         readd_request.last_conversation_id, bob_readd_conversation_id,
         "message request should point at the fresh re-add conversation"
     );
-    let readd_share_url = readd_request
-        .sender_bundle_share_url
-        .as_deref()
-        .context("re-add request must include a sender share URL")?;
-    let readd_approval = with_tokio(|| async {
-        Ok::<_, anyhow::Error>(
-            assess_external_url(readd_share_url, ExternalResourceKind::ContactShare)
-                .await?
-                .approve(),
-        )
-    })?;
-
     let readd_accept = with_tokio(|| async {
-        desktop_app::message_request_accept_with_approval(
-            &alice_profile,
-            &readd_request.request_id,
-            Some(readd_approval),
-        )
-        .await
+        desktop_app::message_request_accept(&alice_profile, &readd_request.request_id).await
     })?;
     assert!(readd_accept.accepted);
     assert!(readd_accept.contact_available);

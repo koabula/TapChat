@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "crates/tapchat_transport_adapter", "app/desktop/src-tauri"]
+exclude = ["third_party/rust/hpke-rs"]
 resolver = "2"
 
 [package]
@@ -64,8 +65,13 @@ tapchat_transport_adapter = { path = "crates/tapchat_transport_adapter" }
 tapchat-desktop = { path = "app/desktop/src-tauri", default-features = false, features = ["test-support"] }
 proptest = "1.11"
 
-# hpke-rs 0.6.1 lists its optional libcrux provider in Cargo.lock even though
-# TapChat uses only the RustCrypto provider. Pin the upstream provider manifest
-# that upgrades the vulnerable libcrux-aead 0.0.7 chain to 0.0.8.
+# hpke-rs 0.6.1 pins libcrux-sha3 0.0.8, which is affected by
+# RUSTSEC-2026-0207 and RUSTSEC-2026-0208 and pulls in the
+# RUSTSEC-2026-0212-affected libcrux-secrets 0.0.5. The four hpke-rs packages
+# must stay on one upstream commit because that commit changed their shared
+# provider API. Only package manifests are patched; Rust sources are unchanged.
 [patch.crates-io]
-hpke-rs-libcrux = { git = "https://github.com/cryspen/hpke-rs.git", rev = "0a4aa953e157111b9a00c9cfc586e9c6a2778e9f" }
+hpke-rs = { path = "third_party/rust/hpke-rs" }
+hpke-rs-crypto = { path = "third_party/rust/hpke-rs/traits" }
+hpke-rs-rust-crypto = { path = "third_party/rust/hpke-rs/rust_crypto_provider" }
+hpke-rs-libcrux = { path = "third_party/rust/hpke-rs/libcrux_provider" }

@@ -12,6 +12,8 @@ import {
   Play,
   Pause,
 } from "lucide-react";
+import { useAttachmentDownload } from "@/hooks/useAttachmentDownload";
+import { formatAttachmentDownloadError } from "@/lib/attachmentDownload";
 
 export interface MediaItem {
   type: "image" | "video" | "audio" | "other";
@@ -568,6 +570,29 @@ function AudioLightboxContent({ item }: { item: MediaItem }) {
 
 /** Fallback for non-media files */
 function OtherLightboxContent({ item }: { item: MediaItem }) {
+  const {
+    downloading,
+    downloadedPath,
+    error,
+    setError,
+    download,
+  } = useAttachmentDownload({
+    conversationId: item.conversationId,
+    messageId: item.messageId,
+    reference: item.reference,
+    fileName: item.fileName,
+    mimeType: item.mimeType,
+  });
+
+  const handleOpen = async () => {
+    if (!downloadedPath) return;
+    try {
+      await invoke("open_file", { path: downloadedPath });
+    } catch (caught) {
+      setError(formatAttachmentDownloadError(caught));
+    }
+  };
+
   return (
     <div className="bg-white/10 backdrop-blur rounded-xl p-8 text-center max-w-sm">
       <Download size={40} className="text-white/40 mx-auto mb-3" />
@@ -579,18 +604,29 @@ function OtherLightboxContent({ item }: { item: MediaItem }) {
       </p>
       <button
         className="px-4 py-2 bg-white/20 hover:bg-white/30 text-white rounded-lg transition-colors text-sm"
-        onClick={() => {
-          // Trigger download through the normal invoke flow
-          invoke("download_attachment", {
-            conversationId: item.conversationId,
-            messageId: item.messageId,
-            reference: item.reference,
-            destination: "", // Will prompt via save dialog — handled differently
-          }).catch(console.error);
-        }}
+        disabled={downloading}
+        onClick={() => void download()}
       >
-        Download File
+        {downloading ? "Downloading..." : downloadedPath ? "Download Again" : "Download File"}
       </button>
+      {downloadedPath && (
+        <button
+          className="ml-2 px-4 py-2 bg-white text-black rounded-lg text-sm hover:bg-white/90"
+          onClick={() => void handleOpen()}
+        >
+          Open File
+        </button>
+      )}
+      {downloadedPath && (
+        <p className="mt-3 break-all text-xs text-white/60" role="status">
+          Saved to {downloadedPath}
+        </p>
+      )}
+      {error && (
+        <p className="mt-3 text-sm text-red-300" role="alert">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

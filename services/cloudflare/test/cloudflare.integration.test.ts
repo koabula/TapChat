@@ -30,6 +30,9 @@ const TMP_DIR = path.join(os.tmpdir(), "tapchat-cloudflare-test-runtime");
 const WORKER_BUNDLE = path.join(TMP_DIR, "worker.mjs");
 const BASE_URL = "https://example.com";
 const BOOTSTRAP_SECRET = "integration-bootstrap-secret-0123456789abcdef0123456789abcdef";
+const SHARING_SECRET = "integration-sharing-secret-0123456789abcdef0123456789abcdef";
+const DEVICE_RUNTIME_SECRET = "integration-runtime-secret-0123456789abcdef0123456789abcdef";
+const DEVICE_RUNTIME_KEY_ID = "integration-runtime-current";
 const signedFixtures = new Map<string, { bundle: IdentityBundle; capability: InboxAppendCapability }>();
 
 async function ensureWorkerBundle(): Promise<string> {
@@ -59,8 +62,10 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       RETENTION_DAYS: options?.retentionDays ?? "1",
       RATE_LIMIT_PER_MINUTE: options?.rateLimitPerMinute ?? "60",
       RATE_LIMIT_PER_HOUR: options?.rateLimitPerHour ?? "600",
-      SHARING_INTERNAL_SECRET: "integration-sharing-secret-0123456789abcdef0123456789abcdef",
-      BOOTSTRAP_LINK_SECRET: BOOTSTRAP_SECRET
+      SHARING_INTERNAL_SECRET: SHARING_SECRET,
+      BOOTSTRAP_LINK_SECRET: BOOTSTRAP_SECRET,
+      DEVICE_RUNTIME_SECRET,
+      DEVICE_RUNTIME_SECRET_KEY_ID: DEVICE_RUNTIME_KEY_ID
     },
     durableObjects: {
       INBOX: "InboxDurableObject",

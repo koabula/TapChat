@@ -11,8 +11,10 @@ import {
   CONTROL_JSON_MAX_BYTES,
   DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES,
   readJsonLimited,
+  requireDeviceRuntimeSecrets,
   requireSharingSecret
 } from "../auth/runtime-security";
+import type { RotatingSecretSet } from "../auth/runtime-security";
 import { GroupOutboxService } from "./service";
 import { GroupAuthorizationService } from "./authorization";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
@@ -152,6 +154,7 @@ export async function handleGroupOutboxDurableRequest(
     maxInlineBytes: number;
     retentionDays: number;
     sharingSecret: string;
+    deviceRuntimeSecrets: RotatingSecretSet;
     now?: number;
     onUpgrade?: () => Response;
   }
@@ -169,7 +172,7 @@ export async function handleGroupOutboxDurableRequest(
     if (url.pathname.endsWith("/authorization/bootstrap") && request.method === "POST") {
       const runtimeToken = await validateAnyDeviceRuntimeAuthorization(
         request,
-        deps.sharingSecret,
+        deps.deviceRuntimeSecrets,
         "group_authorization_bootstrap",
         now
       );
@@ -583,8 +586,10 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     let sharingSecret: string;
+    let deviceRuntimeSecrets: RotatingSecretSet;
     try {
       sharingSecret = requireSharingSecret(this.envRef);
+      deviceRuntimeSecrets = requireDeviceRuntimeSecrets(this.envRef);
     } catch (error) {
       if (error instanceof HttpError) {
         return jsonResponse({ error: error.code, message: error.message }, error.status);
@@ -610,6 +615,7 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
       maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
       sharingSecret,
+      deviceRuntimeSecrets,
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
