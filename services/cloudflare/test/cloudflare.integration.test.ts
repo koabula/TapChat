@@ -8,8 +8,9 @@ import { Miniflare } from "miniflare";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   CURRENT_MODEL_VERSION,
-  type BootstrapDeviceRequest,
   type DeploymentBundle,
+  type DeviceRuntimeAuth,
+  type DeviceRuntimeRefreshChallenge,
   type DeviceBinding,
   type GroupCapability,
   type GroupManifest,
@@ -18,7 +19,6 @@ import {
   type MessageRequestListResult,
   type PrepareBlobUploadRequest
 } from "../src/types/contracts";
-import { signSharingPayload } from "../src/storage/sharing";
 import {
   groupCapabilitySigningPayload,
   groupManifestSigningPayload,
@@ -29,7 +29,7 @@ const ROOT = path.resolve(import.meta.dirname, "..");
 const TMP_DIR = path.join(os.tmpdir(), "tapchat-cloudflare-test-runtime");
 const WORKER_BUNDLE = path.join(TMP_DIR, "worker.mjs");
 const BASE_URL = "https://example.com";
-const BOOTSTRAP_SECRET = "integration-bootstrap-secret-0123456789abcdef0123456789abcdef";
+const RUNTIME_ID = "runtime:integration";
 const SHARING_SECRET = "integration-sharing-secret-0123456789abcdef0123456789abcdef";
 const DEVICE_RUNTIME_SECRET = "integration-runtime-secret-0123456789abcdef0123456789abcdef";
 const DEVICE_RUNTIME_KEY_ID = "integration-runtime-current";
@@ -49,7 +49,7 @@ async function ensureWorkerBundle(): Promise<string> {
   return WORKER_BUNDLE;
 }
 
-async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?: string; rateLimitPerMinute?: string; rateLimitPerHour?: string }) {
+async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?: string; rateLimitPerMinute?: string; rateLimitPerHour?: string; ownerUserId?: string }) {
   const scriptPath = await ensureWorkerBundle();
   const mf = new Miniflare({
     scriptPath,
@@ -57,19 +57,22 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
     compatibilityDate: "2026-07-09",
     bindings: {
       PUBLIC_BASE_URL: BASE_URL,
+      RUNTIME_ID,
+      OWNER_USER_ID: options?.ownerUserId ?? "user:bob",
+      OWNER_USER_PUBLIC_KEY: bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(11))),
       DEPLOYMENT_REGION: "local",
       MAX_INLINE_BYTES: options?.maxInlineBytes ?? "128",
       RETENTION_DAYS: options?.retentionDays ?? "1",
       RATE_LIMIT_PER_MINUTE: options?.rateLimitPerMinute ?? "60",
       RATE_LIMIT_PER_HOUR: options?.rateLimitPerHour ?? "600",
       SHARING_INTERNAL_SECRET: SHARING_SECRET,
-      BOOTSTRAP_LINK_SECRET: BOOTSTRAP_SECRET,
       DEVICE_RUNTIME_SECRET,
       DEVICE_RUNTIME_SECRET_KEY_ID: DEVICE_RUNTIME_KEY_ID
     },
     durableObjects: {
       INBOX: "InboxDurableObject",
-      GROUP_OUTBOX: "GroupOutboxDurableObject"
+      GROUP_OUTBOX: "GroupOutboxDurableObject",
+      DEVICE_REGISTRY: "DeviceRegistryDurableObject"
     },
     r2Buckets: ["TAPCHAT_STORAGE"]
   });
@@ -81,46 +84,51 @@ function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` };
 }
 
-async function bootstrapToken(userId: string, deviceId: string): Promise<string> {
-  return signSharingPayload(BOOTSTRAP_SECRET, {
-    version: CURRENT_MODEL_VERSION,
-    service: "bootstrap",
-    userId,
-    deviceId,
-    operations: ["issue_device_bundle"],
-    expiresAt: Date.now() + 60_000
-  });
-}
+type IssuedDeployment = DeploymentBundle & { runtimeCredential: DeviceRuntimeAuth };
 
-async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = "device:bob:phone"): Promise<DeploymentBundle> {
-  const requestBody: BootstrapDeviceRequest = {
-    version: CURRENT_MODEL_VERSION,
-    userId,
-    deviceId
-  };
-  const response = await mf.dispatchFetch(`${BASE_URL}/v1/bootstrap/device`, {
-    method: "POST",
-    headers: {
-      ...authHeaders(await bootstrapToken(userId, deviceId)),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(requestBody)
-  });
-  assert.equal(response.status, 200);
-  const deployment = (await response.json()) as DeploymentBundle;
+async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = "device:bob:phone"): Promise<IssuedDeployment> {
   const fixture = signedIdentityFixture(userId, deviceId);
+  const deploymentResponse = await mf.dispatchFetch(`${BASE_URL}/v1/deployment-bundle`);
+  assert.equal(deploymentResponse.status, 200);
+  const deployment = (await deploymentResponse.json()) as DeploymentBundle;
+  const challengeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/challenge`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ purpose: "enroll", userId, deviceId })
+  });
+  assert.equal(challengeResponse.status, 200);
+  const challenge = (await challengeResponse.json()) as DeviceRuntimeRefreshChallenge;
+  const enrollmentResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/enroll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      challenge,
+      device: fixture.bundle.devices[0],
+      signature: signHex(fixture.deviceSecret, [
+        "tapchat.device_runtime_auth.v2",
+        `purpose=${challenge.purpose}`,
+        `runtime_id=${challenge.runtimeId}`,
+        `user_id=${challenge.userId}`,
+        `device_id=${challenge.deviceId}`,
+        `nonce=${challenge.nonce}`,
+        `expires_at=${challenge.expiresAt}`
+      ].join("\n"))
+    })
+  });
+  assert.equal(enrollmentResponse.status, 200);
+  const { runtimeCredential } = (await enrollmentResponse.json()) as { runtimeCredential: DeviceRuntimeAuth };
   assert.equal(verifyIdentityBundle(fixture.bundle), true, "generated identity bundle must verify");
   signedFixtures.set(deviceId, fixture);
   const publish = await mf.dispatchFetch(`${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`, {
     method: "PUT",
     headers: {
-      ...authHeaders(deployment.deviceRuntimeAuth!.token),
+      ...authHeaders(runtimeCredential.token),
       "content-type": "application/json"
     },
     body: JSON.stringify(fixture.bundle)
   });
   assert.equal(publish.status, 200);
-  return deployment;
+  return { ...deployment, runtimeCredential };
 }
 
 function sampleAppend(deviceId: string, messageId: string, ciphertext: string, senderUserId = "user:alice") {
@@ -153,7 +161,7 @@ function sampleCapability(deviceId: string): InboxAppendCapability {
   return fixture.capability;
 }
 
-function signedIdentityFixture(userId: string, deviceId: string): { bundle: IdentityBundle; capability: InboxAppendCapability } {
+function signedIdentityFixture(userId: string, deviceId: string): { bundle: IdentityBundle; capability: InboxAppendCapability; deviceSecret: Uint8Array } {
   const now = Date.now();
   const userSecret = new Uint8Array(32).fill(11);
   const deviceSecret = new Uint8Array(32).fill(12);
@@ -205,7 +213,7 @@ function signedIdentityFixture(userId: string, deviceId: string): { bundle: Iden
     signature: ""
   };
   bundle.signature = signHex(userSecret, identityBundlePayload(bundle));
-  return { bundle, capability };
+  return { bundle, capability, deviceSecret };
 }
 
 function capabilityPayload(capability: InboxAppendCapability): string {
@@ -424,7 +432,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
 
   const deviceId = "device:bob:phone";
   const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
-  const token = bundle.deviceRuntimeAuth!.token;
+  const token = bundle.runtimeCredential.token;
   await setAllowlist(mf, token, deviceId, ["user:alice"]);
 
   const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
@@ -508,7 +516,7 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
 
   const deviceId = "device:bob:cleanup";
   const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
-  const token = bundle.deviceRuntimeAuth!.token;
+  const token = bundle.runtimeCredential.token;
   await setAllowlist(mf, token, deviceId, ["user:alice"]);
 
   const append1 = await appendEnvelope(mf, deviceId, "msg:cleanup-1", "cipher-cleanup-1");
@@ -561,7 +569,7 @@ test("runtime integration: message request changes push over realtime and inbox 
 
   const deviceId = "device:bob:phone";
   const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
-  const token = bundle.deviceRuntimeAuth!.token;
+  const token = bundle.runtimeCredential.token;
 
   const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
     headers: {
@@ -650,7 +658,7 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   });
 
   const bundle = await issueDeviceBundle(mf, "user:bob", "device:bob:laptop");
-  const token = bundle.deviceRuntimeAuth!.token;
+  const token = bundle.runtimeCredential.token;
   const request: PrepareBlobUploadRequest = {
     taskId: "task-1",
     conversationId: "conv:alice:bob",
@@ -703,7 +711,7 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
 });
 
 test("runtime integration: group FSM routes expose open-invite and join lease flow", async (t) => {
-  const mf = await createRuntime();
+  const mf = await createRuntime({ ownerUserId: GROUP_OWNER_USER_ID });
   t.after(async () => {
     await mf.dispose();
   });
@@ -720,7 +728,7 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
     {
       method: "POST",
       headers: {
-        ...authHeaders(deployment.deviceRuntimeAuth!.token),
+        ...authHeaders(deployment.runtimeCredential.token),
         "content-type": "application/json"
       },
       body: JSON.stringify({

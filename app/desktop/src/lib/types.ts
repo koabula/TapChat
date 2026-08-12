@@ -398,6 +398,13 @@ export interface CloudflareStatus {
     | "unreachable"
     | "outdated"
     | "auth_expired"
+    | "refreshing"
+    | "degraded"
+    | "offline_expired"
+    | "upgrade_required"
+    | "enrollment_required"
+    | "device_revoked"
+    | "login_required"
     | "writeback_incomplete"
     | string;
   action?:
@@ -410,6 +417,8 @@ export interface CloudflareStatus {
     | null
     | string;
   details?: string | null;
+  credential_expires_at?: number | null;
+  error_code?: string | null;
   secret_rotation?: {
     phase: "stable" | "prepared" | "deploying" | "grace" | "pending_authorization" | "failed";
     last_rotated_at_ms?: number | null;

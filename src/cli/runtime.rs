@@ -12,22 +12,41 @@ use std::os::windows::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use rand::RngCore;
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::model::{DeploymentBundle, CURRENT_MODEL_VERSION};
+use crate::identity::LocalIdentityState;
+use crate::model::{
+    DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceRuntimeRefreshChallenge,
+    DeviceRuntimeRefreshProof, IdentityBundle, Validate, CURRENT_MODEL_VERSION,
+};
 
-use super::util::{sign_hmac_token, to_snake_case_json_string};
+use super::util::to_snake_case_json_string;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LocalRuntimeInstance {
     pub pid: u32,
     pub base_url: String,
     pub websocket_base_url: String,
-    pub bootstrap_secret: String,
     pub sharing_secret: String,
     pub service_root: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl LocalRuntimeInstance {
+    /// Keep the detached runtime alive after startup has been fully persisted.
+    pub fn detach(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for LocalRuntimeInstance {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = stop_local_runtime(self.pid);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +61,6 @@ pub struct CloudflareDeployDefaults {
     pub bucket_name: String,
     pub preview_bucket_name: String,
     pub sharing_token_secret: String,
-    pub bootstrap_token_secret: String,
-    pub bootstrap_token_key_id: String,
     pub device_runtime_secret: String,
     pub device_runtime_key_id: String,
 }
@@ -72,6 +89,9 @@ pub struct CloudflareDeployOverrides {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCloudflareDeployConfig {
+    pub runtime_id: String,
+    pub owner_user_id: String,
+    pub owner_user_public_key: String,
     pub worker_name: String,
     pub public_base_url: String,
     pub deployment_region: String,
@@ -82,12 +102,6 @@ pub struct ResolvedCloudflareDeployConfig {
     pub bucket_name: String,
     pub preview_bucket_name: String,
     pub sharing_token_secret: String,
-    pub bootstrap_token_secret: String,
-    pub bootstrap_token_key_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap_previous_secret: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bootstrap_previous_key_id: Option<String>,
     pub device_runtime_secret: String,
     pub device_runtime_key_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,7 +147,6 @@ pub struct CloudflarePreflight {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CloudflareGeneratedSecrets {
     pub sharing_token_secret: bool,
-    pub bootstrap_token_secret: bool,
 }
 
 const DESKTOP_EMBEDDED_RUNTIME_ROOT_ENV: &str = "TAPCHAT_DESKTOP_RUNTIME_ROOT";
@@ -153,11 +166,14 @@ fn apply_windows_command_flags(_: &mut Command) {}
 pub fn start_local_runtime(
     service_root: impl AsRef<Path>,
     persist_to: impl AsRef<Path>,
+    runtime_id: &str,
+    owner_user_id: &str,
+    owner_user_public_key: &str,
 ) -> Result<LocalRuntimeInstance> {
     let service_root = service_root.as_ref().to_path_buf();
     let port = reserve_port()?;
     let base_url = format!("http://127.0.0.1:{port}");
-    let bootstrap_secret = generate_hex_secret();
+    let runtime_secret = generate_hex_secret();
     let sharing_secret = generate_hex_secret();
     let persist_to = persist_to.as_ref();
 
@@ -168,7 +184,10 @@ pub fn start_local_runtime(
             persist_to,
             port,
             &base_url,
-            &bootstrap_secret,
+            runtime_id,
+            owner_user_id,
+            owner_user_public_key,
+            &runtime_secret,
             &sharing_secret,
         )
     }
@@ -181,7 +200,13 @@ pub fn start_local_runtime(
             .current_dir(&service_root)
             .env("TAPCHAT_TRANSPORT_PORT", port.to_string())
             .env("TAPCHAT_TRANSPORT_PERSIST_TO", persist_to)
-            .env("TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET", &bootstrap_secret)
+            .env("TAPCHAT_TRANSPORT_RUNTIME_ID", runtime_id)
+            .env("TAPCHAT_TRANSPORT_OWNER_USER_ID", owner_user_id)
+            .env(
+                "TAPCHAT_TRANSPORT_OWNER_USER_PUBLIC_KEY",
+                owner_user_public_key,
+            )
+            .env("TAPCHAT_TRANSPORT_RUNTIME_SECRET", &runtime_secret)
             .env("TAPCHAT_TRANSPORT_SHARING_SECRET", &sharing_secret)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
@@ -212,9 +237,9 @@ pub fn start_local_runtime(
                 .and_then(|value| value.as_str())
                 .unwrap_or(&base_url.replace("http", "ws"))
                 .to_string(),
-            bootstrap_secret,
             sharing_secret,
             service_root,
+            cleanup_on_drop: true,
         })
     }
 }
@@ -244,9 +269,6 @@ pub fn derive_cloudflare_defaults(
         preview_bucket_name,
         sharing_token_secret: std::env::var("TAPCHAT_CLOUDFLARE_SHARING_SECRET")
             .unwrap_or_else(|_| generate_hex_secret()),
-        bootstrap_token_secret: std::env::var("TAPCHAT_CLOUDFLARE_BOOTSTRAP_SECRET")
-            .unwrap_or_else(|_| generate_hex_secret()),
-        bootstrap_token_key_id: generate_secret_key_id(),
         device_runtime_secret: generate_hex_secret(),
         device_runtime_key_id: generate_secret_key_id(),
     }
@@ -257,6 +279,9 @@ pub fn resolve_cloudflare_config(
     overrides: &CloudflareDeployOverrides,
 ) -> ResolvedCloudflareDeployConfig {
     ResolvedCloudflareDeployConfig {
+        runtime_id: uuid::Uuid::new_v4().to_string(),
+        owner_user_id: String::new(),
+        owner_user_public_key: String::new(),
         worker_name: overrides
             .worker_name
             .clone()
@@ -294,10 +319,6 @@ pub fn resolve_cloudflare_config(
             .clone()
             .unwrap_or_else(|| defaults.preview_bucket_name.clone()),
         sharing_token_secret: defaults.sharing_token_secret.clone(),
-        bootstrap_token_secret: defaults.bootstrap_token_secret.clone(),
-        bootstrap_token_key_id: defaults.bootstrap_token_key_id.clone(),
-        bootstrap_previous_secret: None,
-        bootstrap_previous_key_id: None,
         device_runtime_secret: defaults.device_runtime_secret.clone(),
         device_runtime_key_id: defaults.device_runtime_key_id.clone(),
         device_runtime_previous_secret: None,
@@ -398,7 +419,10 @@ fn start_local_runtime_windows(
     persist_to: &Path,
     port: u16,
     base_url: &str,
-    bootstrap_secret: &str,
+    runtime_id: &str,
+    owner_user_id: &str,
+    owner_user_public_key: &str,
+    runtime_secret: &str,
     sharing_secret: &str,
 ) -> Result<LocalRuntimeInstance> {
     let stdout_path = persist_to.join("runtime-stdout.log");
@@ -412,11 +436,17 @@ fn start_local_runtime_windows(
         format!(
             "$env:TAPCHAT_TRANSPORT_PORT = \"{port}\"\n\
 $env:TAPCHAT_TRANSPORT_PERSIST_TO = \"{}\"\n\
-$env:TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET = \"{}\"\n\
+$env:TAPCHAT_TRANSPORT_RUNTIME_ID = \"{}\"\n\
+$env:TAPCHAT_TRANSPORT_OWNER_USER_ID = \"{}\"\n\
+$env:TAPCHAT_TRANSPORT_OWNER_USER_PUBLIC_KEY = \"{}\"\n\
+$env:TAPCHAT_TRANSPORT_RUNTIME_SECRET = \"{}\"\n\
 $env:TAPCHAT_TRANSPORT_SHARING_SECRET = \"{}\"\n\
 node \"{}\" *> \"{}\"\n",
             escape_ps_double_quoted(&persist_to.to_string_lossy()),
-            escape_ps_double_quoted(bootstrap_secret),
+            escape_ps_double_quoted(runtime_id),
+            escape_ps_double_quoted(owner_user_id),
+            escape_ps_double_quoted(owner_user_public_key),
+            escape_ps_double_quoted(runtime_secret),
             escape_ps_double_quoted(sharing_secret),
             escape_ps_double_quoted(&runtime_script_path.to_string_lossy()),
             escape_ps_double_quoted(&stdout_path.to_string_lossy()),
@@ -464,9 +494,9 @@ node \"{}\" *> \"{}\"\n",
             .and_then(|value| value.as_str())
             .unwrap_or(&base_url.replace("http", "ws"))
             .to_string(),
-        bootstrap_secret: bootstrap_secret.to_string(),
         sharing_secret: sharing_secret.to_string(),
         service_root: service_root.to_path_buf(),
+        cleanup_on_drop: true,
     })
 }
 
@@ -513,7 +543,10 @@ fn escape_ps_double_quoted(value: &str) -> String {
 }
 
 pub async fn wait_until_ready(base_url: &str) -> Result<()> {
-    let client = Client::builder().build().context("build reqwest client")?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build reqwest client")?;
 
     // Initial wait for global deployment propagation (Cloudflare needs ~3-5 seconds)
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -579,229 +612,175 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BootstrapAttemptDetail {
-    pub url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cloudflare_code: Option<String>,
-    pub attempt: u32,
-    pub max_attempts: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body_snippet: Option<String>,
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeCredentialResponse {
+    runtime_credential: DeviceRuntimeAuth,
 }
 
-fn extract_cloudflare_error_code(body: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    value
-        .get("errors")
-        .and_then(|errors| errors.as_array())
-        .and_then(|errors| errors.first())
-        .and_then(|item| item.get("code"))
-        .and_then(|code| {
-            code.as_i64()
-                .map(|value| value.to_string())
-                .or_else(|| code.as_str().map(|value| value.to_string()))
+async fn runtime_auth_response_error(response: reqwest::Response, stage: &str) -> anyhow::Error {
+    let status = response.status();
+    let code = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| {
+            body.get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
         })
+        .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+    anyhow::anyhow!("runtime_auth_error:{stage}:{code}")
 }
 
-fn body_snippet(body: &str) -> Option<String> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let max_chars = 280;
-    let snippet: String = trimmed.chars().take(max_chars).collect();
-    if snippet.len() < trimmed.len() {
-        Some(format!("{snippet}..."))
-    } else {
-        Some(snippet)
-    }
+fn unix_time_ms() -> Result<u64> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before unix epoch")?;
+    u64::try_from(elapsed.as_millis()).context("current time does not fit in u64")
 }
 
-const BOOTSTRAP_READY_TIMEOUT_SECS: u64 = 90;
-const BOOTSTRAP_READY_POLL_MS: u64 = 900;
-const BOOTSTRAP_MAX_ATTEMPTS: u32 = 10;
-const BOOTSTRAP_MIN_RETRY_MS: u64 = 500;
-const BOOTSTRAP_MAX_RETRY_MS: u64 = 5_000;
-
-fn is_bootstrap_not_ready(status: StatusCode, cloudflare_code: Option<&str>) -> bool {
-    if status == StatusCode::NOT_FOUND || status == StatusCode::TOO_EARLY {
-        return true;
-    }
-    (status == StatusCode::INTERNAL_SERVER_ERROR && cloudflare_code == Some("1104"))
-        || status == StatusCode::BAD_GATEWAY
-        || status == StatusCode::SERVICE_UNAVAILABLE
-        || status == StatusCode::GATEWAY_TIMEOUT
-        || cloudflare_code == Some("1042")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_bootstrap_not_ready;
-    use reqwest::StatusCode;
-
-    #[test]
-    fn bootstrap_500_with_cloudflare_1104_is_treated_as_not_ready() {
-        assert!(is_bootstrap_not_ready(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Some("1104")
-        ));
-    }
-
-    #[test]
-    fn bootstrap_plain_500_is_not_treated_as_not_ready() {
-        assert!(!is_bootstrap_not_ready(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None
-        ));
-    }
-
-    #[test]
-    fn bootstrap_404_with_cloudflare_1042_is_treated_as_not_ready() {
-        assert!(is_bootstrap_not_ready(StatusCode::NOT_FOUND, Some("1042")));
-    }
-}
-
-pub async fn wait_until_bootstrap_ready(
+/// Fetches the public v3 deployment descriptor. Runtime bearer credentials are
+/// deliberately returned by enrollment/refresh and never embedded in this value.
+pub async fn fetch_deployment_bundle_v3(
     base_url: &str,
-    _bootstrap_secret: &str,
-    user_id: &str,
-    device_id: &str,
-) -> Result<()> {
-    let client = Client::builder().build().context("build reqwest client")?;
-    let bootstrap_url = format!("{}/v1/bootstrap/device", base_url.trim_end_matches('/'));
-    let probe_payload = json!({
-        "version": CURRENT_MODEL_VERSION,
-        "userId": user_id,
-        "deviceId": device_id,
-    });
-    let deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(BOOTSTRAP_READY_TIMEOUT_SECS);
-    loop {
-        let response = client
-            .post(&bootstrap_url)
-            .header("Authorization", "Bearer tapchat-bootstrap-readiness-probe")
-            .json(&probe_payload)
-            .send()
-            .await;
-        if let Ok(response) = response {
-            if response.status() == StatusCode::UNAUTHORIZED
-                || response.status() == StatusCode::FORBIDDEN
-                || response.status() == StatusCode::BAD_REQUEST
-            {
-                return Ok(());
-            }
-            if response.status().is_success() {
-                return Ok(());
-            }
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let code = extract_cloudflare_error_code(&body);
-            if !is_bootstrap_not_ready(status, code.as_deref()) {
-                bail!(
-                    "bootstrap_endpoint_unreachable: bootstrap probe failed for {} with status {}{}{}",
-                    bootstrap_url,
-                    status,
-                    code.as_ref()
-                        .map(|value| format!(" (cloudflare code: {value})"))
-                        .unwrap_or_default(),
-                    body_snippet(&body)
-                        .map(|value| format!(": {value}"))
-                        .unwrap_or_default()
-                );
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "bootstrap_not_ready: bootstrap endpoint was not ready in time for {}",
-                bootstrap_url
-            );
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(BOOTSTRAP_READY_POLL_MS)).await;
-    }
-}
-
-pub async fn bootstrap_device_bundle(
-    base_url: &str,
-    bootstrap_secret: &str,
     user_id: &str,
     device_id: &str,
 ) -> Result<DeploymentBundle> {
-    bootstrap_device_bundle_with_key_id(base_url, bootstrap_secret, None, user_id, device_id).await
+    let mut bundle = Client::new()
+        .get(format!(
+            "{}/v1/deployment-bundle",
+            base_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .context("fetch runtime deployment descriptor")?
+        .error_for_status()
+        .context("runtime deployment descriptor was rejected")?
+        .json::<DeploymentBundle>()
+        .await
+        .context("decode runtime deployment descriptor")?;
+    bundle.expected_user_id = Some(user_id.to_string());
+    bundle.expected_device_id = Some(device_id.to_string());
+    bundle
+        .validate()
+        .context("validate runtime deployment descriptor")?;
+    if !bundle
+        .runtime_config
+        .features
+        .iter()
+        .any(|feature| feature == "device_runtime_refresh_v2")
+    {
+        bail!("upgrade_required: runtime does not support device_runtime_refresh_v2");
+    }
+    Ok(bundle)
 }
 
-pub async fn bootstrap_device_bundle_with_key_id(
-    base_url: &str,
-    bootstrap_secret: &str,
-    bootstrap_key_id: Option<&str>,
-    user_id: &str,
-    device_id: &str,
-) -> Result<DeploymentBundle> {
-    let mut token_payload = json!({
-        "version": CURRENT_MODEL_VERSION,
-        "service": "bootstrap",
-        "userId": user_id,
-        "deviceId": device_id,
-        "operations": ["issue_device_bundle"],
-        "expiresAt": 4_102_444_800_000u64,
-    });
-    if let Some(key_id) = bootstrap_key_id {
-        token_payload["keyId"] = json!(key_id);
+async fn request_device_runtime_credential_v2(
+    deployment: &DeploymentBundle,
+    identity: &LocalIdentityState,
+    purpose: &str,
+    device: Option<&DeviceContactProfile>,
+) -> Result<DeviceRuntimeAuth> {
+    let user_id = &identity.user_identity.user_id;
+    let device_id = &identity.device_identity.device_id;
+    let base_url = deployment.inbox_http_endpoint.trim_end_matches('/');
+    let client = Client::new();
+    let response = client
+        .post(format!("{base_url}/v2/runtime-auth/challenge"))
+        .json(&json!({
+            "purpose": purpose,
+            "userId": user_id,
+            "deviceId": device_id,
+        }))
+        .send()
+        .await
+        .context("request runtime authorization challenge")?;
+    if !response.status().is_success() {
+        return Err(runtime_auth_response_error(response, "challenge").await);
     }
-    let token = sign_hmac_token(bootstrap_secret, &token_payload)?;
-    let client = Client::builder().build().context("build reqwest client")?;
-    let bootstrap_url = format!("{base_url}/v1/bootstrap/device");
-    let max_attempts: u32 = BOOTSTRAP_MAX_ATTEMPTS;
-    let mut attempt: u32 = 0;
-    loop {
-        attempt = attempt.saturating_add(1);
-        let response = client
-            .post(&bootstrap_url)
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&json!({
-                "version": CURRENT_MODEL_VERSION,
-                "userId": user_id,
-                "deviceId": device_id,
-            }))
-            .send()
-            .await
-            .with_context(|| {
-                format!("bootstrap request failed (attempt {attempt}/{max_attempts})")
-            })?;
-
-        if response.status().is_success() {
-            let body = response.text().await.context("read bootstrap response")?;
-            return Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?);
-        }
-
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<response body unavailable>"));
-        let cloudflare_code = extract_cloudflare_error_code(&body);
-        if attempt < max_attempts && is_bootstrap_not_ready(status, cloudflare_code.as_deref()) {
-            let exponential = BOOTSTRAP_MIN_RETRY_MS.saturating_mul(1u64 << (attempt - 1));
-            let wait_ms = exponential.min(BOOTSTRAP_MAX_RETRY_MS);
-            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms)).await;
-            continue;
-        }
-
-        let detail = BootstrapAttemptDetail {
-            url: bootstrap_url.clone(),
-            status: Some(status.as_u16()),
-            cloudflare_code,
-            attempt,
-            max_attempts,
-            body_snippet: body_snippet(&body),
-        };
-        let detail_json = serde_json::to_string(&detail)
-            .unwrap_or_else(|_| String::from("{\"error\":\"serialization_failed\"}"));
-        bail!("bootstrap_failed_detail: {detail_json}");
+    let challenge = response
+        .json::<DeviceRuntimeRefreshChallenge>()
+        .await
+        .context("decode runtime authorization challenge")?;
+    if challenge.version != CURRENT_MODEL_VERSION
+        || challenge.purpose != purpose
+        || challenge.runtime_id != deployment.runtime_id
+        || challenge.user_id != *user_id
+        || challenge.device_id != *device_id
+        || challenge.expires_at <= unix_time_ms()?
+    {
+        bail!("runtime_auth_error:challenge:runtime_mismatch");
     }
+    let proof = DeviceRuntimeRefreshProof {
+        signature: identity.sign_sender_proof(challenge.signing_payload().as_bytes()),
+        challenge,
+    };
+    let (endpoint, body) = match (purpose, device) {
+        ("enroll", Some(device)) => (
+            "enroll",
+            json!({
+                "challenge": proof.challenge,
+                "signature": proof.signature,
+                "device": device,
+            }),
+        ),
+        ("refresh", None) => (
+            "refresh",
+            serde_json::to_value(&proof).context("encode runtime refresh proof")?,
+        ),
+        _ => bail!("invalid runtime authorization proof inputs"),
+    };
+    let response = client
+        .post(format!("{base_url}/v2/runtime-auth/{endpoint}"))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("submit runtime authorization {endpoint} proof"))?;
+    if !response.status().is_success() {
+        return Err(runtime_auth_response_error(response, endpoint).await);
+    }
+    let credential = response
+        .json::<RuntimeCredentialResponse>()
+        .await
+        .context("decode runtime credential")?
+        .runtime_credential;
+    credential
+        .validate()
+        .context("validate runtime credential")?;
+    if credential.runtime_id != deployment.runtime_id
+        || credential.user_id != *user_id
+        || credential.device_id != *device_id
+        || credential.expires_at.saturating_sub(credential.issued_at) != 24 * 60 * 60 * 1_000
+    {
+        bail!("runtime_auth_error:{endpoint}:runtime_mismatch");
+    }
+    Ok(credential)
 }
+
+pub async fn enroll_device_runtime_v2(
+    deployment: &DeploymentBundle,
+    identity: &LocalIdentityState,
+    identity_bundle: &IdentityBundle,
+) -> Result<DeviceRuntimeAuth> {
+    let device = identity_bundle
+        .devices
+        .iter()
+        .find(|device| device.device_id == identity.device_identity.device_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("enrollment_required: local device is absent from IdentityBundle")
+        })?;
+    request_device_runtime_credential_v2(deployment, identity, "enroll", Some(device)).await
+}
+
+pub async fn refresh_device_runtime_v2(
+    deployment: &DeploymentBundle,
+    identity: &LocalIdentityState,
+) -> Result<DeviceRuntimeAuth> {
+    request_device_runtime_credential_v2(deployment, identity, "refresh", None).await
+}
+
+// v1 bootstrap issuance was removed by the v3 runtime authorization cutover.
 
 pub fn cloudflare_preflight(profile_root: Option<&Path>) -> CloudflarePreflight {
     let service_root = resolve_service_root(None, profile_root).ok();
@@ -868,8 +847,7 @@ pub fn prepare_legacy_runtime_secret_migration(
 ) -> Result<bool> {
     let needs_runtime_key =
         secrets.device_runtime_secret.is_none() || secrets.device_runtime_key_id.is_none();
-    let needs_bootstrap_key = secrets.bootstrap_key_id.is_none();
-    if !needs_runtime_key && !needs_bootstrap_key {
+    if !needs_runtime_key {
         return Ok(false);
     }
 
@@ -890,16 +868,10 @@ pub fn prepare_legacy_runtime_secret_migration(
         secrets.device_runtime_secret = Some(generate_hex_secret());
         secrets.device_runtime_key_id = Some(generate_secret_key_id());
     }
-    if needs_bootstrap_key {
-        let bootstrap = secrets
-            .bootstrap_secret
-            .clone()
-            .or_else(|| runtime.bootstrap_secret.clone())
-            .ok_or_else(|| anyhow::anyhow!("cloudflare bootstrap_secret is not recorded"))?;
-        secrets.previous_bootstrap_secret = Some(bootstrap);
-        secrets.previous_bootstrap_key_id = None;
-        secrets.bootstrap_key_id = Some(generate_secret_key_id());
-    }
+    secrets.bootstrap_secret = None;
+    secrets.bootstrap_key_id = None;
+    secrets.previous_bootstrap_secret = None;
+    secrets.previous_bootstrap_key_id = None;
     runtime.secret_rotation = crate::cli::profile::RuntimeSecretRotationMetadata {
         phase: crate::cli::profile::RuntimeSecretRotationPhase::Prepared,
         current_key_id: secrets.device_runtime_key_id.clone(),
@@ -929,8 +901,7 @@ pub fn prepare_runtime_secret_rotation(
             bail!("the previous secret rotation must be finalized before starting another")
         }
         RuntimeSecretRotationPhase::PendingAuthorization
-            if secrets.previous_device_runtime_secret.is_some()
-                || secrets.previous_bootstrap_secret.is_some() =>
+            if secrets.previous_device_runtime_secret.is_some() =>
         {
             return Ok(())
         }
@@ -943,11 +914,6 @@ pub fn prepare_runtime_secret_rotation(
         .or_else(|| secrets.sharing_secret.clone())
         .or_else(|| runtime.sharing_secret.clone())
         .ok_or_else(|| anyhow::anyhow!("device runtime secret is not recorded"))?;
-    let old_bootstrap_secret = secrets
-        .bootstrap_secret
-        .clone()
-        .or_else(|| runtime.bootstrap_secret.clone())
-        .ok_or_else(|| anyhow::anyhow!("bootstrap secret is not recorded"))?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -958,10 +924,10 @@ pub fn prepare_runtime_secret_rotation(
     secrets.previous_device_runtime_key_id = secrets.device_runtime_key_id.clone();
     secrets.device_runtime_secret = Some(generate_hex_secret());
     secrets.device_runtime_key_id = Some(new_runtime_key_id.clone());
-    secrets.previous_bootstrap_secret = Some(old_bootstrap_secret);
-    secrets.previous_bootstrap_key_id = secrets.bootstrap_key_id.clone();
-    secrets.bootstrap_secret = Some(generate_hex_secret());
-    secrets.bootstrap_key_id = Some(generate_secret_key_id());
+    secrets.bootstrap_secret = None;
+    secrets.bootstrap_key_id = None;
+    secrets.previous_bootstrap_secret = None;
+    secrets.previous_bootstrap_key_id = None;
     runtime.secret_rotation = RuntimeSecretRotationMetadata {
         phase: RuntimeSecretRotationPhase::Prepared,
         current_key_id: Some(new_runtime_key_id),
@@ -981,6 +947,12 @@ pub fn rebuild_cloudflare_config(
     secrets: &crate::cli::profile::RuntimeSecrets,
 ) -> Result<ResolvedCloudflareDeployConfig> {
     Ok(ResolvedCloudflareDeployConfig {
+        runtime_id: runtime
+            .runtime_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        owner_user_id: String::new(),
+        owner_user_public_key: String::new(),
         worker_name: runtime
             .worker_name
             .clone()
@@ -1007,17 +979,6 @@ pub fn rebuild_cloudflare_config(
             .clone()
             .or_else(|| runtime.sharing_secret.clone())
             .ok_or_else(|| anyhow::anyhow!("cloudflare sharing_secret is not recorded"))?,
-        bootstrap_token_secret: secrets
-            .bootstrap_secret
-            .clone()
-            .or_else(|| runtime.bootstrap_secret.clone())
-            .ok_or_else(|| anyhow::anyhow!("cloudflare bootstrap_secret is not recorded"))?,
-        bootstrap_token_key_id: secrets
-            .bootstrap_key_id
-            .clone()
-            .unwrap_or_else(|| "legacy-bootstrap".into()),
-        bootstrap_previous_secret: secrets.previous_bootstrap_secret.clone(),
-        bootstrap_previous_key_id: secrets.previous_bootstrap_key_id.clone(),
         device_runtime_secret: secrets.device_runtime_secret.clone().unwrap_or_else(|| {
             runtime
                 .sharing_secret

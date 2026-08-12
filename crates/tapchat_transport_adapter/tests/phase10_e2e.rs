@@ -1909,13 +1909,11 @@ async fn setup_pair_with_runtime_options(options: CloudflareRuntimeOptions) -> R
         &bob,
         &concrete_deployment_bundle(&bob_bundle, &bob_user_id),
     )?;
-    let alice_auth = alice_bundle
-        .device_runtime_auth
-        .clone()
+    let alice_auth = tapchat_transport_adapter::runtime::deployment_runtime_auth(&alice_bundle)
+        .cloned()
         .context("alice device auth")?;
-    let bob_auth = bob_bundle
-        .device_runtime_auth
-        .clone()
+    let bob_auth = tapchat_transport_adapter::runtime::deployment_runtime_auth(&bob_bundle)
+        .cloned()
         .context("bob device auth")?;
 
     runtime
@@ -2033,10 +2031,10 @@ async fn setup_trio() -> Result<TrioContext> {
             )?,
         })
         .await?;
-    let bob_laptop_auth = bob_laptop_bundle
-        .device_runtime_auth
-        .clone()
-        .context("bob laptop auth")?;
+    let bob_laptop_auth =
+        tapchat_transport_adapter::runtime::deployment_runtime_auth(&bob_laptop_bundle)
+            .cloned()
+            .context("bob laptop auth")?;
     configure_allowlist(
         &runtime,
         &bob_laptop_auth,
@@ -2223,6 +2221,7 @@ fn public_deployment_bundle(
         .context("device status ref missing")?;
     Ok(DeploymentBundle {
         version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
+        runtime_id: format!("legacy-test-runtime:{}", runtime.base_url()),
         region: "local-transport".into(),
         inbox_http_endpoint: runtime.base_url().to_string(),
         inbox_websocket_endpoint: format!(
@@ -2244,7 +2243,6 @@ fn public_deployment_bundle(
             max_inline_bytes: Some(4096),
             features: vec!["generic_sync".into(), "attachment_v1".into()],
         },
-        device_runtime_auth: None,
         expected_user_id: None,
         expected_device_id: None,
     })

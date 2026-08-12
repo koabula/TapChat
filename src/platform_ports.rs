@@ -535,6 +535,7 @@ mod tests {
                     url: "https://example.com".into(),
                     headers: BTreeMap::new(),
                     body: None,
+                    auth: None,
                 },
             },
         )
@@ -555,6 +556,7 @@ mod tests {
                         endpoint: "ws://example.com".into(),
                         last_acked_seq: 0,
                         headers: BTreeMap::new(),
+                        auth: None,
                     },
                 },
             },

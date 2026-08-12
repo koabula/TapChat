@@ -489,8 +489,8 @@ mod tests {
     use super::{IdentityManager, IdentityModule, DEFAULT_MNEMONIC_WORDS};
     use crate::model::{
         CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
-        DeviceContactProfile, DeviceRuntimeAuth, DeviceStatusKind, IdentityBundle,
-        InboxAppendCapability, KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
+        DeviceContactProfile, DeviceStatusKind, IdentityBundle, InboxAppendCapability,
+        KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
     };
     use bip39::Language;
 
@@ -744,6 +744,7 @@ mod tests {
     fn sample_deployment() -> DeploymentBundle {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
+            runtime_id: "runtime:test".into(),
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -763,15 +764,6 @@ mod tests {
                 max_inline_bytes: Some(4096),
                 features: vec!["generic_sync".into()],
             },
-            device_runtime_auth: Some(DeviceRuntimeAuth {
-                scheme: "bearer".into(),
-                token: "device-runtime-token".into(),
-                expires_at: 999,
-                user_id: "user:alice".into(),
-                device_id: "device:alice:phone".into(),
-                scopes: vec!["inbox_read".into(), "shared_state_write".into()],
-                key_id: None,
-            }),
             expected_user_id: None,
             expected_device_id: None,
         }

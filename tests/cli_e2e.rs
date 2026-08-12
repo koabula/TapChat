@@ -6206,10 +6206,8 @@ fn publish_merged_identity_bundle_for_profiles(
 }
 
 fn bundle_auth(bundle: &DeploymentBundle) -> Result<&DeviceRuntimeAuth> {
-    bundle
-        .device_runtime_auth
-        .as_ref()
-        .context("deployment bundle missing device runtime auth")
+    tapchat_transport_adapter::runtime::deployment_runtime_auth(bundle)
+        .context("test deployment missing private runtime credential")
 }
 
 fn run_orchestrated_cli_case(test_name: &str) -> Result<()> {

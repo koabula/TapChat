@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;
+use crate::runtime_auth::RuntimeAuthManager;
 
 /// Startup phase to track initialization progress.
 /// Prevents race conditions where frontend queries session status before backend is ready.
@@ -32,6 +33,7 @@ pub struct AppState {
     pub deferred_transport_tx: mpsc::Sender<DeferredTransportBatch>,
     pub deferred_transport_rx: Arc<Mutex<Option<mpsc::Receiver<DeferredTransportBatch>>>>,
     pub deferred_send_gate: Arc<Mutex<()>>,
+    pub runtime_auth: RuntimeAuthManager,
 }
 
 /// A persisted batch waiting for serialized network dispatch. The profile path
@@ -138,7 +140,8 @@ impl AppState {
     pub fn new() -> Self {
         let profile_manager = ProfileManager::new();
         let inner_arc = profile_manager.inner_arc();
-        let ports = DesktopPlatformPorts::new(inner_arc);
+        let runtime_auth = RuntimeAuthManager::default();
+        let ports = DesktopPlatformPorts::new(inner_arc, runtime_auth.clone());
         let (deferred_transport_tx, deferred_transport_rx) =
             mpsc::channel(DEFERRED_TRANSPORT_QUEUE_CAPACITY);
         Self {
@@ -157,6 +160,7 @@ impl AppState {
             deferred_transport_tx,
             deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
             deferred_send_gate: Arc::new(Mutex::new(())),
+            runtime_auth,
         }
     }
 
@@ -164,7 +168,8 @@ impl AppState {
     pub fn with_profile_name(name: &str) -> Self {
         let profile_manager = ProfileManager::with_profile_name(name);
         let inner_arc = profile_manager.inner_arc();
-        let ports = DesktopPlatformPorts::new(inner_arc);
+        let runtime_auth = RuntimeAuthManager::default();
+        let ports = DesktopPlatformPorts::new(inner_arc, runtime_auth.clone());
         let (deferred_transport_tx, deferred_transport_rx) =
             mpsc::channel(DEFERRED_TRANSPORT_QUEUE_CAPACITY);
         Self {
@@ -183,6 +188,7 @@ impl AppState {
             deferred_transport_tx,
             deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
             deferred_send_gate: Arc::new(Mutex::new(())),
+            runtime_auth,
         }
     }
 

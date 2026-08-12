@@ -1,9 +1,10 @@
 import { GroupOutboxDurableObject } from "./group-outbox/durable";
 import { InboxDurableObject } from "./inbox/durable";
+import { DeviceRegistryDurableObject } from "./device-registry/durable";
 import { handleRequest } from "./routes/http";
 import type { Env } from "./types/env";
 
-export { GroupOutboxDurableObject, InboxDurableObject };
+export { DeviceRegistryDurableObject, GroupOutboxDurableObject, InboxDurableObject };
 
 export function routeFamilyForObservability(rawUrl: string): string {
   let path = "/";
@@ -13,7 +14,7 @@ export function routeFamilyForObservability(rawUrl: string): string {
     return "invalid_url";
   }
   if (path === "/v1/deployment-bundle") return "deployment_bundle";
-  if (path === "/v1/bootstrap/device") return "device_bootstrap";
+  if (path.startsWith("/v2/runtime-auth/")) return "runtime_auth";
   if (path.startsWith("/v1/inbox/")) return "inbox";
   if (path.startsWith("/v1/groups/")) return "group_outbox";
   if (path.startsWith("/v1/group-invite/")) return "group_invite";

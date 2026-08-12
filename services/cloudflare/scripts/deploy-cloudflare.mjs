@@ -1,5 +1,5 @@
 import { createInterface } from "node:readline/promises";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -195,9 +195,11 @@ async function runCommand(command, args, options = {}) {
 
 function coerceResolvedConfig(config) {
   const configuredSharingSecret = config.sharing_internal_secret ?? config.sharing_token_secret ?? config.sharingTokenSecret;
-  const configuredBootstrapSecret = config.bootstrap_link_secret ?? config.bootstrap_token_secret ?? config.bootstrapTokenSecret;
   const configuredRuntimeSecret = config.device_runtime_secret ?? config.deviceRuntimeSecret;
   return {
+    runtimeId: config.runtime_id ?? config.runtimeId,
+    ownerUserId: config.owner_user_id ?? config.ownerUserId,
+    ownerUserPublicKey: config.owner_user_public_key ?? config.ownerUserPublicKey,
     workerName: config.worker_name ?? config.workerName,
     publicBaseUrl: normalizeBaseUrl(config.public_base_url ?? config.publicBaseUrl ?? ""),
     deploymentRegion: String(config.deployment_region ?? config.deploymentRegion ?? DEFAULTS.deploymentRegion),
@@ -215,18 +217,13 @@ function coerceResolvedConfig(config) {
     bucketName: config.bucket_name ?? config.bucketName,
     previewBucketName: config.preview_bucket_name ?? config.previewBucketName,
     sharingTokenSecret: configuredSharingSecret ?? generateSecret(),
-    bootstrapTokenSecret: configuredBootstrapSecret ?? generateSecret(),
-    bootstrapTokenKeyId: config.bootstrap_token_key_id ?? config.bootstrapTokenKeyId ?? generateKeyId(),
-    bootstrapPreviousSecret: config.bootstrap_previous_secret ?? config.bootstrapPreviousSecret,
-    bootstrapPreviousKeyId: config.bootstrap_previous_key_id ?? config.bootstrapPreviousKeyId,
     deviceRuntimeSecret: configuredRuntimeSecret ?? generateSecret(),
     deviceRuntimeKeyId: config.device_runtime_key_id ?? config.deviceRuntimeKeyId ?? generateKeyId(),
     deviceRuntimePreviousSecret: config.device_runtime_previous_secret ?? config.deviceRuntimePreviousSecret,
     deviceRuntimePreviousKeyId: config.device_runtime_previous_key_id ?? config.deviceRuntimePreviousKeyId,
     authRotationGraceUntilMs: config.auth_rotation_grace_until_ms ?? config.authRotationGraceUntilMs,
     generatedPublicBaseUrl: !normalizeBaseUrl(config.public_base_url ?? config.publicBaseUrl ?? ""),
-    generatedSharingSecret: !configuredSharingSecret,
-    generatedBootstrapSecret: !configuredBootstrapSecret
+    generatedSharingSecret: !configuredSharingSecret
   };
 }
 
@@ -240,6 +237,10 @@ async function collectInputs() {
     const workerName =
       (await rl.question(`Worker name [${DEFAULTS.workerName}]: `)).trim() ||
       DEFAULTS.workerName;
+    const generatedRuntimeId = randomUUID();
+    const runtimeId = (await rl.question(`RUNTIME_ID [${generatedRuntimeId}]: `)).trim() || generatedRuntimeId;
+    const ownerUserId = (await rl.question("OWNER_USER_ID: ")).trim();
+    const ownerUserPublicKey = (await rl.question("OWNER_USER_PUBLIC_KEY: ")).trim();
     const derivedBuckets = deriveBucketNames(workerName);
 
     const publicBaseUrlInput = await rl.question("PUBLIC_BASE_URL [leave blank to use the deployed URL automatically]: ");
@@ -267,16 +268,14 @@ async function collectInputs() {
       derivedBuckets.previewBucketName;
 
     const generatedSharingSecret = generateSecret();
-    const generatedBootstrapSecret = generateSecret();
     const generatedRuntimeSecret = generateSecret();
     const sharingTokenSecret = (
       await rl.question(`SHARING_INTERNAL_SECRET [press Enter to auto-generate]: `)
     ).trim() || generatedSharingSecret;
-    const bootstrapTokenSecret = (
-      await rl.question(`BOOTSTRAP_LINK_SECRET [press Enter to auto-generate]: `)
-    ).trim() || generatedBootstrapSecret;
-
     return {
+      runtimeId,
+      ownerUserId,
+      ownerUserPublicKey,
       workerName,
       publicBaseUrl,
       deploymentRegion,
@@ -294,18 +293,13 @@ async function collectInputs() {
       bucketName,
       previewBucketName,
       sharingTokenSecret,
-      bootstrapTokenSecret,
-      bootstrapTokenKeyId: generateKeyId(),
-      bootstrapPreviousSecret: undefined,
-      bootstrapPreviousKeyId: undefined,
       deviceRuntimeSecret: generatedRuntimeSecret,
       deviceRuntimeKeyId: generateKeyId(),
       deviceRuntimePreviousSecret: undefined,
       deviceRuntimePreviousKeyId: undefined,
       authRotationGraceUntilMs: undefined,
       generatedPublicBaseUrl: !publicBaseUrl,
-      generatedSharingSecret: sharingTokenSecret === generatedSharingSecret,
-      generatedBootstrapSecret: bootstrapTokenSecret === generatedBootstrapSecret
+      generatedSharingSecret: sharingTokenSecret === generatedSharingSecret
     };
   } finally {
     rl.close();
@@ -323,6 +317,9 @@ function updateConfig(baseConfig, config) {
   rendered.main = entryPoint;
   rendered.vars = {
     ...rendered.vars,
+    RUNTIME_ID: config.runtimeId,
+    OWNER_USER_ID: config.ownerUserId,
+    OWNER_USER_PUBLIC_KEY: config.ownerUserPublicKey,
     DEPLOYMENT_REGION: config.deploymentRegion,
     MAX_INLINE_BYTES: config.maxInlineBytes,
     RETENTION_DAYS: config.retentionDays,
@@ -336,13 +333,7 @@ function updateConfig(baseConfig, config) {
     MESSAGE_REQUEST_RATE_LIMIT_MINUTE: config.messageRequestRateLimitMinute,
     MESSAGE_REQUEST_RATE_LIMIT_HOUR: config.messageRequestRateLimitHour
   };
-  rendered.vars.BOOTSTRAP_LINK_SECRET_KEY_ID = config.bootstrapTokenKeyId;
   rendered.vars.DEVICE_RUNTIME_SECRET_KEY_ID = config.deviceRuntimeKeyId;
-  if (config.bootstrapPreviousKeyId) {
-    rendered.vars.BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID = config.bootstrapPreviousKeyId;
-  } else {
-    delete rendered.vars.BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID;
-  }
   if (config.deviceRuntimePreviousKeyId) {
     rendered.vars.DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID = config.deviceRuntimePreviousKeyId;
   } else {
@@ -551,11 +542,13 @@ async function main() {
 
   logStep("Collecting deployment settings");
   const config = await collectInputs();
+  if (!config.runtimeId || !config.ownerUserId || !config.ownerUserPublicKey) {
+    throw new Error("RUNTIME_ID, OWNER_USER_ID, and OWNER_USER_PUBLIC_KEY are required.");
+  }
   validateSecret(config.sharingTokenSecret, "SHARING_INTERNAL_SECRET");
-  validateSecret(config.bootstrapTokenSecret, "BOOTSTRAP_LINK_SECRET");
   validateSecret(config.deviceRuntimeSecret, "DEVICE_RUNTIME_SECRET");
-  if (new Set([config.sharingTokenSecret, config.bootstrapTokenSecret, config.deviceRuntimeSecret]).size !== 3) {
-    throw new Error("Sharing, bootstrap, and device runtime secrets must be independent values.");
+  if (config.sharingTokenSecret === config.deviceRuntimeSecret) {
+    throw new Error("Sharing and device runtime secrets must be independent values.");
   }
   const baseConfig = await readFile(CONFIG_PATH, "utf8");
   const renderedConfig = updateConfig(baseConfig, config);
@@ -570,13 +563,9 @@ async function main() {
 
     logStep("Writing Cloudflare secrets");
     await putSecret(tempConfigPath, "SHARING_INTERNAL_SECRET", config.sharingTokenSecret);
-    if (config.bootstrapPreviousSecret) {
-      await putSecret(tempConfigPath, "BOOTSTRAP_LINK_SECRET_PREVIOUS", config.bootstrapPreviousSecret);
-    }
     if (config.deviceRuntimePreviousSecret) {
       await putSecret(tempConfigPath, "DEVICE_RUNTIME_SECRET_PREVIOUS", config.deviceRuntimePreviousSecret);
     }
-    await putSecret(tempConfigPath, "BOOTSTRAP_LINK_SECRET", config.bootstrapTokenSecret);
     await putSecret(tempConfigPath, "DEVICE_RUNTIME_SECRET", config.deviceRuntimeSecret);
 
     if (DESKTOP_BUNDLED) {
@@ -622,9 +611,6 @@ async function main() {
 
     logStep("Verifying runtime security configuration");
     await verifyRuntimeConfiguration(validation.effectiveBaseUrl ?? deployUrl);
-    if (!config.bootstrapPreviousSecret) {
-      await deleteSecretBestEffort(tempConfigPath, "BOOTSTRAP_LINK_SECRET_PREVIOUS");
-    }
     if (!config.deviceRuntimePreviousSecret) {
       await deleteSecretBestEffort(tempConfigPath, "DEVICE_RUNTIME_SECRET_PREVIOUS");
     }
@@ -638,8 +624,7 @@ async function main() {
       preview_bucket_name: config.previewBucketName,
       deployment_region: config.deploymentRegion,
       generated_secrets: {
-        sharing_token_secret: config.generatedSharingSecret,
-        bootstrap_token_secret: config.generatedBootstrapSecret
+        sharing_token_secret: config.generatedSharingSecret
       },
       mode: NON_INTERACTIVE_CONFIG ? "non_interactive" : "interactive"
     };
@@ -654,8 +639,7 @@ async function main() {
           `Preview bucket: ${config.previewBucketName}`,
           config.generatedPublicBaseUrl ? "PUBLIC_BASE_URL was left blank, so the deployed Worker URL will be used at runtime via request origin fallback." : "PUBLIC_BASE_URL was explicitly configured.",
           config.generatedSharingSecret ? "SHARING_INTERNAL_SECRET was auto-generated for this deployment." : "SHARING_INTERNAL_SECRET was provided manually.",
-          config.generatedBootstrapSecret ? "BOOTSTRAP_LINK_SECRET was auto-generated for this deployment." : "BOOTSTRAP_LINK_SECRET was provided manually.",
-          "Next step: issue a bootstrap token, call POST /v1/bootstrap/device, and import the returned deployment bundle into the TapChat profile."
+          "Next step: enroll the current device through POST /v2/runtime-auth/enroll."
         ].join("\n") + "\n"
       );
     }
@@ -684,8 +668,7 @@ main().catch((error) => {
       preview_bucket_name: "",
       deployment_region: "",
       generated_secrets: {
-        sharing_token_secret: false,
-        bootstrap_token_secret: false
+        sharing_token_secret: false
       },
       mode: NON_INTERACTIVE_CONFIG ? "non_interactive" : "interactive",
       failure_class: process.exitCode ? String(process.exitCode) : "unknown",

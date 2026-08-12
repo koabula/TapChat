@@ -256,7 +256,21 @@ impl RealtimeManager {
                 {
                     sessions.remove(&device_id);
                 }
-                let detail = format!("websocket connect: {}", error);
+                let runtime_error_code = match &error {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => response
+                        .body()
+                        .as_ref()
+                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                        .and_then(|value| {
+                            value
+                                .get("error")
+                                .and_then(|code| code.as_str())
+                                .map(str::to_owned)
+                        }),
+                    _ => None,
+                };
+                let detail =
+                    runtime_error_code.unwrap_or_else(|| format!("websocket connect: {}", error));
                 log::warn!(
                     "RealtimeManager: websocket connect failed device_id={} endpoint={} error=connect_failed",
                     device_ref,

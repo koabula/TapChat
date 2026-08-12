@@ -8,7 +8,6 @@ use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
-use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, LockReason, SessionState};
 
 #[tauri::command]
@@ -238,6 +237,7 @@ async fn reload_engine_from_profile(
     app: &AppHandle,
     state: &State<'_, AppState>,
 ) -> Result<(), String> {
+    state.runtime_auth.invalidate();
     // Emit profile-switch-start to notify frontend that we're beginning a switch
     let _ = app.emit("profile-switch-start", {});
 
@@ -260,9 +260,22 @@ async fn reload_engine_from_profile(
     // Step 2.5: Refresh device runtime auth on disk before loading snapshot.
     {
         let inner = state.inner.read().await;
-        ensure_fresh_device_runtime_auth(&inner.profile_manager)
+        if state
+            .runtime_auth
+            .ensure(&inner.profile_manager, false)
             .await
-            .map_err(|e| format!("Failed to refresh device runtime auth: {}", e))?;
+            .is_err()
+        {
+            let auth = state.runtime_auth.snapshot().await;
+            log::warn!(
+                "profile switch runtime authorization unavailable: code={} retryable={} next_retry_at={}",
+                auth.error_code.as_deref().unwrap_or("temporary_unavailable"),
+                auth.retryable,
+                auth.next_retry_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".into())
+            );
+        }
     }
 
     // Step 3: Load snapshot from active profile

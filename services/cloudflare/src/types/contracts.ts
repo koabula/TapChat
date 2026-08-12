@@ -692,10 +692,13 @@ export interface StorageBaseInfo {
 export interface DeviceRuntimeAuth {
   scheme: "bearer";
   token: string;
+  issuedAt: number;
   expiresAt: number;
+  runtimeId: string;
   userId: string;
   deviceId: string;
   scopes: DeviceRuntimeScope[];
+  registrationVersion: number;
   keyId?: string;
 }
 
@@ -720,12 +723,12 @@ export interface RuntimeConfig {
 
 export interface DeploymentBundle {
   version: string;
+  runtimeId: string;
   region: string;
   inboxHttpEndpoint: string;
   inboxWebsocketEndpoint: string;
   storageBaseInfo: StorageBaseInfo;
   runtimeConfig: RuntimeConfig;
-  deviceRuntimeAuth?: DeviceRuntimeAuth;
   expectedUserId?: string;
   expectedDeviceId?: string;
 }
@@ -850,35 +853,23 @@ export interface KeyPackageWriteToken {
   expiresAt: number;
 }
 
-export interface BootstrapDeviceRequest {
-  version: string;
-  userId: string;
-  deviceId: string;
-}
-
-export interface BootstrapToken {
-  version: string;
-  service: "bootstrap";
-  userId: string;
-  deviceId: string;
-  operations: Array<"issue_device_bundle">;
-  expiresAt: number;
-  keyId?: string;
-}
-
 export interface DeviceRuntimeToken {
   version: string;
   service: "device_runtime";
+  runtimeId: string;
   userId: string;
   deviceId: string;
   scopes: DeviceRuntimeScope[];
+  issuedAt: number;
   expiresAt: number;
+  registrationVersion: number;
   keyId?: string;
 }
 
 export interface DeviceRuntimeRefreshChallenge {
   version: string;
-  origin: string;
+  purpose: "enroll" | "refresh";
+  runtimeId: string;
   userId: string;
   deviceId: string;
   nonce: string;
@@ -888,6 +879,23 @@ export interface DeviceRuntimeRefreshChallenge {
 export interface DeviceRuntimeRefreshProof {
   challenge: DeviceRuntimeRefreshChallenge;
   signature: string;
+}
+
+export interface DeviceRuntimeEnrollmentProof extends DeviceRuntimeRefreshProof {
+  device: DeviceContactProfile;
+}
+
+export interface DeviceRegistryRecord {
+  version: string;
+  runtimeId: string;
+  userId: string;
+  deviceId: string;
+  devicePublicKey: string;
+  bindingHash: string;
+  status: DeviceStatusKind;
+  registrationVersion: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface RealtimeEvent {

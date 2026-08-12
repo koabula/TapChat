@@ -120,13 +120,14 @@ pub async fn fetch_message_requests(
             )?;
             Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
         }
-        Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-            retryable: false,
-            detail: Some(format!(
-                "list message requests failed with status {}",
-                response.status()
-            )),
-        }]),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                retryable: false,
+                detail: Some(format!("HTTP {status}: {body}")),
+            }])
+        }
         Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
             retryable: true,
             detail: Some(error.to_string()),
@@ -205,15 +206,16 @@ pub async fn act_on_message_request(
             };
             Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
         }
-        Ok(response) => Ok(vec![CoreEvent::MessageRequestActionFailed {
-            request_id: action.request_id,
-            action: action.action,
-            retryable: false,
-            detail: Some(format!(
-                "message request action failed with status {}",
-                response.status()
-            )),
-        }]),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Ok(vec![CoreEvent::MessageRequestActionFailed {
+                request_id: action.request_id,
+                action: action.action,
+                retryable: false,
+                detail: Some(format!("HTTP {status}: {body}")),
+            }])
+        }
         Err(error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
             request_id: action.request_id,
             action: action.action,
@@ -239,13 +241,14 @@ pub async fn fetch_allowlist(
             let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
             Ok(vec![CoreEvent::AllowlistFetched { document }])
         }
-        Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
-            retryable: false,
-            detail: Some(format!(
-                "get allowlist failed with status {}",
-                response.status()
-            )),
-        }]),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Ok(vec![CoreEvent::AllowlistFetchFailed {
+                retryable: false,
+                detail: Some(format!("HTTP {status}: {body}")),
+            }])
+        }
         Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
             retryable: true,
             detail: Some(error.to_string()),
@@ -279,13 +282,14 @@ pub async fn replace_allowlist(
             let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
             Ok(vec![CoreEvent::AllowlistReplaced { document }])
         }
-        Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-            retryable: false,
-            detail: Some(format!(
-                "put allowlist failed with status {}",
-                response.status()
-            )),
-        }]),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                retryable: false,
+                detail: Some(format!("HTTP {status}: {body}")),
+            }])
+        }
         Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
             retryable: true,
             detail: Some(error.to_string()),
@@ -315,15 +319,16 @@ pub async fn publish_shared_state(
                 reference: publish.reference,
             }])
         }
-        Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
-            document_kind: publish.document_kind,
-            reference: publish.reference,
-            retryable: false,
-            detail: Some(format!(
-                "shared state publish failed with status {}",
-                response.status()
-            )),
-        }]),
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            Ok(vec![CoreEvent::SharedStatePublishFailed {
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+                retryable: false,
+                detail: Some(format!("HTTP {status}: {body}")),
+            }])
+        }
         Err(error) => Ok(vec![CoreEvent::SharedStatePublishFailed {
             document_kind: publish.document_kind,
             reference: publish.reference,

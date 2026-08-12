@@ -59,24 +59,6 @@ fn repair_worker_secret(candidate: Option<String>) -> (String, bool) {
     (generated, true)
 }
 
-fn repair_worker_secrets(
-    sharing_candidate: Option<String>,
-    bootstrap_candidate: Option<String>,
-) -> (String, bool, String, bool) {
-    let (sharing_secret, repaired_sharing) = repair_worker_secret(sharing_candidate);
-    let (mut bootstrap_secret, mut repaired_bootstrap) = repair_worker_secret(bootstrap_candidate);
-    if bootstrap_secret == sharing_secret {
-        (bootstrap_secret, _) = repair_worker_secret(None);
-        repaired_bootstrap = true;
-    }
-    (
-        sharing_secret,
-        repaired_sharing,
-        bootstrap_secret,
-        repaired_bootstrap,
-    )
-}
-
 /// Preflight check result
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightResult {
@@ -123,6 +105,8 @@ pub struct CloudflareRuntimeStatus {
     pub action: Option<String>,
     pub details: Option<String>,
     pub secret_rotation: Option<RuntimeSecretRotationMetadata>,
+    pub credential_expires_at: Option<u64>,
+    pub error_code: Option<String>,
 }
 
 const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
@@ -134,7 +118,8 @@ const REQUIRED_GROUP_RUNTIME_FEATURES: &[&str] = &[
     "group_authorization_v2",
     "group_membership_fsm_v2",
     "runtime_secret_rotation_v1",
-    "device_runtime_refresh_v1",
+    "device_runtime_refresh_v2",
+    "device_registry_v1",
 ];
 
 fn status_from_features(
@@ -201,6 +186,8 @@ fn status_from_features(
         action,
         details,
         secret_rotation: None,
+        credential_expires_at: None,
+        error_code: None,
     }
 }
 
@@ -305,21 +292,17 @@ pub fn runtime_missing_group_outbox_message(status: &CloudflareRuntimeStatus) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        repair_worker_secrets, runtime_missing_group_outbox_message, status_from_features,
+        repair_worker_secret, runtime_missing_group_outbox_message, status_from_features,
         valid_worker_secret,
     };
 
     #[test]
-    fn worker_secrets_are_valid_and_independent() {
+    fn worker_secret_reuses_valid_input() {
         let same = "same-runtime-secret-0123456789abcdef0123456789abcdef".to_string();
-        let (sharing, repaired_sharing, bootstrap, repaired_bootstrap) =
-            repair_worker_secrets(Some(same.clone()), Some(same));
-
+        let (sharing, repaired_sharing) = repair_worker_secret(Some(same.clone()));
         assert!(!repaired_sharing);
-        assert!(repaired_bootstrap);
         assert!(valid_worker_secret(&sharing));
-        assert!(valid_worker_secret(&bootstrap));
-        assert_ne!(sharing, bootstrap);
+        assert_eq!(sharing, same);
     }
 
     #[test]
@@ -347,6 +330,8 @@ mod tests {
                 "group_member_subscribe".into(),
                 "group_authorization_v2".into(),
                 "group_membership_fsm_v2".into(),
+                "device_runtime_refresh_v2".into(),
+                "device_registry_v1".into(),
             ],
             None,
         );
@@ -553,6 +538,7 @@ pub async fn cloudflare_deploy(
         });
     };
     let user_id = identity_ref.user_identity.user_id.clone();
+    let user_public_key = identity_ref.user_identity.user_public_key.clone();
     let device_id = identity_ref.device_identity.device_id.clone();
 
     // Get profile name
@@ -598,6 +584,7 @@ pub async fn cloudflare_deploy(
         .ok_or_else(|| "No Cloudflare account found".to_string())?;
 
     let api_token = crate::commands::cloudflare_oauth::load_access_token()
+        .await
         .map_err(|error| error.to_string())?;
 
     // Load embedded Worker script
@@ -613,6 +600,28 @@ pub async fn cloudflare_deploy(
         let inner = state.inner.read().await;
         inner.profile_manager.get_runtime_metadata().await
     };
+    let runtime_id = existing_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if existing_runtime
+        .as_ref()
+        .and_then(|runtime| runtime.runtime_id.as_deref())
+        != Some(runtime_id.as_str())
+    {
+        let inner = state.inner.read().await;
+        let pm = inner.profile_manager.inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "active profile is missing".to_string())?;
+        let mut pending = existing_runtime.clone().unwrap_or_default();
+        pending.runtime_id = Some(runtime_id.clone());
+        pending.secret_rotation.last_error = Some("upgrade_pending_enrollment".into());
+        profile
+            .save_runtime_metadata(&pending)
+            .map_err(|error| format!("failed to persist pending runtime upgrade: {error}"))?;
+    }
     let existing_secrets = {
         let inner = state.inner.read().await;
         let pm_inner = inner.profile_manager.inner.read().await;
@@ -622,12 +631,7 @@ pub async fn cloudflare_deploy(
             .and_then(|profile| profile.load_runtime_secrets().ok())
             .unwrap_or_default()
     };
-    let (
-        sharing_token_secret,
-        repaired_sharing_secret,
-        bootstrap_token_secret,
-        repaired_bootstrap_secret,
-    ) = repair_worker_secrets(
+    let (sharing_token_secret, repaired_sharing_secret) = repair_worker_secret(
         existing_runtime
             .as_ref()
             .and_then(|_| existing_secrets.sharing_secret.clone())
@@ -637,15 +641,6 @@ pub async fn cloudflare_deploy(
                     .and_then(|runtime| runtime.sharing_secret.clone())
             })
             .or_else(|| Some(defaults.sharing_token_secret.clone())),
-        existing_secrets
-            .bootstrap_secret
-            .clone()
-            .or_else(|| {
-                existing_runtime
-                    .as_ref()
-                    .and_then(|runtime| runtime.bootstrap_secret.clone())
-            })
-            .or_else(|| Some(defaults.bootstrap_token_secret.clone())),
     );
 
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -655,35 +650,26 @@ pub async fn cloudflare_deploy(
         .device_runtime_key_id
         .clone()
         .unwrap_or_else(|| generate_runtime_key_id("runtime"));
-    let bootstrap_key_id = existing_secrets
-        .bootstrap_key_id
-        .clone()
-        .unwrap_or_else(|| generate_runtime_key_id("bootstrap"));
     let first_keyed_deploy = existing_secrets.device_runtime_secret.is_none();
     let previous_device_runtime_secret = existing_secrets
         .previous_device_runtime_secret
         .clone()
         .or_else(|| first_keyed_deploy.then(|| sharing_token_secret.clone()));
     let previous_device_runtime_key_id = existing_secrets.previous_device_runtime_key_id.clone();
-    let previous_bootstrap_secret = existing_secrets
-        .previous_bootstrap_secret
-        .clone()
-        .or_else(|| first_keyed_deploy.then(|| bootstrap_token_secret.clone()));
-    let previous_bootstrap_key_id = existing_secrets.previous_bootstrap_key_id.clone();
     let grace_until_ms = existing_runtime
         .as_ref()
         .and_then(|runtime| runtime.secret_rotation.grace_until_ms)
         .or_else(|| first_keyed_deploy.then_some(now_ms.saturating_add(AUTH_ROTATION_GRACE_MS)));
     let prepared_secrets = RuntimeSecrets {
-        bootstrap_secret: Some(bootstrap_token_secret.clone()),
+        bootstrap_secret: None,
         sharing_secret: Some(sharing_token_secret.clone()),
         device_runtime_secret: Some(device_runtime_secret.clone()),
         device_runtime_key_id: Some(device_runtime_key_id.clone()),
         previous_device_runtime_secret: previous_device_runtime_secret.clone(),
         previous_device_runtime_key_id: previous_device_runtime_key_id.clone(),
-        bootstrap_key_id: Some(bootstrap_key_id.clone()),
-        previous_bootstrap_secret: previous_bootstrap_secret.clone(),
-        previous_bootstrap_key_id: previous_bootstrap_key_id.clone(),
+        bootstrap_key_id: None,
+        previous_bootstrap_secret: None,
+        previous_bootstrap_key_id: None,
     };
     {
         // Transaction phase 1: persist exactly one prepared key set before any
@@ -718,6 +704,9 @@ pub async fn cloudflare_deploy(
             .as_ref()
             .and_then(|runtime| runtime.worker_name.clone())
             .unwrap_or(defaults.worker_name),
+        runtime_id,
+        owner_user_id: user_id.clone(),
+        owner_user_public_key: user_public_key,
         public_base_url: existing_runtime
             .as_ref()
             .and_then(|runtime| runtime.public_base_url.clone().or(runtime.base_url.clone()))
@@ -735,10 +724,6 @@ pub async fn cloudflare_deploy(
             .and_then(|runtime| runtime.preview_bucket_name.clone())
             .unwrap_or(defaults.preview_bucket_name),
         sharing_token_secret,
-        bootstrap_token_secret,
-        bootstrap_key_id: bootstrap_key_id.clone(),
-        previous_bootstrap_secret,
-        previous_bootstrap_key_id,
         device_runtime_secret,
         device_runtime_key_id: device_runtime_key_id.clone(),
         previous_device_runtime_secret,
@@ -757,19 +742,19 @@ pub async fn cloudflare_deploy(
         message_request_rate_limit_hour: 300,
     };
 
-    if repaired_sharing_secret || repaired_bootstrap_secret || generated_device_runtime_secret {
+    if repaired_sharing_secret || generated_device_runtime_secret {
         let _ = app.emit(
             "cloudflare-progress",
             DeployProgress {
                 phase: DeployPhase::Preflight,
-                message: "Invalid or missing runtime secrets were rotated. Unused legacy invite or bootstrap links may no longer work.".into(),
+                message: "Invalid or missing runtime secrets were rotated.".into(),
                 progress_percent: 20,
             },
         );
     }
 
     // Deploy via REST API
-    let result = cloudflare_rest::deploy_via_rest_api(
+    let first_deploy = cloudflare_rest::deploy_via_rest_api(
         &api_token,
         &account_id,
         &worker_script,
@@ -778,7 +763,27 @@ pub async fn cloudflare_deploy(
             let _ = app.emit("cloudflare-progress", progress);
         },
     )
-    .await?;
+    .await;
+    let result = match first_deploy {
+        Ok(result) => result,
+        Err(error) if error.contains("cloudflare_api_unauthorized") => {
+            let refreshed =
+                crate::commands::cloudflare_oauth::force_refresh_access_token(&api_token)
+                    .await
+                    .map_err(|refresh_error| refresh_error.to_string())?;
+            cloudflare_rest::deploy_via_rest_api(
+                &refreshed,
+                &account_id,
+                &worker_script,
+                &config,
+                |progress| {
+                    let _ = app.emit("cloudflare-progress", progress);
+                },
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
 
     if !result.success {
         let elapsed_ms = deploy_start.elapsed().as_millis();
@@ -816,24 +821,81 @@ pub async fn cloudflare_deploy(
     );
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-    // Bootstrap device bundle
+    // Fetch the public deployment descriptor, build the root-signed local
+    // IdentityBundle, then enroll the current device with its long-lived key.
     let _ = app.emit(
         "cloudflare-progress",
         DeployProgress {
             phase: DeployPhase::VerifyingDeployment,
-            message: "Bootstrapping device...".into(),
+            message: "Enrolling this device...".into(),
             progress_percent: 90,
         },
     );
 
-    let deployment_bundle = tapchat_core::cli::runtime::bootstrap_device_bundle(
-        &result.worker_url,
-        &config.bootstrap_token_secret,
-        &user_id,
-        &device_id,
-    )
-    .await
-    .map_err(|e| format!("Bootstrap failed: {}", e))?;
+    let deployment_bundle = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/deployment-bundle",
+            result.worker_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|error| format!("Fetch deployment descriptor failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Fetch deployment descriptor rejected: {error}"))?
+        .json::<DeploymentBundle>()
+        .await
+        .map_err(|error| format!("Decode deployment descriptor failed: {error}"))?;
+
+    let profile_manager = {
+        let inner = state.inner.read().await;
+        inner.profile_manager.clone()
+    };
+    let (local_bundle, local_identity, prepared_snapshot) = {
+        let mut inner = state.inner.write().await;
+        inner
+            .engine
+            .handle_command(CoreCommand::ImportDeploymentBundle {
+                bundle: deployment_bundle.clone(),
+            })
+            .map_err(|error| format!("Prepare deployment import failed: {error}"))?;
+        let snapshot = inner.engine.refresh_snapshot();
+        let local_bundle = snapshot
+            .deployment
+            .as_ref()
+            .and_then(|deployment| deployment.local_bundle.clone())
+            .ok_or_else(|| {
+                "Local IdentityBundle is unavailable for device enrollment".to_string()
+            })?;
+        let local_identity = snapshot
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.state.clone())
+            .ok_or_else(|| "Local identity is unavailable for device enrollment".to_string())?;
+        (local_bundle, local_identity, snapshot)
+    };
+    {
+        let mut pm_inner = profile_manager.inner.write().await;
+        let profile = pm_inner
+            .active_profile
+            .as_mut()
+            .ok_or_else(|| "active profile disappeared during enrollment".to_string())?;
+        profile
+            .save_snapshot(&prepared_snapshot)
+            .map_err(|error| format!("Persist prepared enrollment snapshot failed: {error}"))?;
+        profile
+            .save_deployment_bundle(&deployment_bundle)
+            .map_err(|error| format!("Persist deployment descriptor failed: {error}"))?;
+    }
+    state
+        .runtime_auth
+        .enroll(
+            &profile_manager,
+            &deployment_bundle,
+            &local_bundle,
+            &local_identity,
+        )
+        .await
+        .map_err(|error| format!("Device enrollment failed: {error}"))?;
 
     // Import deployment bundle
     drive_core_with_handle(
@@ -886,6 +948,7 @@ pub async fn cloudflare_deploy(
         let service_root = resolve_embedded_runtime_root(Some(&app));
 
         let runtime = RuntimeMetadata {
+            runtime_id: Some(config.runtime_id.clone()),
             pid: None,
             base_url: Some(result.worker_url.clone()),
             websocket_base_url: Some(
@@ -894,7 +957,7 @@ pub async fn cloudflare_deploy(
                     .replace("https://", "wss://")
                     .replace("http://", "ws://"),
             ),
-            bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
+            bootstrap_secret: None,
             sharing_secret: Some(config.sharing_token_secret.clone()),
             mode: Some("cloudflare".into()),
             workspace_root: None,
@@ -968,8 +1031,7 @@ async fn prepare_runtime_secret_rotation(state: &State<'_, AppState>) -> Result<
             )
         }
         RuntimeSecretRotationPhase::PendingAuthorization
-            if secrets.previous_device_runtime_secret.is_some()
-                || secrets.previous_bootstrap_secret.is_some() =>
+            if secrets.previous_device_runtime_secret.is_some() =>
         {
             // Authorization expired after preparation. Reuse the exact prepared
             // key set instead of creating a third generation.
@@ -984,25 +1046,18 @@ async fn prepare_runtime_secret_rotation(state: &State<'_, AppState>) -> Result<
         .or_else(|| secrets.sharing_secret.clone())
         .ok_or_else(|| "Current device runtime secret is missing.".to_string())?;
     let old_runtime_key_id = secrets.device_runtime_key_id.clone();
-    let old_bootstrap_secret = secrets
-        .bootstrap_secret
-        .clone()
-        .ok_or_else(|| "Current bootstrap secret is missing.".to_string())?;
-    let old_bootstrap_key_id = secrets.bootstrap_key_id.clone();
     let (new_runtime_secret, _) = repair_worker_secret(None);
-    let (new_bootstrap_secret, _) = repair_worker_secret(None);
     let new_runtime_key_id = generate_runtime_key_id("runtime");
-    let new_bootstrap_key_id = generate_runtime_key_id("bootstrap");
     let grace_until_ms = now_ms.saturating_add(AUTH_ROTATION_GRACE_MS);
 
     secrets.previous_device_runtime_secret = Some(old_runtime_secret);
     secrets.previous_device_runtime_key_id = old_runtime_key_id.clone();
     secrets.device_runtime_secret = Some(new_runtime_secret);
     secrets.device_runtime_key_id = Some(new_runtime_key_id.clone());
-    secrets.previous_bootstrap_secret = Some(old_bootstrap_secret);
-    secrets.previous_bootstrap_key_id = old_bootstrap_key_id;
-    secrets.bootstrap_secret = Some(new_bootstrap_secret);
-    secrets.bootstrap_key_id = Some(new_bootstrap_key_id);
+    secrets.previous_bootstrap_secret = None;
+    secrets.previous_bootstrap_key_id = None;
+    secrets.bootstrap_secret = None;
+    secrets.bootstrap_key_id = None;
 
     runtime.secret_rotation = RuntimeSecretRotationMetadata {
         phase: RuntimeSecretRotationPhase::Prepared,
@@ -1070,10 +1125,9 @@ pub async fn cloudflare_finalize_secret_rotation(
 
     let result = cloudflare_deploy(app, state).await?;
     if result.success {
-        if let (Ok(whoami), Ok(api_token)) = (
-            crate::commands::cloudflare_oauth::whoami().await,
-            crate::commands::cloudflare_oauth::load_access_token(),
-        ) {
+        let whoami = crate::commands::cloudflare_oauth::whoami().await;
+        let api_token = crate::commands::cloudflare_oauth::load_access_token().await;
+        if let (Ok(whoami), Ok(api_token)) = (whoami, api_token) {
             if let Some(account_id) = whoami
                 .active_account_id
                 .or_else(|| whoami.accounts.first().map(|item| item.account_id.clone()))
@@ -1087,14 +1141,6 @@ pub async fn cloudflare_finalize_secret_rotation(
                     &account_id,
                     &worker_name,
                     "DEVICE_RUNTIME_SECRET_PREVIOUS",
-                )
-                .await;
-                let _ = cloudflare_rest::delete_worker_secret(
-                    &client,
-                    &api_token,
-                    &account_id,
-                    &worker_name,
-                    "BOOTSTRAP_LINK_SECRET_PREVIOUS",
                 )
                 .await;
             }
@@ -1118,8 +1164,7 @@ pub async fn maybe_run_due_secret_rotation(app: &AppHandle) -> Result<bool, Stri
             runtime.secret_rotation.next_rotation_at_ms,
             runtime.secret_rotation.grace_until_ms,
             runtime.secret_rotation.prepared_at_ms,
-            secrets.previous_device_runtime_secret.is_some()
-                || secrets.previous_bootstrap_secret.is_some(),
+            secrets.previous_device_runtime_secret.is_some(),
         )
     };
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1306,7 +1351,7 @@ pub async fn cloudflare_status(
 async fn cloudflare_status_impl(
     state: &State<'_, AppState>,
 ) -> Result<CloudflareRuntimeStatus, String> {
-    let (runtime, snapshot_deployment, bundle_file, metadata_bundle_path) = {
+    let (runtime, snapshot_deployment, bundle_file, metadata_bundle_path, credential) = {
         let inner = state.inner.read().await;
         let pm_inner = inner.profile_manager.inner.read().await;
         let Some(profile) = pm_inner.active_profile.as_ref() else {
@@ -1324,7 +1369,14 @@ async fn cloudflare_status_impl(
         let snapshot = profile.load_snapshot().map_err(|e| e.to_string())?;
         let bundle_path = profile.metadata().deployment_bundle_path.clone();
         let bundle_file = profile.load_deployment_bundle().ok().flatten();
-        (runtime, snapshot.deployment, bundle_file, bundle_path)
+        let credential = profile.load_runtime_credential().ok().flatten();
+        (
+            runtime,
+            snapshot.deployment,
+            bundle_file,
+            bundle_path,
+            credential,
+        )
     };
 
     let endpoint = runtime.public_base_url.clone().or(runtime.base_url.clone());
@@ -1393,21 +1445,85 @@ async fn cloudflare_status_impl(
         }
         RuntimeSecretRotationPhase::Stable => {}
     }
-    if status.state == "ready" && device_runtime_auth_expired(&deployment) {
-        status.state = "auth_expired".into();
-        status.action = Some("refresh_auth".into());
-        status.details = Some("Device runtime authorization is missing or expired.".into());
+    status.credential_expires_at = credential.as_ref().map(|value| value.expires_at);
+    if status.state == "ready" {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        match credential {
+            None => {
+                status.state = "enrollment_required".into();
+                status.action = Some("refresh_auth".into());
+                status.error_code = Some("enrollment_required".into());
+                status.details = Some("This device must enroll with the upgraded runtime.".into());
+            }
+            Some(auth) if auth.runtime_id != deployment.deployment_bundle.runtime_id => {
+                status.state = "enrollment_required".into();
+                status.action = Some("refresh_auth".into());
+                status.error_code = Some("runtime_mismatch".into());
+                status.details =
+                    Some("The saved runtime credential belongs to another runtime.".into());
+            }
+            Some(auth) if auth.expires_at <= now => {
+                status.state = "offline_expired".into();
+                status.action = Some("refresh_auth".into());
+                status.error_code = Some("runtime_auth_expired".into());
+                status.details = Some("Runtime authorization is expired; local data remains available while refresh retries.".into());
+            }
+            _ => {}
+        }
+    }
+    if status.state == "ready" {
+        let auth = state.runtime_auth.snapshot().await;
+        status.credential_expires_at = auth.expires_at.or(status.credential_expires_at);
+        status.error_code = auth.error_code.clone();
+        match auth.state {
+            crate::runtime_auth::RuntimeAuthState::Ready => {}
+            crate::runtime_auth::RuntimeAuthState::Refreshing => {
+                status.state = "refreshing".into();
+            }
+            crate::runtime_auth::RuntimeAuthState::Degraded => {
+                status.state = "degraded".into();
+                status.details = Some("Runtime authorization refresh will retry automatically; the current credential is still valid.".into());
+            }
+            crate::runtime_auth::RuntimeAuthState::OfflineExpired => {
+                status.state = "offline_expired".into();
+                status.action = Some("refresh_auth".into());
+            }
+            crate::runtime_auth::RuntimeAuthState::UpgradeRequired => {
+                status.state = "upgrade_required".into();
+                status.action = Some("upgrade".into());
+            }
+            crate::runtime_auth::RuntimeAuthState::EnrollmentRequired => {
+                status.state = "enrollment_required".into();
+                status.action = Some("refresh_auth".into());
+            }
+            crate::runtime_auth::RuntimeAuthState::DeviceRevoked => {
+                status.state = "device_revoked".into();
+                status.action = None;
+                status.details = Some(
+                    "This device has been revoked. Restore the identity or create a new device."
+                        .into(),
+                );
+            }
+        }
     }
     Ok(status)
 }
 
-fn device_runtime_auth_expired(deployment: &PersistedDeployment) -> bool {
-    let Some(auth) = deployment.deployment_bundle.device_runtime_auth.as_ref() else {
-        return true;
+#[tauri::command]
+pub async fn cloudflare_refresh_runtime_auth(
+    state: State<'_, AppState>,
+) -> Result<CloudflareRuntimeStatus, String> {
+    let profile_manager = {
+        let inner = state.inner.read().await;
+        inner.profile_manager.clone()
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    auth.expires_at <= now
+    state
+        .runtime_auth
+        .ensure(&profile_manager, true)
+        .await
+        .map_err(|error| error.to_string())?;
+    cloudflare_status_impl(&state).await
 }

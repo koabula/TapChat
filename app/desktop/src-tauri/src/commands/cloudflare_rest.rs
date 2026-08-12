@@ -13,6 +13,14 @@ use std::path::Path;
 const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const WORKER_COMPATIBILITY_DATE: &str = "2026-07-09";
 
+fn reject_unauthorized(status: StatusCode) -> Result<(), String> {
+    if status == StatusCode::UNAUTHORIZED {
+        Err("cloudflare_api_unauthorized".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// OAuth login result from login.mjs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
@@ -55,15 +63,14 @@ pub struct AccountInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerDeployConfig {
     pub worker_name: String,
+    pub runtime_id: String,
+    pub owner_user_id: String,
+    pub owner_user_public_key: String,
     pub public_base_url: Option<String>,
     pub deployment_region: String,
     pub bucket_name: String,
     pub preview_bucket_name: String,
     pub sharing_token_secret: String,
-    pub bootstrap_token_secret: String,
-    pub bootstrap_key_id: String,
-    pub previous_bootstrap_secret: Option<String>,
-    pub previous_bootstrap_key_id: Option<String>,
     pub device_runtime_secret: String,
     pub device_runtime_key_id: String,
     pub previous_device_runtime_secret: Option<String>,
@@ -137,20 +144,20 @@ struct CloudflareErrorDetail {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkerMigrationPlan {
-    FreshV2,
-    UpgradeGroupOutbox,
+    FreshV3,
+    UpgradeDeviceRegistry,
     None,
 }
 
 fn worker_migration_metadata(plan: WorkerMigrationPlan) -> Option<Value> {
     match plan {
-        WorkerMigrationPlan::FreshV2 => Some(serde_json::json!({
-            "tag": "v2",
-            "new_sqlite_classes": ["InboxDurableObject", "GroupOutboxDurableObject"],
+        WorkerMigrationPlan::FreshV3 => Some(serde_json::json!({
+            "tag": "v3",
+            "new_sqlite_classes": ["InboxDurableObject", "GroupOutboxDurableObject", "DeviceRegistryDurableObject"],
         })),
-        WorkerMigrationPlan::UpgradeGroupOutbox => Some(serde_json::json!({
-            "tag": "v2",
-            "new_sqlite_classes": ["GroupOutboxDurableObject"],
+        WorkerMigrationPlan::UpgradeDeviceRegistry => Some(serde_json::json!({
+            "tag": "v3",
+            "new_sqlite_classes": ["DeviceRegistryDurableObject"],
         })),
         WorkerMigrationPlan::None => None,
     }
@@ -187,6 +194,11 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
                 "class_name": "GroupOutboxDurableObject",
             },
             {
+                "type": "durable_object_namespace",
+                "name": "DEVICE_REGISTRY",
+                "class_name": "DeviceRegistryDurableObject",
+            },
+            {
                 "type": "r2_bucket",
                 "name": "TAPCHAT_STORAGE",
                 "bucket_name": config.bucket_name,
@@ -195,6 +207,21 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
                 "type": "plain_text",
                 "name": "DEPLOYMENT_REGION",
                 "text": config.deployment_region,
+            },
+            {
+                "type": "plain_text",
+                "name": "RUNTIME_ID",
+                "text": config.runtime_id,
+            },
+            {
+                "type": "plain_text",
+                "name": "OWNER_USER_ID",
+                "text": config.owner_user_id,
+            },
+            {
+                "type": "plain_text",
+                "name": "OWNER_USER_PUBLIC_KEY",
+                "text": config.owner_user_public_key,
             },
             {
                 "type": "plain_text",
@@ -253,16 +280,6 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
             },
             {
                 "type": "plain_text",
-                "name": "BOOTSTRAP_LINK_SECRET_KEY_ID",
-                "text": config.bootstrap_key_id,
-            },
-            {
-                "type": "plain_text",
-                "name": "BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID",
-                "text": config.previous_bootstrap_key_id.clone().unwrap_or_default(),
-            },
-            {
-                "type": "plain_text",
                 "name": "DEVICE_RUNTIME_SECRET_KEY_ID",
                 "text": config.device_runtime_key_id,
             },
@@ -315,6 +332,7 @@ pub async fn create_r2_bucket(
         .map_err(|e| format!("R2 bucket create request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
 
     // 200 OK = bucket created
     // 409 Conflict = bucket already exists (acceptable)
@@ -388,6 +406,7 @@ pub async fn upload_worker_script(
         .map_err(|e| format!("Worker upload request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
 
     if !status.is_success() {
         let error_body = response
@@ -420,9 +439,9 @@ async fn upload_worker_script_with_migration_retry(
     worker_exists: bool,
 ) -> Result<(), String> {
     let migration_plan = if worker_exists {
-        WorkerMigrationPlan::UpgradeGroupOutbox
+        WorkerMigrationPlan::UpgradeDeviceRegistry
     } else {
-        WorkerMigrationPlan::FreshV2
+        WorkerMigrationPlan::FreshV3
     };
 
     match upload_worker_script(
@@ -438,14 +457,14 @@ async fn upload_worker_script_with_migration_retry(
     {
         Ok(()) => Ok(()),
         Err(error)
-            if migration_plan == WorkerMigrationPlan::UpgradeGroupOutbox
+            if migration_plan == WorkerMigrationPlan::UpgradeDeviceRegistry
                 && is_duplicate_sqlite_class_migration_error(
                     &error,
-                    "GroupOutboxDurableObject",
+                    "DeviceRegistryDurableObject",
                 ) =>
         {
             eprintln!(
-                "GroupOutboxDurableObject migration already exists; retrying worker upload without migrations"
+                "DeviceRegistryDurableObject migration already exists; retrying worker upload without migrations"
             );
             upload_worker_script(
                 client,
@@ -459,11 +478,11 @@ async fn upload_worker_script_with_migration_retry(
             .await
         }
         Err(error)
-            if migration_plan == WorkerMigrationPlan::FreshV2
+            if migration_plan == WorkerMigrationPlan::FreshV3
                 && is_duplicate_sqlite_class_migration_error(&error, "InboxDurableObject") =>
         {
             Err(format!(
-                "{error}. The Cloudflare account already has InboxDurableObject state for this worker name; retry Upgrade Cloudflare runtime so TapChat can apply only the group outbox migration."
+                "{error}. The Cloudflare account already has Durable Object state for this worker name; retry Upgrade Cloudflare runtime so TapChat can apply only the device registry migration."
             ))
         }
         Err(error) => Err(error),
@@ -497,6 +516,7 @@ pub async fn write_worker_secret(
         .map_err(|e| format!("Secret write request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
 
     if !status.is_success() {
         let error_body = response
@@ -539,6 +559,7 @@ pub async fn delete_worker_secret(
         .send()
         .await
         .map_err(|error| format!("Secret delete request failed: {error}"))?;
+    reject_unauthorized(response.status())?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
         return Ok(());
     }
@@ -578,6 +599,7 @@ pub async fn enable_workers_dev_routing(
         .map_err(|e| format!("Workers.dev routing request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
     let response_body = response
         .text()
         .await
@@ -619,6 +641,7 @@ pub async fn check_worker_exists(
         .map_err(|e| format!("Worker check request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
     if status.is_success() {
         return Ok(true);
     }
@@ -646,6 +669,7 @@ pub async fn get_worker_subdomain(
         .map_err(|e| format!("Worker subdomain request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
 
     if !status.is_success() {
         return Err(format!("Failed to get worker subdomain: HTTP {}", status));
@@ -711,6 +735,7 @@ pub async fn ensure_account_workers_dev_subdomain(
         .map_err(|e| format!("Create subdomain request failed: {}", e))?;
 
     let status = response.status();
+    reject_unauthorized(status)?;
 
     if !status.is_success() {
         eprintln!("Failed to set workers.dev subdomain: HTTP {}", status);
@@ -803,17 +828,6 @@ pub async fn deploy_via_rest_api(
         &config.sharing_token_secret,
     )
     .await?;
-    if let Some(previous) = &config.previous_bootstrap_secret {
-        write_worker_secret(
-            &client,
-            api_token,
-            account_id,
-            &config.worker_name,
-            "BOOTSTRAP_LINK_SECRET_PREVIOUS",
-            previous,
-        )
-        .await?;
-    }
     write_worker_secret(
         &client,
         api_token,
@@ -834,16 +848,6 @@ pub async fn deploy_via_rest_api(
         )
         .await?;
     }
-    write_worker_secret(
-        &client,
-        api_token,
-        account_id,
-        &config.worker_name,
-        "BOOTSTRAP_LINK_SECRET",
-        &config.bootstrap_token_secret,
-    )
-    .await?;
-
     // Phase 4: Get deployment URL
     progress_callback(DeployProgress {
         phase: DeployPhase::VerifyingDeployment,
@@ -988,10 +992,9 @@ mod tests {
             bucket_name: "tapchat-storage".into(),
             preview_bucket_name: "tapchat-storage-preview".into(),
             sharing_token_secret: "sharing".into(),
-            bootstrap_token_secret: "bootstrap".into(),
-            bootstrap_key_id: "bootstrap-key".into(),
-            previous_bootstrap_secret: None,
-            previous_bootstrap_key_id: None,
+            runtime_id: "runtime-test".into(),
+            owner_user_id: "user:test".into(),
+            owner_user_public_key: "owner-public-key".into(),
             device_runtime_secret: "runtime".into(),
             device_runtime_key_id: "runtime-key".into(),
             previous_device_runtime_secret: None,
@@ -1012,8 +1015,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_worker_metadata_includes_v2_group_runtime() {
-        let metadata = build_worker_metadata(&deploy_config(), WorkerMigrationPlan::FreshV2);
+    fn fresh_worker_metadata_includes_v3_device_registry() {
+        let metadata = build_worker_metadata(&deploy_config(), WorkerMigrationPlan::FreshV3);
         assert_eq!(
             metadata["compatibility_date"].as_str(),
             Some(WORKER_COMPATIBILITY_DATE)
@@ -1034,6 +1037,10 @@ mod tests {
         assert!(bindings.iter().any(|binding| {
             binding["name"] == "GROUP_OUTBOX" && binding["class_name"] == "GroupOutboxDurableObject"
         }));
+        assert!(bindings.iter().any(|binding| {
+            binding["name"] == "DEVICE_REGISTRY"
+                && binding["class_name"] == "DeviceRegistryDurableObject"
+        }));
 
         let classes = metadata["migrations"]["new_sqlite_classes"]
             .as_array()
@@ -1042,19 +1049,22 @@ mod tests {
         assert!(classes
             .iter()
             .any(|class| class == "GroupOutboxDurableObject"));
-        assert_eq!(metadata["migrations"]["tag"].as_str(), Some("v2"));
+        assert!(classes
+            .iter()
+            .any(|class| class == "DeviceRegistryDurableObject"));
+        assert_eq!(metadata["migrations"]["tag"].as_str(), Some("v3"));
     }
 
     #[test]
-    fn upgrade_worker_metadata_does_not_recreate_inbox_class() {
+    fn upgrade_worker_metadata_only_creates_device_registry() {
         let metadata =
-            build_worker_metadata(&deploy_config(), WorkerMigrationPlan::UpgradeGroupOutbox);
+            build_worker_metadata(&deploy_config(), WorkerMigrationPlan::UpgradeDeviceRegistry);
         let classes = metadata["migrations"]["new_sqlite_classes"]
             .as_array()
             .expect("new sqlite classes");
         assert!(!classes.iter().any(|class| class == "InboxDurableObject"));
         assert_eq!(classes.len(), 1);
-        assert_eq!(classes[0].as_str(), Some("GroupOutboxDurableObject"));
+        assert_eq!(classes[0].as_str(), Some("DeviceRegistryDurableObject"));
     }
 
     #[test]

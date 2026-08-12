@@ -46,7 +46,7 @@ use tapchat_core::transport_contract::{
     PutWelcomePickupRequest, PutWelcomePickupResult, RealtimeSubscriptionRequest,
     ReplaceAllowlistRequest, RevokeGroupInviteRequest, RevokeGroupInviteResult,
     SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
-    SubmitGroupLeaveRequest, SubmitGroupLeaveResult,
+    SubmitGroupLeaveRequest, SubmitGroupLeaveResult, TransportAuthRequirement,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -56,6 +56,7 @@ use crate::platform::persistence::DesktopPersistence;
 use crate::platform::profile::ProfileManagerInner;
 use crate::platform::realtime::RealtimeManager;
 use crate::platform::transport::DesktopTransport;
+use crate::runtime_auth::RuntimeAuthManager;
 
 /// Desktop-specific implementation of all platform port traits.
 /// This is the bridge between CoreEngine effects and actual platform operations.
@@ -71,11 +72,15 @@ pub struct DesktopPlatformPorts {
     app_handle: Option<Arc<AppHandle>>,
     /// Current conversation ID for upload progress context
     current_conversation_id: Option<String>,
+    runtime_auth: RuntimeAuthManager,
     // Timer uses spawn directly
 }
 
 impl DesktopPlatformPorts {
-    pub fn new(profile_inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
+    pub fn new(
+        profile_inner: Arc<RwLock<ProfileManagerInner>>,
+        runtime_auth: RuntimeAuthManager,
+    ) -> Self {
         Self {
             transport: DesktopTransport::new(profile_inner.clone()),
             realtime: RealtimeManager::new(profile_inner.clone()),
@@ -91,7 +96,46 @@ impl DesktopPlatformPorts {
                 }),
             app_handle: None,
             current_conversation_id: None,
+            runtime_auth,
         }
+    }
+
+    async fn inject_runtime_authorization(
+        &self,
+        headers: &mut std::collections::BTreeMap<String, String>,
+        auth: Option<&TransportAuthRequirement>,
+        force_refresh: bool,
+    ) -> Result<()> {
+        let Some(TransportAuthRequirement::DeviceRuntime {
+            runtime_id,
+            device_id,
+        }) = auth
+        else {
+            return Ok(());
+        };
+        let profile_manager = crate::platform::profile::ProfileManager::from_inner(
+            self.transport.profile_inner.clone(),
+        );
+        let credential = self
+            .runtime_auth
+            .ensure(&profile_manager, force_refresh)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("runtime_auth_error:enrollment_required"))?;
+        if credential.runtime_id != *runtime_id || credential.device_id != *device_id {
+            anyhow::bail!("runtime_auth_error:runtime_mismatch");
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if credential.expires_at <= now {
+            anyhow::bail!("runtime_auth_error:runtime_auth_expired");
+        }
+        headers.insert(
+            "Authorization".into(),
+            format!("Bearer {}", credential.token),
+        );
+        Ok(())
     }
 
     /// Set the app handle for emitting events
@@ -279,7 +323,10 @@ fn summarize_endpoint_url(url: &url::Url) -> String {
 // We implement by delegating to the platform modules
 
 impl TransportPort for DesktopPlatformPorts {
-    async fn execute_http_request(&mut self, request: HttpRequestEffect) -> Result<Vec<CoreEvent>> {
+    async fn execute_http_request(
+        &mut self,
+        mut request: HttpRequestEffect,
+    ) -> Result<Vec<CoreEvent>> {
         // Intercept append envelope requests to inject correct sender_bundle_share_url
         if request.method == HttpMethod::Post && request.url.contains("/messages") {
             log::info!("[TransportPort] Intercepting /messages POST request");
@@ -322,14 +369,7 @@ impl TransportPort for DesktopPlatformPorts {
                             append_request.sender_bundle_share_url = Some(url);
                             // Rebuild the request with modified body
                             let modified_body = serde_json::to_string(&append_request)?;
-                            let modified_request = HttpRequestEffect {
-                                request_id: request.request_id.clone(),
-                                method: request.method.clone(),
-                                url: request.url.clone(),
-                                headers: request.headers.clone(),
-                                body: Some(modified_body),
-                            };
-                            return self.transport.execute_http_request(modified_request).await;
+                            request.body = Some(modified_body);
                         } else {
                             log::warn!(
                                 "[TransportPort] Failed to generate contact_share_url, sending original request"
@@ -342,7 +382,27 @@ impl TransportPort for DesktopPlatformPorts {
             }
         }
 
-        self.transport.execute_http_request(request).await
+        let original = request.clone();
+        self.inject_runtime_authorization(&mut request.headers, request.auth.as_ref(), false)
+            .await?;
+        let events = self.transport.execute_http_request(request).await?;
+        let runtime_expired = events.iter().any(|event| match event {
+            CoreEvent::HttpResponseReceived {
+                status,
+                body: Some(body),
+                ..
+            } if *status == 401 || *status == 403 => {
+                extract_error_code(body).as_deref() == Some("runtime_auth_expired")
+            }
+            _ => false,
+        });
+        if !runtime_expired || original.auth.is_none() {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        self.transport.execute_http_request(retry).await
     }
 
     async fn fetch_identity_bundle(
@@ -372,34 +432,87 @@ impl TransportPort for DesktopPlatformPorts {
 
     async fn fetch_message_requests(
         &mut self,
-        fetch: FetchMessageRequestsRequest,
+        mut fetch: FetchMessageRequestsRequest,
     ) -> Result<Vec<CoreEvent>> {
-        transport::fetch_message_requests(&self.client, fetch).await
+        let original = fetch.clone();
+        self.inject_runtime_authorization(&mut fetch.headers, fetch.auth.as_ref(), false)
+            .await?;
+        let events = transport::fetch_message_requests(&self.client, fetch).await?;
+        if !events_report_runtime_auth_expired(&events) {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        transport::fetch_message_requests(&self.client, retry).await
     }
 
     async fn act_on_message_request(
         &mut self,
-        action: MessageRequestActionRequest,
+        mut action: MessageRequestActionRequest,
     ) -> Result<Vec<CoreEvent>> {
-        transport::act_on_message_request(&self.client, action).await
+        let original = action.clone();
+        self.inject_runtime_authorization(&mut action.headers, action.auth.as_ref(), false)
+            .await?;
+        let events = transport::act_on_message_request(&self.client, action).await?;
+        if !events_report_runtime_auth_expired(&events) {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        transport::act_on_message_request(&self.client, retry).await
     }
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
-        transport::fetch_allowlist(&self.client, fetch).await
+    async fn fetch_allowlist(
+        &mut self,
+        mut fetch: FetchAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let original = fetch.clone();
+        self.inject_runtime_authorization(&mut fetch.headers, fetch.auth.as_ref(), false)
+            .await?;
+        let events = transport::fetch_allowlist(&self.client, fetch).await?;
+        if !events_report_runtime_auth_expired(&events) {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        transport::fetch_allowlist(&self.client, retry).await
     }
 
     async fn replace_allowlist(
         &mut self,
-        update: ReplaceAllowlistRequest,
+        mut update: ReplaceAllowlistRequest,
     ) -> Result<Vec<CoreEvent>> {
-        transport::replace_allowlist(&self.client, update).await
+        let original = update.clone();
+        self.inject_runtime_authorization(&mut update.headers, update.auth.as_ref(), false)
+            .await?;
+        let events = transport::replace_allowlist(&self.client, update).await?;
+        if !events_report_runtime_auth_expired(&events) {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        transport::replace_allowlist(&self.client, retry).await
     }
 
     async fn publish_shared_state(
         &mut self,
-        publish: PublishSharedStateRequest,
+        mut publish: PublishSharedStateRequest,
     ) -> Result<Vec<CoreEvent>> {
-        transport::publish_shared_state(&self.client, publish).await
+        let original = publish.clone();
+        self.inject_runtime_authorization(&mut publish.headers, publish.auth.as_ref(), false)
+            .await?;
+        let events = transport::publish_shared_state(&self.client, publish).await?;
+        if !events_report_runtime_auth_expired(&events) {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        transport::publish_shared_state(&self.client, retry).await
     }
 
     async fn append_group_envelope(
@@ -462,8 +575,15 @@ impl TransportPort for DesktopPlatformPorts {
 
     async fn initialize_group_authorization(
         &mut self,
-        initialize: InitializeGroupAuthorizationRequest,
+        mut initialize: InitializeGroupAuthorizationRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let already_retried = initialize
+            .headers
+            .remove("X-Tapchat-Runtime-Retry")
+            .is_some();
+        let original = initialize.clone();
+        self.inject_runtime_authorization(&mut initialize.headers, initialize.auth.as_ref(), false)
+            .await?;
         let base = self.inbox_base_url().await?;
         let endpoint = format!(
             "{}/v1/groups/{}/authorization/bootstrap",
@@ -479,7 +599,7 @@ impl TransportPort for DesktopPlatformPorts {
         }
         let group_id = initialize.group_id.clone();
         let body = to_camel_case_json_string(&serde_json::to_string(&initialize)?)?;
-        match request.body(body).send().await {
+        let events: Result<Vec<CoreEvent>> = match request.body(body).send().await {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
@@ -506,7 +626,18 @@ impl TransportPort for DesktopPlatformPorts {
                 code: None,
                 detail: Some(error.to_string()),
             }]),
+        };
+        let events = events?;
+        if already_retried || !events_report_runtime_auth_expired(&events) {
+            return Ok(events);
         }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        retry
+            .headers
+            .insert("X-Tapchat-Runtime-Retry".into(), "1".into());
+        Box::pin(self.initialize_group_authorization(retry)).await
     }
 
     async fn append_group_transition(
@@ -1577,6 +1708,23 @@ fn extract_error_code(body: &str) -> Option<String> {
         })
 }
 
+fn events_report_runtime_auth_expired(events: &[CoreEvent]) -> bool {
+    events.iter().any(|event| match event {
+        CoreEvent::MessageRequestsFetchFailed { detail, .. }
+        | CoreEvent::MessageRequestActionFailed { detail, .. }
+        | CoreEvent::AllowlistFetchFailed { detail, .. }
+        | CoreEvent::AllowlistReplaceFailed { detail, .. }
+        | CoreEvent::SharedStatePublishFailed { detail, .. }
+        | CoreEvent::BlobTransferFailed { detail, .. } => detail
+            .as_deref()
+            .is_some_and(|value| value.contains("runtime_auth_expired")),
+        CoreEvent::GroupAuthorizationInitializeFailed { code, .. } => {
+            code.as_deref() == Some("runtime_auth_expired")
+        }
+        _ => false,
+    })
+}
+
 fn extract_sealed_at(body: &str) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1592,9 +1740,30 @@ fn extract_sealed_at(body: &str) -> Option<u64> {
 impl RealtimePort for DesktopPlatformPorts {
     async fn open_realtime(
         &mut self,
-        subscription: RealtimeSubscriptionRequest,
+        mut subscription: RealtimeSubscriptionRequest,
     ) -> Result<Vec<CoreEvent>> {
-        self.realtime.open_connection(subscription).await
+        let original = subscription.clone();
+        self.inject_runtime_authorization(
+            &mut subscription.headers,
+            subscription.auth.as_ref(),
+            false,
+        )
+        .await?;
+        let events = self.realtime.open_connection(subscription).await?;
+        let expired = events.iter().any(|event| {
+            matches!(
+                event,
+                CoreEvent::WebSocketDisconnected { reason: Some(reason), .. }
+                    if reason.contains("runtime_auth_expired")
+            )
+        });
+        if !expired {
+            return Ok(events);
+        }
+        let mut retry = original;
+        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await?;
+        self.realtime.open_connection(retry).await
     }
 
     async fn close_realtime(&mut self, device_id: String) -> Result<Vec<CoreEvent>> {
@@ -1640,10 +1809,23 @@ impl BlobIoPort for DesktopPlatformPorts {
 
     async fn prepare_blob_upload(
         &mut self,
-        upload: PrepareBlobUploadRequest,
+        mut upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let original = upload.clone();
+        self.inject_runtime_authorization(&mut upload.headers, upload.auth.as_ref(), false)
+            .await?;
         // Use transport to prepare upload
-        let result = self.transport.prepare_blob_upload(upload.clone()).await?;
+        let result = match self.transport.prepare_blob_upload(upload.clone()).await {
+            Ok(result) => result,
+            Err(error) if error.to_string().contains("runtime_auth_expired") => {
+                let mut retry = original;
+                self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+                    .await?;
+                upload = retry;
+                self.transport.prepare_blob_upload(upload.clone()).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         // Emit progress event
         if let Some(app) = &self.app_handle {

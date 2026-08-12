@@ -132,10 +132,8 @@ pub fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
 /// fail with a clear message if it's missing (which would indicate
 /// the test runtime's bootstrap step never completed).
 pub fn bundle_auth(bundle: &DeploymentBundle) -> Result<&DeviceRuntimeAuth> {
-    bundle
-        .device_runtime_auth
-        .as_ref()
-        .ok_or_else(|| anyhow!("deployment bundle missing device runtime auth"))
+    tapchat_transport_adapter::runtime::deployment_runtime_auth(bundle)
+        .ok_or_else(|| anyhow!("test deployment missing private runtime credential"))
 }
 
 /// Run `tapchat profile export-identity` and return the path to the

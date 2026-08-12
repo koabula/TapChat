@@ -98,6 +98,8 @@ pub struct RealtimeSubscriptionRequest {
     pub last_acked_seq: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +142,8 @@ pub struct InitializeGroupAuthorizationRequest {
     pub identity_bundles: Vec<IdentityBundle>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +574,8 @@ pub struct PrepareBlobUploadRequest {
     pub file_name: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,6 +681,8 @@ pub struct FetchMessageRequestsRequest {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,6 +705,8 @@ pub struct MessageRequestActionRequest {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -728,6 +738,8 @@ pub struct FetchAllowlistRequest {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -736,6 +748,8 @@ pub struct ReplaceAllowlistRequest {
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
     pub document: AllowlistDocument,
 }
 
@@ -770,6 +784,8 @@ pub struct PublishSharedStateRequest {
     pub body: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TransportAuthRequirement>,
 }
 
 #[cfg(test)]
@@ -849,7 +865,11 @@ mod tests {
         let request = ReplaceAllowlistRequest {
             device_id: "device:bob:phone".into(),
             endpoint: "https://transport.example/v1/inbox/device%3Abob%3Aphone/allowlist".into(),
-            headers: BTreeMap::from([("Authorization".into(), "Bearer token".into())]),
+            headers: BTreeMap::new(),
+            auth: Some(TransportAuthRequirement::DeviceRuntime {
+                runtime_id: "runtime:test".into(),
+                device_id: "device:bob:phone".into(),
+            }),
             document: AllowlistDocument {
                 allowed_sender_user_ids: vec!["user:alice".into()],
                 rejected_sender_user_ids: vec!["user:mallory".into()],
@@ -1041,4 +1061,12 @@ mod tests {
         assert_eq!(decoded_legacy.sealed_at, 1_700_000_000_000);
         assert!(!decoded_legacy.was_already_sealed);
     }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransportAuthRequirement {
+    DeviceRuntime {
+        runtime_id: String,
+        device_id: String,
+    },
 }

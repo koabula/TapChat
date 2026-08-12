@@ -437,7 +437,8 @@ impl DesktopTransport {
 
         let status = response.status();
         if !status.is_success() {
-            anyhow::bail!("prepare upload failed with status {}", status);
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("prepare upload failed with status {status}: {body}");
         }
 
         // Convert camelCase response back to snake_case for Rust

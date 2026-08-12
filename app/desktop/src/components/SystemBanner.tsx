@@ -147,7 +147,7 @@ function runtimeBannerForStatus(status: CloudflareStatus | null): {
   message: string;
   actionLabel?: string;
 } | null {
-  if (!status || status.state === "ready") {
+  if (!status || status.state === "ready" || status.state === "refreshing" || status.state === "degraded") {
     return null;
   }
   switch (status.state) {
@@ -173,9 +173,24 @@ function runtimeBannerForStatus(status: CloudflareStatus | null): {
         actionLabel: "Redeploy",
       };
     case "auth_expired":
+    case "offline_expired":
       return {
         message: "Cloudflare runtime authorization needs refresh.",
         actionLabel: "Refresh",
+      };
+    case "upgrade_required":
+      return {
+        message: "Cloudflare runtime needs a one-time upgrade.",
+        actionLabel: "Upgrade",
+      };
+    case "enrollment_required":
+      return {
+        message: "This device must enroll with the Cloudflare runtime.",
+        actionLabel: "Open",
+      };
+    case "device_revoked":
+      return {
+        message: "This device was revoked. Restore your identity or create a new device.",
       };
     default:
       return {

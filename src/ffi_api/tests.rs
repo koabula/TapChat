@@ -14,7 +14,7 @@ mod tests {
     use crate::mls_adapter::MlsAdapter;
     use crate::model::{
         CapabilityService, ConversationKind, ConversationState, DeliveryClass, DeploymentBundle,
-        DeviceRuntimeAuth, Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
         GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
         GroupManifest, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
         GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord,
@@ -28,6 +28,7 @@ mod tests {
     use crate::transport_contract::{
         GroupJoinDecision, MessageRequestAction, MessageRequestActionResult,
         SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
+        TransportAuthRequirement,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use ed25519_dalek::Signer;
@@ -4011,8 +4012,8 @@ mod tests {
         assert!(prepared.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::PrepareBlobUpload { upload }
-                if upload.headers.get("Authorization")
-                    == Some(&"Bearer device-runtime-token".into())
+                if upload.headers.get("Authorization").is_none()
+                    && matches!(upload.auth.as_ref(), Some(TransportAuthRequirement::DeviceRuntime { .. }))
                     && upload.storage_scope.as_deref() == Some("direct")
                     && upload.group_id.is_none()
         )));
@@ -4550,7 +4551,8 @@ mod tests {
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
-                && request.headers.get("Authorization") == Some(&"Bearer device-runtime-token".into())
+                && request.headers.get("Authorization").is_none()
+                && matches!(request.auth.as_ref(), Some(TransportAuthRequirement::DeviceRuntime { .. }))
         )));
     }
 
@@ -4812,7 +4814,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_requests_include_device_runtime_auth_header() {
+    fn sync_requests_declare_device_runtime_auth_without_bearer_header() {
         let mut engine = CoreEngine::new();
         engine
             .handle_command(CoreCommand::ImportDeploymentBundle {
@@ -4845,20 +4847,28 @@ mod tests {
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::OpenRealtimeConnection { connection }
-                if connection.subscription.headers.get("Authorization")
-                    == Some(&"Bearer device-runtime-token".into())
+                if connection.subscription.headers.get("Authorization").is_none()
+                    && matches!(
+                        connection.subscription.auth.as_ref(),
+                        Some(TransportAuthRequirement::DeviceRuntime { runtime_id, device_id: _ })
+                            if runtime_id == "runtime:test"
+                    )
         )));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request }
                 if request.url.contains("/head")
-                    && request.headers.get("Authorization")
-                        == Some(&"Bearer device-runtime-token".into())
+                    && request.headers.get("Authorization").is_none()
+                    && matches!(
+                        request.auth.as_ref(),
+                        Some(TransportAuthRequirement::DeviceRuntime { runtime_id, device_id: _ })
+                            if runtime_id == "runtime:test"
+                    )
         )));
     }
 
     #[test]
-    fn prepare_blob_upload_effect_includes_device_runtime_auth_header() {
+    fn prepare_blob_upload_effect_declares_device_runtime_auth() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -4886,8 +4896,12 @@ mod tests {
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::PrepareBlobUpload { upload }
-                if upload.headers.get("Authorization")
-                    == Some(&"Bearer device-runtime-token".into())
+                if upload.headers.get("Authorization").is_none()
+                    && matches!(
+                        upload.auth.as_ref(),
+                        Some(TransportAuthRequirement::DeviceRuntime { runtime_id, device_id: _ })
+                            if runtime_id == "runtime:test"
+                    )
         )));
     }
 
@@ -8363,6 +8377,7 @@ mod tests {
     fn sample_deployment() -> DeploymentBundle {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
+            runtime_id: "runtime:test".into(),
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -8386,20 +8401,6 @@ mod tests {
                     "group_membership_fsm_v2".into(),
                 ],
             },
-            device_runtime_auth: Some(DeviceRuntimeAuth {
-                scheme: "bearer".into(),
-                token: "device-runtime-token".into(),
-                expires_at: 999,
-                user_id: "user:alice".into(),
-                device_id: "device:alice:phone".into(),
-                scopes: vec![
-                    "inbox_read".into(),
-                    "inbox_ack".into(),
-                    "inbox_subscribe".into(),
-                    "storage_prepare_upload".into(),
-                ],
-                key_id: None,
-            }),
             expected_user_id: None,
             expected_device_id: None,
         }

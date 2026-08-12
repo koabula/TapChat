@@ -2389,10 +2389,7 @@ async function verifySignedToken(secrets, request, now) {
       if (secrets.previous?.keyId === keyId && secrets.graceUntilMs !== void 0 && now < secrets.graceUntilMs) return [secrets.previous.secret];
       return [];
     }
-    const unkeyed = [];
-    if (secrets.allowUnkeyedCurrent) unkeyed.push(secrets.current.secret);
-    if (secrets.previous && secrets.graceUntilMs !== void 0 && now < secrets.graceUntilMs) unkeyed.push(secrets.previous.secret);
-    return unkeyed;
+    return secrets.allowUnkeyedCurrent ? [secrets.current.secret] : [];
   })();
   let lastMessage = "invalid signed token";
   for (const secret of candidates) {
@@ -2408,52 +2405,44 @@ async function verifySignedToken(secrets, request, now) {
   throw new HttpError(403, "invalid_capability", lastMessage);
 }
 async function verifyDeviceRuntimeToken(request, secrets, now) {
-  const token = await verifySignedToken(secrets, request, now);
+  let token;
+  try {
+    token = await verifySignedToken(secrets, request, now);
+  } catch (error) {
+    if (error instanceof HttpError && error.code === "capability_expired") {
+      throw new HttpError(403, "runtime_auth_expired", "device runtime token is expired");
+    }
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token is invalid");
+  }
   if (token.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "device runtime token version is not supported");
   }
   if (token.service !== "device_runtime") {
-    throw new HttpError(403, "invalid_capability", "token service must be device_runtime");
+    throw new HttpError(403, "runtime_auth_invalid", "token service must be device_runtime");
   }
-  if (!token.userId || !token.deviceId || !token.scopes.length) {
-    throw new HttpError(403, "invalid_capability", "device runtime token is malformed");
-  }
-  return token;
-}
-async function validateBootstrapAuthorization(request, secret, userId, deviceId, now) {
-  const token = await verifySignedToken(secret, request, now);
-  if (token.version !== CURRENT_MODEL_VERSION) {
-    throw new HttpError(400, "unsupported_version", "bootstrap token version is not supported");
-  }
-  if (token.service !== "bootstrap") {
-    throw new HttpError(403, "invalid_capability", "token service must be bootstrap");
-  }
-  if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "bootstrap token scope does not match request");
-  }
-  if (!token.operations.includes("issue_device_bundle")) {
-    throw new HttpError(403, "invalid_capability", "bootstrap token does not grant device bundle issuance");
+  if (!token.runtimeId || !token.userId || !token.deviceId || !token.scopes.length || !Number.isSafeInteger(token.issuedAt) || !Number.isSafeInteger(token.registrationVersion) || token.registrationVersion < 1) {
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token is malformed");
   }
   return token;
 }
 async function validateAnyDeviceRuntimeAuthorization(request, secret, scope, now) {
   const token = await verifyDeviceRuntimeToken(request, secret, now);
   if (!token.scopes.includes(scope)) {
-    throw new HttpError(403, "invalid_capability", `device runtime token does not grant ${scope}`);
+    throw new HttpError(403, "runtime_auth_invalid", `device runtime token does not grant ${scope}`);
   }
   return token;
 }
 async function validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, scope, now) {
   const token = await validateAnyDeviceRuntimeAuthorization(request, secret, scope, now);
   if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token scope does not match request path");
   }
   return token;
 }
 async function validateDeviceRuntimeAuthorizationForDevice(request, secret, deviceId, scope, now) {
   const token = await validateAnyDeviceRuntimeAuthorization(request, secret, scope, now);
   if (token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token scope does not match request path");
   }
   return token;
 }
@@ -2461,7 +2450,7 @@ async function validateSharedStateWriteAuthorization(request, secret, userId, de
   try {
     return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "shared_state_write", now);
   } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
       throw error;
     }
   }
@@ -2484,7 +2473,7 @@ async function validateKeyPackageWriteAuthorization(request, secret, userId, dev
   try {
     return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
   } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
       throw error;
     }
   }
@@ -2529,9 +2518,6 @@ function requireSecretValue(value, label) {
 function requireSharingSecret(env) {
   return requireSecretValue(env.SHARING_INTERNAL_SECRET, "SHARING_INTERNAL_SECRET");
 }
-function requireBootstrapSecret(env) {
-  return requireSecretValue(env.BOOTSTRAP_LINK_SECRET, "BOOTSTRAP_LINK_SECRET");
-}
 function optionalKeyId(value) {
   const keyId = value?.trim();
   return keyId || void 0;
@@ -2546,12 +2532,6 @@ function rotationGraceUntilMs(env) {
   return value;
 }
 function requireDeviceRuntimeSecrets(env) {
-  if (!env.DEVICE_RUNTIME_SECRET?.trim()) {
-    return {
-      current: { secret: requireSharingSecret(env) },
-      allowUnkeyedCurrent: true
-    };
-  }
   const currentKeyId = optionalKeyId(env.DEVICE_RUNTIME_SECRET_KEY_ID);
   if (!currentKeyId) {
     throw new HttpError(503, "runtime_misconfigured", "DEVICE_RUNTIME_SECRET_KEY_ID is missing");
@@ -2568,24 +2548,6 @@ function requireDeviceRuntimeSecrets(env) {
     } : void 0,
     graceUntilMs: rotationGraceUntilMs(env),
     allowUnkeyedCurrent: false
-  };
-}
-function requireBootstrapSecrets(env) {
-  const currentKeyId = optionalKeyId(env.BOOTSTRAP_LINK_SECRET_KEY_ID);
-  const previousSecret = env.BOOTSTRAP_LINK_SECRET_PREVIOUS?.trim();
-  return {
-    current: {
-      secret: requireBootstrapSecret(env),
-      keyId: currentKeyId
-    },
-    previous: previousSecret ? {
-      secret: requireSecretValue(previousSecret, "BOOTSTRAP_LINK_SECRET_PREVIOUS"),
-      keyId: optionalKeyId(env.BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID)
-    } : void 0,
-    graceUntilMs: rotationGraceUntilMs(env),
-    // Legacy bootstrap links have no key id. They remain valid on a deployment
-    // that has not entered keyed rotation yet.
-    allowUnkeyedCurrent: !currentKeyId
   };
 }
 async function readRequestTextLimited(request, maxBytes) {
@@ -2637,6 +2599,264 @@ async function readJsonLimited(request, maxBytes) {
   }
 }
 
+// src/auth/runtime-auth.ts
+function deviceRuntimeSigningPayload(challenge) {
+  return [
+    "tapchat.device_runtime_auth.v2",
+    `purpose=${challenge.purpose}`,
+    `runtime_id=${challenge.runtimeId}`,
+    `user_id=${challenge.userId}`,
+    `device_id=${challenge.deviceId}`,
+    `nonce=${challenge.nonce}`,
+    `expires_at=${challenge.expiresAt}`
+  ].join("\n");
+}
+
+// src/device-registry/durable.ts
+var CHALLENGE_TTL_MS = 5 * 60 * 1e3;
+var CHALLENGE_PREFIX = "challenge:";
+var DEVICE_PREFIX = "device:";
+var MAX_ACTIVE_CHALLENGES = 8;
+var DurableObjectBase = globalThis.DurableObject ?? class {
+  constructor(_state, _env) {
+  }
+};
+function jsonResponse(body, status = 200) {
+  return Response.json(body, { status });
+}
+function runtimeConfig(env) {
+  const runtimeId = env.RUNTIME_ID?.trim();
+  const userId = env.OWNER_USER_ID?.trim();
+  const userPublicKey = env.OWNER_USER_PUBLIC_KEY?.trim();
+  if (!runtimeId || !userId || !userPublicKey) {
+    throw new HttpError(503, "runtime_misconfigured", "runtime owner identity is not configured");
+  }
+  return { runtimeId, userId, userPublicKey };
+}
+function challengeKey(nonce) {
+  return `${CHALLENGE_PREFIX}${nonce}`;
+}
+function deviceKey(deviceId) {
+  return `${DEVICE_PREFIX}${deviceId}`;
+}
+function randomNonce() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function bindingHash(device) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(device.binding))
+  );
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function assertChallengeScope(challenge, purpose, config, now) {
+  if (challenge.version !== CURRENT_MODEL_VERSION || challenge.purpose !== purpose || challenge.runtimeId !== config.runtimeId || challenge.userId !== config.userId || !challenge.deviceId || !challenge.nonce || challenge.expiresAt <= now) {
+    throw new HttpError(403, "runtime_auth_invalid", "runtime authorization challenge is invalid or expired");
+  }
+}
+function sameChallenge(stored, submitted) {
+  return stored.version === submitted.version && stored.purpose === submitted.purpose && stored.runtimeId === submitted.runtimeId && stored.userId === submitted.userId && stored.deviceId === submitted.deviceId && stored.nonce === submitted.nonce && stored.expiresAt === submitted.expiresAt;
+}
+var DeviceRegistryDurableObject = class extends DurableObjectBase {
+  stateRef;
+  envRef;
+  constructor(state, env) {
+    super(state, env);
+    this.stateRef = state;
+    this.envRef = env;
+  }
+  async fetch(request) {
+    try {
+      const url = new URL(request.url);
+      const now = Date.now();
+      if (request.method === "POST" && url.pathname.endsWith("/challenge")) {
+        return await this.issueChallenge(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/enroll")) {
+        return await this.enroll(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/refresh")) {
+        return await this.refresh(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/authorize")) {
+        return await this.authorize(request);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/sync")) {
+        return await this.syncIdentityBundle(request, now);
+      }
+      return jsonResponse({ error: "not_found" }, 404);
+    } catch (error) {
+      if (error instanceof HttpError) {
+        return jsonResponse({ error: error.code, message: error.message }, error.status);
+      }
+      return jsonResponse({ error: "temporary_unavailable", message: "device registry request failed" }, 500);
+    }
+  }
+  async issueChallenge(request, now) {
+    const config = runtimeConfig(this.envRef);
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    if (body.purpose !== "enroll" && body.purpose !== "refresh" || body.userId !== config.userId || !body.deviceId) {
+      throw new HttpError(400, "runtime_auth_invalid", "runtime authorization challenge scope is invalid");
+    }
+    if (body.purpose === "refresh") {
+      const record = await this.stateRef.storage.get(deviceKey(body.deviceId));
+      if (!record) throw new HttpError(403, "enrollment_required", "device is not registered");
+      if (record.status !== "active") throw new HttpError(403, "device_revoked", "device is revoked");
+    }
+    const existing = await this.stateRef.storage.list({ prefix: CHALLENGE_PREFIX });
+    const expired = Array.from(existing.entries()).filter(([, challenge2]) => challenge2.expiresAt <= now).map(([key]) => key);
+    if (expired.length) await this.stateRef.storage.delete(expired);
+    if (existing.size - expired.length >= MAX_ACTIVE_CHALLENGES) {
+      throw new HttpError(429, "rate_limited", "too many active runtime authorization challenges");
+    }
+    const challenge = {
+      version: CURRENT_MODEL_VERSION,
+      purpose: body.purpose,
+      runtimeId: config.runtimeId,
+      userId: config.userId,
+      deviceId: body.deviceId,
+      nonce: randomNonce(),
+      expiresAt: now + CHALLENGE_TTL_MS
+    };
+    await this.stateRef.storage.put(challengeKey(challenge.nonce), challenge);
+    return jsonResponse(challenge);
+  }
+  async consumeChallenge(challenge, purpose, now) {
+    const config = runtimeConfig(this.envRef);
+    assertChallengeScope(challenge, purpose, config, now);
+    const key = challengeKey(challenge.nonce);
+    const consumed = await this.stateRef.storage.transaction(async (transaction) => {
+      const stored = await transaction.get(key);
+      if (!stored || !sameChallenge(stored, challenge)) return false;
+      await transaction.delete(key);
+      return true;
+    });
+    if (!consumed) {
+      throw new HttpError(403, "challenge_replayed", "runtime authorization challenge was already consumed");
+    }
+  }
+  async enroll(request, now) {
+    const config = runtimeConfig(this.envRef);
+    const proof = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const { challenge, device } = proof;
+    assertChallengeScope(challenge, "enroll", config, now);
+    if (!device || device.status !== "active" || device.deviceId !== challenge.deviceId || device.devicePublicKey !== device.binding.devicePublicKey || device.binding.userId !== config.userId || device.binding.deviceId !== device.deviceId || !verifyDeviceBinding(config.userPublicKey, device.binding) || !verifyEd25519(device.devicePublicKey, proof.signature, deviceRuntimeSigningPayload(challenge))) {
+      throw new HttpError(403, "runtime_auth_invalid", "device enrollment proof is invalid");
+    }
+    const key = deviceKey(device.deviceId);
+    const hash = await bindingHash(device);
+    const existing = await this.stateRef.storage.get(key);
+    if (existing?.status === "revoked") {
+      throw new HttpError(403, "device_revoked", "revoked devices cannot be re-enrolled");
+    }
+    if (existing && (existing.devicePublicKey !== device.devicePublicKey || existing.bindingHash !== hash)) {
+      throw new HttpError(403, "runtime_auth_invalid", "registered device identity does not match");
+    }
+    await this.consumeChallenge(challenge, "enroll", now);
+    const record = existing ?? {
+      version: CURRENT_MODEL_VERSION,
+      runtimeId: config.runtimeId,
+      userId: config.userId,
+      deviceId: device.deviceId,
+      devicePublicKey: device.devicePublicKey,
+      bindingHash: hash,
+      status: "active",
+      registrationVersion: 1,
+      createdAt: now,
+      updatedAt: now
+    };
+    await this.stateRef.storage.put(key, { ...record, updatedAt: now });
+    return jsonResponse({ registrationVersion: record.registrationVersion });
+  }
+  async refresh(request, now) {
+    const proof = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const config = runtimeConfig(this.envRef);
+    assertChallengeScope(proof.challenge, "refresh", config, now);
+    const record = await this.stateRef.storage.get(deviceKey(proof.challenge.deviceId));
+    if (!record) throw new HttpError(403, "enrollment_required", "device is not registered");
+    if (record.status !== "active") throw new HttpError(403, "device_revoked", "device is revoked");
+    if (!verifyEd25519(record.devicePublicKey, proof.signature, deviceRuntimeSigningPayload(proof.challenge))) {
+      throw new HttpError(403, "runtime_auth_invalid", "runtime authorization proof is invalid");
+    }
+    await this.consumeChallenge(proof.challenge, "refresh", now);
+    return jsonResponse({ registrationVersion: record.registrationVersion });
+  }
+  async authorize(request) {
+    const token = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const config = runtimeConfig(this.envRef);
+    if (token.runtimeId !== config.runtimeId || token.userId !== config.userId) {
+      throw new HttpError(403, "runtime_mismatch", "runtime token audience does not match this runtime");
+    }
+    const record = await this.stateRef.storage.get(deviceKey(token.deviceId));
+    if (!record) throw new HttpError(403, "enrollment_required", "device is not registered");
+    if (record.status !== "active") throw new HttpError(403, "device_revoked", "device is revoked");
+    if (record.registrationVersion !== token.registrationVersion) {
+      throw new HttpError(403, "runtime_auth_invalid", "runtime token registration is stale");
+    }
+    return jsonResponse({ active: true });
+  }
+  async syncIdentityBundle(request, now) {
+    const bundle = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const config = runtimeConfig(this.envRef);
+    if (bundle.userId !== config.userId || bundle.userPublicKey !== config.userPublicKey || !verifyIdentityBundle(bundle)) {
+      throw new HttpError(403, "runtime_auth_invalid", "identity bundle does not match runtime owner");
+    }
+    const changes = [];
+    for (const device of bundle.devices) {
+      if (device.binding.userId !== config.userId || device.binding.deviceId !== device.deviceId || device.binding.devicePublicKey !== device.devicePublicKey || !verifyDeviceBinding(config.userPublicKey, device.binding)) {
+        throw new HttpError(403, "runtime_auth_invalid", "identity bundle contains an invalid device binding");
+      }
+      const key = deviceKey(device.deviceId);
+      const hash = await bindingHash(device);
+      const existing = await this.stateRef.storage.get(key);
+      if (existing && (existing.devicePublicKey !== device.devicePublicKey || existing.bindingHash !== hash)) {
+        throw new HttpError(403, "runtime_auth_invalid", "identity bundle attempts to replace a registered device key");
+      }
+      if (existing?.status === "revoked" && device.status === "active") {
+        throw new HttpError(403, "device_revoked", "identity bundle attempts to reactivate a revoked device");
+      }
+      const status = existing?.status === "revoked" || device.status === "revoked" ? "revoked" : "active";
+      changes.push({
+        key,
+        record: {
+          version: CURRENT_MODEL_VERSION,
+          runtimeId: config.runtimeId,
+          userId: config.userId,
+          deviceId: device.deviceId,
+          devicePublicKey: device.devicePublicKey,
+          bindingHash: hash,
+          status,
+          registrationVersion: existing && existing.status !== status ? existing.registrationVersion + 1 : existing?.registrationVersion ?? 1,
+          createdAt: existing?.createdAt ?? now,
+          updatedAt: now
+        }
+      });
+    }
+    await this.stateRef.storage.transaction(async (transaction) => {
+      for (const change of changes) await transaction.put(change.key, change.record);
+    });
+    return jsonResponse({ synchronized: changes.length });
+  }
+};
+function registryStub(env) {
+  const runtimeId = runtimeConfig(env).runtimeId;
+  return env.DEVICE_REGISTRY.get(env.DEVICE_REGISTRY.idFromName(runtimeId));
+}
+async function assertRegisteredRuntimeToken(env, token) {
+  const response = await registryStub(env).fetch(
+    new Request("https://device-registry.internal/v2/device-registry/authorize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(token)
+    })
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new HttpError(response.status, body.error ?? "runtime_auth_invalid", body.message ?? "device registry rejected token");
+  }
+}
+
 // src/group-outbox/authorization.ts
 var GROUP_AUTHORIZATION_KEY = "group-authorization:v2";
 var MAX_CAPABILITY_TTL_MS = 24 * 60 * 60 * 1e3 + 5 * 60 * 1e3;
@@ -2666,7 +2886,7 @@ var ROLE_OPERATIONS = {
   ]),
   member: /* @__PURE__ */ new Set(["read", "subscribe", "append_application", "append_control"])
 };
-function deviceKey(userId, deviceId) {
+function deviceKey2(userId, deviceId) {
   return `${userId}\0${deviceId}`;
 }
 function activeMember(manifest, userId) {
@@ -2747,7 +2967,7 @@ function mergeVerifiedDevices(existing, bundles) {
       if (device.binding.userId !== bundle.userId || device.binding.deviceId !== device.deviceId || device.binding.devicePublicKey !== device.devicePublicKey || !verifyDeviceBinding(bundle.userPublicKey, device.binding)) {
         throw new HttpError(403, "invalid_capability", `device binding is invalid for ${device.deviceId}`);
       }
-      devices[deviceKey(bundle.userId, device.deviceId)] = {
+      devices[deviceKey2(bundle.userId, device.deviceId)] = {
         userId: bundle.userId,
         deviceId: device.deviceId,
         publicKey: device.devicePublicKey,
@@ -2762,7 +2982,7 @@ function validateManifestDevices(manifest, devices) {
     if (memberDevice.status !== "active") {
       continue;
     }
-    const device = devices[deviceKey(memberDevice.userId, memberDevice.deviceId)];
+    const device = devices[deviceKey2(memberDevice.userId, memberDevice.deviceId)];
     if (!device || device.status !== "active" || device.userId !== memberDevice.userId) {
       throw new HttpError(
         409,
@@ -2773,7 +2993,7 @@ function validateManifestDevices(manifest, devices) {
   }
 }
 function verifyManifestSignature(manifest, devices) {
-  const signer = devices[deviceKey(manifest.signerUserId, manifest.signerDeviceId)];
+  const signer = devices[deviceKey2(manifest.signerUserId, manifest.signerDeviceId)];
   const signerMember = activeMember(manifest, manifest.signerUserId);
   const signerDevice = (manifest.memberDevices ?? []).find(
     (device) => device.userId === manifest.signerUserId && device.deviceId === manifest.signerDeviceId && device.status === "active"
@@ -2783,7 +3003,7 @@ function verifyManifestSignature(manifest, devices) {
   }
 }
 function verifyMembershipProof(proof, oldState, nextManifest) {
-  const signer = oldState.devices[deviceKey(proof.signerUserId, proof.signerDeviceId)];
+  const signer = oldState.devices[deviceKey2(proof.signerUserId, proof.signerDeviceId)];
   const signerMember = activeMember(oldState.manifest, proof.signerUserId);
   if (proof.type !== "membership_signature" || !signer || signer.status !== "active" || !signerMember || !["owner", "admin"].includes(signerMember.role) || !verifyEd25519(signer.publicKey, proof.signature, groupMembershipProofSigningPayload(proof))) {
     throw new HttpError(403, "invalid_capability", "group membership proof signature is invalid");
@@ -2802,7 +3022,7 @@ function verifyIdempotentMembershipProof(proof, current, manifestHash) {
   if (current.lastTransitionProof && sameJson(current.lastTransitionProof, proof)) {
     return;
   }
-  const signer = current.devices[deviceKey(proof.signerUserId, proof.signerDeviceId)];
+  const signer = current.devices[deviceKey2(proof.signerUserId, proof.signerDeviceId)];
   const signerMember = activeMember(current.manifest, proof.signerUserId);
   if (proof.type !== "membership_signature" || !signer || signer.status !== "active" || !signerMember || !["owner", "admin"].includes(signerMember.role) || !verifyEd25519(signer.publicKey, proof.signature, groupMembershipProofSigningPayload(proof))) {
     throw new HttpError(403, "invalid_capability", "group membership proof signature is invalid");
@@ -3207,7 +3427,7 @@ var GroupAuthorizationService = class {
     if (capability.version !== CURRENT_MODEL_VERSION || capability.service !== "group_outbox" || capability.groupId !== this.groupId || !bearer || bearer !== capability.signature || !Number.isSafeInteger(capability.expiresAt) || capability.expiresAt <= now || capability.expiresAt - now > MAX_CAPABILITY_TTL_MS || !capability.operations.includes(operation)) {
       throw new HttpError(403, "invalid_capability", "group capability is invalid or expired");
     }
-    const device = state.devices[deviceKey(capability.userId, capability.deviceId)];
+    const device = state.devices[deviceKey2(capability.userId, capability.deviceId)];
     const knownMember = state.manifest.members.find((item) => item.userId === capability.userId);
     const knownManifestDevice = (state.manifest.memberDevices ?? []).find(
       (item) => item.userId === capability.userId && item.deviceId === capability.deviceId
@@ -4221,7 +4441,7 @@ function versionedBody(body) {
     ...record
   };
 }
-function jsonResponse(body, status = 200) {
+function jsonResponse2(body, status = 200) {
   return new Response(JSON.stringify(versionedBody(body)), {
     status,
     headers: {
@@ -4229,7 +4449,7 @@ function jsonResponse(body, status = 200) {
     }
   });
 }
-var DurableObjectBase = globalThis.DurableObject ?? class {
+var DurableObjectBase2 = globalThis.DurableObject ?? class {
   constructor(_state, _env) {
   }
 };
@@ -4250,8 +4470,9 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         "group_authorization_bootstrap",
         now
       );
+      if (deps.assertRuntimeToken) await deps.assertRuntimeToken(runtimeToken);
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-      return jsonResponse(await authorization.initialize(body, runtimeToken, now));
+      return jsonResponse2(await authorization.initialize(body, runtimeToken, now));
     }
     if (url.pathname.endsWith("/subscribe") && deps.onUpgrade) {
       await authorization.authorize(
@@ -4307,7 +4528,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       if (!preparedUpdate) {
         throw new HttpError(409, "group_transition_invalid", "group transition did not produce an authorization update");
       }
-      return jsonResponse(await service.appendTransition(body, preparedUpdate, now));
+      return jsonResponse2(await service.appendTransition(body, preparedUpdate, now));
     }
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = await readJsonLimited(request, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
@@ -4343,7 +4564,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       );
       const result = await service.appendEnvelope(body, now);
       await authorization.commitPreparedUpdate(preparedUpdate);
-      return jsonResponse(result);
+      return jsonResponse2(result);
     }
     if (url.pathname.endsWith("/messages") && request.method === "GET") {
       const fromSeq = Number(url.searchParams.get("fromSeq") ?? "1");
@@ -4358,7 +4579,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         now,
         sealed
       );
-      return jsonResponse(await service.fetchOutbox({
+      return jsonResponse2(await service.fetchOutbox({
         groupId: deps.groupId,
         fromSeq,
         limit,
@@ -4376,7 +4597,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         sealed
       );
       const head = await service.getHead();
-      return jsonResponse({
+      return jsonResponse2({
         ...head,
         currentRosterVersion: auth.state.manifest.rosterVersion,
         lastCommitMessageId: auth.state.manifest.lastCommitMessageId
@@ -4392,12 +4613,12 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         false,
         true
       );
-      return jsonResponse(await authorization.getPublicState());
+      return jsonResponse2(await authorization.getPublicState());
     }
     if (url.pathname.endsWith("/outbox/seal") && request.method === "POST") {
       const capability = readGroupCapabilityHeader(request);
       await authorization.authorize(request, capability, "seal_group", ["owner"], now);
-      return jsonResponse(await service.sealOutbox(now));
+      return jsonResponse2(await service.sealOutbox(now));
     }
     if (url.pathname.match(/\/v1\/groups\/[^/]+\/invites$/) && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
@@ -4413,7 +4634,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         expiresAt: body.document.expiresAt,
         maxUses: body.maxUses ?? body.document.maxUses
       });
-      return jsonResponse(
+      return jsonResponse2(
         await service.createInvite(
           body,
           `${url.origin}/v1/group-invite/${encodeURIComponent(deps.groupId)}/${encodeURIComponent(body.document.inviteId)}`,
@@ -4430,7 +4651,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         ["owner", "admin"],
         now
       );
-      return jsonResponse(await service.listInvites(now));
+      return jsonResponse2(await service.listInvites(now));
     }
     const shortInviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)\/([^/]+)$/);
     if (shortInviteFetchMatch && request.method === "GET") {
@@ -4438,18 +4659,18 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       if (routeGroupId !== deps.groupId) {
         throw new HttpError(400, "invalid_input", "group invite route does not match durable object");
       }
-      return jsonResponse(await service.fetchInviteById(decodeURIComponent(shortInviteFetchMatch[2]), now));
+      return jsonResponse2(await service.fetchInviteById(decodeURIComponent(shortInviteFetchMatch[2]), now));
     }
     const inviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
     if (inviteFetchMatch && request.method === "GET") {
       const payload = await verifyInviteToken(deps.sharingSecret, decodeURIComponent(inviteFetchMatch[1]), now);
-      return jsonResponse(await service.fetchInvite(payload, now));
+      return jsonResponse2(await service.fetchInvite(payload, now));
     }
     const revokeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);
     if (revokeMatch && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "manage_invites", ["owner", "admin"], now);
-      return jsonResponse(
+      return jsonResponse2(
         await service.revokeInvite(
           {
             version: body.version,
@@ -4466,7 +4687,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       const token = getBearerToken(request);
       const payload = await verifyInviteToken(deps.sharingSecret, token, now);
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-      return jsonResponse(await service.submitJoinRequest({ ...body, inviteToken: token }, payload, now));
+      return jsonResponse2(await service.submitJoinRequest({ ...body, inviteToken: token }, payload, now));
     }
     if (joinCollectionMatch && request.method === "GET") {
       await authorization.authorize(
@@ -4476,33 +4697,33 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         ["owner", "admin"],
         now
       );
-      return jsonResponse(await service.listJoinRequests());
+      return jsonResponse2(await service.listJoinRequests());
     }
     const joinStatusMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)$/);
     if (joinStatusMatch && request.method === "GET") {
-      return jsonResponse(await service.getJoinRequestStatus(decodeURIComponent(joinStatusMatch[1]), getBearerToken(request)));
+      return jsonResponse2(await service.getJoinRequestStatus(decodeURIComponent(joinStatusMatch[1]), getBearerToken(request)));
     }
     const leaveCollectionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests$/);
     if (leaveCollectionMatch && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "append_control", ["admin", "member"], now);
-      return jsonResponse(await service.submitLeaveRequest(body, now));
+      return jsonResponse2(await service.submitLeaveRequest(body, now));
     }
     if (leaveCollectionMatch && request.method === "GET") {
       await authorization.authorize(request, readGroupCapabilityHeader(request), "approve_join", ["owner", "admin"], now);
-      return jsonResponse(await service.listLeaveRequests());
+      return jsonResponse2(await service.listLeaveRequests());
     }
     const leaveClaimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/leave-requests\/([^/]+)\/claim$/);
     if (leaveClaimMatch && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
-      return jsonResponse(await service.claimLeaveRequest({ ...body, groupId: deps.groupId, requestId: decodeURIComponent(leaveClaimMatch[1]) }, now));
+      return jsonResponse2(await service.claimLeaveRequest({ ...body, groupId: deps.groupId, requestId: decodeURIComponent(leaveClaimMatch[1]) }, now));
     }
     const claimMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/claim$/);
     if (claimMatch && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
-      return jsonResponse(
+      return jsonResponse2(
         await service.claimJoinRequest(
           { ...body, groupId: deps.groupId, requestId: decodeURIComponent(claimMatch[1]) },
           now
@@ -4513,7 +4734,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     if (completeMatch && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
-      return jsonResponse(
+      return jsonResponse2(
         await service.completeJoinRequest(
           { ...body, groupId: deps.groupId, requestId: decodeURIComponent(completeMatch[1]) },
           now
@@ -4529,7 +4750,7 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         throw new HttpError(400, "invalid_input", "welcome claim request, device and capability are required");
       }
       await service.markWelcomeClaimed(body.requestId, body.deviceId, body.capability);
-      return jsonResponse({ accepted: true });
+      return jsonResponse2({ accepted: true });
     }
     if (url.pathname.endsWith("/internal/welcome-authorize") && request.method === "POST") {
       if (request.headers.get("X-Tapchat-Internal-Secret") !== deps.sharingSecret) {
@@ -4538,13 +4759,13 @@ async function handleGroupOutboxDurableRequest(request, deps) {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       if (!body.deviceId || !body.requestId || !body.capability) throw new HttpError(400, "invalid_input", "welcome authorization binding is required");
       await service.authorizeWelcomeUpload(body.requestId, body.deviceId, body.capability);
-      return jsonResponse({ accepted: true });
+      return jsonResponse2({ accepted: true });
     }
     const decisionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests\/([^/]+)\/decision$/);
     if (decisionMatch && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       await authorization.authorize(request, body.capability, "approve_join", ["owner", "admin"], now);
-      return jsonResponse(
+      return jsonResponse2(
         await service.decideJoinRequest({
           ...body,
           groupId: deps.groupId,
@@ -4552,14 +4773,14 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         })
       );
     }
-    return jsonResponse({ error: "not_found" }, 404);
+    return jsonResponse2({ error: "not_found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
+      return jsonResponse2({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
     }
     const runtimeError = error;
     const message = runtimeError.message ?? "internal error";
-    return jsonResponse({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse2({ error: "temporary_unavailable", message }, 500);
   }
 }
 async function verifyInviteToken(secret, token, now) {
@@ -4599,7 +4820,7 @@ async function groupIdFromGroupOutboxRequestUrl(url, sharingSecret, now) {
   }
   return groupId;
 }
-var GroupOutboxDurableObject = class extends DurableObjectBase {
+var GroupOutboxDurableObject = class extends DurableObjectBase2 {
   sessions = /* @__PURE__ */ new Map();
   stateRef;
   envRef;
@@ -4618,9 +4839,9 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
       deviceRuntimeSecrets2 = requireDeviceRuntimeSecrets(this.envRef);
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonResponse({ error: error.code, message: error.message }, error.status);
+        return jsonResponse2({ error: error.code, message: error.message }, error.status);
       }
-      return jsonResponse({ error: "runtime_misconfigured", message: "sharing secret is invalid" }, 503);
+      return jsonResponse2({ error: "runtime_misconfigured", message: "sharing secret is invalid" }, 503);
     }
     const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
     this.groupIdRef = groupId;
@@ -4640,6 +4861,7 @@ var GroupOutboxDurableObject = class extends DurableObjectBase {
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
       sharingSecret,
       deviceRuntimeSecrets: deviceRuntimeSecrets2,
+      assertRuntimeToken: (token) => assertRegisteredRuntimeToken(this.envRef, token),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
@@ -5400,138 +5622,7 @@ var InboxService = class {
   }
 };
 
-// src/storage/shared-state.ts
-function sanitizeSegment(value) {
-  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
-}
-var SharedStateService = class {
-  store;
-  baseUrl;
-  constructor(store, baseUrl2) {
-    this.store = store;
-    this.baseUrl = baseUrl2;
-  }
-  identityBundleKey(userId) {
-    return `shared-state/${sanitizeSegment(userId)}/identity_bundle.json`;
-  }
-  deviceListKey(userId) {
-    return `shared-state/${sanitizeSegment(userId)}/device_list.json`;
-  }
-  deviceStatusKey(userId) {
-    return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
-  }
-  keyPackageRefsKey(userId, deviceId) {
-    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/refs.json`;
-  }
-  keyPackageObjectKey(userId, deviceId, keyPackageId) {
-    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/${sanitizeSegment(keyPackageId)}.bin`;
-  }
-  identityBundleUrl(userId) {
-    return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
-  }
-  deviceStatusUrl(userId) {
-    return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/device-status`;
-  }
-  keyPackageRefsUrl(userId, deviceId) {
-    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}`;
-  }
-  keyPackageObjectUrl(userId, deviceId, keyPackageId) {
-    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/${encodeURIComponent(keyPackageId)}`;
-  }
-  async getIdentityBundle(userId) {
-    return this.store.getJson(this.identityBundleKey(userId));
-  }
-  async putIdentityBundle(userId, bundle) {
-    if (bundle.userId !== userId) {
-      throw new HttpError(400, "invalid_input", "identity bundle userId does not match request path");
-    }
-    const normalized = {
-      ...bundle,
-      identityBundleRef: this.identityBundleUrl(userId),
-      deviceStatusRef: bundle.deviceStatusRef ?? this.deviceStatusUrl(userId),
-      devices: bundle.devices.map((device) => ({
-        ...device,
-        keypackageRef: {
-          ...device.keypackageRef,
-          userId,
-          deviceId: device.deviceId,
-          ref: device.keypackageRef.ref
-        }
-      }))
-    };
-    await this.store.putJson(this.identityBundleKey(userId), normalized);
-    await this.store.putJson(this.deviceListKey(userId), this.buildDeviceListDocument(normalized));
-  }
-  async getDeviceList(userId) {
-    return this.store.getJson(this.deviceListKey(userId));
-  }
-  async getDeviceStatus(userId) {
-    return this.store.getJson(this.deviceStatusKey(userId));
-  }
-  async putDeviceStatus(userId, document) {
-    if (document.userId !== userId) {
-      throw new HttpError(400, "invalid_input", "device status userId does not match request path");
-    }
-    for (const device of document.devices) {
-      if (device.userId !== userId) {
-        throw new HttpError(400, "invalid_input", "device status entry userId does not match request path");
-      }
-    }
-    await this.store.putJson(this.deviceStatusKey(userId), document);
-  }
-  async getKeyPackageRefs(userId, deviceId) {
-    return this.store.getJson(this.keyPackageRefsKey(userId, deviceId));
-  }
-  async putKeyPackageRefs(userId, deviceId, document) {
-    if (document.userId !== userId || document.deviceId !== deviceId) {
-      throw new HttpError(400, "invalid_input", "keypackage refs scope does not match request path");
-    }
-    for (const entry of document.refs) {
-      if (!entry.ref || !entry.ref.startsWith(this.keyPackageRefsUrl(userId, deviceId))) {
-        throw new HttpError(400, "invalid_input", "keypackage ref must be a concrete object URL");
-      }
-    }
-    await this.store.putJson(this.keyPackageRefsKey(userId, deviceId), document);
-  }
-  async putKeyPackageObject(userId, deviceId, keyPackageId, body) {
-    await this.store.putBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId), body, {
-      "content-type": "application/octet-stream"
-    });
-  }
-  async getKeyPackageObject(userId, deviceId, keyPackageId) {
-    return this.store.getBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId));
-  }
-  buildDeviceListDocument(bundle) {
-    return {
-      version: bundle.version,
-      userId: bundle.userId,
-      updatedAt: bundle.updatedAt,
-      devices: bundle.devices.map((device) => ({
-        deviceId: device.deviceId,
-        status: device.status
-      }))
-    };
-  }
-};
-
 // src/inbox/durable.ts
-var RUNTIME_AUTH_CHALLENGE_TTL_MS = 5 * 60 * 1e3;
-var RUNTIME_AUTH_CHALLENGE_PREFIX = "runtime-auth-challenge:";
-var MAX_ACTIVE_RUNTIME_AUTH_CHALLENGES = 8;
-function deviceRuntimeRefreshSigningPayload(challenge) {
-  return [
-    "tapchat.device_runtime_refresh.v1",
-    `origin=${challenge.origin}`,
-    `user_id=${challenge.userId}`,
-    `device_id=${challenge.deviceId}`,
-    `nonce=${challenge.nonce}`,
-    `expires_at=${challenge.expiresAt}`
-  ].join("\n");
-}
-function randomChallengeNonce() {
-  const bytes = crypto.getRandomValues(new Uint8Array(32));
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 var DurableObjectStorageAdapter2 = class {
   storage;
   constructor(storage) {
@@ -5574,79 +5665,6 @@ var DurableObjectStorageAdapter2 = class {
     });
   }
 };
-function runtimeAuthError(error) {
-  if (error instanceof HttpError) {
-    return jsonResponse2({ error: error.code, message: error.message }, error.status);
-  }
-  return jsonResponse2({ error: "temporary_unavailable", message: "runtime auth refresh failed" }, 500);
-}
-async function issueDeviceRuntimeAuthChallenge(request, deviceId, state, spillStore, now = Date.now()) {
-  try {
-    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-    if (!body.userId || body.deviceId !== deviceId) {
-      throw new HttpError(400, "invalid_input", "challenge scope is invalid");
-    }
-    const sharedState = new SharedStateService(spillStore, new URL(request.url).origin);
-    const bundle = await sharedState.getIdentityBundle(body.userId);
-    const device = bundle?.devices.find((item) => item.deviceId === deviceId);
-    if (!bundle || !verifyIdentityBundle(bundle) || device?.status !== "active") {
-      throw new HttpError(403, "device_revoked", "device is not active");
-    }
-    const existing = await state.list({ prefix: RUNTIME_AUTH_CHALLENGE_PREFIX });
-    const expired = Array.from(existing.entries()).filter(([, challenge2]) => challenge2.expiresAt <= now).map(([key]) => key);
-    if (expired.length > 0) await state.mutateEntries({}, expired);
-    if (existing.size - expired.length >= MAX_ACTIVE_RUNTIME_AUTH_CHALLENGES) {
-      throw new HttpError(429, "rate_limited", "too many active runtime auth challenges");
-    }
-    const challenge = {
-      version: "0.1",
-      origin: new URL(request.url).origin,
-      userId: body.userId,
-      deviceId,
-      nonce: randomChallengeNonce(),
-      expiresAt: now + RUNTIME_AUTH_CHALLENGE_TTL_MS
-    };
-    await state.put(`${RUNTIME_AUTH_CHALLENGE_PREFIX}${challenge.nonce}`, challenge);
-    return jsonResponse2(challenge);
-  } catch (error) {
-    return runtimeAuthError(error);
-  }
-}
-async function verifyAndConsumeDeviceRuntimeAuthChallenge(request, deviceId, state, spillStore, now = Date.now()) {
-  try {
-    const proof = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-    const challenge = proof.challenge;
-    if (!challenge || challenge.version !== "0.1" || challenge.deviceId !== deviceId || challenge.origin !== new URL(request.url).origin || challenge.expiresAt <= now || !proof.signature) {
-      throw new HttpError(403, "invalid_challenge", "runtime auth challenge is invalid or expired");
-    }
-    const key = `${RUNTIME_AUTH_CHALLENGE_PREFIX}${challenge.nonce}`;
-    const stored = await state.get(key);
-    if (!stored || JSON.stringify(stored) !== JSON.stringify(challenge)) {
-      throw new HttpError(403, "challenge_replayed", "runtime auth challenge was already consumed");
-    }
-    const sharedState = new SharedStateService(spillStore, challenge.origin);
-    const bundle = await sharedState.getIdentityBundle(challenge.userId);
-    const device = bundle?.devices.find((item) => item.deviceId === deviceId);
-    if (!bundle || !verifyIdentityBundle(bundle) || !device || device.status !== "active") {
-      throw new HttpError(403, "device_revoked", "device is not active");
-    }
-    if (!verifyEd25519(device.devicePublicKey, proof.signature, deviceRuntimeRefreshSigningPayload(challenge))) {
-      throw new HttpError(403, "invalid_proof", "runtime auth refresh signature is invalid");
-    }
-    const consumed = state.consumeIfEqual ? await state.consumeIfEqual(key, challenge) : await (async () => {
-      const current = await state.get(key);
-      if (!current || JSON.stringify(current) !== JSON.stringify(challenge)) return false;
-      await state.delete(key);
-      return true;
-    })();
-    if (!consumed) {
-      throw new HttpError(403, "challenge_replayed", "runtime auth challenge was already consumed");
-    }
-    return jsonResponse2({ verified: true });
-  } catch (error) {
-    return runtimeAuthError(error);
-  }
-}
 var R2JsonBlobStore2 = class {
   bucket;
   constructor(bucket) {
@@ -5689,7 +5707,7 @@ function versionedBody2(body) {
     ...record
   };
 }
-function jsonResponse2(body, status = 200, headers) {
+function jsonResponse3(body, status = 200, headers) {
   return new Response(JSON.stringify(versionedBody2(body)), {
     status,
     headers: {
@@ -5698,7 +5716,7 @@ function jsonResponse2(body, status = 200, headers) {
     }
   });
 }
-var DurableObjectBase2 = globalThis.DurableObject ?? class {
+var DurableObjectBase3 = globalThis.DurableObject ?? class {
   constructor(_state, _env) {
   }
 };
@@ -5720,12 +5738,6 @@ async function handleInboxDurableRequest(request, deps) {
     messageRequestRateLimitHour: deps.messageRequestRateLimitHour ?? 300
   });
   try {
-    if (url.pathname.endsWith("/runtime-auth-challenge") && request.method === "POST") {
-      return issueDeviceRuntimeAuthChallenge(request, deps.deviceId, deps.state, deps.spillStore, now);
-    }
-    if (url.pathname.endsWith("/runtime-auth-refresh") && request.method === "POST") {
-      return verifyAndConsumeDeviceRuntimeAuthChallenge(request, deps.deviceId, deps.state, deps.spillStore, now);
-    }
     if (url.pathname.endsWith("/subscribe")) {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         throw new HttpError(400, "invalid_input", "subscribe requires websocket upgrade");
@@ -5736,17 +5748,17 @@ async function handleInboxDurableRequest(request, deps) {
       return deps.onUpgrade();
     }
     if (url.pathname.endsWith("/message-requests") && request.method === "GET") {
-      return jsonResponse2({ requests: await service.listMessageRequests(now) });
+      return jsonResponse3({ requests: await service.listMessageRequests(now) });
     }
     const requestActionMatch = url.pathname.match(/\/message-requests\/([^/]+)\/(accept|reject)$/);
     if (requestActionMatch && request.method === "POST") {
       const requestId = decodeURIComponent(requestActionMatch[1]);
       const action = requestActionMatch[2];
       const result = action === "accept" ? await service.acceptMessageRequest(requestId, now) : await service.rejectMessageRequest(requestId, now);
-      return jsonResponse2(result);
+      return jsonResponse3(result);
     }
     if (url.pathname.endsWith("/allowlist") && request.method === "GET") {
-      return jsonResponse2(await service.getAllowlist(now));
+      return jsonResponse3(await service.getAllowlist(now));
     }
     if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
@@ -5755,7 +5767,7 @@ async function handleInboxDurableRequest(request, deps) {
         body.rejectedSenderUserIds ?? [],
         now
       );
-      return jsonResponse2(result);
+      return jsonResponse3(result);
     }
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = await readJsonLimited(
@@ -5767,7 +5779,7 @@ async function handleInboxDurableRequest(request, deps) {
         mode,
         reason: request.headers.get(APPEND_AUTH_REASON_HEADER) ?? void 0
       });
-      return jsonResponse2(result);
+      return jsonResponse3(result);
     }
     if (url.pathname.endsWith("/messages") && request.method === "GET") {
       const fromSeq = Number(url.searchParams.get("fromSeq") ?? "1");
@@ -5777,7 +5789,7 @@ async function handleInboxDurableRequest(request, deps) {
         fromSeq,
         limit
       });
-      return jsonResponse2({
+      return jsonResponse3({
         toSeq: result.toSeq,
         records: result.records
       });
@@ -5785,20 +5797,20 @@ async function handleInboxDurableRequest(request, deps) {
     if (url.pathname.endsWith("/ack") && request.method === "POST") {
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       const result = await service.ack(body);
-      return jsonResponse2({
+      return jsonResponse3({
         accepted: result.accepted,
         ackSeq: result.ackSeq
       });
     }
     if (url.pathname.endsWith("/head") && request.method === "GET") {
       const result = await service.getHead();
-      return jsonResponse2(result);
+      return jsonResponse3(result);
     }
-    return jsonResponse2({ error: "not_found" }, 404);
+    return jsonResponse3({ error: "not_found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
       const retryAfter = error.details?.retryAfterSeconds;
-      return jsonResponse2(
+      return jsonResponse3(
         { error: error.code, message: error.message },
         error.status,
         typeof retryAfter === "number" ? { "Retry-After": String(retryAfter) } : void 0
@@ -5806,10 +5818,10 @@ async function handleInboxDurableRequest(request, deps) {
     }
     const runtimeError = error;
     const message = runtimeError.message ?? "internal error";
-    return jsonResponse2({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse3({ error: "temporary_unavailable", message }, 500);
   }
 }
-var InboxDurableObject = class extends DurableObjectBase2 {
+var InboxDurableObject = class extends DurableObjectBase3 {
   sessions = /* @__PURE__ */ new Map();
   stateRef;
   envRef;
@@ -5822,22 +5834,6 @@ var InboxDurableObject = class extends DurableObjectBase2 {
     const url = new URL(request.url);
     const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
     const deviceId = decodeURIComponent(match?.[1] ?? "");
-    if (url.pathname.endsWith("/runtime-auth-challenge") && request.method === "POST") {
-      return issueDeviceRuntimeAuthChallenge(
-        request,
-        deviceId,
-        new DurableObjectStorageAdapter2(this.stateRef.storage),
-        new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE)
-      );
-    }
-    if (url.pathname.endsWith("/runtime-auth-refresh") && request.method === "POST") {
-      return verifyAndConsumeDeviceRuntimeAuthChallenge(
-        request,
-        deviceId,
-        new DurableObjectStorageAdapter2(this.stateRef.storage),
-        new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE)
-      );
-    }
     return handleInboxDurableRequest(request, {
       deviceId,
       state: new DurableObjectStorageAdapter2(this.stateRef.storage),
@@ -5951,6 +5947,120 @@ var ManagedSession2 = class {
       }
     }
     this.onClosed();
+  }
+};
+
+// src/storage/shared-state.ts
+function sanitizeSegment(value) {
+  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
+}
+var SharedStateService = class {
+  store;
+  baseUrl;
+  constructor(store, baseUrl2) {
+    this.store = store;
+    this.baseUrl = baseUrl2;
+  }
+  identityBundleKey(userId) {
+    return `shared-state/${sanitizeSegment(userId)}/identity_bundle.json`;
+  }
+  deviceListKey(userId) {
+    return `shared-state/${sanitizeSegment(userId)}/device_list.json`;
+  }
+  deviceStatusKey(userId) {
+    return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
+  }
+  keyPackageRefsKey(userId, deviceId) {
+    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/refs.json`;
+  }
+  keyPackageObjectKey(userId, deviceId, keyPackageId) {
+    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/${sanitizeSegment(keyPackageId)}.bin`;
+  }
+  identityBundleUrl(userId) {
+    return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
+  }
+  deviceStatusUrl(userId) {
+    return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/device-status`;
+  }
+  keyPackageRefsUrl(userId, deviceId) {
+    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}`;
+  }
+  keyPackageObjectUrl(userId, deviceId, keyPackageId) {
+    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/${encodeURIComponent(keyPackageId)}`;
+  }
+  async getIdentityBundle(userId) {
+    return this.store.getJson(this.identityBundleKey(userId));
+  }
+  async putIdentityBundle(userId, bundle) {
+    if (bundle.userId !== userId) {
+      throw new HttpError(400, "invalid_input", "identity bundle userId does not match request path");
+    }
+    const normalized = {
+      ...bundle,
+      identityBundleRef: this.identityBundleUrl(userId),
+      deviceStatusRef: bundle.deviceStatusRef ?? this.deviceStatusUrl(userId),
+      devices: bundle.devices.map((device) => ({
+        ...device,
+        keypackageRef: {
+          ...device.keypackageRef,
+          userId,
+          deviceId: device.deviceId,
+          ref: device.keypackageRef.ref
+        }
+      }))
+    };
+    await this.store.putJson(this.identityBundleKey(userId), normalized);
+    await this.store.putJson(this.deviceListKey(userId), this.buildDeviceListDocument(normalized));
+  }
+  async getDeviceList(userId) {
+    return this.store.getJson(this.deviceListKey(userId));
+  }
+  async getDeviceStatus(userId) {
+    return this.store.getJson(this.deviceStatusKey(userId));
+  }
+  async putDeviceStatus(userId, document) {
+    if (document.userId !== userId) {
+      throw new HttpError(400, "invalid_input", "device status userId does not match request path");
+    }
+    for (const device of document.devices) {
+      if (device.userId !== userId) {
+        throw new HttpError(400, "invalid_input", "device status entry userId does not match request path");
+      }
+    }
+    await this.store.putJson(this.deviceStatusKey(userId), document);
+  }
+  async getKeyPackageRefs(userId, deviceId) {
+    return this.store.getJson(this.keyPackageRefsKey(userId, deviceId));
+  }
+  async putKeyPackageRefs(userId, deviceId, document) {
+    if (document.userId !== userId || document.deviceId !== deviceId) {
+      throw new HttpError(400, "invalid_input", "keypackage refs scope does not match request path");
+    }
+    for (const entry of document.refs) {
+      if (!entry.ref || !entry.ref.startsWith(this.keyPackageRefsUrl(userId, deviceId))) {
+        throw new HttpError(400, "invalid_input", "keypackage ref must be a concrete object URL");
+      }
+    }
+    await this.store.putJson(this.keyPackageRefsKey(userId, deviceId), document);
+  }
+  async putKeyPackageObject(userId, deviceId, keyPackageId, body) {
+    await this.store.putBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId), body, {
+      "content-type": "application/octet-stream"
+    });
+  }
+  async getKeyPackageObject(userId, deviceId, keyPackageId) {
+    return this.store.getBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId));
+  }
+  buildDeviceListDocument(bundle) {
+    return {
+      version: bundle.version,
+      userId: bundle.userId,
+      updatedAt: bundle.updatedAt,
+      devices: bundle.devices.map((device) => ({
+        deviceId: device.deviceId,
+        status: device.status
+      }))
+    };
   }
 };
 
@@ -6185,7 +6295,7 @@ function versionedBody3(body) {
     ...record
   };
 }
-function jsonResponse3(body, status = 200) {
+function jsonResponse4(body, status = 200) {
   return new Response(JSON.stringify(versionedBody3(body)), {
     status,
     headers: {
@@ -6243,9 +6353,6 @@ function downloadGrantTtlDays(env) {
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : 365;
 }
-function bootstrapSecrets(env) {
-  return requireBootstrapSecrets(env);
-}
 function deviceRuntimeSecrets(env) {
   return requireDeviceRuntimeSecrets(env);
 }
@@ -6265,32 +6372,50 @@ function runtimeScopes() {
     "keypackage_write"
   ];
 }
-async function issueDeviceRuntimeAuth(env, userId, deviceId, now) {
+function runtimeIdentity(env) {
+  const runtimeId = env.RUNTIME_ID?.trim();
+  const userId = env.OWNER_USER_ID?.trim();
+  const userPublicKey = env.OWNER_USER_PUBLIC_KEY?.trim();
+  if (!runtimeId || !userId || !userPublicKey) {
+    throw new HttpError(503, "runtime_misconfigured", "runtime owner identity is not configured");
+  }
+  return { runtimeId, userId, userPublicKey };
+}
+async function issueDeviceRuntimeAuth(env, userId, deviceId, registrationVersion, now) {
+  const { runtimeId } = runtimeIdentity(env);
   const expiresAt = now + 24 * 60 * 60 * 1e3;
   const scopes = runtimeScopes();
   const signingKey = deviceRuntimeSecrets(env).current;
   const token = await signSharingPayload(signingKey.secret, {
     version: CURRENT_MODEL_VERSION,
     service: "device_runtime",
+    runtimeId,
     userId,
     deviceId,
     scopes,
+    issuedAt: now,
     expiresAt,
+    registrationVersion,
     ...signingKey.keyId ? { keyId: signingKey.keyId } : {}
   });
   return {
     scheme: "bearer",
     token,
+    issuedAt: now,
     expiresAt,
+    runtimeId,
     userId,
     deviceId,
     scopes,
+    registrationVersion,
     keyId: signingKey.keyId
   };
 }
 function publicDeploymentBundle(request, env) {
+  const { runtimeId } = runtimeIdentity(env);
   return {
     version: CURRENT_MODEL_VERSION,
+    runtimeId,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
     inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
@@ -6317,20 +6442,43 @@ function publicDeploymentBundle(request, env) {
         "group_authorization_v2",
         "group_membership_fsm_v2",
         "runtime_secret_rotation_v1",
-        "device_runtime_refresh_v1"
+        "device_runtime_refresh_v2",
+        "device_registry_v1"
       ]
     }
   };
 }
+async function validateRegisteredRuntimeAuthorization(request, env, scope, now) {
+  const token = await validateAnyDeviceRuntimeAuthorization(request, deviceRuntimeSecrets(env), scope, now);
+  if (token.runtimeId !== runtimeIdentity(env).runtimeId) {
+    throw new HttpError(403, "runtime_mismatch", "runtime token audience does not match this runtime");
+  }
+  await assertRegisteredRuntimeToken(env, token);
+  return token;
+}
+async function validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, scope, now) {
+  const token = await validateDeviceRuntimeAuthorizationForDevice(
+    request,
+    deviceRuntimeSecrets(env),
+    deviceId,
+    scope,
+    now
+  );
+  if (token.runtimeId !== runtimeIdentity(env).runtimeId) {
+    throw new HttpError(403, "runtime_mismatch", "runtime token audience does not match this runtime");
+  }
+  await assertRegisteredRuntimeToken(env, token);
+  return token;
+}
 async function authorizeSharedStateWrite(request, env, userId, objectKind, now) {
   try {
-    const auth = await validateAnyDeviceRuntimeAuthorization(request, deviceRuntimeSecrets(env), "shared_state_write", now);
+    const auth = await validateRegisteredRuntimeAuthorization(request, env, "shared_state_write", now);
     if (auth.userId !== userId) {
       throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
     }
     return;
   } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired" || error.code === "device_revoked" || error.code === "runtime_mismatch" || error.code === "enrollment_required") {
       throw error;
     }
   }
@@ -6340,12 +6488,8 @@ async function handleRequest(request, env) {
   try {
     const url = new URL(request.url);
     const sharingSecret = sharedStateSecret(env);
-    const bootstrapLinkSecret = bootstrapSecrets(env).current.secret;
     const runtimeSecret = deviceRuntimeSecrets(env).current.secret;
-    if (sharingSecret === bootstrapLinkSecret) {
-      throw new HttpError(503, "runtime_misconfigured", "runtime secrets must use independent values");
-    }
-    if (env.DEVICE_RUNTIME_SECRET?.trim() && (runtimeSecret === sharingSecret || runtimeSecret === bootstrapLinkSecret)) {
+    if (env.DEVICE_RUNTIME_SECRET?.trim() && runtimeSecret === sharingSecret) {
       throw new HttpError(503, "runtime_misconfigured", "device runtime secret must use an independent value");
     }
     const store = new StorageService(
@@ -6358,7 +6502,7 @@ async function handleRequest(request, env) {
     const welcomePickup = new WelcomePickupService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE));
     const now = Date.now();
     if (request.method === "GET" && url.pathname === "/v1/deployment-bundle") {
-      return jsonResponse3(publicDeploymentBundle(request, env));
+      return jsonResponse4(publicDeploymentBundle(request, env));
     }
     const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
     if (contactShareMatch && request.method === "GET") {
@@ -6369,53 +6513,55 @@ async function handleRequest(request, env) {
       }
       const bundle = await sharedState.getIdentityBundle(payload.userId);
       if (!bundle || bundle.bundleShareId !== payload.shareId) {
-        return jsonResponse3({ error: "not_found", message: "contact share not found" }, 404);
+        return jsonResponse4({ error: "not_found", message: "contact share not found" }, 404);
       }
-      return jsonResponse3(bundle);
+      return jsonResponse4(bundle);
     }
-    if (request.method === "POST" && url.pathname === "/v1/bootstrap/device") {
-      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-      if (body.version !== CURRENT_MODEL_VERSION) {
-        throw new HttpError(400, "unsupported_version", "bootstrap request version is not supported");
-      }
-      await validateBootstrapAuthorization(request, bootstrapSecrets(env), body.userId, body.deviceId, now);
-      const bundle = {
-        ...publicDeploymentBundle(request, env),
-        deviceRuntimeAuth: await issueDeviceRuntimeAuth(env, body.userId, body.deviceId, now),
-        expectedUserId: body.userId,
-        expectedDeviceId: body.deviceId
-      };
-      return jsonResponse3(bundle);
-    }
-    if (request.method === "POST" && url.pathname === "/v1/runtime-auth/challenge") {
+    if (request.method === "POST" && url.pathname === "/v2/runtime-auth/challenge") {
       const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       const body = JSON.parse(bodyText);
-      if (!body.userId || !body.deviceId) {
-        throw new HttpError(400, "invalid_input", "userId and deviceId are required");
+      if (body.purpose !== "enroll" && body.purpose !== "refresh" || !body.userId || !body.deviceId) {
+        throw new HttpError(400, "runtime_auth_invalid", "purpose, userId and deviceId are required");
       }
-      const stub = env.INBOX.get(env.INBOX.idFromName(body.deviceId));
-      return stub.fetch(new Request(`${url.origin}/v1/inbox/${encodeURIComponent(body.deviceId)}/runtime-auth-challenge`, {
+      return registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/challenge", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: bodyText
       }));
     }
-    if (request.method === "POST" && url.pathname === "/v1/runtime-auth/refresh") {
+    if (request.method === "POST" && url.pathname === "/v2/runtime-auth/enroll") {
       const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
       const proof = JSON.parse(bodyText);
       const deviceId = proof.challenge?.deviceId;
       const userId = proof.challenge?.userId;
       if (!deviceId || !userId) {
-        throw new HttpError(400, "invalid_input", "refresh proof scope is required");
+        throw new HttpError(400, "runtime_auth_invalid", "enrollment proof scope is required");
       }
-      const stub = env.INBOX.get(env.INBOX.idFromName(deviceId));
-      const verified = await stub.fetch(new Request(`${url.origin}/v1/inbox/${encodeURIComponent(deviceId)}/runtime-auth-refresh`, {
+      const verified = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/enroll", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: bodyText
       }));
       if (!verified.ok) return verified;
-      return jsonResponse3({ deviceRuntimeAuth: await issueDeviceRuntimeAuth(env, userId, deviceId, now) });
+      const result = await verified.json();
+      return jsonResponse4({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
+    }
+    if (request.method === "POST" && url.pathname === "/v2/runtime-auth/refresh") {
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+      const proof = JSON.parse(bodyText);
+      const deviceId = proof.challenge?.deviceId;
+      const userId = proof.challenge?.userId;
+      if (!deviceId || !userId) {
+        throw new HttpError(400, "runtime_auth_invalid", "refresh proof scope is required");
+      }
+      const verified = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/refresh", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: bodyText
+      }));
+      if (!verified.ok) return verified;
+      const result = await verified.json();
+      return jsonResponse4({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
     const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
@@ -6434,13 +6580,13 @@ async function handleRequest(request, env) {
         }
         return await stub.fetch(forwarded);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_read", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
       } else if (request.method === "POST" && operation === "ack") {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_ack", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_ack", now);
       } else if (operation === "subscribe") {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_subscribe", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
       } else if (operation === "allowlist" || operation === "message-requests" || operation.startsWith("message-requests/")) {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_manage", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
       }
       if (request.method !== "GET" && request.method !== "HEAD") {
         const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
@@ -6589,7 +6735,7 @@ async function handleRequest(request, env) {
           );
           if (!authorized.ok) throw new HttpError(409, "group_transition_invalid", "welcome upload is not authorized by a committed join transition");
         }
-        return jsonResponse3(await welcomePickup.put(body, now));
+        return jsonResponse4(await welcomePickup.put(body, now));
       }
       if (request.method === "GET") {
         const encoded = request.headers.get("X-Tapchat-Welcome-Pickup");
@@ -6620,7 +6766,7 @@ async function handleRequest(request, env) {
             throw new HttpError(500, "temporary_unavailable", "failed to finalize joined group state");
           }
         }
-        return jsonResponse3(result);
+        return jsonResponse4(result);
       }
     }
     const identityBundleMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/identity-bundle$/);
@@ -6629,16 +6775,22 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const bundle = await sharedState.getIdentityBundle(userId);
         if (!bundle) {
-          return jsonResponse3({ error: "not_found", message: "identity bundle not found" }, 404);
+          return jsonResponse4({ error: "not_found", message: "identity bundle not found" }, 404);
         }
-        return jsonResponse3(bundle);
+        return jsonResponse4(bundle);
       }
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
         const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+        const synchronized = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/sync", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body)
+        }));
+        if (!synchronized.ok) return synchronized;
         await sharedState.putIdentityBundle(userId, body);
         const saved = await sharedState.getIdentityBundle(userId);
-        return jsonResponse3(saved);
+        return jsonResponse4(saved);
       }
     }
     const deviceStatusMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-status$/);
@@ -6647,16 +6799,16 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const document = await sharedState.getDeviceStatus(userId);
         if (!document) {
-          return jsonResponse3({ error: "not_found", message: "device status not found" }, 404);
+          return jsonResponse4({ error: "not_found", message: "device status not found" }, 404);
         }
-        return jsonResponse3(document);
+        return jsonResponse4(document);
       }
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "device_status", now);
         const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putDeviceStatus(userId, body);
         const saved = await sharedState.getDeviceStatus(userId);
-        return jsonResponse3(saved);
+        return jsonResponse4(saved);
       }
     }
     const deviceListMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-list$/);
@@ -6664,9 +6816,9 @@ async function handleRequest(request, env) {
       const userId = decodeURIComponent(deviceListMatch[1]);
       const document = await sharedState.getDeviceList(userId);
       if (!document) {
-        return jsonResponse3({ error: "not_found", message: "device list not found" }, 404);
+        return jsonResponse4({ error: "not_found", message: "device list not found" }, 404);
       }
-      return jsonResponse3(document);
+      return jsonResponse4(document);
     }
     const keyPackageRefsMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);
     if (keyPackageRefsMatch) {
@@ -6675,12 +6827,12 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const document = await sharedState.getKeyPackageRefs(userId, deviceId);
         if (!document) {
-          return jsonResponse3({ error: "not_found", message: "keypackage refs not found" }, 404);
+          return jsonResponse4({ error: "not_found", message: "keypackage refs not found" }, 404);
         }
-        return jsonResponse3(document);
+        return jsonResponse4(document);
       }
       if (request.method === "PUT") {
-        await validateKeyPackageWriteAuthorization(
+        const authorization = await validateKeyPackageWriteAuthorization(
           request,
           deviceRuntimeSecrets(env),
           userId,
@@ -6689,10 +6841,11 @@ async function handleRequest(request, env) {
           now,
           sharedStateSecret(env)
         );
+        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
         const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putKeyPackageRefs(userId, deviceId, body);
         const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
-        return jsonResponse3(saved);
+        return jsonResponse4(saved);
       }
     }
     const keyPackageObjectMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);
@@ -6703,7 +6856,7 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
         if (!payload) {
-          return jsonResponse3({ error: "not_found", message: "keypackage not found" }, 404);
+          return jsonResponse4({ error: "not_found", message: "keypackage not found" }, 404);
         }
         return new Response(payload, {
           status: 200,
@@ -6713,7 +6866,7 @@ async function handleRequest(request, env) {
         });
       }
       if (request.method === "PUT") {
-        await validateKeyPackageWriteAuthorization(
+        const authorization = await validateKeyPackageWriteAuthorization(
           request,
           deviceRuntimeSecrets(env),
           userId,
@@ -6722,15 +6875,16 @@ async function handleRequest(request, env) {
           now,
           sharedStateSecret(env)
         );
+        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
         await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
         return new Response(null, { status: 204 });
       }
     }
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
-      const auth = await validateAnyDeviceRuntimeAuthorization(request, deviceRuntimeSecrets(env), "storage_prepare_upload", now);
+      const auth = await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
       const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
-      return jsonResponse3(result);
+      return jsonResponse4(result);
     }
     if (request.method === "POST" && url.pathname === "/v1/storage/authorize-download") {
       const header = request.headers.get("Authorization")?.trim();
@@ -6745,7 +6899,7 @@ async function handleRequest(request, env) {
       if (body.version !== CURRENT_MODEL_VERSION) {
         throw new HttpError(400, "unsupported_version", "authorize download version is not supported");
       }
-      return jsonResponse3(await store.authorizeDownload(body.blobRef, token, now));
+      return jsonResponse4(await store.authorizeDownload(body.blobRef, token, now));
     }
     const uploadMatch = url.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);
     if (request.method === "PUT" && uploadMatch) {
@@ -6773,14 +6927,14 @@ async function handleRequest(request, env) {
         }
       });
     }
-    return jsonResponse3({ error: "not_found", message: "route not found" }, 404);
+    return jsonResponse4({ error: "not_found", message: "route not found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse3({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
+      return jsonResponse4({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
     }
     const runtimeError = error;
     const message = runtimeError.message ?? "internal error";
-    return jsonResponse3({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse4({ error: "temporary_unavailable", message }, 500);
   }
 }
 
@@ -6793,7 +6947,7 @@ function routeFamilyForObservability(rawUrl) {
     return "invalid_url";
   }
   if (path === "/v1/deployment-bundle") return "deployment_bundle";
-  if (path === "/v1/bootstrap/device") return "device_bootstrap";
+  if (path.startsWith("/v2/runtime-auth/")) return "runtime_auth";
   if (path.startsWith("/v1/inbox/")) return "inbox";
   if (path.startsWith("/v1/groups/")) return "group_outbox";
   if (path.startsWith("/v1/group-invite/")) return "group_invite";
@@ -6826,6 +6980,7 @@ var index_default = {
   }
 };
 export {
+  DeviceRegistryDurableObject,
   GroupOutboxDurableObject,
   InboxDurableObject,
   index_default as default,

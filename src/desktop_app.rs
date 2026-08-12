@@ -11,11 +11,11 @@ use crate::cli::profile::{
     RuntimeSecretRotationPhase, RuntimeSecrets,
 };
 use crate::cli::runtime::{
-    bootstrap_device_bundle_with_key_id, cloudflare_preflight as runtime_cloudflare_preflight,
-    deploy_cloudflare_runtime, derive_cloudflare_defaults, ensure_cloudflare_runtime_metadata,
-    prepare_legacy_runtime_secret_migration, prepare_runtime_secret_rotation,
-    rebuild_cloudflare_config, resolve_cloudflare_config, resolve_service_root,
-    wait_until_bootstrap_ready, CloudflareDeployOverrides, CloudflarePreflight,
+    cloudflare_preflight as runtime_cloudflare_preflight, deploy_cloudflare_runtime,
+    derive_cloudflare_defaults, enroll_device_runtime_v2, ensure_cloudflare_runtime_metadata,
+    fetch_deployment_bundle_v3, prepare_legacy_runtime_secret_migration,
+    prepare_runtime_secret_rotation, rebuild_cloudflare_config, resolve_cloudflare_config,
+    resolve_service_root, CloudflareDeployOverrides, CloudflarePreflight,
     ResolvedCloudflareDeployConfig,
 };
 use crate::cli::util::sign_hmac_token;
@@ -893,9 +893,9 @@ where
                 (!configured_runtime_url.trim().is_empty()).then_some(configured_runtime_url)
             });
             let diagnostics = CloudflareWizardDiagnostics {
-                bootstrap_url: runtime_url
-                    .as_deref()
-                    .map(|value| format!("{}/v1/bootstrap/device", value.trim_end_matches('/'))),
+                bootstrap_url: runtime_url.as_deref().map(|value| {
+                    format!("{}/v2/runtime-auth/challenge", value.trim_end_matches('/'))
+                }),
                 deploy_url: latest_deploy_url.clone(),
                 runtime_url,
             };
@@ -2105,7 +2105,7 @@ async fn provision_cloudflare_profile_with_progress<F>(
     user_id: &str,
     device_id: &str,
     service_root: &Path,
-    config: ResolvedCloudflareDeployConfig,
+    mut config: ResolvedCloudflareDeployConfig,
     mut update: F,
 ) -> Result<ProvisionedCloudflareState>
 where
@@ -2116,44 +2116,80 @@ where
         .ok()
         .map(|runtime| runtime.secret_rotation)
         .unwrap_or_default();
+    let local_identity = driver
+        .local_identity()
+        .cloned()
+        .ok_or_else(|| anyhow!("local identity is not initialized"))?;
+    if let Some(existing_runtime_id) = profile
+        .load_runtime_metadata()
+        .ok()
+        .and_then(|runtime| runtime.runtime_id)
+    {
+        config.runtime_id = existing_runtime_id;
+    }
+    config.owner_user_id = local_identity.user_identity.user_id.clone();
+    config.owner_user_public_key = local_identity.user_identity.user_public_key.clone();
+    if config.runtime_id.trim().is_empty() {
+        config.runtime_id = uuid::Uuid::new_v4().to_string();
+    }
+    let mut pending_runtime = profile.load_runtime_metadata().unwrap_or_default();
+    pending_runtime.runtime_id = Some(config.runtime_id.clone());
+    pending_runtime.mode = Some("cloudflare".into());
+    pending_runtime.service_root = Some(service_root.to_path_buf());
+    pending_runtime.worker_name = Some(config.worker_name.clone());
+    pending_runtime.public_base_url = Some(config.public_base_url.clone());
+    pending_runtime.deployment_region = Some(config.deployment_region.clone());
+    pending_runtime.bucket_name = Some(config.bucket_name.clone());
+    pending_runtime.preview_bucket_name = Some(config.preview_bucket_name.clone());
+    pending_runtime.bootstrap_secret = None;
+    pending_runtime.secret_rotation.last_error = Some("upgrade_pending_enrollment".into());
+    let pending_secrets = RuntimeSecrets {
+        sharing_secret: Some(config.sharing_token_secret.clone()),
+        device_runtime_secret: Some(config.device_runtime_secret.clone()),
+        device_runtime_key_id: Some(config.device_runtime_key_id.clone()),
+        previous_device_runtime_secret: config.device_runtime_previous_secret.clone(),
+        previous_device_runtime_key_id: config.device_runtime_previous_key_id.clone(),
+        ..RuntimeSecrets::default()
+    };
+    profile.save_runtime_rotation_state(&pending_runtime, &pending_secrets)?;
     update("deploying", None);
     let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
-    update("bootstrapping", Some(&deployment));
+    update("enrolling", Some(&deployment));
     crate::cli::runtime::wait_until_ready(&deployment.effective_public_base_url).await?;
-    wait_until_bootstrap_ready(
-        &deployment.effective_public_base_url,
-        &config.bootstrap_token_secret,
-        user_id,
-        device_id,
-    )
-    .await?;
-    let bundle = bootstrap_device_bundle_with_key_id(
-        &deployment.effective_public_base_url,
-        &config.bootstrap_token_secret,
-        Some(&config.bootstrap_token_key_id),
-        user_id,
-        device_id,
-    )
-    .await?;
+    let bundle =
+        fetch_deployment_bundle_v3(&deployment.effective_public_base_url, user_id, device_id)
+            .await?;
+    if bundle.runtime_id != config.runtime_id {
+        anyhow::bail!("runtime_mismatch: deployed runtime id differs from persisted runtime id");
+    }
     update("importing_bundle", Some(&deployment));
-    driver
-        .run_command_until_idle(CoreCommand::ImportDeploymentBundle {
-            bundle: bundle.clone(),
-        })
-        .await?;
+    let prepared = driver.prepare_command(CoreCommand::ImportDeploymentBundle {
+        bundle: bundle.clone(),
+    })?;
+    let local_bundle = driver
+        .local_bundle()
+        .cloned()
+        .ok_or_else(|| anyhow!("local IdentityBundle is unavailable for enrollment"))?;
+    if let Some(snapshot) = driver.latest_snapshot() {
+        profile.save_snapshot(snapshot)?;
+    }
     profile.save_deployment_bundle(&bundle)?;
+    let credential = enroll_device_runtime_v2(&bundle, &local_identity, &local_bundle).await?;
+    profile.save_runtime_credential(Some(credential.clone()))?;
+    driver.set_runtime_credential(Some(credential));
+    driver.execute_prepared_until_idle(prepared).await?;
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64;
-    let has_previous = config.device_runtime_previous_secret.is_some()
-        || config.bootstrap_previous_secret.is_some();
+    let has_previous = config.device_runtime_previous_secret.is_some();
     let runtime_metadata = RuntimeMetadata {
+        runtime_id: Some(bundle.runtime_id.clone()),
         pid: None,
         base_url: Some(deployment.effective_public_base_url.clone()),
         websocket_base_url: None,
-        bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
+        bootstrap_secret: None,
         sharing_secret: Some(config.sharing_token_secret.clone()),
         mode: Some("cloudflare".into()),
         workspace_root: service_root.parent().map(PathBuf::from),
@@ -2192,10 +2228,10 @@ where
     };
     let runtime_secrets = RuntimeSecrets {
         sharing_secret: Some(config.sharing_token_secret.clone()),
-        bootstrap_secret: Some(config.bootstrap_token_secret.clone()),
-        bootstrap_key_id: Some(config.bootstrap_token_key_id.clone()),
-        previous_bootstrap_secret: config.bootstrap_previous_secret.clone(),
-        previous_bootstrap_key_id: config.bootstrap_previous_key_id.clone(),
+        bootstrap_secret: None,
+        bootstrap_key_id: None,
+        previous_bootstrap_secret: None,
+        previous_bootstrap_key_id: None,
         device_runtime_secret: Some(config.device_runtime_secret.clone()),
         device_runtime_key_id: Some(config.device_runtime_key_id.clone()),
         previous_device_runtime_secret: config.device_runtime_previous_secret.clone(),

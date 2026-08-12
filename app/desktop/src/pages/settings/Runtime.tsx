@@ -15,6 +15,8 @@ interface RuntimeStatus {
   state: string;
   action: string | null;
   details: string | null;
+  credential_expires_at?: number | null;
+  error_code?: string | null;
   secret_rotation?: RuntimeSecretRotation | null;
 }
 
@@ -153,6 +155,24 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
       }
     } catch (err) {
       setError(String(err));
+    } finally {
+      setDeploying(false);
+    }
+  };
+
+  const handleRuntimeAction = async () => {
+    if (status?.action !== "refresh_auth") {
+      await handleDeploy();
+      return;
+    }
+    setError(null);
+    setDeploying(true);
+    try {
+      const refreshed = await invoke<RuntimeStatus>("cloudflare_refresh_runtime_auth");
+      setStatus(refreshed);
+    } catch (err) {
+      setError(String(err));
+      await loadStatus();
     } finally {
       setDeploying(false);
     }
@@ -361,7 +381,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
 
             {/* Redeploy option */}
             {status?.bound && !status.needs_upgrade && !deploying && (
-              <button className="btn btn-secondary w-full transition-fast" onClick={handleDeploy}>
+              <button className="btn btn-secondary w-full transition-fast" onClick={handleRuntimeAction}>
                 {status.state === "ready" ? "Update / Redeploy" : runtimeActionLabel(status)}
               </button>
             )}
@@ -383,7 +403,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
                 </h2>
                 <p className="mb-3 text-sm text-secondary-color">
                   These keys let this device authenticate to your personal Cloudflare Runtime for
-                  bootstrap and runtime requests. They do not encrypt messages or replace your
+                  runtime requests. They do not encrypt messages or replace your
                   recovery phrase or profile passphrase. During rotation, the old key remains
                   accepted briefly to avoid interruptions.
                 </p>
@@ -477,7 +497,18 @@ function runtimeStateMessage(status: RuntimeStatus): string {
     case "outdated":
       return "Cloudflare runtime needs an upgrade.";
     case "auth_expired":
+    case "offline_expired":
       return "Cloudflare runtime authorization needs refresh.";
+    case "refreshing":
+      return "Refreshing runtime authorization…";
+    case "degraded":
+      return "Runtime authorization refresh will retry automatically.";
+    case "upgrade_required":
+      return "Cloudflare runtime needs a one-time protocol upgrade.";
+    case "enrollment_required":
+      return "This device must enroll with the runtime.";
+    case "device_revoked":
+      return "This device was revoked. Restore the identity or create a new device.";
     default:
       return "Cloudflare runtime needs attention.";
   }

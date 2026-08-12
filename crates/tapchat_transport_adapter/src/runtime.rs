@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rand::RngCore;
@@ -58,6 +60,19 @@ pub struct CloudflareRuntimeHandle {
     websocket_base_url: String,
     bootstrap_secret: String,
     sharing_secret: String,
+}
+
+static PROVISIONED_RUNTIME_AUTH: LazyLock<
+    Mutex<BTreeMap<(String, String), &'static DeviceRuntimeAuth>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+pub fn deployment_runtime_auth(bundle: &DeploymentBundle) -> Option<&'static DeviceRuntimeAuth> {
+    let device_id = bundle.expected_device_id.as_ref()?;
+    PROVISIONED_RUNTIME_AUTH
+        .lock()
+        .ok()?
+        .get(&(bundle.runtime_id.clone(), device_id.clone()))
+        .copied()
 }
 
 impl CloudflareRuntimeHandle {
@@ -187,7 +202,60 @@ impl CloudflareRuntimeHandle {
             bail!("bootstrap failed with status {}", response.status());
         }
         let body = response.text().await.context("read bootstrap response")?;
-        Ok(serde_json::from_str(&to_snake_case_json_string(&body)?)?)
+        let normalized = to_snake_case_json_string(&body)?;
+        let value: serde_json::Value = serde_json::from_str(&normalized)?;
+        let auth_value = value
+            .get("device_runtime_auth")
+            .cloned()
+            .ok_or_else(|| anyhow!("bootstrap response missing runtime credential"))?;
+        let mut bundle: DeploymentBundle = serde_json::from_value(value)?;
+        if bundle.runtime_id.is_empty() {
+            bundle.runtime_id = format!("legacy-test-runtime:{}", self.base_url);
+        }
+        bundle.expected_user_id = Some(user_id.to_string());
+        bundle.expected_device_id = Some(device_id.to_string());
+        let expires_at = auth_value
+            .get("expires_at")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let auth = DeviceRuntimeAuth {
+            scheme: auth_value
+                .get("scheme")
+                .and_then(|value| value.as_str())
+                .unwrap_or("bearer")
+                .to_string(),
+            token: auth_value
+                .get("token")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            issued_at: expires_at.saturating_sub(24 * 60 * 60 * 1000),
+            expires_at,
+            runtime_id: bundle.runtime_id.clone(),
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            scopes: auth_value
+                .get("scopes")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            registration_version: 1,
+            key_id: auth_value
+                .get("key_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned),
+        };
+        let leaked = Box::leak(Box::new(auth));
+        PROVISIONED_RUNTIME_AUTH
+            .lock()
+            .map_err(|_| anyhow!("runtime credential registry lock poisoned"))?
+            .insert((bundle.runtime_id.clone(), device_id.to_string()), leaked);
+        Ok(bundle)
     }
 
     pub async fn put_identity_bundle(

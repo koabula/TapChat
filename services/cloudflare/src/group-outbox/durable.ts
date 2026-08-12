@@ -6,6 +6,7 @@ import {
   requiredGroupAppendOperations,
   validateAnyDeviceRuntimeAuthorization
 } from "../auth/capability";
+import { assertRegisteredRuntimeToken } from "../device-registry/durable";
 import type { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import {
   CONTROL_JSON_MAX_BYTES,
@@ -27,6 +28,7 @@ import type {
   CreateGroupInviteRequest,
   DecideGroupJoinRequest,
   FetchGroupOutboxRequest,
+  DeviceRuntimeToken,
   InitializeGroupAuthorizationRequest,
   GroupInviteTokenPayload,
   RevokeGroupInviteRequest,
@@ -155,6 +157,7 @@ export async function handleGroupOutboxDurableRequest(
     retentionDays: number;
     sharingSecret: string;
     deviceRuntimeSecrets: RotatingSecretSet;
+    assertRuntimeToken?: (token: DeviceRuntimeToken) => Promise<void>;
     now?: number;
     onUpgrade?: () => Response;
   }
@@ -176,6 +179,7 @@ export async function handleGroupOutboxDurableRequest(
         "group_authorization_bootstrap",
         now
       );
+      if (deps.assertRuntimeToken) await deps.assertRuntimeToken(runtimeToken);
       const body = await readJsonLimited<InitializeGroupAuthorizationRequest>(request, CONTROL_JSON_MAX_BYTES);
       return jsonResponse(await authorization.initialize(body, runtimeToken, now));
     }
@@ -616,6 +620,7 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
       retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
       sharingSecret,
       deviceRuntimeSecrets,
+      assertRuntimeToken: (token) => assertRegisteredRuntimeToken(this.envRef, token),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];

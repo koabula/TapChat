@@ -66,6 +66,8 @@ pub struct ProfileMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RuntimeMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
@@ -106,8 +108,12 @@ pub struct ProfilePrivateState {
     pub runtime_secrets: RuntimeSecrets,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_secret_rotation: Option<RuntimeSecretRotationMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deployment_runtime_auth: Option<DeviceRuntimeAuth>,
+    #[serde(
+        default,
+        alias = "deployment_runtime_auth",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub runtime_credential: Option<DeviceRuntimeAuth>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -185,7 +191,7 @@ impl Default for ProfilePrivateState {
             version: 1,
             runtime_secrets: RuntimeSecrets::default(),
             runtime_secret_rotation: None,
-            deployment_runtime_auth: None,
+            runtime_credential: None,
             settings: BTreeMap::new(),
             attachment_cache: BTreeMap::new(),
         }
@@ -604,13 +610,7 @@ impl Profile {
 
     pub fn save_deployment_bundle(&mut self, bundle: &DeploymentBundle) -> Result<PathBuf> {
         let path = self.meta.bundles_dir.join("deployment_bundle.json");
-        let mut private = self.load_private_state()?;
-        private.deployment_runtime_auth = bundle.device_runtime_auth.clone();
-        self.save_private_state(&private)?;
-
-        let mut public_bundle = bundle.clone();
-        public_bundle.device_runtime_auth = None;
-        let bytes = serde_json::to_vec_pretty(&public_bundle)?;
+        let bytes = serde_json::to_vec_pretty(bundle)?;
         write_atomic_unique(&path, &bytes)?;
         self.set_deployment_bundle_path(path.clone())?;
         Ok(path)
@@ -637,21 +637,17 @@ impl Profile {
         let Some(path) = self.meta.deployment_bundle_path.as_ref() else {
             return Ok(None);
         };
-        let mut bundle = Self::load_deployment_bundle_file(path)?;
-        if bundle.device_runtime_auth.is_some() {
-            let mut private = self.load_private_state()?;
-            private.deployment_runtime_auth = bundle.device_runtime_auth.clone();
-            self.save_private_state(&private)?;
-            bundle.device_runtime_auth = private.deployment_runtime_auth;
-            let mut public_bundle = bundle.clone();
-            public_bundle.device_runtime_auth = None;
-            write_atomic_unique(path, &serde_json::to_vec_pretty(&public_bundle)?)?;
-            return Ok(Some(bundle));
-        }
-        if let Some(auth) = self.load_private_state()?.deployment_runtime_auth {
-            bundle.device_runtime_auth = Some(auth);
-        }
-        Ok(Some(bundle))
+        Ok(Some(Self::load_deployment_bundle_file(path)?))
+    }
+
+    pub fn load_runtime_credential(&self) -> Result<Option<DeviceRuntimeAuth>> {
+        Ok(self.load_private_state()?.runtime_credential)
+    }
+
+    pub fn save_runtime_credential(&self, credential: Option<DeviceRuntimeAuth>) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private.runtime_credential = credential;
+        self.save_private_state(&private)
     }
 
     pub fn load_identity_bundle_file(path: impl AsRef<Path>) -> Result<IdentityBundle> {
@@ -2080,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_bundle_file_strips_runtime_auth_token() {
+    fn runtime_credential_is_private_and_absent_from_deployment_bundle() {
         let _guard = env_lock();
         let dir = tempdir().expect("tempdir");
         unsafe {
@@ -2100,6 +2096,7 @@ mod tests {
         .expect("init profile");
         let bundle = crate::model::DeploymentBundle {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            runtime_id: "runtime:test".into(),
             region: "test".into(),
             inbox_http_endpoint: "https://inbox.test".into(),
             inbox_websocket_endpoint: "wss://inbox.test".into(),
@@ -2108,18 +2105,24 @@ mod tests {
                 bucket_hint: Some("bucket".into()),
             },
             runtime_config: crate::model::RuntimeConfig::default(),
-            device_runtime_auth: Some(crate::model::DeviceRuntimeAuth {
-                scheme: "bearer".into(),
-                token: "runtime-token-visible-marker".into(),
-                expires_at: 42,
-                user_id: "user:alice".into(),
-                device_id: "device:alice".into(),
-                scopes: vec!["inbox:append".into()],
-                key_id: None,
-            }),
             expected_user_id: None,
             expected_device_id: None,
         };
+        let credential = crate::model::DeviceRuntimeAuth {
+            scheme: "bearer".into(),
+            token: "runtime-token-visible-marker".into(),
+            issued_at: 1,
+            expires_at: 86_400_001,
+            runtime_id: "runtime:test".into(),
+            user_id: "user:alice".into(),
+            device_id: "device:alice".into(),
+            scopes: vec!["inbox_read".into()],
+            registration_version: 1,
+            key_id: None,
+        };
+        profile
+            .save_runtime_credential(Some(credential.clone()))
+            .expect("save private runtime credential");
         let path = profile
             .save_deployment_bundle(&bundle)
             .expect("save deployment");
@@ -2130,12 +2133,10 @@ mod tests {
             .load_deployment_bundle()
             .expect("load deployment")
             .expect("deployment present");
+        assert_eq!(loaded, bundle);
         assert_eq!(
-            loaded
-                .device_runtime_auth
-                .as_ref()
-                .map(|auth| auth.token.as_str()),
-            Some("runtime-token-visible-marker")
+            profile.load_runtime_credential().expect("load credential"),
+            Some(credential)
         );
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");

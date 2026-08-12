@@ -73,7 +73,7 @@ use crate::transport_contract::{
     PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
     SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
-    SubmitGroupLeaveRequest,
+    SubmitGroupLeaveRequest, TransportAuthRequirement,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Verifier;
@@ -2804,6 +2804,7 @@ mod group_membership_security_tests {
     fn membership_fsm_deployment() -> DeploymentBundle {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
+            runtime_id: "runtime:test".into(),
             region: "test".into(),
             inbox_http_endpoint: "https://example.test".into(),
             inbox_websocket_endpoint: "wss://example.test/ws".into(),
@@ -2819,7 +2820,6 @@ mod group_membership_security_tests {
                 max_inline_bytes: Some(4096),
                 features: vec!["group_membership_fsm_v2".into()],
             },
-            device_runtime_auth: None,
             expected_user_id: None,
             expected_device_id: None,
         }

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -35,6 +36,8 @@ struct StoredCloudflareToken {
     account_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +73,26 @@ struct TokenExchangeResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+}
+
+const ACCESS_TOKEN_REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn refresh_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn access_token_needs_refresh(token: &StoredCloudflareToken, now: u64) -> bool {
+    token
+        .expires_at_ms
+        .is_none_or(|expires| expires <= now.saturating_add(ACCESS_TOKEN_REFRESH_SKEW_MS))
 }
 
 pub async fn login() -> Result<OAuthTokens> {
@@ -117,6 +140,9 @@ pub async fn login() -> Result<OAuthTokens> {
         account_id: Some(account.account_id.clone()),
         account_name: Some(account.account_name.clone()),
         email: whoami.email.clone(),
+        expires_at_ms: token
+            .expires_in
+            .map(|seconds| now_ms().saturating_add(seconds.saturating_mul(1000))),
     })?;
 
     Ok(OAuthTokens {
@@ -131,8 +157,16 @@ pub async fn login() -> Result<OAuthTokens> {
 }
 
 pub async fn whoami() -> Result<WhoamiResult> {
+    let access_token = valid_access_token(false, None).await?;
+    let mut result = match whoami_for_token(&access_token).await {
+        Ok(result) => result,
+        Err(error) if error.to_string().contains("cloudflare_api_unauthorized") => {
+            let access_token = valid_access_token(true, Some(&access_token)).await?;
+            whoami_for_token(&access_token).await?
+        }
+        Err(error) => return Err(error),
+    };
     let token = load_token()?;
-    let mut result = whoami_for_token(&token.access_token).await?;
     if result.active_account_id.is_none() {
         result.active_account_id = token.account_id.clone().or_else(|| {
             result
@@ -144,8 +178,48 @@ pub async fn whoami() -> Result<WhoamiResult> {
     Ok(result)
 }
 
-pub fn load_access_token() -> Result<String> {
-    Ok(load_token()?.access_token)
+pub async fn load_access_token() -> Result<String> {
+    valid_access_token(false, None).await
+}
+
+pub async fn force_refresh_access_token(stale_access_token: &str) -> Result<String> {
+    valid_access_token(true, Some(stale_access_token)).await
+}
+
+async fn valid_access_token(force: bool, stale_access_token: Option<&str>) -> Result<String> {
+    let _guard = refresh_gate().lock().await;
+    let mut token = load_token()?;
+    if force
+        && stale_access_token.is_some_and(|stale| stale != token.access_token)
+        && !access_token_needs_refresh(&token, now_ms())
+    {
+        return Ok(token.access_token);
+    }
+    if !force && !access_token_needs_refresh(&token, now_ms()) {
+        return Ok(token.access_token);
+    }
+    let refresh_token = token
+        .refresh_token
+        .clone()
+        .ok_or_else(|| anyhow!("oauth_login_required: Cloudflare refresh token is missing"))?;
+    let refreshed = refresh_access_token(&refresh_token).await?;
+    apply_token_refresh(&mut token, refreshed, now_ms());
+    store_token(&token)?;
+    Ok(token.access_token)
+}
+
+fn apply_token_refresh(
+    token: &mut StoredCloudflareToken,
+    refreshed: TokenExchangeResponse,
+    refreshed_at_ms: u64,
+) {
+    token.access_token = refreshed.access_token;
+    if let Some(rotated) = refreshed.refresh_token.filter(|value| !value.is_empty()) {
+        token.refresh_token = Some(rotated);
+    }
+    token.expires_at_ms = refreshed
+        .expires_in
+        .map(|seconds| refreshed_at_ms.saturating_add(seconds.saturating_mul(1000)));
 }
 
 fn load_token() -> Result<StoredCloudflareToken> {
@@ -189,6 +263,7 @@ fn load_wrangler_token() -> Result<StoredCloudflareToken> {
         account_id: parse_toml_string(&content, "account_id"),
         account_name: None,
         email: None,
+        expires_at_ms: None,
     })
 }
 
@@ -225,13 +300,17 @@ async fn whoami_for_token(access_token: &str) -> Result<WhoamiResult> {
 }
 
 async fn get_user_info(client: &Client, access_token: &str) -> Result<UserResult> {
-    let envelope = client
+    let response = client
         .get(format!("{CF_API_BASE}/user"))
         .bearer_auth(access_token)
         .header("Accept", "application/json")
         .send()
         .await
-        .context("request Cloudflare user")?
+        .context("request Cloudflare user")?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("cloudflare_api_unauthorized");
+    }
+    let envelope = response
         .json::<CloudflareEnvelope<UserResult>>()
         .await
         .context("decode Cloudflare user response")?;
@@ -239,13 +318,17 @@ async fn get_user_info(client: &Client, access_token: &str) -> Result<UserResult
 }
 
 async fn get_account_info(client: &Client, access_token: &str) -> Result<Vec<AccountInfo>> {
-    let envelope = client
+    let response = client
         .get(format!("{CF_API_BASE}/accounts"))
         .bearer_auth(access_token)
         .header("Accept", "application/json")
         .send()
         .await
-        .context("request Cloudflare accounts")?
+        .context("request Cloudflare accounts")?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("cloudflare_api_unauthorized");
+    }
+    let envelope = response
         .json::<CloudflareEnvelope<Vec<AccountResult>>>()
         .await
         .context("decode Cloudflare accounts response")?;
@@ -302,6 +385,45 @@ async fn exchange_code_for_token(
         .json::<TokenExchangeResponse>()
         .await
         .context("decode Cloudflare token exchange response")
+}
+
+async fn refresh_access_token(refresh_token: &str) -> Result<TokenExchangeResponse> {
+    let client = Client::builder()
+        .build()
+        .context("build OAuth refresh client")?;
+    let response = client
+        .post(TOKEN_URL)
+        .header("Accept", "application/json")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CLIENT_ID),
+        ])
+        .send()
+        .await
+        .context("refresh Cloudflare OAuth access token")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let invalid_grant = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("invalid_grant");
+        if invalid_grant {
+            bail!("oauth_login_required: Cloudflare refresh token was rejected");
+        }
+        bail!("oauth_refresh_failed: HTTP {status}");
+    }
+    response
+        .json::<TokenExchangeResponse>()
+        .await
+        .context("decode Cloudflare OAuth refresh response")
 }
 
 async fn wait_for_oauth_code(listener: TcpListener, expected_state: &str) -> Result<String> {
@@ -445,5 +567,50 @@ mod tests {
             .expect("matching callback should return authorization code");
 
         assert_eq!(code, "abc123");
+    }
+
+    #[test]
+    fn legacy_oauth_record_without_expiry_refreshes_on_first_use() {
+        let token = StoredCloudflareToken {
+            access_token: "access".into(),
+            refresh_token: Some("refresh".into()),
+            account_id: None,
+            account_name: None,
+            email: None,
+            expires_at_ms: None,
+        };
+        assert!(access_token_needs_refresh(&token, 1_000));
+    }
+
+    #[test]
+    fn oauth_refresh_rotates_refresh_token_only_when_returned() {
+        let mut token = StoredCloudflareToken {
+            access_token: "old-access".into(),
+            refresh_token: Some("old-refresh".into()),
+            account_id: None,
+            account_name: None,
+            email: None,
+            expires_at_ms: Some(1),
+        };
+        apply_token_refresh(
+            &mut token,
+            TokenExchangeResponse {
+                access_token: "new-access".into(),
+                refresh_token: None,
+                expires_in: Some(3_600),
+            },
+            10_000,
+        );
+        assert_eq!(token.refresh_token.as_deref(), Some("old-refresh"));
+        apply_token_refresh(
+            &mut token,
+            TokenExchangeResponse {
+                access_token: "newer-access".into(),
+                refresh_token: Some("rotated-refresh".into()),
+                expires_in: Some(3_600),
+            },
+            20_000,
+        );
+        assert_eq!(token.refresh_token.as_deref(), Some("rotated-refresh"));
     }
 }

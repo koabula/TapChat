@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+legacy-multi-owner-runtime-tests = []
+
+[[test]]
+name = "phase10_e2e"
+path = "tests/phase10_e2e.rs"
+required-features = ["legacy-multi-owner-runtime-tests"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

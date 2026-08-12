@@ -2,7 +2,6 @@ import { ed25519 } from "@noble/curves/ed25519";
 import type {
   AppendEnvelopeRequest,
   AppendGroupEnvelopeRequest,
-  BootstrapToken,
   DeviceBinding,
   DeviceContactProfile,
   DeviceRuntimeScope,
@@ -537,14 +536,7 @@ async function verifySignedToken<T>(secrets: string | RotatingSecretSet, request
           ) return [secrets.previous.secret];
           return [];
         }
-        const unkeyed: string[] = [];
-        if (secrets.allowUnkeyedCurrent) unkeyed.push(secrets.current.secret);
-        if (
-          secrets.previous &&
-          secrets.graceUntilMs !== undefined &&
-          now < secrets.graceUntilMs
-        ) unkeyed.push(secrets.previous.secret);
-        return unkeyed;
+        return secrets.allowUnkeyedCurrent ? [secrets.current.secret] : [];
       })();
   let lastMessage = "invalid signed token";
   for (const secret of candidates) {
@@ -561,38 +553,31 @@ async function verifySignedToken<T>(secrets: string | RotatingSecretSet, request
 }
 
 async function verifyDeviceRuntimeToken(request: Request, secrets: string | RotatingSecretSet, now: number): Promise<DeviceRuntimeToken> {
-  const token = await verifySignedToken<DeviceRuntimeToken>(secrets, request, now);
+  let token: DeviceRuntimeToken;
+  try {
+    token = await verifySignedToken<DeviceRuntimeToken>(secrets, request, now);
+  } catch (error) {
+    if (error instanceof HttpError && error.code === "capability_expired") {
+      throw new HttpError(403, "runtime_auth_expired", "device runtime token is expired");
+    }
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token is invalid");
+  }
   if (token.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "device runtime token version is not supported");
   }
   if (token.service !== "device_runtime") {
-    throw new HttpError(403, "invalid_capability", "token service must be device_runtime");
+    throw new HttpError(403, "runtime_auth_invalid", "token service must be device_runtime");
   }
-  if (!token.userId || !token.deviceId || !token.scopes.length) {
-    throw new HttpError(403, "invalid_capability", "device runtime token is malformed");
-  }
-  return token;
-}
-
-export async function validateBootstrapAuthorization(
-  request: Request,
-  secret: string | RotatingSecretSet,
-  userId: string,
-  deviceId: string,
-  now: number
-): Promise<BootstrapToken> {
-  const token = await verifySignedToken<BootstrapToken>(secret, request, now);
-  if (token.version !== CURRENT_MODEL_VERSION) {
-    throw new HttpError(400, "unsupported_version", "bootstrap token version is not supported");
-  }
-  if (token.service !== "bootstrap") {
-    throw new HttpError(403, "invalid_capability", "token service must be bootstrap");
-  }
-  if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "bootstrap token scope does not match request");
-  }
-  if (!token.operations.includes("issue_device_bundle")) {
-    throw new HttpError(403, "invalid_capability", "bootstrap token does not grant device bundle issuance");
+  if (
+    !token.runtimeId ||
+    !token.userId ||
+    !token.deviceId ||
+    !token.scopes.length ||
+    !Number.isSafeInteger(token.issuedAt) ||
+    !Number.isSafeInteger(token.registrationVersion) ||
+    token.registrationVersion < 1
+  ) {
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token is malformed");
   }
   return token;
 }
@@ -605,7 +590,7 @@ export async function validateAnyDeviceRuntimeAuthorization(
 ): Promise<DeviceRuntimeToken> {
   const token = await verifyDeviceRuntimeToken(request, secret, now);
   if (!token.scopes.includes(scope)) {
-    throw new HttpError(403, "invalid_capability", `device runtime token does not grant ${scope}`);
+    throw new HttpError(403, "runtime_auth_invalid", `device runtime token does not grant ${scope}`);
   }
   return token;
 }
@@ -620,7 +605,7 @@ export async function validateDeviceRuntimeAuthorization(
 ): Promise<DeviceRuntimeToken> {
   const token = await validateAnyDeviceRuntimeAuthorization(request, secret, scope, now);
   if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token scope does not match request path");
   }
   return token;
 }
@@ -634,7 +619,7 @@ export async function validateDeviceRuntimeAuthorizationForDevice(
 ): Promise<DeviceRuntimeToken> {
   const token = await validateAnyDeviceRuntimeAuthorization(request, secret, scope, now);
   if (token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
+    throw new HttpError(403, "runtime_auth_invalid", "device runtime token scope does not match request path");
   }
   return token;
 }
@@ -650,7 +635,7 @@ export async function validateSharedStateWriteAuthorization(
   try {
     return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "shared_state_write", now);
   } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
       throw error;
     }
   }
@@ -683,7 +668,7 @@ export async function validateKeyPackageWriteAuthorization(
   try {
     return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
   } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
       throw error;
     }
   }

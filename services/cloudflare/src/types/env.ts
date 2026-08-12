@@ -5,11 +5,11 @@
  */
 export type Env = Omit<CloudflareBindings, "PUBLIC_BASE_URL"> & {
   PUBLIC_BASE_URL?: string;
+  RUNTIME_ID?: string;
+  OWNER_USER_ID?: string;
+  OWNER_USER_PUBLIC_KEY?: string;
+  DEVICE_REGISTRY: DurableObjectNamespace;
   SHARING_INTERNAL_SECRET?: string;
-  BOOTSTRAP_LINK_SECRET?: string;
-  BOOTSTRAP_LINK_SECRET_KEY_ID?: string;
-  BOOTSTRAP_LINK_SECRET_PREVIOUS?: string;
-  BOOTSTRAP_LINK_SECRET_PREVIOUS_KEY_ID?: string;
   DEVICE_RUNTIME_SECRET?: string;
   DEVICE_RUNTIME_SECRET_KEY_ID?: string;
   DEVICE_RUNTIME_SECRET_PREVIOUS?: string;

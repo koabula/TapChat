@@ -11,7 +11,6 @@ use tapchat_core::platform_ports::execute_platform_effect;
 use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput};
 
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
-use crate::runtime_auth::ensure_fresh_device_runtime_auth;
 use crate::state::{AppState, DeferredTransportBatch, LockReason, SessionState, StartupPhase};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
@@ -141,7 +140,11 @@ pub async fn on_app_ready(app: &AppHandle) {
         let refresh_started_at = Instant::now();
         {
             let inner = state.inner.read().await;
-            match ensure_fresh_device_runtime_auth(&inner.profile_manager).await {
+            match state
+                .runtime_auth
+                .ensure(&inner.profile_manager, false)
+                .await
+            {
                 Ok(Some(_)) => {
                     log::info!(
                         "on_app_ready: refreshed device runtime auth in {}ms",
@@ -155,9 +158,15 @@ pub async fn on_app_ready(app: &AppHandle) {
                     );
                 }
                 Err(_error) => {
+                    let auth = state.runtime_auth.snapshot().await;
                     log::warn!(
-                        "on_app_ready: device runtime auth refresh failed in {}ms",
-                        refresh_started_at.elapsed().as_millis()
+                        "on_app_ready: device runtime auth refresh failed: stage=startup code={} retryable={} next_retry_at={} elapsed_ms={}",
+                        auth.error_code.as_deref().unwrap_or("temporary_unavailable"),
+                        auth.retryable,
+                        auth.next_retry_at
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".into()),
+                        refresh_started_at.elapsed().as_millis(),
                     );
                 }
             }
@@ -304,12 +313,79 @@ pub async fn on_app_ready(app: &AppHandle) {
                 app_started_at.elapsed().as_millis()
             );
         });
+        spawn_runtime_auth_scheduler(app.clone());
     }
 
     log::info!(
         "on_app_ready: total startup path completed in {}ms",
         startup_started_at.elapsed().as_millis()
     );
+}
+
+fn spawn_runtime_auth_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let state = app.state::<AppState>();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let manager_snapshot = state.runtime_auth.snapshot().await;
+            let next_retry = manager_snapshot.next_retry_at;
+            let credential_expiry = {
+                let inner = state.inner.read().await;
+                let pm = inner.profile_manager.inner.read().await;
+                pm.active_profile
+                    .as_ref()
+                    .and_then(|profile| profile.load_runtime_credential().ok().flatten())
+                    .map(|credential| credential.expires_at)
+            };
+            let jitter_ms = rand::random::<u64>() % (5 * 60 * 1000);
+            let wake_at = next_retry.or_else(|| {
+                credential_expiry.map(|expires_at| {
+                    expires_at
+                        .saturating_sub(crate::runtime_auth::DEVICE_RUNTIME_REFRESH_SKEW_MS)
+                        .saturating_sub(jitter_ms)
+                })
+            });
+            let delay_ms = wake_at
+                .map(|wake_at| wake_at.saturating_sub(now).clamp(30_000, 60 * 60 * 1000))
+                .unwrap_or(15 * 60 * 1000);
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+            let profile_manager = {
+                let inner = state.inner.read().await;
+                if !matches!(inner.session, SessionState::Active { .. }) {
+                    continue;
+                }
+                inner.profile_manager.clone()
+            };
+            let before = state.runtime_auth.snapshot().await.state;
+            match state.runtime_auth.ensure(&profile_manager, false).await {
+                Ok(Some(_)) if before != crate::runtime_auth::RuntimeAuthState::Ready => {
+                    if let Err(_error) =
+                        drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppForegrounded))
+                            .await
+                    {
+                        log::warn!("runtime authorization recovered but sync restart failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(_error) => {
+                    let snapshot = state.runtime_auth.snapshot().await;
+                    log::warn!(
+                        "scheduled runtime authorization refresh failed: code={} retryable={} next_retry_at={}",
+                        snapshot.error_code.as_deref().unwrap_or("temporary_unavailable"),
+                        snapshot.retryable,
+                        snapshot
+                            .next_retry_at
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".into())
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Determine the appropriate onboarding step based on startup check.

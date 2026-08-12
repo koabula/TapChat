@@ -6,6 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     "PUBLIC_BASE_URL": "https://example.com",
+    "RUNTIME_ID": "00000000-0000-4000-8000-000000000000",
+    "OWNER_USER_ID": "local-owner",
+    "OWNER_USER_PUBLIC_KEY": "0000000000000000000000000000000000000000000000000000000000000000",
     "DEPLOYMENT_REGION": "local",
     "MAX_INLINE_BYTES": "4096",
     "RETENTION_DAYS": "30",
@@ -23,7 +26,8 @@
   "durable_objects": {
     "bindings": [
       { "name": "INBOX", "class_name": "InboxDurableObject" },
-      { "name": "GROUP_OUTBOX", "class_name": "GroupOutboxDurableObject" }
+      { "name": "GROUP_OUTBOX", "class_name": "GroupOutboxDurableObject" },
+      { "name": "DEVICE_REGISTRY", "class_name": "DeviceRegistryDurableObject" }
     ]
   },
   "r2_buckets": [
@@ -35,7 +39,8 @@
   ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["InboxDurableObject"] },
-    { "tag": "v2", "new_sqlite_classes": ["GroupOutboxDurableObject"] }
+    { "tag": "v2", "new_sqlite_classes": ["GroupOutboxDurableObject"] },
+    { "tag": "v3", "new_sqlite_classes": ["DeviceRegistryDurableObject"] }
   ],
   "observability": {
     "enabled": true,

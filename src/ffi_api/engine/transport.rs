@@ -181,7 +181,7 @@ impl CoreEngine {
 
         let inbox_websocket_endpoint = deployment.inbox_websocket_endpoint.clone();
         let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
-        let headers = self.device_runtime_headers()?;
+        let auth = self.device_runtime_auth_requirement()?;
         let retry_reset_ops = if Self::should_reset_pending_direct_transport(reason.as_deref()) {
             self.reset_pending_direct_transport_for_retry(&device_id)
         } else {
@@ -223,7 +223,8 @@ impl CoreEngine {
                             device_id: device_id.clone(),
                             endpoint: inbox_websocket_endpoint,
                             last_acked_seq,
-                            headers: headers.clone(),
+                            headers: BTreeMap::new(),
+                            auth: Some(auth.clone()),
                         },
                     },
                 },
@@ -236,7 +237,8 @@ impl CoreEngine {
                             inbox_http_endpoint.trim_end_matches('/'),
                             device_id
                         ),
-                        headers: headers.clone(),
+                        headers: BTreeMap::new(),
+                        auth: Some(auth.clone()),
                         body: None,
                     },
                 },
@@ -280,24 +282,16 @@ impl CoreEngine {
         self.state.message_nonce
     }
 
-    pub(super) fn device_runtime_headers(&self) -> CoreResult<BTreeMap<String, String>> {
+    pub(super) fn device_runtime_auth_requirement(&self) -> CoreResult<TransportAuthRequirement> {
         let deployment = self
             .state
             .deployment_bundle
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
-        let auth = deployment
-            .device_runtime_auth
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("device runtime auth is not initialized"))?;
-        if auth.scheme != "bearer" {
-            return Err(CoreError::invalid_state(
-                "unsupported device runtime auth scheme",
-            ));
-        }
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".into(), format!("Bearer {}", auth.token));
-        Ok(headers)
+        Ok(TransportAuthRequirement::DeviceRuntime {
+            runtime_id: deployment.runtime_id.clone(),
+            device_id: self.local_device_id_required()?,
+        })
     }
 
     pub(super) fn local_device_id_required(&self) -> CoreResult<String> {
@@ -352,7 +346,7 @@ impl CoreEngine {
         let Some(bundle) = self.state.local_bundle.as_ref() else {
             return Ok(effects);
         };
-        let headers = self.device_runtime_headers()?;
+        let auth = self.device_runtime_auth_requirement()?;
         if let Some(reference) = bundle.identity_bundle_ref.clone() {
             effects.push(CoreEffect::PublishSharedState {
                 publish: PublishSharedStateRequest {
@@ -363,7 +357,8 @@ impl CoreEngine {
                             "failed to encode local identity bundle: {error}"
                         ))
                     })?,
-                    headers: headers.clone(),
+                    headers: BTreeMap::new(),
+                    auth: Some(auth.clone()),
                 },
             });
         }
@@ -378,7 +373,8 @@ impl CoreEngine {
                             "failed to encode local device status document: {error}"
                         ))
                     })?,
-                    headers,
+                    headers: BTreeMap::new(),
+                    auth: Some(auth),
                 },
             });
         }
@@ -392,7 +388,8 @@ impl CoreEngine {
                 fetch: FetchMessageRequestsRequest {
                     device_id: self.local_device_id_required()?,
                     endpoint: self.inbox_management_endpoint("message-requests")?,
-                    headers: self.device_runtime_headers()?,
+                    headers: BTreeMap::new(),
+                    auth: Some(self.device_runtime_auth_requirement()?),
                 },
             }],
             view_model: None,
@@ -412,7 +409,8 @@ impl CoreEngine {
                     request_id,
                     action,
                     endpoint: self.inbox_management_endpoint("message-requests")?,
-                    headers: self.device_runtime_headers()?,
+                    headers: BTreeMap::new(),
+                    auth: Some(self.device_runtime_auth_requirement()?),
                 },
             }],
             view_model: None,
@@ -427,7 +425,8 @@ impl CoreEngine {
                 fetch: FetchAllowlistRequest {
                     device_id,
                     endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: self.device_runtime_headers()?,
+                    headers: BTreeMap::new(),
+                    auth: Some(self.device_runtime_auth_requirement()?),
                 },
             }],
             view_model: None,
@@ -445,7 +444,8 @@ impl CoreEngine {
                 fetch: FetchAllowlistRequest {
                     device_id,
                     endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: self.device_runtime_headers()?,
+                    headers: BTreeMap::new(),
+                    auth: Some(self.device_runtime_auth_requirement()?),
                 },
             }],
             view_model: None,
@@ -479,7 +479,8 @@ impl CoreEngine {
                 fetch: FetchAllowlistRequest {
                     device_id,
                     endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: self.device_runtime_headers()?,
+                    headers: BTreeMap::new(),
+                    auth: Some(self.device_runtime_auth_requirement()?),
                 },
             }],
             view_model: None,
@@ -1016,7 +1017,7 @@ impl CoreEngine {
     }
 
     pub(super) fn flush_blob_uploads(&mut self) -> CoreResult<CoreOutput> {
-        let headers = self.device_runtime_headers()?;
+        let auth = self.device_runtime_auth_requirement()?;
         let keys: Vec<String> = self.state.pending_blob_uploads.keys().cloned().collect();
         let mut effects = Vec::new();
         for task_id in keys {
@@ -1064,7 +1065,8 @@ impl CoreEngine {
                         mime_type: task.descriptor.mime_type.clone(),
                         size_bytes,
                         file_name: task.descriptor.file_name.clone(),
-                        headers: headers.clone(),
+                        headers: BTreeMap::new(),
+                        auth: Some(auth.clone()),
                     },
                 });
             }
@@ -1185,6 +1187,7 @@ impl CoreEngine {
             method: HttpMethod::Post,
             url: device_profile.inbox_append_capability.endpoint.clone(),
             headers,
+            auth: None,
             body: Some(serde_json::to_string(&body).map_err(|error| {
                 CoreError::invalid_input(format!("failed to encode append request: {error}"))
             })?),
@@ -1206,7 +1209,8 @@ impl CoreEngine {
                 ack_seq: ack.ack_seq,
             },
         );
-        let mut headers = self.device_runtime_headers()?;
+        let auth = self.device_runtime_auth_requirement()?;
+        let mut headers = BTreeMap::new();
         headers.insert("Content-Type".into(), "application/json".into());
         let request = AckRequest { ack: ack.clone() };
         Ok(HttpRequestEffect {
@@ -1218,6 +1222,7 @@ impl CoreEngine {
                 ack.device_id
             ),
             headers,
+            auth: Some(auth),
             body: Some(serde_json::to_string(&request).map_err(|error| {
                 CoreError::invalid_input(format!("failed to encode ack request: {error}"))
             })?),
@@ -1235,7 +1240,7 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
         let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
-        let headers = self.device_runtime_headers()?;
+        let auth = self.device_runtime_auth_requirement()?;
         let limit = decision
             .to_seq
             .saturating_sub(decision.from_seq)
@@ -1272,7 +1277,8 @@ impl CoreEngine {
                         fetch.from_seq,
                         fetch.limit
                     ),
-                    headers: headers.clone(),
+                    headers: BTreeMap::new(),
+                    auth: Some(auth),
                     body: None,
                 },
             }],
@@ -3623,7 +3629,8 @@ impl CoreEngine {
                 update: ReplaceAllowlistRequest {
                     device_id: self.local_device_id_required()?,
                     endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: self.device_runtime_headers()?,
+                    headers: BTreeMap::new(),
+                    auth: Some(self.device_runtime_auth_requirement()?),
                     document,
                 },
             }],

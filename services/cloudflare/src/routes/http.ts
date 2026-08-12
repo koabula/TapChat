@@ -4,7 +4,6 @@ import {
   APPEND_AUTH_REASON_HEADER,
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
-  validateBootstrapAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization,
@@ -15,7 +14,6 @@ import {
   DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES,
   readJsonLimited,
   readRequestTextLimited,
-  requireBootstrapSecrets,
   requireDeviceRuntimeSecrets,
   requireSharingSecret
 } from "../auth/runtime-security";
@@ -29,10 +27,12 @@ import {
   type AppendGroupEnvelopeRequest,
   type AppendEnvelopeRequest,
   type AuthorizeBlobDownloadRequest,
-  type BootstrapDeviceRequest,
   type DeploymentBundle,
   type DeviceRuntimeAuth,
+  type DeviceRuntimeEnrollmentProof,
   type DeviceRuntimeRefreshProof,
+  type DeviceRuntimeScope,
+  type DeviceRuntimeToken,
   type DeviceStatusDocument,
   type GroupInviteTokenPayload,
   type IdentityBundle,
@@ -42,6 +42,7 @@ import {
   type WelcomePickupDescriptor
 } from "../types/contracts";
 import type { Env } from "../types/env";
+import { assertRegisteredRuntimeToken, registryStub } from "../device-registry/durable";
 
 function versionedBody(body: unknown): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -127,10 +128,6 @@ function downloadGrantTtlDays(env: Env): number {
   return Number.isFinite(parsed) ? parsed : 365;
 }
 
-function bootstrapSecrets(env: Env) {
-  return requireBootstrapSecrets(env);
-}
-
 function deviceRuntimeSecrets(env: Env) {
   return requireDeviceRuntimeSecrets(env);
 }
@@ -155,33 +152,58 @@ function runtimeScopes(): DeviceRuntimeAuth["scopes"] {
   ];
 }
 
-async function issueDeviceRuntimeAuth(env: Env, userId: string, deviceId: string, now: number): Promise<DeviceRuntimeAuth> {
+function runtimeIdentity(env: Env): { runtimeId: string; userId: string; userPublicKey: string } {
+  const runtimeId = env.RUNTIME_ID?.trim();
+  const userId = env.OWNER_USER_ID?.trim();
+  const userPublicKey = env.OWNER_USER_PUBLIC_KEY?.trim();
+  if (!runtimeId || !userId || !userPublicKey) {
+    throw new HttpError(503, "runtime_misconfigured", "runtime owner identity is not configured");
+  }
+  return { runtimeId, userId, userPublicKey };
+}
+
+async function issueDeviceRuntimeAuth(
+  env: Env,
+  userId: string,
+  deviceId: string,
+  registrationVersion: number,
+  now: number
+): Promise<DeviceRuntimeAuth> {
+  const { runtimeId } = runtimeIdentity(env);
   const expiresAt = now + 24 * 60 * 60 * 1000;
   const scopes = runtimeScopes();
   const signingKey = deviceRuntimeSecrets(env).current;
   const token = await signSharingPayload(signingKey.secret, {
     version: CURRENT_MODEL_VERSION,
     service: "device_runtime",
+    runtimeId,
     userId,
     deviceId,
     scopes,
+    issuedAt: now,
     expiresAt,
+    registrationVersion,
     ...(signingKey.keyId ? { keyId: signingKey.keyId } : {})
   });
   return {
     scheme: "bearer",
     token,
+    issuedAt: now,
     expiresAt,
+    runtimeId,
     userId,
     deviceId,
     scopes,
+    registrationVersion,
     keyId: signingKey.keyId
   };
 }
 
 function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
+  const { runtimeId } = runtimeIdentity(env);
   return {
     version: CURRENT_MODEL_VERSION,
+    runtimeId,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
     inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
@@ -208,10 +230,46 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "group_authorization_v2",
         "group_membership_fsm_v2",
         "runtime_secret_rotation_v1",
-        "device_runtime_refresh_v1"
+        "device_runtime_refresh_v2",
+        "device_registry_v1"
       ]
     }
   };
+}
+
+async function validateRegisteredRuntimeAuthorization(
+  request: Request,
+  env: Env,
+  scope: DeviceRuntimeScope,
+  now: number
+): Promise<DeviceRuntimeToken> {
+  const token = await validateAnyDeviceRuntimeAuthorization(request, deviceRuntimeSecrets(env), scope, now);
+  if (token.runtimeId !== runtimeIdentity(env).runtimeId) {
+    throw new HttpError(403, "runtime_mismatch", "runtime token audience does not match this runtime");
+  }
+  await assertRegisteredRuntimeToken(env, token);
+  return token;
+}
+
+async function validateRegisteredRuntimeAuthorizationForDevice(
+  request: Request,
+  env: Env,
+  deviceId: string,
+  scope: DeviceRuntimeScope,
+  now: number
+): Promise<DeviceRuntimeToken> {
+  const token = await validateDeviceRuntimeAuthorizationForDevice(
+    request,
+    deviceRuntimeSecrets(env),
+    deviceId,
+    scope,
+    now
+  );
+  if (token.runtimeId !== runtimeIdentity(env).runtimeId) {
+    throw new HttpError(403, "runtime_mismatch", "runtime token audience does not match this runtime");
+  }
+  await assertRegisteredRuntimeToken(env, token);
+  return token;
 }
 
 async function authorizeSharedStateWrite(
@@ -222,13 +280,19 @@ async function authorizeSharedStateWrite(
   now: number
 ): Promise<void> {
   try {
-    const auth = await validateAnyDeviceRuntimeAuthorization(request, deviceRuntimeSecrets(env), "shared_state_write", now);
+    const auth = await validateRegisteredRuntimeAuthorization(request, env, "shared_state_write", now);
     if (auth.userId !== userId) {
       throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
     }
     return;
   } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "capability_expired") {
+    if (
+      !(error instanceof HttpError) ||
+      error.code === "runtime_auth_expired" ||
+      error.code === "device_revoked" ||
+      error.code === "runtime_mismatch" ||
+      error.code === "enrollment_required"
+    ) {
       throw error;
     }
   }
@@ -239,12 +303,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   try {
     const url = new URL(request.url);
     const sharingSecret = sharedStateSecret(env);
-    const bootstrapLinkSecret = bootstrapSecrets(env).current.secret;
     const runtimeSecret = deviceRuntimeSecrets(env).current.secret;
-    if (sharingSecret === bootstrapLinkSecret) {
-      throw new HttpError(503, "runtime_misconfigured", "runtime secrets must use independent values");
-    }
-    if (env.DEVICE_RUNTIME_SECRET?.trim() && (runtimeSecret === sharingSecret || runtimeSecret === bootstrapLinkSecret)) {
+    if (env.DEVICE_RUNTIME_SECRET?.trim() && runtimeSecret === sharingSecret) {
       throw new HttpError(503, "runtime_misconfigured", "device runtime secret must use an independent value");
     }
     const store = new StorageService(
@@ -282,51 +342,53 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse(bundle);
     }
 
-    if (request.method === "POST" && url.pathname === "/v1/bootstrap/device") {
-      const body = await readJsonLimited<BootstrapDeviceRequest>(request, CONTROL_JSON_MAX_BYTES);
-      if (body.version !== CURRENT_MODEL_VERSION) {
-        throw new HttpError(400, "unsupported_version", "bootstrap request version is not supported");
-      }
-      await validateBootstrapAuthorization(request, bootstrapSecrets(env), body.userId, body.deviceId, now);
-      const bundle: DeploymentBundle = {
-        ...publicDeploymentBundle(request, env),
-        deviceRuntimeAuth: await issueDeviceRuntimeAuth(env, body.userId, body.deviceId, now),
-        expectedUserId: body.userId,
-        expectedDeviceId: body.deviceId
-      };
-      return jsonResponse(bundle);
-    }
-
-    if (request.method === "POST" && url.pathname === "/v1/runtime-auth/challenge") {
+    if (request.method === "POST" && url.pathname === "/v2/runtime-auth/challenge") {
       const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
-      const body = JSON.parse(bodyText) as { userId?: string; deviceId?: string };
-      if (!body.userId || !body.deviceId) {
-        throw new HttpError(400, "invalid_input", "userId and deviceId are required");
+      const body = JSON.parse(bodyText) as { purpose?: "enroll" | "refresh"; userId?: string; deviceId?: string };
+      if ((body.purpose !== "enroll" && body.purpose !== "refresh") || !body.userId || !body.deviceId) {
+        throw new HttpError(400, "runtime_auth_invalid", "purpose, userId and deviceId are required");
       }
-      const stub = env.INBOX.get(env.INBOX.idFromName(body.deviceId));
-      return stub.fetch(new Request(`${url.origin}/v1/inbox/${encodeURIComponent(body.deviceId)}/runtime-auth-challenge`, {
+      return registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/challenge", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: bodyText
       }));
     }
 
-    if (request.method === "POST" && url.pathname === "/v1/runtime-auth/refresh") {
+    if (request.method === "POST" && url.pathname === "/v2/runtime-auth/enroll") {
       const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
-      const proof = JSON.parse(bodyText) as DeviceRuntimeRefreshProof;
+      const proof = JSON.parse(bodyText) as DeviceRuntimeEnrollmentProof;
       const deviceId = proof.challenge?.deviceId;
       const userId = proof.challenge?.userId;
       if (!deviceId || !userId) {
-        throw new HttpError(400, "invalid_input", "refresh proof scope is required");
+        throw new HttpError(400, "runtime_auth_invalid", "enrollment proof scope is required");
       }
-      const stub = env.INBOX.get(env.INBOX.idFromName(deviceId));
-      const verified = await stub.fetch(new Request(`${url.origin}/v1/inbox/${encodeURIComponent(deviceId)}/runtime-auth-refresh`, {
+      const verified = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/enroll", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: bodyText
       }));
       if (!verified.ok) return verified;
-      return jsonResponse({ deviceRuntimeAuth: await issueDeviceRuntimeAuth(env, userId, deviceId, now) });
+      const result = await verified.json<{ registrationVersion: number }>();
+      return jsonResponse({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
+    }
+
+    if (request.method === "POST" && url.pathname === "/v2/runtime-auth/refresh") {
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+      const proof = JSON.parse(bodyText) as DeviceRuntimeRefreshProof;
+      const deviceId = proof.challenge?.deviceId;
+      const userId = proof.challenge?.userId;
+      if (!deviceId || !userId) {
+        throw new HttpError(400, "runtime_auth_invalid", "refresh proof scope is required");
+      }
+      const verified = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/refresh", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: bodyText
+      }));
+      if (!verified.ok) return verified;
+      const result = await verified.json<{ registrationVersion: number }>();
+      return jsonResponse({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
 
     const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
@@ -347,17 +409,17 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         }
         return await stub.fetch(forwarded);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_read", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
       } else if (request.method === "POST" && operation === "ack") {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_ack", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_ack", now);
       } else if (operation === "subscribe") {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_subscribe", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
       } else if (
         operation === "allowlist" ||
         operation === "message-requests" ||
         operation.startsWith("message-requests/")
       ) {
-        await validateDeviceRuntimeAuthorizationForDevice(request, deviceRuntimeSecrets(env), deviceId, "inbox_manage", now);
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
       }
 
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -569,6 +631,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "PUT") {
         await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
         const body = await readJsonLimited<IdentityBundle>(request, CONTROL_JSON_MAX_BYTES);
+        const synchronized = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/sync", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body)
+        }));
+        if (!synchronized.ok) return synchronized;
         await sharedState.putIdentityBundle(userId, body);
         const saved = await sharedState.getIdentityBundle(userId);
         return jsonResponse(saved);
@@ -616,7 +684,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         return jsonResponse(document);
       }
       if (request.method === "PUT") {
-        await validateKeyPackageWriteAuthorization(
+        const authorization = await validateKeyPackageWriteAuthorization(
           request,
           deviceRuntimeSecrets(env),
           userId,
@@ -625,6 +693,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           now,
           sharedStateSecret(env)
         );
+        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
         const body = await readJsonLimited<KeyPackageRefsDocument>(request, CONTROL_JSON_MAX_BYTES);
         await sharedState.putKeyPackageRefs(userId, deviceId, body);
         const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
@@ -650,7 +719,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         });
       }
       if (request.method === "PUT") {
-        await validateKeyPackageWriteAuthorization(
+        const authorization = await validateKeyPackageWriteAuthorization(
           request,
           deviceRuntimeSecrets(env),
           userId,
@@ -659,13 +728,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           now,
           sharedStateSecret(env)
         );
+        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
         await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
         return new Response(null, { status: 204 });
       }
     }
 
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
-      const auth = await validateAnyDeviceRuntimeAuthorization(request, deviceRuntimeSecrets(env), "storage_prepare_upload", now);
+      const auth = await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
       const body = await readJsonLimited<PrepareBlobUploadRequest>(request, CONTROL_JSON_MAX_BYTES);
       const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
       return jsonResponse(result);

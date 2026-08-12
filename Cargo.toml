@@ -13,6 +13,23 @@ publish = false
 name = "tapchat_core"
 path = "src/lib.rs"
 
+[features]
+default = []
+# The retired transport fixture modeled one Worker as several users' runtime.
+# It is retained only to aid historical comparisons and is incompatible with
+# the v3 one-runtime/one-root-identity security model.
+legacy-multi-owner-runtime-tests = []
+
+[[test]]
+name = "desktop_group_e2e"
+path = "tests/desktop_group_e2e.rs"
+required-features = ["legacy-multi-owner-runtime-tests"]
+
+[[test]]
+name = "desktop_message_request_e2e"
+path = "tests/desktop_message_request_e2e.rs"
+required-features = ["legacy-multi-owner-runtime-tests"]
+
 [[bin]]
 name = "tapchat"
 path = "src/main.rs"

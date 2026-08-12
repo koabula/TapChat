@@ -116,7 +116,8 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
 
     let engine = CoreEngine::try_from_restored_state(snapshot)
         .context("restore desktop test profile snapshot")?;
-    let ports = DesktopPlatformPorts::new(inner_lock.clone());
+    let runtime_auth = crate::runtime_auth::RuntimeAuthManager::default();
+    let ports = DesktopPlatformPorts::new(inner_lock.clone(), runtime_auth.clone());
     let (deferred_transport_tx, deferred_transport_rx) = mpsc::channel(128);
 
     Ok(AppState {
@@ -135,6 +136,7 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         deferred_transport_tx,
         deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
         deferred_send_gate: Arc::new(Mutex::new(())),
+        runtime_auth,
     })
 }
 

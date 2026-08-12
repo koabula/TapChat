@@ -1373,7 +1373,8 @@ impl CoreEngine {
             group_id: group_id.to_string(),
             manifest: update.manifest,
             identity_bundles: update.identity_bundles,
-            headers: self.device_runtime_headers()?,
+            headers: BTreeMap::new(),
+            auth: Some(self.device_runtime_auth_requirement()?),
         })
     }
 

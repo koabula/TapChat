@@ -19,7 +19,9 @@ use crate::ffi_api::{
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, RecoveryDiagnostics,
     SyncCheckpointSnapshot,
 };
-use crate::model::{DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus};
+use crate::model::{
+    DeviceRuntimeAuth, DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus,
+};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::platform_ports::{
     execute_platform_effect, BlobIoPort, NotificationPort, PersistencePort, RealtimePort,
@@ -44,6 +46,7 @@ use crate::transport_contract::{
     RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
     RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
     SubmitGroupJoinResult, SubmitGroupLeaveRequest, SubmitGroupLeaveResult,
+    TransportAuthRequirement,
 };
 
 use super::util::{
@@ -62,6 +65,7 @@ pub struct DriverRuntime {
     contact_share_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
+    runtime_credential: Option<DeviceRuntimeAuth>,
 }
 
 pub struct CoreDriver {
@@ -128,6 +132,7 @@ impl CoreDriver {
                 contact_share_url,
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
+                runtime_credential: None,
             },
             suppress_realtime: false,
         })
@@ -135,6 +140,37 @@ impl CoreDriver {
 
     pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
         self.runtime.latest_snapshot.as_ref()
+    }
+
+    pub fn set_runtime_credential(&mut self, credential: Option<DeviceRuntimeAuth>) {
+        self.runtime.runtime_credential = credential;
+    }
+
+    fn inject_runtime_authorization(
+        &self,
+        headers: &mut BTreeMap<String, String>,
+        auth: Option<&TransportAuthRequirement>,
+    ) -> Result<()> {
+        let Some(TransportAuthRequirement::DeviceRuntime {
+            runtime_id,
+            device_id,
+        }) = auth
+        else {
+            return Ok(());
+        };
+        let credential = self
+            .runtime
+            .runtime_credential
+            .as_ref()
+            .ok_or_else(|| anyhow!("runtime credential is not available"))?;
+        if credential.runtime_id != *runtime_id || credential.device_id != *device_id {
+            return Err(anyhow!("runtime credential scope mismatch"));
+        }
+        headers.insert(
+            "Authorization".into(),
+            format!("Bearer {}", credential.token),
+        );
+        Ok(())
     }
 
     pub fn notifications(&self) -> &[String] {
@@ -361,6 +397,25 @@ impl CoreDriver {
         Ok(output)
     }
 
+    /// Applies a command to Core without executing platform effects. This is used
+    /// during runtime enrollment: Core must first materialize the root-signed
+    /// IdentityBundle, while network effects wait until the private runtime
+    /// credential has been obtained and durably stored.
+    pub fn prepare_command(&mut self, command: CoreCommand) -> Result<CoreOutput> {
+        self.suppress_realtime = false;
+        let output = self.engine.handle_command(command)?;
+        self.sync_latest_snapshot();
+        self.record_observed_output(&output);
+        Ok(output)
+    }
+
+    pub async fn execute_prepared_until_idle(&mut self, output: CoreOutput) -> Result<CoreOutput> {
+        let output = self.execute_until_idle(output).await?;
+        self.sync_latest_snapshot();
+        self.record_observed_output(&output);
+        Ok(output)
+    }
+
     pub async fn run_command_until_idle_without_realtime(
         &mut self,
         command: CoreCommand,
@@ -481,8 +536,10 @@ impl CoreDriver {
 
     async fn execute_http_request(
         &mut self,
-        request: crate::ffi_api::HttpRequestEffect,
+        mut request: crate::ffi_api::HttpRequestEffect,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = request.auth.clone();
+        self.inject_runtime_authorization(&mut request.headers, auth.as_ref())?;
         let method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
@@ -594,8 +651,10 @@ impl CoreDriver {
 
     async fn open_realtime(
         &mut self,
-        subscription: RealtimeSubscriptionRequest,
+        mut subscription: RealtimeSubscriptionRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = subscription.auth.clone();
+        self.inject_runtime_authorization(&mut subscription.headers, auth.as_ref())?;
         let endpoint = subscription
             .endpoint
             .replace("{deviceId}", &urlencoding::encode(&subscription.device_id));
@@ -669,8 +728,10 @@ impl CoreDriver {
 
     async fn fetch_message_requests(
         &mut self,
-        fetch: FetchMessageRequestsRequest,
+        mut fetch: FetchMessageRequestsRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = fetch.auth.clone();
+        self.inject_runtime_authorization(&mut fetch.headers, auth.as_ref())?;
         let mut request = self.runtime.client.get(fetch.endpoint);
         for (key, value) in &fetch.headers {
             request = request.header(key, value);
@@ -704,8 +765,10 @@ impl CoreDriver {
 
     async fn act_on_message_request(
         &mut self,
-        action: MessageRequestActionRequest,
+        mut action: MessageRequestActionRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = action.auth.clone();
+        self.inject_runtime_authorization(&mut action.headers, auth.as_ref())?;
         let mut request = self.runtime.client.post(format!(
             "{}/{}/{}",
             action.endpoint.trim_end_matches('/'),
@@ -786,7 +849,12 @@ impl CoreDriver {
         }
     }
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
+    async fn fetch_allowlist(
+        &mut self,
+        mut fetch: FetchAllowlistRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let auth = fetch.auth.clone();
+        self.inject_runtime_authorization(&mut fetch.headers, auth.as_ref())?;
         let mut request = self.runtime.client.get(fetch.endpoint);
         for (key, value) in &fetch.headers {
             request = request.header(key, value);
@@ -813,8 +881,10 @@ impl CoreDriver {
 
     async fn replace_allowlist(
         &mut self,
-        update: ReplaceAllowlistRequest,
+        mut update: ReplaceAllowlistRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = update.auth.clone();
+        self.inject_runtime_authorization(&mut update.headers, auth.as_ref())?;
         let mut request = self.runtime.client.put(update.endpoint);
         for (key, value) in &update.headers {
             request = request.header(key, value);
@@ -850,8 +920,10 @@ impl CoreDriver {
 
     async fn publish_shared_state(
         &mut self,
-        publish: PublishSharedStateRequest,
+        mut publish: PublishSharedStateRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = publish.auth.clone();
+        self.inject_runtime_authorization(&mut publish.headers, auth.as_ref())?;
         let mut request = self.runtime.client.put(publish.reference.clone());
         for (key, value) in &publish.headers {
             request = request.header(key, value);
@@ -888,8 +960,10 @@ impl CoreDriver {
 
     async fn prepare_blob_upload(
         &self,
-        upload: PrepareBlobUploadRequest,
+        mut upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = upload.auth.clone();
+        self.inject_runtime_authorization(&mut upload.headers, auth.as_ref())?;
         let url = self
             .runtime
             .storage_prepare_url
@@ -1213,8 +1287,10 @@ impl TransportPort for CoreDriver {
 
     async fn initialize_group_authorization(
         &mut self,
-        initialize: InitializeGroupAuthorizationRequest,
+        mut initialize: InitializeGroupAuthorizationRequest,
     ) -> Result<Vec<CoreEvent>> {
+        let auth = initialize.auth.clone();
+        self.inject_runtime_authorization(&mut initialize.headers, auth.as_ref())?;
         let base = self
             .engine
             .refresh_snapshot()

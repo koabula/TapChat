@@ -1,265 +1,453 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
-use tapchat_core::cli::runtime::bootstrap_device_bundle_with_key_id;
+use serde::Deserialize;
+use tapchat_core::identity::LocalIdentityState;
 use tapchat_core::model::{
-    DeploymentBundle, DeviceRuntimeAuth, DeviceRuntimeRefreshChallenge, DeviceRuntimeRefreshProof,
+    DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceRuntimeRefreshChallenge,
+    DeviceRuntimeRefreshProof, IdentityBundle, Validate,
 };
-use tapchat_core::persistence::PersistedDeployment;
-use tapchat_core::CoreCommand;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::platform::log_sanitize::redact_id;
 use crate::platform::profile::ProfileManager;
 use crate::state::AppState;
 
-const DEVICE_RUNTIME_REFRESH_SKEW_MS: u64 = 5 * 60 * 1000;
+pub const DEVICE_RUNTIME_REFRESH_SKEW_MS: u64 = 6 * 60 * 60 * 1000;
+const DEVICE_RUNTIME_TOKEN_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RefreshReason {
-    MissingAuth,
-    Expired,
-    ExpiringSoon,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAuthState {
+    Ready,
+    Refreshing,
+    Degraded,
+    OfflineExpired,
+    UpgradeRequired,
+    EnrollmentRequired,
+    DeviceRevoked,
 }
 
-fn refresh_reason(expires_at: Option<u64>, now_ms: u64) -> Option<RefreshReason> {
-    match expires_at {
-        None => Some(RefreshReason::MissingAuth),
-        Some(value) if value <= now_ms => Some(RefreshReason::Expired),
-        Some(value) if value <= now_ms.saturating_add(DEVICE_RUNTIME_REFRESH_SKEW_MS) => {
-            Some(RefreshReason::ExpiringSoon)
+#[derive(Debug, Clone)]
+pub struct RuntimeAuthSnapshot {
+    pub state: RuntimeAuthState,
+    pub expires_at: Option<u64>,
+    pub error_code: Option<String>,
+    pub retryable: bool,
+    pub next_retry_at: Option<u64>,
+}
+
+impl Default for RuntimeAuthSnapshot {
+    fn default() -> Self {
+        Self {
+            state: RuntimeAuthState::Ready,
+            expires_at: None,
+            error_code: None,
+            retryable: false,
+            next_retry_at: None,
         }
-        Some(_) => None,
     }
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimeAuthManager {
+    gate: Arc<Mutex<()>>,
+    generation: Arc<AtomicU64>,
+    failure_count: Arc<AtomicU64>,
+    retry_at_ms: Arc<AtomicU64>,
+    snapshot: Arc<RwLock<RuntimeAuthSnapshot>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProofPurpose {
+    Enroll,
+    Refresh,
+}
+
+impl ProofPurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enroll => "enroll",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CredentialResponse {
+    runtime_credential: DeviceRuntimeAuth,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorResponse {
+    error: Option<String>,
 }
 
 fn now_ms() -> Result<u64> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock before unix epoch")?;
-    let millis = duration.as_millis();
-    u64::try_from(millis).context("current time does not fit in u64")
+    u64::try_from(duration.as_millis()).context("current time does not fit in u64")
 }
 
-async fn refresh_device_runtime_auth_with_proof(
-    base_url: &str,
-    user_id: &str,
-    device_id: &str,
-    identity: &tapchat_core::identity::LocalIdentityState,
-) -> Result<DeviceRuntimeAuth> {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RefreshResponse {
-        device_runtime_auth: DeviceRuntimeAuth,
-    }
+pub fn runtime_credential_needs_refresh(credential: Option<&DeviceRuntimeAuth>, now: u64) -> bool {
+    credential
+        .is_none_or(|value| value.expires_at <= now.saturating_add(DEVICE_RUNTIME_REFRESH_SKEW_MS))
+}
 
+fn runtime_error(code: &str) -> anyhow::Error {
+    anyhow!("runtime_auth_error:{code}")
+}
+
+fn runtime_error_code(error: &anyhow::Error) -> String {
+    error
+        .to_string()
+        .strip_prefix("runtime_auth_error:")
+        .unwrap_or("temporary_unavailable")
+        .to_string()
+}
+
+async fn decode_runtime_error(response: reqwest::Response, stage: &str) -> anyhow::Error {
+    let status = response.status();
+    let code = response
+        .json::<ErrorResponse>()
+        .await
+        .ok()
+        .and_then(|body| body.error)
+        .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+    log::warn!(
+        "runtime authorization request failed: stage={} code={} retryable={}",
+        stage,
+        code,
+        status.is_server_error() || status.as_u16() == 429
+    );
+    runtime_error(&code)
+}
+
+async fn request_runtime_credential(
+    deployment: &DeploymentBundle,
+    identity: &LocalIdentityState,
+    purpose: ProofPurpose,
+    device: Option<&DeviceContactProfile>,
+) -> Result<DeviceRuntimeAuth> {
+    let user_id = &identity.user_identity.user_id;
+    let device_id = &identity.device_identity.device_id;
+    let base_url = deployment.inbox_http_endpoint.trim_end_matches('/');
     let client = reqwest::Client::builder()
         .build()
-        .context("build runtime refresh client")?;
-    let base_url = base_url.trim_end_matches('/');
-    let challenge = client
-        .post(format!("{base_url}/v1/runtime-auth/challenge"))
+        .context("build runtime authorization client")?;
+
+    let response = client
+        .post(format!("{base_url}/v2/runtime-auth/challenge"))
         .json(&serde_json::json!({
+            "purpose": purpose.as_str(),
             "userId": user_id,
             "deviceId": device_id,
         }))
         .send()
         .await
-        .context("request runtime auth challenge")?
-        .error_for_status()
-        .context("runtime auth challenge rejected")?
+        .context("request runtime authorization challenge")?;
+    if !response.status().is_success() {
+        return Err(decode_runtime_error(response, "challenge").await);
+    }
+    let challenge = response
         .json::<DeviceRuntimeRefreshChallenge>()
         .await
-        .context("decode runtime auth challenge")?;
-    if challenge.user_id != user_id
-        || challenge.device_id != device_id
+        .context("decode runtime authorization challenge")?;
+    if challenge.version != tapchat_core::model::CURRENT_MODEL_VERSION
+        || challenge.purpose != purpose.as_str()
+        || challenge.runtime_id != deployment.runtime_id
+        || challenge.user_id != *user_id
+        || challenge.device_id != *device_id
         || challenge.expires_at <= now_ms()?
-        || challenge.origin != url::Url::parse(base_url)?.origin().ascii_serialization()
     {
-        return Err(anyhow!("runtime auth challenge scope is invalid"));
+        return Err(runtime_error("runtime_mismatch"));
     }
     let proof = DeviceRuntimeRefreshProof {
         signature: identity.sign_sender_proof(challenge.signing_payload().as_bytes()),
         challenge,
     };
+    let (endpoint, body) = match (purpose, device) {
+        (ProofPurpose::Enroll, Some(device)) => (
+            "enroll",
+            serde_json::json!({
+                "challenge": proof.challenge,
+                "signature": proof.signature,
+                "device": device,
+            }),
+        ),
+        (ProofPurpose::Refresh, None) => (
+            "refresh",
+            serde_json::to_value(&proof).context("encode runtime refresh proof")?,
+        ),
+        _ => return Err(anyhow!("invalid runtime authorization proof inputs")),
+    };
     let response = client
-        .post(format!("{base_url}/v1/runtime-auth/refresh"))
-        .json(&proof)
+        .post(format!("{base_url}/v2/runtime-auth/{endpoint}"))
+        .json(&body)
         .send()
         .await
-        .context("submit runtime auth refresh proof")?
-        .error_for_status()
-        .context("runtime auth refresh proof rejected")?
-        .json::<RefreshResponse>()
+        .with_context(|| format!("submit runtime authorization {endpoint} proof"))?;
+    if !response.status().is_success() {
+        return Err(decode_runtime_error(response, endpoint).await);
+    }
+    let credential = response
+        .json::<CredentialResponse>()
         .await
-        .context("decode refreshed runtime auth")?;
-    Ok(response.device_runtime_auth)
+        .context("decode runtime credential")?
+        .runtime_credential;
+    credential
+        .validate()
+        .context("validate runtime credential")?;
+    if credential.runtime_id != deployment.runtime_id
+        || credential.user_id != *user_id
+        || credential.device_id != *device_id
+        || credential.expires_at.saturating_sub(credential.issued_at) != DEVICE_RUNTIME_TOKEN_TTL_MS
+    {
+        return Err(runtime_error("runtime_mismatch"));
+    }
+    Ok(credential)
 }
 
-pub async fn ensure_fresh_device_runtime_auth(
-    profile_manager: &ProfileManager,
-) -> Result<Option<DeploymentBundle>> {
-    let (
-        base_url,
-        bootstrap_secret,
-        bootstrap_key_id,
-        user_id,
-        device_id,
-        reason,
-        mut current_bundle,
-        local_identity,
-    ) = {
-        let inner = profile_manager.inner.read().await;
-        let profile = match inner.active_profile.as_ref() {
-            Some(profile) => profile,
-            None => return Ok(None),
-        };
-
-        let runtime = profile
-            .load_runtime_metadata()
-            .context("load runtime metadata for device runtime refresh")?;
-        let snapshot = profile
-            .load_snapshot()
-            .context("load snapshot for device runtime refresh")?;
-        let deployment = match snapshot.deployment.as_ref() {
-            Some(deployment) => deployment,
-            None => return Ok(None),
-        };
-
-        let Some(base_url) = runtime.public_base_url.clone().or(runtime.base_url.clone()) else {
-            return Ok(None);
-        };
-        let Some(bootstrap_secret) = runtime.bootstrap_secret.clone() else {
-            return Ok(None);
-        };
-        let bootstrap_key_id = profile
-            .load_runtime_secrets()
-            .context("load private runtime secrets for device runtime refresh")?
-            .bootstrap_key_id;
-        let user_id = profile
-            .metadata()
-            .user_id
-            .clone()
-            .or_else(|| {
-                snapshot
-                    .local_identity
-                    .as_ref()
-                    .map(|identity| identity.state.user_identity.user_id.clone())
-            })
-            .ok_or_else(|| anyhow!("active profile missing user_id for device runtime refresh"))?;
-        let device_id = profile
-            .metadata()
-            .device_id
-            .clone()
-            .or_else(|| {
-                snapshot
-                    .local_identity
-                    .as_ref()
-                    .map(|identity| identity.state.device_identity.device_id.clone())
-            })
-            .ok_or_else(|| {
-                anyhow!("active profile missing device_id for device runtime refresh")
-            })?;
-        let expires_at = deployment
-            .deployment_bundle
-            .device_runtime_auth
-            .as_ref()
-            .map(|auth| auth.expires_at);
-        let Some(reason) = refresh_reason(expires_at, now_ms()?) else {
-            return Ok(None);
-        };
-
-        let local_identity = snapshot
-            .local_identity
-            .as_ref()
-            .map(|identity| identity.state.clone())
-            .ok_or_else(|| anyhow!("active profile missing local identity for runtime refresh"))?;
-        (
-            base_url,
-            bootstrap_secret,
-            bootstrap_key_id,
-            user_id,
-            device_id,
-            reason,
-            deployment.deployment_bundle.clone(),
-            local_identity,
-        )
-    };
-
-    log::info!(
-        "device runtime auth refresh needed: reason={:?} user_id={} device_id={}",
-        reason,
-        redact_id("user", &user_id),
-        redact_id("device", &device_id)
-    );
-
-    let refreshed_bundle = if current_bundle
-        .runtime_config
-        .features
-        .iter()
-        .any(|feature| feature == "device_runtime_refresh_v1")
-    {
-        current_bundle.device_runtime_auth = Some(
-            refresh_device_runtime_auth_with_proof(
-                &base_url,
-                &user_id,
-                &device_id,
-                &local_identity,
-            )
-            .await
-            .context("refresh device runtime auth with device proof")?,
-        );
-        current_bundle
-    } else {
-        bootstrap_device_bundle_with_key_id(
-            &base_url,
-            &bootstrap_secret,
-            bootstrap_key_id.as_deref(),
-            &user_id,
-            &device_id,
-        )
-        .await
-        .context("refresh legacy device runtime auth")?
-    };
-
-    {
-        let mut inner = profile_manager.inner.write().await;
-        let profile = inner
-            .active_profile
-            .as_mut()
-            .ok_or_else(|| anyhow!("active profile disappeared during device runtime refresh"))?;
-        let mut snapshot = profile
-            .load_snapshot()
-            .context("reload snapshot during device runtime refresh")?;
-
-        if let Some(deployment) = snapshot.deployment.as_mut() {
-            deployment.deployment_bundle = refreshed_bundle.clone();
-        } else {
-            snapshot.deployment = Some(PersistedDeployment {
-                deployment_bundle: refreshed_bundle.clone(),
-                local_bundle: None,
-                published_key_package: None,
-                serialized_mls_bootstrap_state: None,
-            });
-        }
-
-        profile
-            .save_deployment_bundle(&refreshed_bundle)
-            .context("persist refreshed deployment bundle")?;
-        profile
-            .save_snapshot(&snapshot)
-            .context("persist snapshot with refreshed deployment bundle")?;
+impl RuntimeAuthManager {
+    pub fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    log::info!(
-        "device runtime auth refreshed successfully for user_id={} device_id={} expires_at={}",
-        redact_id("user", &user_id),
-        redact_id("device", &device_id),
-        refreshed_bundle
-            .device_runtime_auth
-            .as_ref()
-            .map(|auth| auth.expires_at.to_string())
-            .unwrap_or_else(|| "none".into())
-    );
+    pub async fn snapshot(&self) -> RuntimeAuthSnapshot {
+        self.snapshot.read().await.clone()
+    }
 
-    Ok(Some(refreshed_bundle))
+    async fn set_snapshot(&self, snapshot: RuntimeAuthSnapshot) {
+        *self.snapshot.write().await = snapshot;
+    }
+
+    pub async fn ensure(
+        &self,
+        profile_manager: &ProfileManager,
+        force: bool,
+    ) -> Result<Option<DeviceRuntimeAuth>> {
+        let _guard = self.gate.lock().await;
+        let generation = self.generation.load(Ordering::SeqCst);
+        let (profile_path, deployment, identity_bundle, identity, current) = {
+            let inner = profile_manager.inner.read().await;
+            let Some(profile) = inner.active_profile.as_ref() else {
+                return Ok(None);
+            };
+            let snapshot = profile
+                .load_snapshot()
+                .context("load snapshot for runtime authorization")?;
+            let Some(persisted_deployment) = snapshot.deployment else {
+                return Ok(None);
+            };
+            let deployment = persisted_deployment.deployment_bundle;
+            if !deployment
+                .runtime_config
+                .features
+                .iter()
+                .any(|feature| feature == "device_runtime_refresh_v2")
+            {
+                self.set_snapshot(RuntimeAuthSnapshot {
+                    state: RuntimeAuthState::UpgradeRequired,
+                    error_code: Some("upgrade_required".into()),
+                    ..RuntimeAuthSnapshot::default()
+                })
+                .await;
+                return Err(runtime_error("upgrade_required"));
+            }
+            let identity = snapshot
+                .local_identity
+                .map(|value| value.state)
+                .ok_or_else(|| runtime_error("enrollment_required"))?;
+            let identity_bundle = persisted_deployment
+                .local_bundle
+                .ok_or_else(|| runtime_error("enrollment_required"))?;
+            (
+                profile.root().to_path_buf(),
+                deployment,
+                identity_bundle,
+                identity,
+                profile
+                    .load_runtime_credential()
+                    .context("load private runtime credential")?,
+            )
+        };
+        let now = now_ms()?;
+        let retry_at = self.retry_at_ms.load(Ordering::SeqCst);
+        if !force && retry_at > now {
+            let expired = current.as_ref().is_none_or(|value| value.expires_at <= now);
+            self.set_snapshot(RuntimeAuthSnapshot {
+                state: if expired {
+                    RuntimeAuthState::OfflineExpired
+                } else {
+                    RuntimeAuthState::Degraded
+                },
+                expires_at: current.as_ref().map(|value| value.expires_at),
+                error_code: Some("temporary_unavailable".into()),
+                retryable: true,
+                next_retry_at: Some(retry_at),
+            })
+            .await;
+            if expired {
+                return Err(runtime_error("temporary_unavailable"));
+            }
+            return Ok(current);
+        }
+        if !force && !runtime_credential_needs_refresh(current.as_ref(), now) {
+            self.set_snapshot(RuntimeAuthSnapshot {
+                state: RuntimeAuthState::Ready,
+                expires_at: current.as_ref().map(|value| value.expires_at),
+                ..RuntimeAuthSnapshot::default()
+            })
+            .await;
+            return Ok(current);
+        }
+        self.set_snapshot(RuntimeAuthSnapshot {
+            state: RuntimeAuthState::Refreshing,
+            expires_at: current.as_ref().map(|value| value.expires_at),
+            ..RuntimeAuthSnapshot::default()
+        })
+        .await;
+        log::info!(
+            "runtime authorization refresh started: runtime_id={} device_id={}",
+            redact_id("runtime", &deployment.runtime_id),
+            redact_id("device", &identity.device_identity.device_id)
+        );
+        let local_device = identity_bundle
+            .devices
+            .iter()
+            .find(|device| device.device_id == identity.device_identity.device_id)
+            .ok_or_else(|| runtime_error("enrollment_required"))?;
+        let mut refreshed = if current.is_none() {
+            request_runtime_credential(
+                &deployment,
+                &identity,
+                ProofPurpose::Enroll,
+                Some(local_device),
+            )
+            .await
+        } else {
+            request_runtime_credential(&deployment, &identity, ProofPurpose::Refresh, None).await
+        };
+        if refreshed
+            .as_ref()
+            .is_err_and(|error| runtime_error_code(error) == "enrollment_required")
+        {
+            refreshed = request_runtime_credential(
+                &deployment,
+                &identity,
+                ProofPurpose::Enroll,
+                Some(local_device),
+            )
+            .await;
+        }
+        let refreshed = match refreshed {
+            Ok(value) => value,
+            Err(error) => {
+                let code = runtime_error_code(&error);
+                let expired = current.as_ref().is_none_or(|value| value.expires_at <= now);
+                let state = match code.as_str() {
+                    "device_revoked" => RuntimeAuthState::DeviceRevoked,
+                    "enrollment_required" => RuntimeAuthState::EnrollmentRequired,
+                    _ if expired => RuntimeAuthState::OfflineExpired,
+                    _ => RuntimeAuthState::Degraded,
+                };
+                let retryable = matches!(
+                    state,
+                    RuntimeAuthState::Degraded | RuntimeAuthState::OfflineExpired
+                ) && !matches!(
+                    code.as_str(),
+                    "runtime_mismatch" | "runtime_auth_invalid" | "challenge_replayed"
+                );
+                let next_retry_at = if retryable {
+                    let failure = self.failure_count.fetch_add(1, Ordering::SeqCst);
+                    let delay_minutes = match failure {
+                        0 => 1,
+                        1 => 5,
+                        2 => 15,
+                        _ => 60,
+                    };
+                    let retry_at = now.saturating_add(delay_minutes * 60 * 1000);
+                    self.retry_at_ms.store(retry_at, Ordering::SeqCst);
+                    Some(retry_at)
+                } else {
+                    self.retry_at_ms.store(0, Ordering::SeqCst);
+                    None
+                };
+                self.set_snapshot(RuntimeAuthSnapshot {
+                    state,
+                    expires_at: current.as_ref().map(|value| value.expires_at),
+                    error_code: Some(code),
+                    retryable,
+                    next_retry_at,
+                })
+                .await;
+                if !expired {
+                    return Ok(current);
+                }
+                return Err(error);
+            }
+        };
+        self.failure_count.store(0, Ordering::SeqCst);
+        self.retry_at_ms.store(0, Ordering::SeqCst);
+        {
+            let inner = profile_manager.inner.write().await;
+            let profile = inner
+                .active_profile
+                .as_ref()
+                .ok_or_else(|| anyhow!("active profile disappeared during runtime refresh"))?;
+            if profile.root() != profile_path
+                || self.generation.load(Ordering::SeqCst) != generation
+            {
+                return Err(anyhow!(
+                    "runtime refresh result belongs to a stale profile generation"
+                ));
+            }
+            profile
+                .save_runtime_credential(Some(refreshed.clone()))
+                .context("atomically persist refreshed runtime credential")?;
+        }
+        self.set_snapshot(RuntimeAuthSnapshot {
+            state: RuntimeAuthState::Ready,
+            expires_at: Some(refreshed.expires_at),
+            ..RuntimeAuthSnapshot::default()
+        })
+        .await;
+        log::info!(
+            "runtime authorization refreshed: runtime_id={} device_id={} expires_at={}",
+            redact_id("runtime", &refreshed.runtime_id),
+            redact_id("device", &refreshed.device_id),
+            refreshed.expires_at
+        );
+        Ok(Some(refreshed))
+    }
+
+    pub async fn enroll(
+        &self,
+        profile_manager: &ProfileManager,
+        deployment: &DeploymentBundle,
+        identity_bundle: &IdentityBundle,
+        identity: &LocalIdentityState,
+    ) -> Result<DeviceRuntimeAuth> {
+        let device = identity_bundle
+            .devices
+            .iter()
+            .find(|device| device.device_id == identity.device_identity.device_id)
+            .ok_or_else(|| runtime_error("enrollment_required"))?;
+        let credential =
+            request_runtime_credential(deployment, identity, ProofPurpose::Enroll, Some(device))
+                .await?;
+        let inner = profile_manager.inner.read().await;
+        let profile = inner
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| anyhow!("active profile disappeared during enrollment"))?;
+        profile
+            .save_runtime_credential(Some(credential.clone()))
+            .context("atomically persist enrolled runtime credential")?;
+        Ok(credential)
+    }
 }
 
 pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Result<bool> {
@@ -267,35 +455,11 @@ pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Res
         let inner = state.inner.read().await;
         inner.profile_manager.clone()
     };
-    let refreshed = { ensure_fresh_device_runtime_auth(&profile_manager).await? };
-
-    let Some(bundle) = refreshed else {
-        return Ok(false);
-    };
-
-    let mut inner = state.inner.write().await;
-    let _ = inner
-        .engine
-        .handle_command(CoreCommand::ImportDeploymentBundle {
-            bundle: bundle.clone(),
-        })
-        .context("import refreshed deployment bundle into engine")?;
-
-    let snapshot = inner.engine.refresh_snapshot();
-    {
-        let mut pm_inner = profile_manager.inner.write().await;
-        let profile = pm_inner.active_profile.as_mut().ok_or_else(|| {
-            anyhow!("active profile disappeared while updating engine runtime auth")
-        })?;
-        profile
-            .save_snapshot(&snapshot)
-            .context("persist refreshed engine snapshot")?;
-        profile
-            .save_deployment_bundle(&bundle)
-            .context("persist refreshed deployment bundle after engine import")?;
-    }
-
-    Ok(true)
+    Ok(state
+        .runtime_auth
+        .ensure(&profile_manager, false)
+        .await?
+        .is_some())
 }
 
 #[cfg(test)]
@@ -303,17 +467,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refresh_reason_requires_refresh_for_missing_or_expired_tokens() {
-        let now = 1_000_000_u64;
-        assert_eq!(refresh_reason(None, now), Some(RefreshReason::MissingAuth));
-        assert_eq!(
-            refresh_reason(Some(now.saturating_sub(1)), now),
-            Some(RefreshReason::Expired)
-        );
-        assert_eq!(
-            refresh_reason(Some(now + 60_000), now),
-            Some(RefreshReason::ExpiringSoon)
-        );
-        assert_eq!(refresh_reason(Some(now + 10_000_000), now), None);
+    fn refresh_window_is_six_hours() {
+        let now = 1_000_000;
+        let credential = DeviceRuntimeAuth {
+            scheme: "bearer".into(),
+            token: "secret".into(),
+            issued_at: now,
+            expires_at: now + DEVICE_RUNTIME_REFRESH_SKEW_MS,
+            runtime_id: "runtime".into(),
+            user_id: "user".into(),
+            device_id: "device".into(),
+            scopes: vec!["inbox_read".into()],
+            registration_version: 1,
+            key_id: Some("current".into()),
+        };
+        assert!(runtime_credential_needs_refresh(Some(&credential), now));
     }
 }

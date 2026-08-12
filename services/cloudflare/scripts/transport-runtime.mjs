@@ -3,7 +3,13 @@ import { unstable_dev } from "wrangler";
 const port = Number(process.env.TAPCHAT_TRANSPORT_PORT ?? "0");
 const persistTo = process.env.TAPCHAT_TRANSPORT_PERSIST_TO;
 const sharingSecret = process.env.TAPCHAT_TRANSPORT_SHARING_SECRET ?? "transport-sharing-secret-0123456789abcdef0123456789abcdef";
-const bootstrapSecret = process.env.TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET ?? "transport-bootstrap-secret-0123456789abcdef0123456789abcdef";
+const runtimeSecret = process.env.TAPCHAT_TRANSPORT_RUNTIME_SECRET ?? "transport-runtime-secret-0123456789abcdef0123456789abcdef";
+const runtimeId = process.env.TAPCHAT_TRANSPORT_RUNTIME_ID;
+const ownerUserId = process.env.TAPCHAT_TRANSPORT_OWNER_USER_ID;
+const ownerUserPublicKey = process.env.TAPCHAT_TRANSPORT_OWNER_USER_PUBLIC_KEY;
+if (!runtimeId || !ownerUserId || !ownerUserPublicKey) {
+  throw new Error("local runtime requires runtime id and owner identity variables");
+}
 const maxInlineBytes = process.env.MAX_INLINE_BYTES;
 const retentionDays = process.env.RETENTION_DAYS;
 const rateLimitPerMinute = process.env.RATE_LIMIT_PER_MINUTE;
@@ -20,9 +26,13 @@ const worker = await unstable_dev("src/index.ts", {
   logLevel: "error",
   vars: {
     PUBLIC_BASE_URL: baseUrl,
+    RUNTIME_ID: runtimeId,
+    OWNER_USER_ID: ownerUserId,
+    OWNER_USER_PUBLIC_KEY: ownerUserPublicKey,
     DEPLOYMENT_REGION: "local-transport",
     SHARING_INTERNAL_SECRET: sharingSecret,
-    BOOTSTRAP_LINK_SECRET: bootstrapSecret,
+    DEVICE_RUNTIME_SECRET: runtimeSecret,
+    DEVICE_RUNTIME_SECRET_KEY_ID: "local-runtime-current",
     ...(maxInlineBytes ? { MAX_INLINE_BYTES: maxInlineBytes } : {}),
     ...(retentionDays ? { RETENTION_DAYS: retentionDays } : {}),
     ...(rateLimitPerMinute ? { RATE_LIMIT_PER_MINUTE: rateLimitPerMinute } : {}),
@@ -41,7 +51,7 @@ const metadata = {
   baseUrl,
   websocketBaseUrl: baseUrl.replace(/^http/i, "ws"),
   sharingSecret,
-  bootstrapSecret
+  runtimeId
 };
 process.stdout.write(`${JSON.stringify(metadata)}\n`);
 
