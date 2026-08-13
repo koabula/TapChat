@@ -346,6 +346,7 @@ pub fn run() {
             commands::utility::show_notification,
             commands::utility::write_temp_file,
             commands::utility::get_file_metadata,
+            commands::utility::get_local_image_thumbnail,
             commands::utility::set_debug_mode,
             commands::utility::get_debug_mode,
             // Attachment settings

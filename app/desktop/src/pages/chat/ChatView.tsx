@@ -69,6 +69,7 @@ export default function ChatView() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchIndex, setSearchIndex] = useState(-1);
+  const [autoDownloadMedia, setAutoDownloadMedia] = useState(true);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -156,6 +157,20 @@ export default function ChatView() {
     closeSearch();
     messageRefs.current.clear();
   }, [closeSearch, conversationId, isGroup]);
+
+  useEffect(() => {
+    let mounted = true;
+    void invoke<{ auto_download_media: boolean }>("get_attachment_settings")
+      .then((settings) => {
+        if (mounted) setAutoDownloadMedia(settings.auto_download_media);
+      })
+      .catch(() => {
+        // Keep the default when the private setting is temporarily unavailable.
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [conversationId]);
 
   useEffect(() => {
     if (isGroup) return;
@@ -780,6 +795,7 @@ export default function ChatView() {
         {imageItems.length > 0 && (
           <ImageGrid
             items={imageItems}
+            autoDownloadMedia={autoDownloadMedia}
             onImageClick={(index) => openMedia(imageItems[index])}
           />
         )}

@@ -91,6 +91,9 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   const deploymentResponse = await mf.dispatchFetch(`${BASE_URL}/v1/deployment-bundle`);
   assert.equal(deploymentResponse.status, 200);
   const deployment = (await deploymentResponse.json()) as DeploymentBundle;
+  const readyResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/ready`);
+  assert.equal(readyResponse.status, 200);
+  assert.deepEqual(await readyResponse.json(), { ready: true, runtimeId: RUNTIME_ID });
   const challengeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/challenge`, {
     method: "POST",
     headers: { "content-type": "application/json" },

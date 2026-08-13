@@ -55,6 +55,34 @@ pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
     Ok(FileMetadata { size, mime_type })
 }
 
+/// Generate a small local-only image preview for the composer. The original
+/// file is never rewritten and remains the input to attachment encryption.
+#[tauri::command]
+pub async fn get_local_image_thumbnail(path: String) -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(move || {
+        use image::ImageReader;
+
+        let image = match ImageReader::open(&path)
+            .map_err(|error| format!("Failed to open image preview: {error}"))?
+            .decode()
+        {
+            Ok(image) => image,
+            Err(_) => return Ok(None),
+        };
+        let thumbnail = image.resize(320, 320, image::imageops::FilterType::Lanczos3);
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        thumbnail
+            .write_to(&mut buffer, image::ImageFormat::Jpeg)
+            .map_err(|error| format!("Failed to encode image preview: {error}"))?;
+        Ok(Some(format!(
+            "data:image/jpeg;base64,{}",
+            BASE64.encode(buffer.into_inner())
+        )))
+    })
+    .await
+    .map_err(|error| format!("Image preview task failed: {error}"))?
+}
+
 fn infer_mime_type(path: &str) -> String {
     let ext = std::path::Path::new(path)
         .extension()

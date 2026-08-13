@@ -2670,6 +2670,9 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
     try {
       const url = new URL(request.url);
       const now = Date.now();
+      if (request.method === "GET" && url.pathname.endsWith("/ready")) {
+        return await this.ready();
+      }
       if (request.method === "POST" && url.pathname.endsWith("/challenge")) {
         return await this.issueChallenge(request, now);
       }
@@ -2692,6 +2695,11 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
       }
       return jsonResponse({ error: "temporary_unavailable", message: "device registry request failed" }, 500);
     }
+  }
+  async ready() {
+    const config = runtimeConfig(this.envRef);
+    await this.stateRef.storage.get("__runtime_registry_ready__");
+    return jsonResponse({ ready: true, runtimeId: config.runtimeId });
   }
   async issueChallenge(request, now) {
     const config = runtimeConfig(this.envRef);
@@ -6504,6 +6512,18 @@ async function handleRequest(request, env) {
     if (request.method === "GET" && url.pathname === "/v1/deployment-bundle") {
       return jsonResponse4(publicDeploymentBundle(request, env));
     }
+    if (request.method === "GET" && url.pathname === "/v2/runtime-auth/ready") {
+      try {
+        return await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/ready")
+        );
+      } catch {
+        return jsonResponse4(
+          { error: "temporary_unavailable", message: "device registry is not ready" },
+          503
+        );
+      }
+    }
     const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
     if (contactShareMatch && request.method === "GET") {
       const token = decodeURIComponent(contactShareMatch[1]);
@@ -6523,11 +6543,18 @@ async function handleRequest(request, env) {
       if (body.purpose !== "enroll" && body.purpose !== "refresh" || !body.userId || !body.deviceId) {
         throw new HttpError(400, "runtime_auth_invalid", "purpose, userId and deviceId are required");
       }
-      return registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/challenge", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: bodyText
-      }));
+      try {
+        return await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/challenge", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText
+        }));
+      } catch {
+        return jsonResponse4(
+          { error: "temporary_unavailable", message: "device registry is not ready" },
+          503
+        );
+      }
     }
     if (request.method === "POST" && url.pathname === "/v2/runtime-auth/enroll") {
       const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
@@ -6973,7 +7000,13 @@ var index_default = {
         logServerFailure(request, response.status);
       }
       return response;
-    } catch {
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "worker_unhandled_failure",
+        route_family: routeFamilyForObservability(request.url),
+        method: request.method,
+        error_type: error instanceof Error ? error.name : "unknown"
+      }));
       logServerFailure(request, 500);
       return Response.json({ error: "internal_error" }, { status: 500 });
     }

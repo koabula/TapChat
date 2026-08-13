@@ -42,7 +42,13 @@ export default {
         logServerFailure(request, response.status);
       }
       return response;
-    } catch {
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: "worker_unhandled_failure",
+        route_family: routeFamilyForObservability(request.url),
+        method: request.method,
+        error_type: error instanceof Error ? error.name : "unknown"
+      }));
       logServerFailure(request, 500);
       return Response.json({ error: "internal_error" }, { status: 500 });
     }

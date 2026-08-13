@@ -357,6 +357,9 @@ class FakeDeviceRegistryStub {
     const path = new URL(request.url).pathname;
     const body = request.method === "POST" ? await request.json() as Record<string, any> : {};
     const config = this.config();
+    if (path.endsWith("/ready")) {
+      return Response.json({ ready: true, runtimeId: config.runtimeId });
+    }
     if (path.endsWith("/challenge")) {
       if (body.userId !== config.userId || (body.purpose !== "enroll" && body.purpose !== "refresh")) {
         return Response.json({ error: "runtime_auth_invalid" }, { status: 400 });
@@ -1112,6 +1115,27 @@ async function setAllowlist(env: Env, token: string, deviceId: string, allowedSe
   assert.equal(response.status, 200);
   return (await response.json()) as AllowlistDocument;
 }
+
+test("runtime readiness checks the device registry and reports its audience", async () => {
+  const { env } = createEnv();
+  const response = await handleRequest(
+    new Request("https://example.com/v2/runtime-auth/ready"),
+    env
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ready: true, runtimeId: "runtime:test" });
+});
+
+test("runtime readiness reports a retryable error while the registry binding propagates", async () => {
+  const { env } = createEnv();
+  delete (env as unknown as Record<string, unknown>).DEVICE_REGISTRY;
+  const response = await handleRequest(
+    new Request("https://example.com/v2/runtime-auth/ready"),
+    env
+  );
+  assert.equal(response.status, 503);
+  assert.equal((await response.json() as { error: string }).error, "temporary_unavailable");
+});
 
 test("issues device deployment bundle with runtime auth and security features", async () => {
   const { env } = createEnv();

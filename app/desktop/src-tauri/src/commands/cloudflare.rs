@@ -25,6 +25,7 @@ use crate::commands::cloudflare_rest::{
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::sanitize_url_for_log;
+use crate::runtime_auth::wait_for_runtime_registry;
 use crate::state::AppState;
 use crate::state::SessionState;
 use crate::timetest;
@@ -809,18 +810,6 @@ pub async fn cloudflare_deploy(
         .await
         .map_err(|e| format!("Deployment not ready: {}", e))?;
 
-    // Wait for secrets to propagate in Worker environment
-    // Cloudflare Workers secrets need additional time to become available
-    let _ = app.emit(
-        "cloudflare-progress",
-        DeployProgress {
-            phase: DeployPhase::VerifyingDeployment,
-            message: "Waiting for secrets to propagate...".into(),
-            progress_percent: 88,
-        },
-    );
-    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
     // Fetch the public deployment descriptor, build the root-signed local
     // IdentityBundle, then enroll the current device with its long-lived key.
     let _ = app.emit(
@@ -845,6 +834,18 @@ pub async fn cloudflare_deploy(
         .json::<DeploymentBundle>()
         .await
         .map_err(|error| format!("Decode deployment descriptor failed: {error}"))?;
+
+    let _ = app.emit(
+        "cloudflare-progress",
+        DeployProgress {
+            phase: DeployPhase::VerifyingDeployment,
+            message: "Waiting for the device registry...".into(),
+            progress_percent: 88,
+        },
+    );
+    wait_for_runtime_registry(&deployment_bundle)
+        .await
+        .map_err(|error| format!("Device registry not ready: {error}"))?;
 
     let profile_manager = {
         let inner = state.inner.read().await;

@@ -14,7 +14,7 @@ pub struct AttachmentSettings {
     #[serde(default)]
     pub auto_download_media: bool,
     /// When true, show a save dialog every time the user downloads an attachment.
-    /// When false, download silently to the profile's attachments directory.
+    /// When false, save to the operating system Downloads directory.
     #[serde(default)]
     pub always_ask_save_path: bool,
 }

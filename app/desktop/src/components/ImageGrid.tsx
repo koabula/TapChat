@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Image } from "lucide-react";
 
@@ -15,12 +15,12 @@ export interface ImageGridItem {
 
 interface ImageGridProps {
   items: ImageGridItem[];
+  autoDownloadMedia: boolean;
   onImageClick: (index: number) => void;
 }
 
 /** Grid layout for multiple image attachments. */
-export default function ImageGrid({ items, onImageClick }: ImageGridProps) {
-  // Determine grid layout based on count
+export default function ImageGrid({ items, autoDownloadMedia, onImageClick }: ImageGridProps) {
   const count = items.length;
   const gridClass = getGridClass(count);
 
@@ -32,6 +32,7 @@ export default function ImageGrid({ items, onImageClick }: ImageGridProps) {
           item={item}
           index={index}
           isLarge={count >= 5 && index === 0}
+          autoDownload={autoDownloadMedia && (item.sizeBytes ?? 0) <= 10 * 1024 * 1024}
           onClick={() => {
             if (item.metadataReady !== false) onImageClick(index);
           }}
@@ -53,41 +54,24 @@ interface ImageGridCellProps {
   item: ImageGridItem;
   index: number;
   isLarge: boolean;
+  autoDownload: boolean;
   onClick: () => void;
 }
 
-function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
+function ImageGridCell({ item, index, isLarge, autoDownload, onClick }: ImageGridCellProps) {
   const [imageData, setImageData] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
-  const mountedRef = useRef(true);
+  const [deferred, setDeferred] = useState(false);
+  const requestVersionRef = useRef(0);
 
-  useEffect(() => {
-    mountedRef.current = true;
-    setImageData(null);
-    setFailed(false);
-    if (item.metadataReady === false) {
-      setLoading(false);
-      return () => {
-        mountedRef.current = false;
-      };
-    }
-    loadThumbnail();
-
-    return () => {
-      mountedRef.current = false;
-    };
-  }, [item.reference, item.metadataReady, item.metadataVersion]);
-
-  const loadThumbnail = async () => {
-    if (item.metadataReady === false) {
-      setFailed(false);
+  const loadThumbnail = useCallback(async () => {
+    const requestVersion = ++requestVersionRef.current;
+    if (item.metadataReady === false || !item.reference) {
+      setFailed(Boolean(item.metadataReady !== false));
       return;
     }
-    if (!item.reference) {
-      setFailed(true);
-      return;
-    }
+    setDeferred(false);
     setLoading(true);
     setFailed(false);
     try {
@@ -96,17 +80,41 @@ function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
         messageId: item.messageId,
         reference: item.reference,
       });
-      if (mountedRef.current && result) {
+      if (requestVersionRef.current !== requestVersion) return;
+      if (result) {
         setImageData(result);
-      } else if (mountedRef.current && !result) {
+      } else {
         setFailed(true);
       }
     } catch {
-      if (mountedRef.current) setFailed(true);
+      if (requestVersionRef.current === requestVersion) setFailed(true);
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (requestVersionRef.current === requestVersion) setLoading(false);
     }
-  };
+  }, [item.conversationId, item.messageId, item.metadataReady, item.reference]);
+
+  useEffect(() => {
+    requestVersionRef.current += 1;
+    setImageData(null);
+    setFailed(false);
+    setDeferred(false);
+    if (item.metadataReady === false) {
+      setLoading(false);
+      return () => {
+        requestVersionRef.current += 1;
+      };
+    }
+    if (autoDownload) {
+      void loadThumbnail();
+    } else {
+      setLoading(false);
+      setDeferred(true);
+    }
+
+    return () => {
+      requestVersionRef.current += 1;
+    };
+  }, [item.reference, item.metadataReady, item.metadataVersion, autoDownload, loadThumbnail]);
 
   const cellClass = isLarge
     ? "col-span-2 row-span-2"
@@ -116,7 +124,13 @@ function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
     <div
       className={`relative cursor-pointer overflow-hidden rounded-md bg-surface-elevated ${cellClass}`}
       style={{ aspectRatio: item.mimeType.startsWith("image/") && !isLarge ? "1" : "4 / 3" }}
-      onClick={onClick}
+      onClick={() => {
+        if (imageData) {
+          onClick();
+        } else if (!loading && item.metadataReady !== false) {
+          void loadThumbnail();
+        }
+      }}
     >
       {loading && (
         <div className="absolute inset-0 flex items-center justify-center">
@@ -137,6 +151,13 @@ function ImageGridCell({ item, index, isLarge, onClick }: ImageGridCellProps) {
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-muted-color">
           <Image size={24} />
           <span className="text-[10px]">Preparing...</span>
+        </div>
+      )}
+
+      {deferred && !loading && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-muted-color">
+          <Image size={24} />
+          <span className="text-[10px]">Click to load</span>
         </div>
       )}
 

@@ -25,8 +25,6 @@ export interface MediaItem {
   sizeBytes?: number;
   metadataReady?: boolean;
   metadataVersion?: string;
-  /** Pre-loaded base64 data for images; when set, skips remote fetch. */
-  base64Data?: string;
 }
 
 interface MediaLightboxProps {
@@ -38,6 +36,18 @@ interface MediaLightboxProps {
 export default function MediaLightbox({ items, initialIndex, onClose }: MediaLightboxProps) {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
   const currentItem = items[currentIndex];
+  const {
+    downloading: saving,
+    downloadedPath: savedPath,
+    error: saveError,
+    download: saveOriginal,
+  } = useAttachmentDownload({
+    conversationId: currentItem.conversationId,
+    messageId: currentItem.messageId,
+    reference: currentItem.reference,
+    fileName: currentItem.fileName,
+    mimeType: currentItem.mimeType,
+  });
 
   // Keyboard navigation
   useEffect(() => {
@@ -80,28 +90,56 @@ export default function MediaLightbox({ items, initialIndex, onClose }: MediaLig
           )}
         </div>
         <div className="flex items-center gap-1">
+          {saveError ? (
+            <span className="max-w-48 truncate px-2 text-xs text-red-300" role="alert">
+              {saveError}
+            </span>
+          ) : null}
+          {currentItem.type !== "other" ? (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-white/10 disabled:opacity-50"
+              onClick={() => void saveOriginal()}
+              disabled={saving || currentItem.metadataReady === false}
+              title={saveError ?? (savedPath ? "Save another copy" : "Save original")}
+              aria-label="Save original attachment"
+            >
+              {saving ? (
+                <span className="h-4 w-4 animate-spin rounded-full border border-white border-t-transparent" />
+              ) : (
+                <Download size={18} />
+              )}
+              <span className="hidden sm:inline">{savedPath ? "Saved" : "Save"}</span>
+            </button>
+          ) : null}
           {items.length > 1 && (
             <>
               <button
+                type="button"
                 className="p-2 rounded-lg hover:bg-white/10 transition-colors"
                 onClick={() => setCurrentIndex(Math.max(0, currentIndex - 1))}
                 disabled={currentIndex === 0}
+                aria-label="Previous attachment"
               >
                 <ChevronLeft size={20} />
               </button>
               <button
+                type="button"
                 className="p-2 rounded-lg hover:bg-white/10 transition-colors"
                 onClick={() => setCurrentIndex(Math.min(items.length - 1, currentIndex + 1))}
                 disabled={currentIndex === items.length - 1}
+                aria-label="Next attachment"
               >
                 <ChevronRight size={20} />
               </button>
             </>
           )}
           <button
+            type="button"
             className="p-2 rounded-lg hover:bg-white/10 transition-colors ml-2"
             onClick={onClose}
             title="Close (Esc)"
+            aria-label="Close attachment viewer"
           >
             <X size={20} />
           </button>
@@ -132,10 +170,9 @@ function useTempFile(item: MediaItem): { url: string | null; loading: boolean; e
   const [url, setUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const mountedRef = useRef(true);
 
   useEffect(() => {
-    mountedRef.current = true;
+    let cancelled = false;
     setUrl(null);
     setLoading(true);
     setError(null);
@@ -162,23 +199,23 @@ function useTempFile(item: MediaItem): { url: string | null; loading: boolean; e
           fileName: item.fileName,
         });
 
-        if (mountedRef.current) {
+        if (!cancelled) {
           const localUrl = convertFileSrc(tempPath);
           setUrl(localUrl);
         }
       } catch (err) {
-        if (mountedRef.current) {
+        if (!cancelled) {
           setError(formatMediaError(err));
         }
       } finally {
-        if (mountedRef.current) {
+        if (!cancelled) {
           setLoading(false);
         }
       }
     })();
 
     return () => {
-      mountedRef.current = false;
+      cancelled = true;
     };
   }, [
     item.messageId,
@@ -209,64 +246,7 @@ function formatMediaError(err: unknown): string {
   return text;
 }
 
-/** Image viewer with wheel zoom and pan */
-/** Hook to load an image via get_attachment_preview (base64), avoiding download_attachment. */
-function useImageBase64(item: MediaItem): { dataUrl: string | null; loading: boolean; error: string | null } {
-  const [dataUrl, setDataUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const mountedRef = useRef(true);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    setDataUrl(null);
-    setLoading(true);
-    setError(null);
-
-    if (item.metadataReady === false) {
-      setLoading(false);
-      setError("Preparing attachment...");
-      return;
-    }
-
-    if (!item.reference) {
-      setLoading(false);
-      setError("No reference to load");
-      return;
-    }
-
-    (async () => {
-      try {
-        const base64 = await invoke<string | null>("get_attachment_preview", {
-          conversationId: item.conversationId,
-          messageId: item.messageId,
-          reference: item.reference,
-        });
-        if (mountedRef.current && base64) {
-          setDataUrl(`data:image/jpeg;base64,${base64}`);
-        } else if (mountedRef.current && !base64) {
-          setError("Image not available");
-        }
-      } catch (err) {
-        if (mountedRef.current) setError(formatMediaError(err));
-      } finally {
-        if (mountedRef.current) setLoading(false);
-      }
-    })();
-
-    return () => { mountedRef.current = false; };
-  }, [
-    item.messageId,
-    item.conversationId,
-    item.reference,
-    item.mimeType,
-    item.metadataReady,
-    item.metadataVersion,
-  ]);
-
-  return { dataUrl, loading, error };
-}
-
+/** Image viewer with wheel zoom and pan, backed by the original attachment. */
 function ImageLightboxContent({ item }: { item: MediaItem }) {
   const [scale, setScale] = useState(1);
   const [position, setPosition] = useState({ x: 0, y: 0 });
@@ -274,13 +254,7 @@ function ImageLightboxContent({ item }: { item: MediaItem }) {
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Use pre-loaded base64 if available, otherwise fetch via get_attachment_preview
-  const fetched = useImageBase64(item);
-  const dataUrl = item.base64Data
-    ? `data:image/jpeg;base64,${item.base64Data}`
-    : fetched.dataUrl;
-  const loading = !item.base64Data && fetched.loading;
-  const error = item.base64Data ? null : fetched.error;
+  const { url: dataUrl, loading, error } = useTempFile(item);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();

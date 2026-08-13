@@ -112,6 +112,9 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
     try {
       const url = new URL(request.url);
       const now = Date.now();
+      if (request.method === "GET" && url.pathname.endsWith("/ready")) {
+        return await this.ready();
+      }
       if (request.method === "POST" && url.pathname.endsWith("/challenge")) {
         return await this.issueChallenge(request, now);
       }
@@ -134,6 +137,14 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
       }
       return jsonResponse({ error: "temporary_unavailable", message: "device registry request failed" }, 500);
     }
+  }
+
+  private async ready(): Promise<Response> {
+    const config = runtimeConfig(this.envRef);
+    // Touch storage so this endpoint only succeeds once the namespace, class,
+    // and backing storage are all available at the serving location.
+    await this.stateRef.storage.get("__runtime_registry_ready__");
+    return jsonResponse({ ready: true, runtimeId: config.runtimeId });
   }
 
   private async issueChallenge(request: Request, now: number): Promise<Response> {

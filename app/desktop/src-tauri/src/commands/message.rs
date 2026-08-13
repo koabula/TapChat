@@ -199,11 +199,25 @@ pub async fn download_attachment_to_default_path(
     mime_type: Option<String>,
 ) -> Result<String, String> {
     ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
-    let _ = file_name;
-    let _ = mime_type;
-    let preview_path =
+    let cached_original =
         ensure_attachment_cached(&app, conversation_id, message_id, reference).await?;
-    Ok(preview_path.to_string_lossy().to_string())
+    let downloads = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("failed to locate Downloads directory: {error}"))?;
+    std::fs::create_dir_all(&downloads)
+        .map_err(|error| format!("failed to create Downloads directory: {error}"))?;
+    let requested_name = file_name.unwrap_or_else(|| {
+        format!(
+            "attachment{}",
+            extension_from_mime(mime_type.as_deref().unwrap_or_default())
+        )
+    });
+    let destination = unique_download_destination(&downloads, &requested_name);
+    tokio::fs::copy(&cached_original, &destination)
+        .await
+        .map_err(|error| format!("failed to save attachment to Downloads: {error}"))?;
+    Ok(destination.to_string_lossy().to_string())
 }
 
 /// Download an attachment into the profile-local attachment cache.
@@ -810,8 +824,9 @@ async fn generate_thumbnail(path: &std::path::Path) -> anyhow::Result<Option<Str
         Err(_) => return Ok(None), // Not a valid image
     };
 
-    // Resize to max 200x200 while maintaining aspect ratio
-    let thumbnail = img.resize(200, 200, image::imageops::FilterType::Lanczos3);
+    // This derivative is only used in the compact chat grid. Full-screen
+    // viewing and saving use the original cached attachment.
+    let thumbnail = img.resize(512, 512, image::imageops::FilterType::Lanczos3);
 
     // Convert to JPEG and encode as base64
     let mut buffer = std::io::Cursor::new(Vec::new());
@@ -821,6 +836,57 @@ async fn generate_thumbnail(path: &std::path::Path) -> anyhow::Result<Option<Str
     Ok(Some(encoded))
 }
 
+fn unique_download_destination(
+    directory: &std::path::Path,
+    requested_name: &str,
+) -> std::path::PathBuf {
+    let base_name = std::path::Path::new(requested_name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let sanitized = base_name
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim().trim_matches('.');
+    let sanitized = if sanitized.is_empty() {
+        "attachment"
+    } else {
+        sanitized
+    };
+    let initial = directory.join(sanitized);
+    if !initial.exists() {
+        return initial;
+    }
+    let path = std::path::Path::new(sanitized);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for suffix in 1_u32..10_000 {
+        let candidate = match extension {
+            Some(extension) => directory.join(format!("{stem} ({suffix}).{extension}")),
+            None => directory.join(format!("{stem} ({suffix})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    directory.join(format!("{stem}-{}", uuid::Uuid::new_v4()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +894,19 @@ mod tests {
     use tapchat_core::cli::profile::{
         override_profile_registry_path_for_test, Profile, ProfileInitOptions,
     };
+
+    #[test]
+    fn download_destination_is_sanitized_and_never_overwrites() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("tapchat-download-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("create download test directory");
+        let first = unique_download_destination(&temp_dir, "../photo:original.png");
+        assert_eq!(first, temp_dir.join("photo_original.png"));
+        std::fs::write(&first, b"existing").expect("write existing download");
+        let second = unique_download_destination(&temp_dir, "photo:original.png");
+        assert_eq!(second, temp_dir.join("photo_original (1).png"));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn encrypted_attachment_cache_round_trips_without_plaintext_at_rest() {

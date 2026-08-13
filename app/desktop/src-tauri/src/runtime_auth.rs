@@ -84,6 +84,13 @@ struct ErrorResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeRegistryReadyResponse {
+    ready: bool,
+    runtime_id: String,
+}
+
 fn now_ms() -> Result<u64> {
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -210,6 +217,89 @@ async fn request_runtime_credential(
     Ok(credential)
 }
 
+fn runtime_request_is_retryable(error: &anyhow::Error) -> bool {
+    let code = runtime_error_code(error);
+    code == "temporary_unavailable"
+        || code == "internal_error"
+        || code == "rate_limited"
+        || code.starts_with("http_5")
+}
+
+async fn request_runtime_credential_with_retry(
+    deployment: &DeploymentBundle,
+    identity: &LocalIdentityState,
+    purpose: ProofPurpose,
+    device: Option<&DeviceContactProfile>,
+) -> Result<DeviceRuntimeAuth> {
+    const RETRY_DELAYS_MS: &[u64] = &[0, 500, 1_000, 2_000, 5_000, 10_000];
+    let mut last_error = None;
+    for (attempt, delay_ms) in RETRY_DELAYS_MS.iter().enumerate() {
+        if *delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        }
+        match request_runtime_credential(deployment, identity, purpose, device).await {
+            Ok(credential) => return Ok(credential),
+            Err(error)
+                if runtime_request_is_retryable(&error) && attempt + 1 < RETRY_DELAYS_MS.len() =>
+            {
+                log::warn!(
+                    "runtime authorization will retry: stage={} code={} attempt={}",
+                    purpose.as_str(),
+                    runtime_error_code(&error),
+                    attempt + 1
+                );
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| runtime_error("temporary_unavailable")))
+}
+
+pub async fn wait_for_runtime_registry(deployment: &DeploymentBundle) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build runtime registry readiness client")?;
+    let endpoint = format!(
+        "{}/v2/runtime-auth/ready",
+        deployment.inbox_http_endpoint.trim_end_matches('/')
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let last_code = match client.get(&endpoint).send().await {
+            Ok(response) if response.status().is_success() => {
+                let ready = response
+                    .json::<RuntimeRegistryReadyResponse>()
+                    .await
+                    .context("decode runtime registry readiness response")?;
+                if ready.ready && ready.runtime_id == deployment.runtime_id {
+                    return Ok(());
+                }
+                "runtime_mismatch".to_string()
+            }
+            Ok(response) => {
+                let status = response.status();
+                let code = response
+                    .json::<ErrorResponse>()
+                    .await
+                    .ok()
+                    .and_then(|body| body.error)
+                    .unwrap_or_else(|| format!("http_{}", status.as_u16()));
+                if !status.is_server_error() && status.as_u16() != 429 {
+                    return Err(runtime_error(&code));
+                }
+                code
+            }
+            Err(_) => "temporary_unavailable".to_string(),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!("runtime_registry_not_ready:{last_code}"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 impl RuntimeAuthManager {
     pub fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -320,7 +410,7 @@ impl RuntimeAuthManager {
             .find(|device| device.device_id == identity.device_identity.device_id)
             .ok_or_else(|| runtime_error("enrollment_required"))?;
         let mut refreshed = if current.is_none() {
-            request_runtime_credential(
+            request_runtime_credential_with_retry(
                 &deployment,
                 &identity,
                 ProofPurpose::Enroll,
@@ -328,13 +418,19 @@ impl RuntimeAuthManager {
             )
             .await
         } else {
-            request_runtime_credential(&deployment, &identity, ProofPurpose::Refresh, None).await
+            request_runtime_credential_with_retry(
+                &deployment,
+                &identity,
+                ProofPurpose::Refresh,
+                None,
+            )
+            .await
         };
         if refreshed
             .as_ref()
             .is_err_and(|error| runtime_error_code(error) == "enrollment_required")
         {
-            refreshed = request_runtime_credential(
+            refreshed = request_runtime_credential_with_retry(
                 &deployment,
                 &identity,
                 ProofPurpose::Enroll,
@@ -435,9 +531,13 @@ impl RuntimeAuthManager {
             .iter()
             .find(|device| device.device_id == identity.device_identity.device_id)
             .ok_or_else(|| runtime_error("enrollment_required"))?;
-        let credential =
-            request_runtime_credential(deployment, identity, ProofPurpose::Enroll, Some(device))
-                .await?;
+        let credential = request_runtime_credential_with_retry(
+            deployment,
+            identity,
+            ProofPurpose::Enroll,
+            Some(device),
+        )
+        .await?;
         let inner = profile_manager.inner.read().await;
         let profile = inner
             .active_profile
@@ -482,5 +582,29 @@ mod tests {
             key_id: Some("current".into()),
         };
         assert!(runtime_credential_needs_refresh(Some(&credential), now));
+    }
+
+    #[test]
+    fn enrollment_retry_only_accepts_transient_failures() {
+        for code in [
+            "temporary_unavailable",
+            "internal_error",
+            "rate_limited",
+            "http_500",
+            "http_503",
+        ] {
+            assert!(runtime_request_is_retryable(&runtime_error(code)), "{code}");
+        }
+        for code in [
+            "runtime_auth_invalid",
+            "runtime_mismatch",
+            "device_revoked",
+            "enrollment_required",
+        ] {
+            assert!(
+                !runtime_request_is_retryable(&runtime_error(code)),
+                "{code}"
+            );
+        }
     }
 }

@@ -152,11 +152,11 @@ pub(crate) enum WorkerMigrationPlan {
 fn worker_migration_metadata(plan: WorkerMigrationPlan) -> Option<Value> {
     match plan {
         WorkerMigrationPlan::FreshV3 => Some(serde_json::json!({
-            "tag": "v3",
+            "new_tag": "v3",
             "new_sqlite_classes": ["InboxDurableObject", "GroupOutboxDurableObject", "DeviceRegistryDurableObject"],
         })),
         WorkerMigrationPlan::UpgradeDeviceRegistry => Some(serde_json::json!({
-            "tag": "v3",
+            "new_tag": "v3",
             "new_sqlite_classes": ["DeviceRegistryDurableObject"],
         })),
         WorkerMigrationPlan::None => None,
@@ -1052,7 +1052,8 @@ mod tests {
         assert!(classes
             .iter()
             .any(|class| class == "DeviceRegistryDurableObject"));
-        assert_eq!(metadata["migrations"]["tag"].as_str(), Some("v3"));
+        assert_eq!(metadata["migrations"]["new_tag"].as_str(), Some("v3"));
+        assert!(metadata["migrations"].get("tag").is_none());
     }
 
     #[test]
@@ -1065,6 +1066,8 @@ mod tests {
         assert!(!classes.iter().any(|class| class == "InboxDurableObject"));
         assert_eq!(classes.len(), 1);
         assert_eq!(classes[0].as_str(), Some("DeviceRegistryDurableObject"));
+        assert_eq!(metadata["migrations"]["new_tag"].as_str(), Some("v3"));
+        assert!(metadata["migrations"].get("tag").is_none());
     }
 
     #[test]

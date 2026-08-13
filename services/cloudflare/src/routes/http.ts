@@ -321,6 +321,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse(publicDeploymentBundle(request, env));
     }
 
+    if (request.method === "GET" && url.pathname === "/v2/runtime-auth/ready") {
+      try {
+        return await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/ready")
+        );
+      } catch {
+        return jsonResponse(
+          { error: "temporary_unavailable", message: "device registry is not ready" },
+          503
+        );
+      }
+    }
+
     const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
     if (contactShareMatch && request.method === "GET") {
       type ContactSharePayload = {
@@ -348,11 +361,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if ((body.purpose !== "enroll" && body.purpose !== "refresh") || !body.userId || !body.deviceId) {
         throw new HttpError(400, "runtime_auth_invalid", "purpose, userId and deviceId are required");
       }
-      return registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/challenge", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: bodyText
-      }));
+      try {
+        return await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/challenge", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: bodyText
+        }));
+      } catch {
+        return jsonResponse(
+          { error: "temporary_unavailable", message: "device registry is not ready" },
+          503
+        );
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/v2/runtime-auth/enroll") {
