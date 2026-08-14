@@ -34,7 +34,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Resolve release version
         id: release-version
@@ -146,7 +146,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install Windows SQLCipher/OpenSSL build dependencies
         if: matrix.platform == 'windows'
@@ -162,7 +162,7 @@ jobs:
       - name: Bundle Linux Node.js runtime
         if: matrix.platform == 'linux'
         run: |
-          NODE_VERSION="20.11.0"
+          NODE_VERSION="22.17.1"
           curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz
           tar -xJf /tmp/node.tar.xz -C /tmp
           mkdir -p app/desktop/src-tauri/embedded/node
@@ -173,7 +173,7 @@ jobs:
       - name: Bundle macOS Node.js runtime (Intel)
         if: matrix.platform == 'macos-intel'
         run: |
-          NODE_VERSION="20.11.0"
+          NODE_VERSION="22.17.1"
           curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-x64.tar.gz" -o /tmp/node.tar.gz
           tar -xzf /tmp/node.tar.gz -C /tmp
           mkdir -p app/desktop/src-tauri/embedded/node
@@ -184,7 +184,7 @@ jobs:
       - name: Bundle macOS Node.js runtime (ARM)
         if: matrix.platform == 'macos-arm'
         run: |
-          NODE_VERSION="20.11.0"
+          NODE_VERSION="22.17.1"
           curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-arm64.tar.gz" -o /tmp/node.tar.gz
           tar -xzf /tmp/node.tar.gz -C /tmp
           mkdir -p app/desktop/src-tauri/embedded/node

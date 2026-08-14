@@ -94,7 +94,7 @@ There is no central TapChat directory or username search. Contact discovery is i
 Prerequisites:
 
 - Rust stable
-- Node.js 20+
+- Node.js 22+
 - Cloudflare account for real transport deployment
 
 Useful commands:

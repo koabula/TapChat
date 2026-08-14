@@ -94,7 +94,7 @@ TapChat 当前提供基于 Cloudflare Workers、Durable Objects、WebSocket 和 
 前置依赖：
 
 - Rust stable
-- Node.js 20+
+- Node.js 22+
 - 用于真实传输层部署的 Cloudflare 账户
 
 常用命令：

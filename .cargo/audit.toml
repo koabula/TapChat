@@ -5,10 +5,15 @@
 # tauri-winrt-notification and wayland-scanner. TapChat does not pass message,
 # attachment, or network-controlled XML to either parser. Remove these entries
 # as soon as those upstream crates accept quick-xml >= 0.41.
+# rkyv 0.7 is reachable only through rust_decimal's disabled optional archive
+# feature (tauri-plugin-log -> byte-unit -> rust_decimal). It is absent from the
+# production feature graph. Remove this entry when rust_decimal no longer locks
+# the vulnerable optional version.
 ignore = [
   "RUSTSEC-2026-0124",
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
+  "RUSTSEC-2026-0235",
 ]
 informational_warnings = ["unmaintained", "unsound"]
 
