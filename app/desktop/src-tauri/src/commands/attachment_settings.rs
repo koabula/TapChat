@@ -9,10 +9,10 @@ const ATTACHMENT_SETTINGS_KEY: &str = "desktop.attachment_settings";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachmentSettings {
-    /// When true, automatically download image/audio/video attachments (<=10MB)
-    /// from trusted contacts during sync.
-    #[serde(default)]
-    pub auto_download_media: bool,
+    /// When true, prefetch only screen previews from accepted conversations.
+    /// The alias migrates the former setting without enabling original downloads.
+    #[serde(default = "default_prefetch_previews", alias = "auto_download_media")]
+    pub prefetch_previews: bool,
     /// When true, show a save dialog every time the user downloads an attachment.
     /// When false, save to the operating system Downloads directory.
     #[serde(default)]
@@ -22,10 +22,14 @@ pub struct AttachmentSettings {
 impl Default for AttachmentSettings {
     fn default() -> Self {
         Self {
-            auto_download_media: true,
+            prefetch_previews: true,
             always_ask_save_path: false,
         }
     }
+}
+
+fn default_prefetch_previews() -> bool {
+    true
 }
 
 fn settings_path(profile_root: &PathBuf) -> PathBuf {
@@ -37,6 +41,16 @@ fn load_settings(profile: &Profile) -> AttachmentSettings {
         Ok(Some(settings)) => settings,
         _ => migrate_legacy_settings(profile).unwrap_or_default(),
     }
+}
+
+pub(crate) async fn preview_prefetch_enabled(state: &AppState) -> bool {
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    pm.active_profile
+        .as_ref()
+        .map(load_settings)
+        .unwrap_or_default()
+        .prefetch_previews
 }
 
 fn save_settings(profile: &Profile, settings: &AttachmentSettings) -> Result<(), String> {
@@ -102,5 +116,21 @@ pub async fn get_attachment_cache_dir(state: State<'_, AppState>) -> Result<Stri
     match dir {
         Some(path) => Ok(path.to_string_lossy().into()),
         None => Err("No profile active".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_auto_download_setting_migrates_only_to_preview_prefetch() {
+        let migrated: AttachmentSettings =
+            serde_json::from_str(r#"{"auto_download_media":false,"always_ask_save_path":true}"#)
+                .expect("legacy settings");
+        assert!(!migrated.prefetch_previews);
+        assert!(migrated.always_ask_save_path);
+        let fresh: AttachmentSettings = serde_json::from_str("{}").expect("default settings");
+        assert!(fresh.prefetch_previews);
     }
 }

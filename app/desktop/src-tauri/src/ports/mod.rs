@@ -1854,12 +1854,12 @@ impl BlobIoPort for DesktopPlatformPorts {
         if let Some(app) = &self.app_handle {
             let _ = app.emit(
                 "upload-progress",
-                blob_io::UploadProgressEvent {
-                    task_id: read.task_id.clone(),
-                    conversation_id: read.conversation_id.clone(),
-                    progress: 5,
-                    status: "reading".to_string(),
-                },
+                blob_io::UploadProgressEvent::simple(
+                    read.task_id.clone(),
+                    read.conversation_id.clone(),
+                    5,
+                    "reading",
+                ),
             );
         }
 
@@ -1954,12 +1954,12 @@ impl BlobIoPort for DesktopPlatformPorts {
         if let Some(app) = &self.app_handle {
             let _ = app.emit(
                 "upload-progress",
-                blob_io::UploadProgressEvent {
-                    task_id: upload.task_id.clone(),
-                    conversation_id: upload.conversation_id.clone(),
-                    progress: 10,
-                    status: "preparing".to_string(),
-                },
+                blob_io::UploadProgressEvent::simple(
+                    upload.task_id.clone(),
+                    upload.conversation_id.clone(),
+                    10,
+                    "preparing",
+                ),
             );
         }
 
@@ -1995,16 +1995,16 @@ impl BlobIoPort for DesktopPlatformPorts {
         if let Some(app) = &self.app_handle {
             let _ = app.emit(
                 "download-progress",
-                blob_io::UploadProgressEvent {
-                    task_id: task_id.clone(),
-                    conversation_id: conversation_id.clone(),
-                    progress: 50,
-                    status: "downloading".to_string(),
-                },
+                blob_io::UploadProgressEvent::simple(
+                    task_id.clone(),
+                    conversation_id.clone(),
+                    0,
+                    "downloading",
+                ),
             );
         }
 
-        let result = blob_io::download_blob(&self.client, download).await;
+        let result = blob_io::download_blob(&self.client, download, self.app_handle.clone()).await;
 
         // A transport response is not necessarily a successful download: the
         // blob adapter reports HTTP failures as BlobTransferFailed events so
@@ -2017,12 +2017,12 @@ impl BlobIoPort for DesktopPlatformPorts {
             });
             let _ = app.emit(
                 "download-progress",
-                blob_io::UploadProgressEvent {
+                blob_io::UploadProgressEvent::simple(
                     task_id,
                     conversation_id,
-                    progress: if completed { 100 } else { 0 },
-                    status: if completed { "complete" } else { "failed" }.to_string(),
-                },
+                    if completed { 100 } else { 0 },
+                    if completed { "complete" } else { "failed" },
+                ),
             );
         }
 

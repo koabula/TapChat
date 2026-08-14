@@ -10,12 +10,23 @@ export interface DurableObjectNamespace {
 }
 
 export interface R2ObjectBody {
+  readonly body: ReadableStream;
+  readonly size: number;
+  readonly httpEtag: string;
+  readonly customMetadata?: Record<string, string>;
   json<T = unknown>(): Promise<T>;
   arrayBuffer(): Promise<ArrayBuffer>;
 }
 
+export interface R2Object {
+  readonly size: number;
+  readonly httpEtag: string;
+  readonly customMetadata?: Record<string, string>;
+}
+
 export interface R2Bucket {
-  put(key: string, value: string | ArrayBuffer | ArrayBufferView, options?: unknown): Promise<unknown>;
-  get(key: string): Promise<R2ObjectBody | null>;
+  put(key: string, value: string | ArrayBuffer | ArrayBufferView | ReadableStream, options?: unknown): Promise<R2Object>;
+  head(key: string): Promise<R2Object | null>;
+  get(key: string, options?: { range?: { offset: number; length: number } }): Promise<R2ObjectBody | null>;
   delete(key: string): Promise<void>;
 }

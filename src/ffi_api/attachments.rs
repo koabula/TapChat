@@ -3,7 +3,8 @@ use sha2::{Digest, Sha256};
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::AttachmentDescriptor;
 
-const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 192 * 1024;
 const MAX_ATTACHMENT_MIME_TYPE_LEN: usize = 255;
 const MAX_ATTACHMENT_FILE_NAME_LEN: usize = 255;
 
@@ -39,7 +40,7 @@ pub(super) fn validate_attachment_descriptor(descriptor: &AttachmentDescriptor) 
         if preview.attachment_id.trim().is_empty()
             || preview.mime_type != "image/webp"
             || preview.size_bytes == 0
-            || preview.size_bytes > 128 * 1024
+            || preview.size_bytes > MAX_ATTACHMENT_PREVIEW_BYTES
         {
             return Err(CoreError::invalid_input(
                 "attachment preview descriptor is invalid",

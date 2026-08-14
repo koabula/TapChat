@@ -778,6 +778,9 @@ fn emit_core_update(app: &AppHandle, output: &CoreOutput) {
     if has_updates {
         let _ = app.emit("core-update", output);
     }
+    if output.state_update.messages_changed {
+        crate::commands::message::schedule_preview_prefetch(app);
+    }
 }
 
 async fn execute_effect_with_handle(

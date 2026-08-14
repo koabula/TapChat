@@ -102,8 +102,46 @@ impl CoreEngine {
         reference: String,
         destination: String,
     ) -> CoreResult<CoreOutput> {
+        let blob_descriptor =
+            self.resolve_attachment_descriptor(&conversation_id, &message_id, &reference)?;
+        let task_id = attachment_download_task_id(&message_id, &reference, &destination);
+        self.state.pending_blob_downloads.insert(
+            task_id.clone(),
+            PendingBlobDownload {
+                task_id: task_id.clone(),
+                conversation_id,
+                message_id,
+                reference,
+                destination_id: destination,
+                blob_descriptor,
+                retries: 0,
+                in_flight: false,
+            },
+        );
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    messages_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SavePendingBlobTransfer { task_id }],
+                )],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        ))
+    }
+
+    pub fn resolve_attachment_descriptor(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        reference: &str,
+    ) -> CoreResult<EncryptedBlobDescriptor> {
         let payload_metadata =
-            self.attachment_payload_metadata_json(&conversation_id, &message_id)?;
+            self.attachment_payload_metadata_json(conversation_id, message_id)?;
         let payload_metadata: AttachmentPayloadMetadata = serde_json::from_str(&payload_metadata)
             .map_err(|error| {
             CoreError::invalid_input(format!(
@@ -143,34 +181,7 @@ impl CoreEngine {
             }
             blob_descriptor.storage_origin = manifest_origin;
         }
-        let task_id = attachment_download_task_id(&message_id, &reference, &destination);
-        self.state.pending_blob_downloads.insert(
-            task_id.clone(),
-            PendingBlobDownload {
-                task_id: task_id.clone(),
-                conversation_id,
-                message_id,
-                reference,
-                destination_id: destination,
-                blob_descriptor,
-                retries: 0,
-                in_flight: false,
-            },
-        );
-        Ok(merge_outputs(
-            CoreOutput {
-                state_update: CoreStateUpdate {
-                    messages_changed: true,
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![persist_effect(
-                    &self.state,
-                    vec![PersistOp::SavePendingBlobTransfer { task_id }],
-                )],
-                view_model: None,
-            },
-            self.flush_pending_transport()?,
-        ))
+        Ok(blob_descriptor)
     }
 
     pub(super) fn attachment_payload_metadata_json(
@@ -2055,7 +2066,18 @@ impl CoreEngine {
                 let ciphertext = task.blob_ciphertext.as_deref().ok_or_else(|| {
                     CoreError::invalid_state("uploaded attachment ciphertext is missing")
                 })?;
-                let plaintext = decrypt_blob(ciphertext, &descriptor.encryption)?;
+                let plaintext =
+                    if descriptor.encryption.algorithm == CHUNKED_ATTACHMENT_CIPHER_ALGORITHM {
+                        decrypt_chunked_blob(
+                            ciphertext,
+                            &descriptor.encryption,
+                            &message_id,
+                            descriptor.variant,
+                            descriptor.plaintext_size,
+                        )?
+                    } else {
+                        decrypt_blob(ciphertext, &descriptor.encryption)?
+                    };
                 Ok(CoreEffect::CacheUploadedAttachment {
                     cache: CacheUploadedAttachmentEffect {
                         task_id: format!("cache-uploaded:{}", task.task_id),
@@ -2145,13 +2167,14 @@ impl CoreEngine {
         task_id: String,
         plaintext: Vec<u8>,
     ) -> CoreResult<CoreOutput> {
-        let (variant, mime_type, size_bytes) = {
+        let (message_id, variant, mime_type, size_bytes) = {
             let task = self
                 .state
                 .pending_blob_uploads
                 .get(&task_id)
                 .ok_or_else(|| CoreError::invalid_input("pending blob upload task not found"))?;
             (
+                task.message_id.clone(),
                 task.variant,
                 task.source.mime_type.clone(),
                 task.source.size_bytes,
@@ -2162,7 +2185,12 @@ impl CoreEngine {
                 "attachment plaintext size did not match descriptor size",
             ));
         }
-        let encrypted = encrypt_blob(&plaintext)?;
+        let encrypted = if variant == AttachmentVariant::Original && mime_type.starts_with("video/")
+        {
+            encrypt_chunked_blob(&plaintext, &message_id, variant)?
+        } else {
+            encrypt_blob(&plaintext)?
+        };
         let descriptor = EncryptedBlobDescriptor {
             variant,
             object_ref: String::new(),
@@ -2205,7 +2233,25 @@ impl CoreEngine {
         let mut effects = Vec::new();
         if let Some(task) = self.state.pending_blob_downloads.remove(&task_id) {
             if let Some(blob_ciphertext) = blob_ciphertext {
-                let plaintext = decrypt_blob(&blob_ciphertext, &task.blob_descriptor.encryption)?;
+                let crypto_message_id = self
+                    .attachment_payload_metadata_json(&task.conversation_id, &task.message_id)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<AttachmentPayloadMetadata>(&json).ok())
+                    .map(|manifest| manifest.attachment_id)
+                    .unwrap_or_else(|| task.message_id.clone());
+                let plaintext = if task.blob_descriptor.encryption.algorithm
+                    == CHUNKED_ATTACHMENT_CIPHER_ALGORITHM
+                {
+                    decrypt_chunked_blob(
+                        &blob_ciphertext,
+                        &task.blob_descriptor.encryption,
+                        &crypto_message_id,
+                        task.blob_descriptor.variant,
+                        task.blob_descriptor.plaintext_size,
+                    )?
+                } else {
+                    decrypt_blob(&blob_ciphertext, &task.blob_descriptor.encryption)?
+                };
                 if plaintext.len() as u64 != task.blob_descriptor.plaintext_size
                     || crate::attachment_crypto::sha256_hex(&plaintext)
                         != task.blob_descriptor.digest_sha256

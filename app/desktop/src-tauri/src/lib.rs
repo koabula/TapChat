@@ -142,31 +142,15 @@ pub fn run() {
         |context, request, responder| {
             let app = context.app_handle().clone();
             let handle = request.uri().path().trim_start_matches('/').to_string();
+            let range = request
+                .headers()
+                .get(http::header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             tauri::async_runtime::spawn(async move {
-                let state = app.state::<AppState>();
-                let profile_path = state.inner.read().await.profile_path.clone();
-                let profile_generation = state.profile_generation.load(Ordering::SeqCst);
-                let now = ts_ms().min(u64::MAX as u128) as u64;
-                let media = state.media_handles.read().await.get(&handle).cloned();
-                let response = match media {
-                    Some(media)
-                        if media.expires_at_ms > now
-                            && media.profile_path == profile_path
-                            && media.profile_generation == profile_generation =>
-                    {
-                        http::Response::builder()
-                            .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, media.mime_type)
-                            .header(http::header::CACHE_CONTROL, "no-store")
-                            .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                            .body((*media.bytes).clone())
-                    }
-                    _ => http::Response::builder()
-                        .status(http::StatusCode::NOT_FOUND)
-                        .header(http::header::CACHE_CONTROL, "no-store")
-                        .body(Vec::new()),
-                }
-                .unwrap_or_else(|_| http::Response::new(Vec::new()));
+                let response =
+                    commands::message::media_protocol_response(&app, &handle, range.as_deref())
+                        .await;
                 responder.respond(response);
             });
         },
@@ -332,6 +316,7 @@ pub fn run() {
             commands::message::send_attachment,
             commands::message::download_attachment,
             commands::message::download_attachment_to_default_path,
+            commands::message::get_attachment_media_state,
             commands::message::open_media,
             commands::message::release_media,
             commands::message::clear_attachment_cache,
@@ -381,6 +366,7 @@ pub fn run() {
             // Utility
             commands::utility::get_app_metadata,
             commands::utility::open_file,
+            commands::utility::open_containing_folder,
             commands::utility::path_exists,
             commands::utility::check_notification_permission,
             commands::utility::request_notification_permission,

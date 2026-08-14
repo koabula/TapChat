@@ -1,4 +1,5 @@
 use serde::Serialize;
+use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
 
@@ -155,4 +156,29 @@ pub fn set_debug_mode(enabled: bool) {
 #[tauri::command]
 pub fn get_debug_mode() -> bool {
     crate::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tauri::command]
+#[allow(deprecated)]
+pub async fn open_containing_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let file = std::path::PathBuf::from(path);
+    if !file.is_absolute() || !file.is_file() {
+        return Err("Saved attachment path must be an existing absolute file".into());
+    }
+    if !app
+        .state::<crate::state::AppState>()
+        .saved_attachment_paths
+        .read()
+        .await
+        .contains(&file)
+    {
+        return Err("Attachment was not saved during this app session".into());
+    }
+    let parent = file
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| "Saved attachment folder is unavailable".to_string())?;
+    app.shell()
+        .open(parent.to_string_lossy().as_ref(), None)
+        .map_err(|error| error.to_string())
 }

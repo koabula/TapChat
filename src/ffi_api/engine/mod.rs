@@ -19,8 +19,9 @@ use super::sync::{
     WELCOME_PICKUP_RETRY_TIMER_PREFIX,
 };
 use crate::attachment_crypto::{
-    decrypt_blob, encrypt_blob, AttachmentKind, AttachmentManifestV2, AttachmentPayloadMetadata,
-    AttachmentVariant, EncryptedBlobDescriptor,
+    decrypt_blob, decrypt_chunked_blob, encrypt_blob, encrypt_chunked_blob, AttachmentKind,
+    AttachmentManifestV2, AttachmentPayloadMetadata, AttachmentVariant, EncryptedBlobDescriptor,
+    CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
 };
 use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,

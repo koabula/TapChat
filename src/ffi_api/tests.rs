@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::attachment_crypto::{
-        AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CIPHER_ALGORITHM,
+        AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CHUNK_SIZE_BYTES,
+        ATTACHMENT_CIPHER_ALGORITHM, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
     };
     use crate::conversation::RecoveryStatus;
     use crate::ffi_api::groups;
@@ -4165,6 +4166,110 @@ mod tests {
             stored_metadata.original.encryption.algorithm,
             ATTACHMENT_CIPHER_ALGORITHM
         );
+    }
+
+    #[test]
+    fn video_original_uses_chunked_cipher_and_download_restores_plaintext() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let mut descriptor = sample_attachment_descriptor();
+        descriptor.mime_type = "video/mp4".into();
+        descriptor.file_name = Some("clip.mp4".into());
+        let queued = alice
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id: conversation_id.clone(),
+                attachment_descriptor: descriptor,
+            })
+            .expect("queue video");
+        let task_id = queued
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+                _ => None,
+            })
+            .expect("read video task");
+        let plaintext = vec![1_u8, 2, 3, 4];
+        let prepared = alice
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id: task_id.clone(),
+                plaintext: plaintext.clone(),
+            })
+            .expect("encrypt video");
+        assert!(prepared.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::PrepareBlobUpload { upload } if upload.size_bytes == 20
+        )));
+        let upload_ready = alice
+            .handle_event(CoreEvent::BlobUploadPrepared {
+                task_id: task_id.clone(),
+                result: crate::transport_contract::PrepareBlobUploadResult {
+                    blob_ref: "blob:video-chunked".into(),
+                    upload_target: "upload:video-chunked".into(),
+                    upload_headers: std::collections::BTreeMap::new(),
+                    read_capability: "read-video".into(),
+                    download_target:
+                        "https://storage.example.com/v1/storage/blob/blob%3Avideo-chunked".into(),
+                    expires_at: Some(99),
+                },
+            })
+            .expect("prepare video");
+        let ciphertext = upload_ready
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::UploadBlob { upload } => Some(upload.blob_ciphertext.clone()),
+                _ => None,
+            })
+            .expect("video ciphertext");
+        alice
+            .handle_event(CoreEvent::BlobUploaded { task_id })
+            .expect("publish video");
+        let outbox = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| !item.envelope.storage_refs.is_empty())
+            .expect("video outbox");
+        let envelope_message_id = outbox.envelope.message_id.clone();
+        let manifest: AttachmentPayloadMetadata =
+            serde_json::from_str(outbox.plaintext_cache.as_deref().expect("video manifest"))
+                .expect("decode video manifest");
+        assert_eq!(
+            manifest.original.encryption.algorithm,
+            CHUNKED_ATTACHMENT_CIPHER_ALGORITHM
+        );
+        assert_eq!(
+            manifest.original.encryption.chunk_size_bytes,
+            Some(ATTACHMENT_CHUNK_SIZE_BYTES)
+        );
+        let download = alice
+            .handle_command(CoreCommand::DownloadAttachment {
+                conversation_id,
+                message_id: envelope_message_id,
+                reference: "blob:video-chunked".into(),
+                destination: "saved/clip.mp4".into(),
+            })
+            .expect("queue video download");
+        let download_task_id = download
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::DownloadBlob { download } => Some(download.task_id.clone()),
+                _ => None,
+            })
+            .expect("video download task");
+        let completed = alice
+            .handle_event(CoreEvent::BlobDownloaded {
+                task_id: download_task_id,
+                blob_ciphertext: Some(ciphertext),
+            })
+            .expect("decrypt video");
+        assert!(completed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::WriteDownloadedAttachment { write } if write.plaintext == plaintext
+        )));
     }
 
     #[test]
@@ -8535,6 +8640,7 @@ mod tests {
                     algorithm: ATTACHMENT_CIPHER_ALGORITHM.into(),
                     key_b64: STANDARD.encode([1_u8; 32]),
                     nonce_b64: STANDARD.encode([2_u8; 12]),
+                    chunk_size_bytes: None,
                 },
             },
             preview: None,

@@ -296,7 +296,7 @@ export function onSessionStatus(
 
 // Attachment settings
 export interface AttachmentSettings {
-  auto_download_media: boolean;
+  prefetch_previews: boolean;
   always_ask_save_path: boolean;
 }
 

@@ -1,15 +1,26 @@
-use tauri::Manager;
+use futures_util::StreamExt;
+use rand::Rng;
+use sha2::{Digest, Sha256};
+use tauri::{Emitter, Manager};
 #[cfg(feature = "gui")]
 use tauri_plugin_clipboard_manager::ClipboardExt;
 #[cfg(feature = "gui")]
 use tauri_plugin_dialog::DialogExt;
+use tokio::io::AsyncWriteExt;
 
-use tapchat_core::attachment_crypto::AttachmentPayloadMetadata;
+use tapchat_core::attachment_crypto::{
+    AttachmentPayloadMetadata, EncryptedBlobDescriptor, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
+};
 use tapchat_core::ffi_api::{AttachmentDescriptor, AttachmentVariantSource, SystemStatus};
 use tapchat_core::{CoreCommand, CoreOutput};
 
 const ATTACHMENT_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const IMAGE_PREVIEW_INITIAL_EDGE: u32 = 1280;
+const IMAGE_PREVIEW_MIN_EDGE: u32 = 512;
+const IMAGE_PREVIEW_INITIAL_QUALITY: f32 = 75.0;
+const IMAGE_PREVIEW_MIN_QUALITY: f32 = 45.0;
+const IMAGE_PREVIEW_MAX_BYTES: usize = 192 * 1024;
 
 use super::conversation::MessageDeliveryState;
 #[cfg(any(test, feature = "test-support"))]
@@ -128,8 +139,8 @@ fn generate_image_preview(source: &[u8]) -> Result<Option<(Vec<u8>, u32, u32, St
         Err(_) => return Ok(None),
     };
     let (original_width, original_height) = image.dimensions();
-    let mut max_edge = 512_u32;
-    let mut quality = 75.0_f32;
+    let mut max_edge = IMAGE_PREVIEW_INITIAL_EDGE;
+    let mut quality = IMAGE_PREVIEW_INITIAL_QUALITY;
     loop {
         let preview = image.resize(max_edge, max_edge, image::imageops::FilterType::Lanczos3);
         let rgba = preview.to_rgba8();
@@ -138,17 +149,18 @@ fn generate_image_preview(source: &[u8]) -> Result<Option<(Vec<u8>, u32, u32, St
         let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
             .encode(quality)
             .to_vec();
-        if encoded.len() <= 128 * 1024 || max_edge <= 160 {
-            if encoded.len() > 128 * 1024 {
-                return Ok(None);
-            }
+        if encoded.len() <= IMAGE_PREVIEW_MAX_BYTES {
             return Ok(Some((encoded, original_width, original_height, blur_hash)));
         }
-        if quality > 45.0 {
+        if quality > IMAGE_PREVIEW_MIN_QUALITY {
             quality -= 10.0;
+        } else if max_edge > IMAGE_PREVIEW_MIN_EDGE {
+            max_edge = ((max_edge as f32) * 0.8)
+                .round()
+                .max(IMAGE_PREVIEW_MIN_EDGE as f32) as u32;
+            quality = IMAGE_PREVIEW_INITIAL_QUALITY;
         } else {
-            max_edge = ((max_edge as f32) * 0.8).round().max(160.0) as u32;
-            quality = 75.0;
+            return Ok(None);
         }
     }
 }
@@ -230,7 +242,9 @@ async fn register_staged_attachment(
         state.media_handles.write().await.insert(
             handle.clone(),
             crate::state::MediaHandle {
-                bytes: std::sync::Arc::new(preview_bytes.clone()),
+                source: crate::state::MediaHandleSource::InMemory {
+                    bytes: std::sync::Arc::new(preview_bytes.clone()),
+                },
                 mime_type: "image/webp".into(),
                 profile_path: profile_path.clone(),
                 profile_generation,
@@ -614,8 +628,29 @@ pub async fn download_attachment(
     reference: String,
     destination: String,
 ) -> Result<CoreOutput, String> {
+    let destination_path = std::path::PathBuf::from(&destination);
+    if !destination_path.is_absolute() {
+        return Err("Attachment save destination must be an absolute path".into());
+    }
     let reference =
         resolve_attachment_reference(&app, &conversation_id, &message_id, &reference).await?;
+    let descriptor =
+        attachment_descriptor_for_reference(&app, &conversation_id, &message_id, &reference)
+            .await?;
+    if descriptor.encryption.algorithm == CHUNKED_ATTACHMENT_CIPHER_ALGORITHM {
+        let crypto_message_id =
+            attachment_crypto_message_id(&app, &conversation_id, &message_id).await?;
+        save_chunked_attachment_to_path(
+            &app,
+            &conversation_id,
+            &crypto_message_id,
+            &descriptor,
+            &destination_path,
+        )
+        .await?;
+        remember_saved_attachment_path(&app, destination_path).await;
+        return Ok(CoreOutput::default());
+    }
     let output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::DownloadAttachment {
@@ -629,6 +664,9 @@ pub async fn download_attachment(
     .map_err(|e| normalize_attachment_error(&e.to_string()))?;
     if let Some(error) = attachment_download_failure(&output) {
         return Err(normalize_attachment_error(&error));
+    }
+    if destination_path.is_file() {
+        remember_saved_attachment_path(&app, destination_path).await;
     }
     Ok(output)
 }
@@ -676,8 +714,6 @@ pub async fn download_attachment_to_default_path(
     let descriptor =
         attachment_variant_from_snapshot(&app, &conversation_id, &message_id, requested_variant)
             .await?;
-    let plaintext =
-        load_media_variant_bytes(&app, &conversation_id, &message_id, &descriptor).await?;
     let downloads = app
         .path()
         .download_dir()
@@ -691,9 +727,67 @@ pub async fn download_attachment_to_default_path(
         )
     });
     let destination = unique_download_destination(&downloads, &requested_name);
-    write_atomic_sync(&destination, &plaintext)
-        .map_err(|error| format!("failed to save attachment to Downloads: {error}"))?;
+    if descriptor.encryption.algorithm == CHUNKED_ATTACHMENT_CIPHER_ALGORITHM {
+        let crypto_message_id =
+            attachment_crypto_message_id(&app, &conversation_id, &message_id).await?;
+        save_chunked_attachment_to_path(
+            &app,
+            &conversation_id,
+            &crypto_message_id,
+            &descriptor,
+            &destination,
+        )
+        .await?;
+    } else {
+        let plaintext =
+            load_media_variant_bytes(&app, &conversation_id, &message_id, &descriptor).await?;
+        write_atomic_sync(&destination, &plaintext)
+            .map_err(|error| format!("failed to save attachment to Downloads: {error}"))?;
+    }
+    remember_saved_attachment_path(&app, destination.clone()).await;
     Ok(destination.to_string_lossy().to_string())
+}
+
+async fn remember_saved_attachment_path(app: &tauri::AppHandle, path: std::path::PathBuf) {
+    app.state::<AppState>()
+        .saved_attachment_paths
+        .write()
+        .await
+        .insert(path);
+}
+
+async fn attachment_descriptor_for_reference(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+    reference: &str,
+) -> Result<EncryptedBlobDescriptor, String> {
+    let manifest = attachment_metadata_from_snapshot(app, conversation_id, message_id)
+        .await?
+        .ok_or_else(|| "Attachment metadata missing".to_string())?;
+    let variant = if manifest.original.object_ref == reference {
+        "original"
+    } else if manifest
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.object_ref == reference)
+    {
+        "preview"
+    } else {
+        return Err("Attachment reference is not present in manifest".into());
+    };
+    attachment_variant_from_snapshot(app, conversation_id, message_id, variant).await
+}
+
+async fn attachment_crypto_message_id(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<String, String> {
+    attachment_metadata_from_snapshot(app, conversation_id, message_id)
+        .await?
+        .map(|manifest| manifest.attachment_id)
+        .ok_or_else(|| "Attachment metadata missing".to_string())
 }
 
 async fn resolve_attachment_reference(
@@ -717,6 +811,216 @@ pub struct OpenMediaResult {
     pub handle: String,
     pub url: String,
     pub expires_at: u64,
+    pub served_variant: String,
+    pub cached: bool,
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttachmentMediaState {
+    pub preview_state: String,
+    pub original_state: String,
+    pub cached_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Clone)]
+struct PreviewPrefetchCandidate {
+    conversation_id: String,
+    message_id: String,
+    created_at: u64,
+}
+
+fn conversation_allows_preview_prefetch(state: tapchat_core::model::ConversationState) -> bool {
+    state == tapchat_core::model::ConversationState::Active
+}
+
+fn retain_recent_preview_candidates(
+    mut candidates: Vec<PreviewPrefetchCandidate>,
+) -> Vec<PreviewPrefetchCandidate> {
+    candidates.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    candidates.truncate(20);
+    candidates
+}
+
+pub(crate) fn schedule_preview_prefetch(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    if state
+        .preview_prefetch_running
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let generation = state
+            .profile_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if !matches!(
+            state.inner.read().await.session,
+            crate::state::SessionState::Active { .. }
+        ) || !super::attachment_settings::preview_prefetch_enabled(&state).await
+        {
+            state
+                .preview_prefetch_running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let initial_delay = rand::thread_rng().gen_range(5_000_u64..=20_000);
+        tokio::time::sleep(std::time::Duration::from_millis(initial_delay)).await;
+        if state
+            .profile_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != generation
+            || !matches!(
+                state.inner.read().await.session,
+                crate::state::SessionState::Active { .. }
+            )
+            || !super::attachment_settings::preview_prefetch_enabled(&state).await
+        {
+            state
+                .preview_prefetch_running
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let mut candidates = {
+            let inner = state.inner.read().await;
+            let snapshot = inner.engine.refresh_snapshot();
+            snapshot
+                .conversations
+                .iter()
+                .filter(|conversation| {
+                    conversation_allows_preview_prefetch(conversation.state.conversation.state)
+                })
+                .flat_map(|conversation| {
+                    conversation.state.messages.iter().filter_map(|message| {
+                        let manifest = message.plaintext.as_deref().and_then(|plaintext| {
+                            serde_json::from_str::<AttachmentPayloadMetadata>(plaintext).ok()
+                        })?;
+                        manifest.preview.as_ref()?;
+                        Some(PreviewPrefetchCandidate {
+                            conversation_id: conversation.conversation_id.clone(),
+                            message_id: manifest.attachment_id,
+                            created_at: message.created_at,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        candidates = retain_recent_preview_candidates(candidates);
+        let jobs = candidates.into_iter().map(|candidate| {
+            let app = app.clone();
+            async move {
+                let state = app.state::<AppState>();
+                if state
+                    .profile_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != generation
+                    || !super::attachment_settings::preview_prefetch_enabled(&state).await
+                {
+                    return;
+                }
+                let Ok(descriptor) = attachment_variant_from_snapshot(
+                    &app,
+                    &candidate.conversation_id,
+                    &candidate.message_id,
+                    "preview",
+                )
+                .await
+                else {
+                    return;
+                };
+                if complete_attachment_cache_exists(&app, &descriptor)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                let jitter = rand::thread_rng().gen_range(250_u64..=750);
+                tokio::time::sleep(std::time::Duration::from_millis(jitter)).await;
+                if state
+                    .profile_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != generation
+                    || !super::attachment_settings::preview_prefetch_enabled(&state).await
+                {
+                    return;
+                }
+                let key = format!("{}:preview", descriptor.object_ref);
+                let gate = {
+                    let mut inflight = state.media_inflight.lock().await;
+                    inflight
+                        .entry(key.clone())
+                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                        .clone()
+                };
+                let _single_flight = gate.lock().await;
+                if !complete_attachment_cache_exists(&app, &descriptor)
+                    .await
+                    .unwrap_or(false)
+                {
+                    let _ = load_media_variant_bytes(
+                        &app,
+                        &candidate.conversation_id,
+                        &candidate.message_id,
+                        &descriptor,
+                    )
+                    .await;
+                }
+                state.media_inflight.lock().await.remove(&key);
+            }
+        });
+        let _: Vec<()> = futures_util::stream::iter(jobs)
+            .buffer_unordered(2)
+            .collect()
+            .await;
+        state
+            .preview_prefetch_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+#[tauri::command]
+pub async fn get_attachment_media_state(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    message_id: String,
+) -> Result<AttachmentMediaState, String> {
+    let manifest = attachment_metadata_from_snapshot(&app, &conversation_id, &message_id)
+        .await?
+        .ok_or_else(|| "Attachment metadata missing".to_string())?;
+    let preview_state = match &manifest.preview {
+        None => "unavailable",
+        Some(preview) if complete_attachment_cache_exists(&app, preview).await? => "cached",
+        Some(_) => "remote",
+    }
+    .to_string();
+    let total_bytes = manifest.original.plaintext_size;
+    let (original_state, cached_bytes) =
+        if complete_attachment_cache_exists(&app, &manifest.original).await? {
+            ("cached", total_bytes)
+        } else if manifest.original.encryption.algorithm == CHUNKED_ATTACHMENT_CIPHER_ALGORITHM {
+            let cached = chunked_cached_plaintext_bytes(&app, &manifest.original).await?;
+            (
+                if cached == total_bytes {
+                    "cached"
+                } else if cached > 0 {
+                    "partial"
+                } else {
+                    "remote"
+                },
+                cached,
+            )
+        } else {
+            ("remote", 0)
+        };
+    Ok(AttachmentMediaState {
+        preview_state,
+        original_state: original_state.to_string(),
+        cached_bytes,
+        total_bytes,
+    })
 }
 
 /// Resolve an attachment variant entirely in Rust and expose it through a
@@ -758,19 +1062,59 @@ pub async fn open_media(
             .clone()
     };
     let single_flight = gate.lock().await;
-    let (bytes, mime_type) = match descriptor {
+    let (source, mime_type, cached, streaming) = match descriptor {
         Ok(descriptor) => {
             let mime_type = descriptor.mime_type.clone();
-            let bytes =
-                load_media_variant_bytes(&app, &conversation_id, &message_id, &descriptor).await?;
-            (bytes, mime_type)
+            let was_cached = complete_attachment_cache_exists(&app, &descriptor).await?;
+            if descriptor.encryption.algorithm == CHUNKED_ATTACHMENT_CIPHER_ALGORITHM && !was_cached
+            {
+                tapchat_core::attachment_crypto::validate_chunked_ciphertext_size(
+                    &descriptor.encryption,
+                    descriptor.plaintext_size,
+                    descriptor.ciphertext_size,
+                )
+                .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+                let crypto_message_id =
+                    attachment_crypto_message_id(&app, &conversation_id, &message_id).await?;
+                let chunks_cached = chunked_cached_plaintext_bytes(&app, &descriptor).await?
+                    == descriptor.plaintext_size;
+                (
+                    crate::state::MediaHandleSource::ChunkedVideo {
+                        conversation_id: conversation_id.clone(),
+                        message_id: crypto_message_id,
+                        descriptor,
+                    },
+                    mime_type,
+                    chunks_cached,
+                    true,
+                )
+            } else {
+                let bytes =
+                    load_media_variant_bytes(&app, &conversation_id, &message_id, &descriptor)
+                        .await?;
+                (
+                    crate::state::MediaHandleSource::InMemory {
+                        bytes: std::sync::Arc::new(bytes),
+                    },
+                    mime_type,
+                    was_cached,
+                    false,
+                )
+            }
         }
         Err(_) => {
             let source = pending_source
                 .ok_or_else(|| "Attachment local staging data is unavailable".to_string())?;
             let mime_type = source.mime_type.clone();
             let bytes = load_pending_attachment_bytes(&app, &source).await?;
-            (bytes, mime_type)
+            (
+                crate::state::MediaHandleSource::InMemory {
+                    bytes: std::sync::Arc::new(bytes),
+                },
+                mime_type,
+                true,
+                false,
+            )
         }
     };
     if state.inner.read().await.profile_path != profile_before
@@ -788,7 +1132,7 @@ pub async fn open_media(
     state.media_handles.write().await.insert(
         handle.clone(),
         crate::state::MediaHandle {
-            bytes: std::sync::Arc::new(bytes),
+            source,
             mime_type,
             profile_path: profile_before,
             profile_generation: generation_before,
@@ -800,6 +1144,9 @@ pub async fn open_media(
         handle,
         url,
         expires_at,
+        served_variant: variant,
+        cached,
+        streaming,
     })
 }
 
@@ -887,6 +1234,172 @@ pub async fn release_media(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaintextHttpRange {
+    start: u64,
+    end_exclusive: u64,
+}
+
+fn parse_single_http_range(
+    header: Option<&str>,
+    total_size: u64,
+) -> Result<Option<PlaintextHttpRange>, ()> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let value = header.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') || total_size == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        return Ok(Some(PlaintextHttpRange {
+            start: total_size.saturating_sub(suffix.min(total_size)),
+            end_exclusive: total_size,
+        }));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= total_size {
+        return Err(());
+    }
+    let end_exclusive = if end.is_empty() {
+        total_size
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| ())?
+            .saturating_add(1)
+            .min(total_size)
+    };
+    if start >= end_exclusive {
+        return Err(());
+    }
+    Ok(Some(PlaintextHttpRange {
+        start,
+        end_exclusive,
+    }))
+}
+
+fn media_http_response(
+    status: http::StatusCode,
+    mime_type: &str,
+    body: Vec<u8>,
+    total_size: u64,
+    range: Option<PlaintextHttpRange>,
+) -> http::Response<Vec<u8>> {
+    let mut builder = http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, mime_type)
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string());
+    if let Some(range) = range {
+        builder = builder.header(
+            http::header::CONTENT_RANGE,
+            format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end_exclusive - 1,
+                total_size
+            ),
+        );
+    }
+    builder
+        .body(body)
+        .unwrap_or_else(|_| http::Response::new(Vec::new()))
+}
+
+fn media_range_not_satisfiable(total_size: u64) -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(http::StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(http::header::CONTENT_RANGE, format!("bytes */{total_size}"))
+        .body(Vec::new())
+        .unwrap_or_else(|_| http::Response::new(Vec::new()))
+}
+
+pub(crate) async fn media_protocol_response(
+    app: &tauri::AppHandle,
+    handle: &str,
+    range_header: Option<&str>,
+) -> http::Response<Vec<u8>> {
+    let state = app.state::<AppState>();
+    let profile_path = state.inner.read().await.profile_path.clone();
+    let profile_generation = state
+        .profile_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let media = state.media_handles.read().await.get(handle).cloned();
+    let Some(media) = media.filter(|media| {
+        media.expires_at_ms > now_ms()
+            && media.profile_path == profile_path
+            && media.profile_generation == profile_generation
+    }) else {
+        return http::Response::builder()
+            .status(http::StatusCode::NOT_FOUND)
+            .header(http::header::CACHE_CONTROL, "no-store")
+            .body(Vec::new())
+            .unwrap_or_else(|_| http::Response::new(Vec::new()));
+    };
+    let total_size = match &media.source {
+        crate::state::MediaHandleSource::InMemory { bytes } => bytes.len() as u64,
+        crate::state::MediaHandleSource::ChunkedVideo { descriptor, .. } => {
+            descriptor.plaintext_size
+        }
+    };
+    let range = match parse_single_http_range(range_header, total_size) {
+        Ok(range) => range,
+        Err(()) => return media_range_not_satisfiable(total_size),
+    };
+    let selected = range.unwrap_or(PlaintextHttpRange {
+        start: 0,
+        end_exclusive: total_size,
+    });
+    let body = match &media.source {
+        crate::state::MediaHandleSource::InMemory { bytes } => {
+            bytes[selected.start as usize..selected.end_exclusive as usize].to_vec()
+        }
+        crate::state::MediaHandleSource::ChunkedVideo {
+            conversation_id,
+            message_id,
+            descriptor,
+        } => match load_chunked_plaintext_range(
+            app,
+            conversation_id,
+            message_id,
+            descriptor,
+            selected.start,
+            selected.end_exclusive,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                log::warn!(
+                    target: "tapchat_attachment",
+                    "attachment range failed error_class={}",
+                    attachment_error_class(&error)
+                );
+                return http::Response::builder()
+                    .status(http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .header(http::header::CACHE_CONTROL, "no-store")
+                    .body(Vec::new())
+                    .unwrap_or_else(|_| http::Response::new(Vec::new()));
+            }
+        },
+    };
+    let status = if range.is_some() {
+        http::StatusCode::PARTIAL_CONTENT
+    } else {
+        http::StatusCode::OK
+    };
+    media_http_response(status, &media.mime_type, body, total_size, range)
+}
+
 async fn attachment_variant_from_snapshot(
     app: &tauri::AppHandle,
     conversation_id: &str,
@@ -896,12 +1409,32 @@ async fn attachment_variant_from_snapshot(
     let manifest = attachment_metadata_from_snapshot(app, conversation_id, message_id)
         .await?
         .ok_or_else(|| "Attachment metadata missing".to_string())?;
-    match variant {
+    let descriptor = match variant {
         "original" => Ok(manifest.original),
         "preview" => manifest
             .preview
             .ok_or_else(|| "Attachment preview is unavailable".to_string()),
         _ => Err("Unsupported attachment variant".into()),
+    }?;
+    let resolved = {
+        let state = app.state::<AppState>();
+        let inner = state.inner.read().await;
+        inner.engine.resolve_attachment_descriptor(
+            conversation_id,
+            message_id,
+            &descriptor.object_ref,
+        )
+    };
+    match resolved {
+        Ok(descriptor) => Ok(descriptor),
+        Err(_error)
+            if pending_attachment_variant_source(app, conversation_id, message_id, variant)
+                .await?
+                .is_some() =>
+        {
+            Ok(descriptor)
+        }
+        Err(error) => Err(normalize_attachment_error(&error.to_string())),
     }
 }
 
@@ -912,6 +1445,10 @@ async fn load_media_variant_bytes(
     descriptor: &tapchat_core::attachment_crypto::EncryptedBlobDescriptor,
 ) -> Result<Vec<u8>, String> {
     let state = app.state::<AppState>();
+    let profile_before = state.inner.read().await.profile_path.clone();
+    let generation_before = state
+        .profile_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
     let attachments_dir = {
         let ports = state.ports.lock().await;
         ports.persistence.attachments_dir().await
@@ -954,6 +1491,14 @@ async fn load_media_variant_bytes(
         if let Some(error) = attachment_download_failure(&output) {
             return Err(normalize_attachment_error(&error));
         }
+    }
+    if state.inner.read().await.profile_path != profile_before
+        || state
+            .profile_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != generation_before
+    {
+        return Err("Profile changed while loading media".into());
     }
     let encrypted = tokio::fs::read(&encrypted_path)
         .await
@@ -1003,6 +1548,433 @@ fn attachment_cache_id(
         &descriptor.storage_origin,
         &descriptor.object_ref,
     )
+}
+
+async fn attachment_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let state = app.state::<AppState>();
+    let directory = {
+        let ports = state.ports.lock().await;
+        ports.persistence.attachments_dir().await
+    }
+    .ok_or_else(|| "no attachments directory configured".to_string())?;
+    Ok(directory)
+}
+
+async fn complete_attachment_cache_exists(
+    app: &tauri::AppHandle,
+    descriptor: &EncryptedBlobDescriptor,
+) -> Result<bool, String> {
+    let attachments_dir = attachment_cache_dir(app).await?;
+    let destination = EncryptedCacheDestination::from_cache_id(&attachment_cache_id(descriptor))
+        .map_err(|_| "invalid encrypted media cache destination".to_string())?;
+    Ok(attachments_dir.join(destination.relative_path()).is_file())
+}
+
+fn chunk_cache_relative_path(
+    descriptor: &EncryptedBlobDescriptor,
+    index: u32,
+) -> std::path::PathBuf {
+    std::path::PathBuf::from("attachment-cache")
+        .join("chunks")
+        .join(attachment_cache_id(descriptor))
+        .join(format!("{index}.chunk"))
+}
+
+fn chunk_cache_entry_id(descriptor: &EncryptedBlobDescriptor, index: u32) -> String {
+    tapchat_core::attachment_crypto::sha256_hex(
+        format!("{}\0{index}", attachment_cache_id(descriptor)).as_bytes(),
+    )
+}
+
+async fn chunked_cached_plaintext_bytes(
+    app: &tauri::AppHandle,
+    descriptor: &EncryptedBlobDescriptor,
+) -> Result<u64, String> {
+    let attachments_dir = attachment_cache_dir(app).await?;
+    let chunk_size = descriptor
+        .encryption
+        .chunk_size_bytes
+        .ok_or_else(|| "Chunked attachment is missing its chunk size".to_string())?;
+    let count = tapchat_core::attachment_crypto::attachment_chunk_count(
+        descriptor.plaintext_size,
+        chunk_size,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut cached = 0_u64;
+    for index in 0..count {
+        let range = tapchat_core::attachment_crypto::attachment_chunk_ciphertext_range(
+            &descriptor.encryption,
+            descriptor.plaintext_size,
+            index,
+        )
+        .map_err(|error| error.to_string())?;
+        let path = attachments_dir.join(chunk_cache_relative_path(descriptor, index));
+        if path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == range.end_exclusive - range.start)
+        {
+            cached = cached.saturating_add(
+                range.end_exclusive
+                    - range.start
+                    - tapchat_core::attachment_crypto::ATTACHMENT_GCM_TAG_BYTES,
+            );
+        }
+    }
+    Ok(cached)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AttachmentTransferProgressEvent {
+    conversation_id: String,
+    message_id: String,
+    transferred_bytes: u64,
+    total_bytes: u64,
+    percent: u32,
+    variant: String,
+    status: String,
+}
+
+async fn remember_chunk_cache_entry(
+    app: &tauri::AppHandle,
+    descriptor: &EncryptedBlobDescriptor,
+    index: u32,
+    size: u64,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile".to_string())?;
+    profile
+        .save_attachment_cache_entry(&tapchat_core::cli::profile::AttachmentCacheEntry {
+            cache_id: chunk_cache_entry_id(descriptor, index),
+            relative_path: chunk_cache_relative_path(descriptor, index),
+            mime_type: Some("application/octet-stream".into()),
+            size_bytes: Some(size),
+            updated_at_ms: now_ms(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+async fn write_ciphertext_chunk(
+    app: &tauri::AppHandle,
+    descriptor: &EncryptedBlobDescriptor,
+    index: u32,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let attachments_dir = attachment_cache_dir(app).await?;
+    let path = attachments_dir.join(chunk_cache_relative_path(descriptor, index));
+    write_atomic_sync(&path, bytes)
+        .map_err(|error| format!("failed to cache encrypted video chunk: {error}"))?;
+    remember_chunk_cache_entry(app, descriptor, index, bytes.len() as u64).await
+}
+
+async fn cache_complete_ciphertext_blob(
+    app: &tauri::AppHandle,
+    descriptor: &EncryptedBlobDescriptor,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if bytes.len() as u64 != descriptor.ciphertext_size {
+        return Err("Storage returned an invalid attachment size".into());
+    }
+    let count = tapchat_core::attachment_crypto::attachment_chunk_count(
+        descriptor.plaintext_size,
+        descriptor
+            .encryption
+            .chunk_size_bytes
+            .ok_or_else(|| "Chunked attachment is missing its chunk size".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    for index in 0..count {
+        let range = tapchat_core::attachment_crypto::attachment_chunk_ciphertext_range(
+            &descriptor.encryption,
+            descriptor.plaintext_size,
+            index,
+        )
+        .map_err(|error| error.to_string())?;
+        write_ciphertext_chunk(
+            app,
+            descriptor,
+            index,
+            &bytes[range.start as usize..range.end_exclusive as usize],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn load_ciphertext_chunk(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+    descriptor: &EncryptedBlobDescriptor,
+    index: u32,
+) -> Result<Vec<u8>, String> {
+    let range = tapchat_core::attachment_crypto::attachment_chunk_ciphertext_range(
+        &descriptor.encryption,
+        descriptor.plaintext_size,
+        index,
+    )
+    .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+    let expected_len = range.end_exclusive - range.start;
+    let attachments_dir = attachment_cache_dir(app).await?;
+    let path = attachments_dir.join(chunk_cache_relative_path(descriptor, index));
+    if let Ok(bytes) = tokio::fs::read(&path).await {
+        if bytes.len() as u64 == expected_len {
+            remember_chunk_cache_entry(app, descriptor, index, expected_len).await?;
+            return Ok(bytes);
+        }
+    }
+
+    let state = app.state::<AppState>();
+    let inflight_key = format!("chunk:{}:{index}", attachment_cache_id(descriptor));
+    let gate = {
+        let mut inflight = state.media_inflight.lock().await;
+        inflight
+            .entry(inflight_key.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _single_flight = gate.lock().await;
+    if let Ok(bytes) = tokio::fs::read(&path).await {
+        if bytes.len() as u64 == expected_len {
+            return Ok(bytes);
+        }
+    }
+
+    let generation = state
+        .profile_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let _permit = state
+        .media_network_limit
+        .acquire()
+        .await
+        .map_err(|_| "media manager stopped".to_string())?;
+    let target = format!(
+        "{}/v1/storage/blob/{}",
+        descriptor.storage_origin.trim_end_matches('/'),
+        urlencoding::encode(&descriptor.object_ref)
+    );
+    let response = crate::platform::transport::build_desktop_http_client()
+        .get(target)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("TapChat-Blob {}", descriptor.read_capability),
+        )
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={}-{}", range.start, range.end_exclusive - 1),
+        )
+        .send()
+        .await
+        .map_err(|error| {
+            normalize_attachment_error(&format!("Attachment download failed: {error}"))
+        })?;
+    let status = response.status();
+    if status != reqwest::StatusCode::PARTIAL_CONTENT && status != reqwest::StatusCode::OK {
+        return Err(normalize_attachment_error(&format!(
+            "Attachment download failed with HTTP {}",
+            status.as_u16()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > descriptor.ciphertext_size)
+    {
+        return Err("Storage returned an oversized attachment".into());
+    }
+    let mut received = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(next) = stream.next().await {
+        let bytes = next.map_err(|error| format!("failed to read attachment stream: {error}"))?;
+        received.extend_from_slice(&bytes);
+        if received.len() as u64 > descriptor.ciphertext_size {
+            return Err("Storage returned an oversized attachment".into());
+        }
+        let transferred = received.len() as u64;
+        let total = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            expected_len
+        } else {
+            descriptor.ciphertext_size
+        };
+        let _ = app.emit(
+            "download-progress",
+            AttachmentTransferProgressEvent {
+                conversation_id: conversation_id.to_string(),
+                message_id: message_id.to_string(),
+                transferred_bytes: transferred.min(total),
+                total_bytes: total,
+                percent: ((transferred.min(total) * 100) / total.max(1)) as u32,
+                variant: descriptor.variant.as_str().into(),
+                status: "downloading".into(),
+            },
+        );
+    }
+    if state
+        .profile_generation
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != generation
+    {
+        return Err("Profile changed while loading media".into());
+    }
+    let chunk = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        if received.len() as u64 != expected_len {
+            return Err("Storage returned an incomplete attachment range".into());
+        }
+        write_ciphertext_chunk(app, descriptor, index, &received).await?;
+        received
+    } else {
+        // Older storage Workers ignored Range. Accept a bounded full response,
+        // split it locally once, and keep the deployment order backwards compatible.
+        cache_complete_ciphertext_blob(app, descriptor, &received).await?;
+        received[range.start as usize..range.end_exclusive as usize].to_vec()
+    };
+    state.media_inflight.lock().await.remove(&inflight_key);
+    Ok(chunk)
+}
+
+async fn load_chunked_plaintext_range(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+    descriptor: &EncryptedBlobDescriptor,
+    start: u64,
+    end_exclusive: u64,
+) -> Result<Vec<u8>, String> {
+    let span = tapchat_core::attachment_crypto::plaintext_range_to_chunk_span(
+        &descriptor.encryption,
+        descriptor.plaintext_size,
+        start,
+        end_exclusive,
+    )
+    .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+    let chunk_size = descriptor.encryption.chunk_size_bytes.unwrap_or_default() as u64;
+    let mut output = Vec::with_capacity((end_exclusive - start) as usize);
+    for index in span.first_chunk..=span.last_chunk {
+        let ciphertext =
+            load_ciphertext_chunk(app, conversation_id, message_id, descriptor, index).await?;
+        let plaintext = tapchat_core::attachment_crypto::decrypt_attachment_chunk(
+            &ciphertext,
+            &descriptor.encryption,
+            message_id,
+            descriptor.variant,
+            descriptor.plaintext_size,
+            index,
+        )
+        .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+        let chunk_start = index as u64 * chunk_size;
+        let local_start = start.saturating_sub(chunk_start) as usize;
+        let local_end =
+            (end_exclusive.min(chunk_start + plaintext.len() as u64) - chunk_start) as usize;
+        output.extend_from_slice(&plaintext[local_start..local_end]);
+    }
+    Ok(output)
+}
+
+async fn save_chunked_attachment_to_path(
+    app: &tauri::AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+    descriptor: &EncryptedBlobDescriptor,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    tapchat_core::attachment_crypto::validate_chunked_ciphertext_size(
+        &descriptor.encryption,
+        descriptor.plaintext_size,
+        descriptor.ciphertext_size,
+    )
+    .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "Attachment save destination has no parent directory".to_string())?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| format!("failed to create attachment destination: {error}"))?;
+    let temporary = parent.join(format!(".tapchat-{}.tmp", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut file = tokio::fs::File::create(&temporary)
+            .await
+            .map_err(|error| format!("failed to create attachment temp file: {error}"))?;
+        let chunk_size = descriptor
+            .encryption
+            .chunk_size_bytes
+            .ok_or_else(|| "Chunked attachment is missing its chunk size".to_string())?;
+        let count = tapchat_core::attachment_crypto::attachment_chunk_count(
+            descriptor.plaintext_size,
+            chunk_size,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut digest = Sha256::new();
+        let mut written = 0_u64;
+        for index in 0..count {
+            let ciphertext =
+                load_ciphertext_chunk(app, conversation_id, message_id, descriptor, index).await?;
+            let plaintext = tapchat_core::attachment_crypto::decrypt_attachment_chunk(
+                &ciphertext,
+                &descriptor.encryption,
+                message_id,
+                descriptor.variant,
+                descriptor.plaintext_size,
+                index,
+            )
+            .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+            file.write_all(&plaintext)
+                .await
+                .map_err(|error| format!("failed to write attachment temp file: {error}"))?;
+            digest.update(&plaintext);
+            written = written.saturating_add(plaintext.len() as u64);
+            let _ = app.emit(
+                "download-progress",
+                AttachmentTransferProgressEvent {
+                    conversation_id: conversation_id.to_string(),
+                    message_id: message_id.to_string(),
+                    transferred_bytes: written,
+                    total_bytes: descriptor.plaintext_size,
+                    percent: ((written * 100) / descriptor.plaintext_size.max(1)) as u32,
+                    variant: descriptor.variant.as_str().into(),
+                    status: "saving".into(),
+                },
+            );
+        }
+        file.flush()
+            .await
+            .map_err(|error| format!("failed to flush attachment temp file: {error}"))?;
+        file.sync_all()
+            .await
+            .map_err(|error| format!("failed to sync attachment temp file: {error}"))?;
+        drop(file);
+        let actual_digest = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if written != descriptor.plaintext_size || actual_digest != descriptor.digest_sha256 {
+            return Err("Attachment integrity verification failed".into());
+        }
+        tokio::fs::rename(&temporary, destination)
+            .await
+            .map_err(|error| format!("failed to finalize attachment save: {error}"))?;
+        let _ = app.emit(
+            "download-progress",
+            AttachmentTransferProgressEvent {
+                conversation_id: conversation_id.to_string(),
+                message_id: message_id.to_string(),
+                transferred_bytes: descriptor.plaintext_size,
+                total_bytes: descriptor.plaintext_size,
+                percent: 100,
+                variant: descriptor.variant.as_str().into(),
+                status: "complete".into(),
+            },
+        );
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+    }
+    result
 }
 
 async fn attachment_metadata_from_snapshot(
@@ -1404,7 +2376,7 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("create preview test directory");
         let original_path = temp_dir.join("original.png");
         let original =
-            image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(960, 640, |x, y| {
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(1600, 1000, |x, y| {
                 image::Rgba([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8, 255])
             }));
         original.save(&original_path).expect("save original image");
@@ -1414,10 +2386,88 @@ mod tests {
             .expect("preview available");
         let after = std::fs::read(&original_path).expect("read original after preview");
         assert_eq!(before, after);
-        assert_eq!((width, height), (960, 640));
-        assert!(preview.len() <= 128 * 1024);
+        assert_eq!((width, height), (1600, 1000));
+        assert!(preview.len() <= IMAGE_PREVIEW_MAX_BYTES);
         assert_eq!(&preview[..4], b"RIFF");
+        let decoded = image::load_from_memory(&preview).expect("decode preview");
+        assert!(decoded.width().max(decoded.height()) <= IMAGE_PREVIEW_INITIAL_EDGE);
+        assert!(decoded.width().max(decoded.height()) >= IMAGE_PREVIEW_MIN_EDGE);
         assert!(!blur_hash.is_empty());
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn single_http_ranges_cover_closed_open_and_suffix_forms() {
+        assert_eq!(parse_single_http_range(None, 100), Ok(None));
+        assert_eq!(
+            parse_single_http_range(Some("bytes=0-0"), 100),
+            Ok(Some(PlaintextHttpRange {
+                start: 0,
+                end_exclusive: 1,
+            }))
+        );
+        assert_eq!(
+            parse_single_http_range(Some("bytes=50-"), 100),
+            Ok(Some(PlaintextHttpRange {
+                start: 50,
+                end_exclusive: 100,
+            }))
+        );
+        assert_eq!(
+            parse_single_http_range(Some("bytes=-12"), 100),
+            Ok(Some(PlaintextHttpRange {
+                start: 88,
+                end_exclusive: 100,
+            }))
+        );
+        assert!(parse_single_http_range(Some("bytes=0-1,4-5"), 100).is_err());
+        assert!(parse_single_http_range(Some("bytes=100-"), 100).is_err());
+        assert!(parse_single_http_range(Some("items=0-1"), 100).is_err());
+    }
+
+    #[test]
+    fn partial_media_response_has_plaintext_range_headers() {
+        let range = PlaintextHttpRange {
+            start: 10,
+            end_exclusive: 20,
+        };
+        let response = media_http_response(
+            http::StatusCode::PARTIAL_CONTENT,
+            "video/mp4",
+            vec![0_u8; 10],
+            100,
+            Some(range),
+        );
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "10");
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 10-19/100"
+        );
+        assert_eq!(response.headers()[http::header::ACCEPT_RANGES], "bytes");
+    }
+
+    #[test]
+    fn preview_prefetch_accepts_only_active_conversations_and_caps_recent_items() {
+        assert!(conversation_allows_preview_prefetch(
+            tapchat_core::model::ConversationState::Active
+        ));
+        assert!(!conversation_allows_preview_prefetch(
+            tapchat_core::model::ConversationState::Archived
+        ));
+        assert!(!conversation_allows_preview_prefetch(
+            tapchat_core::model::ConversationState::Closed
+        ));
+        let candidates = (0..25)
+            .map(|index| PreviewPrefetchCandidate {
+                conversation_id: "conversation:accepted".into(),
+                message_id: format!("message:{index}"),
+                created_at: index,
+            })
+            .collect();
+        let selected = retain_recent_preview_candidates(candidates);
+        assert_eq!(selected.len(), 20);
+        assert_eq!(selected.first().map(|item| item.created_at), Some(24));
+        assert_eq!(selected.last().map(|item| item.created_at), Some(5));
     }
 }

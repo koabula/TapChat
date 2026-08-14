@@ -114,6 +114,52 @@ class R2JsonBlobStore {
     };
   }
 
+  async putStream(
+    key: string,
+    value: ReadableStream,
+    metadata?: Record<string, string>,
+  ): Promise<{ size: number }> {
+    const object = await this.bucket.put(
+      key,
+      value,
+      metadata ? { customMetadata: metadata } : undefined,
+    );
+    return { size: object.size };
+  }
+
+  async headBytes(key: string): Promise<{
+    size: number;
+    customMetadata: Record<string, string>;
+    httpEtag?: string;
+  } | null> {
+    const object = await this.bucket.head(key);
+    if (!object) return null;
+    return {
+      size: object.size,
+      customMetadata: object.customMetadata ?? {},
+      ...(object.httpEtag ? { httpEtag: object.httpEtag } : {}),
+    };
+  }
+
+  async getStream(
+    key: string,
+    range?: { offset: number; length: number },
+  ): Promise<{
+    body: ReadableStream;
+    size: number;
+    customMetadata: Record<string, string>;
+    httpEtag?: string;
+  } | null> {
+    const object = await this.bucket.get(key, range ? { range } : undefined);
+    if (!object) return null;
+    return {
+      body: object.body,
+      size: object.size,
+      customMetadata: object.customMetadata ?? {},
+      ...(object.httpEtag ? { httpEtag: object.httpEtag } : {}),
+    };
+  }
+
   async delete(key: string): Promise<void> {
     await this.bucket.delete(key);
   }
@@ -769,31 +815,58 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!token) {
         throw new HttpError(401, "invalid_capability", "missing upload token");
       }
-      await store.uploadBlob(blobKey, token, await request.arrayBuffer(), now);
+      const contentLengthHeader = request.headers.get("Content-Length");
+      const contentLength = contentLengthHeader && /^\d+$/.test(contentLengthHeader)
+        ? Number(contentLengthHeader)
+        : Number.NaN;
+      if (!Number.isSafeInteger(contentLength) || contentLength <= 0 || !request.body) {
+        throw new HttpError(400, "invalid_input", "valid Content-Length and upload body are required");
+      }
+      await store.uploadBlob(blobKey, token, request.body, contentLength, now);
       return new Response(null, { status: 204 });
     }
 
     const blobMatch = url.pathname.match(/^\/v1\/storage\/blob\/(.+)$/);
-    if (request.method === "GET" && blobMatch) {
+    if ((request.method === "GET" || request.method === "HEAD") && blobMatch) {
       const blobKey = decodeURIComponent(blobMatch[1]);
       const header = request.headers.get("Authorization")?.trim();
       if (!header?.startsWith("TapChat-Blob ")) {
         throw new HttpError(401, "invalid_capability", "missing blob capability");
       }
       const capability = header.slice("TapChat-Blob ".length).trim();
-      const payload = await store.fetchBlob(blobKey, capability);
-      return new Response(payload, {
-        status: 200,
-        headers: {
-          "content-type": "application/octet-stream"
-        }
+      const payload = await store.fetchBlob(
+        blobKey,
+        capability,
+        request.headers.get("Range") ?? undefined,
+        request.method === "GET",
+      );
+      const headers = new Headers({
+        "content-type": "application/octet-stream",
+        "accept-ranges": "bytes",
+        "content-length": String(payload.contentLength),
+      });
+      if (payload.httpEtag) headers.set("etag", payload.httpEtag);
+      if (payload.range) {
+        headers.set(
+          "content-range",
+          `bytes ${payload.range.offset}-${payload.range.offset + payload.range.length - 1}/${payload.size}`,
+        );
+      }
+      return new Response(payload.body, {
+        status: payload.range ? 206 : 200,
+        headers,
       });
     }
 
     return jsonResponse({ error: "not_found", message: "route not found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) }, error.status);
+      const response = jsonResponse({ error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) }, error.status);
+      if (error.status === 416 && typeof error.details?.totalSize === "number") {
+        response.headers.set("accept-ranges", "bytes");
+        response.headers.set("content-range", `bytes */${error.details.totalSize}`);
+      }
+      return response;
     }
     const runtimeError = error as { message?: string };
     const message = runtimeError.message ?? "internal error";

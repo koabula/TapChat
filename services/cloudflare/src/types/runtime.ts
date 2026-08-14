@@ -18,6 +18,32 @@ export interface JsonBlobStore {
   delete(key: string): Promise<void>;
 }
 
+export interface BlobByteRange {
+  offset: number;
+  length: number;
+}
+
+export interface BinaryBlobMetadata {
+  size: number;
+  customMetadata: Record<string, string>;
+  httpEtag?: string;
+}
+
+export interface BinaryBlobBody extends BinaryBlobMetadata {
+  body: ReadableStream;
+}
+
+export interface BinaryBlobStore {
+  putStream(
+    key: string,
+    value: ReadableStream,
+    metadata?: Record<string, string>,
+  ): Promise<{ size: number }>;
+  headBytes(key: string): Promise<BinaryBlobMetadata | null>;
+  getStream(key: string, range?: BlobByteRange): Promise<BinaryBlobBody | null>;
+  delete(key: string): Promise<void>;
+}
+
 export interface SessionSink {
   send(payload: string): boolean;
 }

@@ -1075,6 +1075,7 @@ mod tests {
                         algorithm: crate::attachment_crypto::ATTACHMENT_CIPHER_ALGORITHM.into(),
                         key_b64: base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
                         nonce_b64: base64::engine::general_purpose::STANDARD.encode([9_u8; 12]),
+                        chunk_size_bytes: None,
                     },
                 },
                 retries: 1,

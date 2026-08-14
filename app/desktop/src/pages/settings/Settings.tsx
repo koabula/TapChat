@@ -1141,7 +1141,7 @@ function InfoRow({ label, value }: { label: string; value: string }) {
 }
 
 function AttachmentsSettings() {
-  const [settings, setLocalSettings] = useState<{ auto_download_media: boolean; always_ask_save_path: boolean } | null>(null);
+  const [settings, setLocalSettings] = useState<{ prefetch_previews: boolean; always_ask_save_path: boolean } | null>(null);
   const [cacheDir, setCacheDir] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -1152,7 +1152,7 @@ function AttachmentsSettings() {
 
   const loadSettings = async () => {
     try {
-      const s = await invoke<{ auto_download_media: boolean; always_ask_save_path: boolean }>("get_attachment_settings");
+      const s = await invoke<{ prefetch_previews: boolean; always_ask_save_path: boolean }>("get_attachment_settings");
       setLocalSettings(s);
     } catch (err) {
       console.error("[Settings] Failed to load attachment settings:", err);
@@ -1167,9 +1167,9 @@ function AttachmentsSettings() {
     }
   };
 
-  const toggleAutoDownload = async () => {
+  const togglePreviewPrefetch = async () => {
     if (!settings) return;
-    const next = { ...settings, auto_download_media: !settings.auto_download_media };
+    const next = { ...settings, prefetch_previews: !settings.prefetch_previews };
     setLocalSettings(next);
     setSaving(true);
     try {
@@ -1209,21 +1209,22 @@ function AttachmentsSettings() {
     <div className="card space-y-4">
       <label className="flex cursor-pointer items-center justify-between">
         <div className="flex-1">
-          <span className="text-primary-color">Auto-download media</span>
+          <span className="text-primary-color">Prefetch image previews</span>
           <p className="mt-0.5 text-xs text-muted-color">
-            Automatically download image, audio, and video attachments up to 10 MB from trusted contacts.
+            Privately cache small screen previews from accepted chats. Originals are always loaded on demand.
           </p>
         </div>
         <button
           className={`ml-3 h-6 w-11 flex-shrink-0 rounded-full transition-colors ${
-            settings.auto_download_media ? "bg-primary" : "bg-surface-elevated"
+            settings.prefetch_previews ? "bg-primary" : "bg-surface-elevated"
           }`}
-          onClick={toggleAutoDownload}
+          onClick={togglePreviewPrefetch}
           disabled={saving}
+          aria-label="Prefetch image previews"
         >
           <span
             className={`block h-5 w-5 rounded-full bg-white transition-transform ${
-              settings.auto_download_media ? "translate-x-5" : "translate-x-1"
+              settings.prefetch_previews ? "translate-x-5" : "translate-x-1"
             }`}
           />
         </button>

@@ -6079,7 +6079,7 @@ var SharedStateService = class {
 };
 
 // src/storage/service.ts
-var MAX_BLOB_BYTES = 25 * 1024 * 1024;
+var MAX_BLOB_BYTES = 25 * 1024 * 1024 + 1024;
 var SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1e3;
 var CAPABILITY_METADATA_KEY = "read-capability-sha256";
 function sanitizeSegment2(value) {
@@ -6166,45 +6166,60 @@ var StorageService = class {
       expiresAt
     };
   }
-  async uploadBlob(blobKey, token, body, now) {
+  async uploadBlob(blobKey, token, body, contentLength, now) {
     const payload = await this.verifyToken(token, now);
     if (payload.action !== "upload" || payload.blobKey !== blobKey) {
       throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
     }
-    if (!Number.isSafeInteger(payload.sizeBytes) || body.byteLength !== payload.sizeBytes) {
+    if (!Number.isSafeInteger(payload.sizeBytes) || contentLength !== payload.sizeBytes) {
       throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
     if (!payload.readCapabilityHash) {
       throw new HttpError(403, "invalid_capability", "upload token is missing blob capability binding");
     }
-    await this.store.putBytes(blobKey, body, {
+    const stored = await this.store.putStream(blobKey, body, {
       [CAPABILITY_METADATA_KEY]: payload.readCapabilityHash,
       "content-type": "application/octet-stream"
     });
+    if (stored.size !== payload.sizeBytes) {
+      await this.store.delete(blobKey);
+      throw new HttpError(400, "invalid_input", "stored upload size does not match prepared size");
+    }
   }
-  async fetchBlob(blobKey, capability) {
-    if (!capability || !this.store.getBytesMetadata) {
+  async fetchBlob(blobKey, capability, rangeHeader, includeBody = true) {
+    if (!capability) {
       throw new HttpError(403, "invalid_capability", "blob capability cannot be verified");
     }
-    const object = await this.store.getBytesMetadata(blobKey);
-    if (!object) {
+    const metadata = await this.store.headBytes(blobKey);
+    if (!metadata) {
       throw new HttpError(404, "blob_not_found", "blob does not exist");
     }
-    const expectedHash = object.customMetadata[CAPABILITY_METADATA_KEY];
+    const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);
     if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
       throw new HttpError(403, "invalid_capability", "blob capability is not valid for this object");
     }
-    return object.bytes;
-  }
-  async putJson(key, value) {
-    await this.store.putJson(key, value);
-  }
-  async getJson(key) {
-    return this.store.getJson(key);
-  }
-  async delete(key) {
-    await this.store.delete(key);
+    const range = rangeHeader ? parseRange(rangeHeader, metadata.size) : void 0;
+    if (!includeBody) {
+      return {
+        body: null,
+        size: metadata.size,
+        contentLength: range?.length ?? metadata.size,
+        ...range ? { range } : {},
+        ...metadata.httpEtag ? { httpEtag: metadata.httpEtag } : {}
+      };
+    }
+    const object = await this.store.getStream(blobKey, range);
+    if (!object) {
+      throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    return {
+      body: object.body,
+      size: metadata.size,
+      contentLength: range?.length ?? metadata.size,
+      ...range ? { range } : {},
+      ...object.httpEtag ? { httpEtag: object.httpEtag } : metadata.httpEtag ? { httpEtag: metadata.httpEtag } : {}
+    };
   }
   async verifyToken(token, now) {
     try {
@@ -6218,6 +6233,36 @@ var StorageService = class {
     }
   }
 };
+function parseRange(header, size) {
+  const value = header.startsWith("bytes=") ? header.slice("bytes=".length) : "";
+  if (!value || value.includes(",") || !Number.isSafeInteger(size) || size <= 0) {
+    throw rangeError(size);
+  }
+  const separator = value.indexOf("-");
+  if (separator < 0 || value.indexOf("-", separator + 1) >= 0) {
+    throw rangeError(size);
+  }
+  const startText = value.slice(0, separator);
+  const endText = value.slice(separator + 1);
+  if (!startText) {
+    const suffix = Number(endText);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) throw rangeError(size);
+    const length = Math.min(suffix, size);
+    return { offset: size - length, length };
+  }
+  const offset = Number(startText);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset >= size) throw rangeError(size);
+  if (!endText) return { offset, length: size - offset };
+  const requestedEnd = Number(endText);
+  if (!Number.isSafeInteger(requestedEnd) || requestedEnd < offset) throw rangeError(size);
+  const end = Math.min(requestedEnd, size - 1);
+  return { offset, length: end - offset + 1 };
+}
+function rangeError(size) {
+  return new HttpError(416, "range_not_satisfiable", "requested byte range is invalid", {
+    totalSize: size
+  });
+}
 
 // src/welcome-pickup/service.ts
 function pickupKey(groupId, deviceId, requestId) {
@@ -6326,6 +6371,33 @@ var R2JsonBlobStore3 = class {
     return {
       bytes: await object.arrayBuffer(),
       customMetadata: object.customMetadata ?? {}
+    };
+  }
+  async putStream(key, value, metadata) {
+    const object = await this.bucket.put(
+      key,
+      value,
+      metadata ? { customMetadata: metadata } : void 0
+    );
+    return { size: object.size };
+  }
+  async headBytes(key) {
+    const object = await this.bucket.head(key);
+    if (!object) return null;
+    return {
+      size: object.size,
+      customMetadata: object.customMetadata ?? {},
+      ...object.httpEtag ? { httpEtag: object.httpEtag } : {}
+    };
+  }
+  async getStream(key, range) {
+    const object = await this.bucket.get(key, range ? { range } : void 0);
+    if (!object) return null;
+    return {
+      body: object.body,
+      size: object.size,
+      customMetadata: object.customMetadata ?? {},
+      ...object.httpEtag ? { httpEtag: object.httpEtag } : {}
     };
   }
   async delete(key) {
@@ -6899,29 +6971,54 @@ async function handleRequest(request, env) {
       if (!token) {
         throw new HttpError(401, "invalid_capability", "missing upload token");
       }
-      await store.uploadBlob(blobKey, token, await request.arrayBuffer(), now);
+      const contentLengthHeader = request.headers.get("Content-Length");
+      const contentLength = contentLengthHeader && /^\d+$/.test(contentLengthHeader) ? Number(contentLengthHeader) : Number.NaN;
+      if (!Number.isSafeInteger(contentLength) || contentLength <= 0 || !request.body) {
+        throw new HttpError(400, "invalid_input", "valid Content-Length and upload body are required");
+      }
+      await store.uploadBlob(blobKey, token, request.body, contentLength, now);
       return new Response(null, { status: 204 });
     }
     const blobMatch = url.pathname.match(/^\/v1\/storage\/blob\/(.+)$/);
-    if (request.method === "GET" && blobMatch) {
+    if ((request.method === "GET" || request.method === "HEAD") && blobMatch) {
       const blobKey = decodeURIComponent(blobMatch[1]);
       const header = request.headers.get("Authorization")?.trim();
       if (!header?.startsWith("TapChat-Blob ")) {
         throw new HttpError(401, "invalid_capability", "missing blob capability");
       }
       const capability = header.slice("TapChat-Blob ".length).trim();
-      const payload = await store.fetchBlob(blobKey, capability);
-      return new Response(payload, {
-        status: 200,
-        headers: {
-          "content-type": "application/octet-stream"
-        }
+      const payload = await store.fetchBlob(
+        blobKey,
+        capability,
+        request.headers.get("Range") ?? void 0,
+        request.method === "GET"
+      );
+      const headers = new Headers({
+        "content-type": "application/octet-stream",
+        "accept-ranges": "bytes",
+        "content-length": String(payload.contentLength)
+      });
+      if (payload.httpEtag) headers.set("etag", payload.httpEtag);
+      if (payload.range) {
+        headers.set(
+          "content-range",
+          `bytes ${payload.range.offset}-${payload.range.offset + payload.range.length - 1}/${payload.size}`
+        );
+      }
+      return new Response(payload.body, {
+        status: payload.range ? 206 : 200,
+        headers
       });
     }
     return jsonResponse4({ error: "not_found", message: "route not found" }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse4({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
+      const response = jsonResponse4({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
+      if (error.status === 416 && typeof error.details?.totalSize === "number") {
+        response.headers.set("accept-ranges", "bytes");
+        response.headers.set("content-range", `bytes */${error.details.totalSize}`);
+      }
+      return response;
     }
     const runtimeError = error;
     const message = runtimeError.message ?? "internal error";

@@ -37,6 +37,7 @@ import type {
   DurableObjectNamespace,
   DurableObjectStub,
   R2Bucket,
+  R2Object,
   R2ObjectBody
 } from "./runtime-types";
 import { signSharingPayload } from "../src/storage/sharing";
@@ -228,10 +229,12 @@ class MemoryR2Store implements JsonBlobStore {
   asBucket(): R2Bucket {
     const self = this;
     return {
-      async put(key: string, value: string | ArrayBuffer | ArrayBufferView, options?: R2PutOptions) {
+      async put(key: string, value: string | ArrayBuffer | ArrayBufferView | ReadableStream, options?: R2PutOptions) {
         const customMetadata = options?.customMetadata ?? {};
         if (typeof value === "string") {
           await self.putBytes(key, new TextEncoder().encode(value), customMetadata);
+        } else if (value instanceof ReadableStream) {
+          await self.putBytes(key, await new Response(value).arrayBuffer(), customMetadata);
         } else if (value instanceof ArrayBuffer) {
           await self.putBytes(key, value, customMetadata);
         } else {
@@ -241,19 +244,38 @@ class MemoryR2Store implements JsonBlobStore {
             customMetadata
           );
         }
-        return null;
+        const size = self.map.get(key)?.byteLength ?? 0;
+        return { size, httpEtag: `"memory-${size}"`, customMetadata } as R2Object;
       },
-      async get(key: string) {
+      async head(key: string) {
+        const value = self.map.get(key);
+        if (!value) return null;
+        return {
+          size: value.byteLength,
+          httpEtag: `"memory-${value.byteLength}"`,
+          customMetadata: { ...(self.metadata.get(key) ?? {}) },
+        } as R2Object;
+      },
+      async get(key: string, options?: { range?: { offset: number; length: number } }) {
         const value = self.map.get(key);
         if (!value) {
           return null;
         }
+        const range = options?.range;
+        const selected = range
+          ? value.slice(range.offset, range.offset + range.length)
+          : value;
         return {
+          body: new Response(
+            selected.buffer.slice(selected.byteOffset, selected.byteOffset + selected.byteLength) as ArrayBuffer,
+          ).body!,
+          size: value.byteLength,
+          httpEtag: `"memory-${value.byteLength}"`,
           async json<T>() {
-            return JSON.parse(new TextDecoder().decode(value)) as T;
+            return JSON.parse(new TextDecoder().decode(selected)) as T;
           },
           async arrayBuffer() {
-            return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
+            return selected.buffer.slice(selected.byteOffset, selected.byteOffset + selected.byteLength) as ArrayBuffer;
           },
           customMetadata: { ...(self.metadata.get(key) ?? {}) }
         } as unknown as R2ObjectBody;
@@ -1870,7 +1892,7 @@ test("prepare-upload requires runtime auth and blob-scoped capability gates acce
   const wrongSize = await handleRequest(
     new Request(prepared.uploadTarget, {
       method: "PUT",
-      headers: { "Content-Type": "application/octet-stream" },
+      headers: { "Content-Type": "application/octet-stream", "Content-Length": "3" },
       body: new Uint8Array([1, 2, 3])
     }),
     env
@@ -1880,7 +1902,7 @@ test("prepare-upload requires runtime auth and blob-scoped capability gates acce
   const upload = await handleRequest(
     new Request(prepared.uploadTarget, {
       method: "PUT",
-      headers: { "Content-Type": "application/octet-stream" },
+      headers: { "Content-Type": "application/octet-stream", "Content-Length": "4" },
       body: new Uint8Array([1, 2, 3, 4])
     }),
     env
@@ -1897,7 +1919,54 @@ test("prepare-upload requires runtime auth and blob-scoped capability gates acce
     headers: { Authorization: `TapChat-Blob ${prepared.readCapability}` }
   }), env);
   assert.equal(download.status, 200);
+  assert.equal(download.headers.get("accept-ranges"), "bytes");
+  assert.equal(download.headers.get("content-length"), "4");
   assert.deepEqual(new Uint8Array(await download.arrayBuffer()), new Uint8Array([1, 2, 3, 4]));
+
+  const openRange = await handleRequest(new Request(prepared.downloadTarget, {
+    headers: {
+      Authorization: `TapChat-Blob ${prepared.readCapability}`,
+      Range: "bytes=1-",
+    },
+  }), env);
+  assert.equal(openRange.status, 206);
+  assert.equal(openRange.headers.get("content-range"), "bytes 1-3/4");
+  assert.deepEqual(Array.from(new Uint8Array(await openRange.arrayBuffer())), [2, 3, 4]);
+
+  const closedRange = await handleRequest(new Request(prepared.downloadTarget, {
+    headers: {
+      Authorization: `TapChat-Blob ${prepared.readCapability}`,
+      Range: "bytes=1-2",
+    },
+  }), env);
+  assert.equal(closedRange.status, 206);
+  assert.deepEqual(Array.from(new Uint8Array(await closedRange.arrayBuffer())), [2, 3]);
+
+  const suffixRange = await handleRequest(new Request(prepared.downloadTarget, {
+    headers: {
+      Authorization: `TapChat-Blob ${prepared.readCapability}`,
+      Range: "bytes=-2",
+    },
+  }), env);
+  assert.equal(suffixRange.status, 206);
+  assert.deepEqual(Array.from(new Uint8Array(await suffixRange.arrayBuffer())), [3, 4]);
+
+  const head = await handleRequest(new Request(prepared.downloadTarget, {
+    method: "HEAD",
+    headers: { Authorization: `TapChat-Blob ${prepared.readCapability}` },
+  }), env);
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get("content-length"), "4");
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+
+  const invalidRange = await handleRequest(new Request(prepared.downloadTarget, {
+    headers: {
+      Authorization: `TapChat-Blob ${prepared.readCapability}`,
+      Range: "bytes=9-10",
+    },
+  }), env);
+  assert.equal(invalidRange.status, 416);
+  assert.equal(invalidRange.headers.get("content-range"), "bytes */4");
 });
 
 test("shared-state writes accept device runtime auth", async () => {

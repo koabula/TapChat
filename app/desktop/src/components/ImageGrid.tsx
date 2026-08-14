@@ -21,7 +21,6 @@ interface OpenMediaResult { handle: string; url: string; expires_at: number }
 
 export default function ImageGrid({ items, onImageClick }: {
   items: ImageGridItem[];
-  autoDownloadMedia?: boolean;
   onImageClick: (index: number) => void;
 }) {
   const count = items.length;

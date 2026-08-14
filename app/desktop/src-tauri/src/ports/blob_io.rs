@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
@@ -13,13 +14,49 @@ use tapchat_core::transport_contract::{BlobDownloadRequest, BlobUploadRequest};
 
 use crate::platform::log_sanitize::redact_id;
 
+const MAX_ATTACHMENT_CIPHERTEXT_BYTES: u64 = 25 * 1024 * 1024 + 1024;
+
 /// Progress event payload sent to frontend during uploads
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UploadProgressEvent {
     pub task_id: String,
     pub conversation_id: String,
-    pub progress: u32,  // 0-100 percentage
-    pub status: String, // "reading", "encrypting", "uploading", "complete", "failed"
+    pub transferred_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: u32,
+    /// Kept during the UI migration; it is always identical to `percent`.
+    pub progress: u32,
+    pub variant: String,
+    pub status: String,
+}
+
+impl UploadProgressEvent {
+    pub fn simple(
+        task_id: String,
+        conversation_id: String,
+        percent: u32,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            variant: transfer_variant(&task_id),
+            task_id,
+            conversation_id,
+            transferred_bytes: 0,
+            total_bytes: 0,
+            percent,
+            progress: percent,
+            status: status.into(),
+        }
+    }
+}
+
+fn transfer_variant(task_id: &str) -> String {
+    if task_id.ends_with(":preview") {
+        "preview"
+    } else {
+        "original"
+    }
+    .into()
 }
 
 /// Read attachment bytes from the platform-owned attachment handle.
@@ -62,12 +99,7 @@ pub async fn upload_blob_with_progress(
     if let Some(app_ref) = &app {
         let _ = app_ref.emit(
             "upload-progress",
-            UploadProgressEvent {
-                task_id: task_id.clone(),
-                conversation_id: conversation_id.clone(),
-                progress: 0,
-                status: "uploading".to_string(),
-            },
+            UploadProgressEvent::simple(task_id.clone(), conversation_id.clone(), 0, "uploading"),
         );
     }
 
@@ -77,22 +109,46 @@ pub async fn upload_blob_with_progress(
         request = request.header(key, value);
     }
 
-    // Use body with progress tracking
-    // Note: reqwest doesn't have built-in progress, so we chunk it manually
-    // For now, emit progress at start and completion
-    if let Some(app_ref) = &app {
-        let _ = app_ref.emit(
-            "upload-progress",
-            UploadProgressEvent {
-                task_id: task_id.clone(),
-                conversation_id: conversation_id.clone(),
-                progress: 10,
-                status: "uploading".to_string(),
-            },
-        );
-    }
-
-    request = request.body(upload.blob_ciphertext);
+    let total_bytes = upload.blob_ciphertext.len() as u64;
+    let variant = transfer_variant(&task_id);
+    let stream_task_id = task_id.clone();
+    let stream_conversation_id = conversation_id.clone();
+    let upload_stream = futures_util::stream::unfold(
+        (upload.blob_ciphertext, 0_usize, app.clone()),
+        move |(bytes, offset, app)| {
+            let task_id = stream_task_id.clone();
+            let conversation_id = stream_conversation_id.clone();
+            let variant = variant.clone();
+            async move {
+                if offset >= bytes.len() {
+                    return None;
+                }
+                let end = (offset + 64 * 1024).min(bytes.len());
+                let chunk = bytes[offset..end].to_vec();
+                if let Some(app_ref) = &app {
+                    let transferred = end as u64;
+                    let percent = ((transferred * 100) / total_bytes.max(1)) as u32;
+                    let _ = app_ref.emit(
+                        "upload-progress",
+                        UploadProgressEvent {
+                            task_id,
+                            conversation_id,
+                            transferred_bytes: transferred,
+                            total_bytes,
+                            percent,
+                            progress: percent,
+                            variant,
+                            status: "uploading".into(),
+                        },
+                    );
+                }
+                Some((Ok::<Vec<u8>, std::io::Error>(chunk), (bytes, end, app)))
+            }
+        },
+    );
+    request = request
+        .header(reqwest::header::CONTENT_LENGTH, total_bytes)
+        .body(reqwest::Body::wrap_stream(upload_stream));
 
     match request.send().await {
         Ok(response) => {
@@ -105,8 +161,12 @@ pub async fn upload_blob_with_progress(
                         UploadProgressEvent {
                             task_id: task_id.clone(),
                             conversation_id: conversation_id.clone(),
+                            transferred_bytes: total_bytes,
+                            total_bytes,
+                            percent: 100,
                             progress: 100,
-                            status: "complete".to_string(),
+                            variant: transfer_variant(&task_id),
+                            status: "complete".into(),
                         },
                     );
                 }
@@ -132,12 +192,12 @@ pub async fn upload_blob_with_progress(
                 if let Some(app_ref) = &app {
                     let _ = app_ref.emit(
                         "upload-progress",
-                        UploadProgressEvent {
-                            task_id: task_id.clone(),
-                            conversation_id: conversation_id.clone(),
-                            progress: 0,
-                            status: if retryable { "retrying" } else { "failed" }.to_string(),
-                        },
+                        UploadProgressEvent::simple(
+                            task_id.clone(),
+                            conversation_id.clone(),
+                            0,
+                            if retryable { "retrying" } else { "failed" },
+                        ),
                     );
                 }
 
@@ -165,12 +225,12 @@ pub async fn upload_blob_with_progress(
             if let Some(app_ref) = &app {
                 let _ = app_ref.emit(
                     "upload-progress",
-                    UploadProgressEvent {
-                        task_id: task_id.clone(),
+                    UploadProgressEvent::simple(
+                        task_id.clone(),
                         conversation_id,
-                        progress: 0,
-                        status: if retryable { "retrying" } else { "failed" }.to_string(),
-                    },
+                        0,
+                        if retryable { "retrying" } else { "failed" },
+                    ),
                 );
             }
 
@@ -194,6 +254,7 @@ pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
 pub async fn download_blob(
     client: &reqwest::Client,
     download: BlobDownloadRequest,
+    app: Option<Arc<AppHandle>>,
 ) -> Result<Vec<CoreEvent>> {
     let mut request = client.get(&download.download_target);
 
@@ -205,10 +266,52 @@ pub async fn download_blob(
         Ok(response) => {
             let status = response.status().as_u16();
             if status >= 200 && status < 300 {
-                let bytes = response.bytes().await.context("read blob response")?;
+                let total_bytes = response.content_length().unwrap_or_default();
+                if total_bytes > MAX_ATTACHMENT_CIPHERTEXT_BYTES {
+                    return Ok(vec![CoreEvent::BlobTransferFailed {
+                        task_id: download.task_id,
+                        retryable: false,
+                        detail: Some("blob_download:oversized".into()),
+                    }]);
+                }
+                let mut transferred_bytes = 0_u64;
+                let mut bytes = Vec::with_capacity(total_bytes as usize);
+                let mut stream = response.bytes_stream();
+                while let Some(next) = stream.next().await {
+                    let chunk = next.context("read blob response")?;
+                    transferred_bytes = transferred_bytes.saturating_add(chunk.len() as u64);
+                    if transferred_bytes > MAX_ATTACHMENT_CIPHERTEXT_BYTES {
+                        return Ok(vec![CoreEvent::BlobTransferFailed {
+                            task_id: download.task_id,
+                            retryable: false,
+                            detail: Some("blob_download:oversized".into()),
+                        }]);
+                    }
+                    bytes.extend_from_slice(&chunk);
+                    if let Some(app_ref) = &app {
+                        let percent = if total_bytes == 0 {
+                            0
+                        } else {
+                            ((transferred_bytes.min(total_bytes) * 100) / total_bytes) as u32
+                        };
+                        let _ = app_ref.emit(
+                            "download-progress",
+                            UploadProgressEvent {
+                                task_id: download.task_id.clone(),
+                                conversation_id: download.conversation_id.clone(),
+                                transferred_bytes,
+                                total_bytes,
+                                percent,
+                                progress: percent,
+                                variant: transfer_variant(&download.task_id),
+                                status: "downloading".into(),
+                            },
+                        );
+                    }
+                }
                 Ok(vec![CoreEvent::BlobDownloaded {
                     task_id: download.task_id,
-                    blob_ciphertext: Some(bytes.to_vec()),
+                    blob_ciphertext: Some(bytes),
                 }])
             } else {
                 let error_body = response.text().await.unwrap_or_default();

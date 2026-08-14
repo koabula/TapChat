@@ -695,7 +695,8 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   const uploadResponse = await mf.dispatchFetch(prepared.uploadTarget, {
     method: "PUT",
     headers: {
-      "content-type": "application/octet-stream"
+      "content-type": "application/octet-stream",
+      "content-length": "4"
     },
     body: new Uint8Array([1, 2, 3, 4])
   });
@@ -714,6 +715,17 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   assert.equal(downloadResponse.status, 200);
   const bytes = new Uint8Array(await downloadResponse.arrayBuffer());
   assert.deepEqual(Array.from(bytes), [1, 2, 3, 4]);
+
+  const rangeResponse = await mf.dispatchFetch(prepared.downloadTarget, {
+    method: "GET",
+    headers: {
+      Authorization: `TapChat-Blob ${prepared.readCapability}`,
+      Range: "bytes=2-3",
+    },
+  });
+  assert.equal(rangeResponse.status, 206);
+  assert.equal(rangeResponse.headers.get("content-range"), "bytes 2-3/4");
+  assert.deepEqual(Array.from(new Uint8Array(await rangeResponse.arrayBuffer())), [3, 4]);
 });
 
 test("runtime integration: group FSM routes expose open-invite and join lease flow", async (t) => {

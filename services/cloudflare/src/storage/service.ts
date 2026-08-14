@@ -2,11 +2,13 @@ import {
   type PrepareBlobUploadRequest,
   type PrepareBlobUploadResult
 } from "../types/contracts";
-import type { JsonBlobStore } from "../types/runtime";
+import type { BinaryBlobStore, BlobByteRange } from "../types/runtime";
 import { HttpError } from "../auth/capability";
 import { signSharingPayload, verifySharingPayload } from "./sharing";
 
-const MAX_BLOB_BYTES = 25 * 1024 * 1024;
+// Core caps plaintext at 25 MiB. Storage receives AEAD ciphertext, including
+// up to fifty 16-byte chunk tags for the fixed 512 KiB video format.
+const MAX_BLOB_BYTES = 25 * 1024 * 1024 + 1024;
 const SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1000;
 const CAPABILITY_METADATA_KEY = "read-capability-sha256";
 
@@ -43,11 +45,11 @@ function constantTimeEqual(left: string, right: string): boolean {
 }
 
 export class StorageService {
-  private readonly store: JsonBlobStore;
+  private readonly store: BinaryBlobStore;
   private readonly baseUrl: string;
   private readonly secret: string;
 
-  constructor(store: JsonBlobStore, baseUrl: string, secret: string) {
+  constructor(store: BinaryBlobStore, baseUrl: string, secret: string) {
     this.store = store;
     this.baseUrl = baseUrl;
     this.secret = secret;
@@ -107,49 +109,79 @@ export class StorageService {
     };
   }
 
-  async uploadBlob(blobKey: string, token: string, body: ArrayBuffer, now: number): Promise<void> {
+  async uploadBlob(
+    blobKey: string,
+    token: string,
+    body: ReadableStream,
+    contentLength: number,
+    now: number,
+  ): Promise<void> {
     const payload = await this.verifyToken<{ action: string; blobKey: string; sizeBytes?: number; readCapabilityHash?: string }>(token, now);
     if (payload.action !== "upload" || payload.blobKey !== blobKey) {
       throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
     }
-    if (!Number.isSafeInteger(payload.sizeBytes) || body.byteLength !== payload.sizeBytes) {
+    if (!Number.isSafeInteger(payload.sizeBytes) || contentLength !== payload.sizeBytes) {
       throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
     if (!payload.readCapabilityHash) {
       throw new HttpError(403, "invalid_capability", "upload token is missing blob capability binding");
     }
-    await this.store.putBytes(blobKey, body, {
+    const stored = await this.store.putStream(blobKey, body, {
       [CAPABILITY_METADATA_KEY]: payload.readCapabilityHash,
       "content-type": "application/octet-stream"
     });
+    if (stored.size !== payload.sizeBytes) {
+      await this.store.delete(blobKey);
+      throw new HttpError(400, "invalid_input", "stored upload size does not match prepared size");
+    }
   }
 
-  async fetchBlob(blobKey: string, capability: string): Promise<ArrayBuffer> {
-    if (!capability || !this.store.getBytesMetadata) {
+  async fetchBlob(
+    blobKey: string,
+    capability: string,
+    rangeHeader?: string,
+    includeBody = true,
+  ): Promise<{
+    body: ReadableStream | null;
+    size: number;
+    contentLength: number;
+    range?: BlobByteRange;
+    httpEtag?: string;
+  }> {
+    if (!capability) {
       throw new HttpError(403, "invalid_capability", "blob capability cannot be verified");
     }
-    const object = await this.store.getBytesMetadata(blobKey);
-    if (!object) {
+    const metadata = await this.store.headBytes(blobKey);
+    if (!metadata) {
       throw new HttpError(404, "blob_not_found", "blob does not exist");
     }
-    const expectedHash = object.customMetadata[CAPABILITY_METADATA_KEY];
+    const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);
     if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
       throw new HttpError(403, "invalid_capability", "blob capability is not valid for this object");
     }
-    return object.bytes;
-  }
-
-  async putJson<T>(key: string, value: T): Promise<void> {
-    await this.store.putJson(key, value);
-  }
-
-  async getJson<T>(key: string): Promise<T | null> {
-    return this.store.getJson<T>(key);
-  }
-
-  async delete(key: string): Promise<void> {
-    await this.store.delete(key);
+    // Capability verification deliberately completes before R2 exposes a body.
+    const range = rangeHeader ? parseRange(rangeHeader, metadata.size) : undefined;
+    if (!includeBody) {
+      return {
+        body: null,
+        size: metadata.size,
+        contentLength: range?.length ?? metadata.size,
+        ...(range ? { range } : {}),
+        ...(metadata.httpEtag ? { httpEtag: metadata.httpEtag } : {}),
+      };
+    }
+    const object = await this.store.getStream(blobKey, range);
+    if (!object) {
+      throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    return {
+      body: object.body,
+      size: metadata.size,
+      contentLength: range?.length ?? metadata.size,
+      ...(range ? { range } : {}),
+      ...(object.httpEtag ? { httpEtag: object.httpEtag } : metadata.httpEtag ? { httpEtag: metadata.httpEtag } : {}),
+    };
   }
 
   private async verifyToken<T>(token: string, now: number): Promise<T> {
@@ -163,4 +195,36 @@ export class StorageService {
       throw new HttpError(403, "invalid_capability", message);
     }
   }
+}
+
+function parseRange(header: string, size: number): BlobByteRange {
+  const value = header.startsWith("bytes=") ? header.slice("bytes=".length) : "";
+  if (!value || value.includes(",") || !Number.isSafeInteger(size) || size <= 0) {
+    throw rangeError(size);
+  }
+  const separator = value.indexOf("-");
+  if (separator < 0 || value.indexOf("-", separator + 1) >= 0) {
+    throw rangeError(size);
+  }
+  const startText = value.slice(0, separator);
+  const endText = value.slice(separator + 1);
+  if (!startText) {
+    const suffix = Number(endText);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) throw rangeError(size);
+    const length = Math.min(suffix, size);
+    return { offset: size - length, length };
+  }
+  const offset = Number(startText);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset >= size) throw rangeError(size);
+  if (!endText) return { offset, length: size - offset };
+  const requestedEnd = Number(endText);
+  if (!Number.isSafeInteger(requestedEnd) || requestedEnd < offset) throw rangeError(size);
+  const end = Math.min(requestedEnd, size - 1);
+  return { offset, length: end - offset + 1 };
+}
+
+function rangeError(size: number): HttpError {
+  return new HttpError(416, "range_not_satisfiable", "requested byte range is invalid", {
+    totalSize: size,
+  });
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -39,19 +40,33 @@ pub struct AppState {
     pub runtime_auth: RuntimeAuthManager,
     pub media_handles: Arc<RwLock<HashMap<String, MediaHandle>>>,
     pub staged_attachments: Arc<Mutex<HashMap<String, StagedAttachment>>>,
+    pub saved_attachment_paths: Arc<RwLock<HashSet<PathBuf>>>,
     pub media_inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub media_network_limit: Arc<Semaphore>,
     pub media_decode_limit: Arc<Semaphore>,
+    pub preview_prefetch_running: Arc<AtomicBool>,
     pub profile_generation: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
 pub struct MediaHandle {
-    pub bytes: Arc<Vec<u8>>,
+    pub source: MediaHandleSource,
     pub mime_type: String,
     pub profile_path: Option<PathBuf>,
     pub profile_generation: u64,
     pub expires_at_ms: u64,
+}
+
+#[derive(Clone)]
+pub enum MediaHandleSource {
+    InMemory {
+        bytes: Arc<Vec<u8>>,
+    },
+    ChunkedVideo {
+        conversation_id: String,
+        message_id: String,
+        descriptor: tapchat_core::attachment_crypto::EncryptedBlobDescriptor,
+    },
 }
 
 #[derive(Clone)]
@@ -189,9 +204,11 @@ impl AppState {
             runtime_auth,
             media_handles: Arc::new(RwLock::new(HashMap::new())),
             staged_attachments: Arc::new(Mutex::new(HashMap::new())),
+            saved_attachment_paths: Arc::new(RwLock::new(HashSet::new())),
             media_inflight: Arc::new(Mutex::new(HashMap::new())),
             media_network_limit: Arc::new(Semaphore::new(3)),
             media_decode_limit: Arc::new(Semaphore::new(2)),
+            preview_prefetch_running: Arc::new(AtomicBool::new(false)),
             profile_generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -223,9 +240,11 @@ impl AppState {
             runtime_auth,
             media_handles: Arc::new(RwLock::new(HashMap::new())),
             staged_attachments: Arc::new(Mutex::new(HashMap::new())),
+            saved_attachment_paths: Arc::new(RwLock::new(HashSet::new())),
             media_inflight: Arc::new(Mutex::new(HashMap::new())),
             media_network_limit: Arc::new(Semaphore::new(3)),
             media_decode_limit: Arc::new(Semaphore::new(2)),
+            preview_prefetch_running: Arc::new(AtomicBool::new(false)),
             profile_generation: Arc::new(AtomicU64::new(0)),
         }
     }
