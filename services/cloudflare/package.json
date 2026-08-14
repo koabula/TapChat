@@ -8,7 +8,7 @@
     "types:check": "wrangler types --config wrangler.jsonc --env-interface CloudflareBindings --include-runtime --no-strict-vars --check",
     "check": "npm run types:check && tsc --noEmit",
     "test": "tsx --test test/cloudflare.test.ts test/group-contract-parity.test.ts",
-    "test:integration": "tsx --test test/*.integration.test.ts",
+    "test:integration": "tsx --test --test-force-exit test/*.integration.test.ts",
     "build:embedded": "node scripts/build-embedded-worker.mjs",
     "check:embedded": "node scripts/build-embedded-worker.mjs --check",
     "transport:runtime": "node scripts/transport-runtime.mjs",

@@ -36,6 +36,7 @@ jobs:
   cloudflare:
     name: cloudflare
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: services/cloudflare
