@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
@@ -26,7 +25,7 @@ import {
 } from "../src/auth/capability";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const TMP_DIR = path.join(os.tmpdir(), "tapchat-cloudflare-test-runtime");
+const TMP_DIR = path.join(ROOT, "node_modules", ".cache", "tapchat-cloudflare-test-runtime");
 const WORKER_BUNDLE = path.join(TMP_DIR, "worker.mjs");
 const BASE_URL = "https://example.com";
 const RUNTIME_ID = "runtime:integration";
@@ -946,7 +945,7 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
   socket.close(1000, "done");
 });
 
-process.on("exit", () => {
-  void fs.rm(TMP_DIR, { recursive: true, force: true });
+test.after(async () => {
+  await fs.rm(TMP_DIR, { recursive: true, force: true });
 });
 
