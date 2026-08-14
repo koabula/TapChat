@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::attachment_crypto::AttachmentPayloadMetadata;
+use crate::attachment_crypto::{AttachmentVariant, EncryptedBlobDescriptor};
 use crate::conversation::LocalConversationState;
 use crate::conversation::RecoveryStatus;
 use crate::identity::LocalIdentityState;
@@ -19,19 +19,19 @@ use crate::persistence::{
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
     AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest,
-    AppendGroupTransitionRequest, AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult,
-    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
-    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
-    FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
-    GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
-    GroupRealtimeSubscriptionRequest, InitializeGroupAuthorizationRequest, ListGroupInvitesRequest,
-    ListGroupJoinRequestsRequest, ListGroupLeaveRequestsRequest, MessageRequestAction,
-    MessageRequestActionRequest, MessageRequestActionResult, MessageRequestItem,
-    MessageRequestRealtimeChange, PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    PublishSharedStateRequest, PutWelcomePickupRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
-    SharedStateDocumentKind, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
+    AppendGroupTransitionRequest, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
+    ClaimGroupLeaveRequest, CompleteGroupJoinRequest, CreateGroupInviteRequest,
+    DecideGroupJoinRequest, FetchAllowlistRequest, FetchGroupInviteRequest,
+    FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest,
+    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
+    InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
+    ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
+    MessageRequestActionResult, MessageRequestItem, MessageRequestRealtimeChange,
+    PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
+    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
+    SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -333,22 +333,20 @@ pub enum CoreEvent {
     },
     AttachmentBytesLoaded {
         task_id: String,
-        plaintext_b64: String,
+        #[serde(skip_serializing)]
+        plaintext: Vec<u8>,
     },
     BlobUploadPrepared {
         task_id: String,
         result: PrepareBlobUploadResult,
-    },
-    BlobDownloadAuthorized {
-        task_id: String,
-        result: AuthorizeBlobDownloadResult,
     },
     BlobUploaded {
         task_id: String,
     },
     BlobDownloaded {
         task_id: String,
-        blob_ciphertext: Option<String>,
+        #[serde(skip_serializing)]
+        blob_ciphertext: Option<Vec<u8>>,
     },
     BlobTransferFailed {
         task_id: String,
@@ -639,11 +637,27 @@ pub struct AttachmentDescriptor {
     pub mime_type: String,
     pub size_bytes: u64,
     pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<AttachmentVariantSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blur_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentVariantSource {
+    pub attachment_id: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadAttachmentBytesEffect {
     pub task_id: String,
+    pub conversation_id: String,
     // Platform-defined attachment handle. It may be a path-like string in the CLI,
     // but core treats it as an opaque identifier owned by BlobIoPort.
     pub attachment_id: String,
@@ -655,7 +669,23 @@ pub struct WriteDownloadedAttachmentEffect {
     // Platform-defined destination handle. The CLI currently resolves it to a file path,
     // but core only promises an opaque identifier for BlobIoPort to interpret.
     pub destination_id: String,
-    pub plaintext_b64: String,
+    #[serde(skip_serializing)]
+    pub plaintext: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheUploadedAttachmentEffect {
+    pub task_id: String,
+    /// Platform-owned staging handle. A platform may promote it into its
+    /// encrypted media cache and remove it atomically; other platforms may
+    /// intentionally ignore this optional optimization.
+    pub source_attachment_id: String,
+    pub object_ref: String,
+    pub storage_origin: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing)]
+    pub plaintext: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,14 +846,14 @@ pub enum CoreEffect {
     UploadBlob {
         upload: BlobUploadRequest,
     },
-    AuthorizeBlobDownload {
-        authorize: AuthorizeBlobDownloadRequest,
-    },
     DownloadBlob {
         download: BlobDownloadRequest,
     },
     WriteDownloadedAttachment {
         write: WriteDownloadedAttachmentEffect,
+    },
+    CacheUploadedAttachment {
+        cache: CacheUploadedAttachmentEffect,
     },
     PersistState {
         persist: PersistStateEffect,
@@ -843,6 +873,7 @@ pub enum SystemStatus {
     IdentityRefreshNeeded,
     ConversationNeedsRebuild,
     AttachmentUploadFailed,
+    AttachmentDownloadFailed,
     TemporaryNetworkFailure,
     MessageQueuedForApproval,
     MessageRejectedByPolicy,
@@ -1048,11 +1079,16 @@ pub(crate) struct PendingBlobUpload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group_id: Option<String>,
     pub(crate) descriptor: AttachmentDescriptor,
-    pub(crate) blob_ciphertext_b64: Option<String>,
-    pub(crate) payload_metadata: Option<AttachmentPayloadMetadata>,
+    pub(crate) source: AttachmentVariantSource,
+    pub(crate) variant: AttachmentVariant,
+    #[serde(skip)]
+    pub(crate) blob_ciphertext: Option<Vec<u8>>,
+    pub(crate) encrypted_descriptor: Option<EncryptedBlobDescriptor>,
     pub(crate) message_id: String,
-    pub(crate) metadata_ciphertext: Option<String>,
+    pub(crate) created_at: u64,
     pub(crate) prepared_upload: Option<PrepareBlobUploadResult>,
+    #[serde(default)]
+    pub(crate) uploaded: bool,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
 }
@@ -1064,9 +1100,7 @@ pub(crate) struct PendingBlobDownload {
     pub(crate) message_id: String,
     pub(crate) reference: String,
     pub(crate) destination_id: String,
-    pub(crate) payload_metadata: AttachmentPayloadMetadata,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) authorized_download: Option<AuthorizeBlobDownloadResult>,
+    pub(crate) blob_descriptor: EncryptedBlobDescriptor,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
 }

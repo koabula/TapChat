@@ -633,8 +633,7 @@ impl CoreEngine {
         let sender_user_id = local_identity.user_identity.user_id.clone();
         let sender_device_id = local_identity.device_identity.device_id.clone();
         let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
-        let mut recipient_device_ids = self.recipient_device_ids(&conversation_id)?;
-        recipient_device_ids.sort();
+        let recipient_device_ids = self.recipient_device_ids(&conversation_id)?;
         let app_message_nonce = self.next_message_nonce();
         let app_message_id =
             self.next_app_message_id(&conversation_id, &sender_device_id, app_message_nonce);
@@ -670,7 +669,7 @@ impl CoreEngine {
             peer_user_id,
             envelopes.clone(),
             plaintext.clone(),
-            Some(app_message_id),
+            Some(app_message_id.clone()),
         );
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
@@ -692,14 +691,13 @@ impl CoreEngine {
                 ],
             )],
             view_model: Some(CoreViewModel {
-                messages: envelopes
-                    .iter()
-                    .map(|envelope| MessageSummary {
-                        conversation_id: envelope.conversation_id.clone(),
-                        message_id: envelope.message_id.clone(),
-                        message_type: envelope.message_type,
-                    })
-                    .collect(),
+                // The protected application id is the only user-visible
+                // identity. Envelope ids are per-recipient transport details.
+                messages: vec![MessageSummary {
+                    conversation_id,
+                    message_id: app_message_id,
+                    message_type: MessageType::MlsApplication,
+                }],
                 ..CoreViewModel::default()
             }),
         })
@@ -1036,6 +1034,7 @@ impl CoreEngine {
             let system_message = StoredMessage {
                 message_id: format!("{conversation_id}:system:legacy_archive"),
                 app_message_id: None,
+                mls_ciphertext_sha256: None,
                 sender_user_id: None,
                 sender_device_id: local_device_id.clone(),
                 recipient_device_id: peer_user_id,
@@ -1142,7 +1141,7 @@ impl CoreEngine {
             .user_identity
             .user_id
             .clone();
-        Ok(self
+        let mut device_ids = self
             .state
             .conversations
             .get(conversation_id)
@@ -1152,7 +1151,10 @@ impl CoreEngine {
             .iter()
             .filter(|member| member.user_id != local_user_id)
             .map(|member| member.device_id.clone())
-            .collect())
+            .collect::<Vec<_>>();
+        device_ids.sort();
+        device_ids.dedup();
+        Ok(device_ids)
     }
 
     pub(super) fn direct_peer_contact_bundle(
@@ -1364,11 +1366,27 @@ impl CoreEngine {
             })
     }
 
+    pub(super) fn conversation_has_mls_ciphertext(
+        &self,
+        conversation_id: &str,
+        ciphertext_sha256: &str,
+    ) -> bool {
+        self.state
+            .conversations
+            .get(conversation_id)
+            .is_some_and(|state| {
+                state.messages.iter().any(|message| {
+                    message.mls_ciphertext_sha256.as_deref() == Some(ciphertext_sha256)
+                })
+            })
+    }
+
     pub(super) fn store_accepted_application_message(
         &mut self,
         record: &InboxRecord,
         plaintext: String,
         app_message_id: Option<String>,
+        mls_ciphertext_sha256: String,
     ) -> CoreResult<bool> {
         let conversation_id = &record.envelope.conversation_id;
         let state = self
@@ -1388,6 +1406,7 @@ impl CoreEngine {
         state.messages.push(StoredMessage {
             message_id: record.message_id.clone(),
             app_message_id,
+            mls_ciphertext_sha256: Some(mls_ciphertext_sha256),
             sender_user_id: Some(record.envelope.sender_user_id.clone()),
             sender_device_id: record.envelope.sender_device_id.clone(),
             recipient_device_id: record.envelope.recipient_device_id.clone(),
@@ -1758,6 +1777,7 @@ impl CoreEngine {
         StoredMessage {
             message_id: format!("{conversation_id}:system:{tag}:{nonce}"),
             app_message_id: None,
+            mls_ciphertext_sha256: None,
             sender_user_id,
             sender_device_id,
             recipient_device_id,
@@ -2325,6 +2345,7 @@ impl CoreEngine {
         let system_message = StoredMessage {
             message_id: envelope.message_id.clone(),
             app_message_id: None,
+            mls_ciphertext_sha256: None,
             sender_user_id: Some(peer_user_id.clone()),
             sender_device_id: envelope.sender_device_id.clone(),
             recipient_device_id: envelope.recipient_device_id.clone(),

@@ -19,6 +19,11 @@ pub enum CoreInput {
     Event(CoreEvent),
 }
 
+enum DriverWork {
+    Input(CoreInput),
+    Effect(CoreEffect),
+}
+
 /// Called once after Tauri setup completes. Determines whether to show
 /// onboarding or the main window based on ProfileManager session check.
 pub async fn on_app_ready(app: &AppHandle) {
@@ -136,41 +141,6 @@ pub async fn on_app_ready(app: &AppHandle) {
         }
     } else {
         log::info!("Session ready, loading snapshot and showing main window");
-
-        let refresh_started_at = Instant::now();
-        {
-            let inner = state.inner.read().await;
-            match state
-                .runtime_auth
-                .ensure(&inner.profile_manager, false)
-                .await
-            {
-                Ok(Some(_)) => {
-                    log::info!(
-                        "on_app_ready: refreshed device runtime auth in {}ms",
-                        refresh_started_at.elapsed().as_millis()
-                    );
-                }
-                Ok(None) => {
-                    log::info!(
-                        "on_app_ready: device runtime auth refresh not needed ({}ms)",
-                        refresh_started_at.elapsed().as_millis()
-                    );
-                }
-                Err(_error) => {
-                    let auth = state.runtime_auth.snapshot().await;
-                    log::warn!(
-                        "on_app_ready: device runtime auth refresh failed: stage=startup code={} retryable={} next_retry_at={} elapsed_ms={}",
-                        auth.error_code.as_deref().unwrap_or("temporary_unavailable"),
-                        auth.retryable,
-                        auth.next_retry_at
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".into()),
-                        refresh_started_at.elapsed().as_millis(),
-                    );
-                }
-            }
-        }
 
         // Load snapshot from profile and initialize engine
         let load_snapshot_started_at = Instant::now();
@@ -534,9 +504,64 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
 /// The single entry point for all core state changes. Processes a command or event
 /// through CoreEngine, executes resulting effects, and pushes UI updates to the frontend.
 pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result<CoreOutput> {
+    drive_core_work_queue(app, vec![DriverWork::Input(input)]).await
+}
+
+/// Drain core inputs, platform effects and the events they produce without
+/// recursively re-entering the driver. Attachment upload and inbox recovery
+/// can each produce long effect/event chains; a heap-backed work stack keeps
+/// the native thread stack constant on Windows.
+async fn drive_core_work_queue(
+    app: &AppHandle,
+    mut pending: Vec<DriverWork>,
+) -> Result<CoreOutput> {
     let state = app.state::<AppState>();
     let app_arc = Arc::new(app.clone());
+    let mut aggregate = CoreOutput::default();
 
+    while let Some(work) = pending.pop() {
+        match work {
+            DriverWork::Input(input) => {
+                let output = {
+                    let mut inner = state.inner.write().await;
+                    match input {
+                        CoreInput::Command(command) => inner.engine.handle_command(command)?,
+                        CoreInput::Event(event) => inner.engine.handle_event(event)?,
+                    }
+                };
+                emit_core_update(app, &output);
+                for effect in output.effects.iter().cloned().rev() {
+                    pending.push(DriverWork::Effect(effect));
+                }
+                merge_core_outputs(&mut aggregate, output);
+            }
+            DriverWork::Effect(effect) => {
+                let events = {
+                    let mut ports = state.ports.lock().await;
+                    ports.set_app_handle(app_arc.clone());
+                    execute_platform_effect(&mut *ports, effect).await?
+                };
+                for event in events.into_iter().rev() {
+                    pending.push(DriverWork::Input(CoreInput::Event(event)));
+                }
+            }
+        }
+    }
+
+    Ok(aggregate)
+}
+
+/// Execute the command's foreground effect (for example accepting a message
+/// request), commit any persistence produced by its result, then enqueue the
+/// remaining notification/sync effects. This keeps the user-visible commit
+/// boundary synchronous without making the dialog wait for unrelated inbox
+/// reconciliation.
+pub async fn drive_core_then_defer_event_effects(
+    app: &AppHandle,
+    input: CoreInput,
+) -> Result<CoreOutput> {
+    let state = app.state::<AppState>();
+    let app_arc = Arc::new(app.clone());
     let mut output = {
         let mut inner = state.inner.write().await;
         match input {
@@ -544,34 +569,51 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
             CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
         }
     };
-
-    // Push UI update to frontend
-    let has_updates = output.view_model.is_some()
-        || output.state_update.conversations_changed
-        || output.state_update.messages_changed
-        || output.state_update.contacts_changed
-        || output.state_update.identity_changed
-        || output.state_update.checkpoints_changed
-        || !output.state_update.system_statuses_changed.is_empty();
-    if has_updates {
-        let _ = app.emit("core-update", &output);
-    }
-
-    // Execute effects — each may produce new events that feed back into the engine
-    let effects = output.effects.clone();
-    for effect in effects {
+    emit_core_update(app, &output);
+    for effect in output.effects.clone() {
         let events = {
             let mut ports = state.ports.lock().await;
             ports.set_app_handle(app_arc.clone());
             execute_platform_effect(&mut *ports, effect).await?
         };
         for event in events {
-            let event_output =
-                Box::pin(drive_core_with_handle(app, CoreInput::Event(event))).await?;
+            let event_output = drive_core_event_persist_then_defer(app, event).await?;
             merge_core_outputs(&mut output, event_output);
         }
     }
+    Ok(output)
+}
 
+async fn drive_core_event_persist_then_defer(
+    app: &AppHandle,
+    event: CoreEvent,
+) -> Result<CoreOutput> {
+    let state = app.state::<AppState>();
+    let _send_order = state.deferred_send_gate.lock().await;
+    let app_arc = Arc::new(app.clone());
+    let mut output = {
+        let mut inner = state.inner.write().await;
+        inner.engine.handle_event(event)?
+    };
+    let (persistence_effects, deferred_effects) = split_persistence_prefix(output.effects.clone());
+    for effect in persistence_effects {
+        execute_effect_with_handle(app, &app_arc, &mut output, effect).await?;
+    }
+    emit_core_update(app, &output);
+    if deferred_effects.is_empty() {
+        return Ok(output);
+    }
+    ensure_deferred_transport_worker(app).await;
+    let profile_path = state.inner.read().await.profile_path.clone();
+    state
+        .deferred_transport_tx
+        .send(DeferredTransportBatch {
+            effects: deferred_effects,
+            profile_path,
+            enqueued_at: Instant::now(),
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("deferred transport queue is unavailable"))?;
     Ok(output)
 }
 
@@ -740,20 +782,12 @@ fn emit_core_update(app: &AppHandle, output: &CoreOutput) {
 
 async fn execute_effect_with_handle(
     app: &AppHandle,
-    app_arc: &Arc<AppHandle>,
+    _app_arc: &Arc<AppHandle>,
     output: &mut CoreOutput,
     effect: CoreEffect,
 ) -> Result<()> {
-    let state = app.state::<AppState>();
-    let events = {
-        let mut ports = state.ports.lock().await;
-        ports.set_app_handle(app_arc.clone());
-        execute_platform_effect(&mut *ports, effect).await?
-    };
-    for event in events {
-        let event_output = Box::pin(drive_core_with_handle(app, CoreInput::Event(event))).await?;
-        merge_core_outputs(output, event_output);
-    }
+    let event_output = drive_core_work_queue(app, vec![DriverWork::Effect(effect)]).await?;
+    merge_core_outputs(output, event_output);
     Ok(())
 }
 
@@ -817,30 +851,35 @@ async fn ensure_deferred_transport_worker(app: &AppHandle) {
 /// semantics — is identical.
 #[cfg(any(test, feature = "test-support"))]
 pub async fn drive_core_without_handle(state: &AppState, input: CoreInput) -> Result<CoreOutput> {
-    let mut output = {
-        let mut inner = state.inner.write().await;
-        match input {
-            CoreInput::Command(cmd) => inner.engine.handle_command(cmd)?,
-            CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
-        }
-    };
-
-    // Execute effects — each may produce new events that feed back
-    // into the engine. No UI emit; no AppHandle registration.
-    let effects = output.effects.clone();
-    for effect in effects {
-        let events = {
-            let mut ports = state.ports.lock().await;
-            execute_platform_effect(&mut *ports, effect).await?
-        };
-        for event in events {
-            let event_output =
-                Box::pin(drive_core_without_handle(state, CoreInput::Event(event))).await?;
-            merge_core_outputs(&mut output, event_output);
+    let mut pending = vec![DriverWork::Input(input)];
+    let mut aggregate = CoreOutput::default();
+    while let Some(work) = pending.pop() {
+        match work {
+            DriverWork::Input(input) => {
+                let output = {
+                    let mut inner = state.inner.write().await;
+                    match input {
+                        CoreInput::Command(command) => inner.engine.handle_command(command)?,
+                        CoreInput::Event(event) => inner.engine.handle_event(event)?,
+                    }
+                };
+                for effect in output.effects.iter().cloned().rev() {
+                    pending.push(DriverWork::Effect(effect));
+                }
+                merge_core_outputs(&mut aggregate, output);
+            }
+            DriverWork::Effect(effect) => {
+                let events = {
+                    let mut ports = state.ports.lock().await;
+                    execute_platform_effect(&mut *ports, effect).await?
+                };
+                for event in events.into_iter().rev() {
+                    pending.push(DriverWork::Input(CoreInput::Event(event)));
+                }
+            }
         }
     }
-
-    Ok(output)
+    Ok(aggregate)
 }
 
 pub(crate) fn merge_core_outputs(base: &mut CoreOutput, mut next: CoreOutput) {

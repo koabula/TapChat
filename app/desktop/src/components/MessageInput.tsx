@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   Clapperboard,
   File,
@@ -14,7 +13,6 @@ import {
   X,
 } from "lucide-react";
 import {
-  attachmentSendWasRejected,
   shouldSubmitComposerOnKeyDown,
 } from "@/lib/messageComposer";
 
@@ -38,11 +36,19 @@ interface SendMessageResult {
 
 interface AttachmentInfo {
   id: string;
-  path: string;
+  handle: string;
   name: string;
   size: number;
   mimeType: string;
   previewUrl: string | null;
+}
+
+interface StagedAttachmentResult {
+  handle: string;
+  name: string;
+  size: number;
+  mime_type: string;
+  preview_url: string | null;
 }
 
 interface UploadProgressEvent {
@@ -50,12 +56,6 @@ interface UploadProgressEvent {
   conversation_id: string;
   progress: number;
   status: string;
-}
-
-interface SendAttachmentOutput {
-  state_update?: {
-    system_statuses_changed?: string[];
-  };
 }
 
 interface DragDropPayload {
@@ -93,25 +93,6 @@ function describeSendError(err: unknown): string {
   return errorMsg;
 }
 
-function mimeTypeFromExtension(name: string): string {
-  const ext = name.split(".").pop()?.toLowerCase() || "";
-  const mimeMap: Record<string, string> = {
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    png: "image/png",
-    gif: "image/gif",
-    webp: "image/webp",
-    pdf: "application/pdf",
-    doc: "application/msword",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    mp3: "audio/mpeg",
-    mp4: "video/mp4",
-    zip: "application/zip",
-    txt: "text/plain",
-  };
-  return mimeMap[ext] || "application/octet-stream";
-}
-
 function fileIcon(mimeType: string) {
   const className = "h-5 w-5";
   if (mimeType.startsWith("image/")) return <Image className={`${className} text-file-icon-image`} />;
@@ -131,74 +112,72 @@ export default function MessageInput({
   const [attachments, setAttachments] = useState<AttachmentInfo[]>([]);
   const [uploadingId, setUploadingId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [uploadPosition, setUploadPosition] = useState<{ current: number; total: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const onSentRef = useRef(onSent);
   const uploadActiveRef = useRef(false);
+  const attachmentsRef = useRef<AttachmentInfo[]>([]);
   onSentRef.current = onSent;
+  attachmentsRef.current = attachments;
 
-  const handleFileFromPath = useCallback(async (filePath: string) => {
-    const name = filePath.split(/[/\\]/).pop() || "file";
-    let size = 0;
-    let mimeType = mimeTypeFromExtension(name);
-    try {
-      const metadata = await invoke<{ size: number; mime_type: string }>("get_file_metadata", {
-        path: filePath,
-      });
-      size = metadata.size;
-      mimeType = metadata.mime_type;
-    } catch (err) {
-      console.error(`[MessageInput] Failed to get file metadata: ${String(err)}`);
-    }
-
-    const id = attachmentId();
-    setAttachments((previous) => [
-      ...previous,
-      { id, path: filePath, name, size, mimeType, previewUrl: null },
-    ]);
-
-    if (mimeType.startsWith("image/") && mimeType !== "image/svg+xml") {
-      try {
-        const previewUrl = await invoke<string | null>("get_local_image_thumbnail", {
-          path: filePath,
-        });
-        if (previewUrl) {
-          setAttachments((previous) =>
-            previous.map((attachment) =>
-              attachment.id === id ? { ...attachment, previewUrl } : attachment,
-            ),
-          );
-        }
-      } catch (err) {
-        console.warn(`[MessageInput] Local image preview unavailable: ${String(err)}`);
-      }
+  useEffect(() => () => {
+    for (const attachment of attachmentsRef.current) {
+      void invoke("release_staged_attachment", { handle: attachment.handle });
     }
   }, []);
 
-  const handleFileObject = useCallback(async (file: File) => {
+  const handleFileFromPath = useCallback(async (filePath: string) => {
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      let binary = "";
-      const chunkSize = 0x8000;
-      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
-      }
-      const tempPath = await invoke<string>("write_temp_file", {
-        fileName: file.name,
-        contentBase64: btoa(binary),
-      });
-      await handleFileFromPath(tempPath);
+      const staged = await invoke<StagedAttachmentResult>("stage_attachment", { filePath });
+      setAttachments((previous) => [
+        ...previous,
+        {
+          id: attachmentId(),
+          handle: staged.handle,
+          name: staged.name,
+          size: staged.size,
+          mimeType: staged.mime_type,
+          previewUrl: staged.preview_url,
+        },
+      ]);
     } catch (err) {
-      console.error(`[MessageInput] Failed to handle file object: ${String(err)}`);
+      console.error(`[MessageInput] Failed to stage attachment: ${String(err)}`);
+      alert(`Unable to attach this file: ${String(err)}`);
+    }
+  }, []);
+
+  const handleClipboardImage = useCallback(async () => {
+    try {
+      const staged = await invoke<StagedAttachmentResult>("stage_clipboard_image");
+      setAttachments((previous) => [
+        ...previous,
+        {
+          id: attachmentId(),
+          handle: staged.handle,
+          name: staged.name,
+          size: staged.size,
+          mimeType: staged.mime_type,
+          previewUrl: staged.preview_url,
+        },
+      ]);
+    } catch (err) {
+      console.error(`[MessageInput] Failed to read clipboard image: ${String(err)}`);
       alert("Unable to attach this clipboard item. Try the attachment button instead.");
     }
-  }, [handleFileFromPath]);
+  }, []);
+
+  const removeAttachment = useCallback((attachment: AttachmentInfo) => {
+    setAttachments((previous) => previous.filter((item) => item.id !== attachment.id));
+    void invoke("release_staged_attachment", { handle: attachment.handle });
+  }, []);
 
   useEffect(() => {
     const unlistenProgress = listen<UploadProgressEvent>("upload-progress", (event) => {
       if (event.payload.conversation_id !== conversationId || !uploadActiveRef.current) return;
       setUploadProgress(event.payload.progress);
+      setUploadStatus(event.payload.status);
     });
     const unlistenDrop = listen<DragDropPayload>("tauri://drag-drop", (event) => {
       for (const path of event.payload.paths) void handleFileFromPath(path);
@@ -251,18 +230,13 @@ export default function MessageInput({
         setUploadingId(attachment.id);
         setUploadPosition({ current: index + 1, total: pendingAttachments.length });
         setUploadProgress(0);
+        setUploadStatus("queued");
         uploadActiveRef.current = true;
-        const output = await invoke<SendAttachmentOutput>("send_attachment", {
+        await invoke("send_attachment", {
           conversationId,
-          filePath: attachment.path,
-          mimeType: attachment.mimeType,
-          sizeBytes: attachment.size,
-          fileName: attachment.name,
+          attachmentHandle: attachment.handle,
         });
         uploadActiveRef.current = false;
-        if (attachmentSendWasRejected(output.state_update?.system_statuses_changed)) {
-          throw new Error(`Upload failed for ${attachment.name}`);
-        }
         setAttachments((previous) => previous.filter((item) => item.id !== attachment.id));
         onSentRef.current?.();
       }
@@ -273,6 +247,7 @@ export default function MessageInput({
       setSending(false);
       setUploadingId(null);
       setUploadProgress(null);
+      setUploadStatus(null);
       setUploadPosition(null);
       uploadActiveRef.current = false;
     }
@@ -280,13 +255,18 @@ export default function MessageInput({
 
   const handleAttachClick = async () => {
     try {
-      const selected = await open({ multiple: true, title: "Select files to attach" });
-      if (!selected) return;
-      await Promise.all(
-        (Array.isArray(selected) ? selected : [selected]).map((path) =>
-          handleFileFromPath(path as string),
-        ),
-      );
+      const staged = await invoke<StagedAttachmentResult[]>("stage_attachments_from_dialog");
+      setAttachments((previous) => [
+        ...previous,
+        ...staged.map((attachment) => ({
+          id: attachmentId(),
+          handle: attachment.handle,
+          name: attachment.name,
+          size: attachment.size,
+          mimeType: attachment.mime_type,
+          previewUrl: attachment.preview_url,
+        })),
+      ]);
     } catch (err) {
       console.error(`[MessageInput] File selection failed: ${String(err)}`);
     }
@@ -299,13 +279,15 @@ export default function MessageInput({
       .filter((file): file is File => file !== null);
     if (files.length === 0) return;
     event.preventDefault();
-    for (const file of files) void handleFileObject(file);
+    void handleClipboardImage();
   };
 
   const hasAttachments = attachments.length > 0;
   const sendDisabled = sending || (!hasAttachments && !inputText.trim());
   const statusLabel = sending && uploadPosition
-    ? `Uploading ${uploadPosition.current} of ${uploadPosition.total}`
+    ? uploadStatus === "retrying"
+      ? `Upload will retry (${uploadPosition.current} of ${uploadPosition.total})`
+      : `Queueing ${uploadPosition.current} of ${uploadPosition.total}`
     : hasAttachments
       ? `${attachments.length} file${attachments.length === 1 ? "" : "s"} ready`
       : null;
@@ -333,7 +315,6 @@ export default function MessageInput({
         event.preventDefault();
         event.stopPropagation();
         setIsDragging(false);
-        for (const file of Array.from(event.dataTransfer.files)) void handleFileObject(file);
       }}
     >
       {isDragging ? (
@@ -371,13 +352,13 @@ export default function MessageInput({
                   )}
                   {isUploading && uploadProgress !== null ? (
                     <div className="absolute inset-0 flex items-center justify-center bg-black/45 text-xs font-medium text-white">
-                      {uploadProgress}%
+                      {uploadStatus === "retrying" ? "Retrying…" : `${uploadProgress}%`}
                     </div>
                   ) : null}
                   <button
                     type="button"
                     className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/60 text-white opacity-90 transition-opacity hover:bg-error group-hover:opacity-100"
-                    onClick={() => setAttachments((previous) => previous.filter((item) => item.id !== attachment.id))}
+                    onClick={() => removeAttachment(attachment)}
                     disabled={sending}
                     title="Remove attachment"
                     aria-label={`Remove ${attachment.name}`}

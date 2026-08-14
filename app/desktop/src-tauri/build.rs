@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(mobile)");
     emit_build_metadata();
+    emit_windows_stack_reserve();
 
     let test_support = std::env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some();
     let gui = std::env::var_os("CARGO_FEATURE_GUI").is_some();
@@ -11,6 +12,17 @@ fn main() {
 
     // Ensure plugins configuration is properly embedded.
     tauri_build::build()
+}
+
+/// Rust's default 1 MiB Windows PE stack reserve is too small for Tauri's
+/// generated IPC dispatcher plus non-trivial async commands. Keep this aligned
+/// with the stack budget used by the CLI and desktop integration tests.
+fn emit_windows_stack_reserve() {
+    const WINDOWS_STACK_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-arg-bin=tapchat-desktop=/STACK:{WINDOWS_STACK_RESERVE_BYTES}");
+    }
 }
 
 fn emit_build_metadata() {

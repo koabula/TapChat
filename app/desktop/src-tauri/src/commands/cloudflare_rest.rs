@@ -69,7 +69,7 @@ pub struct WorkerDeployConfig {
     pub public_base_url: Option<String>,
     pub deployment_region: String,
     pub bucket_name: String,
-    pub preview_bucket_name: String,
+    pub worker_build_id: String,
     pub sharing_token_secret: String,
     pub device_runtime_secret: String,
     pub device_runtime_key_id: String,
@@ -100,8 +100,6 @@ pub struct DeployResult {
     #[serde(default)]
     pub bucket_name: Option<String>,
     #[serde(default)]
-    pub preview_bucket_name: Option<String>,
-    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -119,7 +117,6 @@ pub enum DeployPhase {
     Preflight,
     CreatingBuckets,
     UploadingWorker,
-    WritingSecrets,
     ConfiguringBindings,
     VerifyingDeployment,
     Complete,
@@ -142,32 +139,125 @@ struct CloudflareErrorDetail {
     message: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerMigrationPlan {
-    FreshV3,
-    UpgradeDeviceRegistry,
-    None,
-}
-
-fn worker_migration_metadata(plan: WorkerMigrationPlan) -> Option<Value> {
-    match plan {
-        WorkerMigrationPlan::FreshV3 => Some(serde_json::json!({
-            "new_tag": "v3",
-            "new_sqlite_classes": ["InboxDurableObject", "GroupOutboxDurableObject", "DeviceRegistryDurableObject"],
-        })),
-        WorkerMigrationPlan::UpgradeDeviceRegistry => Some(serde_json::json!({
-            "new_tag": "v3",
-            "new_sqlite_classes": ["DeviceRegistryDurableObject"],
-        })),
-        WorkerMigrationPlan::None => None,
+fn build_worker_metadata(config: &WorkerDeployConfig) -> Value {
+    let mut bindings = vec![
+        serde_json::json!({
+            "type": "durable_object_namespace",
+            "name": "INBOX",
+            "class_name": "InboxDurableObject",
+        }),
+        serde_json::json!({
+            "type": "durable_object_namespace",
+            "name": "GROUP_OUTBOX",
+            "class_name": "GroupOutboxDurableObject",
+        }),
+        serde_json::json!({
+            "type": "durable_object_namespace",
+            "name": "DEVICE_REGISTRY",
+            "class_name": "DeviceRegistryDurableObject",
+        }),
+        serde_json::json!({
+            "type": "r2_bucket",
+            "name": "TAPCHAT_STORAGE",
+            "bucket_name": config.bucket_name,
+        }),
+    ];
+    for (name, text) in [
+        ("DEPLOYMENT_REGION", config.deployment_region.clone()),
+        ("RUNTIME_ID", config.runtime_id.clone()),
+        ("OWNER_USER_ID", config.owner_user_id.clone()),
+        (
+            "OWNER_USER_PUBLIC_KEY",
+            config.owner_user_public_key.clone(),
+        ),
+        ("WORKER_BUILD_ID", config.worker_build_id.clone()),
+        ("MAX_INLINE_BYTES", config.max_inline_bytes.to_string()),
+        ("RETENTION_DAYS", config.retention_days.to_string()),
+        (
+            "RATE_LIMIT_PER_MINUTE",
+            config.rate_limit_per_minute.to_string(),
+        ),
+        (
+            "RATE_LIMIT_PER_HOUR",
+            config.rate_limit_per_hour.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_MAX_BODY_BYTES",
+            config.message_request_max_body_bytes.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_MAX_PER_SENDER",
+            config.message_request_max_per_sender.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_MAX_SENDERS",
+            config.message_request_max_senders.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_MAX_TOTAL_BYTES",
+            config.message_request_max_total_bytes.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_TTL_SECONDS",
+            config.message_request_ttl_seconds.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_RATE_LIMIT_MINUTE",
+            config.message_request_rate_limit_minute.to_string(),
+        ),
+        (
+            "MESSAGE_REQUEST_RATE_LIMIT_HOUR",
+            config.message_request_rate_limit_hour.to_string(),
+        ),
+        (
+            "DEVICE_RUNTIME_SECRET_KEY_ID",
+            config.device_runtime_key_id.clone(),
+        ),
+        (
+            "DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID",
+            config
+                .previous_device_runtime_key_id
+                .clone()
+                .unwrap_or_default(),
+        ),
+        (
+            "AUTH_ROTATION_GRACE_UNTIL_MS",
+            config
+                .auth_rotation_grace_until_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ),
+    ] {
+        bindings.push(serde_json::json!({ "type": "plain_text", "name": name, "text": text }));
     }
-}
+    for (name, text) in [
+        (
+            "SHARING_INTERNAL_SECRET",
+            Some(config.sharing_token_secret.clone()),
+        ),
+        (
+            "DEVICE_RUNTIME_SECRET",
+            Some(config.device_runtime_secret.clone()),
+        ),
+        (
+            "DEVICE_RUNTIME_SECRET_PREVIOUS",
+            config.previous_device_runtime_secret.clone(),
+        ),
+    ] {
+        if let Some(text) = text.filter(|value| !value.is_empty()) {
+            bindings.push(serde_json::json!({ "type": "secret_text", "name": name, "text": text }));
+        }
+    }
 
-fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan) -> Value {
-    let mut metadata = serde_json::json!({
+    serde_json::json!({
         "main_module": "worker.js",
         "compatibility_date": WORKER_COMPATIBILITY_DATE,
         "compatibility_flags": ["nodejs_compat"],
+        "exports": {
+            "InboxDurableObject": { "type": "durable-object", "storage": "sqlite" },
+            "GroupOutboxDurableObject": { "type": "durable-object", "storage": "sqlite" },
+            "DeviceRegistryDurableObject": { "type": "durable-object", "storage": "sqlite" },
+        },
         "observability": {
             "enabled": true,
             "logs": {
@@ -182,131 +272,8 @@ fn build_worker_metadata(config: &WorkerDeployConfig, plan: WorkerMigrationPlan)
                 "persist": false,
             },
         },
-        "bindings": [
-            {
-                "type": "durable_object_namespace",
-                "name": "INBOX",
-                "class_name": "InboxDurableObject",
-            },
-            {
-                "type": "durable_object_namespace",
-                "name": "GROUP_OUTBOX",
-                "class_name": "GroupOutboxDurableObject",
-            },
-            {
-                "type": "durable_object_namespace",
-                "name": "DEVICE_REGISTRY",
-                "class_name": "DeviceRegistryDurableObject",
-            },
-            {
-                "type": "r2_bucket",
-                "name": "TAPCHAT_STORAGE",
-                "bucket_name": config.bucket_name,
-            },
-            {
-                "type": "plain_text",
-                "name": "DEPLOYMENT_REGION",
-                "text": config.deployment_region,
-            },
-            {
-                "type": "plain_text",
-                "name": "RUNTIME_ID",
-                "text": config.runtime_id,
-            },
-            {
-                "type": "plain_text",
-                "name": "OWNER_USER_ID",
-                "text": config.owner_user_id,
-            },
-            {
-                "type": "plain_text",
-                "name": "OWNER_USER_PUBLIC_KEY",
-                "text": config.owner_user_public_key,
-            },
-            {
-                "type": "plain_text",
-                "name": "MAX_INLINE_BYTES",
-                "text": config.max_inline_bytes.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "RETENTION_DAYS",
-                "text": config.retention_days.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "RATE_LIMIT_PER_MINUTE",
-                "text": config.rate_limit_per_minute.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "RATE_LIMIT_PER_HOUR",
-                "text": config.rate_limit_per_hour.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_MAX_BODY_BYTES",
-                "text": config.message_request_max_body_bytes.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_MAX_PER_SENDER",
-                "text": config.message_request_max_per_sender.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_MAX_SENDERS",
-                "text": config.message_request_max_senders.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_MAX_TOTAL_BYTES",
-                "text": config.message_request_max_total_bytes.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_TTL_SECONDS",
-                "text": config.message_request_ttl_seconds.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_RATE_LIMIT_MINUTE",
-                "text": config.message_request_rate_limit_minute.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "MESSAGE_REQUEST_RATE_LIMIT_HOUR",
-                "text": config.message_request_rate_limit_hour.to_string(),
-            },
-            {
-                "type": "plain_text",
-                "name": "DEVICE_RUNTIME_SECRET_KEY_ID",
-                "text": config.device_runtime_key_id,
-            },
-            {
-                "type": "plain_text",
-                "name": "DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID",
-                "text": config.previous_device_runtime_key_id.clone().unwrap_or_default(),
-            },
-            {
-                "type": "plain_text",
-                "name": "AUTH_ROTATION_GRACE_UNTIL_MS",
-                "text": config.auth_rotation_grace_until_ms.map(|value| value.to_string()).unwrap_or_default(),
-            },
-        ],
-    });
-
-    if let Some(migration) = worker_migration_metadata(plan) {
-        metadata["migrations"] = migration;
-    }
-
-    metadata
-}
-
-fn is_duplicate_sqlite_class_migration_error(message: &str, class_name: &str) -> bool {
-    message.contains(class_name)
-        && message.contains("Cannot apply new-sqlite-class migration")
-        && message.contains("already depended on by existing Durable Objects")
+        "bindings": bindings,
+    })
 }
 
 /// Create R2 bucket via REST API
@@ -372,9 +339,8 @@ pub async fn upload_worker_script(
     worker_name: &str,
     worker_script: &str,
     config: &WorkerDeployConfig,
-    migration_plan: WorkerMigrationPlan,
 ) -> Result<(), String> {
-    let metadata = build_worker_metadata(config, migration_plan);
+    let metadata = build_worker_metadata(config);
     // Build multipart form data
     // Cloudflare expects: metadata (JSON) + script (JS file named 'worker.js')
     let form = reqwest::multipart::Form::new()
@@ -424,119 +390,6 @@ pub async fn upload_worker_script(
             .unwrap_or_else(|| format!("HTTP {}", status));
 
         return Err(format!("Failed to upload worker: {error_msg}"));
-    }
-
-    Ok(())
-}
-
-async fn upload_worker_script_with_migration_retry(
-    client: &Client,
-    api_token: &str,
-    account_id: &str,
-    worker_name: &str,
-    worker_script: &str,
-    config: &WorkerDeployConfig,
-    worker_exists: bool,
-) -> Result<(), String> {
-    let migration_plan = if worker_exists {
-        WorkerMigrationPlan::UpgradeDeviceRegistry
-    } else {
-        WorkerMigrationPlan::FreshV3
-    };
-
-    match upload_worker_script(
-        client,
-        api_token,
-        account_id,
-        worker_name,
-        worker_script,
-        config,
-        migration_plan,
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(error)
-            if migration_plan == WorkerMigrationPlan::UpgradeDeviceRegistry
-                && is_duplicate_sqlite_class_migration_error(
-                    &error,
-                    "DeviceRegistryDurableObject",
-                ) =>
-        {
-            eprintln!(
-                "DeviceRegistryDurableObject migration already exists; retrying worker upload without migrations"
-            );
-            upload_worker_script(
-                client,
-                api_token,
-                account_id,
-                worker_name,
-                worker_script,
-                config,
-                WorkerMigrationPlan::None,
-            )
-            .await
-        }
-        Err(error)
-            if migration_plan == WorkerMigrationPlan::FreshV3
-                && is_duplicate_sqlite_class_migration_error(&error, "InboxDurableObject") =>
-        {
-            Err(format!(
-                "{error}. The Cloudflare account already has Durable Object state for this worker name; retry Upgrade Cloudflare runtime so TapChat can apply only the device registry migration."
-            ))
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// Write secret to Worker via REST API
-pub async fn write_worker_secret(
-    client: &Client,
-    api_token: &str,
-    account_id: &str,
-    worker_name: &str,
-    secret_name: &str,
-    secret_value: &str,
-) -> Result<(), String> {
-    let url = format!(
-        "{}/accounts/{}/workers/scripts/{}/secrets",
-        CF_API_BASE, account_id, worker_name
-    );
-
-    let response = client
-        .put(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .json(&serde_json::json!({
-            "name": secret_name,
-            "text": secret_value,
-            "type": "secret_text",
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Secret write request failed: {}", e))?;
-
-    let status = response.status();
-    reject_unauthorized(status)?;
-
-    if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response: {}", e))?;
-
-        let cf_error: CloudflareError = serde_json::from_str(&error_body)
-            .map_err(|e| format!("Failed to parse error response: {}", e))?;
-
-        let error_msg = cf_error
-            .errors
-            .first()
-            .and_then(|e| e.message.clone())
-            .unwrap_or_else(|| format!("HTTP {}", status));
-
-        return Err(format!(
-            "Failed to write secret {}: {}",
-            secret_name, error_msg
-        ));
     }
 
     Ok(())
@@ -619,37 +472,6 @@ pub async fn enable_workers_dev_routing(
         worker_name
     );
     Ok(())
-}
-
-/// Check if a Worker script exists
-pub async fn check_worker_exists(
-    client: &Client,
-    api_token: &str,
-    account_id: &str,
-    worker_name: &str,
-) -> Result<bool, String> {
-    let url = format!(
-        "{}/accounts/{}/workers/scripts/{}/",
-        CF_API_BASE, account_id, worker_name
-    );
-
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_token))
-        .send()
-        .await
-        .map_err(|e| format!("Worker check request failed: {}", e))?;
-
-    let status = response.status();
-    reject_unauthorized(status)?;
-    if status.is_success() {
-        return Ok(true);
-    }
-    if status == StatusCode::NOT_FOUND {
-        return Ok(false);
-    }
-
-    Err(format!("Worker check failed before upload: HTTP {status}"))
 }
 
 /// Get Worker deployment info (account's workers.dev subdomain)
@@ -780,7 +602,6 @@ pub async fn deploy_via_rest_api(
     });
 
     create_r2_bucket(&client, api_token, account_id, &config.bucket_name).await?;
-    create_r2_bucket(&client, api_token, account_id, &config.preview_bucket_name).await?;
 
     // Phase 2: Upload Worker script
     progress_callback(DeployProgress {
@@ -789,17 +610,13 @@ pub async fn deploy_via_rest_api(
         progress_percent: 40,
     });
 
-    let worker_exists =
-        check_worker_exists(&client, api_token, account_id, &config.worker_name).await?;
-
-    upload_worker_script_with_migration_retry(
+    upload_worker_script(
         &client,
         api_token,
         account_id,
         &config.worker_name,
         worker_script,
         config,
-        worker_exists,
     )
     .await?;
 
@@ -812,43 +629,8 @@ pub async fn deploy_via_rest_api(
 
     enable_workers_dev_routing(&client, api_token, account_id, &config.worker_name).await?;
 
-    // Phase 3: Write secrets
-    progress_callback(DeployProgress {
-        phase: DeployPhase::WritingSecrets,
-        message: "Writing authentication secrets...".into(),
-        progress_percent: 60,
-    });
-
-    write_worker_secret(
-        &client,
-        api_token,
-        account_id,
-        &config.worker_name,
-        "SHARING_INTERNAL_SECRET",
-        &config.sharing_token_secret,
-    )
-    .await?;
-    write_worker_secret(
-        &client,
-        api_token,
-        account_id,
-        &config.worker_name,
-        "DEVICE_RUNTIME_SECRET",
-        &config.device_runtime_secret,
-    )
-    .await?;
-    if let Some(previous) = &config.previous_device_runtime_secret {
-        write_worker_secret(
-            &client,
-            api_token,
-            account_id,
-            &config.worker_name,
-            "DEVICE_RUNTIME_SECRET_PREVIOUS",
-            previous,
-        )
-        .await?;
-    }
-    // Phase 4: Get deployment URL
+    // Phase 3: Get deployment URL. Authentication secrets were committed in
+    // the same script upload, so there is no partially configured Worker.
     progress_callback(DeployProgress {
         phase: DeployPhase::VerifyingDeployment,
         message: "Verifying deployment...".into(),
@@ -876,36 +658,6 @@ pub async fn deploy_via_rest_api(
         }
     };
 
-    // Verify Worker exists before returning
-    progress_callback(DeployProgress {
-        phase: DeployPhase::VerifyingDeployment,
-        message: "Verifying Worker deployment...".into(),
-        progress_percent: 85,
-    });
-
-    // Wait for Worker to be globally deployed (check existence first)
-    let worker_exists = check_worker_exists(&client, api_token, account_id, &config.worker_name)
-        .await
-        .unwrap_or(false);
-
-    if !worker_exists {
-        // Worker might still be deploying, wait a bit and retry
-        for i in 0..5 {
-            progress_callback(DeployProgress {
-                phase: DeployPhase::VerifyingDeployment,
-                message: format!("Waiting for deployment... (attempt {})", i + 1),
-                progress_percent: 85 + i as u8,
-            });
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            if check_worker_exists(&client, api_token, account_id, &config.worker_name)
-                .await
-                .unwrap_or(false)
-            {
-                break;
-            }
-        }
-    }
-
     // Phase 5: Complete
     progress_callback(DeployProgress {
         phase: DeployPhase::Complete,
@@ -919,7 +671,6 @@ pub async fn deploy_via_rest_api(
         worker_url,
         account_id: Some(account_id.to_string()),
         bucket_name: Some(config.bucket_name.clone()),
-        preview_bucket_name: Some(config.preview_bucket_name.clone()),
         error: None,
     })
 }
@@ -979,10 +730,7 @@ pub async fn get_accounts(api_token: &str) -> Result<Vec<AccountInfo>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_worker_metadata, is_duplicate_sqlite_class_migration_error, WorkerDeployConfig,
-        WorkerMigrationPlan, WORKER_COMPATIBILITY_DATE,
-    };
+    use super::{build_worker_metadata, WorkerDeployConfig, WORKER_COMPATIBILITY_DATE};
 
     fn deploy_config() -> WorkerDeployConfig {
         WorkerDeployConfig {
@@ -990,7 +738,7 @@ mod tests {
             public_base_url: None,
             deployment_region: "test".into(),
             bucket_name: "tapchat-storage".into(),
-            preview_bucket_name: "tapchat-storage-preview".into(),
+            worker_build_id: "tapchat-worker-v4-test".into(),
             sharing_token_secret: "sharing".into(),
             runtime_id: "runtime-test".into(),
             owner_user_id: "user:test".into(),
@@ -1015,8 +763,8 @@ mod tests {
     }
 
     #[test]
-    fn fresh_worker_metadata_includes_v3_device_registry() {
-        let metadata = build_worker_metadata(&deploy_config(), WorkerMigrationPlan::FreshV3);
+    fn worker_metadata_uses_declarative_sqlite_exports_and_embeds_secrets() {
+        let metadata = build_worker_metadata(&deploy_config());
         assert_eq!(
             metadata["compatibility_date"].as_str(),
             Some(WORKER_COMPATIBILITY_DATE)
@@ -1042,54 +790,27 @@ mod tests {
                 && binding["class_name"] == "DeviceRegistryDurableObject"
         }));
 
-        let classes = metadata["migrations"]["new_sqlite_classes"]
-            .as_array()
-            .expect("new sqlite classes");
-        assert!(classes.iter().any(|class| class == "InboxDurableObject"));
-        assert!(classes
-            .iter()
-            .any(|class| class == "GroupOutboxDurableObject"));
-        assert!(classes
-            .iter()
-            .any(|class| class == "DeviceRegistryDurableObject"));
-        assert_eq!(metadata["migrations"]["new_tag"].as_str(), Some("v3"));
-        assert!(metadata["migrations"].get("tag").is_none());
-    }
-
-    #[test]
-    fn upgrade_worker_metadata_only_creates_device_registry() {
-        let metadata =
-            build_worker_metadata(&deploy_config(), WorkerMigrationPlan::UpgradeDeviceRegistry);
-        let classes = metadata["migrations"]["new_sqlite_classes"]
-            .as_array()
-            .expect("new sqlite classes");
-        assert!(!classes.iter().any(|class| class == "InboxDurableObject"));
-        assert_eq!(classes.len(), 1);
-        assert_eq!(classes[0].as_str(), Some("DeviceRegistryDurableObject"));
-        assert_eq!(metadata["migrations"]["new_tag"].as_str(), Some("v3"));
-        assert!(metadata["migrations"].get("tag").is_none());
-    }
-
-    #[test]
-    fn no_migration_plan_keeps_bindings_without_migration_payload() {
-        let metadata = build_worker_metadata(&deploy_config(), WorkerMigrationPlan::None);
         assert!(metadata.get("migrations").is_none());
+        for class in [
+            "InboxDurableObject",
+            "GroupOutboxDurableObject",
+            "DeviceRegistryDurableObject",
+        ] {
+            assert_eq!(metadata["exports"][class]["type"], "durable-object");
+            assert_eq!(metadata["exports"][class]["storage"], "sqlite");
+        }
         let bindings = metadata["bindings"].as_array().expect("bindings");
-        assert!(bindings
-            .iter()
-            .any(|binding| binding["name"] == "GROUP_OUTBOX"));
-    }
-
-    #[test]
-    fn duplicate_sqlite_class_error_detection_is_class_specific() {
-        let error = "Failed to upload worker: Cannot apply new-sqlite-class migration to class 'InboxDurableObject' that is already depended on by existing Durable Objects";
-        assert!(is_duplicate_sqlite_class_migration_error(
-            error,
-            "InboxDurableObject"
-        ));
-        assert!(!is_duplicate_sqlite_class_migration_error(
-            error,
-            "GroupOutboxDurableObject"
-        ));
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding["type"] == "r2_bucket")
+                .count(),
+            1
+        );
+        for name in ["SHARING_INTERNAL_SECRET", "DEVICE_RUNTIME_SECRET"] {
+            assert!(bindings
+                .iter()
+                .any(|binding| { binding["type"] == "secret_text" && binding["name"] == name }));
+        }
     }
 }

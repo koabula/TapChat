@@ -1,175 +1,99 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { decode } from "blurhash";
 import { Image } from "lucide-react";
 
 export interface ImageGridItem {
   messageId: string;
   conversationId: string;
-  reference: string;
   mimeType: string;
   fileName?: string;
   sizeBytes?: number;
-  metadataReady?: boolean;
-  metadataVersion?: string;
+  width?: number;
+  height?: number;
+  blurHash?: string;
+  previewAvailable?: boolean;
+  attachmentState?: "pending" | "published";
+  uploadState?: "sending" | "sent" | "failed";
 }
 
-interface ImageGridProps {
+interface OpenMediaResult { handle: string; url: string; expires_at: number }
+
+export default function ImageGrid({ items, onImageClick }: {
   items: ImageGridItem[];
-  autoDownloadMedia: boolean;
+  autoDownloadMedia?: boolean;
   onImageClick: (index: number) => void;
-}
-
-/** Grid layout for multiple image attachments. */
-export default function ImageGrid({ items, autoDownloadMedia, onImageClick }: ImageGridProps) {
+}) {
   const count = items.length;
-  const gridClass = getGridClass(count);
-
-  return (
-    <div className={gridClass}>
-      {items.map((item, index) => (
-        <ImageGridCell
-          key={`${item.messageId}-${index}`}
-          item={item}
-          index={index}
-          isLarge={count >= 5 && index === 0}
-          autoDownload={autoDownloadMedia && (item.sizeBytes ?? 0) <= 10 * 1024 * 1024}
-          onClick={() => {
-            if (item.metadataReady !== false) onImageClick(index);
-          }}
-        />
-      ))}
-    </div>
-  );
+  // Every child is position-driven while its media is loading, so max-width
+  // alone has no intrinsic size and can collapse to 0px inside the chat flex
+  // row. Give the grid a real responsive inline size up front.
+  const gridClass = count === 1
+    ? "grid w-[min(22rem,72vw)] max-w-full grid-cols-1"
+    : count <= 4
+      ? "grid w-[min(24rem,72vw)] max-w-full grid-cols-2 gap-1"
+      : "grid w-[min(28rem,72vw)] max-w-full grid-cols-3 gap-1";
+  return <div className={gridClass}>{items.map((item, index) =>
+    <ImageCell key={item.messageId} item={item} large={count >= 5 && index === 0} onClick={() => onImageClick(index)} />
+  )}</div>;
 }
 
-function getGridClass(count: number): string {
-  if (count === 1) return "grid grid-cols-1 max-w-[22rem]";
-  if (count === 2) return "grid grid-cols-2 gap-1 max-w-[24rem]";
-  if (count === 3) return "grid grid-cols-2 gap-1 max-w-[24rem]";
-  if (count === 4) return "grid grid-cols-2 gap-1 max-w-[24rem]";
-  return "grid grid-cols-3 gap-1 max-w-[28rem]";
-}
-
-interface ImageGridCellProps {
-  item: ImageGridItem;
-  index: number;
-  isLarge: boolean;
-  autoDownload: boolean;
-  onClick: () => void;
-}
-
-function ImageGridCell({ item, index, isLarge, autoDownload, onClick }: ImageGridCellProps) {
-  const [imageData, setImageData] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+function ImageCell({ item, large, onClick }: { item: ImageGridItem; large: boolean; onClick: () => void }) {
+  const root = useRef<HTMLButtonElement>(null);
+  const [visible, setVisible] = useState(false);
+  const [media, setMedia] = useState<OpenMediaResult | null>(null);
   const [failed, setFailed] = useState(false);
-  const [deferred, setDeferred] = useState(false);
-  const requestVersionRef = useRef(0);
-
-  const loadThumbnail = useCallback(async () => {
-    const requestVersion = ++requestVersionRef.current;
-    if (item.metadataReady === false || !item.reference) {
-      setFailed(Boolean(item.metadataReady !== false));
-      return;
-    }
-    setDeferred(false);
-    setLoading(true);
-    setFailed(false);
-    try {
-      const result = await invoke<string | null>("get_attachment_preview", {
-        conversationId: item.conversationId,
-        messageId: item.messageId,
-        reference: item.reference,
-      });
-      if (requestVersionRef.current !== requestVersion) return;
-      if (result) {
-        setImageData(result);
-      } else {
-        setFailed(true);
-      }
-    } catch {
-      if (requestVersionRef.current === requestVersion) setFailed(true);
-    } finally {
-      if (requestVersionRef.current === requestVersion) setLoading(false);
-    }
-  }, [item.conversationId, item.messageId, item.metadataReady, item.reference]);
-
   useEffect(() => {
-    requestVersionRef.current += 1;
-    setImageData(null);
-    setFailed(false);
-    setDeferred(false);
-    if (item.metadataReady === false) {
-      setLoading(false);
-      return () => {
-        requestVersionRef.current += 1;
-      };
-    }
-    if (autoDownload) {
-      void loadThumbnail();
-    } else {
-      setLoading(false);
-      setDeferred(true);
-    }
+    const target = root.current;
+    if (!target) return;
+    const observer = new IntersectionObserver(([entry]) => entry.isIntersecting && setVisible(true), { rootMargin: "300px" });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (!visible || !item.previewAvailable) return;
+    let cancelled = false;
+    let handle: string | null = null;
+    void invoke<OpenMediaResult>("open_media", { conversationId: item.conversationId, messageId: item.messageId, variant: "preview" })
+      .then((opened) => {
+        handle = opened.handle;
+        if (cancelled) void invoke("release_media", { handle });
+        else setMedia(opened);
+      })
+      .catch(() => !cancelled && setFailed(true));
+    return () => { cancelled = true; if (handle) void invoke("release_media", { handle }); };
+  }, [item.conversationId, item.messageId, item.previewAvailable, visible]);
+  const sourceRatio = item.width && item.height ? item.width / item.height : 4 / 3;
+  const aspectRatio = Math.min(1.8, Math.max(0.65, sourceRatio));
+  return <button
+    ref={root}
+    type="button"
+    className={`relative min-h-24 w-full min-w-0 overflow-hidden rounded-xl bg-surface-elevated ${large ? "col-span-2 row-span-2" : ""}`}
+    style={{ aspectRatio }}
+    onClick={onClick}
+  >
+    {item.blurHash && !media && <BlurHashCanvas hash={item.blurHash} />}
+    {media && <img src={media.url} alt={item.fileName || "Image"} className="h-full w-full object-cover transition-transform duration-200 hover:scale-[1.02]" onError={() => setFailed(true)} />}
+    {!item.blurHash && !media && <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-muted-color"><Image size={24} /><span className="text-[10px]">Image</span></div>}
+    {failed && <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-1 bg-black/45 px-3 text-center text-white"><Image size={24} /><span className="text-xs font-medium">Preview unavailable</span><span className="text-[10px] text-white/70">Open image to retry</span></div>}
+    {item.attachmentState === "pending" && <span className="absolute bottom-1.5 left-1.5 rounded-full bg-black/55 px-2 py-0.5 text-[10px] text-white/85">{item.uploadState === "failed" ? "Upload failed" : "Uploading"}</span>}
+    <span className="absolute inset-0 bg-black/0 transition-colors hover:bg-black/15" />
+  </button>;
+}
 
-    return () => {
-      requestVersionRef.current += 1;
-    };
-  }, [item.reference, item.metadataReady, item.metadataVersion, autoDownload, loadThumbnail]);
-
-  const cellClass = isLarge
-    ? "col-span-2 row-span-2"
-    : "";
-
-  return (
-    <div
-      className={`relative cursor-pointer overflow-hidden rounded-md bg-surface-elevated ${cellClass}`}
-      style={{ aspectRatio: item.mimeType.startsWith("image/") && !isLarge ? "1" : "4 / 3" }}
-      onClick={() => {
-        if (imageData) {
-          onClick();
-        } else if (!loading && item.metadataReady !== false) {
-          void loadThumbnail();
-        }
-      }}
-    >
-      {loading && (
-        <div className="absolute inset-0 flex items-center justify-center">
-          <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        </div>
-      )}
-
-      {imageData && (
-        <img
-          src={`data:image/jpeg;base64,${imageData}`}
-          alt={item.fileName || `Image ${index + 1}`}
-          className="w-full h-full object-cover transition-transform duration-200 hover:scale-[1.02]"
-          onError={() => setFailed(true)}
-        />
-      )}
-
-      {item.metadataReady === false && !loading && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-muted-color">
-          <Image size={24} />
-          <span className="text-[10px]">Preparing...</span>
-        </div>
-      )}
-
-      {deferred && !loading && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-muted-color">
-          <Image size={24} />
-          <span className="text-[10px]">Click to load</span>
-        </div>
-      )}
-
-      {failed && !loading && item.metadataReady !== false && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 text-muted-color">
-          <Image size={24} />
-          <span className="text-[10px]">No preview</span>
-        </div>
-      )}
-
-      {/* Hover overlay */}
-      <div className="absolute inset-0 rounded-md bg-black/0 transition-colors hover:bg-black/15" />
-    </div>
-  );
+function BlurHashCanvas({ hash }: { hash: string }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const element = canvas.current;
+    if (!element) return;
+    try {
+      const pixels = decode(hash, 32, 24);
+      const context = element.getContext("2d");
+      if (!context) return;
+      const image = context.createImageData(32, 24);
+      image.data.set(pixels);
+      context.putImageData(image, 0, 0);
+    } catch { /* invalid placeholders fall back to the icon */ }
+  }, [hash]);
+  return <canvas ref={canvas} width={32} height={24} className="absolute inset-0 h-full w-full scale-105 blur-md" aria-hidden="true" />;
 }

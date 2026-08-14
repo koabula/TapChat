@@ -1752,6 +1752,12 @@ pub struct DeploymentBundle {
     pub version: String,
     #[serde(default, alias = "runtimeId")]
     pub runtime_id: String,
+    #[serde(default, alias = "protocolVersion")]
+    pub protocol_version: u32,
+    #[serde(default, alias = "workerBuildId")]
+    pub worker_build_id: String,
+    #[serde(default, alias = "registrySchemaVersion")]
+    pub registry_schema_version: u32,
     pub region: String,
     #[serde(alias = "inboxHttpEndpoint")]
     pub inbox_http_endpoint: String,
@@ -1773,6 +1779,19 @@ impl Validate for DeploymentBundle {
     fn validate(&self) -> CoreResult<()> {
         validate_version(&self.version)?;
         validate_required("runtime_id", &self.runtime_id)?;
+        if self.protocol_version != 4 {
+            return Err(CoreError::invalid_input(format!(
+                "unsupported runtime protocol {}, expected 4",
+                self.protocol_version
+            )));
+        }
+        validate_required("worker_build_id", &self.worker_build_id)?;
+        if self.registry_schema_version != 1 {
+            return Err(CoreError::invalid_input(format!(
+                "unsupported registry schema {}, expected 1",
+                self.registry_schema_version
+            )));
+        }
         validate_required("region", &self.region)?;
         validate_required("inbox_http_endpoint", &self.inbox_http_endpoint)?;
         validate_required("inbox_websocket_endpoint", &self.inbox_websocket_endpoint)?;
@@ -2356,6 +2375,9 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -2375,6 +2397,9 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -2424,6 +2449,9 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

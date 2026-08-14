@@ -102,8 +102,6 @@ pub struct CloudflareRuntimeDetailsView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_bucket_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
@@ -1785,7 +1783,6 @@ fn cloudflare_runtime_details_from_profile(
         deploy_url: runtime.deploy_url,
         deployment_region: runtime.deployment_region,
         bucket_name: runtime.bucket_name,
-        preview_bucket_name: runtime.preview_bucket_name,
         service_root: runtime.service_root,
         workspace_root,
         deployment_bundle_path: profile.metadata().deployment_bundle_path.clone(),
@@ -2140,7 +2137,6 @@ where
     pending_runtime.public_base_url = Some(config.public_base_url.clone());
     pending_runtime.deployment_region = Some(config.deployment_region.clone());
     pending_runtime.bucket_name = Some(config.bucket_name.clone());
-    pending_runtime.preview_bucket_name = Some(config.preview_bucket_name.clone());
     pending_runtime.bootstrap_secret = None;
     pending_runtime.secret_rotation.last_error = Some("upgrade_pending_enrollment".into());
     let pending_secrets = RuntimeSecrets {
@@ -2155,7 +2151,11 @@ where
     update("deploying", None);
     let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
     update("enrolling", Some(&deployment));
-    crate::cli::runtime::wait_until_ready(&deployment.effective_public_base_url).await?;
+    crate::cli::runtime::wait_until_ready(
+        &deployment.effective_public_base_url,
+        &config.runtime_id,
+    )
+    .await?;
     let bundle =
         fetch_deployment_bundle_v3(&deployment.effective_public_base_url, user_id, device_id)
             .await?;
@@ -2199,7 +2199,6 @@ where
         deploy_url: Some(deployment.deploy_url.clone()),
         deployment_region: Some(deployment.deployment_region.clone()),
         bucket_name: Some(deployment.bucket_name.clone()),
-        preview_bucket_name: Some(deployment.preview_bucket_name.clone()),
         last_deployed_at: Some(format!("{:?}", std::time::SystemTime::now())),
         secret_rotation: RuntimeSecretRotationMetadata {
             phase: if has_previous {
@@ -2733,7 +2732,7 @@ fn map_transfer(
             task_id,
             conversation_id,
             message_id,
-            file_name,
+            descriptor,
             prepared_upload,
             retries,
             ..
@@ -2747,7 +2746,7 @@ fn map_transfer(
                 conversation_id,
                 scope: "conversation".into(),
                 message_id: Some(message_id),
-                file_name,
+                file_name: descriptor.file_name,
                 reference: None,
                 state: if prepared_upload.is_some() {
                     "in_flight".into()
@@ -2829,6 +2828,10 @@ fn attachment_descriptor(path: &Path) -> Result<AttachmentDescriptor> {
         mime_type: mime_type.to_string(),
         size_bytes: metadata.len(),
         file_name,
+        preview: None,
+        width: None,
+        height: None,
+        blur_hash: None,
     })
 }
 

@@ -173,14 +173,12 @@ pub async fn deploy_worker_rest(
     let client = Client::new();
     let base = format!("https://api.cloudflare.com/client/v4/accounts/{account_id}");
 
-    // 1. 创建 R2 Buckets
-    for bucket in [&config.bucket_name, &config.preview_bucket_name] {
-        client.put(format!("{base}/r2/buckets/{bucket}"))
-            .header("Authorization", format!("Bearer {api_token}"))
-            .json(&serde_json::json!({"name": bucket}))
-            .send()
-            .await?;
-    }
+    // 1. 创建唯一 R2 Bucket；original/preview 由对象前缀区分
+    client.put(format!("{base}/r2/buckets/{}", config.bucket_name))
+        .header("Authorization", format!("Bearer {api_token}"))
+        .json(&serde_json::json!({"name": config.bucket_name}))
+        .send()
+        .await?;
 
     // 2. 上传 Worker 脚本
     // Worker 脚本需要包含 metadata (bindings, durable objects)

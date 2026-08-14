@@ -94,8 +94,6 @@ pub struct RuntimeMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_bucket_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_deployed_at: Option<String>,
     #[serde(default)]
     pub secret_rotation: RuntimeSecretRotationMetadata,
@@ -114,6 +112,8 @@ pub struct ProfilePrivateState {
         skip_serializing_if = "Option::is_none"
     )]
     pub runtime_credential: Option<DeviceRuntimeAuth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_runtime_provisioning: Option<PendingRuntimeProvisioning>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -140,6 +140,31 @@ pub struct RuntimeSecrets {
     pub previous_bootstrap_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_bootstrap_key_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProvisioningPhase {
+    #[default]
+    Prepared,
+    CloudDeployed,
+    RuntimeReady,
+    DeviceEnrolled,
+    Complete,
+}
+
+/// Encrypted, resumable journal for a single Cloudflare provisioning
+/// transaction. Values in this record are generated once and reused verbatim
+/// after retries or process restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRuntimeProvisioning {
+    pub runtime_id: String,
+    pub worker_name: String,
+    pub bucket_name: String,
+    pub worker_build_id: String,
+    pub generated_secrets: RuntimeSecrets,
+    #[serde(default)]
+    pub phase: RuntimeProvisioningPhase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -192,6 +217,7 @@ impl Default for ProfilePrivateState {
             runtime_secrets: RuntimeSecrets::default(),
             runtime_secret_rotation: None,
             runtime_credential: None,
+            pending_runtime_provisioning: None,
             settings: BTreeMap::new(),
             attachment_cache: BTreeMap::new(),
         }
@@ -647,6 +673,29 @@ impl Profile {
     pub fn save_runtime_credential(&self, credential: Option<DeviceRuntimeAuth>) -> Result<()> {
         let mut private = self.load_private_state()?;
         private.runtime_credential = credential;
+        self.save_private_state(&private)
+    }
+
+    pub fn load_pending_runtime_provisioning(&self) -> Result<Option<PendingRuntimeProvisioning>> {
+        Ok(self.load_private_state()?.pending_runtime_provisioning)
+    }
+
+    pub fn save_pending_runtime_provisioning(
+        &self,
+        pending: Option<PendingRuntimeProvisioning>,
+    ) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private.pending_runtime_provisioning = pending;
+        self.save_private_state(&private)
+    }
+
+    pub fn advance_runtime_provisioning(&self, phase: RuntimeProvisioningPhase) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        let pending = private
+            .pending_runtime_provisioning
+            .as_mut()
+            .context("runtime provisioning journal is missing")?;
+        pending.phase = phase;
         self.save_private_state(&private)
     }
 
@@ -2097,6 +2146,9 @@ mod tests {
         let bundle = crate::model::DeploymentBundle {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "test".into(),
             inbox_http_endpoint: "https://inbox.test".into(),
             inbox_websocket_endpoint: "wss://inbox.test".into(),

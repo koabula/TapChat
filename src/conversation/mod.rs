@@ -21,6 +21,11 @@ pub struct StoredMessage {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_message_id: Option<String>,
+    /// SHA-256 of the inbound MLS ciphertext that produced this message.
+    /// A replay is only terminal when this proof was durably stored with the
+    /// corresponding application message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mls_ciphertext_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_user_id: Option<String>,
     pub sender_device_id: String,
@@ -260,6 +265,7 @@ impl ConversationManager {
         state.messages.push(StoredMessage {
             message_id: envelope.message_id.clone(),
             app_message_id: None,
+            mls_ciphertext_sha256: None,
             sender_user_id: Some(envelope.sender_user_id.clone()),
             sender_device_id: envelope.sender_device_id.clone(),
             recipient_device_id: envelope.recipient_device_id.clone(),

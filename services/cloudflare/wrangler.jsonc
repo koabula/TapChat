@@ -9,6 +9,7 @@
     "RUNTIME_ID": "00000000-0000-4000-8000-000000000000",
     "OWNER_USER_ID": "local-owner",
     "OWNER_USER_PUBLIC_KEY": "0000000000000000000000000000000000000000000000000000000000000000",
+    "WORKER_BUILD_ID": "tapchat-worker-v4-dev",
     "DEPLOYMENT_REGION": "local",
     "MAX_INLINE_BYTES": "4096",
     "RETENTION_DAYS": "30",
@@ -20,8 +21,7 @@
     "MESSAGE_REQUEST_MAX_TOTAL_BYTES": "4194304",
     "MESSAGE_REQUEST_TTL_SECONDS": "604800",
     "MESSAGE_REQUEST_RATE_LIMIT_MINUTE": "30",
-    "MESSAGE_REQUEST_RATE_LIMIT_HOUR": "300",
-    "ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS": "365"
+    "MESSAGE_REQUEST_RATE_LIMIT_HOUR": "300"
   },
   "durable_objects": {
     "bindings": [
@@ -33,15 +33,14 @@
   "r2_buckets": [
     {
       "binding": "TAPCHAT_STORAGE",
-      "bucket_name": "tapchat-storage",
-      "preview_bucket_name": "tapchat-storage-preview"
+      "bucket_name": "tapchat-storage"
     }
   ],
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["InboxDurableObject"] },
-    { "tag": "v2", "new_sqlite_classes": ["GroupOutboxDurableObject"] },
-    { "tag": "v3", "new_sqlite_classes": ["DeviceRegistryDurableObject"] }
-  ],
+  "exports": {
+    "InboxDurableObject": { "type": "durable-object", "storage": "sqlite" },
+    "GroupOutboxDurableObject": { "type": "durable-object", "storage": "sqlite" },
+    "DeviceRegistryDurableObject": { "type": "durable-object", "storage": "sqlite" }
+  },
   "observability": {
     "enabled": true,
     "logs": {

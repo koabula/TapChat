@@ -745,6 +745,9 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

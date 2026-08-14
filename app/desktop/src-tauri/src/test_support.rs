@@ -137,6 +137,12 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
         deferred_send_gate: Arc::new(Mutex::new(())),
         runtime_auth,
+        media_handles: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        staged_attachments: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        media_inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        media_network_limit: Arc::new(tokio::sync::Semaphore::new(3)),
+        media_decode_limit: Arc::new(tokio::sync::Semaphore::new(2)),
+        profile_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 

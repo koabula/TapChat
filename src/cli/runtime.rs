@@ -22,8 +22,6 @@ use crate::model::{
     DeviceRuntimeRefreshProof, IdentityBundle, Validate, CURRENT_MODEL_VERSION,
 };
 
-use super::util::to_snake_case_json_string;
-
 #[derive(Debug)]
 pub struct LocalRuntimeInstance {
     pub pid: u32,
@@ -59,7 +57,6 @@ pub struct CloudflareDeployDefaults {
     pub rate_limit_per_minute: String,
     pub rate_limit_per_hour: String,
     pub bucket_name: String,
-    pub preview_bucket_name: String,
     pub sharing_token_secret: String,
     pub device_runtime_secret: String,
     pub device_runtime_key_id: String,
@@ -83,8 +80,6 @@ pub struct CloudflareDeployOverrides {
     pub rate_limit_per_hour: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bucket_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_bucket_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,7 +95,6 @@ pub struct ResolvedCloudflareDeployConfig {
     pub rate_limit_per_minute: String,
     pub rate_limit_per_hour: String,
     pub bucket_name: String,
-    pub preview_bucket_name: String,
     pub sharing_token_secret: String,
     pub device_runtime_secret: String,
     pub device_runtime_key_id: String,
@@ -119,7 +113,6 @@ pub struct CloudflareDeploymentResult {
     pub deploy_url: String,
     pub effective_public_base_url: String,
     pub bucket_name: String,
-    pub preview_bucket_name: String,
     pub deployment_region: String,
     #[serde(default)]
     pub generated_secrets: CloudflareGeneratedSecrets,
@@ -255,7 +248,6 @@ pub fn derive_cloudflare_defaults(
         short_identifier(user_id, 8)
     ));
     let bucket_name = format!("{worker_name}-storage");
-    let preview_bucket_name = format!("{worker_name}-storage-preview");
     let _ = device_id;
     CloudflareDeployDefaults {
         worker_name,
@@ -266,7 +258,6 @@ pub fn derive_cloudflare_defaults(
         rate_limit_per_minute: "60".into(),
         rate_limit_per_hour: "600".into(),
         bucket_name,
-        preview_bucket_name,
         sharing_token_secret: std::env::var("TAPCHAT_CLOUDFLARE_SHARING_SECRET")
             .unwrap_or_else(|_| generate_hex_secret()),
         device_runtime_secret: generate_hex_secret(),
@@ -314,10 +305,6 @@ pub fn resolve_cloudflare_config(
             .bucket_name
             .clone()
             .unwrap_or_else(|| defaults.bucket_name.clone()),
-        preview_bucket_name: overrides
-            .preview_bucket_name
-            .clone()
-            .unwrap_or_else(|| defaults.preview_bucket_name.clone()),
         sharing_token_secret: defaults.sharing_token_secret.clone(),
         device_runtime_secret: defaults.device_runtime_secret.clone(),
         device_runtime_key_id: defaults.device_runtime_key_id.clone(),
@@ -346,7 +333,6 @@ pub fn prompt_cloudflare_overrides(
         )?,
         rate_limit_per_hour: prompt_override("rate_limit_per_hour", &defaults.rate_limit_per_hour)?,
         bucket_name: prompt_override("bucket_name", &defaults.bucket_name)?,
-        preview_bucket_name: prompt_override("preview_bucket_name", &defaults.preview_bucket_name)?,
     })
 }
 
@@ -542,14 +528,23 @@ fn escape_ps_double_quoted(value: &str) -> String {
     value.replace('`', "``").replace('"', "`\"")
 }
 
-pub async fn wait_until_ready(base_url: &str) -> Result<()> {
+pub const CLI_WORKER_BUILD_ID: &str = "tapchat-worker-v4-dev";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeReadyResponse {
+    ready: bool,
+    runtime_id: String,
+    protocol_version: u32,
+    worker_build_id: String,
+    registry_schema_version: u32,
+}
+
+pub async fn wait_until_ready(base_url: &str, expected_runtime_id: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("build reqwest client")?;
-
-    // Initial wait for global deployment propagation (Cloudflare needs ~3-5 seconds)
-    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(90);
     #[allow(unused_assignments)]
@@ -558,41 +553,35 @@ pub async fn wait_until_ready(base_url: &str) -> Result<()> {
     loop {
         attempt += 1;
         let response = client
-            .get(format!("{base_url}/v1/deployment-bundle"))
+            .get(format!("{base_url}/v2/runtime/ready"))
             .send()
             .await;
         match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
-                    if let Ok(body) = resp.text().await {
-                        if let Ok(json_body) = to_snake_case_json_string(&body) {
-                            match serde_json::from_str::<DeploymentBundle>(&json_body) {
-                                Ok(_) => return Ok(()),
-                                Err(e) => {
-                                    last_error = format!(
-                                        "Parse error: {} (body: {})",
-                                        e,
-                                        &body[..body.len().min(200)]
-                                    );
-                                }
-                            }
-                        } else {
-                            last_error = format!(
-                                "JSON conversion failed (body: {})",
-                                &body[..body.len().min(200)]
-                            );
-                        }
-                    } else {
-                        last_error = "Failed to read response body".to_string();
+                    let ready = resp
+                        .json::<RuntimeReadyResponse>()
+                        .await
+                        .context("decode runtime readiness response")?;
+                    if !ready.ready || ready.runtime_id != expected_runtime_id {
+                        bail!("runtime_mismatch: runtime readiness audience differs from provisioning journal");
                     }
+                    if ready.protocol_version != 4 || ready.registry_schema_version != 1 {
+                        bail!("protocol_mismatch: runtime readiness protocol or registry schema is unsupported");
+                    }
+                    if ready.worker_build_id != CLI_WORKER_BUILD_ID {
+                        bail!("worker_build_mismatch: deployed worker build differs from provisioning request");
+                    }
+                    return Ok(());
+                } else if status.as_u16() == 404
+                    || status.as_u16() == 409
+                    || status.as_u16() == 429
+                    || status.is_server_error()
+                {
+                    last_error = format!("HTTP {status}");
                 } else {
-                    if let Ok(body) = resp.text().await {
-                        last_error =
-                            format!("HTTP {} (body: {})", status, &body[..body.len().min(200)]);
-                    } else {
-                        last_error = format!("HTTP {}", status);
-                    }
+                    bail!("runtime readiness failed with non-retryable HTTP {status}");
                 }
             }
             Err(e) => {
@@ -970,10 +959,6 @@ pub fn rebuild_cloudflare_config(
             .bucket_name
             .clone()
             .ok_or_else(|| anyhow::anyhow!("cloudflare bucket_name is not recorded"))?,
-        preview_bucket_name: runtime
-            .preview_bucket_name
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("cloudflare preview_bucket_name is not recorded"))?,
         sharing_token_secret: secrets
             .sharing_secret
             .clone()

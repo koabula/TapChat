@@ -144,7 +144,13 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
     // Touch storage so this endpoint only succeeds once the namespace, class,
     // and backing storage are all available at the serving location.
     await this.stateRef.storage.get("__runtime_registry_ready__");
-    return jsonResponse({ ready: true, runtimeId: config.runtimeId });
+    return jsonResponse({
+      ready: true,
+      runtimeId: config.runtimeId,
+      protocolVersion: 4,
+      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v4-unknown",
+      registrySchemaVersion: 1
+    });
   }
 
   private async issueChallenge(request: Request, now: number): Promise<Response> {

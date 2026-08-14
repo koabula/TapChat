@@ -67,8 +67,7 @@ function logStep(message) {
 
 function deriveBucketNames(workerName) {
   return {
-    bucketName: `${workerName}-storage`,
-    previewBucketName: `${workerName}-storage-preview`
+    bucketName: `${workerName}-storage`
   };
 }
 
@@ -215,7 +214,6 @@ function coerceResolvedConfig(config) {
     messageRequestRateLimitMinute: String(config.message_request_rate_limit_minute ?? config.messageRequestRateLimitMinute ?? DEFAULTS.messageRequestRateLimitMinute),
     messageRequestRateLimitHour: String(config.message_request_rate_limit_hour ?? config.messageRequestRateLimitHour ?? DEFAULTS.messageRequestRateLimitHour),
     bucketName: config.bucket_name ?? config.bucketName,
-    previewBucketName: config.preview_bucket_name ?? config.previewBucketName,
     sharingTokenSecret: configuredSharingSecret ?? generateSecret(),
     deviceRuntimeSecret: configuredRuntimeSecret ?? generateSecret(),
     deviceRuntimeKeyId: config.device_runtime_key_id ?? config.deviceRuntimeKeyId ?? generateKeyId(),
@@ -263,9 +261,6 @@ async function collectInputs() {
     const bucketName =
       (await rl.question(`R2 bucket name [${derivedBuckets.bucketName}]: `)).trim() ||
       derivedBuckets.bucketName;
-    const previewBucketName =
-      (await rl.question(`R2 preview bucket name [${derivedBuckets.previewBucketName}]: `)).trim() ||
-      derivedBuckets.previewBucketName;
 
     const generatedSharingSecret = generateSecret();
     const generatedRuntimeSecret = generateSecret();
@@ -291,7 +286,6 @@ async function collectInputs() {
       messageRequestRateLimitMinute: DEFAULTS.messageRequestRateLimitMinute,
       messageRequestRateLimitHour: DEFAULTS.messageRequestRateLimitHour,
       bucketName,
-      previewBucketName,
       sharingTokenSecret,
       deviceRuntimeSecret: generatedRuntimeSecret,
       deviceRuntimeKeyId: generateKeyId(),
@@ -320,6 +314,7 @@ function updateConfig(baseConfig, config) {
     RUNTIME_ID: config.runtimeId,
     OWNER_USER_ID: config.ownerUserId,
     OWNER_USER_PUBLIC_KEY: config.ownerUserPublicKey,
+    WORKER_BUILD_ID: config.workerBuildId,
     DEPLOYMENT_REGION: config.deploymentRegion,
     MAX_INLINE_BYTES: config.maxInlineBytes,
     RETENTION_DAYS: config.retentionDays,
@@ -353,8 +348,7 @@ function updateConfig(baseConfig, config) {
     bucket.binding === "TAPCHAT_STORAGE"
       ? {
           ...bucket,
-          bucket_name: config.bucketName,
-          preview_bucket_name: config.previewBucketName
+          bucket_name: config.bucketName
         }
       : bucket
   );
@@ -459,27 +453,41 @@ async function deleteSecretBestEffort(configPath, name) {
   });
 }
 
-async function verifyRuntimeConfiguration(baseUrl) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/v1/deployment-bundle`, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" }
-    });
-    if (!response.ok) {
-      let errorCode = "unknown";
-      try {
-        const body = await response.json();
-        errorCode = body?.error ?? errorCode;
-      } catch {
-        // Do not include response text because it may contain deployment metadata.
+async function verifyRuntimeConfiguration(baseUrl, config) {
+  const deadline = Date.now() + 90_000;
+  let delayMs = 500;
+  let lastError = "runtime not ready";
+  while (Date.now() < deadline) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch(`${baseUrl.replace(/\/+$/, "")}/v2/runtime/ready`, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" }
+      });
+      if (response.ok) {
+        const ready = await response.json();
+        if (ready.runtimeId !== config.runtimeId) throw new Error("runtime_mismatch");
+        if (ready.protocolVersion !== 4) throw new Error("protocol_mismatch");
+        if (ready.workerBuildId !== config.workerBuildId) throw new Error("worker_build_mismatch");
+        if (ready.registrySchemaVersion !== 1) throw new Error("registry_schema_mismatch");
+        return ready;
       }
-      throw new Error(`Runtime configuration health check failed with HTTP ${response.status} (${errorCode}).`);
+      if (![404, 409, 429].includes(response.status) && response.status < 500) {
+        throw new Error(`runtime readiness failed with HTTP ${response.status}`);
+      }
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.endsWith("_mismatch") || message.startsWith("runtime readiness failed")) throw error;
+      lastError = message;
+    } finally {
+      clearTimeout(timeout);
     }
-  } finally {
-    clearTimeout(timeout);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    delayMs = Math.min(delayMs * 2, 5_000);
   }
+  throw new Error(`Runtime readiness timed out after 90 seconds (${lastError}).`);
 }
 
 function printStructuredResult(result) {
@@ -542,6 +550,7 @@ async function main() {
 
   logStep("Collecting deployment settings");
   const config = await collectInputs();
+  config.workerBuildId = config.workerBuildId ?? "tapchat-worker-v4-dev";
   if (!config.runtimeId || !config.ownerUserId || !config.ownerUserPublicKey) {
     throw new Error("RUNTIME_ID, OWNER_USER_ID, and OWNER_USER_PUBLIC_KEY are required.");
   }
@@ -559,7 +568,7 @@ async function main() {
 
   try {
     logStep("Preparing Cloudflare resources");
-    await ensureBuckets(tempConfigPath, [config.bucketName, config.previewBucketName]);
+    await ensureBuckets(tempConfigPath, [config.bucketName]);
 
     logStep("Writing Cloudflare secrets");
     await putSecret(tempConfigPath, "SHARING_INTERNAL_SECRET", config.sharingTokenSecret);
@@ -610,7 +619,7 @@ async function main() {
     }
 
     logStep("Verifying runtime security configuration");
-    await verifyRuntimeConfiguration(validation.effectiveBaseUrl ?? deployUrl);
+    await verifyRuntimeConfiguration(validation.effectiveBaseUrl ?? deployUrl, config);
     if (!config.deviceRuntimePreviousSecret) {
       await deleteSecretBestEffort(tempConfigPath, "DEVICE_RUNTIME_SECRET_PREVIOUS");
     }
@@ -621,7 +630,6 @@ async function main() {
       deploy_url: deployUrl,
       effective_public_base_url: validation.effectiveBaseUrl ?? config.publicBaseUrl,
       bucket_name: config.bucketName,
-      preview_bucket_name: config.previewBucketName,
       deployment_region: config.deploymentRegion,
       generated_secrets: {
         sharing_token_secret: config.generatedSharingSecret
@@ -636,7 +644,6 @@ async function main() {
           `Worker name: ${config.workerName}`,
           `PUBLIC_BASE_URL: ${validation.effectiveBaseUrl ?? config.publicBaseUrl}`,
           `Storage bucket: ${config.bucketName}`,
-          `Preview bucket: ${config.previewBucketName}`,
           config.generatedPublicBaseUrl ? "PUBLIC_BASE_URL was left blank, so the deployed Worker URL will be used at runtime via request origin fallback." : "PUBLIC_BASE_URL was explicitly configured.",
           config.generatedSharingSecret ? "SHARING_INTERNAL_SECRET was auto-generated for this deployment." : "SHARING_INTERNAL_SECRET was provided manually.",
           "Next step: enroll the current device through POST /v2/runtime-auth/enroll."
@@ -665,7 +672,6 @@ main().catch((error) => {
       deploy_url: "",
       effective_public_base_url: "",
       bucket_name: "",
-      preview_bucket_name: "",
       deployment_region: "",
       generated_secrets: {
         sharing_token_secret: false

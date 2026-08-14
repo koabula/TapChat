@@ -94,6 +94,19 @@ export interface StorageRef {
   expires_at?: number;
 }
 
+export interface AttachmentManifestView {
+  version: 2;
+  attachment_id: string;
+  kind: "image" | "video" | "audio" | "file";
+  file_name?: string;
+  width?: number;
+  height?: number;
+  blur_hash?: string;
+  mime_type: string;
+  size_bytes: number;
+  preview_available: boolean;
+}
+
 export type GroupRole = "owner" | "admin" | "member";
 export type GroupMemberStatus = "active" | "pending" | "removed" | "left";
 export type GroupJoinPolicy = "closed" | "approval_required" | "open_by_invite";
@@ -232,13 +245,20 @@ export interface Message {
   message_id: string;
   sender_device_id: string;
   recipient_device_id: string;
-  message_type: string; // "sent" | "received" | "control"
+  message_type: "sent" | "received" | "system";
   raw_message_type?: string;
   created_at: number;
   plaintext: string | null;
   has_attachment: boolean;
-  storage_refs?: StorageRef[]; // attachment references with full metadata
+  storage_refs?: StorageRef[]; // opaque transport references for non-v2 messages
+  attachment_manifest?: AttachmentManifestView;
+  attachment_state?: "pending" | "published";
   delivery_state?: "sending" | "sent" | "failed";
+}
+
+export interface MessagePage {
+  items: Message[];
+  next_cursor?: string | null;
 }
 
 // Contacts - matches backend ContactSummary
@@ -313,6 +333,7 @@ export type SystemStatus =
   | "identity_refresh_needed"
   | "conversation_needs_rebuild"
   | "attachment_upload_failed"
+  | "attachment_download_failed"
   | "temporary_network_failure"
   | "message_queued_for_approval"
   | "message_rejected_by_policy";
@@ -400,6 +421,7 @@ export interface CloudflareStatus {
     | "auth_expired"
     | "refreshing"
     | "degraded"
+    | "protocol_invalid"
     | "offline_expired"
     | "upgrade_required"
     | "enrollment_required"
@@ -682,6 +704,7 @@ interface PublishSharedStateRequest {
 
 interface ReadAttachmentBytesEffect {
   task_id: string;
+  conversation_id: string;
   attachment_id: string;
 }
 
@@ -689,15 +712,14 @@ interface PrepareBlobUploadRequest {
   task_id: string;
   conversation_id: string;
   message_id: string;
-  mime_type: string;
+  variant: "original" | "preview";
   size_bytes: number;
-  file_name?: string;
   headers: Record<string, string>;
 }
 
 interface BlobUploadRequest {
   task_id: string;
-  blob_ciphertext_b64: string;
+  conversation_id: string;
   upload_target: string;
   upload_headers: Record<string, string>;
   blob_ref: string;
@@ -705,6 +727,7 @@ interface BlobUploadRequest {
 
 interface BlobDownloadRequest {
   task_id: string;
+  conversation_id: string;
   blob_ref: string;
   download_target: string;
   download_headers: Record<string, string>;
@@ -713,7 +736,6 @@ interface BlobDownloadRequest {
 interface WriteDownloadedAttachmentEffect {
   task_id: string;
   destination_id: string;
-  plaintext_b64: string;
 }
 
 interface PersistStateEffect {

@@ -2440,6 +2440,7 @@ impl CoreEngine {
         state.messages.push(crate::conversation::StoredMessage {
             message_id: record.message_id.clone(),
             app_message_id: None,
+            mls_ciphertext_sha256: None,
             sender_user_id: Some(record.envelope.sender_user_id.clone()),
             sender_device_id: record.envelope.sender_device_id.clone(),
             recipient_device_id: String::new(),

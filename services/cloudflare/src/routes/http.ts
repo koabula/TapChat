@@ -26,7 +26,6 @@ import {
   type AllowlistDocument,
   type AppendGroupEnvelopeRequest,
   type AppendEnvelopeRequest,
-  type AuthorizeBlobDownloadRequest,
   type DeploymentBundle,
   type DeviceRuntimeAuth,
   type DeviceRuntimeEnrollmentProof,
@@ -95,7 +94,7 @@ class R2JsonBlobStore {
   }
 
   async putBytes(key: string, value: ArrayBuffer | Uint8Array, metadata?: Record<string, string>): Promise<void> {
-    await this.bucket.put(key, value, metadata ? { httpMetadata: metadata } : undefined);
+    await this.bucket.put(key, value, metadata ? { customMetadata: metadata } : undefined);
   }
 
   async getBytes(key: string): Promise<ArrayBuffer | null> {
@@ -104,6 +103,15 @@ class R2JsonBlobStore {
       return null;
     }
     return object.arrayBuffer();
+  }
+
+  async getBytesMetadata(key: string): Promise<{ bytes: ArrayBuffer; customMetadata: Record<string, string> } | null> {
+    const object = await this.bucket.get(key);
+    if (!object) return null;
+    return {
+      bytes: await object.arrayBuffer(),
+      customMetadata: object.customMetadata ?? {}
+    };
   }
 
   async delete(key: string): Promise<void> {
@@ -117,15 +125,6 @@ function baseUrl(request: Request, env: Env): string {
 
 function sharedStateSecret(env: Env): string {
   return requireSharingSecret(env);
-}
-
-function downloadGrantTtlDays(env: Env): number {
-  const raw = env.ATTACHMENT_DOWNLOAD_GRANT_TTL_DAYS?.trim();
-  if (!raw) {
-    return 365;
-  }
-  const parsed = Number(raw);
-  return Number.isFinite(parsed) ? parsed : 365;
 }
 
 function deviceRuntimeSecrets(env: Env) {
@@ -204,6 +203,9 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
   return {
     version: CURRENT_MODEL_VERSION,
     runtimeId,
+    protocolVersion: 4,
+    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v4-unknown",
+    registrySchemaVersion: 1,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
     inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
@@ -219,7 +221,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
       features: [
         "generic_sync",
-        "attachment_v1",
+        "attachment_v2",
         "message_requests",
         "allowlist",
         "rate_limit",
@@ -310,8 +312,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const store = new StorageService(
       new R2JsonBlobStore(env.TAPCHAT_STORAGE),
       baseUrl(request, env),
-      sharingSecret,
-      downloadGrantTtlDays(env)
+      sharingSecret
     );
     const sharedState = new SharedStateService(new R2JsonBlobStore(env.TAPCHAT_STORAGE), baseUrl(request, env));
     const welcomePickup = new WelcomePickupService(new R2JsonBlobStore(env.TAPCHAT_STORAGE));
@@ -321,7 +322,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse(publicDeploymentBundle(request, env));
     }
 
-    if (request.method === "GET" && url.pathname === "/v2/runtime-auth/ready") {
+    if (request.method === "GET" && url.pathname === "/v2/runtime/ready") {
       try {
         return await registryStub(env).fetch(
           new Request("https://device-registry.internal/v2/device-registry/ready")
@@ -761,22 +762,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse(result);
     }
 
-    if (request.method === "POST" && url.pathname === "/v1/storage/authorize-download") {
-      const header = request.headers.get("Authorization")?.trim();
-      if (!header?.startsWith("Bearer ")) {
-        throw new HttpError(401, "invalid_capability", "missing download refresh grant");
-      }
-      const token = header.slice("Bearer ".length).trim();
-      if (!token) {
-        throw new HttpError(401, "invalid_capability", "download refresh grant must not be empty");
-      }
-      const body = await readJsonLimited<AuthorizeBlobDownloadRequest>(request, CONTROL_JSON_MAX_BYTES);
-      if (body.version !== CURRENT_MODEL_VERSION) {
-        throw new HttpError(400, "unsupported_version", "authorize download version is not supported");
-      }
-      return jsonResponse(await store.authorizeDownload(body.blobRef, token, now));
-    }
-
     const uploadMatch = url.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);
     if (request.method === "PUT" && uploadMatch) {
       const blobKey = decodeURIComponent(uploadMatch[1]);
@@ -784,19 +769,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (!token) {
         throw new HttpError(401, "invalid_capability", "missing upload token");
       }
-      const contentType = request.headers.get("content-type") ?? "application/octet-stream";
-      await store.uploadBlob(blobKey, token, await request.arrayBuffer(), { "content-type": contentType }, now);
+      await store.uploadBlob(blobKey, token, await request.arrayBuffer(), now);
       return new Response(null, { status: 204 });
     }
 
     const blobMatch = url.pathname.match(/^\/v1\/storage\/blob\/(.+)$/);
     if (request.method === "GET" && blobMatch) {
       const blobKey = decodeURIComponent(blobMatch[1]);
-      const token = url.searchParams.get("token");
-      if (!token) {
-        throw new HttpError(401, "invalid_capability", "missing download token");
+      const header = request.headers.get("Authorization")?.trim();
+      if (!header?.startsWith("TapChat-Blob ")) {
+        throw new HttpError(401, "invalid_capability", "missing blob capability");
       }
-      const payload = await store.fetchBlob(blobKey, token, now);
+      const capability = header.slice("TapChat-Blob ".length).trim();
+      const payload = await store.fetchBlob(blobKey, capability);
       return new Response(payload, {
         status: 200,
         headers: {

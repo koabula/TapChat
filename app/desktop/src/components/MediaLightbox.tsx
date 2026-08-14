@@ -1,606 +1,128 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import {
-  X,
-  ChevronLeft,
-  ChevronRight,
-  Download,
-  ZoomIn,
-  ZoomOut,
-  RotateCcw,
-  Play,
-  Pause,
-} from "lucide-react";
+import { decode } from "blurhash";
+import { ChevronLeft, ChevronRight, Download, Image, ScanSearch, X } from "lucide-react";
 import { useAttachmentDownload } from "@/hooks/useAttachmentDownload";
-import { formatAttachmentDownloadError } from "@/lib/attachmentDownload";
 
 export interface MediaItem {
   type: "image" | "video" | "audio" | "other";
   messageId: string;
   conversationId: string;
-  reference: string;
   mimeType: string;
   fileName?: string;
   sizeBytes?: number;
-  metadataReady?: boolean;
-  metadataVersion?: string;
+  width?: number;
+  height?: number;
+  blurHash?: string;
+  previewAvailable?: boolean;
+  attachmentState?: "pending" | "published";
+  uploadState?: "sending" | "sent" | "failed";
 }
 
-interface MediaLightboxProps {
+interface OpenMediaResult { handle: string; url: string; expires_at: number }
+
+function useMedia(item: MediaItem, variant: "preview" | "original", enabled: boolean) {
+  const [media, setMedia] = useState<OpenMediaResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!enabled) {
+      setMedia(null);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    let handle: string | null = null;
+    setMedia(null);
+    setError(null);
+    void invoke<OpenMediaResult>("open_media", {
+      conversationId: item.conversationId,
+      messageId: item.messageId,
+      variant,
+    }).then((opened) => {
+      handle = opened.handle;
+      if (cancelled) void invoke("release_media", { handle });
+      else setMedia(opened);
+    }).catch((reason) => !cancelled && setError(String(reason)));
+    return () => {
+      cancelled = true;
+      if (handle) void invoke("release_media", { handle });
+    };
+  }, [enabled, item.conversationId, item.messageId, variant]);
+  return { media, error };
+}
+
+function BlurHashBackdrop({ hash }: { hash: string }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const element = canvas.current;
+    if (!element) return;
+    try {
+      const pixels = decode(hash, 32, 24);
+      const context = element.getContext("2d");
+      if (!context) return;
+      const image = context.createImageData(32, 24);
+      image.data.set(pixels);
+      context.putImageData(image, 0, 0);
+    } catch { /* Invalid placeholders fall back to the image card. */ }
+  }, [hash]);
+  return <canvas ref={canvas} width={32} height={24} className="max-h-[85vh] max-w-[90vw] scale-105 blur-xl" aria-hidden="true" />;
+}
+
+export default function MediaLightbox({ items, initialIndex, onClose }: {
   items: MediaItem[];
   initialIndex: number;
   onClose: () => void;
-}
-
-export default function MediaLightbox({ items, initialIndex, onClose }: MediaLightboxProps) {
-  const [currentIndex, setCurrentIndex] = useState(initialIndex);
-  const currentItem = items[currentIndex];
-  const {
-    downloading: saving,
-    downloadedPath: savedPath,
-    error: saveError,
-    download: saveOriginal,
-  } = useAttachmentDownload({
-    conversationId: currentItem.conversationId,
-    messageId: currentItem.messageId,
-    reference: currentItem.reference,
-    fileName: currentItem.fileName,
-    mimeType: currentItem.mimeType,
-  });
-
-  // Keyboard navigation
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case "Escape":
-          onClose();
-          break;
-        case "ArrowLeft":
-          if (currentIndex > 0) setCurrentIndex(currentIndex - 1);
-          break;
-        case "ArrowRight":
-          if (currentIndex < items.length - 1) setCurrentIndex(currentIndex + 1);
-          break;
-      }
-    };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [currentIndex, items.length, onClose]);
-
-  const handleBackdropClick = (e: React.MouseEvent) => {
-    if (e.target === e.currentTarget) onClose();
-  };
-
-  return (
-    <div
-      className="fixed inset-0 z-50 bg-black/85 flex flex-col animate-fade-in"
-      onClick={handleBackdropClick}
-    >
-      {/* Top bar */}
-      <div className="flex items-center justify-between px-4 py-3 text-white/90">
-        <div className="flex items-center gap-3 min-w-0">
-          <span className="text-sm font-medium truncate">
-            {currentItem.fileName || currentItem.type}
-          </span>
-          {items.length > 1 && (
-            <span className="text-xs text-white/50">
-              {currentIndex + 1} / {items.length}
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-1">
-          {saveError ? (
-            <span className="max-w-48 truncate px-2 text-xs text-red-300" role="alert">
-              {saveError}
-            </span>
-          ) : null}
-          {currentItem.type !== "other" ? (
-            <button
-              type="button"
-              className="inline-flex items-center gap-1.5 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-white/10 disabled:opacity-50"
-              onClick={() => void saveOriginal()}
-              disabled={saving || currentItem.metadataReady === false}
-              title={saveError ?? (savedPath ? "Save another copy" : "Save original")}
-              aria-label="Save original attachment"
-            >
-              {saving ? (
-                <span className="h-4 w-4 animate-spin rounded-full border border-white border-t-transparent" />
-              ) : (
-                <Download size={18} />
-              )}
-              <span className="hidden sm:inline">{savedPath ? "Saved" : "Save"}</span>
-            </button>
-          ) : null}
-          {items.length > 1 && (
-            <>
-              <button
-                type="button"
-                className="p-2 rounded-lg hover:bg-white/10 transition-colors"
-                onClick={() => setCurrentIndex(Math.max(0, currentIndex - 1))}
-                disabled={currentIndex === 0}
-                aria-label="Previous attachment"
-              >
-                <ChevronLeft size={20} />
-              </button>
-              <button
-                type="button"
-                className="p-2 rounded-lg hover:bg-white/10 transition-colors"
-                onClick={() => setCurrentIndex(Math.min(items.length - 1, currentIndex + 1))}
-                disabled={currentIndex === items.length - 1}
-                aria-label="Next attachment"
-              >
-                <ChevronRight size={20} />
-              </button>
-            </>
-          )}
-          <button
-            type="button"
-            className="p-2 rounded-lg hover:bg-white/10 transition-colors ml-2"
-            onClick={onClose}
-            title="Close (Esc)"
-            aria-label="Close attachment viewer"
-          >
-            <X size={20} />
-          </button>
-        </div>
-      </div>
-
-      {/* Content */}
-      <div className="flex-1 flex items-center justify-center min-h-0 p-4">
-        {currentItem.type === "image" && (
-          <ImageLightboxContent item={currentItem} />
-        )}
-        {currentItem.type === "video" && (
-          <VideoLightboxContent item={currentItem} />
-        )}
-        {currentItem.type === "audio" && (
-          <AudioLightboxContent item={currentItem} />
-        )}
-        {currentItem.type === "other" && (
-          <OtherLightboxContent item={currentItem} />
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** useTempFile hook — downloads a blob to a temp file and returns a local URL. */
-function useTempFile(item: MediaItem): { url: string | null; loading: boolean; error: string | null } {
-  const [url, setUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setUrl(null);
-    setLoading(true);
-    setError(null);
-
-    if (item.metadataReady === false) {
-      setLoading(false);
-      setError("Preparing attachment...");
-      return;
-    }
-
-    if (!item.reference) {
-      setLoading(false);
-      setError("No reference to download");
-      return;
-    }
-
-    (async () => {
-      try {
-        // Download into the profile-local cache and expose it through Tauri's asset URL.
-        const tempPath = await invoke<string>("cache_attachment", {
-          conversationId: item.conversationId,
-          messageId: item.messageId,
-          reference: item.reference,
-          fileName: item.fileName,
-        });
-
-        if (!cancelled) {
-          const localUrl = convertFileSrc(tempPath);
-          setUrl(localUrl);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError(formatMediaError(err));
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    item.messageId,
-    item.conversationId,
-    item.reference,
-    item.fileName,
-    item.metadataReady,
-    item.metadataVersion,
-  ]);
-
-  return { url, loading, error };
-}
-
-function formatMediaError(err: unknown): string {
-  const text = String(err);
-  const lower = text.toLowerCase();
-  if (
-    lower.includes("capability_expired") ||
-    lower.includes("sharing token expired") ||
-    lower.includes("http 403") ||
-    lower.includes("link may have expired")
-  ) {
-    return "Attachment link expired";
-  }
-  if (lower.includes("metadata is missing") || lower.includes("attachment metadata missing")) {
-    return "Attachment metadata missing";
-  }
-  return text;
-}
-
-/** Image viewer with wheel zoom and pan, backed by the original attachment. */
-function ImageLightboxContent({ item }: { item: MediaItem }) {
-  const [scale, setScale] = useState(1);
-  const [position, setPosition] = useState({ x: 0, y: 0 });
-  const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  const { url: dataUrl, loading, error } = useTempFile(item);
-
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    const delta = e.deltaY > 0 ? -0.2 : 0.2;
-    setScale(prev => Math.min(5, Math.max(0.5, prev + delta)));
-  }, []);
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (scale <= 1) return;
-    setIsDragging(true);
-    setDragStart({ x: e.clientX - position.x, y: e.clientY - position.y });
-  };
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return;
-    setPosition({
-      x: e.clientX - dragStart.x,
-      y: e.clientY - dragStart.y,
-    });
-  };
-
-  const handleMouseUp = () => setIsDragging(false);
-
-  const resetZoom = () => {
-    setScale(1);
-    setPosition({ x: 0, y: 0 });
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center">
-        <div className="w-10 h-10 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-      </div>
-    );
-  }
-
-  if (error || !dataUrl) {
-    return (
-      <div className="text-white/60 text-center">
-        <p>Failed to load image</p>
-        <p className="text-xs mt-1 text-white/30">{error}</p>
-      </div>
-    );
-  }
-
-  return (
-    <div
-      ref={containerRef}
-      className="w-full h-full flex items-center justify-center overflow-hidden select-none"
-      onWheel={handleWheel}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
-      style={{ cursor: scale > 1 ? (isDragging ? "grabbing" : "grab") : "default" }}
-    >
-      <img
-        src={dataUrl}
-        alt={item.fileName || "Image"}
-        className="max-w-[90vw] max-h-[85vh] object-contain transition-transform duration-100"
-        style={{
-          transform: `scale(${scale}) translate(${position.x / scale}px, ${position.y / scale}px)`,
-        }}
-        draggable={false}
-      />
-
-      {/* Zoom controls */}
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-black/50 rounded-full px-3 py-2">
-        <button
-          className="p-1.5 rounded-full hover:bg-white/10 transition-colors text-white/80"
-          onClick={() => setScale(s => Math.max(0.5, s - 0.5))}
-          title="Zoom out"
-        >
-          <ZoomOut size={16} />
-        </button>
-        <button
-          className="p-1.5 rounded-full hover:bg-white/10 transition-colors text-white/80"
-          onClick={resetZoom}
-          title="Reset zoom"
-        >
-          <RotateCcw size={16} />
-        </button>
-        <button
-          className="p-1.5 rounded-full hover:bg-white/10 transition-colors text-white/80"
-          onClick={() => setScale(s => Math.min(5, s + 0.5))}
-          title="Zoom in"
-        >
-          <ZoomIn size={16} />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/** Video player */
-function VideoLightboxContent({ item }: { item: MediaItem }) {
-  const { url, loading, error } = useTempFile(item);
-  const [poster, setPoster] = useState<string | null>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-
-  // Generate thumbnail poster via canvas
-  useEffect(() => {
-    if (!url) return;
-    const video = document.createElement("video");
-    video.crossOrigin = "anonymous";
-    video.preload = "metadata";
-    video.muted = true;
-    video.src = url;
-
-    const onLoaded = () => {
-      video.currentTime = 1;
-    };
-    const onSeeked = () => {
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth || 320;
-        canvas.height = video.videoHeight || 180;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          setPoster(canvas.toDataURL("image/jpeg", 0.7));
-        }
-      } catch {
-        // ignore capture errors
-      }
-      video.remove();
-    };
-
-    video.addEventListener("loadeddata", onLoaded);
-    video.addEventListener("seeked", onSeeked);
-    video.addEventListener("error", () => video.remove());
-
-    return () => {
-      video.removeEventListener("loadeddata", onLoaded);
-      video.removeEventListener("seeked", onSeeked);
-      video.remove();
-    };
-  }, [url]);
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center">
-        <div className="w-10 h-10 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-      </div>
-    );
-  }
-
-  if (error || !url) {
-    return (
-      <div className="text-white/60 text-center">
-        <p>Failed to load video</p>
-        <p className="text-xs mt-1 text-white/30">{error}</p>
-      </div>
-    );
-  }
-
-  return (
-    <video
-      ref={videoRef}
-      src={url}
-      poster={poster ?? undefined}
-      controls
-      autoPlay
-      className="max-w-[90vw] max-h-[85vh] rounded-lg shadow-2xl"
-    >
-      Your browser does not support video playback.
-    </video>
-  );
-}
-
-/** Custom audio player */
-function AudioLightboxContent({ item }: { item: MediaItem }) {
-  const { url, loading, error } = useTempFile(item);
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-
-    const onTime = () => setCurrentTime(audio.currentTime);
-    const onDuration = () => setDuration(audio.duration);
-    const onEnded = () => setPlaying(false);
-    const onPlay = () => setPlaying(true);
-    const onPause = () => setPlaying(false);
-
-    audio.addEventListener("timeupdate", onTime);
-    audio.addEventListener("loadedmetadata", onDuration);
-    audio.addEventListener("ended", onEnded);
-    audio.addEventListener("play", onPlay);
-    audio.addEventListener("pause", onPause);
-
-    return () => {
-      audio.removeEventListener("timeupdate", onTime);
-      audio.removeEventListener("loadedmetadata", onDuration);
-      audio.removeEventListener("ended", onEnded);
-      audio.removeEventListener("play", onPlay);
-      audio.removeEventListener("pause", onPause);
-    };
-  }, [url]);
-
-  const togglePlay = () => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    if (audio.paused) {
-      audio.play().catch(() => {});
-    } else {
-      audio.pause();
-    }
-  };
-
-  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
-    const audio = audioRef.current;
-    if (!audio || !duration) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const ratio = (e.clientX - rect.left) / rect.width;
-    audio.currentTime = ratio * duration;
-  };
-
-  const formatTime = (t: number) => {
-    const m = Math.floor(t / 60);
-    const s = Math.floor(t % 60);
-    return `${m}:${s.toString().padStart(2, "0")}`;
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center">
-        <div className="w-10 h-10 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-      </div>
-    );
-  }
-
-  if (error || !url) {
-    return (
-      <div className="text-white/60 text-center">
-        <p>Failed to load audio</p>
-        <p className="text-xs mt-1 text-white/30">{error}</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="bg-white/10 backdrop-blur rounded-2xl p-6 w-80 shadow-2xl">
-      <audio ref={audioRef} src={url} preload="auto" />
-
-      {/* File name */}
-      <p className="text-white/90 text-sm font-medium text-center truncate mb-4">
-        {item.fileName || "Audio"}
-      </p>
-
-      {/* Play/Pause button */}
-      <div className="flex items-center justify-center mb-4">
-        <button
-          className="w-14 h-14 rounded-full bg-white/20 hover:bg-white/30 transition-colors flex items-center justify-center"
-          onClick={togglePlay}
-        >
-          {playing ? (
-            <Pause size={28} className="text-white" />
-          ) : (
-            <Play size={28} className="text-white ml-1" />
-          )}
-        </button>
-      </div>
-
-      {/* Progress bar */}
-      <div
-        className="w-full h-1.5 bg-white/20 rounded-full cursor-pointer mb-2"
-        onClick={handleSeek}
-      >
-        <div
-          className="h-full bg-white rounded-full transition-all duration-100"
-          style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
-        />
-      </div>
-
-      {/* Time display */}
-      <div className="flex items-center justify-between text-xs text-white/60">
-        <span>{formatTime(currentTime)}</span>
-        <span>{formatTime(duration)}</span>
-      </div>
-    </div>
-  );
-}
-
-/** Fallback for non-media files */
-function OtherLightboxContent({ item }: { item: MediaItem }) {
-  const {
-    downloading,
-    downloadedPath,
-    error,
-    setError,
-    download,
-  } = useAttachmentDownload({
+}) {
+  const [index, setIndex] = useState(initialIndex);
+  const [showOriginal, setShowOriginal] = useState(false);
+  const item = items[index];
+  const useOriginal = showOriginal || item.type !== "image" || !item.previewAvailable;
+  const requestedVariant = useOriginal ? "original" : "preview";
+  const shouldLoad = item.type !== "other";
+  const { media, error } = useMedia(item, requestedVariant, shouldLoad);
+  const save = useAttachmentDownload({
     conversationId: item.conversationId,
     messageId: item.messageId,
-    reference: item.reference,
+    reference: "original",
     fileName: item.fileName,
     mimeType: item.mimeType,
   });
-
-  const handleOpen = async () => {
-    if (!downloadedPath) return;
-    try {
-      await invoke("open_file", { path: downloadedPath });
-    } catch (caught) {
-      setError(formatAttachmentDownloadError(caught));
-    }
-  };
-
-  return (
-    <div className="bg-white/10 backdrop-blur rounded-xl p-8 text-center max-w-sm">
-      <Download size={40} className="text-white/40 mx-auto mb-3" />
-      <p className="text-white/90 font-medium mb-1">
-        {item.fileName || "File"}
-      </p>
-      <p className="text-white/50 text-sm mb-4">
-        This file type cannot be previewed
-      </p>
-      <button
-        className="px-4 py-2 bg-white/20 hover:bg-white/30 text-white rounded-lg transition-colors text-sm"
-        disabled={downloading}
-        onClick={() => void download()}
-      >
-        {downloading ? "Downloading..." : downloadedPath ? "Download Again" : "Download File"}
-      </button>
-      {downloadedPath && (
-        <button
-          className="ml-2 px-4 py-2 bg-white text-black rounded-lg text-sm hover:bg-white/90"
-          onClick={() => void handleOpen()}
-        >
-          Open File
-        </button>
-      )}
-      {downloadedPath && (
-        <p className="mt-3 break-all text-xs text-white/60" role="status">
-          Saved to {downloadedPath}
-        </p>
-      )}
-      {error && (
-        <p className="mt-3 text-sm text-red-300" role="alert">
-          {error}
-        </p>
-      )}
+  useEffect(() => {
+    setShowOriginal(false);
+  }, [item.messageId]);
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "ArrowLeft") setIndex((value) => Math.max(0, value - 1));
+      if (event.key === "ArrowRight") setIndex((value) => Math.min(items.length - 1, value + 1));
+    };
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [items.length, onClose]);
+  return <div className="fixed inset-0 z-50 flex flex-col bg-black/85" onClick={(event) => event.target === event.currentTarget && onClose()}>
+    <div className="flex items-center justify-between px-4 py-3 text-white/90">
+      <span className="min-w-0 truncate text-sm font-medium">{item.fileName || "Image"}</span>
+      <div className="flex items-center gap-1">
+        {item.type === "image" && !useOriginal && (
+          <button className="rounded-lg px-3 py-2 text-sm hover:bg-white/10" onClick={() => setShowOriginal(true)} title="Load the full-resolution original"><span className="inline-flex items-center gap-1.5"><ScanSearch size={18} />View original</span></button>
+        )}
+        <button className="rounded-lg p-2 hover:bg-white/10 disabled:opacity-50" onClick={() => void save.download()} disabled={save.downloading || item.attachmentState === "pending"} title={item.attachmentState === "pending" ? "Available after upload completes" : "Save original"}><Download size={18} /></button>
+        {items.length > 1 && <>
+          <button className="rounded-lg p-2 hover:bg-white/10 disabled:opacity-40" disabled={index === 0} onClick={() => setIndex((value) => value - 1)} aria-label="Previous attachment"><ChevronLeft size={20} /></button>
+          <button className="rounded-lg p-2 hover:bg-white/10 disabled:opacity-40" disabled={index === items.length - 1} onClick={() => setIndex((value) => value + 1)} aria-label="Next attachment"><ChevronRight size={20} /></button>
+        </>}
+        <button className="ml-2 rounded-lg p-2 hover:bg-white/10" onClick={onClose} aria-label="Close attachment viewer"><X size={20} /></button>
+      </div>
     </div>
-  );
+    <div className="flex min-h-0 flex-1 items-center justify-center p-4">
+      {!shouldLoad && item.blurHash && <BlurHashBackdrop hash={item.blurHash} />}
+      {!shouldLoad && !item.blurHash && <div className="text-center text-white/60"><Image className="mx-auto mb-2" size={40} /><p>Preview unavailable</p><button className="mt-3 rounded-lg bg-white/10 px-4 py-2 text-sm hover:bg-white/15" onClick={() => setShowOriginal(true)}>View original</button></div>}
+      {shouldLoad && !media && !error && <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/30 border-t-white" />}
+      {error && <div className="text-center text-white/60"><p>Failed to load {requestedVariant}</p><p className="mt-1 text-xs text-white/30">{error}</p>{!useOriginal && <button className="mt-3 rounded-lg bg-white/10 px-4 py-2 text-sm hover:bg-white/15" onClick={() => setShowOriginal(true)}>Try original</button>}</div>}
+      {media && item.type === "image" && <div className="flex flex-col items-center gap-3"><img src={media.url} alt={item.fileName || "Image"} className="max-h-[80vh] max-w-[90vw] object-contain" />{item.attachmentState === "pending" && <span className="rounded-full bg-white/10 px-3 py-1 text-xs text-white/70">Stored locally · {item.uploadState === "failed" ? "Upload failed" : "Upload pending"}</span>}</div>}
+      {media && item.type === "video" && <video src={media.url} controls autoPlay className="max-h-[80vh] max-w-[90vw] rounded-lg" />}
+      {media && item.type === "audio" && <audio src={media.url} controls autoPlay className="w-[min(90vw,36rem)]" />}
+      {media && item.type === "other" && <p className="text-white/60">Use Save to download this attachment.</p>}
+    </div>
+  </div>;
 }

@@ -645,42 +645,16 @@ export interface PrepareBlobUploadRequest {
   groupId?: string;
   storageScope?: "direct" | "group";
   messageId: string;
-  mimeType: string;
+  variant: "original" | "preview";
   sizeBytes: number;
-  fileName?: string;
 }
 
 export interface PrepareBlobUploadResult {
   blobRef: string;
   uploadTarget: string;
   uploadHeaders: Record<string, string>;
-  downloadGrant?: BlobDownloadGrant;
-  downloadTarget?: string;
-  expiresAt?: number;
-}
-
-export interface BlobDownloadGrant {
-  version: string;
-  service: "storage";
-  action: "authorize_download";
-  blobRef: string;
-  authorizeEndpoint: string;
-  token: string;
-  expiresAt: number;
-  startSeq?: number;
-  rosterVersion?: number;
-  lastCommitMessageId?: string;
-}
-
-export interface AuthorizeBlobDownloadRequest {
-  version: string;
-  blobRef: string;
-}
-
-export interface AuthorizeBlobDownloadResult {
-  blobRef: string;
+  readCapability: string;
   downloadTarget: string;
-  downloadHeaders: Record<string, string>;
   expiresAt?: number;
 }
 
@@ -724,6 +698,9 @@ export interface RuntimeConfig {
 export interface DeploymentBundle {
   version: string;
   runtimeId: string;
+  protocolVersion: number;
+  workerBuildId: string;
+  registrySchemaVersion: number;
   region: string;
   inboxHttpEndpoint: string;
   inboxWebsocketEndpoint: string;

@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use tauri::State;
 
+use tapchat_core::attachment_crypto::{AttachmentKind, AttachmentManifestV2};
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::ConversationSummary;
-use tapchat_core::model::{ConversationKind, ConversationState};
+use tapchat_core::model::{ConversationKind, ConversationState, StorageRef};
 use tapchat_core::CoreCommand;
 
 use super::conversation_view::{
@@ -18,6 +19,68 @@ use crate::state::{AppState, SessionState};
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateConversationResult {
     pub conversation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessagePage {
+    pub items: Vec<MessageView>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    Sent,
+    Received,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDeliveryState {
+    Sending,
+    Sent,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageAttachmentState {
+    Pending,
+    Published,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentManifestView {
+    pub version: u32,
+    pub attachment_id: String,
+    pub kind: AttachmentKind,
+    pub file_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub blur_hash: Option<String>,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub preview_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageView {
+    pub message_id: String,
+    pub sender_device_id: String,
+    pub recipient_device_id: String,
+    pub message_type: MessageDirection,
+    pub raw_message_type: String,
+    pub created_at: u64,
+    pub plaintext: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_manifest: Option<AttachmentManifestView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_state: Option<MessageAttachmentState>,
+    pub has_attachment: bool,
+    pub storage_refs: Vec<StorageRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<MessageDeliveryState>,
 }
 
 #[tauri::command]
@@ -119,7 +182,9 @@ pub async fn recover_conversation(
 pub async fn get_messages(
     state: State<'_, AppState>,
     conversation_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
+    before_cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<MessagePage, String> {
     let inner = state.inner.read().await;
 
     // Get snapshot to find the conversation and local device_id
@@ -155,7 +220,7 @@ pub async fn get_messages(
 
     // Find the conversation and extract messages
     // Filter out MLS protocol messages (Welcome, Commit) - they have no plaintext and shouldn't be displayed
-    let conversation_messages: Vec<serde_json::Value> = snapshot
+    let conversation_messages: Vec<MessageView> = snapshot
         .conversations
         .iter()
         .find(|c| c.conversation_id == conversation_id)
@@ -180,6 +245,19 @@ pub async fn get_messages(
                             ))
                 })
                 .map(|msg| {
+                    let logical_message_id =
+                        msg.app_message_id.as_deref().unwrap_or(&msg.message_id);
+                    let attachment_manifest = msg
+                        .plaintext
+                        .as_deref()
+                        .and_then(|plaintext| {
+                            serde_json::from_str::<
+                                tapchat_core::attachment_crypto::AttachmentManifestV2,
+                            >(plaintext)
+                            .ok()
+                        })
+                        .filter(|manifest| manifest.version == 2)
+                        .map(attachment_manifest_view);
                     // Log plaintext status for debugging
                     log::debug!(
                         "get_messages: message_id={}, message_type={:?}, {}",
@@ -193,33 +271,113 @@ pub async fn get_messages(
                         tapchat_core::model::MessageType::ControlContactRemoved
                             | tapchat_core::model::MessageType::ControlIdentityStateUpdated
                     ) {
-                        "system"
+                        MessageDirection::System
                     } else if local_device_id.as_ref() == Some(&msg.sender_device_id) {
-                        "sent"
+                        MessageDirection::Sent
                     } else {
-                        "received"
+                        MessageDirection::Received
                     };
-                    serde_json::json!({
-                        "message_id": msg.message_id,
-                        "sender_device_id": msg.sender_device_id,
-                        "recipient_device_id": msg.recipient_device_id,
-                        "message_type": direction,
-                        "raw_message_type": format!("{:?}", msg.message_type).to_lowercase(),
-                        "created_at": msg.created_at,
-                        "plaintext": msg.plaintext,
-                        "has_attachment": !msg.storage_refs.is_empty(),
-                        "storage_refs": msg.storage_refs,
-                        "delivery_state": if direction == "sent" { Some("sent") } else { None },
-                    })
+                    let has_manifest = attachment_manifest.is_some();
+                    MessageView {
+                        message_id: logical_message_id.to_string(),
+                        sender_device_id: msg.sender_device_id.clone(),
+                        recipient_device_id: msg.recipient_device_id.clone(),
+                        message_type: direction,
+                        raw_message_type: format!("{:?}", msg.message_type).to_lowercase(),
+                        created_at: msg.created_at,
+                        plaintext: if has_manifest {
+                            None
+                        } else {
+                            msg.plaintext.clone()
+                        },
+                        attachment_manifest,
+                        attachment_state: has_manifest.then_some(MessageAttachmentState::Published),
+                        has_attachment: !msg.storage_refs.is_empty() || has_manifest,
+                        storage_refs: if has_manifest {
+                            Vec::new()
+                        } else {
+                            msg.storage_refs.clone()
+                        },
+                        delivery_state: matches!(direction, MessageDirection::Sent)
+                            .then_some(MessageDeliveryState::Sent),
+                    }
                 })
                 .collect()
         })
         .unwrap_or_default();
 
+    // Blob preparation happens before an envelope exists. Surface one local
+    // placeholder per attachment message so reliable background retries are
+    // visible instead of making the composer item disappear at 0%.
+    let pending_attachment_messages: Vec<MessageView> = snapshot
+        .pending_blob_transfers
+        .iter()
+        .filter_map(|transfer| match transfer {
+            tapchat_core::persistence::PersistedPendingBlobTransfer::Upload {
+                conversation_id: pending_conversation_id,
+                message_id,
+                created_at,
+                descriptor,
+                variant: tapchat_core::attachment_crypto::AttachmentVariant::Original,
+                ..
+            } if pending_conversation_id == &conversation_id
+                && !snapshot
+                    .pending_outbox
+                    .iter()
+                    .any(|item| item.envelope.message_id == *message_id) =>
+            {
+                Some(MessageView {
+                    message_id: message_id.clone(),
+                    sender_device_id: local_device_id.clone().unwrap_or_default(),
+                    recipient_device_id: String::new(),
+                    message_type: MessageDirection::Sent,
+                    raw_message_type: "mls_application".into(),
+                    created_at: *created_at,
+                    plaintext: None,
+                    attachment_manifest: Some(AttachmentManifestView {
+                        version: 2,
+                        attachment_id: message_id.clone(),
+                        kind: if descriptor.mime_type.starts_with("image/") {
+                            AttachmentKind::Image
+                        } else if descriptor.mime_type.starts_with("video/") {
+                            AttachmentKind::Video
+                        } else if descriptor.mime_type.starts_with("audio/") {
+                            AttachmentKind::Audio
+                        } else {
+                            AttachmentKind::File
+                        },
+                        file_name: descriptor.file_name.clone(),
+                        width: descriptor.width,
+                        height: descriptor.height,
+                        blur_hash: descriptor.blur_hash.clone(),
+                        mime_type: descriptor.mime_type.clone(),
+                        size_bytes: descriptor.size_bytes,
+                        preview_available: descriptor.preview.is_some(),
+                    }),
+                    attachment_state: Some(MessageAttachmentState::Pending),
+                    has_attachment: true,
+                    storage_refs: Vec::new(),
+                    delivery_state: Some(if snapshot.pending_blob_transfers.iter().any(|candidate| matches!(candidate,
+                        tapchat_core::persistence::PersistedPendingBlobTransfer::Upload {
+                            message_id: candidate_message_id,
+                            retries,
+                            ..
+                        } if candidate_message_id == message_id && *retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES
+                    )) {
+                        MessageDeliveryState::Failed
+                    } else {
+                        MessageDeliveryState::Sending
+                    }),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
     // Merge pending outbox messages (sent but not yet acked)
     // These are outgoing messages that haven't been confirmed yet
     // All pending outbox messages are MlsApplication type (actual user messages)
-    let outbox_messages: Vec<serde_json::Value> = snapshot
+    let outbox_messages: Vec<MessageView> = snapshot
         .pending_outbox
         .iter()
         .filter(|env| env.envelope.conversation_id == conversation_id)
@@ -230,39 +388,107 @@ pub async fn get_messages(
             )
         })
         .filter_map(|env| {
+            let logical_message_id = env
+                .app_message_id
+                .as_deref()
+                .unwrap_or(&env.envelope.message_id);
             // Only include if not already in conversation messages
             let already_exists = conversation_messages
                 .iter()
-                .any(|msg| msg["message_id"] == env.envelope.message_id);
+                .any(|msg| msg.message_id == logical_message_id);
             if already_exists {
                 return None;
             }
+            let attachment_manifest = env
+                .plaintext_cache
+                .as_deref()
+                .and_then(|plaintext| {
+                    serde_json::from_str::<tapchat_core::attachment_crypto::AttachmentManifestV2>(
+                        plaintext,
+                    )
+                    .ok()
+                })
+                .filter(|manifest| manifest.version == 2)
+                .map(attachment_manifest_view);
+            let has_manifest = attachment_manifest.is_some();
             // This is an outgoing message
-            Some(serde_json::json!({
-                "message_id": env.envelope.message_id,
-                "sender_device_id": env.envelope.sender_device_id,
-                "recipient_device_id": env.envelope.recipient_device_id,
-                "message_type": "sent",
-                "raw_message_type": "mls_application",
-                "created_at": env.envelope.created_at,
-                "plaintext": env.plaintext_cache, // Use cached plaintext if available
-                "has_attachment": !env.envelope.storage_refs.is_empty(),
-                "storage_refs": env.envelope.storage_refs,
-                "delivery_state": if env.retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES {
-                    "failed"
+            Some(MessageView {
+                message_id: logical_message_id.to_string(),
+                sender_device_id: env.envelope.sender_device_id.clone(),
+                recipient_device_id: env.envelope.recipient_device_id.clone(),
+                message_type: MessageDirection::Sent,
+                raw_message_type: "mls_application".into(),
+                created_at: env.envelope.created_at,
+                plaintext: if has_manifest {
+                    None
                 } else {
-                    "sending"
+                    env.plaintext_cache.clone()
                 },
-            }))
+                attachment_manifest,
+                attachment_state: has_manifest.then_some(MessageAttachmentState::Published),
+                has_attachment: !env.envelope.storage_refs.is_empty() || has_manifest,
+                storage_refs: if has_manifest {
+                    Vec::new()
+                } else {
+                    env.envelope.storage_refs.clone()
+                },
+                delivery_state: Some(
+                    if env.retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES {
+                        MessageDeliveryState::Failed
+                    } else {
+                        MessageDeliveryState::Sending
+                    },
+                ),
+            })
         })
         .collect();
 
     // Combine and sort by created_at
-    let mut all_messages: Vec<serde_json::Value> = conversation_messages;
-    all_messages.extend(outbox_messages);
-    all_messages.sort_by_key(|msg| msg["created_at"].as_u64().unwrap_or(0));
+    // One logical attachment/text message may have one transport envelope per
+    // recipient device. Collapse those envelopes and replace the upload
+    // placeholder deterministically, with persisted conversation state taking
+    // precedence over outbox state and outbox over the placeholder.
+    let mut messages_by_id = BTreeMap::<String, MessageView>::new();
+    for message in pending_attachment_messages
+        .into_iter()
+        .chain(outbox_messages)
+        .chain(conversation_messages)
+    {
+        messages_by_id.insert(message.message_id.clone(), message);
+    }
+    let mut all_messages = messages_by_id.into_values().collect::<Vec<_>>();
+    all_messages.sort_by_key(|message| message.created_at);
 
-    Ok(all_messages)
+    let end = before_cursor
+        .as_deref()
+        .and_then(|cursor| {
+            all_messages
+                .iter()
+                .position(|message| message.message_id == cursor)
+        })
+        .unwrap_or(all_messages.len());
+    let limit = limit.unwrap_or(50).clamp(1, 100);
+    let start = end.saturating_sub(limit);
+    let next_cursor = (start > 0).then(|| all_messages[start].message_id.clone());
+    Ok(MessagePage {
+        items: all_messages[start..end].to_vec(),
+        next_cursor,
+    })
+}
+
+pub(crate) fn attachment_manifest_view(manifest: AttachmentManifestV2) -> AttachmentManifestView {
+    AttachmentManifestView {
+        version: manifest.version,
+        attachment_id: manifest.attachment_id,
+        kind: manifest.kind,
+        file_name: manifest.file_name,
+        width: manifest.width,
+        height: manifest.height,
+        blur_hash: manifest.blur_hash,
+        mime_type: manifest.original.mime_type,
+        size_bytes: manifest.original.plaintext_size,
+        preview_available: manifest.preview.is_some(),
+    }
 }
 
 #[cfg(test)]
@@ -275,5 +501,41 @@ mod tests {
         assert_eq!(summary, "has_plaintext=true plaintext_len=18");
         assert!(!summary.contains("hello"));
         assert!(!summary.contains("secret"));
+    }
+
+    #[test]
+    fn typed_attachment_message_serializes_the_desktop_contract() {
+        let message = MessageView {
+            message_id: "msg:logical".into(),
+            sender_device_id: "device:peer".into(),
+            recipient_device_id: "device:local".into(),
+            message_type: MessageDirection::Received,
+            raw_message_type: "mls_application".into(),
+            created_at: 42,
+            plaintext: None,
+            attachment_manifest: Some(AttachmentManifestView {
+                version: 2,
+                attachment_id: "attachment:1".into(),
+                kind: AttachmentKind::Image,
+                file_name: Some("photo.webp".into()),
+                width: Some(640),
+                height: Some(480),
+                blur_hash: Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".into()),
+                mime_type: "image/webp".into(),
+                size_bytes: 123,
+                preview_available: true,
+            }),
+            attachment_state: Some(MessageAttachmentState::Published),
+            has_attachment: true,
+            storage_refs: Vec::new(),
+            delivery_state: None,
+        };
+
+        let value = serde_json::to_value(message).expect("message view should serialize");
+        assert_eq!(value["message_id"], "msg:logical");
+        assert_eq!(value["message_type"], "received");
+        assert_eq!(value["attachment_state"], "published");
+        assert_eq!(value["attachment_manifest"]["kind"], "image");
+        assert!(value.get("delivery_state").is_none());
     }
 }

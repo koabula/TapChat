@@ -1,4 +1,5 @@
 pub mod blob_io;
+pub mod media_cache;
 pub mod notification;
 pub mod persistence;
 pub mod realtime;
@@ -6,7 +7,6 @@ pub mod timer;
 pub mod transport;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -16,8 +16,8 @@ use tapchat_core::external_fetch::{
     fetch_external_json, validate_group_invite_transport_binding, ExternalResourceKind,
 };
 use tapchat_core::ffi_api::{
-    CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect, ReadAttachmentBytesEffect,
-    UserNotificationEffect, WriteDownloadedAttachmentEffect,
+    CacheUploadedAttachmentEffect, CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect,
+    ReadAttachmentBytesEffect, UserNotificationEffect, WriteDownloadedAttachmentEffect,
 };
 use tapchat_core::model::CURRENT_MODEL_VERSION;
 use tapchat_core::platform_ports::{
@@ -29,14 +29,14 @@ use tapchat_core::transport_contract::json_case::{
 };
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AppendGroupTransitionRequest, AppendGroupTransitionResult, AuthorizeBlobDownloadRequest,
-    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult,
-    ClaimGroupLeaveRequest, ClaimGroupLeaveResult, CompleteGroupJoinRequest,
-    CompleteGroupJoinResult, CreateGroupInviteRequest, CreateGroupInviteResult,
-    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
-    FetchWelcomePickupResult, GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
+    AppendGroupTransitionRequest, AppendGroupTransitionResult, BlobDownloadRequest,
+    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
+    ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
+    CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
+    DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupInviteResult,
+    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
     GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult, GetGroupOutboxHeadRequest,
     GetGroupOutboxHeadResult, GroupRealtimeSubscriptionRequest,
     InitializeGroupAuthorizationRequest, InitializeGroupAuthorizationResult,
@@ -55,7 +55,7 @@ use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::persistence::DesktopPersistence;
 use crate::platform::profile::ProfileManagerInner;
 use crate::platform::realtime::RealtimeManager;
-use crate::platform::transport::DesktopTransport;
+use crate::platform::transport::{build_desktop_http_client, DesktopTransport};
 use crate::runtime_auth::RuntimeAuthManager;
 
 /// Desktop-specific implementation of all platform port traits.
@@ -70,8 +70,6 @@ pub struct DesktopPlatformPorts {
     client: reqwest::Client,
     /// AppHandle for emitting progress events
     app_handle: Option<Arc<AppHandle>>,
-    /// Current conversation ID for upload progress context
-    current_conversation_id: Option<String>,
     runtime_auth: RuntimeAuthManager,
     // Timer uses spawn directly
 }
@@ -81,21 +79,15 @@ impl DesktopPlatformPorts {
         profile_inner: Arc<RwLock<ProfileManagerInner>>,
         runtime_auth: RuntimeAuthManager,
     ) -> Self {
+        let client = build_desktop_http_client();
         Self {
-            transport: DesktopTransport::new(profile_inner.clone()),
+            transport: DesktopTransport::new(profile_inner.clone(), client.clone()),
             realtime: RealtimeManager::new(profile_inner.clone()),
             persistence: DesktopPersistence::new(profile_inner),
             notification: notification::NotificationManager::new(),
             timer: timer::TimerManager::new(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .unwrap_or_else(|_error| {
-                    log::warn!("Failed to build timeout-configured desktop HTTP client");
-                    reqwest::Client::new()
-                }),
+            client,
             app_handle: None,
-            current_conversation_id: None,
             runtime_auth,
         }
     }
@@ -146,11 +138,6 @@ impl DesktopPlatformPorts {
         if let Some(app_handle) = &self.app_handle {
             self.timer.set_app_handle((**app_handle).clone());
         }
-    }
-
-    /// Set the current conversation ID for upload progress context
-    pub fn set_conversation_context(&mut self, conversation_id: String) {
-        self.current_conversation_id = Some(conversation_id);
     }
 
     /// Build contact share URL for sender identification in message requests.
@@ -356,7 +343,16 @@ impl TransportPort for DesktopPlatformPorts {
 
                     if needs_contact_share_url {
                         // Generate correct contact share URL from runtime metadata
-                        let contact_share_url = self.build_contact_share_url().await?;
+                        let contact_share_url = match self.build_contact_share_url().await {
+                            Ok(url) => url,
+                            Err(_) => {
+                                return Ok(vec![CoreEvent::HttpRequestFailed {
+                                    request_id: request.request_id.clone(),
+                                    retryable: false,
+                                    detail: Some("contact_share:unavailable".into()),
+                                }]);
+                            }
+                        };
                         log::info!(
                             "[TransportPort] generated_contact_share_url={}",
                             summarize_share_url(contact_share_url.as_deref())
@@ -383,8 +379,12 @@ impl TransportPort for DesktopPlatformPorts {
         }
 
         let original = request.clone();
-        self.inject_runtime_authorization(&mut request.headers, request.auth.as_ref(), false)
-            .await?;
+        if let Err(error) = self
+            .inject_runtime_authorization(&mut request.headers, request.auth.as_ref(), false)
+            .await
+        {
+            return Ok(vec![runtime_auth_http_failure(&request.request_id, &error)]);
+        }
         let events = self.transport.execute_http_request(request).await?;
         let runtime_expired = events.iter().any(|event| match event {
             CoreEvent::HttpResponseReceived {
@@ -400,8 +400,12 @@ impl TransportPort for DesktopPlatformPorts {
             return Ok(events);
         }
         let mut retry = original;
-        self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
-            .await?;
+        if let Err(error) = self
+            .inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+            .await
+        {
+            return Ok(vec![runtime_auth_http_failure(&retry.request_id, &error)]);
+        }
         self.transport.execute_http_request(retry).await
     }
 
@@ -1708,6 +1712,61 @@ fn extract_error_code(body: &str) -> Option<String> {
         })
 }
 
+fn blob_prepare_failed_event(task_id: &str, error: &anyhow::Error) -> CoreEvent {
+    let detail = error.to_string().to_ascii_lowercase();
+    let (retryable, code) = if detail.contains("device_revoked") {
+        (false, "device_revoked")
+    } else if detail.contains("runtime_mismatch") {
+        (false, "runtime_mismatch")
+    } else if detail.contains("enrollment_required") {
+        (false, "enrollment_required")
+    } else if detail.contains("status 400")
+        || detail.contains("status 401")
+        || detail.contains("status 403")
+        || detail.contains("status 404")
+        || detail.contains("parse prepare result")
+        || detail.contains("convert prepare")
+        || detail.contains("no base url")
+    {
+        (false, "prepare_invalid")
+    } else if detail.contains("runtime_auth_expired") {
+        (true, "runtime_auth_expired")
+    } else {
+        // Network, response-body, rate-limit, conflict and 5xx failures are
+        // safe to retry because prepare-upload is idempotent by task id.
+        (true, "prepare_unavailable")
+    };
+    log::warn!(
+        "Blob prepare failed: task_id={} code={} retryable={}",
+        redact_id("task", task_id),
+        code,
+        retryable
+    );
+    CoreEvent::BlobTransferFailed {
+        task_id: task_id.to_string(),
+        retryable,
+        detail: Some(format!("blob_prepare:{code}")),
+    }
+}
+
+fn runtime_auth_http_failure(request_id: &str, error: &anyhow::Error) -> CoreEvent {
+    let detail = error.to_string().to_ascii_lowercase();
+    let (retryable, code) = if detail.contains("device_revoked") {
+        (false, "device_revoked")
+    } else if detail.contains("runtime_mismatch") {
+        (false, "runtime_mismatch")
+    } else if detail.contains("enrollment_required") {
+        (false, "enrollment_required")
+    } else {
+        (true, "temporary_unavailable")
+    };
+    CoreEvent::HttpRequestFailed {
+        request_id: request_id.to_string(),
+        retryable,
+        detail: Some(format!("runtime_auth:{code}")),
+    }
+}
+
 fn events_report_runtime_auth_expired(events: &[CoreEvent]) -> bool {
     events.iter().any(|event| match event {
         CoreEvent::MessageRequestsFetchFailed { detail, .. }
@@ -1797,13 +1856,64 @@ impl BlobIoPort for DesktopPlatformPorts {
                 "upload-progress",
                 blob_io::UploadProgressEvent {
                     task_id: read.task_id.clone(),
-                    conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
+                    conversation_id: read.conversation_id.clone(),
                     progress: 5,
                     status: "reading".to_string(),
                 },
             );
         }
 
+        if let Some(staging_id) = read.attachment_id.strip_prefix("encrypted-staging:") {
+            let Some(dir) = dir else {
+                return Ok(vec![CoreEvent::BlobTransferFailed {
+                    task_id: read.task_id,
+                    retryable: false,
+                    detail: Some("blob_read:storage_unavailable".into()),
+                }]);
+            };
+            let encrypted = match tokio::fs::read(
+                dir.join("attachment-staging")
+                    .join(format!("{staging_id}.enc")),
+            )
+            .await
+            {
+                Ok(encrypted) => encrypted,
+                Err(_) => {
+                    return Ok(vec![CoreEvent::BlobTransferFailed {
+                        task_id: read.task_id,
+                        retryable: false,
+                        detail: Some("blob_read:staging_missing".into()),
+                    }]);
+                }
+            };
+            let bytes = {
+                let pm = self.transport.profile_inner.read().await;
+                let Some(profile) = pm.active_profile.as_ref() else {
+                    return Ok(vec![CoreEvent::BlobTransferFailed {
+                        task_id: read.task_id,
+                        retryable: false,
+                        detail: Some("blob_read:profile_unavailable".into()),
+                    }]);
+                };
+                match profile.decrypt_profile_document(
+                    &format!("attachment-staging/{staging_id}"),
+                    &encrypted,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(vec![CoreEvent::BlobTransferFailed {
+                            task_id: read.task_id,
+                            retryable: false,
+                            detail: Some("blob_read:decrypt_failed".into()),
+                        }]);
+                    }
+                }
+            };
+            return Ok(vec![CoreEvent::AttachmentBytesLoaded {
+                task_id: read.task_id,
+                plaintext: bytes,
+            }]);
+        }
         blob_io::read_attachment_bytes(read, dir).await
     }
 
@@ -1812,19 +1922,32 @@ impl BlobIoPort for DesktopPlatformPorts {
         mut upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
         let original = upload.clone();
-        self.inject_runtime_authorization(&mut upload.headers, upload.auth.as_ref(), false)
-            .await?;
+        if let Err(error) = self
+            .inject_runtime_authorization(&mut upload.headers, upload.auth.as_ref(), false)
+            .await
+        {
+            return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]);
+        }
         // Use transport to prepare upload
         let result = match self.transport.prepare_blob_upload(upload.clone()).await {
             Ok(result) => result,
             Err(error) if error.to_string().contains("runtime_auth_expired") => {
                 let mut retry = original;
-                self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
-                    .await?;
+                if let Err(error) = self
+                    .inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
+                    .await
+                {
+                    return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]);
+                }
                 upload = retry;
-                self.transport.prepare_blob_upload(upload.clone()).await?
+                match self.transport.prepare_blob_upload(upload.clone()).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]);
+                    }
+                }
             }
-            Err(error) => return Err(error),
+            Err(error) => return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]),
         };
 
         // Emit progress event
@@ -1833,7 +1956,7 @@ impl BlobIoPort for DesktopPlatformPorts {
                 "upload-progress",
                 blob_io::UploadProgressEvent {
                     task_id: upload.task_id.clone(),
-                    conversation_id: self.current_conversation_id.clone().unwrap_or_default(),
+                    conversation_id: upload.conversation_id.clone(),
                     progress: 10,
                     status: "preparing".to_string(),
                 },
@@ -1847,28 +1970,25 @@ impl BlobIoPort for DesktopPlatformPorts {
     }
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
-        let conversation_id = self.current_conversation_id.clone().unwrap_or_default();
         let app_handle = self.app_handle.clone();
 
-        blob_io::upload_blob_with_progress(upload, app_handle, conversation_id).await
-    }
-
-    async fn authorize_blob_download(
-        &mut self,
-        authorize: AuthorizeBlobDownloadRequest,
-    ) -> Result<Vec<CoreEvent>> {
-        let result = self
-            .transport
-            .authorize_blob_download(authorize.clone())
-            .await?;
-        Ok(vec![CoreEvent::BlobDownloadAuthorized {
-            task_id: authorize.task_id,
-            result,
-        }])
+        blob_io::upload_blob_with_progress(&self.client, upload, app_handle).await
     }
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
-        let conversation_id = self.current_conversation_id.clone().unwrap_or_default();
+        if let Some(TransportAuthRequirement::BlobCapability {
+            blob_ref,
+            capability,
+        }) = download.auth.as_ref()
+        {
+            let expected = format!("TapChat-Blob {capability}");
+            if *blob_ref != download.blob_ref
+                || download.download_headers.get("Authorization") != Some(&expected)
+            {
+                anyhow::bail!("blob capability does not match download request");
+            }
+        }
+        let conversation_id = download.conversation_id.clone();
         let task_id = download.task_id.clone();
 
         // Emit download progress
@@ -1884,17 +2004,24 @@ impl BlobIoPort for DesktopPlatformPorts {
             );
         }
 
-        let result = blob_io::download_blob(download).await;
+        let result = blob_io::download_blob(&self.client, download).await;
 
-        // Emit complete
+        // A transport response is not necessarily a successful download: the
+        // blob adapter reports HTTP failures as BlobTransferFailed events so
+        // Core can persist retry state. Reflect that distinction in the UI.
         if let Some(app) = &self.app_handle {
+            let completed = result.as_ref().is_ok_and(|events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, CoreEvent::BlobDownloaded { .. }))
+            });
             let _ = app.emit(
                 "download-progress",
                 blob_io::UploadProgressEvent {
                     task_id,
                     conversation_id,
-                    progress: 100,
-                    status: "complete".to_string(),
+                    progress: if completed { 100 } else { 0 },
+                    status: if completed { "complete" } else { "failed" }.to_string(),
                 },
             );
         }
@@ -1907,23 +2034,121 @@ impl BlobIoPort for DesktopPlatformPorts {
         write: WriteDownloadedAttachmentEffect,
     ) -> Result<Vec<CoreEvent>> {
         let dir = self.persistence.outbox_attachments_dir().await;
+        if let Some(destination) =
+            media_cache::EncryptedCacheDestination::parse(&write.destination_id)?
+        {
+            let dir = dir.ok_or_else(|| anyhow::anyhow!("no attachments directory configured"))?;
+            let encrypted = {
+                let pm = self.transport.profile_inner.read().await;
+                let profile = pm
+                    .active_profile
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no active profile"))?;
+                profile
+                    .encrypt_profile_document(
+                        &format!("attachment-cache/{}", destination.cache_id()),
+                        &write.plaintext,
+                    )
+                    .context("encrypt attachment cache")?
+            };
+            // Never join the untrusted opaque id directly. Rebuild the local
+            // path from the validated cache digest.
+            let path = dir.join(destination.relative_path());
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let temp = path.with_extension("tmp");
+            tokio::fs::write(&temp, encrypted).await?;
+            tokio::fs::rename(temp, path).await?;
+            return Ok(Vec::new());
+        }
         blob_io::write_downloaded_attachment(write, dir).await
+    }
+
+    async fn cache_uploaded_attachment(
+        &mut self,
+        cache: CacheUploadedAttachmentEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let Some(staging_id) = cache
+            .source_attachment_id
+            .strip_prefix("encrypted-staging:")
+            .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
+        else {
+            // A non-desktop adapter may use a path or another opaque handle.
+            // Desktop only owns encrypted-staging handles and must never
+            // delete an arbitrary source path.
+            return Ok(Vec::new());
+        };
+        let dir = self
+            .persistence
+            .outbox_attachments_dir()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no attachments directory configured"))?;
+        let cache_id = tapchat_core::attachment_crypto::blob_cache_id(
+            &cache.storage_origin,
+            &cache.object_ref,
+        );
+        let destination = media_cache::EncryptedCacheDestination::from_cache_id(&cache_id)?;
+        let relative_path = destination.relative_path();
+        let encrypted = {
+            let pm = self.transport.profile_inner.read().await;
+            let profile = pm
+                .active_profile
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no active profile"))?;
+            profile
+                .encrypt_profile_document(
+                    &format!("attachment-cache/{}", destination.cache_id()),
+                    &cache.plaintext,
+                )
+                .context("encrypt uploaded attachment cache")?
+        };
+        let destination = dir.join(&relative_path);
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let temp = destination.with_extension("tmp");
+        tokio::fs::write(&temp, encrypted).await?;
+        tokio::fs::rename(&temp, &destination).await?;
+
+        // Index the completed cache entry before removing staging. A crash at
+        // any earlier point leaves the durable staging copy available for a
+        // retry; after this point the encrypted cache is authoritative.
+        {
+            let pm = self.transport.profile_inner.read().await;
+            let profile = pm
+                .active_profile
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no active profile"))?;
+            profile.save_attachment_cache_entry(
+                &tapchat_core::cli::profile::AttachmentCacheEntry {
+                    cache_id: cache_id.clone(),
+                    relative_path,
+                    mime_type: Some(cache.mime_type),
+                    size_bytes: Some(cache.size_bytes),
+                    updated_at_ms: crate::ts_ms().min(u64::MAX as u128) as u64,
+                },
+            )?;
+        }
+        let staging_path = dir
+            .join("attachment-staging")
+            .join(format!("{staging_id}.enc"));
+        match tokio::fs::remove_file(staging_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Vec::new())
     }
 }
 
 // --- PersistencePort ---
 impl PersistencePort for DesktopPlatformPorts {
-    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
-        // Use tokio runtime to call async persistence
-        let persistence = self.persistence.clone();
-        tokio::task::block_in_place(|| {
-            tauri::async_runtime::handle().block_on(async {
-                persistence
-                    .persist(persist)
-                    .await
-                    .context("desktop persistence failed")
-            })
-        })
+    async fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
+        self.persistence
+            .persist(persist)
+            .await
+            .context("desktop persistence failed")
     }
 }
 
@@ -1975,6 +2200,133 @@ fn sign_contact_share_token(secret: &str, user_id: &str, share_id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tapchat_core::cli::profile::{
+        override_profile_registry_path_for_test, Profile, ProfileInitOptions, ProfileRegistry,
+    };
+
+    #[test]
+    fn blob_prepare_errors_always_return_a_core_failure_event() {
+        let retryable = blob_prepare_failed_event(
+            "task:1",
+            &anyhow::anyhow!("prepare blob upload: connection reset"),
+        );
+        assert!(matches!(
+            retryable,
+            CoreEvent::BlobTransferFailed {
+                retryable: true,
+                ..
+            }
+        ));
+        let revoked = blob_prepare_failed_event(
+            "task:2",
+            &anyhow::anyhow!("runtime_auth_error:device_revoked"),
+        );
+        assert!(matches!(
+            revoked,
+            CoreEvent::BlobTransferFailed {
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn encrypted_cache_writer_accepts_canonical_and_legacy_windows_destinations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("tapchat-cache-port-test-{}", uuid::Uuid::new_v4()));
+        let _registry_override =
+            override_profile_registry_path_for_test(temp_dir.join("config").join("profiles.json"));
+        let profile = Profile::init_with_options(
+            "cache-writer",
+            temp_dir.join("profile"),
+            ProfileInitOptions {
+                passphrase: Some("test-passphrase".into()),
+                use_keychain: false,
+            },
+        )
+        .expect("init profile");
+        let attachments_dir = profile.metadata().attachments_dir.clone();
+        let profile_inner = Arc::new(RwLock::new(ProfileManagerInner {
+            registry: ProfileRegistry::default(),
+            active_profile: Some(profile),
+            locked_profile_path: None,
+            unlock_error: None,
+        }));
+        let mut ports =
+            DesktopPlatformPorts::new(profile_inner.clone(), RuntimeAuthManager::default());
+
+        let cases = [
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "attachment-cache/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.enc",
+                b"preview plaintext".as_slice(),
+            ),
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "attachment-cache\\bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.enc",
+                b"original plaintext".as_slice(),
+            ),
+        ];
+
+        for (cache_id, destination_id, plaintext) in cases {
+            ports
+                .write_downloaded_attachment(WriteDownloadedAttachmentEffect {
+                    task_id: format!("download:{cache_id}"),
+                    destination_id: destination_id.into(),
+                    plaintext: plaintext.to_vec(),
+                })
+                .await
+                .expect("write encrypted cache through desktop port");
+
+            let path = attachments_dir
+                .join("attachment-cache")
+                .join(format!("{cache_id}.enc"));
+            let encrypted = std::fs::read(path).expect("read encrypted cache");
+            assert!(!encrypted
+                .windows(plaintext.len())
+                .any(|window| window == plaintext));
+            let decrypted = {
+                let manager = profile_inner.read().await;
+                manager
+                    .active_profile
+                    .as_ref()
+                    .expect("active profile")
+                    .decrypt_profile_document(&format!("attachment-cache/{cache_id}"), &encrypted)
+                    .expect("decrypt cache")
+            };
+            assert_eq!(decrypted, plaintext);
+        }
+
+        drop(ports);
+        drop(profile_inner);
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn runtime_auth_injection_failure_is_returned_to_core() {
+        let temporary = runtime_auth_http_failure(
+            "request:1",
+            &anyhow::anyhow!("runtime_auth_error:temporary_unavailable"),
+        );
+        assert!(matches!(
+            temporary,
+            CoreEvent::HttpRequestFailed {
+                retryable: true,
+                ..
+            }
+        ));
+        let revoked = runtime_auth_http_failure(
+            "request:2",
+            &anyhow::anyhow!("runtime_auth_error:device_revoked"),
+        );
+        assert!(matches!(
+            revoked,
+            CoreEvent::HttpRequestFailed {
+                retryable: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn summarize_share_url_redacts_contact_share_token() {

@@ -35,6 +35,22 @@ pub(super) fn validate_attachment_descriptor(descriptor: &AttachmentDescriptor) 
             return Err(CoreError::invalid_input("attachment file name is invalid"));
         }
     }
+    if let Some(preview) = &descriptor.preview {
+        if preview.attachment_id.trim().is_empty()
+            || preview.mime_type != "image/webp"
+            || preview.size_bytes == 0
+            || preview.size_bytes > 128 * 1024
+        {
+            return Err(CoreError::invalid_input(
+                "attachment preview descriptor is invalid",
+            ));
+        }
+        if descriptor.width.is_none() || descriptor.height.is_none() {
+            return Err(CoreError::invalid_input(
+                "image dimensions are required when a preview is present",
+            ));
+        }
+    }
     Ok(())
 }
 

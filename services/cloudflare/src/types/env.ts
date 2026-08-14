@@ -8,6 +8,7 @@ export type Env = Omit<CloudflareBindings, "PUBLIC_BASE_URL"> & {
   RUNTIME_ID?: string;
   OWNER_USER_ID?: string;
   OWNER_USER_PUBLIC_KEY?: string;
+  WORKER_BUILD_ID?: string;
   DEVICE_REGISTRY: DurableObjectNamespace;
   SHARING_INTERNAL_SECRET?: string;
   DEVICE_RUNTIME_SECRET?: string;

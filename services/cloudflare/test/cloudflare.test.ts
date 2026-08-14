@@ -184,6 +184,7 @@ class MemoryState implements DurableObjectStorageLike {
 
 class MemoryR2Store implements JsonBlobStore {
   private readonly map = new Map<string, Uint8Array>();
+  private readonly metadata = new Map<string, Record<string, string>>();
 
   async putJson<T>(key: string, value: T): Promise<void> {
     this.map.set(key, new TextEncoder().encode(JSON.stringify(value)));
@@ -197,8 +198,9 @@ class MemoryR2Store implements JsonBlobStore {
     return JSON.parse(new TextDecoder().decode(value)) as T;
   }
 
-  async putBytes(key: string, value: ArrayBuffer | Uint8Array): Promise<void> {
+  async putBytes(key: string, value: ArrayBuffer | Uint8Array, metadata?: Record<string, string>): Promise<void> {
     this.map.set(key, value instanceof Uint8Array ? value : new Uint8Array(value));
+    this.metadata.set(key, { ...(metadata ?? {}) });
   }
 
   async getBytes(key: string): Promise<ArrayBuffer | null> {
@@ -209,8 +211,14 @@ class MemoryR2Store implements JsonBlobStore {
     return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
   }
 
+  async getBytesMetadata(key: string): Promise<{ bytes: ArrayBuffer; customMetadata: Record<string, string> } | null> {
+    const bytes = await this.getBytes(key);
+    return bytes ? { bytes, customMetadata: { ...(this.metadata.get(key) ?? {}) } } : null;
+  }
+
   async delete(key: string): Promise<void> {
     this.map.delete(key);
+    this.metadata.delete(key);
   }
 
   has(key: string): boolean {
@@ -220,15 +228,17 @@ class MemoryR2Store implements JsonBlobStore {
   asBucket(): R2Bucket {
     const self = this;
     return {
-      async put(key: string, value: string | ArrayBuffer | ArrayBufferView) {
+      async put(key: string, value: string | ArrayBuffer | ArrayBufferView, options?: R2PutOptions) {
+        const customMetadata = options?.customMetadata ?? {};
         if (typeof value === "string") {
-          await self.putBytes(key, new TextEncoder().encode(value));
+          await self.putBytes(key, new TextEncoder().encode(value), customMetadata);
         } else if (value instanceof ArrayBuffer) {
-          await self.putBytes(key, value);
+          await self.putBytes(key, value, customMetadata);
         } else {
           await self.putBytes(
             key,
-            value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer
+            value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer,
+            customMetadata
           );
         }
         return null;
@@ -244,11 +254,13 @@ class MemoryR2Store implements JsonBlobStore {
           },
           async arrayBuffer() {
             return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer;
-          }
-        } satisfies R2ObjectBody;
+          },
+          customMetadata: { ...(self.metadata.get(key) ?? {}) }
+        } as unknown as R2ObjectBody;
       },
       async delete(key: string) {
         self.map.delete(key);
+        self.metadata.delete(key);
       }
     };
   }
@@ -346,9 +358,9 @@ class FakeGroupOutboxStub implements DurableObjectStub {
 class FakeDeviceRegistryStub {
   private readonly challenges = new Map<string, DeviceRuntimeRefreshChallenge>();
   private readonly records = new Map<string, { status: "active" | "revoked"; registrationVersion: number }>();
-  private readonly config: () => { runtimeId: string; userId: string };
+  private readonly config: () => { runtimeId: string; userId: string; workerBuildId: string };
 
-  constructor(config: () => { runtimeId: string; userId: string }) {
+  constructor(config: () => { runtimeId: string; userId: string; workerBuildId: string }) {
     this.config = config;
   }
 
@@ -358,7 +370,13 @@ class FakeDeviceRegistryStub {
     const body = request.method === "POST" ? await request.json() as Record<string, any> : {};
     const config = this.config();
     if (path.endsWith("/ready")) {
-      return Response.json({ ready: true, runtimeId: config.runtimeId });
+      return Response.json({
+        ready: true,
+        runtimeId: config.runtimeId,
+        protocolVersion: 4,
+        workerBuildId: config.workerBuildId,
+        registrySchemaVersion: 1
+      });
     }
     if (path.endsWith("/challenge")) {
       if (body.userId !== config.userId || (body.purpose !== "enroll" && body.purpose !== "refresh")) {
@@ -434,7 +452,7 @@ function createEnv(options?: {
   const bucket = new MemoryR2Store();
   const inboxes = new Map<string, FakeInboxStub>();
   const groupOutboxes = new Map<string, FakeGroupOutboxStub>();
-  let envConfig = { runtimeId: "runtime:test", userId: "user:bob" };
+  let envConfig = { runtimeId: "runtime:test", userId: "user:bob", workerBuildId: "test-worker-v4" };
   const deviceRegistry = new FakeDeviceRegistryStub(() => envConfig);
   const maxInlineBytes = Number(options?.maxInlineBytes ?? "128");
   const retentionDays = Number(options?.retentionDays ?? "30");
@@ -457,6 +475,7 @@ function createEnv(options?: {
     RUNTIME_ID: envConfig.runtimeId,
     OWNER_USER_ID: envConfig.userId,
     OWNER_USER_PUBLIC_KEY: signedIdentityFixture().bundle.userPublicKey,
+    WORKER_BUILD_ID: envConfig.workerBuildId,
     DEPLOYMENT_REGION: "local",
     MAX_INLINE_BYTES: String(maxInlineBytes),
     RETENTION_DAYS: String(retentionDays),
@@ -520,7 +539,8 @@ function createEnv(options?: {
   };
   envConfig = {
     get runtimeId() { return env.RUNTIME_ID; },
-    get userId() { return env.OWNER_USER_ID; }
+    get userId() { return env.OWNER_USER_ID; },
+    get workerBuildId() { return env.WORKER_BUILD_ID; }
   };
 
   // Node tests use in-memory structural adapters rather than real branded
@@ -1119,18 +1139,24 @@ async function setAllowlist(env: Env, token: string, deviceId: string, allowedSe
 test("runtime readiness checks the device registry and reports its audience", async () => {
   const { env } = createEnv();
   const response = await handleRequest(
-    new Request("https://example.com/v2/runtime-auth/ready"),
+    new Request("https://example.com/v2/runtime/ready"),
     env
   );
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ready: true, runtimeId: "runtime:test" });
+  assert.deepEqual(await response.json(), {
+    ready: true,
+    runtimeId: "runtime:test",
+    protocolVersion: 4,
+    workerBuildId: "test-worker-v4",
+    registrySchemaVersion: 1
+  });
 });
 
 test("runtime readiness reports a retryable error while the registry binding propagates", async () => {
   const { env } = createEnv();
   delete (env as unknown as Record<string, unknown>).DEVICE_REGISTRY;
   const response = await handleRequest(
-    new Request("https://example.com/v2/runtime-auth/ready"),
+    new Request("https://example.com/v2/runtime/ready"),
     env
   );
   assert.equal(response.status, 503);
@@ -1790,7 +1816,7 @@ test("rate limit is per recipient sender pair and idempotent retries do not cons
   assert.equal(otherSender.status, 200);
 });
 
-test("prepare-upload requires runtime auth and sharing url still gates blob access", async () => {
+test("prepare-upload requires runtime auth and blob-scoped capability gates access", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
 
@@ -1803,7 +1829,7 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
         conversationId: "conv:alice:bob",
         storageScope: "direct",
         messageId: "msg:blob",
-        mimeType: "application/octet-stream",
+        variant: "original",
         sizeBytes: 4
       })
     }),
@@ -1822,7 +1848,7 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
         taskId: "task-1",
         conversationId: "conv:alice:bob",
         messageId: "msg:blob",
-        mimeType: "application/octet-stream",
+        variant: "original",
         sizeBytes: 4
       })
     }),
@@ -1832,18 +1858,14 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
   const prepared = (await prepare.json()) as {
     version: string;
     uploadTarget: string;
-    downloadTarget?: string;
-    downloadGrant: {
-      authorizeEndpoint: string;
-      token: string;
-      expiresAt: number;
-    };
+    downloadTarget: string;
+    readCapability: string;
     blobRef: string;
   };
   assert.equal(prepared.version, CURRENT_MODEL_VERSION);
-  assert.equal(prepared.blobRef, "blob/user:bob/device:bob:phone/direct/direct/conv:alice:bob/msg:blob-task-1");
-  assert.equal(prepared.downloadTarget, undefined);
-  assert.ok(prepared.downloadGrant.token);
+  assert.equal(prepared.blobRef, "blobs/original/user:bob/device:bob:phone/direct/direct/conv:alice:bob/msg:blob-task-1");
+  assert.ok(prepared.downloadTarget);
+  assert.ok(prepared.readCapability);
 
   const wrongSize = await handleRequest(
     new Request(prepared.uploadTarget, {
@@ -1855,24 +1877,6 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
   );
   assert.equal(wrongSize.status, 400);
 
-  const uploadToken = new URL(prepared.uploadTarget).searchParams.get("token");
-  assert.ok(uploadToken);
-  const wrongAction = await handleRequest(
-    new Request(prepared.downloadGrant.authorizeEndpoint, {
-      method: "POST",
-      headers: {
-        ...authHeaders(uploadToken),
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        version: CURRENT_MODEL_VERSION,
-        blobRef: prepared.blobRef
-      })
-    }),
-    env
-  );
-  assert.equal(wrongAction.status, 403);
-
   const upload = await handleRequest(
     new Request(prepared.uploadTarget, {
       method: "PUT",
@@ -1883,60 +1887,17 @@ test("prepare-upload requires runtime auth and sharing url still gates blob acce
   );
 
   assert.equal(upload.status, 204);
-  const authorize = await handleRequest(
-    new Request(prepared.downloadGrant.authorizeEndpoint, {
-      method: "POST",
-      headers: {
-        ...authHeaders(prepared.downloadGrant.token),
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        version: CURRENT_MODEL_VERSION,
-        blobRef: prepared.blobRef
-      })
-    }),
-    env
-  );
-  assert.equal(authorize.status, 200);
-  const authorized = (await authorize.json()) as { downloadTarget: string; blobRef: string; expiresAt: number };
-  assert.equal(authorized.blobRef, prepared.blobRef);
-
-  const download = await handleRequest(new Request(authorized.downloadTarget), env);
+  const missingCapability = await handleRequest(new Request(prepared.downloadTarget), env);
+  assert.equal(missingCapability.status, 401);
+  const wrongCapability = await handleRequest(new Request(prepared.downloadTarget, {
+    headers: { Authorization: "TapChat-Blob wrong-object-capability" }
+  }), env);
+  assert.equal(wrongCapability.status, 403);
+  const download = await handleRequest(new Request(prepared.downloadTarget, {
+    headers: { Authorization: `TapChat-Blob ${prepared.readCapability}` }
+  }), env);
   assert.equal(download.status, 200);
   assert.deepEqual(new Uint8Array(await download.arrayBuffer()), new Uint8Array([1, 2, 3, 4]));
-
-  const expiredRefreshToken = await signSharingPayload("secret", {
-    service: "storage",
-    action: "authorize_download",
-    blobKey: prepared.blobRef,
-    expiresAt: Date.now() - 1
-  });
-  const expiredRefresh = await handleRequest(
-    new Request(prepared.downloadGrant.authorizeEndpoint, {
-      method: "POST",
-      headers: {
-        ...authHeaders(expiredRefreshToken),
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        version: CURRENT_MODEL_VERSION,
-        blobRef: prepared.blobRef
-      })
-    }),
-    env
-  );
-  assert.equal(expiredRefresh.status, 403);
-
-  const expiredToken = await signSharingPayload("secret", {
-    action: "download",
-    blobKey: prepared.blobRef,
-    expiresAt: Date.now() - 1
-  });
-  const expired = await handleRequest(
-    new Request(`https://example.com/v1/storage/blob/${encodeURIComponent(prepared.blobRef)}?token=${encodeURIComponent(expiredToken)}`),
-    env
-  );
-  assert.equal(expired.status, 403);
 });
 
 test("shared-state writes accept device runtime auth", async () => {

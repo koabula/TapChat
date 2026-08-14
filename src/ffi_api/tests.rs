@@ -2297,7 +2297,7 @@ mod tests {
             })
             .expect("download attachment");
         assert!(download.effects.iter().any(|effect| {
-            matches!(effect, CoreEffect::DownloadBlob { download } if download.download_target == reference)
+            matches!(effect, CoreEffect::DownloadBlob { download } if download.blob_ref == reference)
         }));
         let snapshot = bob.engine.refresh_snapshot();
         assert_eq!(snapshot.pending_blob_transfers.len(), 1);
@@ -2316,7 +2316,7 @@ mod tests {
             .expect("restored download effect");
         let blob_ciphertext = harness
             .blobs
-            .get(&download.download_target)
+            .get(&download.blob_ref)
             .cloned()
             .expect("stored group attachment blob");
         let completed = restored
@@ -2789,6 +2789,47 @@ mod tests {
         )));
         assert_eq!(pending.plaintext_cache.as_deref(), Some("hello"));
         assert_ne!(pending.envelope.message_id, app_message_id);
+        let visible = &output.view_model.as_ref().expect("view model").messages;
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].conversation_id, conversation_id);
+        assert_eq!(visible[0].message_id, app_message_id);
+        assert_eq!(visible[0].message_type, MessageType::MlsApplication);
+    }
+
+    #[test]
+    fn non_retryable_append_failure_marks_outbox_delivery_failed() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let request_id = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request } => Some(request.request_id.clone()),
+                _ => None,
+            })
+            .expect("append request");
+        alice
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id,
+                retryable: false,
+                detail: Some("runtime_auth:device_revoked".into()),
+            })
+            .expect("terminal append failure");
+        let pending = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::MlsApplication)
+            .expect("failed outbox delivery remains visible");
+        assert!(!pending.in_flight);
+        assert_eq!(pending.retries, crate::ffi_api::MAX_TRANSPORT_RETRIES);
     }
 
     #[test]
@@ -4006,7 +4047,7 @@ mod tests {
         let prepared = alice
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id: task_id.clone(),
-                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+                plaintext: vec![1_u8, 2, 3, 4],
             })
             .expect("attachment bytes loaded");
         assert!(prepared.effects.iter().any(|effect| matches!(
@@ -4024,17 +4065,9 @@ mod tests {
                     blob_ref: "blob:attachment-1".into(),
                     upload_target: "upload:attachment-1".into(),
                     upload_headers: std::collections::BTreeMap::new(),
-                    download_grant: Some(crate::transport_contract::BlobDownloadGrant {
-                        version: crate::model::CURRENT_MODEL_VERSION.into(),
-                        service: "storage".into(),
-                        action: "authorize_download".into(),
-                        blob_ref: "blob:attachment-1".into(),
-                        authorize_endpoint: "https://storage.example/v1/storage/authorize-download"
-                            .into(),
-                        token: "refresh-grant".into(),
-                        expires_at: 9_999,
-                    }),
-                    download_target: None,
+                    read_capability: "read-capability".into(),
+                    download_target:
+                        "https://storage.example.com/v1/storage/blob/blob%3Aattachment-1".into(),
                     expires_at: Some(99),
                 },
             })
@@ -4075,15 +4108,13 @@ mod tests {
             .expect("attachment metadata cache");
         let metadata: AttachmentPayloadMetadata =
             serde_json::from_str(plaintext_cache).expect("attachment metadata json");
-        assert_eq!(metadata.mime_type, "application/octet-stream");
+        assert_eq!(metadata.original.mime_type, "application/octet-stream");
         assert_eq!(metadata.file_name.as_deref(), Some("file.bin"));
-        assert_eq!(metadata.size_bytes, 4);
+        assert_eq!(metadata.original.plaintext_size, 4);
+        assert_eq!(metadata.original.read_capability, "read-capability");
         assert_eq!(
-            metadata
-                .download_grant
-                .as_ref()
-                .map(|grant| grant.token.as_str()),
-            Some("refresh-grant")
+            metadata.original.storage_origin,
+            "https://storage.example.com"
         );
 
         let download = alice
@@ -4096,33 +4127,10 @@ mod tests {
             .expect("download attachment from pending outbox metadata");
         assert!(download.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::AuthorizeBlobDownload { authorize }
-                if authorize.blob_ref == "blob:attachment-1"
-                    && authorize.grant.token == "refresh-grant"
-        )));
-        let download_task_id = alice
-            .state
-            .pending_blob_downloads
-            .keys()
-            .next()
-            .cloned()
-            .expect("pending blob download");
-        let authorized = alice
-            .handle_event(CoreEvent::BlobDownloadAuthorized {
-                task_id: download_task_id,
-                result: crate::transport_contract::AuthorizeBlobDownloadResult {
-                    blob_ref: "blob:attachment-1".into(),
-                    download_target: "blob-download:short".into(),
-                    download_headers: std::collections::BTreeMap::new(),
-                    expires_at: Some(999),
-                },
-            })
-            .expect("blob download authorized");
-        assert!(authorized.effects.iter().any(|effect| matches!(
-            effect,
             CoreEffect::DownloadBlob { download }
                 if download.blob_ref == "blob:attachment-1"
-                    && download.download_target == "blob-download:short"
+                    && download.download_target == "https://storage.example.com/v1/storage/blob/blob%3Aattachment-1"
+                    && matches!(download.auth.as_ref(), Some(TransportAuthRequirement::BlobCapability { capability, .. }) if capability == "read-capability")
         )));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
@@ -4154,9 +4162,138 @@ mod tests {
         )
         .expect("stored attachment metadata json");
         assert_eq!(
-            stored_metadata.encryption.algorithm,
+            stored_metadata.original.encryption.algorithm,
             ATTACHMENT_CIPHER_ALGORITHM
         );
+    }
+
+    #[test]
+    fn image_original_completion_waits_for_preview_without_reupload_loop() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice.state.pending_outbox.clear();
+        let mut descriptor = sample_attachment_descriptor();
+        descriptor.mime_type = "image/png".into();
+        descriptor.preview = Some(crate::ffi_api::AttachmentVariantSource {
+            attachment_id: "preview:test".into(),
+            mime_type: "image/webp".into(),
+            size_bytes: 2,
+        });
+        descriptor.width = Some(32);
+        descriptor.height = Some(24);
+        let queued = alice
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id,
+                attachment_descriptor: descriptor,
+            })
+            .expect("queue image attachment");
+        let logical_message_id = queued
+            .view_model
+            .as_ref()
+            .and_then(|view| view.messages.first())
+            .map(|message| message.message_id.clone())
+            .expect("logical attachment message id");
+        let task_ids = queued
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let original_task = task_ids
+            .iter()
+            .find(|task_id| task_id.ends_with(":original"))
+            .cloned()
+            .expect("original task");
+        let preview_task = task_ids
+            .iter()
+            .find(|task_id| task_id.ends_with(":preview"))
+            .cloned()
+            .expect("preview task");
+
+        alice
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id: original_task.clone(),
+                plaintext: vec![1, 2, 3, 4],
+            })
+            .expect("encrypt original");
+        alice
+            .handle_event(CoreEvent::BlobUploadPrepared {
+                task_id: original_task.clone(),
+                result: crate::transport_contract::PrepareBlobUploadResult {
+                    blob_ref: "blob:image-original".into(),
+                    upload_target: "upload:image-original".into(),
+                    upload_headers: std::collections::BTreeMap::new(),
+                    read_capability: "read-original".into(),
+                    download_target:
+                        "https://storage.example.com/v1/storage/blob/blob%3Aimage-original".into(),
+                    expires_at: Some(99),
+                },
+            })
+            .expect("prepare original");
+        let original_done = alice
+            .handle_event(CoreEvent::BlobUploaded {
+                task_id: original_task.clone(),
+            })
+            .expect("complete original");
+        assert!(alice.state.pending_outbox.is_empty());
+        assert!(alice
+            .state
+            .pending_blob_uploads
+            .get(&original_task)
+            .is_some_and(|task| task.uploaded));
+        assert!(!original_done.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::UploadBlob { upload } if upload.task_id == original_task
+        )));
+
+        alice
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id: preview_task.clone(),
+                plaintext: vec![9, 8],
+            })
+            .expect("encrypt preview");
+        alice
+            .handle_event(CoreEvent::BlobUploadPrepared {
+                task_id: preview_task.clone(),
+                result: crate::transport_contract::PrepareBlobUploadResult {
+                    blob_ref: "blob:image-preview".into(),
+                    upload_target: "upload:image-preview".into(),
+                    upload_headers: std::collections::BTreeMap::new(),
+                    read_capability: "read-preview".into(),
+                    download_target:
+                        "https://storage.example.com/v1/storage/blob/blob%3Aimage-preview".into(),
+                    expires_at: Some(99),
+                },
+            })
+            .expect("prepare preview");
+        let completed = alice
+            .handle_event(CoreEvent::BlobUploaded {
+                task_id: preview_task,
+            })
+            .expect("complete preview");
+        assert_eq!(alice.state.pending_blob_uploads.len(), 0);
+        assert_eq!(alice.state.pending_outbox.len(), bob_bundle.devices.len());
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| { item.app_message_id.as_deref() == Some(logical_message_id.as_str()) }));
+        assert_eq!(
+            completed
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, CoreEffect::CacheUploadedAttachment { .. }))
+                .count(),
+            2,
+            "original and preview should be promoted into the local cache"
+        );
+        assert!(completed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
+        )));
     }
 
     #[test]
@@ -4181,7 +4318,7 @@ mod tests {
         let prepared = alice
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id: task_id.clone(),
-                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+                plaintext: vec![1_u8, 2, 3, 4],
             })
             .expect("attachment bytes loaded");
         assert!(prepared
@@ -4195,17 +4332,9 @@ mod tests {
                     blob_ref: "blob:long-idle".into(),
                     upload_target: "upload:long-idle".into(),
                     upload_headers: std::collections::BTreeMap::new(),
-                    download_grant: Some(crate::transport_contract::BlobDownloadGrant {
-                        version: crate::model::CURRENT_MODEL_VERSION.into(),
-                        service: "storage".into(),
-                        action: "authorize_download".into(),
-                        blob_ref: "blob:long-idle".into(),
-                        authorize_endpoint: "https://storage.example/v1/storage/authorize-download"
-                            .into(),
-                        token: "refresh-long-idle".into(),
-                        expires_at: 365,
-                    }),
-                    download_target: None,
+                    read_capability: "read-long-idle".into(),
+                    download_target: "https://storage.example.com/v1/storage/blob/blob%3Along-idle"
+                        .into(),
                     expires_at: Some(15),
                 },
             })
@@ -4214,7 +4343,7 @@ mod tests {
             .effects
             .iter()
             .find_map(|effect| match effect {
-                CoreEffect::UploadBlob { upload } => Some(upload.blob_ciphertext_b64.clone()),
+                CoreEffect::UploadBlob { upload } => Some(upload.blob_ciphertext.clone()),
                 _ => None,
             })
             .expect("upload blob ciphertext");
@@ -4259,13 +4388,7 @@ mod tests {
                 .expect("attachment metadata"),
         )
         .expect("attachment metadata json");
-        assert_eq!(
-            metadata
-                .download_grant
-                .as_ref()
-                .map(|grant| grant.token.as_str()),
-            Some("refresh-long-idle")
-        );
+        assert_eq!(metadata.original.read_capability, "read-long-idle");
 
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let download = restored
@@ -4278,58 +4401,33 @@ mod tests {
             .expect("download after long idle restore");
         assert!(download.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::AuthorizeBlobDownload { authorize }
-                if authorize.blob_ref == "blob:long-idle"
-                    && authorize.grant.token == "refresh-long-idle"
-        )));
-        assert!(!download
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, CoreEffect::DownloadBlob { .. })));
-        let download_task_id = restored
-            .state
-            .pending_blob_downloads
-            .keys()
-            .next()
-            .cloned()
-            .expect("pending blob download");
-        let authorized = restored
-            .handle_event(CoreEvent::BlobDownloadAuthorized {
-                task_id: download_task_id.clone(),
-                result: crate::transport_contract::AuthorizeBlobDownloadResult {
-                    blob_ref: "blob:long-idle".into(),
-                    download_target: "download:long-idle:fresh".into(),
-                    download_headers: std::collections::BTreeMap::new(),
-                    expires_at: Some(30),
-                },
-            })
-            .expect("download authorized");
-        assert!(authorized.effects.iter().any(|effect| matches!(
-            effect,
             CoreEffect::DownloadBlob { download }
                 if download.blob_ref == "blob:long-idle"
-                    && download.download_target == "download:long-idle:fresh"
+                    && matches!(download.auth.as_ref(), Some(TransportAuthRequirement::BlobCapability { capability, .. }) if capability == "read-long-idle")
         )));
+        let download_task_id = download
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::DownloadBlob { download } => Some(download.task_id.clone()),
+                _ => None,
+            })
+            .expect("pending blob download");
         let completed = restored
             .handle_event(CoreEvent::BlobDownloaded {
                 task_id: download_task_id,
                 blob_ciphertext: Some(blob_ciphertext),
             })
             .expect("blob downloaded");
-        let plaintext_b64 = completed
+        let plaintext = completed
             .effects
             .iter()
             .find_map(|effect| match effect {
-                CoreEffect::WriteDownloadedAttachment { write } => {
-                    Some(write.plaintext_b64.clone())
-                }
+                CoreEffect::WriteDownloadedAttachment { write } => Some(write.plaintext.clone()),
                 _ => None,
             })
             .expect("write downloaded attachment");
-        assert_eq!(
-            STANDARD.decode(plaintext_b64).expect("download plaintext"),
-            vec![1_u8, 2, 3, 4]
-        );
+        assert_eq!(plaintext, vec![1_u8, 2, 3, 4]);
     }
 
     #[test]
@@ -4358,7 +4456,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_attachment_upload_failure_clears_pending_task() {
+    fn terminal_attachment_upload_failure_keeps_retryable_local_placeholder() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -4385,13 +4483,19 @@ mod tests {
             })
             .expect("upload failure");
 
-        assert!(!alice.state.pending_blob_uploads.contains_key(&task_id));
+        let pending = alice
+            .state
+            .pending_blob_uploads
+            .get(&task_id)
+            .expect("failed upload remains visible and recoverable");
+        assert_eq!(pending.retries, MAX_TRANSPORT_RETRIES);
+        assert!(!pending.in_flight);
         assert!(failed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::PersistState { persist }
                 if persist.ops.iter().any(|op| matches!(
                     op,
-                    PersistOp::DeletePendingBlobTransfer { task_id: deleted } if deleted == &task_id
+                    PersistOp::SavePendingBlobTransfer { task_id: saved } if saved == &task_id
                 ))
         )));
     }
@@ -4399,15 +4503,18 @@ mod tests {
     #[test]
     fn download_attachment_uses_unique_task_ids_for_distinct_destinations() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let bob_user_id = bob_bundle.user_id.clone();
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let conversation_id = "conv:test".to_string();
+        let mut legacy_metadata = sample_attachment_payload_metadata();
+        legacy_metadata.original.storage_origin.clear();
         engine.state.conversations.insert(
             conversation_id.clone(),
             crate::conversation::LocalConversationState {
                 conversation: crate::model::Conversation {
                     conversation_id: conversation_id.clone(),
                     kind: ConversationKind::Direct,
-                    member_users: vec!["user:alice".into(), "user:bob".into()],
+                    member_users: vec!["user:alice".into(), bob_user_id.clone()],
                     member_devices: vec![],
                     state: crate::model::ConversationState::Active,
                     updated_at: 0,
@@ -4415,20 +4522,20 @@ mod tests {
                 messages: vec![crate::conversation::StoredMessage {
                     message_id: "msg:download".into(),
                     app_message_id: None,
-                    sender_user_id: None,
+                    mls_ciphertext_sha256: None,
+                    sender_user_id: Some(bob_user_id.clone()),
                     sender_device_id: "device:sender".into(),
                     recipient_device_id: "device:recipient".into(),
                     message_type: MessageType::MlsApplication,
                     created_at: 0,
                     plaintext: Some(
-                        serde_json::to_string(&sample_attachment_payload_metadata())
-                            .expect("attachment metadata"),
+                        serde_json::to_string(&legacy_metadata).expect("attachment metadata"),
                     ),
                     storage_refs: vec![],
                     downloaded_blob_b64: None,
                 }],
                 last_message_type: Some(MessageType::MlsApplication),
-                peer_user_id: "user:bob".into(),
+                peer_user_id: bob_user_id,
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
@@ -4439,7 +4546,7 @@ mod tests {
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id: conversation_id.clone(),
                 message_id: "msg:download".into(),
-                reference: "cid:download".into(),
+                reference: "blob:test".into(),
                 destination: "cache/a.bin".into(),
             })
             .expect("first download");
@@ -4447,7 +4554,7 @@ mod tests {
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id,
                 message_id: "msg:download".into(),
-                reference: "cid:download".into(),
+                reference: "blob:test".into(),
                 destination: "downloads/a.bin".into(),
             })
             .expect("second download");
@@ -4463,6 +4570,11 @@ mod tests {
             task_id.starts_with("blob-download:msg:download:") && task_id.len() > 32
         }));
         assert_ne!(task_ids[0], task_ids[1]);
+        assert!(engine
+            .state
+            .pending_blob_downloads
+            .values()
+            .all(|task| { task.blob_descriptor.storage_origin == "https://storage.example.com" }));
     }
 
     #[test]
@@ -4890,7 +5002,7 @@ mod tests {
         let output = alice
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id,
-                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+                plaintext: vec![1_u8, 2, 3, 4],
             })
             .expect("attachment bytes loaded");
         assert!(output.effects.iter().any(|effect| matches!(
@@ -5456,7 +5568,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_blob_upload_without_download_grant_reprepares_after_snapshot_restore() {
+    fn pending_blob_upload_rereads_opaque_source_after_snapshot_restore() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut engine, bob_bundle.user_id.clone());
@@ -5477,32 +5589,37 @@ mod tests {
         let prepared_output = engine
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id: task_id.clone(),
-                plaintext_b64: STANDARD.encode([1_u8, 2, 3, 4]),
+                plaintext: vec![1_u8, 2, 3, 4],
             })
             .expect("attachment bytes loaded");
         let mut snapshot = extract_snapshot(&prepared_output);
         if let Some(crate::persistence::PersistedPendingBlobTransfer::Upload {
-            blob_ciphertext_b64,
-            payload_metadata,
-            metadata_ciphertext,
+            encrypted_descriptor,
             prepared_upload,
             ..
         }) = snapshot.pending_blob_transfers.first_mut()
         {
-            assert!(blob_ciphertext_b64.is_some());
-            assert!(payload_metadata.is_some());
-            assert!(metadata_ciphertext.is_some());
+            assert!(encrypted_descriptor.is_some());
             *prepared_upload = Some(crate::transport_contract::PrepareBlobUploadResult {
                 blob_ref: "blob:prepared".into(),
                 upload_target: "upload:prepared".into(),
                 upload_headers: std::collections::BTreeMap::new(),
-                download_grant: None,
-                download_target: Some("download:prepared".into()),
+                read_capability: "read-prepared".into(),
+                download_target: "https://storage.example.com/v1/storage/blob/blob%3Aprepared"
+                    .into(),
                 expires_at: Some(42),
             });
         } else {
             panic!("missing persisted upload task");
         }
+        let serialized = serde_json::to_value(&snapshot.pending_blob_transfers)
+            .expect("serialize pending blob transfers");
+        assert!(serialized
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("Upload"))
+            .and_then(|upload| upload.get("blob_ciphertext"))
+            .is_none());
 
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
@@ -5511,7 +5628,7 @@ mod tests {
 
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { upload } if upload.task_id == task_id
+            CoreEffect::ReadAttachmentBytes { read } if read.task_id == task_id
         )));
     }
 
@@ -5791,6 +5908,133 @@ mod tests {
             .iter()
             .any(|message| { message.plaintext.as_deref() == Some("hello after welcome") }));
         assert!(restored.sync_checkpoint_snapshot(&bob_device_id).is_some());
+    }
+
+    #[test]
+    fn proven_mls_ciphertext_replay_is_acknowledged_without_duplicate_message() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "stored before replay".into(),
+            })
+            .expect("send application");
+
+        let mut application_record = pending_application_record(&alice, &bob_device_id);
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        let persisted =
+            serde_json::to_vec(&bob.refresh_snapshot()).expect("serialize bob snapshot");
+        let restored = serde_json::from_slice(&persisted).expect("deserialize bob snapshot");
+        bob = CoreEngine::try_from_restored_state(restored).expect("restore bob snapshot");
+        let state = bob
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("bob conversation");
+        let stored = state
+            .messages
+            .iter_mut()
+            .find(|message| message.plaintext.as_deref() == Some("stored before replay"))
+            .expect("stored application");
+        assert!(stored.mls_ciphertext_sha256.is_some());
+        // Force the transport-id lookup to miss while retaining the durable
+        // ciphertext proof, as can happen when a relay duplicates a delivery.
+        stored.message_id = "msg:durable-logical-copy".into();
+        let sync = bob
+            .state
+            .sync_states
+            .get_mut(&bob_device_id)
+            .expect("sync state");
+        sync.seen_message_ids.remove(&application_record.message_id);
+        let replay_seq = sync.checkpoint.last_fetched_seq + 1;
+        application_record.seq = replay_seq;
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            records: vec![application_record],
+            to_seq: replay_seq,
+        })
+        .expect("proven replay");
+
+        let sync = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state");
+        assert_eq!(sync.checkpoint.last_acked_seq, replay_seq);
+        assert!(!sync.pending_record_seqs.contains(&replay_seq));
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .iter()
+                .filter(|message| message.plaintext.as_deref() == Some("stored before replay"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unproven_mls_ciphertext_replay_is_retained_and_never_acked() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "must not be lost".into(),
+            })
+            .expect("send application");
+
+        let mut application_record = pending_application_record(&alice, &bob_device_id);
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        bob.state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("bob conversation")
+            .messages
+            .retain(|message| message.plaintext.as_deref() != Some("must not be lost"));
+        let sync = bob
+            .state
+            .sync_states
+            .get_mut(&bob_device_id)
+            .expect("sync state");
+        sync.seen_message_ids.remove(&application_record.message_id);
+        let last_acked = sync.checkpoint.last_acked_seq;
+        let replay_seq = sync.checkpoint.last_fetched_seq + 1;
+        application_record.seq = replay_seq;
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            records: vec![application_record],
+            to_seq: replay_seq,
+        })
+        .expect("unproven replay is recoverable");
+
+        let sync = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state");
+        assert_eq!(sync.checkpoint.last_acked_seq, last_acked);
+        assert!(sync.pending_retry);
+        assert!(sync.pending_records.contains_key(&replay_seq));
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .recovery_status,
+            RecoveryStatus::NeedsRecovery
+        );
     }
 
     #[test]
@@ -6222,6 +6466,13 @@ mod tests {
                 display_name: None,
             })
             .expect("identity");
+        let local_identity = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("local identity");
+        let local_user_id = local_identity.user_identity.user_id.clone();
+        let local_device_id = local_identity.device_identity.device_id.clone();
         engine.state.conversations.insert(
             "conv:test".into(),
             crate::conversation::LocalConversationState {
@@ -6236,8 +6487,9 @@ mod tests {
                 messages: vec![crate::conversation::StoredMessage {
                     message_id: "msg:download".into(),
                     app_message_id: None,
-                    sender_user_id: None,
-                    sender_device_id: "device:sender".into(),
+                    mls_ciphertext_sha256: None,
+                    sender_user_id: Some(local_user_id),
+                    sender_device_id: local_device_id,
                     recipient_device_id: "device:recipient".into(),
                     message_type: MessageType::MlsApplication,
                     created_at: 0,
@@ -6259,7 +6511,7 @@ mod tests {
             .handle_command(CoreCommand::DownloadAttachment {
                 conversation_id: "conv:test".into(),
                 message_id: "msg:download".into(),
-                reference: "cid:download".into(),
+                reference: "blob:test".into(),
                 destination: "download.bin".into(),
             })
             .expect("download attachment");
@@ -7175,7 +7427,7 @@ mod tests {
             ),
         >,
         prepared_blob_downloads: BTreeMap<String, String>,
-        blobs: BTreeMap<String, String>,
+        blobs: BTreeMap<String, Vec<u8>>,
         downloaded_attachments: BTreeMap<String, Vec<u8>>,
         invites: BTreeMap<String, GroupInviteDocument>,
         invite_urls: BTreeMap<String, String>,
@@ -7606,7 +7858,7 @@ mod tests {
                         user.engine
                             .handle_event(CoreEvent::AttachmentBytesLoaded {
                                 task_id: read.task_id,
-                                plaintext_b64: STANDARD.encode(bytes),
+                                plaintext: bytes,
                             })
                             .expect("attachment bytes loaded")
                     }
@@ -7618,9 +7870,18 @@ mod tests {
                         };
                         assert_eq!(upload.storage_scope.as_deref(), Some(scope));
                         let blob_ref = format!("blob-ref:{}", upload.task_id);
-                        let download_target = format!("download-ref:{}", upload.task_id);
+                        let storage_origin = user
+                            .bundle
+                            .storage_profile
+                            .as_ref()
+                            .and_then(|profile| profile.base_url.as_deref())
+                            .expect("user storage origin");
+                        let download_target = format!(
+                            "{storage_origin}/v1/storage/blob/{}",
+                            urlencoding::encode(&blob_ref)
+                        );
                         self.prepared_blob_downloads
-                            .insert(upload.task_id.clone(), download_target.clone());
+                            .insert(blob_ref.clone(), download_target.clone());
                         user.engine
                             .handle_event(CoreEvent::BlobUploadPrepared {
                                 task_id: upload.task_id,
@@ -7628,47 +7889,28 @@ mod tests {
                                     blob_ref,
                                     upload_target: "memory-upload".into(),
                                     upload_headers: BTreeMap::new(),
-                                    download_grant: None,
-                                    download_target: Some(download_target),
+                                    read_capability: "test-read-capability".into(),
+                                    download_target,
                                     expires_at: Some(u64::MAX / 2),
                                 },
                             })
                             .expect("blob upload prepared")
                     }
                     CoreEffect::UploadBlob { upload } => {
-                        let download_target = self
-                            .prepared_blob_downloads
-                            .get(&upload.task_id)
-                            .cloned()
-                            .expect("prepared download target");
-                        self.blobs
-                            .insert(download_target, upload.blob_ciphertext_b64);
+                        self.blobs.insert(upload.blob_ref, upload.blob_ciphertext);
                         user.engine
                             .handle_event(CoreEvent::BlobUploaded {
                                 task_id: upload.task_id,
                             })
                             .expect("blob uploaded")
                     }
-                    CoreEffect::AuthorizeBlobDownload { authorize } => {
-                        let download_target = self
-                            .prepared_blob_downloads
-                            .get(&authorize.task_id)
-                            .cloned()
-                            .unwrap_or_else(|| authorize.blob_ref.clone());
-                        user.engine
-                            .handle_event(CoreEvent::BlobDownloadAuthorized {
-                                task_id: authorize.task_id,
-                                result: crate::transport_contract::AuthorizeBlobDownloadResult {
-                                    blob_ref: authorize.blob_ref,
-                                    download_target,
-                                    download_headers: BTreeMap::new(),
-                                    expires_at: Some(u64::MAX / 2),
-                                },
-                            })
-                            .expect("blob download authorized")
-                    }
                     CoreEffect::DownloadBlob { download } => {
-                        let blob_ciphertext = self.blobs.get(&download.download_target).cloned();
+                        assert_eq!(
+                            download.download_target,
+                            self.prepared_blob_downloads[&download.blob_ref],
+                            "receiver must download from the uploader's runtime"
+                        );
+                        let blob_ciphertext = self.blobs.get(&download.blob_ref).cloned();
                         user.engine
                             .handle_event(CoreEvent::BlobDownloaded {
                                 task_id: download.task_id,
@@ -7677,13 +7919,11 @@ mod tests {
                             .expect("blob downloaded")
                     }
                     CoreEffect::WriteDownloadedAttachment { write } => {
-                        let plaintext = STANDARD
-                            .decode(&write.plaintext_b64)
-                            .expect("downloaded plaintext");
                         self.downloaded_attachments
-                            .insert(write.destination_id, plaintext);
+                            .insert(write.destination_id, write.plaintext);
                         CoreOutput::default()
                     }
+                    CoreEffect::CacheUploadedAttachment { .. } => CoreOutput::default(),
                     CoreEffect::InitializeGroupAuthorization { initialize } => {
                         self.authorization_manifests
                             .insert(initialize.group_id.clone(), initialize.manifest.clone());
@@ -7927,10 +8167,10 @@ mod tests {
 
     fn harness_user(name: &'static str, mnemonic: &str, device_name: &str) -> HarnessUser {
         let mut engine = CoreEngine::new();
+        let mut deployment = sample_deployment();
+        deployment.storage_base_info.base_url = Some(format!("https://storage-{name}.example.com"));
         engine
-            .handle_command(CoreCommand::ImportDeploymentBundle {
-                bundle: sample_deployment(),
-            })
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: deployment })
             .expect("deployment");
         engine
             .handle_command(CoreCommand::CreateOrLoadIdentity {
@@ -8200,6 +8440,27 @@ mod tests {
             .expect("recipient inbox records fetched")
     }
 
+    fn pending_application_record(sender: &CoreEngine, device_id: &str) -> InboxRecord {
+        let item = sender
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == device_id
+                    && item.envelope.message_type == MessageType::MlsApplication
+            })
+            .expect("pending application delivery");
+        InboxRecord {
+            seq: 1,
+            recipient_device_id: item.envelope.recipient_device_id.clone(),
+            message_id: item.envelope.message_id.clone(),
+            received_at: 1,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: item.envelope.clone(),
+        }
+    }
+
     fn sample_identity_bundle(mnemonic: &str, device_name: &str) -> IdentityBundle {
         let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
             .expect("identity");
@@ -8245,20 +8506,38 @@ mod tests {
             mime_type: "application/octet-stream".into(),
             size_bytes: 4,
             file_name: Some("file.bin".into()),
+            preview: None,
+            width: None,
+            height: None,
+            blur_hash: None,
         }
     }
 
     fn sample_attachment_payload_metadata() -> AttachmentPayloadMetadata {
         AttachmentPayloadMetadata {
-            mime_type: "application/octet-stream".into(),
-            size_bytes: 4,
+            version: 2,
+            attachment_id: "attachment:test".into(),
+            kind: crate::attachment_crypto::AttachmentKind::File,
             file_name: Some("file.bin".into()),
-            encryption: AttachmentCipherMetadata {
-                algorithm: ATTACHMENT_CIPHER_ALGORITHM.into(),
-                key_b64: STANDARD.encode([1_u8; 32]),
-                nonce_b64: STANDARD.encode([2_u8; 12]),
+            width: None,
+            height: None,
+            blur_hash: None,
+            original: crate::attachment_crypto::EncryptedBlobDescriptor {
+                variant: crate::attachment_crypto::AttachmentVariant::Original,
+                object_ref: "blob:test".into(),
+                storage_origin: "https://storage.example.com".into(),
+                read_capability: "read:test".into(),
+                mime_type: "application/octet-stream".into(),
+                plaintext_size: 4,
+                ciphertext_size: 20,
+                digest_sha256: crate::attachment_crypto::sha256_hex(&[1_u8, 2, 3, 4]),
+                encryption: AttachmentCipherMetadata {
+                    algorithm: ATTACHMENT_CIPHER_ALGORITHM.into(),
+                    key_b64: STANDARD.encode([1_u8; 32]),
+                    nonce_b64: STANDARD.encode([2_u8; 12]),
+                },
             },
-            download_grant: None,
+            preview: None,
         }
     }
 
@@ -8378,6 +8657,9 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

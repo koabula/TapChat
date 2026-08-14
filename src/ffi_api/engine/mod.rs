@@ -18,7 +18,10 @@ use super::sync::{
     pending_welcome_pickup_key, retry_delay_ms, GROUP_OUTBOX_FETCH_LIMIT,
     WELCOME_PICKUP_RETRY_TIMER_PREFIX,
 };
-use crate::attachment_crypto::{decrypt_blob, encrypt_blob, AttachmentPayloadMetadata};
+use crate::attachment_crypto::{
+    decrypt_blob, encrypt_blob, AttachmentKind, AttachmentManifestV2, AttachmentPayloadMetadata,
+    AttachmentVariant, EncryptedBlobDescriptor,
+};
 use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
     LocalConversationState, ReconcileMembershipInput, RecoveryStatus, StoredMessage,
@@ -58,22 +61,21 @@ use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
     AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
     AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AppendGroupTransitionRequest, AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult,
-    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
-    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
-    DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchMessagesRequest, FetchMessagesResult,
-    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupAuthorizationStateRequest,
-    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GetHeadResult,
-    GroupAuthorizationUpdate, GroupJoinDecision, InitializeGroupAuthorizationRequest,
-    ListGroupInvitesRequest, ListGroupJoinRequestsRequest, ListGroupLeaveRequestsRequest,
-    MessageRequestAction, MessageRequestActionRequest, MessageRequestActionResult,
-    MessageRequestItem, PrepareBlobUploadRequest, PrepareBlobUploadResult,
-    PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
-    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
-    SealGroupOutboxRequest, SharedStateDocumentKind, SubmitGroupJoinRequest,
-    SubmitGroupLeaveRequest, TransportAuthRequirement,
+    AppendGroupTransitionRequest, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
+    ClaimGroupLeaveRequest, CompleteGroupJoinRequest, CreateGroupInviteRequest,
+    DecideGroupJoinRequest, DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest,
+    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
+    FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GetHeadResult, GroupAuthorizationUpdate, GroupJoinDecision,
+    InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
+    ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
+    MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
+    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
+    SubmitGroupJoinRequest, SubmitGroupLeaveRequest, TransportAuthRequirement,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Verifier;
@@ -440,14 +442,13 @@ impl CoreEngine {
                     conversation_id,
                     group_id,
                     message_id,
-                    attachment_id,
-                    blob_ciphertext_b64,
-                    payload_metadata,
-                    mime_type,
-                    size_bytes,
-                    file_name,
-                    metadata_ciphertext,
+                    created_at,
+                    descriptor,
+                    source,
+                    variant,
+                    encrypted_descriptor,
                     prepared_upload,
+                    uploaded,
                     retries,
                 } => {
                     pending_blob_uploads.insert(
@@ -456,18 +457,17 @@ impl CoreEngine {
                             task_id,
                             conversation_id,
                             group_id,
-                            descriptor: AttachmentDescriptor {
-                                attachment_id,
-                                mime_type,
-                                size_bytes,
-                                file_name,
-                            },
-                            blob_ciphertext_b64,
-                            payload_metadata,
+                            descriptor,
+                            source,
+                            variant,
+                            blob_ciphertext: None,
+                            encrypted_descriptor: uploaded
+                                .then_some(encrypted_descriptor)
+                                .flatten(),
                             message_id,
-                            metadata_ciphertext,
-                            prepared_upload: prepared_upload
-                                .filter(|prepared| prepared.download_grant.is_some()),
+                            created_at,
+                            prepared_upload: uploaded.then_some(prepared_upload).flatten(),
+                            uploaded,
                             retries,
                             in_flight: false,
                         },
@@ -479,7 +479,7 @@ impl CoreEngine {
                     message_id,
                     reference,
                     destination_id,
-                    payload_metadata,
+                    blob_descriptor,
                     retries,
                 } => {
                     pending_blob_downloads.insert(
@@ -490,8 +490,7 @@ impl CoreEngine {
                             message_id,
                             reference,
                             destination_id,
-                            payload_metadata,
-                            authorized_download: None,
+                            blob_descriptor,
                             retries,
                             in_flight: false,
                         },
@@ -1296,15 +1295,11 @@ impl CoreEngine {
                 }],
                 view_model: None,
             }),
-            CoreEvent::AttachmentBytesLoaded {
-                task_id,
-                plaintext_b64,
-            } => self.handle_attachment_bytes_loaded(task_id, plaintext_b64),
+            CoreEvent::AttachmentBytesLoaded { task_id, plaintext } => {
+                self.handle_attachment_bytes_loaded(task_id, plaintext)
+            }
             CoreEvent::BlobUploadPrepared { task_id, result } => {
                 self.handle_blob_upload_prepared(task_id, result)
-            }
-            CoreEvent::BlobDownloadAuthorized { task_id, result } => {
-                self.handle_blob_download_authorized(task_id, result)
             }
             CoreEvent::BlobUploaded { task_id } => self.handle_blob_uploaded(task_id),
             CoreEvent::BlobDownloaded {
@@ -2379,14 +2374,13 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 conversation_id: task.conversation_id.clone(),
                 group_id: task.group_id.clone(),
                 message_id: task.message_id.clone(),
-                attachment_id: task.descriptor.attachment_id.clone(),
-                blob_ciphertext_b64: task.blob_ciphertext_b64.clone(),
-                payload_metadata: task.payload_metadata.clone(),
-                mime_type: task.descriptor.mime_type.clone(),
-                size_bytes: task.descriptor.size_bytes,
-                file_name: task.descriptor.file_name.clone(),
-                metadata_ciphertext: task.metadata_ciphertext.clone(),
+                created_at: task.created_at,
+                descriptor: task.descriptor.clone(),
+                source: task.source.clone(),
+                variant: task.variant,
+                encrypted_descriptor: task.encrypted_descriptor.clone(),
                 prepared_upload: task.prepared_upload.clone(),
+                uploaded: task.uploaded,
                 retries: task.retries,
             })
             .chain(state.pending_blob_downloads.values().map(|task| {
@@ -2396,7 +2390,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                     message_id: task.message_id.clone(),
                     reference: task.reference.clone(),
                     destination_id: task.destination_id.clone(),
-                    payload_metadata: task.payload_metadata.clone(),
+                    blob_descriptor: task.blob_descriptor.clone(),
                     retries: task.retries,
                 }
             }))
@@ -2716,6 +2710,7 @@ mod protected_application_message_tests {
                 messages: vec![StoredMessage {
                     message_id: "msg:existing".into(),
                     app_message_id: Some("app:conv:alice:bob:1:device:alice:phone".into()),
+                    mls_ciphertext_sha256: None,
                     sender_user_id: Some("user:alice".into()),
                     sender_device_id: "device:alice:phone".into(),
                     recipient_device_id: "device:bob:phone".into(),
@@ -2805,6 +2800,9 @@ mod group_membership_security_tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
+            protocol_version: 4,
+            worker_build_id: "test-worker-v4".into(),
+            registry_schema_version: 1,
             region: "test".into(),
             inbox_http_endpoint: "https://example.test".into(),
             inbox_websocket_endpoint: "wss://example.test/ws".into(),

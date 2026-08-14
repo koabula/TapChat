@@ -1,8 +1,4 @@
-use std::io::Write;
-
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
-use tauri::Manager;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
 
@@ -53,34 +49,6 @@ pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
     let mime_type = infer_mime_type(&path);
 
     Ok(FileMetadata { size, mime_type })
-}
-
-/// Generate a small local-only image preview for the composer. The original
-/// file is never rewritten and remains the input to attachment encryption.
-#[tauri::command]
-pub async fn get_local_image_thumbnail(path: String) -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(move || {
-        use image::ImageReader;
-
-        let image = match ImageReader::open(&path)
-            .map_err(|error| format!("Failed to open image preview: {error}"))?
-            .decode()
-        {
-            Ok(image) => image,
-            Err(_) => return Ok(None),
-        };
-        let thumbnail = image.resize(320, 320, image::imageops::FilterType::Lanczos3);
-        let mut buffer = std::io::Cursor::new(Vec::new());
-        thumbnail
-            .write_to(&mut buffer, image::ImageFormat::Jpeg)
-            .map_err(|error| format!("Failed to encode image preview: {error}"))?;
-        Ok(Some(format!(
-            "data:image/jpeg;base64,{}",
-            BASE64.encode(buffer.into_inner())
-        )))
-    })
-    .await
-    .map_err(|error| format!("Image preview task failed: {error}"))?
 }
 
 fn infer_mime_type(path: &str) -> String {
@@ -170,38 +138,6 @@ pub fn show_notification(app: tauri::AppHandle, title: String, body: String) -> 
     Ok(())
 }
 
-/// Write a base64-encoded file to a temporary location.
-/// Used for handling drag-drop from browser context where we can't get file paths.
-#[tauri::command]
-pub fn write_temp_file(
-    app: tauri::AppHandle,
-    file_name: String,
-    content_base64: String,
-) -> Result<String, String> {
-    // Get temp directory
-    let temp_dir = app.path().temp_dir().map_err(|e| e.to_string())?;
-
-    // Create tapchat temp subdir
-    let tapchat_temp = temp_dir.join("tapchat");
-    std::fs::create_dir_all(&tapchat_temp).map_err(|e| e.to_string())?;
-
-    // Generate unique filename
-    let unique_name = format!(
-        "{}-{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S"),
-        sanitize_filename(&file_name)
-    );
-    let file_path = tapchat_temp.join(&unique_name);
-
-    // Decode base64 and write
-    let bytes = BASE64.decode(&content_base64).map_err(|e| e.to_string())?;
-
-    let mut file = std::fs::File::create(&file_path).map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-
-    Ok(file_path.to_string_lossy().to_string())
-}
-
 /// Toggle debug mode for performance timing tests.
 /// When enabled, [TIMETEST] tagged log entries are emitted at key instrumentation points.
 #[tauri::command]
@@ -219,12 +155,4 @@ pub fn set_debug_mode(enabled: bool) {
 #[tauri::command]
 pub fn get_debug_mode() -> bool {
     crate::DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-fn sanitize_filename(name: &str) -> String {
-    // Remove potentially dangerous characters
-    name.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-        .take(50) // Limit length
-        .collect()
 }

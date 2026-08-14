@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -29,14 +28,14 @@ use crate::platform_ports::{
 };
 use crate::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AppendGroupTransitionRequest, AppendGroupTransitionResult, AuthorizeBlobDownloadRequest,
-    AuthorizeBlobDownloadResult, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
-    ClaimGroupJoinResult, ClaimGroupLeaveRequest, ClaimGroupLeaveResult, CompleteGroupJoinRequest,
-    CompleteGroupJoinResult, CreateGroupInviteRequest, CreateGroupInviteResult,
-    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
-    FetchWelcomePickupResult, GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
+    AppendGroupTransitionRequest, AppendGroupTransitionResult, BlobDownloadRequest,
+    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
+    ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
+    CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
+    DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupInviteResult,
+    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
     GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult, GetGroupOutboxHeadRequest,
     GetGroupOutboxHeadResult, InitializeGroupAuthorizationRequest,
     InitializeGroupAuthorizationResult, ListGroupInvitesRequest, ListGroupInvitesResult,
@@ -1008,19 +1007,16 @@ impl CoreDriver {
             .context("read attachment bytes")?;
         Ok(vec![CoreEvent::AttachmentBytesLoaded {
             task_id: read.task_id,
-            plaintext_b64: STANDARD.encode(bytes),
+            plaintext: bytes,
         }])
     }
 
     async fn upload_blob(&self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
-        let bytes = STANDARD
-            .decode(&upload.blob_ciphertext_b64)
-            .context("decode upload blob ciphertext")?;
         let mut request = self.runtime.client.put(upload.upload_target.clone());
         for (key, value) in &upload.upload_headers {
             request = request.header(key, value);
         }
-        match request.body(bytes).send().await {
+        match request.body(upload.blob_ciphertext).send().await {
             Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::BlobUploaded {
                 task_id: upload.task_id,
             }]),
@@ -1037,48 +1033,6 @@ impl CoreDriver {
         }
     }
 
-    async fn authorize_blob_download(
-        &self,
-        authorize: AuthorizeBlobDownloadRequest,
-    ) -> Result<Vec<CoreEvent>> {
-        let body = serde_json::json!({
-            "version": authorize.grant.version.clone(),
-            "blob_ref": authorize.blob_ref.clone(),
-        });
-        let body = to_camel_case_json_string(&serde_json::to_string(&body)?)?;
-        let request = self
-            .runtime
-            .client
-            .post(&authorize.grant.authorize_endpoint)
-            .bearer_auth(&authorize.grant.token)
-            .header("Content-Type", "application/json")
-            .body(body);
-        match request.send().await {
-            Ok(response) if response.status().is_success() => {
-                let body = response.text().await?;
-                let result: AuthorizeBlobDownloadResult =
-                    serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::BlobDownloadAuthorized {
-                    task_id: authorize.task_id,
-                    result,
-                }])
-            }
-            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: authorize.task_id,
-                retryable: false,
-                detail: Some(format!(
-                    "authorize download failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: authorize.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
-            }]),
-        }
-    }
-
     async fn download_blob(&self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
         let mut request = self.runtime.client.get(download.download_target.clone());
         for (key, value) in &download.download_headers {
@@ -1089,7 +1043,7 @@ impl CoreDriver {
                 let bytes = response.bytes().await?;
                 Ok(vec![CoreEvent::BlobDownloaded {
                     task_id: download.task_id,
-                    blob_ciphertext: Some(STANDARD.encode(&bytes)),
+                    blob_ciphertext: Some(bytes.to_vec()),
                 }])
             }
             Ok(response) => {
@@ -1112,13 +1066,10 @@ impl CoreDriver {
         &self,
         write: crate::ffi_api::WriteDownloadedAttachmentEffect,
     ) -> Result<Vec<CoreEvent>> {
-        let bytes = STANDARD
-            .decode(&write.plaintext_b64)
-            .context("decode downloaded attachment plaintext")?;
         if let Some(parent) = PathBuf::from(&write.destination_id).parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        tokio::fs::write(&write.destination_id, &bytes).await?;
+        tokio::fs::write(&write.destination_id, &write.plaintext).await?;
         Ok(Vec::new())
     }
 
@@ -2393,13 +2344,6 @@ impl BlobIoPort for CoreDriver {
         CoreDriver::upload_blob(self, upload).await
     }
 
-    async fn authorize_blob_download(
-        &mut self,
-        authorize: AuthorizeBlobDownloadRequest,
-    ) -> Result<Vec<CoreEvent>> {
-        CoreDriver::authorize_blob_download(self, authorize).await
-    }
-
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
         CoreDriver::download_blob(self, download).await
     }
@@ -2413,7 +2357,7 @@ impl BlobIoPort for CoreDriver {
 }
 
 impl PersistencePort for CoreDriver {
-    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
+    async fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
         CoreDriver::persist_state(self, persist)
     }
 }

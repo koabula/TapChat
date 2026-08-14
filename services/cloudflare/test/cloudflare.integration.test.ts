@@ -60,6 +60,7 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       RUNTIME_ID,
       OWNER_USER_ID: options?.ownerUserId ?? "user:bob",
       OWNER_USER_PUBLIC_KEY: bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(11))),
+      WORKER_BUILD_ID: "integration-worker-v4",
       DEPLOYMENT_REGION: "local",
       MAX_INLINE_BYTES: options?.maxInlineBytes ?? "128",
       RETENTION_DAYS: options?.retentionDays ?? "1",
@@ -91,9 +92,15 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   const deploymentResponse = await mf.dispatchFetch(`${BASE_URL}/v1/deployment-bundle`);
   assert.equal(deploymentResponse.status, 200);
   const deployment = (await deploymentResponse.json()) as DeploymentBundle;
-  const readyResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/ready`);
+  const readyResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime/ready`);
   assert.equal(readyResponse.status, 200);
-  assert.deepEqual(await readyResponse.json(), { ready: true, runtimeId: RUNTIME_ID });
+  assert.deepEqual(await readyResponse.json(), {
+    ready: true,
+    runtimeId: RUNTIME_ID,
+    protocolVersion: 4,
+    workerBuildId: "integration-worker-v4",
+    registrySchemaVersion: 1
+  });
   const challengeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/challenge`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -666,7 +673,7 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
     taskId: "task-1",
     conversationId: "conv:alice:bob",
     messageId: "msg:blob-1",
-    mimeType: "application/octet-stream",
+    variant: "original",
     sizeBytes: 4
   };
   const prepareResponse = await mf.dispatchFetch(`${BASE_URL}/v1/storage/prepare-upload`, {
@@ -681,7 +688,8 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   const prepared = (await prepareResponse.json()) as {
     blobRef: string;
     uploadTarget: string;
-    downloadGrant: { authorizeEndpoint: string; token: string; expiresAt: number };
+    downloadTarget: string;
+    readCapability: string;
   };
 
   const uploadResponse = await mf.dispatchFetch(prepared.uploadTarget, {
@@ -697,17 +705,12 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
   const object = await bucket.get(prepared.blobRef);
   assert.ok(object);
 
-  const authorizeResponse = await mf.dispatchFetch(prepared.downloadGrant.authorizeEndpoint, {
-    method: "POST",
+  const downloadResponse = await mf.dispatchFetch(prepared.downloadTarget, {
+    method: "GET",
     headers: {
-      ...authHeaders(prepared.downloadGrant.token),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({ version: CURRENT_MODEL_VERSION, blobRef: prepared.blobRef })
+      Authorization: `TapChat-Blob ${prepared.readCapability}`
+    }
   });
-  assert.equal(authorizeResponse.status, 200);
-  const authorized = (await authorizeResponse.json()) as { downloadTarget: string };
-  const downloadResponse = await mf.dispatchFetch(authorized.downloadTarget);
   assert.equal(downloadResponse.status, 200);
   const bytes = new Uint8Array(await downloadResponse.arrayBuffer());
   assert.deepEqual(Array.from(bytes), [1, 2, 3, 4]);

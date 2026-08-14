@@ -65,12 +65,11 @@ Vars:
 - `RATE_LIMIT_PER_MINUTE` default `60`
 - `RATE_LIMIT_PER_HOUR` default `600`
 - `bucket_name` default `<worker_name>-storage`
-- `preview_bucket_name` default `<worker_name>-storage-preview`
 
 Secrets:
 
 - `SHARING_INTERNAL_SECRET`
-- `BOOTSTRAP_LINK_SECRET`
+- `DEVICE_RUNTIME_SECRET`
 
 Secrets are written with `wrangler secret put` and are not stored in the temporary Wrangler config file.
 
@@ -79,11 +78,11 @@ Secrets are written with `wrangler secret put` and are not stored in the tempora
 After the script succeeds, the target Cloudflare account has:
 
 - a deployed Worker
-- the required Durable Object migration
-- the required R2 bucket bindings
+- three declarative SQLite Durable Object exports
+- one R2 bucket binding for `blobs/original` and `blobs/preview`
 - the configured vars and secrets
 
-The script prints the Worker name, `PUBLIC_BASE_URL`, and storage bucket names. The next manual step is still to bootstrap a device and import the returned deployment bundle into a TapChat profile.
+The script prints the Worker name, `PUBLIC_BASE_URL`, and storage bucket name. Provisioning then enrolls the device through the v2 device-proof protocol.
 
 The bootstrap route returns a deployment bundle that includes:
 

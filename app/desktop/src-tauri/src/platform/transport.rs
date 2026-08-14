@@ -8,8 +8,7 @@ use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_stri
 use tapchat_core::ffi_api::{CoreEvent, HttpMethod, HttpRequestEffect};
 use tapchat_core::model::{Ack, IdentityBundle, InboxRecord};
 use tapchat_core::transport_contract::{
-    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult,
-    AuthorizeBlobDownloadRequest, AuthorizeBlobDownloadResult, FetchIdentityBundleRequest,
+    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, FetchIdentityBundleRequest,
     GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
 };
 
@@ -19,6 +18,18 @@ use crate::platform::log_sanitize::{
 use crate::platform::profile::ProfileManagerInner;
 use crate::timetest;
 
+pub fn build_desktop_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(45))
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| {
+            log::warn!("Failed to build timeout-configured desktop HTTP client");
+            Client::new()
+        })
+}
+
 /// Helper to check if a string looks like JSON
 fn looks_like_json(s: &str) -> bool {
     s.trim().starts_with('{') || s.trim().starts_with('[')
@@ -26,6 +37,30 @@ fn looks_like_json(s: &str) -> bool {
 
 fn sanitize_url_for_log(raw: &str) -> String {
     sanitize_shared_url_for_log(raw)
+}
+
+fn request_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_builder() {
+        "builder"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
+}
+
+fn request_error_is_retryable(error: &reqwest::Error) -> bool {
+    !error.is_builder() && !error.is_redirect()
 }
 
 /// HTTP transport implementation for desktop app.
@@ -37,9 +72,9 @@ pub struct DesktopTransport {
 }
 
 impl DesktopTransport {
-    pub fn new(profile_inner: Arc<RwLock<ProfileManagerInner>>) -> Self {
+    pub fn new(profile_inner: Arc<RwLock<ProfileManagerInner>>, client: Client) -> Self {
         Self {
-            client: Client::new(),
+            client,
             profile_inner,
         }
     }
@@ -127,19 +162,31 @@ impl DesktopTransport {
                     crate::ts_ms()
                 );
 
-                let body = response
-                    .text()
-                    .await
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| {
-                        // Convert camelCase response back to snake_case for CoreEngine
-                        if content_type.contains("application/json") {
-                            to_snake_case_json_string(&value).unwrap_or(value)
-                        } else {
-                            value
-                        }
-                    });
+                let response_body = match response.text().await {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let error_class = request_error_class(&error);
+                        log::warn!(
+                            "HTTP response body failed: {} {} - error_class={} retryable=true",
+                            method,
+                            sanitize_url_for_log(&url_snapshot),
+                            error_class
+                        );
+                        return Ok(vec![CoreEvent::HttpRequestFailed {
+                            request_id: request.request_id,
+                            retryable: true,
+                            detail: Some(format!("response_body:{error_class}")),
+                        }]);
+                    }
+                };
+                let body = (!response_body.is_empty()).then(|| {
+                    // Convert camelCase response back to snake_case for CoreEngine
+                    if content_type.contains("application/json") {
+                        to_snake_case_json_string(&response_body).unwrap_or(response_body)
+                    } else {
+                        response_body
+                    }
+                });
 
                 Ok(vec![CoreEvent::HttpResponseReceived {
                     request_id: request.request_id,
@@ -148,12 +195,14 @@ impl DesktopTransport {
                 }])
             }
             Err(e) => {
-                let retryable = e.is_timeout() || e.is_connect();
+                let retryable = request_error_is_retryable(&e);
+                let error_class = request_error_class(&e);
                 let elapsed_ms = start.elapsed().as_millis();
                 log::warn!(
-                    "HTTP request failed: {} {} - error=request_failed (retryable: {})",
+                    "HTTP request failed: {} {} - error_class={} (retryable: {})",
                     method,
                     sanitize_url_for_log(&url_snapshot),
+                    error_class,
                     retryable
                 );
                 timetest!(
@@ -167,7 +216,7 @@ impl DesktopTransport {
                 Ok(vec![CoreEvent::HttpRequestFailed {
                     request_id: request.request_id,
                     retryable,
-                    detail: Some(e.to_string()),
+                    detail: Some(format!("request_error:{error_class}")),
                 }])
             }
         }
@@ -449,40 +498,6 @@ impl DesktopTransport {
             serde_json::from_str(&snake_case_response).context("parse prepare result")?;
 
         Ok(result)
-    }
-
-    /// Exchange a long-lived encrypted download grant for a short-lived URL.
-    pub async fn authorize_blob_download(
-        &self,
-        request: AuthorizeBlobDownloadRequest,
-    ) -> Result<AuthorizeBlobDownloadResult> {
-        let body = serde_json::json!({
-            "version": request.grant.version.clone(),
-            "blob_ref": request.blob_ref.clone(),
-        });
-        let snake_case_body = serde_json::to_string(&body)?;
-        let body = to_camel_case_json_string(&snake_case_body)
-            .context("convert authorize download request to camelCase")?;
-
-        let response = self
-            .client
-            .post(&request.grant.authorize_endpoint)
-            .bearer_auth(&request.grant.token)
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .context("authorize blob download")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!("authorize download failed with status {}", status);
-        }
-
-        let response_text = response.text().await.context("read authorize result")?;
-        let snake_case_response = to_snake_case_json_string(&response_text)
-            .context("convert authorize result to snake_case")?;
-        serde_json::from_str(&snake_case_response).context("parse authorize result")
     }
 }
 

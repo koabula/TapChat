@@ -161,21 +161,25 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
   };
 
   const handleRuntimeAction = async () => {
-    if (status?.action !== "refresh_auth") {
+    if (status?.action === "refresh_auth") {
+      setError(null);
+      setDeploying(true);
+      try {
+        const refreshed = await invoke<RuntimeStatus>("cloudflare_refresh_runtime_auth");
+        setStatus(refreshed);
+      } catch (err) {
+        setError(String(err));
+        await loadStatus();
+      } finally {
+        setDeploying(false);
+      }
+      return;
+    }
+    if (["deploy", "redeploy", "upgrade"].includes(status?.action ?? "")) {
       await handleDeploy();
       return;
     }
-    setError(null);
-    setDeploying(true);
-    try {
-      const refreshed = await invoke<RuntimeStatus>("cloudflare_refresh_runtime_auth");
-      setStatus(refreshed);
-    } catch (err) {
-      setError(String(err));
-      await loadStatus();
-    } finally {
-      setDeploying(false);
-    }
+    await loadStatus();
   };
 
   const handleSecretAction = async (
@@ -503,6 +507,8 @@ function runtimeStateMessage(status: RuntimeStatus): string {
       return "Refreshing runtime authorization…";
     case "degraded":
       return "Runtime authorization refresh will retry automatically.";
+    case "protocol_invalid":
+      return "Runtime returned an unsupported readiness response. No redeploy was attempted.";
     case "upgrade_required":
       return "Cloudflare runtime needs a one-time protocol upgrade.";
     case "enrollment_required":
@@ -525,7 +531,7 @@ function runtimeActionLabel(status: RuntimeStatus): string {
     case "redeploy":
       return "Redeploy Runtime";
     default:
-      return "Update / Redeploy";
+      return "Check Runtime Again";
   }
 }
 

@@ -84,11 +84,18 @@ struct ErrorResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RuntimeRegistryReadyResponse {
-    ready: bool,
-    runtime_id: String,
+pub(crate) struct RuntimeReadyManifest {
+    pub(crate) ready: bool,
+    pub(crate) runtime_id: String,
+    pub(crate) protocol_version: u32,
+    pub(crate) worker_build_id: String,
+    pub(crate) registry_schema_version: u32,
+}
+
+pub(crate) fn parse_runtime_ready_manifest(body: &str) -> Result<RuntimeReadyManifest> {
+    serde_json::from_str(body).context("decode runtime registry readiness response")
 }
 
 fn now_ms() -> Result<u64> {
@@ -142,6 +149,8 @@ async fn request_runtime_credential(
     let device_id = &identity.device_identity.device_id;
     let base_url = deployment.inbox_http_endpoint.trim_end_matches('/');
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("build runtime authorization client")?;
 
@@ -256,27 +265,34 @@ async fn request_runtime_credential_with_retry(
     Err(last_error.unwrap_or_else(|| runtime_error("temporary_unavailable")))
 }
 
-pub async fn wait_for_runtime_registry(deployment: &DeploymentBundle) -> Result<()> {
+pub async fn wait_for_runtime_ready(
+    base_url: &str,
+    runtime_id: &str,
+    worker_build_id: &str,
+) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("build runtime registry readiness client")?;
-    let endpoint = format!(
-        "{}/v2/runtime-auth/ready",
-        deployment.inbox_http_endpoint.trim_end_matches('/')
-    );
+    let endpoint = format!("{}/v2/runtime/ready", base_url.trim_end_matches('/'));
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         let last_code = match client.get(&endpoint).send().await {
             Ok(response) if response.status().is_success() => {
-                let ready = response
-                    .json::<RuntimeRegistryReadyResponse>()
+                let body = response
+                    .text()
                     .await
-                    .context("decode runtime registry readiness response")?;
-                if ready.ready && ready.runtime_id == deployment.runtime_id {
+                    .context("read runtime registry readiness response")?;
+                let ready = parse_runtime_ready_manifest(&body)?;
+                if ready.ready
+                    && ready.runtime_id == runtime_id
+                    && ready.protocol_version == 4
+                    && ready.worker_build_id == worker_build_id
+                    && ready.registry_schema_version == 1
+                {
                     return Ok(());
                 }
-                "runtime_mismatch".to_string()
+                return Err(runtime_error("runtime_manifest_mismatch"));
             }
             Ok(response) => {
                 let status = response.status();
@@ -286,7 +302,7 @@ pub async fn wait_for_runtime_registry(deployment: &DeploymentBundle) -> Result<
                     .ok()
                     .and_then(|body| body.error)
                     .unwrap_or_else(|| format!("http_{}", status.as_u16()));
-                if !status.is_server_error() && status.as_u16() != 429 {
+                if !status.is_server_error() && !matches!(status.as_u16(), 404 | 409 | 429) {
                     return Err(runtime_error(&code));
                 }
                 code
@@ -565,6 +581,17 @@ pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_manifest_parses_worker_camel_case_contract() {
+        let body = r#"{"ready":true,"runtimeId":"runtime-1","protocolVersion":4,"workerBuildId":"tapchat-worker-v4-0.1.15","registrySchemaVersion":1}"#;
+        let manifest = parse_runtime_ready_manifest(body).expect("parse readiness manifest");
+        assert!(manifest.ready);
+        assert_eq!(manifest.runtime_id, "runtime-1");
+        assert_eq!(manifest.protocol_version, 4);
+        assert_eq!(manifest.worker_build_id, "tapchat-worker-v4-0.1.15");
+        assert_eq!(manifest.registry_schema_version, 1);
+    }
 
     #[test]
     fn refresh_window_is_six_hours() {

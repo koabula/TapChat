@@ -27,3 +27,14 @@ for (const required of ["https://api.github.com", "object-src 'none'", "frame-sr
     throw new Error(`production CSP is missing required restriction: ${required}`);
   }
 }
+for (const directive of ["img-src", "media-src"]) {
+  const sources = csp
+    .split(";")
+    .find((entry) => entry.trim().startsWith(directive))
+    ?.trim()
+    .split(/\s+/)
+    .slice(1) ?? [];
+  if (!sources.includes("tapchat-media:") || !sources.includes("http://tapchat-media.localhost")) {
+    throw new Error(`${directive} must allow only the controlled TapChat media protocol origins`);
+  }
+}

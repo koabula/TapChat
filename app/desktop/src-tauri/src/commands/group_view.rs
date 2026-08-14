@@ -91,15 +91,7 @@ pub(super) fn last_application_preview(messages: &[StoredMessage]) -> Option<Str
         .rev()
         .find(|msg| matches!(msg.message_type, MessageType::MlsApplication))
         .and_then(|msg| msg.plaintext.as_ref())
-        .map(|text| {
-            if text.chars().count() > 50 {
-                let mut out: String = text.chars().take(50).collect();
-                out.push('…');
-                out
-            } else {
-                text.clone()
-            }
-        })
+        .map(|text| super::conversation_view::visible_plaintext_preview(text))
 }
 
 /// Count the user-facing application messages in a conversation so the

@@ -11,10 +11,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use tapchat_core::cli::profile::{
-    RuntimeMetadata, RuntimeSecretRotationMetadata, RuntimeSecretRotationPhase, RuntimeSecrets,
+    PendingRuntimeProvisioning, RuntimeMetadata, RuntimeProvisioningPhase,
+    RuntimeSecretRotationMetadata, RuntimeSecretRotationPhase, RuntimeSecrets,
 };
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
-use tapchat_core::cli::util::to_snake_case_json_string;
 use tapchat_core::model::DeploymentBundle;
 use tapchat_core::persistence::PersistedDeployment;
 use tapchat_core::{CoreCommand, CoreEvent};
@@ -25,7 +25,7 @@ use crate::commands::cloudflare_rest::{
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::sanitize_url_for_log;
-use crate::runtime_auth::wait_for_runtime_registry;
+use crate::runtime_auth::wait_for_runtime_ready;
 use crate::state::AppState;
 use crate::state::SessionState;
 use crate::timetest;
@@ -33,6 +33,7 @@ use crate::timetest;
 static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const AUTH_ROTATION_GRACE_MS: u64 = 48 * 60 * 60 * 1000;
 const AUTH_ROTATION_INTERVAL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v4-", env!("CARGO_PKG_VERSION"));
 
 fn generate_runtime_key_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 8];
@@ -156,16 +157,12 @@ fn status_from_features(
             && has_group_membership_fsm_v2);
     let (state, action, details) = if !bound {
         (
-            "missing".to_string(),
+            "provisioning_required".to_string(),
             Some("deploy".to_string()),
             Some("Cloudflare runtime is not deployed.".to_string()),
         )
     } else if last_error.is_some() {
-        (
-            "unreachable".to_string(),
-            Some("redeploy".to_string()),
-            last_error.clone(),
-        )
+        ("degraded".to_string(), None, last_error.clone())
     } else if needs_upgrade {
         (
             "outdated".to_string(),
@@ -216,7 +213,29 @@ pub async fn runtime_status_for_deployment(
     };
     let endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
     let local_features = deployment.deployment_bundle.runtime_config.features.clone();
-    let client = match reqwest::Client::builder().build() {
+    if deployment.deployment_bundle.protocol_version != 4
+        || deployment.deployment_bundle.registry_schema_version != 1
+        || deployment
+            .deployment_bundle
+            .worker_build_id
+            .trim()
+            .is_empty()
+    {
+        return runtime_status(
+            "upgrade_required",
+            Some("upgrade"),
+            true,
+            Some(endpoint),
+            local_features,
+            None,
+            Some("Cloudflare runtime protocol is not supported by this app.".into()),
+        );
+    }
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             return status_from_features(
@@ -227,39 +246,74 @@ pub async fn runtime_status_for_deployment(
             );
         }
     };
-    let url = format!("{}/v1/deployment-bundle", endpoint.trim_end_matches('/'));
+    let url = format!("{}/v2/runtime/ready", endpoint.trim_end_matches('/'));
     match client.get(url).send().await {
         Ok(response) => {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(_) => {
+                    return runtime_status(
+                        "degraded",
+                        None,
+                        true,
+                        Some(endpoint),
+                        local_features,
+                        Some("runtime readiness response body was interrupted".into()),
+                        Some("Cloudflare runtime is temporarily unreachable.".into()),
+                    );
+                }
+            };
             if !status.is_success() {
-                return status_from_features(
+                return runtime_status(
+                    "degraded",
+                    None,
                     true,
                     Some(endpoint),
                     local_features,
-                    Some(format!(
-                        "deployment bundle check returned HTTP {status}: {body}"
-                    )),
+                    Some(format!("runtime readiness check returned HTTP {status}")),
+                    Some("Cloudflare runtime is temporarily unreachable.".into()),
                 );
             }
-            let normalized = to_snake_case_json_string(&body).unwrap_or(body);
-            match serde_json::from_str::<DeploymentBundle>(&normalized) {
-                Ok(bundle) => {
-                    status_from_features(true, Some(endpoint), bundle.runtime_config.features, None)
+            match crate::runtime_auth::parse_runtime_ready_manifest(&body) {
+                Ok(manifest)
+                    if manifest.ready
+                        && manifest.runtime_id == deployment.deployment_bundle.runtime_id
+                        && manifest.protocol_version == 4
+                        && manifest.registry_schema_version == 1
+                        && manifest.worker_build_id
+                            == deployment.deployment_bundle.worker_build_id =>
+                {
+                    status_from_features(true, Some(endpoint), local_features, None)
                 }
-                Err(error) => status_from_features(
+                Ok(_) => runtime_status(
+                    "upgrade_required",
+                    Some("upgrade"),
                     true,
                     Some(endpoint),
                     local_features,
-                    Some(format!("deployment bundle parse failed: {error}")),
+                    None,
+                    Some("Runtime manifest does not match this Profile.".into()),
+                ),
+                Err(error) => runtime_status(
+                    "protocol_invalid",
+                    None,
+                    true,
+                    Some(endpoint),
+                    local_features,
+                    Some(format!("runtime readiness response parse failed: {error}")),
+                    Some("Cloudflare runtime returned an invalid readiness response.".into()),
                 ),
             }
         }
-        Err(error) => status_from_features(
+        Err(error) => runtime_status(
+            "offline",
+            None,
             true,
             Some(endpoint),
             local_features,
-            Some(format!("deployment bundle check failed: {error}")),
+            Some(format!("runtime readiness check failed: {error}")),
+            Some("Cloudflare runtime is offline; local messages remain available.".into()),
         ),
     }
 }
@@ -516,7 +570,6 @@ pub async fn cloudflare_deploy(
             error: Some("Cloudflare deployment already in progress.".into()),
             account_id: None,
             bucket_name: None,
-            preview_bucket_name: None,
         });
     }
     let _deploy_guard = DeployProgressGuard;
@@ -535,7 +588,6 @@ pub async fn cloudflare_deploy(
             error: Some("No identity created yet. Please complete initial setup first.".into()),
             account_id: None,
             bucket_name: None,
-            preview_bucket_name: None,
         });
     };
     let user_id = identity_ref.user_identity.user_id.clone();
@@ -574,7 +626,6 @@ pub async fn cloudflare_deploy(
             error: Some("Not authenticated. Please login first.".into()),
             account_id: None,
             bucket_name: None,
-            preview_bucket_name: None,
         });
     }
 
@@ -601,36 +652,38 @@ pub async fn cloudflare_deploy(
         let inner = state.inner.read().await;
         inner.profile_manager.get_runtime_metadata().await
     };
-    let runtime_id = existing_runtime
-        .as_ref()
-        .and_then(|runtime| runtime.runtime_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    if existing_runtime
-        .as_ref()
-        .and_then(|runtime| runtime.runtime_id.as_deref())
-        != Some(runtime_id.as_str())
-    {
+    let pending_provisioning = {
         let inner = state.inner.read().await;
         let pm = inner.profile_manager.inner.read().await;
         let profile = pm
             .active_profile
             .as_ref()
             .ok_or_else(|| "active profile is missing".to_string())?;
-        let mut pending = existing_runtime.clone().unwrap_or_default();
-        pending.runtime_id = Some(runtime_id.clone());
-        pending.secret_rotation.last_error = Some("upgrade_pending_enrollment".into());
         profile
-            .save_runtime_metadata(&pending)
-            .map_err(|error| format!("failed to persist pending runtime upgrade: {error}"))?;
-    }
+            .load_pending_runtime_provisioning()
+            .map_err(|error| format!("failed to load provisioning journal: {error}"))?
+    };
+    let runtime_id = pending_provisioning
+        .as_ref()
+        .map(|pending| pending.runtime_id.clone())
+        .or_else(|| {
+            existing_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.runtime_id.clone())
+        })
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let existing_secrets = {
-        let inner = state.inner.read().await;
-        let pm_inner = inner.profile_manager.inner.read().await;
-        pm_inner
-            .active_profile
-            .as_ref()
-            .and_then(|profile| profile.load_runtime_secrets().ok())
-            .unwrap_or_default()
+        if let Some(pending) = pending_provisioning.as_ref() {
+            pending.generated_secrets.clone()
+        } else {
+            let inner = state.inner.read().await;
+            let pm_inner = inner.profile_manager.inner.read().await;
+            pm_inner
+                .active_profile
+                .as_ref()
+                .and_then(|profile| profile.load_runtime_secrets().ok())
+                .unwrap_or_default()
+        }
     };
     let (sharing_token_secret, repaired_sharing_secret) = repair_worker_secret(
         existing_runtime
@@ -698,12 +751,35 @@ pub async fn cloudflare_deploy(
                 .save_runtime_secrets(&prepared_secrets)
                 .map_err(|error| format!("failed to persist prepared runtime secrets: {error}"))?;
         }
+        if pending_provisioning.is_none() {
+            profile
+                .save_pending_runtime_provisioning(Some(PendingRuntimeProvisioning {
+                    runtime_id: runtime_id.clone(),
+                    worker_name: existing_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.worker_name.clone())
+                        .unwrap_or_else(|| defaults.worker_name.clone()),
+                    bucket_name: existing_runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.bucket_name.clone())
+                        .unwrap_or_else(|| defaults.bucket_name.clone()),
+                    worker_build_id: WORKER_BUILD_ID.to_string(),
+                    generated_secrets: prepared_secrets.clone(),
+                    phase: RuntimeProvisioningPhase::Prepared,
+                }))
+                .map_err(|error| format!("failed to persist provisioning journal: {error}"))?;
+        }
     }
 
     let config = WorkerDeployConfig {
-        worker_name: existing_runtime
+        worker_name: pending_provisioning
             .as_ref()
-            .and_then(|runtime| runtime.worker_name.clone())
+            .map(|pending| pending.worker_name.clone())
+            .or_else(|| {
+                existing_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.worker_name.clone())
+            })
             .unwrap_or(defaults.worker_name),
         runtime_id,
         owner_user_id: user_id.clone(),
@@ -716,14 +792,19 @@ pub async fn cloudflare_deploy(
             .as_ref()
             .and_then(|runtime| runtime.deployment_region.clone())
             .unwrap_or(defaults.deployment_region),
-        bucket_name: existing_runtime
+        bucket_name: pending_provisioning
             .as_ref()
-            .and_then(|runtime| runtime.bucket_name.clone())
+            .map(|pending| pending.bucket_name.clone())
+            .or_else(|| {
+                existing_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.bucket_name.clone())
+            })
             .unwrap_or(defaults.bucket_name),
-        preview_bucket_name: existing_runtime
+        worker_build_id: pending_provisioning
             .as_ref()
-            .and_then(|runtime| runtime.preview_bucket_name.clone())
-            .unwrap_or(defaults.preview_bucket_name),
+            .map(|pending| pending.worker_build_id.clone())
+            .unwrap_or_else(|| WORKER_BUILD_ID.to_string()),
         sharing_token_secret,
         device_runtime_secret,
         device_runtime_key_id: device_runtime_key_id.clone(),
@@ -795,6 +876,7 @@ pub async fn cloudflare_deploy(
         );
         return Ok(result);
     }
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::CloudDeployed).await?;
 
     // Wait for deployment to be ready
     let _ = app.emit(
@@ -806,9 +888,14 @@ pub async fn cloudflare_deploy(
         },
     );
 
-    tapchat_core::cli::runtime::wait_until_ready(&result.worker_url)
-        .await
-        .map_err(|e| format!("Deployment not ready: {}", e))?;
+    wait_for_runtime_ready(
+        &result.worker_url,
+        &config.runtime_id,
+        &config.worker_build_id,
+    )
+    .await
+    .map_err(|error| format!("Runtime not ready: {error}"))?;
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::RuntimeReady).await?;
 
     // Fetch the public deployment descriptor, build the root-signed local
     // IdentityBundle, then enroll the current device with its long-lived key.
@@ -834,18 +921,6 @@ pub async fn cloudflare_deploy(
         .json::<DeploymentBundle>()
         .await
         .map_err(|error| format!("Decode deployment descriptor failed: {error}"))?;
-
-    let _ = app.emit(
-        "cloudflare-progress",
-        DeployProgress {
-            phase: DeployPhase::VerifyingDeployment,
-            message: "Waiting for the device registry...".into(),
-            progress_percent: 88,
-        },
-    );
-    wait_for_runtime_registry(&deployment_bundle)
-        .await
-        .map_err(|error| format!("Device registry not ready: {error}"))?;
 
     let profile_manager = {
         let inner = state.inner.read().await;
@@ -897,6 +972,7 @@ pub async fn cloudflare_deploy(
         )
         .await
         .map_err(|error| format!("Device enrollment failed: {error}"))?;
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::DeviceEnrolled).await?;
 
     // Import deployment bundle
     drive_core_with_handle(
@@ -968,7 +1044,6 @@ pub async fn cloudflare_deploy(
             deploy_url: Some(result.worker_url.clone()),
             deployment_region: Some(config.deployment_region.clone()),
             bucket_name: Some(config.bucket_name.clone()),
-            preview_bucket_name: Some(config.preview_bucket_name.clone()),
             last_deployed_at: Some(chrono::Utc::now().to_rfc3339()),
             secret_rotation: RuntimeSecretRotationMetadata {
                 phase: if grace_until_ms.is_some() {
@@ -987,6 +1062,18 @@ pub async fn cloudflare_deploy(
         };
 
         persist_runtime_writeback(&state, &deployment_bundle, &runtime, &result.worker_url).await?;
+    }
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::Complete).await?;
+    {
+        let inner = state.inner.read().await;
+        let pm = inner.profile_manager.inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "active profile is missing".to_string())?;
+        profile
+            .save_pending_runtime_provisioning(None)
+            .map_err(|error| format!("failed to clear provisioning journal: {error}"))?;
     }
 
     let _ = app.emit(
@@ -1009,6 +1096,21 @@ pub async fn cloudflare_deploy(
     restart_runtime_session_after_deploy(&app, &state, &device_id).await;
 
     Ok(result)
+}
+
+async fn advance_provisioning_journal(
+    state: &State<'_, AppState>,
+    phase: RuntimeProvisioningPhase,
+) -> Result<(), String> {
+    let inner = state.inner.read().await;
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "active profile is missing".to_string())?;
+    profile
+        .advance_runtime_provisioning(phase)
+        .map_err(|error| format!("failed to advance provisioning journal: {error}"))
 }
 
 async fn prepare_runtime_secret_rotation(state: &State<'_, AppState>) -> Result<(), String> {

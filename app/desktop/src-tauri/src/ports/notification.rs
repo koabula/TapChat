@@ -107,6 +107,7 @@ fn format_status_title(status: &tapchat_core::ffi_api::SystemStatus) -> String {
     match status {
         SystemStatus::TemporaryNetworkFailure => "Network Error".to_string(),
         SystemStatus::AttachmentUploadFailed => "Upload Failed".to_string(),
+        SystemStatus::AttachmentDownloadFailed => "Download Failed".to_string(),
         SystemStatus::SyncInProgress => "Sync".to_string(),
         SystemStatus::IdentityRefreshNeeded => "Identity".to_string(),
         SystemStatus::ConversationNeedsRebuild => "Conversation".to_string(),

@@ -6,7 +6,7 @@ use tapchat_core::transport_contract::MessageRequestAction;
 use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{drive_core_then_defer_event_effects, drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::redact_id;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::AppState;
@@ -39,6 +39,25 @@ pub async fn list_message_requests(
 
 #[tauri::command]
 pub async fn act_on_message_request(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request_id: String,
+    action: String,
+    sender_bundle_share_url: Option<String>,
+) -> Result<MessageRequestActionOutput, String> {
+    // Tauri's generated dispatcher already carries a sizeable stack frame on
+    // Windows. Keep this command's multi-step async state machine on the heap.
+    Box::pin(act_on_message_request_impl(
+        app,
+        state,
+        request_id,
+        action,
+        sender_bundle_share_url,
+    ))
+    .await
+}
+
+async fn act_on_message_request_impl(
     app: AppHandle,
     state: State<'_, AppState>,
     request_id: String,
@@ -97,7 +116,7 @@ pub async fn act_on_message_request(
             .await
             .map_err(|e| e.to_string())?;
 
-            let output = drive_core_with_handle(
+            let output = drive_core_then_defer_event_effects(
                 &app,
                 CoreInput::Command(CoreCommand::ActOnMessageRequest {
                     request_id: request_id.clone(),

@@ -65,12 +65,11 @@ Vars：
 - `RATE_LIMIT_PER_MINUTE`，默认 `60`
 - `RATE_LIMIT_PER_HOUR`，默认 `600`
 - `bucket_name`，默认 `<worker_name>-storage`
-- `preview_bucket_name`，默认 `<worker_name>-storage-preview`
 
 Secrets：
 
 - `SHARING_INTERNAL_SECRET`
-- `BOOTSTRAP_LINK_SECRET`
+- `DEVICE_RUNTIME_SECRET`
 
 Secrets 通过 `wrangler secret put` 写入，不会进入临时 Wrangler 配置文件。
 
@@ -79,11 +78,11 @@ Secrets 通过 `wrangler secret put` 写入，不会进入临时 Wrangler 配置
 脚本成功后，目标 Cloudflare 账号中会具备：
 
 - 已部署的 Worker
-- 所需 Durable Object migration
-- 所需 R2 bucket 绑定
+- 三个声明式 SQLite Durable Object export
+- 一个 R2 bucket 绑定，用前缀区分 `blobs/original` 与 `blobs/preview`
 - 已写入的 vars 和 secrets
 
-脚本会输出 Worker 名称、`PUBLIC_BASE_URL`、storage bucket 名称。下一步仍需要手工 bootstrap 一个设备，并把返回的 deployment bundle 导入 TapChat profile。
+脚本会输出 Worker 名称、`PUBLIC_BASE_URL`、storage bucket 名称，随后 provisioning 通过 v2 设备证明协议完成 enrollment。
 
 bootstrap 路由返回的 deployment bundle 包含：
 

@@ -104,6 +104,8 @@ pub enum GroupMessageView {
         plaintext: Option<String>,
         has_attachment: bool,
         storage_refs: Vec<StorageRef>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attachment_manifest: Option<super::conversation::AttachmentManifestView>,
         /// Original GroupEnvelope.message_type for debugging.
         raw_message_type: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -547,6 +549,17 @@ pub async fn get_group_messages_impl(
     for message in &conversation.state.messages {
         match message.message_type {
             tapchat_core::model::MessageType::MlsApplication => {
+                let attachment_manifest = message
+                    .plaintext
+                    .as_deref()
+                    .and_then(|plaintext| {
+                        serde_json::from_str::<
+                                tapchat_core::attachment_crypto::AttachmentManifestV2,
+                            >(plaintext)
+                            .ok()
+                    })
+                    .filter(|manifest| manifest.version == 2)
+                    .map(super::conversation::attachment_manifest_view);
                 out.push(GroupMessageView::Bubble {
                     message_id: message.message_id.clone(),
                     sender_user_id: message.sender_user_id.clone().or_else(|| {
@@ -556,9 +569,19 @@ pub async fn get_group_messages_impl(
                     }),
                     sender_device_id: message.sender_device_id.clone(),
                     created_at: message.created_at,
-                    plaintext: message.plaintext.clone(),
-                    has_attachment: !message.storage_refs.is_empty(),
-                    storage_refs: message.storage_refs.clone(),
+                    plaintext: if attachment_manifest.is_some() {
+                        None
+                    } else {
+                        message.plaintext.clone()
+                    },
+                    has_attachment: !message.storage_refs.is_empty()
+                        || attachment_manifest.is_some(),
+                    storage_refs: if attachment_manifest.is_some() {
+                        Vec::new()
+                    } else {
+                        message.storage_refs.clone()
+                    },
+                    attachment_manifest,
                     raw_message_type: "mls_application".into(),
                     delivery_state: snapshot.local_identity.as_ref().and_then(|identity| {
                         (identity.state.device_identity.device_id == message.sender_device_id)
@@ -648,14 +671,35 @@ pub async fn get_group_messages_impl(
             && pending.envelope.message_type == GroupMessageType::MlsApplication
             && !existing_message_ids.contains(&pending.envelope.message_id)
     }) {
+        let attachment_manifest = pending
+            .plaintext_cache
+            .as_deref()
+            .and_then(|plaintext| {
+                serde_json::from_str::<tapchat_core::attachment_crypto::AttachmentManifestV2>(
+                    plaintext,
+                )
+                .ok()
+            })
+            .filter(|manifest| manifest.version == 2)
+            .map(super::conversation::attachment_manifest_view);
         out.push(GroupMessageView::Bubble {
             message_id: pending.envelope.message_id.clone(),
             sender_user_id: Some(pending.envelope.sender_user_id.clone()),
             sender_device_id: pending.envelope.sender_device_id.clone(),
             created_at: pending.envelope.created_at,
-            plaintext: pending.plaintext_cache.clone(),
-            has_attachment: !pending.envelope.storage_refs.is_empty(),
-            storage_refs: pending.envelope.storage_refs.clone(),
+            plaintext: if attachment_manifest.is_some() {
+                None
+            } else {
+                pending.plaintext_cache.clone()
+            },
+            has_attachment: !pending.envelope.storage_refs.is_empty()
+                || attachment_manifest.is_some(),
+            storage_refs: if attachment_manifest.is_some() {
+                Vec::new()
+            } else {
+                pending.envelope.storage_refs.clone()
+            },
+            attachment_manifest,
             raw_message_type: "mls_application".into(),
             delivery_state: Some(
                 if pending.retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES {

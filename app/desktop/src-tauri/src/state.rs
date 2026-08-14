@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use tapchat_core::ffi_api::AttachmentDescriptor;
 use tapchat_core::{CoreEffect, CoreEngine};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;
@@ -34,6 +37,29 @@ pub struct AppState {
     pub deferred_transport_rx: Arc<Mutex<Option<mpsc::Receiver<DeferredTransportBatch>>>>,
     pub deferred_send_gate: Arc<Mutex<()>>,
     pub runtime_auth: RuntimeAuthManager,
+    pub media_handles: Arc<RwLock<HashMap<String, MediaHandle>>>,
+    pub staged_attachments: Arc<Mutex<HashMap<String, StagedAttachment>>>,
+    pub media_inflight: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    pub media_network_limit: Arc<Semaphore>,
+    pub media_decode_limit: Arc<Semaphore>,
+    pub profile_generation: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub struct MediaHandle {
+    pub bytes: Arc<Vec<u8>>,
+    pub mime_type: String,
+    pub profile_path: Option<PathBuf>,
+    pub profile_generation: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone)]
+pub struct StagedAttachment {
+    pub descriptor: AttachmentDescriptor,
+    pub profile_path: Option<PathBuf>,
+    pub profile_generation: u64,
+    pub preview_handle: Option<String>,
 }
 
 /// A persisted batch waiting for serialized network dispatch. The profile path
@@ -161,6 +187,12 @@ impl AppState {
             deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
             deferred_send_gate: Arc::new(Mutex::new(())),
             runtime_auth,
+            media_handles: Arc::new(RwLock::new(HashMap::new())),
+            staged_attachments: Arc::new(Mutex::new(HashMap::new())),
+            media_inflight: Arc::new(Mutex::new(HashMap::new())),
+            media_network_limit: Arc::new(Semaphore::new(3)),
+            media_decode_limit: Arc::new(Semaphore::new(2)),
+            profile_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -189,6 +221,12 @@ impl AppState {
             deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
             deferred_send_gate: Arc::new(Mutex::new(())),
             runtime_auth,
+            media_handles: Arc::new(RwLock::new(HashMap::new())),
+            staged_attachments: Arc::new(Mutex::new(HashMap::new())),
+            media_inflight: Arc::new(Mutex::new(HashMap::new())),
+            media_network_limit: Arc::new(Semaphore::new(3)),
+            media_decode_limit: Arc::new(Semaphore::new(2)),
+            profile_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 

@@ -14,6 +14,7 @@ export interface JsonBlobStore {
   getJson<T>(key: string): Promise<T | null>;
   putBytes(key: string, value: ArrayBuffer | Uint8Array, metadata?: Record<string, string>): Promise<void>;
   getBytes(key: string): Promise<ArrayBuffer | null>;
+  getBytesMetadata?(key: string): Promise<{ bytes: ArrayBuffer; customMetadata: Record<string, string> } | null>;
   delete(key: string): Promise<void>;
 }
 

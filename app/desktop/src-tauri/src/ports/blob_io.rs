@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 use tokio::fs;
 
@@ -22,7 +22,7 @@ pub struct UploadProgressEvent {
     pub status: String, // "reading", "encrypting", "uploading", "complete", "failed"
 }
 
-/// Read attachment bytes from disk and return base64-encoded content.
+/// Read attachment bytes from the platform-owned attachment handle.
 pub async fn read_attachment_bytes(
     read: ReadAttachmentBytesEffect,
     attachments_dir: Option<PathBuf>,
@@ -31,13 +31,10 @@ pub async fn read_attachment_bytes(
     let file_path = dir.join(&read.attachment_id);
 
     match fs::read(&file_path).await {
-        Ok(bytes) => {
-            let encoded = BASE64.encode(&bytes);
-            Ok(vec![CoreEvent::AttachmentBytesLoaded {
-                task_id: read.task_id,
-                plaintext_b64: encoded,
-            }])
-        }
+        Ok(bytes) => Ok(vec![CoreEvent::AttachmentBytesLoaded {
+            task_id: read.task_id,
+            plaintext: bytes,
+        }]),
         Err(e) => {
             log::error!(
                 "Failed to read attachment {}: read_failed",
@@ -54,12 +51,12 @@ pub async fn read_attachment_bytes(
 
 /// Upload blob to remote storage with progress tracking.
 pub async fn upload_blob_with_progress(
+    client: &reqwest::Client,
     upload: BlobUploadRequest,
     app: Option<Arc<AppHandle>>,
-    conversation_id: String,
 ) -> Result<Vec<CoreEvent>> {
-    let client = reqwest::Client::new();
     let task_id = upload.task_id.clone();
+    let conversation_id = upload.conversation_id.clone();
 
     // Emit progress: starting upload
     if let Some(app_ref) = &app {
@@ -73,11 +70,6 @@ pub async fn upload_blob_with_progress(
             },
         );
     }
-
-    // Decode base64 content
-    let bytes = BASE64
-        .decode(&upload.blob_ciphertext_b64)
-        .context("decode base64 blob content")?;
 
     let mut request = client.put(&upload.upload_target);
 
@@ -100,7 +92,7 @@ pub async fn upload_blob_with_progress(
         );
     }
 
-    request = request.body(bytes);
+    request = request.body(upload.blob_ciphertext);
 
     match request.send().await {
         Ok(response) => {
@@ -122,10 +114,18 @@ pub async fn upload_blob_with_progress(
                     task_id: upload.task_id,
                 }])
             } else {
+                let body = response.text().await.unwrap_or_default();
+                let code = serde_json::from_str::<BlobErrorResponse>(&body)
+                    .ok()
+                    .and_then(|value| value.error);
+                let retryable = upload_status_is_retryable(status)
+                    || code.as_deref() == Some("capability_expired");
                 log::error!(
-                    "Blob upload failed: status={} task_id={}",
+                    "Blob upload failed: status={} code={} task_id={} retryable={}",
                     status,
-                    redact_id("task", &upload.task_id)
+                    code.as_deref().unwrap_or("http_error"),
+                    redact_id("task", &upload.task_id),
+                    retryable
                 );
 
                 // Emit progress: failed
@@ -136,24 +136,30 @@ pub async fn upload_blob_with_progress(
                             task_id: task_id.clone(),
                             conversation_id: conversation_id.clone(),
                             progress: 0,
-                            status: "failed".to_string(),
+                            status: if retryable { "retrying" } else { "failed" }.to_string(),
                         },
                     );
                 }
 
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: upload.task_id,
-                    retryable: false,
-                    detail: Some(format!("HTTP {}", status)),
+                    retryable,
+                    detail: Some(match code {
+                        Some(code) => format!("blob_upload:{code}"),
+                        None => format!("blob_upload:http_{status}"),
+                    }),
                 }])
             }
         }
         Err(e) => {
+            let error_class = request_error_class(&e);
+            let retryable = request_error_is_retryable(&e);
             log::error!(
-                "Blob upload error: task_id={} error=request_failed",
-                redact_id("task", &upload.task_id)
+                "Blob upload error: task_id={} error_class={} retryable={}",
+                redact_id("task", &upload.task_id),
+                error_class,
+                retryable
             );
-            let retryable = e.is_timeout() || e.is_connect();
 
             // Emit progress: failed
             if let Some(app_ref) = &app {
@@ -163,7 +169,7 @@ pub async fn upload_blob_with_progress(
                         task_id: task_id.clone(),
                         conversation_id,
                         progress: 0,
-                        status: "failed".to_string(),
+                        status: if retryable { "retrying" } else { "failed" }.to_string(),
                     },
                 );
             }
@@ -171,7 +177,7 @@ pub async fn upload_blob_with_progress(
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
                 retryable,
-                detail: Some(e.to_string()),
+                detail: Some(format!("blob_upload:{error_class}")),
             }])
         }
     }
@@ -180,13 +186,15 @@ pub async fn upload_blob_with_progress(
 /// Upload blob without progress tracking (for cases where app handle isn't available).
 #[allow(dead_code)]
 pub async fn upload_blob(upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
-    upload_blob_with_progress(upload, None, String::new()).await
+    let client = crate::platform::transport::build_desktop_http_client();
+    upload_blob_with_progress(&client, upload, None).await
 }
 
 /// Download blob from remote storage (GET from download URL).
-pub async fn download_blob(download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
-    let client = reqwest::Client::new();
-
+pub async fn download_blob(
+    client: &reqwest::Client,
+    download: BlobDownloadRequest,
+) -> Result<Vec<CoreEvent>> {
     let mut request = client.get(&download.download_target);
 
     for (key, value) in &download.download_headers {
@@ -198,43 +206,46 @@ pub async fn download_blob(download: BlobDownloadRequest) -> Result<Vec<CoreEven
             let status = response.status().as_u16();
             if status >= 200 && status < 300 {
                 let bytes = response.bytes().await.context("read blob response")?;
-                let encoded = BASE64.encode(&bytes);
                 Ok(vec![CoreEvent::BlobDownloaded {
                     task_id: download.task_id,
-                    blob_ciphertext: Some(encoded),
+                    blob_ciphertext: Some(bytes.to_vec()),
                 }])
             } else {
                 let error_body = response.text().await.unwrap_or_default();
-                if status == 403 && error_body.contains("capability_expired") {
-                    log::warn!(
-                        "Blob download link expired: status={} task_id={}",
-                        status,
-                        redact_id("task", &download.task_id)
-                    );
-                } else {
-                    log::error!(
-                        "Blob download failed: status={} task_id={}",
-                        status,
-                        redact_id("task", &download.task_id)
-                    );
-                }
+                let code = serde_json::from_str::<BlobErrorResponse>(&error_body)
+                    .ok()
+                    .and_then(|value| value.error);
+                let retryable = upload_status_is_retryable(status);
+                log::error!(
+                    "Blob download failed: status={} code={} task_id={} retryable={}",
+                    status,
+                    code.as_deref().unwrap_or("http_error"),
+                    redact_id("task", &download.task_id),
+                    retryable
+                );
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
-                    retryable: status == 403,
-                    detail: Some(format!("HTTP {}", status)),
+                    retryable,
+                    detail: Some(match code {
+                        Some(code) => format!("blob_download:{code}"),
+                        None => format!("blob_download:http_{status}"),
+                    }),
                 }])
             }
         }
         Err(e) => {
+            let error_class = request_error_class(&e);
+            let retryable = request_error_is_retryable(&e);
             log::error!(
-                "Blob download error: task_id={} error=request_failed",
-                redact_id("task", &download.task_id)
+                "Blob download error: task_id={} error_class={} retryable={}",
+                redact_id("task", &download.task_id),
+                error_class,
+                retryable
             );
-            let retryable = e.is_timeout() || e.is_connect();
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: download.task_id,
                 retryable,
-                detail: Some(e.to_string()),
+                detail: Some(format!("blob_download:{error_class}")),
             }])
         }
     }
@@ -252,19 +263,14 @@ pub async fn write_downloaded_attachment(
         .await
         .context("create attachments dir")?;
 
-    // Decode base64 content
-    let bytes = BASE64
-        .decode(&write.plaintext_b64)
-        .context("decode base64 attachment content")?;
-
     // Use destination_id as an opaque platform destination. Absolute paths are
     // user-selected save paths; relative ids are written under attachments_dir.
-    if is_encrypted_cache_destination(&write.destination_id) {
-        log::debug!(
-            "write_downloaded_attachment: deferred encrypted cache materialization for {}",
-            redact_id("destination", &write.destination_id)
-        );
-        return Ok(Vec::new());
+    match super::media_cache::EncryptedCacheDestination::parse(&write.destination_id) {
+        Ok(Some(_)) => {
+            anyhow::bail!("encrypted cache destination must be handled by DesktopPlatformPorts")
+        }
+        Err(_) => anyhow::bail!("invalid encrypted cache destination"),
+        Ok(None) => {}
     }
     let file_path = dir.join(&write.destination_id);
     if let Some(parent) = file_path.parent() {
@@ -275,28 +281,82 @@ pub async fn write_downloaded_attachment(
 
     // Write atomically using temp file
     let tmp_path = file_path.with_extension("tmp");
-    fs::write(&tmp_path, &bytes)
+    fs::write(&tmp_path, &write.plaintext)
         .await
         .context("write attachment temp file")?;
     fs::rename(&tmp_path, &file_path)
         .await
         .context("rename attachment file")?;
 
-    // Return a successful result - the destination_id is opaque, so we just confirm success
-    // Core doesn't have a specific "AttachmentWritten" event, we'll use BlobTransferFailed with success
-    // Actually, let's return an empty vec since this is a completion side-effect
     Ok(Vec::new())
 }
 
-fn is_encrypted_cache_destination(destination_id: &str) -> bool {
-    let path = std::path::Path::new(destination_id);
-    !path.is_absolute()
-        && path
-            .components()
-            .next()
-            .and_then(|component| match component {
-                std::path::Component::Normal(value) => value.to_str(),
-                _ => None,
-            })
-            .is_some_and(|first| first == "attachment-cache")
+#[derive(Debug, Deserialize)]
+struct BlobErrorResponse {
+    error: Option<String>,
+}
+
+fn request_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_builder() {
+        "builder"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
+}
+
+fn request_error_is_retryable(error: &reqwest::Error) -> bool {
+    !error.is_builder() && !error.is_redirect()
+}
+
+fn upload_status_is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 409 | 425 | 429 | 500..=599)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CACHE_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn generic_writer_never_writes_encrypted_cache_destinations_as_plaintext() {
+        for destination_id in [
+            format!("attachment-cache/{CACHE_ID}.enc"),
+            format!("attachment-cache\\{CACHE_ID}.enc"),
+            "attachment-cache/../outside.enc".to_string(),
+        ] {
+            let temp_dir = std::env::temp_dir().join(format!(
+                "tapchat-generic-cache-guard-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let error = write_downloaded_attachment(
+                WriteDownloadedAttachmentEffect {
+                    task_id: "download:test".into(),
+                    destination_id,
+                    plaintext: b"must never reach disk".to_vec(),
+                },
+                Some(temp_dir.clone()),
+            )
+            .await
+            .expect_err("encrypted cache destination must be refused");
+            assert!(error.to_string().contains("encrypted cache destination"));
+            assert_eq!(
+                std::fs::read_dir(&temp_dir)
+                    .expect("cache guard directory")
+                    .count(),
+                0
+            );
+            let _ = std::fs::remove_dir_all(temp_dir);
+        }
+    }
 }

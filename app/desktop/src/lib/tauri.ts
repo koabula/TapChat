@@ -6,7 +6,7 @@ import type {
   ConversationSummary,
   ContactSummary,
   ContactLinkPreview,
-  Message,
+  MessagePage,
   PreflightResult,
   CloudflareStatus,
   SessionStatus,
@@ -118,8 +118,12 @@ export async function createConversation(peerUserId: string): Promise<CoreOutput
   return invoke("create_conversation", { peerUserId });
 }
 
-export async function getMessages(conversationId: string): Promise<Message[]> {
-  return invoke("get_messages", { conversationId });
+export async function getMessages(
+  conversationId: string,
+  beforeCursor?: string,
+  limit = 50,
+): Promise<MessagePage> {
+  return invoke("get_messages", { conversationId, beforeCursor, limit });
 }
 
 // Messages
@@ -132,17 +136,11 @@ export async function sendText(
 
 export async function sendAttachment(
   conversationId: string,
-  filePath: string,
-  mimeType: string,
-  sizeBytes: number,
-  fileName?: string
+  attachmentHandle: string,
 ): Promise<CoreOutput> {
   return invoke("send_attachment", {
     conversationId,
-    filePath,
-    mimeType,
-    sizeBytes,
-    fileName,
+    attachmentHandle,
   });
 }
 
@@ -470,6 +468,7 @@ export type GroupMessageView =
       plaintext: string | null;
       has_attachment: boolean;
       storage_refs: StorageRef[];
+      attachment_manifest?: import("./types").AttachmentManifestView;
       raw_message_type: string;
       delivery_state?: "sending" | "sent" | "failed";
     }

@@ -137,7 +137,40 @@ pub fn run() {
     };
 
     // Build Tauri app
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().register_asynchronous_uri_scheme_protocol(
+        "tapchat-media",
+        |context, request, responder| {
+            let app = context.app_handle().clone();
+            let handle = request.uri().path().trim_start_matches('/').to_string();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                let profile_path = state.inner.read().await.profile_path.clone();
+                let profile_generation = state.profile_generation.load(Ordering::SeqCst);
+                let now = ts_ms().min(u64::MAX as u128) as u64;
+                let media = state.media_handles.read().await.get(&handle).cloned();
+                let response = match media {
+                    Some(media)
+                        if media.expires_at_ms > now
+                            && media.profile_path == profile_path
+                            && media.profile_generation == profile_generation =>
+                    {
+                        http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, media.mime_type)
+                            .header(http::header::CACHE_CONTROL, "no-store")
+                            .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .body((*media.bytes).clone())
+                    }
+                    _ => http::Response::builder()
+                        .status(http::StatusCode::NOT_FOUND)
+                        .header(http::header::CACHE_CONTROL, "no-store")
+                        .body(Vec::new()),
+                }
+                .unwrap_or_else(|_| http::Response::new(Vec::new()));
+                responder.respond(response);
+            });
+        },
+    );
 
     // Only load single-instance plugin when NOT in multi-instance mode
     let builder = if !config.multi_instance {
@@ -176,6 +209,10 @@ pub fn run() {
                 } else {
                     log::LevelFilter::Warn
                 })
+                // Keep a small, redacted attachment state-machine breadcrumb
+                // trail in release builds. It contains phases and variants
+                // only—never file names, object refs, capabilities, or bytes.
+                .level_for("tapchat_attachment", log::LevelFilter::Info)
                 .max_file_size(10_000_000)
                 .targets([tauri_plugin_log::Target::new(
                     tauri_plugin_log::TargetKind::Folder {
@@ -288,11 +325,15 @@ pub fn run() {
             commands::group::dissolve_group,
             // Messages
             commands::message::send_text,
+            commands::message::stage_attachment,
+            commands::message::stage_attachments_from_dialog,
+            commands::message::stage_clipboard_image,
+            commands::message::release_staged_attachment,
             commands::message::send_attachment,
             commands::message::download_attachment,
             commands::message::download_attachment_to_default_path,
-            commands::message::cache_attachment,
-            commands::message::get_attachment_preview,
+            commands::message::open_media,
+            commands::message::release_media,
             commands::message::clear_attachment_cache,
             // Contacts
             commands::contact::preview_contact_link,
@@ -344,9 +385,7 @@ pub fn run() {
             commands::utility::check_notification_permission,
             commands::utility::request_notification_permission,
             commands::utility::show_notification,
-            commands::utility::write_temp_file,
             commands::utility::get_file_metadata,
-            commands::utility::get_local_image_thumbnail,
             commands::utility::set_debug_mode,
             commands::utility::get_debug_mode,
             // Attachment settings

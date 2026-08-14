@@ -28,6 +28,7 @@ impl CoreEngine {
             },
             message_nonce,
         );
+        let created_at = current_unix_millis(message_nonce);
         let group_id = if is_group {
             Some(
                 self.group_id_for_conversation(&conversation_id)?
@@ -36,23 +37,40 @@ impl CoreEngine {
         } else {
             None
         };
-        let task_id = format!("blob-upload:{message_id}");
-        self.state.pending_blob_uploads.insert(
-            task_id.clone(),
-            PendingBlobUpload {
-                task_id: task_id.clone(),
-                conversation_id: conversation_id.clone(),
-                group_id,
-                descriptor: attachment_descriptor.clone(),
-                blob_ciphertext_b64: None,
-                payload_metadata: None,
-                message_id: message_id.clone(),
-                metadata_ciphertext: None,
-                prepared_upload: None,
-                retries: 0,
-                in_flight: false,
-            },
-        );
+        let original = AttachmentVariantSource {
+            attachment_id: attachment_descriptor.attachment_id.clone(),
+            mime_type: attachment_descriptor.mime_type.clone(),
+            size_bytes: attachment_descriptor.size_bytes,
+        };
+        let mut task_ids = Vec::new();
+        for (variant, source) in std::iter::once((AttachmentVariant::Original, original)).chain(
+            attachment_descriptor
+                .preview
+                .clone()
+                .map(|preview| (AttachmentVariant::Preview, preview)),
+        ) {
+            let task_id = format!("blob-upload:{message_id}:{}", variant.as_str());
+            task_ids.push(task_id.clone());
+            self.state.pending_blob_uploads.insert(
+                task_id.clone(),
+                PendingBlobUpload {
+                    task_id,
+                    conversation_id: conversation_id.clone(),
+                    group_id: group_id.clone(),
+                    descriptor: attachment_descriptor.clone(),
+                    source,
+                    variant,
+                    blob_ciphertext: None,
+                    encrypted_descriptor: None,
+                    message_id: message_id.clone(),
+                    created_at,
+                    prepared_upload: None,
+                    uploaded: false,
+                    retries: 0,
+                    in_flight: false,
+                },
+            );
+        }
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -60,9 +78,11 @@ impl CoreEngine {
             },
             effects: vec![persist_effect(
                 &self.state,
-                vec![PersistOp::SavePendingBlobTransfer {
-                    task_id: task_id.clone(),
-                }],
+                task_ids
+                    .iter()
+                    .cloned()
+                    .map(|task_id| PersistOp::SavePendingBlobTransfer { task_id })
+                    .collect(),
             )],
             view_model: Some(CoreViewModel {
                 messages: vec![MessageSummary {
@@ -90,6 +110,39 @@ impl CoreEngine {
                 "failed to decode attachment payload metadata: {error}"
             ))
         })?;
+        if payload_metadata.version != 2 {
+            return Err(CoreError::invalid_input(
+                "unsupported attachment manifest version",
+            ));
+        }
+        let mut blob_descriptor = if payload_metadata.original.object_ref == reference {
+            payload_metadata.original.clone()
+        } else {
+            payload_metadata
+                .preview
+                .as_ref()
+                .filter(|preview| preview.object_ref == reference)
+                .cloned()
+                .ok_or_else(|| {
+                    CoreError::invalid_input("attachment reference is not present in manifest")
+                })?
+        };
+        let expected_origin =
+            self.expected_attachment_storage_origin(&conversation_id, &message_id)?;
+        if blob_descriptor.storage_origin.is_empty() {
+            // AttachmentManifestV2 was initially shipped without a storage
+            // origin. Recover those manifests from the sender's signed
+            // identity bundle; never fall back to the receiver's runtime.
+            blob_descriptor.storage_origin = expected_origin;
+        } else {
+            let manifest_origin = normalize_storage_origin(&blob_descriptor.storage_origin)?;
+            if manifest_origin != expected_origin {
+                return Err(CoreError::invalid_input(
+                    "attachment storage origin does not match sender identity",
+                ));
+            }
+            blob_descriptor.storage_origin = manifest_origin;
+        }
         let task_id = attachment_download_task_id(&message_id, &reference, &destination);
         self.state.pending_blob_downloads.insert(
             task_id.clone(),
@@ -99,8 +152,7 @@ impl CoreEngine {
                 message_id,
                 reference,
                 destination_id: destination,
-                payload_metadata,
-                authorized_download: None,
+                blob_descriptor,
                 retries: 0,
                 in_flight: false,
             },
@@ -130,10 +182,10 @@ impl CoreEngine {
             .conversations
             .get(conversation_id)
             .and_then(|state| {
-                state
-                    .messages
-                    .iter()
-                    .find(|message| message.message_id == message_id)
+                state.messages.iter().find(|message| {
+                    message.message_id == message_id
+                        || message.app_message_id.as_deref() == Some(message_id)
+                })
             })
             .and_then(|message| message.plaintext.as_deref())
             .or_else(|| {
@@ -142,7 +194,8 @@ impl CoreEngine {
                     .iter()
                     .find(|item| {
                         item.envelope.conversation_id == conversation_id
-                            && item.envelope.message_id == message_id
+                            && (item.envelope.message_id == message_id
+                                || item.app_message_id.as_deref() == Some(message_id))
                     })
                     .and_then(|item| item.plaintext_cache.as_deref())
             })
@@ -158,6 +211,89 @@ impl CoreEngine {
             })
             .ok_or_else(|| CoreError::invalid_input("attachment metadata is missing"))
             .map(str::to_string)
+    }
+
+    fn local_storage_origin(&self) -> CoreResult<String> {
+        let deployment = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("deployment bundle is missing"))?;
+        normalize_storage_origin(
+            deployment
+                .storage_base_info
+                .base_url
+                .as_deref()
+                .unwrap_or(&deployment.inbox_http_endpoint),
+        )
+    }
+
+    /// Resolve attachment ownership only from authenticated local state. The
+    /// manifest origin must agree with this value before any request is made.
+    fn expected_attachment_storage_origin(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> CoreResult<String> {
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is missing"))?;
+        let local_user_id = &local_identity.user_identity.user_id;
+        let local_device_id = &local_identity.device_identity.device_id;
+
+        let pending_is_local = self.state.pending_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && (item.envelope.message_id == message_id
+                    || item.app_message_id.as_deref() == Some(message_id))
+        }) || self.state.pending_group_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_id == message_id
+        });
+        if pending_is_local {
+            return self.local_storage_origin();
+        }
+
+        let message = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| {
+                conversation.messages.iter().find(|message| {
+                    message.message_id == message_id
+                        || message.app_message_id.as_deref() == Some(message_id)
+                })
+            })
+            .ok_or_else(|| CoreError::invalid_input("attachment message is missing"))?;
+        if message.sender_user_id.as_deref() == Some(local_user_id)
+            || message.sender_device_id == *local_device_id
+        {
+            return self.local_storage_origin();
+        }
+        let sender_user_id = message
+            .sender_user_id
+            .as_deref()
+            .or_else(|| {
+                self.state
+                    .conversations
+                    .get(conversation_id)
+                    .filter(|conversation| {
+                        conversation.conversation.kind == ConversationKind::Direct
+                    })
+                    .map(|conversation| conversation.peer_user_id.as_str())
+            })
+            .ok_or_else(|| CoreError::invalid_state("attachment sender identity is unavailable"))?;
+        let storage_origin = self
+            .state
+            .contacts
+            .get(sender_user_id)
+            .and_then(|contact| contact.bundle.storage_profile.as_ref())
+            .and_then(|profile| profile.base_url.as_deref())
+            .ok_or_else(|| {
+                CoreError::invalid_state("attachment sender storage profile is unavailable")
+            })?;
+        normalize_storage_origin(storage_origin)
     }
 
     pub(super) fn sync_inbox(
@@ -967,7 +1103,6 @@ impl CoreEngine {
         for task in self.state.pending_blob_downloads.values_mut() {
             if !task.in_flight && task.retries >= MAX_TRANSPORT_RETRIES {
                 task.retries = 0;
-                task.authorized_download = None;
                 persist_ops.push(PersistOp::SavePendingBlobTransfer {
                     task_id: task.task_id.clone(),
                 });
@@ -1024,31 +1159,47 @@ impl CoreEngine {
             let Some(task) = self.state.pending_blob_uploads.get(&task_id).cloned() else {
                 continue;
             };
-            if task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
+            if task.uploaded || task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
                 continue;
             }
-            if task.blob_ciphertext_b64.is_none() {
+            if task.blob_ciphertext.is_none() {
+                log::info!(
+                    target: "tapchat_attachment",
+                    "attachment_transfer phase=dispatch action=read variant={}",
+                    task.variant.as_str()
+                );
                 effects.push(CoreEffect::ReadAttachmentBytes {
                     read: ReadAttachmentBytesEffect {
                         task_id: task.task_id.clone(),
-                        attachment_id: task.descriptor.attachment_id.clone(),
+                        conversation_id: task.conversation_id.clone(),
+                        attachment_id: task.source.attachment_id.clone(),
                     },
                 });
             } else if let Some(prepared) = &task.prepared_upload {
+                log::info!(
+                    target: "tapchat_attachment",
+                    "attachment_transfer phase=dispatch action=upload variant={}",
+                    task.variant.as_str()
+                );
                 effects.push(CoreEffect::UploadBlob {
                     upload: BlobUploadRequest {
                         task_id: task.task_id.clone(),
-                        blob_ciphertext_b64: task.blob_ciphertext_b64.clone().unwrap_or_default(),
+                        conversation_id: task.conversation_id.clone(),
+                        blob_ciphertext: task.blob_ciphertext.clone().unwrap_or_default(),
                         upload_target: prepared.upload_target.clone(),
                         upload_headers: prepared.upload_headers.clone(),
                         blob_ref: prepared.blob_ref.clone(),
                     },
                 });
             } else {
+                log::info!(
+                    target: "tapchat_attachment",
+                    "attachment_transfer phase=dispatch action=prepare variant={}",
+                    task.variant.as_str()
+                );
                 let size_bytes = task
-                    .blob_ciphertext_b64
+                    .blob_ciphertext
                     .as_ref()
-                    .and_then(|value| STANDARD.decode(value).ok())
                     .map(|bytes| bytes.len() as u64)
                     .unwrap_or(task.descriptor.size_bytes);
                 effects.push(CoreEffect::PrepareBlobUpload {
@@ -1062,9 +1213,8 @@ impl CoreEngine {
                             "direct".into()
                         }),
                         message_id: task.message_id.clone(),
-                        mime_type: task.descriptor.mime_type.clone(),
+                        variant: task.variant.as_str().into(),
                         size_bytes,
-                        file_name: task.descriptor.file_name.clone(),
                         headers: BTreeMap::new(),
                         auth: Some(auth.clone()),
                     },
@@ -1094,33 +1244,27 @@ impl CoreEngine {
             if task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
                 continue;
             }
-            if let Some(authorized) = task.authorized_download.clone() {
-                effects.push(CoreEffect::DownloadBlob {
-                    download: BlobDownloadRequest {
-                        task_id: task.task_id.clone(),
-                        blob_ref: authorized.blob_ref,
-                        download_target: authorized.download_target,
-                        download_headers: authorized.download_headers,
-                    },
-                });
-            } else if let Some(grant) = task.payload_metadata.download_grant.clone() {
-                effects.push(CoreEffect::AuthorizeBlobDownload {
-                    authorize: AuthorizeBlobDownloadRequest {
-                        task_id: task.task_id.clone(),
+            let base_url = normalize_storage_origin(&task.blob_descriptor.storage_origin)?;
+            let capability = task.blob_descriptor.read_capability.clone();
+            effects.push(CoreEffect::DownloadBlob {
+                download: BlobDownloadRequest {
+                    task_id: task.task_id.clone(),
+                    conversation_id: task.conversation_id.clone(),
+                    blob_ref: task.reference.clone(),
+                    download_target: format!(
+                        "{base_url}/v1/storage/blob/{}",
+                        urlencoding::encode(&task.reference)
+                    ),
+                    download_headers: BTreeMap::from([(
+                        "Authorization".into(),
+                        format!("TapChat-Blob {capability}"),
+                    )]),
+                    auth: Some(TransportAuthRequirement::BlobCapability {
                         blob_ref: task.reference.clone(),
-                        grant,
-                    },
-                });
-            } else {
-                effects.push(CoreEffect::DownloadBlob {
-                    download: BlobDownloadRequest {
-                        task_id: task.task_id.clone(),
-                        blob_ref: task.reference.clone(),
-                        download_target: task.reference.clone(),
-                        download_headers: BTreeMap::new(),
-                    },
-                });
-            }
+                        capability,
+                    }),
+                },
+            });
             if let Some(entry) = self.state.pending_blob_downloads.get_mut(&task_id) {
                 entry.in_flight = true;
             }
@@ -1563,6 +1707,9 @@ impl CoreEngine {
                 {
                     item.in_flight = false;
                     item.retries = item.retries.saturating_add(1);
+                    if !retryable {
+                        item.retries = MAX_TRANSPORT_RETRIES;
+                    }
                     if retryable && item.retries < MAX_TRANSPORT_RETRIES {
                         let timer_id = format!("retry_append:{message_id}");
                         return Ok(CoreOutput {
@@ -1748,47 +1895,29 @@ impl CoreEngine {
         task_id: String,
         result: PrepareBlobUploadResult,
     ) -> CoreResult<CoreOutput> {
-        let (conversation_id, payload_metadata) = {
-            let task = self
-                .state
-                .pending_blob_uploads
-                .get(&task_id)
-                .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
-            (task.conversation_id.clone(), task.payload_metadata.clone())
-        };
-        let mut payload_metadata = payload_metadata;
-        let mut metadata_ciphertext = None;
-        if let Some(download_grant) = result.download_grant.clone() {
-            if let Some(mut metadata) = payload_metadata.take() {
-                metadata.download_grant = Some(download_grant);
-                let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
-                    CoreError::invalid_input(format!(
-                        "failed to encode attachment payload metadata: {error}"
-                    ))
-                })?;
-                let ciphertext = self
-                    .state
-                    .mls_adapter
-                    .as_mut()
-                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                    .encrypt_application(&conversation_id, metadata_json.as_bytes())?
-                    .payload_b64;
-                payload_metadata = Some(metadata);
-                metadata_ciphertext = Some(ciphertext);
-            }
+        let storage_origin =
+            storage_origin_from_download_target(&result.download_target, &result.blob_ref)?;
+        if storage_origin != self.local_storage_origin()? {
+            return Err(CoreError::invalid_input(
+                "prepared blob download target does not match local storage runtime",
+            ));
         }
-
         let task = self
             .state
             .pending_blob_uploads
             .get_mut(&task_id)
             .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
-        if let Some(metadata) = payload_metadata {
-            task.payload_metadata = Some(metadata);
-        }
-        if let Some(ciphertext) = metadata_ciphertext {
-            task.metadata_ciphertext = Some(ciphertext);
-        }
+        let descriptor = task.encrypted_descriptor.as_mut().ok_or_else(|| {
+            CoreError::invalid_state("blob upload prepared before encryption completed")
+        })?;
+        log::info!(
+            target: "tapchat_attachment",
+            "attachment_transfer phase=prepared variant={}",
+            task.variant.as_str()
+        );
+        descriptor.object_ref = result.blob_ref.clone();
+        descriptor.storage_origin = storage_origin;
+        descriptor.read_capability = result.read_capability.clone();
         task.prepared_upload = Some(result);
         task.in_flight = false;
         Ok(merge_outputs(
@@ -1806,76 +1935,148 @@ impl CoreEngine {
         ))
     }
 
-    pub(super) fn handle_blob_download_authorized(
-        &mut self,
-        task_id: String,
-        result: AuthorizeBlobDownloadResult,
-    ) -> CoreResult<CoreOutput> {
-        let task = self
-            .state
-            .pending_blob_downloads
-            .get_mut(&task_id)
-            .ok_or_else(|| CoreError::invalid_input("unknown blob download task"))?;
-        if result.blob_ref != task.reference {
-            return Err(CoreError::invalid_input(
-                "authorized blob_ref does not match pending download reference",
-            ));
-        }
-        task.authorized_download = Some(result);
-        task.in_flight = false;
-        self.flush_pending_transport()
-    }
-
     pub(super) fn handle_blob_uploaded(&mut self, task_id: String) -> CoreResult<CoreOutput> {
-        let task = self
+        let (message_id, completed_variant) = {
+            let task = self
+                .state
+                .pending_blob_uploads
+                .get_mut(&task_id)
+                .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
+            if task.prepared_upload.is_none() || task.encrypted_descriptor.is_none() {
+                return Err(CoreError::invalid_state(
+                    "blob upload completed before preparation finished",
+                ));
+            }
+            task.uploaded = true;
+            task.in_flight = false;
+            (task.message_id.clone(), task.variant)
+        };
+        log::info!(
+            target: "tapchat_attachment",
+            "attachment_transfer phase=uploaded variant={}",
+            completed_variant.as_str()
+        );
+        let attachment_tasks = self
             .state
             .pending_blob_uploads
-            .remove(&task_id)
-            .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
-        let prepared = task.prepared_upload.ok_or_else(|| {
-            CoreError::invalid_state("blob upload completed before upload target was prepared")
-        })?;
-        let payload_metadata = task.payload_metadata.clone().ok_or_else(|| {
-            CoreError::invalid_state("blob upload completed before payload metadata was prepared")
-        })?;
-        let final_ref = if payload_metadata.download_grant.is_some() {
-            prepared.blob_ref.clone()
+            .values()
+            .filter(|task| task.message_id == message_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if attachment_tasks.iter().any(|task| !task.uploaded) {
+            return Ok(merge_outputs(
+                CoreOutput {
+                    state_update: CoreStateUpdate::default(),
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SavePendingBlobTransfer { task_id }],
+                    )],
+                    view_model: None,
+                },
+                self.flush_pending_transport()?,
+            ));
+        }
+
+        log::info!(
+            target: "tapchat_attachment",
+            "attachment_transfer phase=publishing variants={}",
+            attachment_tasks.len()
+        );
+
+        let task = attachment_tasks
+            .iter()
+            .find(|task| task.variant == AttachmentVariant::Original)
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_state("attachment original task is missing"))?;
+        let original = task
+            .encrypted_descriptor
+            .clone()
+            .ok_or_else(|| CoreError::invalid_state("attachment original descriptor is missing"))?;
+        let preview = attachment_tasks
+            .iter()
+            .find(|task| task.variant == AttachmentVariant::Preview)
+            .and_then(|task| task.encrypted_descriptor.clone());
+        let kind = if task.descriptor.mime_type.starts_with("image/") {
+            AttachmentKind::Image
+        } else if task.descriptor.mime_type.starts_with("video/") {
+            AttachmentKind::Video
+        } else if task.descriptor.mime_type.starts_with("audio/") {
+            AttachmentKind::Audio
         } else {
-            prepared.download_target.clone().ok_or_else(|| {
-                CoreError::invalid_state("blob upload result is missing download grant")
-            })?
+            AttachmentKind::File
         };
-        let payload_metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to encode attachment payload metadata: {error}"
-            ))
-        })?;
-        let metadata_ciphertext = task.metadata_ciphertext.clone().ok_or_else(|| {
-            CoreError::invalid_state(
-                "blob upload completed before metadata ciphertext was prepared",
-            )
-        })?;
-        let storage_ref = StorageRef {
-            kind: "attachment".into(),
-            object_ref: final_ref.clone(),
-            size_bytes: task
-                .blob_ciphertext_b64
-                .as_ref()
-                .and_then(|value| STANDARD.decode(value).ok())
-                .map(|bytes| bytes.len() as u64)
-                .or(Some(payload_metadata.size_bytes))
-                .unwrap_or(task.descriptor.size_bytes),
-            mime_type: payload_metadata.mime_type.clone(),
-            file_name: payload_metadata
-                .file_name
-                .clone()
-                .or_else(|| task.descriptor.file_name.clone()),
-            expires_at: payload_metadata
-                .download_grant
-                .as_ref()
-                .map(|grant| grant.expires_at)
-                .or(prepared.expires_at),
+        let manifest = AttachmentManifestV2 {
+            version: 2,
+            attachment_id: message_id.clone(),
+            kind,
+            file_name: task.descriptor.file_name.clone(),
+            width: task.descriptor.width,
+            height: task.descriptor.height,
+            blur_hash: task.descriptor.blur_hash.clone(),
+            original,
+            preview,
         };
+        let manifest_json = serde_json::to_string(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode attachment manifest: {error}"))
+        })?;
+        let metadata_ciphertext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&task.conversation_id, manifest_json.as_bytes())?
+            .payload_b64;
+        let storage_refs = attachment_tasks
+            .iter()
+            .map(|task| {
+                let descriptor = task.encrypted_descriptor.as_ref().ok_or_else(|| {
+                    CoreError::invalid_state("uploaded attachment descriptor is missing")
+                })?;
+                Ok(StorageRef {
+                    kind: format!("attachment_{}", task.variant.as_str()),
+                    object_ref: descriptor.object_ref.clone(),
+                    size_bytes: descriptor.ciphertext_size,
+                    mime_type: "application/octet-stream".into(),
+                    file_name: None,
+                    expires_at: None,
+                })
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let completed_task_ids = attachment_tasks
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>();
+        let local_cache_effects = attachment_tasks
+            .iter()
+            .map(|task| {
+                let descriptor = task.encrypted_descriptor.as_ref().ok_or_else(|| {
+                    CoreError::invalid_state("uploaded attachment descriptor is missing")
+                })?;
+                let ciphertext = task.blob_ciphertext.as_deref().ok_or_else(|| {
+                    CoreError::invalid_state("uploaded attachment ciphertext is missing")
+                })?;
+                let plaintext = decrypt_blob(ciphertext, &descriptor.encryption)?;
+                Ok(CoreEffect::CacheUploadedAttachment {
+                    cache: CacheUploadedAttachmentEffect {
+                        task_id: format!("cache-uploaded:{}", task.task_id),
+                        source_attachment_id: task.source.attachment_id.clone(),
+                        object_ref: descriptor.object_ref.clone(),
+                        storage_origin: descriptor.storage_origin.clone(),
+                        mime_type: descriptor.mime_type.clone(),
+                        size_bytes: descriptor.plaintext_size,
+                        plaintext,
+                    },
+                })
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        for completed_task_id in &completed_task_ids {
+            self.state.pending_blob_uploads.remove(completed_task_id);
+        }
+        let mut persist_ops = completed_task_ids
+            .iter()
+            .cloned()
+            .map(|task_id| PersistOp::DeletePendingBlobTransfer { task_id })
+            .collect::<Vec<_>>();
         if let Some(group_id) = task.group_id {
             let conversation_id = task.conversation_id.clone();
             self.ensure_group_ready_for_send(&conversation_id)?;
@@ -1887,20 +2088,21 @@ impl CoreEngine {
                 GroupEnvelopeVisibility::Visible,
                 metadata_ciphertext,
             )?;
-            envelope.storage_refs.push(storage_ref);
-            self.enqueue_group_envelope(envelope.clone(), capability, Some(payload_metadata_json));
+            // The upload placeholder and the published group envelope are one
+            // logical message, so retain the identifier allocated at enqueue.
+            envelope.message_id = message_id.clone();
+            envelope.created_at = task.created_at;
+            envelope.storage_refs = storage_refs;
+            self.enqueue_group_envelope(envelope.clone(), capability, Some(manifest_json));
+            persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
+                message_id: envelope.message_id,
+            });
             Ok(merge_outputs(
                 CoreOutput {
                     state_update: CoreStateUpdate::default(),
-                    effects: vec![persist_effect(
-                        &self.state,
-                        vec![
-                            PersistOp::DeletePendingBlobTransfer { task_id },
-                            PersistOp::SaveOutgoingGroupEnvelope {
-                                message_id: envelope.message_id,
-                            },
-                        ],
-                    )],
+                    effects: std::iter::once(persist_effect(&self.state, persist_ops))
+                        .chain(local_cache_effects)
+                        .collect(),
                     view_model: None,
                 },
                 self.flush_pending_transport()?,
@@ -1916,22 +2118,21 @@ impl CoreEngine {
                     MessageType::MlsApplication,
                     metadata_ciphertext.clone(),
                 )?;
-                envelope.storage_refs.push(storage_ref.clone());
+                envelope.storage_refs = storage_refs.clone();
                 envelopes.push(envelope);
             }
             self.enqueue_envelopes_with_plaintext(
                 peer_user_id,
                 envelopes,
-                payload_metadata_json,
-                None,
+                manifest_json,
+                Some(message_id),
             );
             Ok(merge_outputs(
                 CoreOutput {
                     state_update: CoreStateUpdate::default(),
-                    effects: vec![persist_effect(
-                        &self.state,
-                        vec![PersistOp::DeletePendingBlobTransfer { task_id }],
-                    )],
+                    effects: std::iter::once(persist_effect(&self.state, persist_ops))
+                        .chain(local_cache_effects)
+                        .collect(),
                     view_model: None,
                 },
                 self.flush_pending_transport()?,
@@ -1942,24 +2143,18 @@ impl CoreEngine {
     pub(super) fn handle_attachment_bytes_loaded(
         &mut self,
         task_id: String,
-        plaintext_b64: String,
+        plaintext: Vec<u8>,
     ) -> CoreResult<CoreOutput> {
-        let plaintext = STANDARD.decode(&plaintext_b64).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "attachment plaintext bytes were not valid base64: {error}"
-            ))
-        })?;
-        let (conversation_id, mime_type, size_bytes, file_name) = {
+        let (variant, mime_type, size_bytes) = {
             let task = self
                 .state
                 .pending_blob_uploads
                 .get(&task_id)
                 .ok_or_else(|| CoreError::invalid_input("pending blob upload task not found"))?;
             (
-                task.conversation_id.clone(),
-                task.descriptor.mime_type.clone(),
-                task.descriptor.size_bytes,
-                task.descriptor.file_name.clone(),
+                task.variant,
+                task.source.mime_type.clone(),
+                task.source.size_bytes,
             )
         };
         if plaintext.len() as u64 != size_bytes {
@@ -1968,33 +2163,24 @@ impl CoreEngine {
             ));
         }
         let encrypted = encrypt_blob(&plaintext)?;
-        let payload_metadata = AttachmentPayloadMetadata {
+        let descriptor = EncryptedBlobDescriptor {
+            variant,
+            object_ref: String::new(),
+            storage_origin: String::new(),
+            read_capability: String::new(),
             mime_type,
-            size_bytes,
-            file_name,
+            plaintext_size: size_bytes,
+            ciphertext_size: encrypted.ciphertext.len() as u64,
+            digest_sha256: crate::attachment_crypto::sha256_hex(&plaintext),
             encryption: encrypted.metadata,
-            download_grant: None,
         };
-        let metadata_json = serde_json::to_string(&payload_metadata).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to encode attachment payload metadata: {error}"
-            ))
-        })?;
-        let metadata_ciphertext = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&conversation_id, metadata_json.as_bytes())?
-            .payload_b64;
         let task = self
             .state
             .pending_blob_uploads
             .get_mut(&task_id)
             .ok_or_else(|| CoreError::invalid_input("pending blob upload task not found"))?;
-        task.blob_ciphertext_b64 = Some(STANDARD.encode(encrypted.ciphertext));
-        task.payload_metadata = Some(payload_metadata);
-        task.metadata_ciphertext = Some(metadata_ciphertext);
+        task.blob_ciphertext = Some(encrypted.ciphertext);
+        task.encrypted_descriptor = Some(descriptor);
         task.in_flight = false;
         Ok(merge_outputs(
             CoreOutput {
@@ -2014,33 +2200,27 @@ impl CoreEngine {
     pub(super) fn handle_blob_downloaded(
         &mut self,
         task_id: String,
-        blob_ciphertext: Option<String>,
+        blob_ciphertext: Option<Vec<u8>>,
     ) -> CoreResult<CoreOutput> {
         let mut effects = Vec::new();
         if let Some(task) = self.state.pending_blob_downloads.remove(&task_id) {
             if let Some(blob_ciphertext) = blob_ciphertext {
-                let ciphertext = STANDARD.decode(&blob_ciphertext).map_err(|error| {
-                    CoreError::invalid_input(format!(
-                        "downloaded blob ciphertext was not valid base64: {error}"
-                    ))
-                })?;
-                let plaintext = decrypt_blob(&ciphertext, &task.payload_metadata.encryption)?;
+                let plaintext = decrypt_blob(&blob_ciphertext, &task.blob_descriptor.encryption)?;
+                if plaintext.len() as u64 != task.blob_descriptor.plaintext_size
+                    || crate::attachment_crypto::sha256_hex(&plaintext)
+                        != task.blob_descriptor.digest_sha256
+                {
+                    return Err(CoreError::invalid_input(
+                        "downloaded attachment failed integrity verification",
+                    ));
+                }
                 effects.push(CoreEffect::WriteDownloadedAttachment {
                     write: WriteDownloadedAttachmentEffect {
                         task_id: task.task_id.clone(),
                         destination_id: task.destination_id.clone(),
-                        plaintext_b64: STANDARD.encode(&plaintext),
+                        plaintext,
                     },
                 });
-                if let Some(state) = self.state.conversations.get_mut(&task.conversation_id) {
-                    if let Some(message) = state
-                        .messages
-                        .iter_mut()
-                        .find(|message| message.message_id == task.message_id)
-                    {
-                        message.downloaded_blob_b64 = Some(blob_ciphertext);
-                    }
-                }
             }
         }
         Ok(CoreOutput {
@@ -2069,6 +2249,18 @@ impl CoreEngine {
         if let Some(task) = self.state.pending_blob_uploads.get_mut(&task_id) {
             task.in_flight = false;
             task.retries = task.retries.saturating_add(1);
+            log::warn!(
+                target: "tapchat_attachment",
+                "attachment_transfer phase=failed variant={} retryable={} attempt={}",
+                task.variant.as_str(),
+                retryable,
+                task.retries
+            );
+            if detail.as_deref() == Some("blob_upload:capability_expired") {
+                // The R2 upload URL is short-lived. Re-enter prepare on the
+                // next attempt while retaining the encrypted staging bytes.
+                task.prepared_upload = None;
+            }
             if retryable && task.retries < MAX_TRANSPORT_RETRIES {
                 let timer_id = format!("retry_blob_upload:{task_id}");
                 return Ok(CoreOutput {
@@ -2085,7 +2277,18 @@ impl CoreEngine {
                     view_model: None,
                 });
             }
-            self.state.pending_blob_uploads.remove(&task_id);
+            let message_id = task.message_id.clone();
+            let failed_task_ids = self
+                .state
+                .pending_blob_uploads
+                .values_mut()
+                .filter(|pending| pending.message_id == message_id)
+                .map(|pending| {
+                    pending.in_flight = false;
+                    pending.retries = MAX_TRANSPORT_RETRIES;
+                    pending.task_id.clone()
+                })
+                .collect::<Vec<_>>();
             return Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::AttachmentUploadFailed],
@@ -2100,9 +2303,10 @@ impl CoreEngine {
                     },
                     persist_effect(
                         &self.state,
-                        vec![PersistOp::DeletePendingBlobTransfer {
-                            task_id: task_id.clone(),
-                        }],
+                        failed_task_ids
+                            .into_iter()
+                            .map(|task_id| PersistOp::SavePendingBlobTransfer { task_id })
+                            .collect(),
                     ),
                 ],
                 view_model: None,
@@ -2110,7 +2314,6 @@ impl CoreEngine {
         }
         if let Some(task) = self.state.pending_blob_downloads.get_mut(&task_id) {
             task.in_flight = false;
-            task.authorized_download = None;
             task.retries = task.retries.saturating_add(1);
             if retryable && task.retries < MAX_TRANSPORT_RETRIES {
                 let timer_id = format!("retry_blob_download:{task_id}");
@@ -2130,16 +2333,17 @@ impl CoreEngine {
             }
             log::warn!("attachment download failed");
             self.state.pending_blob_downloads.remove(&task_id);
+            let failure_detail = detail.unwrap_or_else(|| "blob_download:unknown_failure".into());
             return Ok(CoreOutput {
                 state_update: CoreStateUpdate {
-                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    system_statuses_changed: vec![SystemStatus::AttachmentDownloadFailed],
                     ..CoreStateUpdate::default()
                 },
                 effects: vec![
                     CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
-                            status: SystemStatus::TemporaryNetworkFailure,
-                            message: "attachment download failed".into(),
+                            status: SystemStatus::AttachmentDownloadFailed,
+                            message: failure_detail,
                         },
                     },
                     persist_effect(
@@ -2335,6 +2539,13 @@ impl CoreEngine {
             let conversation_id = record.envelope.conversation_id.clone();
             touched_conversation_ids.insert(conversation_id.clone());
             if record.envelope.message_type == MessageType::MlsApplication {
+                let inline_ciphertext = record
+                    .envelope
+                    .inline_ciphertext
+                    .as_deref()
+                    .unwrap_or_default();
+                let ciphertext_sha256 =
+                    format!("{:x}", Sha256::digest(inline_ciphertext.as_bytes()));
                 let duplicate_delivery = self
                     .state
                     .conversations
@@ -2356,11 +2567,7 @@ impl CoreEngine {
                             &conversation_id,
                             &record.envelope.sender_device_id,
                             record.envelope.message_type,
-                            record
-                                .envelope
-                                .inline_ciphertext
-                                .as_deref()
-                                .unwrap_or_default(),
+                            inline_ciphertext,
                         )? {
                         IngestResult::AppliedApplication(application) => {
                             log::info!(
@@ -2382,6 +2589,7 @@ impl CoreEngine {
                                         &record,
                                         plaintext,
                                         app_message_id,
+                                        ciphertext_sha256.clone(),
                                     )? {
                                         output.state_update.messages_changed = true;
                                         output.state_update.conversations_changed = true;
@@ -2519,12 +2727,47 @@ impl CoreEngine {
                             ackable = true;
                         }
                         IngestResult::IgnoredReplay => {
-                            log::warn!(
-                                "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
-                                redact_id("msg", &record.message_id),
-                                redact_id("conversation", &conversation_id)
-                            );
-                            ackable = true;
+                            if self.conversation_has_mls_ciphertext(
+                                &conversation_id,
+                                &ciphertext_sha256,
+                            ) {
+                                log::info!(
+                                    "handle_inbox_records: acknowledging proven MLS replay message={} conversation={} ciphertext={}",
+                                    redact_id("msg", &record.message_id),
+                                    redact_id("conversation", &conversation_id),
+                                    redact_id("ciphertext", &ciphertext_sha256)
+                                );
+                                ackable = true;
+                            } else {
+                                // OpenMLS has consumed this generation, but no
+                                // durable application projection proves that it
+                                // was committed. Never ACK an unproven replay:
+                                // retain the exact record and enter recovery.
+                                log::warn!(
+                                    "handle_inbox_records: deferring unproven MLS replay message={} conversation={} ciphertext={}",
+                                    redact_id("msg", &record.message_id),
+                                    redact_id("conversation", &conversation_id),
+                                    redact_id("ciphertext", &ciphertext_sha256)
+                                );
+                                let reason = self.recovery_reason_for_record(&conversation_id);
+                                {
+                                    let sync_state = self
+                                        .state
+                                        .sync_states
+                                        .entry(device_id.clone())
+                                        .or_insert_with(|| {
+                                            SyncEngine::new_device_state(&device_id)
+                                        });
+                                    SyncEngine::store_pending_record(sync_state, &record);
+                                }
+                                self.mark_recovery_needed(&conversation_id, reason);
+                                self.transition_recovery_phase(
+                                    &conversation_id,
+                                    RecoveryPhase::WaitingForPendingReplay,
+                                );
+                                touched_recovery_context_ids.insert(conversation_id.clone());
+                                pending_recovery_conversations.insert(conversation_id.clone());
+                            }
                         }
                         IngestResult::PendingRetry => {
                             log::warn!(
@@ -3365,6 +3608,7 @@ impl CoreEngine {
                         conv.messages.push(crate::conversation::StoredMessage {
                             message_id: message_id.to_string(),
                             app_message_id: app_message_id.clone(),
+                            mls_ciphertext_sha256: None,
                             sender_user_id: Some(env.sender_user_id.clone()),
                             sender_device_id: env.sender_device_id.clone(),
                             recipient_device_id: env.recipient_device_id.clone(),
@@ -3536,7 +3780,7 @@ impl CoreEngine {
                 format!("rejected message request {}", result.request_id)
             }
         };
-        let mut output = CoreOutput {
+        let status_output = CoreOutput {
             state_update: CoreStateUpdate::default(),
             effects: vec![CoreEffect::EmitUserNotification {
                 notification: UserNotificationEffect {
@@ -3560,11 +3804,12 @@ impl CoreEngine {
             }),
         };
         if result.accepted && result.action == MessageRequestAction::Accept {
-            output = merge_outputs(output, self.contact_accepted_notification_output(&result)?);
+            let mut output = self.contact_accepted_notification_output(&result)?;
             let device_id = self.local_device_id_required()?;
-            return Ok(merge_outputs(output, self.sync_inbox(device_id, None)?));
+            output = merge_outputs(output, self.sync_inbox(device_id, None)?);
+            return Ok(merge_outputs(output, status_output));
         }
-        Ok(output)
+        Ok(status_output)
     }
 
     pub(super) fn allowlist_output(
@@ -3637,4 +3882,46 @@ impl CoreEngine {
             view_model: None,
         })
     }
+}
+
+fn normalize_storage_origin(value: &str) -> CoreResult<String> {
+    let mut url = url::Url::parse(value)
+        .map_err(|_| CoreError::invalid_input("attachment storage origin is not a valid URL"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(CoreError::invalid_input(
+            "attachment storage origin contains unsupported URL components",
+        ));
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" if matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")) => {}
+        _ => {
+            return Err(CoreError::invalid_input(
+                "attachment storage origin must use HTTPS",
+            ))
+        }
+    }
+    let normalized_path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if normalized_path.is_empty() {
+        "/"
+    } else {
+        &normalized_path
+    });
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn storage_origin_from_download_target(
+    download_target: &str,
+    blob_ref: &str,
+) -> CoreResult<String> {
+    let suffix = format!("/v1/storage/blob/{}", urlencoding::encode(blob_ref));
+    let origin = download_target.strip_suffix(&suffix).ok_or_else(|| {
+        CoreError::invalid_input("prepared blob download target has an unexpected path")
+    })?;
+    normalize_storage_origin(origin)
 }

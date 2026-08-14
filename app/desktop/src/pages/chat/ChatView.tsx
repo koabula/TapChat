@@ -38,9 +38,10 @@ import {
   syncGroupOutbox,
   type GroupMessageView,
 } from "@/lib/tauri";
-import type { Message, CoreUpdateEvent, CloudflareStatus, StorageRef } from "@/lib/types";
+import type { Message, MessagePage, CoreUpdateEvent, CloudflareStatus, StorageRef } from "@/lib/types";
 import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
 import { findMessageMatches, moveSearchIndex } from "@/lib/messageSearch";
+import { mergeMessagePage, reconcileLatestMessagePage } from "@/lib/messageMerge";
 
 interface SendMessageResult {
   message_id: string;
@@ -56,6 +57,8 @@ export default function ChatView() {
   const { id: conversationId } = useParams();
   const navigate = useNavigate();
   const [messages, setMessages] = useState<Message[]>([]);
+  const [nextMessageCursor, setNextMessageCursor] = useState<string | null>(null);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [groupMessages, setGroupMessages] = useState<GroupMessageView[]>([]);
   const [loading, setLoading] = useState(false);
   const [memberDrawerOpen, setMemberDrawerOpen] = useState(false);
@@ -281,21 +284,19 @@ export default function ChatView() {
     if (isGroup) {
       return groupMessages.flatMap((message) =>
         message.kind === "bubble"
-          ? refsToMediaItems(
-              message.storage_refs ?? [],
-              message.message_id,
-              conversationId,
-            )
+          ? message.attachment_manifest
+            ? [manifestToMediaItem(message.attachment_manifest, message.message_id, conversationId)]
+            : refsToMediaItems(
+                message.storage_refs ?? [],
+                message.message_id,
+                conversationId,
+              )
           : [],
       );
     }
-    return messages.flatMap((message) =>
-      refsToMediaItems(
-        message.storage_refs ?? [],
-        message.message_id,
-        conversationId,
-      ),
-    );
+    return messages.flatMap((message) => message.attachment_manifest
+      ? [manifestToMediaItem(message.attachment_manifest, message.message_id, conversationId, message.attachment_state, message.delivery_state)]
+      : refsToMediaItems(message.storage_refs ?? [], message.message_id, conversationId));
   }, [conversationId, groupMessages, isGroup, messages]);
 
   const openMedia = (item: MediaItem) => {
@@ -315,10 +316,34 @@ export default function ChatView() {
     });
   };
 
+  const loadOlderMessages = async () => {
+    if (!conversationId || isGroup || !nextMessageCursor || loadingOlderMessages) return;
+    const container = messagesContainerRef.current;
+    const previousHeight = container?.scrollHeight ?? 0;
+    setLoadingOlderMessages(true);
+    try {
+      const page = await invoke<MessagePage>("get_messages", {
+        conversationId,
+        beforeCursor: nextMessageCursor,
+        limit: 50,
+      });
+      setMessages((current) => mergeMessagePage(current, page.items));
+      setNextMessageCursor(page.next_cursor ?? null);
+      requestAnimationFrame(() => {
+        if (container) container.scrollTop += container.scrollHeight - previousHeight;
+      });
+    } catch (error) {
+      console.error(`[ChatView] Failed to load older messages: ${String(error)}`);
+    } finally {
+      setLoadingOlderMessages(false);
+    }
+  };
+
   const handleScroll = () => {
     if (!messagesContainerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesContainerRef.current;
     shouldAutoScrollRef.current = scrollHeight - scrollTop - clientHeight < 100;
+    if (scrollTop < 80) void loadOlderMessages();
   };
 
   const refreshCurrentGroupSnapshot = async () => {
@@ -495,8 +520,9 @@ export default function ChatView() {
         setGroupMessages(result);
         setMessages([]);
       } else {
-        const result = await invoke<Message[]>("get_messages", { conversationId });
-        setMessages(result);
+        const page = await invoke<MessagePage>("get_messages", { conversationId, limit: 50 });
+        setMessages(page.items);
+        setNextMessageCursor(page.next_cursor ?? null);
         setGroupMessages([]);
       }
     } catch (err) {
@@ -515,8 +541,9 @@ export default function ChatView() {
         const result = await getGroupMessages(conversationId);
         setGroupMessages(result);
       } else {
-        const result = await invoke<Message[]>("get_messages", { conversationId });
-        setMessages(result);
+        const page = await invoke<MessagePage>("get_messages", { conversationId, limit: 50 });
+        setMessages((current) => reconcileLatestMessagePage(current, page.items));
+        setNextMessageCursor((current) => current ?? page.next_cursor ?? null);
       }
     } catch (err) {
       console.error(`[ChatView] Failed to refresh messages: ${String(err)}`);
@@ -694,6 +721,48 @@ export default function ChatView() {
       userId: message.sender_user_id,
       deviceId: message.sender_device_id,
     });
+    if (message.attachment_manifest) {
+      const item = manifestToMediaItem(message.attachment_manifest, message.message_id, conversationId ?? "");
+      return (
+        <div className="max-w-[min(72vw,32rem)]">
+          {!sent && <span className="mb-1 block truncate px-1 text-xs text-muted-color">{senderName}</span>}
+          {item.type === "image" ? (
+            <div className="relative overflow-hidden rounded-xl">
+              <ImageGrid items={[item]} onImageClick={() => openMedia(item)} />
+              <span className="pointer-events-none absolute bottom-1.5 right-1.5 rounded-full bg-black/55 px-2 py-0.5 text-[10px] text-white/85">
+                {formatTime(message.created_at)}
+              </span>
+            </div>
+          ) : item.type === "video" || item.type === "audio" ? (
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 rounded-xl border border-subtle bg-surface-elevated px-4 py-3 text-left transition-colors hover:border-default"
+              onClick={() => openMedia(item)}
+            >
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-surface text-muted-color">
+                {item.type === "video" ? <Clapperboard size={20} /> : <Music size={20} />}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium">{item.fileName || (item.type === "video" ? "Video" : "Audio")}</span>
+                <span className="block text-xs text-muted-color">{formatTime(message.created_at)}{formatMediaSize(item.sizeBytes)}</span>
+              </span>
+            </button>
+          ) : (
+            <div className="rounded-xl bg-surface-elevated p-2">
+              <AttachmentPreview
+                conversationId={item.conversationId}
+                messageId={item.messageId}
+                reference="original"
+                mimeType={item.mimeType}
+                fileName={item.fileName}
+                sizeBytes={item.sizeBytes}
+              />
+              <span className="mt-1 block px-1 text-right text-xs opacity-60">{formatTime(message.created_at)}</span>
+            </div>
+          )}
+        </div>
+      );
+    }
     if (!hasAttachment) {
       return (
         <div className={bubbleCls}>
@@ -716,14 +785,14 @@ export default function ChatView() {
     const validRefs = refs.filter((r) => r.ref);
     const attachmentRefs = validRefs.length > 0 ? validRefs : refs;
     return (
-      <div className={bubbleCls}>
+      <div className="max-w-[min(72vw,32rem)]">
         {!sent && (
-          <span className="block text-xs text-muted-color mb-1 truncate">
+          <span className="mb-1 block truncate px-1 text-xs text-muted-color">
             {senderName}
           </span>
         )}
         {renderAttachmentStack(message.message_id, attachmentRefs)}
-        <span className="block text-xs text-right mt-1 opacity-60">
+        <span className="mt-1 block px-1 text-right text-xs opacity-60">
           {formatTime(message.created_at)}
         </span>
       </div>
@@ -736,11 +805,43 @@ export default function ChatView() {
     const refs = msg.storage_refs ?? [];
     const hasAttachment = msg.has_attachment || refs.length > 0;
 
+    if (msg.attachment_manifest) {
+      const item = manifestToMediaItem(msg.attachment_manifest, msg.message_id, conversationId!, msg.attachment_state, msg.delivery_state);
+      const status = msg.delivery_state === "sending"
+        ? " · Sending…"
+        : msg.delivery_state === "failed"
+          ? " · Upload failed"
+          : "";
+      return <div className="max-w-[min(72vw,32rem)]">
+        {item.type === "image" ? <div className="relative overflow-hidden rounded-xl">
+          <ImageGrid items={[item]} onImageClick={() => openMedia(item)} />
+          <span className="pointer-events-none absolute bottom-1.5 right-1.5 rounded-full bg-black/55 px-2 py-0.5 text-[10px] text-white/85">
+            {formatTime(msg.created_at)}{status}
+          </span>
+        </div> : item.type === "video" || item.type === "audio" ? <button
+          type="button"
+          className="flex w-full items-center gap-3 rounded-xl border border-subtle bg-surface-elevated px-4 py-3 text-left transition-colors hover:border-default"
+          onClick={() => openMedia(item)}
+        >
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-surface text-muted-color">
+            {item.type === "video" ? <Clapperboard size={20} /> : <Music size={20} />}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-medium">{item.fileName || (item.type === "video" ? "Video" : "Audio")}</span>
+            <span className="block text-xs text-muted-color">{formatTime(msg.created_at)}{status}{formatMediaSize(item.sizeBytes)}</span>
+          </span>
+        </button> : <div className="rounded-xl bg-surface-elevated p-2">
+          <AttachmentPreview messageId={msg.message_id} conversationId={conversationId!} reference="original" mimeType={item.mimeType} fileName={item.fileName} sizeBytes={item.sizeBytes} showInline={false} />
+          <span className="mt-1 block px-1 text-right text-xs opacity-60">{formatTime(msg.created_at)}{status}</span>
+        </div>}
+      </div>;
+    }
+
     if (!hasAttachment) {
       const attachmentMeta = tryParseAttachmentFromPlaintext(msg.plaintext);
       if (attachmentMeta) {
         return (
-          <div className={bubbleCls}>
+          <div className="max-w-[min(72vw,32rem)] rounded-xl bg-surface-elevated p-2">
             <AttachmentPreview
               messageId={msg.message_id}
               conversationId={conversationId!}
@@ -749,7 +850,7 @@ export default function ChatView() {
               fileName={attachmentMeta.fileName}
               showInline={false}
             />
-            <span className="block text-xs text-right mt-1 opacity-60">
+            <span className="mt-1 block px-1 text-right text-xs opacity-60">
               {formatTime(msg.created_at)}
             </span>
           </div>
@@ -773,9 +874,9 @@ export default function ChatView() {
     const attachmentRefs = validRefs.length > 0 ? validRefs : refs;
 
     return (
-      <div className={bubbleCls}>
+      <div className="max-w-[min(72vw,32rem)]">
         {renderAttachmentStack(msg.message_id, attachmentRefs)}
-        <span className="block text-xs text-right mt-1 opacity-60">
+        <span className="mt-1 block px-1 text-right text-xs opacity-60">
           {formatTime(msg.created_at)}
           {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
           {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
@@ -1154,7 +1255,6 @@ function refsToMediaItems(
       type: mediaTypeFromMime(ref.mime_type || "application/octet-stream"),
       messageId,
       conversationId,
-      reference: ref.ref,
       mimeType: ref.mime_type || "application/octet-stream",
       fileName: ref.file_name,
       sizeBytes: ref.size_bytes,
@@ -1162,8 +1262,31 @@ function refsToMediaItems(
     }));
 }
 
+function manifestToMediaItem(
+  manifest: import("@/lib/types").AttachmentManifestView,
+  messageId: string,
+  conversationId: string,
+  attachmentState: "pending" | "published" = "published",
+  uploadState: "sending" | "sent" | "failed" = "sent",
+): MediaItem {
+  return {
+    type: manifest.kind === "file" ? "other" : manifest.kind,
+    messageId,
+    conversationId,
+    mimeType: manifest.mime_type,
+    fileName: manifest.file_name,
+    sizeBytes: manifest.size_bytes,
+    width: manifest.width,
+    height: manifest.height,
+    blurHash: manifest.blur_hash,
+    previewAvailable: manifest.preview_available,
+    attachmentState,
+    uploadState,
+  };
+}
+
 function mediaItemKey(item: MediaItem): string {
-  return `${item.messageId}:${item.reference}:${item.mimeType}`;
+  return `${item.messageId}:${item.mimeType}`;
 }
 
 function formatMediaSize(sizeBytes?: number): string {

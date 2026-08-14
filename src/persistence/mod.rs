@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::attachment_crypto::AttachmentPayloadMetadata;
+use crate::attachment_crypto::{AttachmentVariant, EncryptedBlobDescriptor};
 use crate::conversation::LocalConversationState;
+use crate::ffi_api::{AttachmentDescriptor, AttachmentVariantSource};
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsConversationPatch, PublishedKeyPackage};
 use crate::model::{
@@ -329,14 +330,14 @@ pub enum PersistedPendingBlobTransfer {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_id: Option<String>,
         message_id: String,
-        attachment_id: String,
-        blob_ciphertext_b64: Option<String>,
-        payload_metadata: Option<AttachmentPayloadMetadata>,
-        mime_type: String,
-        size_bytes: u64,
-        file_name: Option<String>,
-        metadata_ciphertext: Option<String>,
+        #[serde(default)]
+        created_at: u64,
+        descriptor: AttachmentDescriptor,
+        source: AttachmentVariantSource,
+        variant: AttachmentVariant,
+        encrypted_descriptor: Option<EncryptedBlobDescriptor>,
         prepared_upload: Option<PrepareBlobUploadResult>,
+        uploaded: bool,
         retries: u8,
     },
     Download {
@@ -345,7 +346,7 @@ pub enum PersistedPendingBlobTransfer {
         message_id: String,
         reference: String,
         destination_id: String,
-        payload_metadata: AttachmentPayloadMetadata,
+        blob_descriptor: EncryptedBlobDescriptor,
         retries: u8,
     },
 }
@@ -1061,16 +1062,20 @@ mod tests {
                 message_id: "msg:1".into(),
                 reference: "cid:1".into(),
                 destination_id: "download.bin".into(),
-                payload_metadata: AttachmentPayloadMetadata {
+                blob_descriptor: crate::attachment_crypto::EncryptedBlobDescriptor {
+                    variant: crate::attachment_crypto::AttachmentVariant::Original,
+                    object_ref: "cid:1".into(),
+                    storage_origin: "https://storage.example.com".into(),
+                    read_capability: "read-capability".into(),
                     mime_type: "application/octet-stream".into(),
-                    size_bytes: 8,
-                    file_name: Some("download.bin".into()),
+                    plaintext_size: 8,
+                    ciphertext_size: 24,
+                    digest_sha256: crate::attachment_crypto::sha256_hex(b"12345678"),
                     encryption: crate::attachment_crypto::AttachmentCipherMetadata {
                         algorithm: crate::attachment_crypto::ATTACHMENT_CIPHER_ALGORITHM.into(),
                         key_b64: base64::engine::general_purpose::STANDARD.encode([7_u8; 32]),
                         nonce_b64: base64::engine::general_purpose::STANDARD.encode([9_u8; 12]),
                     },
-                    download_grant: None,
                 },
                 retries: 1,
             }],
@@ -1167,6 +1172,9 @@ mod tests {
                 deployment_bundle: DeploymentBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     runtime_id: "runtime:test".into(),
+                    protocol_version: 4,
+                    worker_build_id: "test-worker-v4".into(),
+                    registry_schema_version: 1,
                     region: "local".into(),
                     inbox_http_endpoint: "https://example.com".into(),
                     inbox_websocket_endpoint: "wss://example.com/ws".into(),

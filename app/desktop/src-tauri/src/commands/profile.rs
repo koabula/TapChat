@@ -238,6 +238,12 @@ async fn reload_engine_from_profile(
     state: &State<'_, AppState>,
 ) -> Result<(), String> {
     state.runtime_auth.invalidate();
+    state
+        .profile_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state.media_handles.write().await.clear();
+    state.staged_attachments.lock().await.clear();
+    state.media_inflight.lock().await.clear();
     // Emit profile-switch-start to notify frontend that we're beginning a switch
     let _ = app.emit("profile-switch-start", {});
 

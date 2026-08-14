@@ -1718,7 +1718,7 @@ impl CliApp {
                     &identity.user_identity.user_id,
                     &identity.user_identity.user_public_key,
                 )?;
-                wait_until_ready(&instance.base_url).await?;
+                wait_until_ready(&instance.base_url, &runtime_id).await?;
                 let bundle = fetch_deployment_bundle_v3(
                     &instance.base_url,
                     &identity.user_identity.user_id,
@@ -1756,7 +1756,6 @@ impl CliApp {
                     deploy_url: None,
                     deployment_region: None,
                     bucket_name: None,
-                    preview_bucket_name: None,
                     last_deployed_at: None,
                     secret_rotation: Default::default(),
                 })?;
@@ -1816,7 +1815,6 @@ impl CliApp {
                     "deploy_url": runtime.deploy_url,
                     "deployment_region": runtime.deployment_region,
                     "bucket_name": runtime.bucket_name,
-                    "preview_bucket_name": runtime.preview_bucket_name,
                     "service_root": runtime.service_root,
                     "secret_rotation": runtime.secret_rotation,
                     "deployment_bound": profile.metadata().deployment_bundle_path.is_some(),
@@ -2092,7 +2090,6 @@ impl CliApp {
         pending_runtime.public_base_url = Some(config.public_base_url.clone());
         pending_runtime.deployment_region = Some(config.deployment_region.clone());
         pending_runtime.bucket_name = Some(config.bucket_name.clone());
-        pending_runtime.preview_bucket_name = Some(config.preview_bucket_name.clone());
         pending_runtime.bootstrap_secret = None;
         pending_runtime.secret_rotation.last_error = Some("upgrade_pending_enrollment".into());
         let pending_secrets = RuntimeSecrets {
@@ -2105,7 +2102,7 @@ impl CliApp {
         };
         profile.save_runtime_rotation_state(&pending_runtime, &pending_secrets)?;
         let deployment = deploy_cloudflare_runtime(service_root, &config).await?;
-        wait_until_ready(&deployment.effective_public_base_url).await?;
+        wait_until_ready(&deployment.effective_public_base_url, &config.runtime_id).await?;
         let bundle =
             fetch_deployment_bundle_v3(&deployment.effective_public_base_url, user_id, device_id)
                 .await?;
@@ -2148,7 +2145,6 @@ impl CliApp {
             deploy_url: Some(deployment.deploy_url.clone()),
             deployment_region: Some(deployment.deployment_region.clone()),
             bucket_name: Some(deployment.bucket_name.clone()),
-            preview_bucket_name: Some(deployment.preview_bucket_name.clone()),
             last_deployed_at: Some(format!("{:?}", std::time::SystemTime::now())),
             secret_rotation: RuntimeSecretRotationMetadata {
                 phase: if has_previous {
@@ -2195,7 +2191,6 @@ impl CliApp {
             "public_base_url": deployment.effective_public_base_url,
             "deploy_url": deployment.deploy_url,
             "bucket_name": deployment.bucket_name,
-            "preview_bucket_name": deployment.preview_bucket_name,
             "deployment_region": deployment.deployment_region,
             "generated_secrets": deployment.generated_secrets,
             "user_id": user_id,
@@ -2321,6 +2316,10 @@ fn attachment_descriptor(path: &Path) -> Result<AttachmentDescriptor> {
         mime_type: mime_type.to_string(),
         size_bytes: metadata.len(),
         file_name,
+        preview: None,
+        width: None,
+        height: None,
+        blur_hash: None,
     })
 }
 
@@ -2404,10 +2403,6 @@ fn rebuild_cloudflare_config(
             .bucket_name
             .clone()
             .ok_or_else(|| anyhow!("cloudflare bucket_name is not recorded"))?,
-        preview_bucket_name: runtime
-            .preview_bucket_name
-            .clone()
-            .ok_or_else(|| anyhow!("cloudflare preview_bucket_name is not recorded"))?,
         sharing_token_secret: secrets
             .sharing_secret
             .clone()

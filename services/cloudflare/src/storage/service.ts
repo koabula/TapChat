@@ -1,7 +1,4 @@
 import {
-  CURRENT_MODEL_VERSION,
-  type AuthorizeBlobDownloadResult,
-  type BlobDownloadGrant,
   type PrepareBlobUploadRequest,
   type PrepareBlobUploadResult
 } from "../types/contracts";
@@ -10,11 +7,8 @@ import { HttpError } from "../auth/capability";
 import { signSharingPayload, verifySharingPayload } from "./sharing";
 
 const MAX_BLOB_BYTES = 25 * 1024 * 1024;
-const MAX_MIME_TYPE_LENGTH = 255;
-const MAX_FILE_NAME_BYTES = 255;
 const SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1000;
-const DEFAULT_DOWNLOAD_GRANT_TTL_DAYS = 365;
-const MAX_DOWNLOAD_GRANT_TTL_DAYS = 3650;
+const CAPABILITY_METADATA_KEY = "read-capability-sha256";
 
 function sanitizeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
@@ -27,36 +21,36 @@ function requireNonEmpty(value: string | undefined, field: string): string {
   return value;
 }
 
-function validateMimeType(mimeType: string): void {
-  if (mimeType.trim().length === 0 || mimeType.length > MAX_MIME_TYPE_LENGTH || /[\r\n]/.test(mimeType)) {
-    throw new HttpError(400, "invalid_input", "mime type is invalid");
-  }
+function randomCapability(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function validateFileName(fileName: string | undefined): void {
-  if (fileName === undefined) {
-    return;
+async function capabilityHash(value: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function constantTimeEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
   }
-  if (
-    fileName.trim().length === 0 ||
-    fileName.length > MAX_FILE_NAME_BYTES ||
-    /[\/\\\0\r\n]/.test(fileName)
-  ) {
-    throw new HttpError(400, "invalid_input", "file name is invalid");
-  }
+  return difference === 0;
 }
 
 export class StorageService {
   private readonly store: JsonBlobStore;
   private readonly baseUrl: string;
   private readonly secret: string;
-  private readonly downloadGrantTtlDays: number;
 
-  constructor(store: JsonBlobStore, baseUrl: string, secret: string, downloadGrantTtlDays = DEFAULT_DOWNLOAD_GRANT_TTL_DAYS) {
+  constructor(store: JsonBlobStore, baseUrl: string, secret: string) {
     this.store = store;
     this.baseUrl = baseUrl;
     this.secret = secret;
-    this.downloadGrantTtlDays = clampDownloadGrantTtlDays(downloadGrantTtlDays);
   }
 
   async prepareUpload(
@@ -67,8 +61,9 @@ export class StorageService {
     const taskId = requireNonEmpty(input.taskId, "taskId");
     const conversationId = requireNonEmpty(input.conversationId, "conversationId");
     const messageId = requireNonEmpty(input.messageId, "messageId");
-    validateMimeType(input.mimeType);
-    validateFileName(input.fileName);
+    if (input.variant !== "original" && input.variant !== "preview") {
+      throw new HttpError(400, "invalid_input", "variant must be original or preview");
+    }
     if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_BLOB_BYTES) {
       throw new HttpError(400, "invalid_input", "sizeBytes is outside supported limits");
     }
@@ -80,7 +75,8 @@ export class StorageService {
       throw new HttpError(400, "invalid_input", "groupId is required for group storage");
     }
     const blobKey = [
-      "blob",
+      "blobs",
+      input.variant,
       sanitizeSegment(owner.userId),
       sanitizeSegment(owner.deviceId),
       storageScope,
@@ -89,85 +85,59 @@ export class StorageService {
       `${sanitizeSegment(messageId)}-${sanitizeSegment(taskId)}`
     ].join("/");
     const expiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
-    const grantExpiresAt = now + this.downloadGrantTtlDays * 24 * 60 * 60 * 1000;
+    const readCapability = randomCapability();
+    const readCapabilityHash = await capabilityHash(readCapability);
     const uploadToken = await signSharingPayload(this.secret, {
       action: "upload",
       blobKey,
       sizeBytes: input.sizeBytes,
+      readCapabilityHash,
       expiresAt
     });
-    const refreshToken = await signSharingPayload(this.secret, {
-      service: "storage",
-      action: "authorize_download",
-      blobKey,
-      expiresAt: grantExpiresAt
-    });
-    const downloadGrant: BlobDownloadGrant = {
-      version: CURRENT_MODEL_VERSION,
-      service: "storage",
-      action: "authorize_download",
-      blobRef: blobKey,
-      authorizeEndpoint: `${this.baseUrl}/v1/storage/authorize-download`,
-      token: refreshToken,
-      expiresAt: grantExpiresAt
-    };
 
     return {
       blobRef: blobKey,
       uploadTarget: `${this.baseUrl}/v1/storage/upload/${encodeURIComponent(blobKey)}?token=${encodeURIComponent(uploadToken)}`,
       uploadHeaders: {
-        "content-type": input.mimeType
+        "content-type": "application/octet-stream"
       },
-      downloadGrant,
+      readCapability,
+      downloadTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}`,
       expiresAt
     };
   }
 
-  async uploadBlob(blobKey: string, token: string, body: ArrayBuffer, metadata: Record<string, string>, now: number): Promise<void> {
-    const payload = await this.verifyToken<{ action: string; blobKey: string; sizeBytes?: number }>(token, now);
+  async uploadBlob(blobKey: string, token: string, body: ArrayBuffer, now: number): Promise<void> {
+    const payload = await this.verifyToken<{ action: string; blobKey: string; sizeBytes?: number; readCapabilityHash?: string }>(token, now);
     if (payload.action !== "upload" || payload.blobKey !== blobKey) {
       throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
     }
     if (!Number.isSafeInteger(payload.sizeBytes) || body.byteLength !== payload.sizeBytes) {
       throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
-    await this.store.putBytes(blobKey, body, metadata);
-  }
-
-  async fetchBlob(blobKey: string, token: string, now: number): Promise<ArrayBuffer> {
-    const payload = await this.verifyToken<{ action: string; blobKey: string }>(token, now);
-    if (payload.action !== "download" || payload.blobKey !== blobKey) {
-      throw new HttpError(403, "invalid_capability", "download token is not valid for this blob");
+    if (!payload.readCapabilityHash) {
+      throw new HttpError(403, "invalid_capability", "upload token is missing blob capability binding");
     }
-    const object = await this.store.getBytes(blobKey);
-    if (!object) {
-      throw new HttpError(404, "blob_not_found", "blob does not exist");
-    }
-    return object;
-  }
-
-  async authorizeDownload(blobRef: string, token: string, now: number): Promise<AuthorizeBlobDownloadResult> {
-    const blobKey = requireNonEmpty(blobRef, "blobRef");
-    const payload = await this.verifyToken<{ service?: string; action: string; blobKey: string }>(token, now);
-    if (payload.service !== "storage" || payload.action !== "authorize_download" || payload.blobKey !== blobKey) {
-      throw new HttpError(403, "invalid_capability", "download refresh grant is not valid for this blob");
-    }
-    const object = await this.store.getBytes(blobKey);
-    if (!object) {
-      throw new HttpError(404, "blob_not_found", "blob does not exist");
-    }
-    const expiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
-    const downloadToken = await signSharingPayload(this.secret, {
-      action: "download",
-      blobKey,
-      expiresAt
+    await this.store.putBytes(blobKey, body, {
+      [CAPABILITY_METADATA_KEY]: payload.readCapabilityHash,
+      "content-type": "application/octet-stream"
     });
-    return {
-      blobRef: blobKey,
-      downloadTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}?token=${encodeURIComponent(downloadToken)}`,
-      downloadHeaders: {},
-      expiresAt
-    };
+  }
+
+  async fetchBlob(blobKey: string, capability: string): Promise<ArrayBuffer> {
+    if (!capability || !this.store.getBytesMetadata) {
+      throw new HttpError(403, "invalid_capability", "blob capability cannot be verified");
+    }
+    const object = await this.store.getBytesMetadata(blobKey);
+    if (!object) {
+      throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    const expectedHash = object.customMetadata[CAPABILITY_METADATA_KEY];
+    const actualHash = await capabilityHash(capability);
+    if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
+      throw new HttpError(403, "invalid_capability", "blob capability is not valid for this object");
+    }
+    return object.bytes;
   }
 
   async putJson<T>(key: string, value: T): Promise<void> {
@@ -193,11 +163,4 @@ export class StorageService {
       throw new HttpError(403, "invalid_capability", message);
     }
   }
-}
-
-export function clampDownloadGrantTtlDays(value: number): number {
-  if (!Number.isFinite(value) || value <= 0) {
-    return DEFAULT_DOWNLOAD_GRANT_TTL_DAYS;
-  }
-  return Math.min(Math.floor(value), MAX_DOWNLOAD_GRANT_TTL_DAYS);
 }
