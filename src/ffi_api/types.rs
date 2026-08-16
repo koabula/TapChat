@@ -252,6 +252,9 @@ pub enum CoreCommand {
 pub enum CoreEvent {
     AppStarted,
     AppForegrounded,
+    CredentialMaintenanceRequested {
+        now_ms: u64,
+    },
     WebSocketConnected {
         device_id: String,
     },
@@ -279,8 +282,7 @@ pub enum CoreEvent {
     },
     HttpRequestFailed {
         request_id: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     IdentityBundleFetched {
         user_id: String,
@@ -288,15 +290,13 @@ pub enum CoreEvent {
     },
     IdentityBundleFetchFailed {
         user_id: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     MessageRequestsFetched {
         requests: Vec<MessageRequestItem>,
     },
     MessageRequestsFetchFailed {
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     MessageRequestActionCompleted {
         result: MessageRequestActionResult,
@@ -304,32 +304,34 @@ pub enum CoreEvent {
     MessageRequestActionFailed {
         request_id: String,
         action: MessageRequestAction,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     AllowlistFetched {
         document: AllowlistDocument,
     },
     AllowlistFetchFailed {
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     AllowlistReplaced {
         document: AllowlistDocument,
     },
     AllowlistReplaceFailed {
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     SharedStatePublished {
+        operation_id: Option<String>,
         document_kind: SharedStateDocumentKind,
         reference: String,
+        etag: Option<String>,
+        saved_bundle: Option<IdentityBundle>,
     },
     SharedStatePublishFailed {
+        operation_id: Option<String>,
         document_kind: SharedStateDocumentKind,
         reference: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
+        current_bundle: Option<IdentityBundle>,
+        etag: Option<String>,
     },
     AttachmentBytesLoaded {
         task_id: String,
@@ -350,8 +352,7 @@ pub enum CoreEvent {
     },
     BlobTransferFailed {
         task_id: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     TimerTriggered {
         timer_id: String,
@@ -366,10 +367,7 @@ pub enum CoreEvent {
     },
     GroupOutboxFetchFailed {
         group_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupOutboxHeadFetched {
         group_id: String,
@@ -379,10 +377,7 @@ pub enum CoreEvent {
     },
     GroupOutboxHeadFetchFailed {
         group_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupEnvelopeAppended {
         group_id: String,
@@ -392,10 +387,7 @@ pub enum CoreEvent {
     GroupEnvelopeAppendFailed {
         group_id: String,
         message_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupTransitionAppended {
         group_id: String,
@@ -408,10 +400,7 @@ pub enum CoreEvent {
     GroupTransitionAppendFailed {
         group_id: String,
         transition_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupAuthorizationStateFetched {
         group_id: String,
@@ -423,10 +412,7 @@ pub enum CoreEvent {
     },
     GroupAuthorizationStateFetchFailed {
         group_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupAuthorizationInitialized {
         group_id: String,
@@ -434,10 +420,7 @@ pub enum CoreEvent {
     },
     GroupAuthorizationInitializeFailed {
         group_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupOutboxSealed {
         group_id: String,
@@ -447,10 +430,7 @@ pub enum CoreEvent {
     },
     GroupOutboxSealFailed {
         group_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     WelcomePickupFetched {
         descriptor: crate::model::WelcomePickupDescriptor,
@@ -459,16 +439,14 @@ pub enum CoreEvent {
     },
     WelcomePickupFetchFailed {
         descriptor: crate::model::WelcomePickupDescriptor,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     WelcomePickupPut {
         descriptor: crate::model::WelcomePickupDescriptor,
     },
     WelcomePickupPutFailed {
         descriptor: crate::model::WelcomePickupDescriptor,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupInviteCreated {
         invite_url: String,
@@ -476,8 +454,7 @@ pub enum CoreEvent {
     },
     GroupInviteCreateFailed {
         group_id: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupInviteFetched {
         invite_url: String,
@@ -485,8 +462,7 @@ pub enum CoreEvent {
     },
     GroupInviteFetchFailed {
         invite_url: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupInviteRevoked {
         group_id: String,
@@ -502,8 +478,7 @@ pub enum CoreEvent {
     },
     GroupJoinRequestSubmitFailed {
         invite_url: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupJoinRequestsListed {
         group_id: String,
@@ -526,10 +501,7 @@ pub enum CoreEvent {
     GroupJoinClaimFailed {
         group_id: String,
         request_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupJoinCompleted {
         request: GroupJoinRequest,
@@ -537,10 +509,7 @@ pub enum CoreEvent {
     GroupJoinCompleteFailed {
         group_id: String,
         request_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupLeaveRequestSubmitted {
         request: GroupLeaveRequest,
@@ -548,10 +517,7 @@ pub enum CoreEvent {
     GroupLeaveRequestSubmitFailed {
         group_id: String,
         request_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupLeaveRequestsListed {
         group_id: String,
@@ -565,16 +531,12 @@ pub enum CoreEvent {
     GroupLeaveClaimFailed {
         group_id: String,
         request_id: String,
-        retryable: bool,
-        status: Option<u16>,
-        code: Option<String>,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupJoinDecisionFailed {
         group_id: String,
         request_id: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     },
     GroupWebSocketConnected {
         group_id: String,
@@ -1032,6 +994,8 @@ pub struct CoreViewModel {
     /// Result summary for `SyncGroupsForNewDevice` batch operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_sync_results: Option<GroupSyncResults>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operation_results: Vec<CoreOperationResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1045,6 +1009,25 @@ pub struct CoreOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreOperationStatus {
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoreOperationResult {
+    pub operation_id: String,
+    pub status: CoreOperationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::error::AppErrorV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingOutboxItem {
     pub(crate) envelope: Envelope,
     pub(crate) peer_user_id: String,
@@ -1054,6 +1037,8 @@ pub(crate) struct PendingOutboxItem {
     pub(crate) app_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) plaintext_cache: Option<String>,
+    #[serde(default)]
+    pub(crate) identity_refresh_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1172,6 +1157,8 @@ pub(crate) struct CoreState {
     pub(crate) mls_adapter: Option<MlsAdapter>,
     pub(crate) mls_summaries: BTreeMap<String, MlsStateSummary>,
     pub(crate) published_key_package: Option<PublishedKeyPackage>,
+    pub(crate) key_package_inventory: Vec<PublishedKeyPackage>,
+    pub(crate) pending_identity_publication: Option<crate::persistence::PendingIdentityPublication>,
     pub(crate) pending_requests: BTreeMap<String, PendingRequest>,
     pub(crate) request_nonce: u64,
     pub(crate) message_nonce: u64,
@@ -1340,6 +1327,8 @@ impl Default for CoreState {
             mls_adapter: None,
             mls_summaries: BTreeMap::new(),
             published_key_package: None,
+            key_package_inventory: Vec::new(),
+            pending_identity_publication: None,
             pending_requests: BTreeMap::new(),
             request_nonce: 0,
             message_nonce: 0,

@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate, useParams } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
+import { presentError } from "@/lib/errors";
 
 import type { ContactRelationshipStatus, ContactSummary } from "@/lib/types";
 
@@ -63,7 +64,7 @@ export default function ContactDetail() {
       setContact(found || null);
       setDisplayName(found?.display_name || "");
     } catch (err) {
-      console.error(`[ContactDetail] Failed to load contact: ${String(err)}`);
+      console.error(`[ContactDetail] Failed to load contact: ${presentError(err).message}`);
     }
   };
 
@@ -74,7 +75,7 @@ export default function ContactDetail() {
       await invoke("refresh_contact", { userId });
       loadContact();
     } catch (err) {
-      console.error(`[ContactDetail] Failed to refresh contact: ${String(err)}`);
+      console.error(`[ContactDetail] Failed to refresh contact: ${presentError(err).message}`);
     } finally {
       setRefreshing(false);
     }
@@ -91,8 +92,8 @@ export default function ContactDetail() {
       setEditingDisplayName(false);
       loadContact();
     } catch (err) {
-      console.error(`[ContactDetail] Failed to save display name: ${String(err)}`);
-      alert(String(err));
+      console.error(`[ContactDetail] Failed to save display name: ${presentError(err).message}`);
+      alert(presentError(err).message);
     } finally {
       setSaving(false);
     }
@@ -106,13 +107,8 @@ export default function ContactDetail() {
       });
       navigate(`/chat/${result.conversation_id}`);
     } catch (err) {
-      console.error(`[ContactDetail] Failed to create conversation: ${String(err)}`);
-      const errorMsg = String(err);
-      if (errorMsg.includes("network") || errorMsg.includes("http") || errorMsg.includes("connect")) {
-        alert("Network error: Unable to connect to the peer's inbox. Both profiles need to have Cloudflare deployed to communicate.");
-      } else {
-        alert(errorMsg);
-      }
+      console.error(`[ContactDetail] Failed to create conversation: ${presentError(err).message}`);
+      alert(presentError(err).message);
     }
   };
 
@@ -129,8 +125,8 @@ export default function ContactDetail() {
       // Navigate back to contacts list
       navigate("/contacts");
     } catch (err) {
-      console.error(`[ContactDetail] Failed to delete contact: ${String(err)}`);
-      alert(String(err));
+      console.error(`[ContactDetail] Failed to delete contact: ${presentError(err).message}`);
+      alert(presentError(err).message);
     } finally {
       setDeleting(false);
     }

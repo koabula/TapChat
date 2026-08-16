@@ -201,6 +201,13 @@ impl CoreEngine {
         self.state.local_bundle.as_ref()
     }
 
+    pub fn has_pending_share_rotation(&self) -> bool {
+        self.state
+            .pending_identity_publication
+            .as_ref()
+            .is_some_and(|pending| pending.reason == "share_link_rotation")
+    }
+
     pub fn local_identity(&self) -> Option<&crate::identity::LocalIdentityState> {
         self.state.local_identity.as_ref()
     }
@@ -369,6 +376,7 @@ impl CoreEngine {
                 in_flight: false,
                 app_message_id: item.app_message_id,
                 plaintext_cache: item.plaintext_cache,
+                identity_refresh_attempted: item.identity_refresh_attempted,
             })
             .collect();
         let outbox = pending_outbox
@@ -642,7 +650,25 @@ impl CoreEngine {
                 mls_adapter: restored_mls.adapter,
                 mls_summaries,
                 published_key_package: persisted_deployment
-                    .and_then(|deployment| deployment.published_key_package),
+                    .as_ref()
+                    .and_then(|deployment| deployment.published_key_package.clone()),
+                key_package_inventory: persisted_deployment
+                    .as_ref()
+                    .map(|deployment| {
+                        if deployment.key_package_inventory.is_empty() {
+                            deployment
+                                .published_key_package
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        } else {
+                            deployment.key_package_inventory.clone()
+                        }
+                    })
+                    .unwrap_or_default(),
+                pending_identity_publication: persisted_deployment
+                    .as_ref()
+                    .and_then(|deployment| deployment.pending_identity_publication.clone()),
                 pending_requests: BTreeMap::new(),
                 request_nonce: 0,
                 message_nonce: snapshot.message_nonce,
@@ -803,11 +829,29 @@ impl CoreEngine {
             CoreCommand::CreateConversation {
                 peer_user_id,
                 conversation_kind,
-            } => self.create_conversation(peer_user_id, conversation_kind),
+            } => {
+                let now_ms = current_unix_millis(self.state.message_nonce);
+                let maintenance = if self.local_credential_maintenance_due(now_ms) {
+                    self.maintain_local_credentials(now_ms)?
+                } else {
+                    CoreOutput::default()
+                };
+                let created = self.create_conversation(peer_user_id, conversation_kind)?;
+                Ok(merge_outputs(maintenance, created))
+            }
             CoreCommand::CreateGroupConversation {
                 title,
                 member_user_ids,
-            } => self.create_group_conversation(title, member_user_ids),
+            } => {
+                let now_ms = current_unix_millis(self.state.message_nonce);
+                let maintenance = if self.local_credential_maintenance_due(now_ms) {
+                    self.maintain_local_credentials(now_ms)?
+                } else {
+                    CoreOutput::default()
+                };
+                let created = self.create_group_conversation(title, member_user_ids)?;
+                Ok(merge_outputs(maintenance, created))
+            }
             CoreCommand::SyncGroupOutbox { group_id, reason } => {
                 self.sync_group_outbox(group_id, reason)
             }
@@ -1146,6 +1190,9 @@ impl CoreEngine {
         match event {
             CoreEvent::AppStarted => self.start_foreground_sync("startup"),
             CoreEvent::AppForegrounded => self.start_foreground_sync("foreground"),
+            CoreEvent::CredentialMaintenanceRequested { now_ms } => {
+                self.maintain_local_credentials(now_ms)
+            }
             CoreEvent::WebSocketConnected { device_id } => {
                 self.handle_websocket_connected(device_id)
             }
@@ -1179,33 +1226,19 @@ impl CoreEngine {
             } => self.handle_http_response(request_id, status, body),
             CoreEvent::HttpRequestFailed {
                 request_id,
-                retryable,
-                detail,
-            } => self.handle_http_failure(request_id, retryable, detail),
+                failure,
+            } => self.handle_http_failure(request_id, failure),
             CoreEvent::IdentityBundleFetched { user_id: _, bundle } => {
                 self.apply_identity_bundle_update(bundle)
             }
             CoreEvent::IdentityBundleFetchFailed {
                 user_id,
-                retryable,
-                detail,
-            } => self.handle_identity_refresh_failure(
-                &user_id,
-                detail.unwrap_or_else(|| {
-                    if retryable {
-                        format!("identity refresh request failed for {user_id}")
-                    } else {
-                        format!("identity refresh failed for {user_id}")
-                    }
-                }),
-            ),
+                failure: _,
+            } => self.handle_identity_refresh_failure(&user_id, "Identity refresh failed.".into()),
             CoreEvent::MessageRequestsFetched { requests } => {
                 Ok(self.message_requests_output(requests))
             }
-            CoreEvent::MessageRequestsFetchFailed {
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
+            CoreEvent::MessageRequestsFetchFailed { failure: _ } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -1213,7 +1246,7 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| "message request query failed".into()),
+                        message: "TapChat couldn't refresh message requests. Try again.".into(),
                     },
                 }],
                 view_model: None,
@@ -1224,8 +1257,7 @@ impl CoreEngine {
             CoreEvent::MessageRequestActionFailed {
                 request_id,
                 action,
-                retryable: _,
-                detail,
+                failure: _,
             } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -1234,18 +1266,13 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| {
-                            format!("message request {:?} failed for {}", action, request_id)
-                        }),
+                        message: format!("TapChat couldn't complete the {action:?} action for message request {request_id}."),
                     },
                 }],
                 view_model: None,
             }),
             CoreEvent::AllowlistFetched { document } => self.handle_allowlist_fetched(document),
-            CoreEvent::AllowlistFetchFailed {
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
+            CoreEvent::AllowlistFetchFailed { failure: _ } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -1253,16 +1280,13 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| "allowlist query failed".into()),
+                        message: "TapChat couldn't refresh the allowlist. Try again.".into(),
                     },
                 }],
                 view_model: None,
             }),
             CoreEvent::AllowlistReplaced { document } => Ok(self.allowlist_output(document, true)),
-            CoreEvent::AllowlistReplaceFailed {
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
+            CoreEvent::AllowlistReplaceFailed { failure: _ } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -1270,32 +1294,271 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| "allowlist update failed".into()),
+                        message: "TapChat couldn't update the allowlist. Try again.".into(),
                     },
                 }],
                 view_model: None,
             }),
-            CoreEvent::SharedStatePublished { .. } => Ok(CoreOutput::default()),
-            CoreEvent::SharedStatePublishFailed {
-                document_kind,
+            CoreEvent::SharedStatePublished {
+                operation_id,
+                document_kind: _,
                 reference: _,
-                retryable: _,
-                detail,
-            } => Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![CoreEffect::EmitUserNotification {
-                    notification: UserNotificationEffect {
-                        status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail.unwrap_or_else(|| {
-                            format!("shared state publish failed for {:?}", document_kind)
-                        }),
+                etag,
+                saved_bundle,
+            } => {
+                let publication_revision = saved_bundle
+                    .as_ref()
+                    .map(|bundle| bundle.publication_revision);
+                let Some(operation_id) = operation_id else {
+                    return Ok(CoreOutput::default());
+                };
+                let mut effects = Vec::new();
+                if let Some(pending) = self.state.pending_identity_publication.clone() {
+                    if pending.operation_id == operation_id {
+                        let confirmed = saved_bundle.as_ref().is_some_and(|saved| {
+                            saved.publication_revision
+                                == pending.candidate_bundle.publication_revision
+                                && saved.bundle_share_id == pending.candidate_bundle.bundle_share_id
+                                && saved.signature == pending.candidate_bundle.signature
+                        });
+                        if !confirmed {
+                            if let Some(current) = self.state.pending_identity_publication.as_mut()
+                            {
+                                current.stage = crate::persistence::PendingIdentityPublicationStage::AwaitingVerification;
+                                current.expected_etag = etag.clone();
+                            }
+                            effects
+                                .push(persist_effect(&self.state, vec![PersistOp::SaveDeployment]));
+                            return Ok(CoreOutput {
+                                effects,
+                                view_model: Some(CoreViewModel {
+                                    operation_results: vec![CoreOperationResult {
+                                        operation_id,
+                                        status: CoreOperationStatus::Failed,
+                                        etag,
+                                        publication_revision,
+                                        failure: Some(
+                                            CoreError::new(
+                                                "contact_share_rotation_unverified",
+                                                "server response did not confirm the candidate identity bundle",
+                                            )
+                                            .to_app_error(),
+                                        ),
+                                    }],
+                                    ..CoreViewModel::default()
+                                }),
+                                ..CoreOutput::default()
+                            });
+                        }
+                        self.state.local_bundle = Some(pending.candidate_bundle);
+                        self.state.pending_identity_publication = None;
+                        effects.push(persist_effect(&self.state, vec![PersistOp::SaveDeployment]));
+                    }
+                }
+                Ok(CoreOutput {
+                    effects,
+                    view_model: Some(CoreViewModel {
+                        operation_results: vec![CoreOperationResult {
+                            operation_id,
+                            status: CoreOperationStatus::Confirmed,
+                            etag,
+                            publication_revision,
+                            failure: None,
+                        }],
+                        ..CoreViewModel::default()
+                    }),
+                    ..CoreOutput::default()
+                })
+            }
+            CoreEvent::SharedStatePublishFailed {
+                operation_id,
+                document_kind: _,
+                reference: _,
+                failure,
+                current_bundle,
+                etag,
+            } => {
+                if failure.code == "identity_bundle_conflict" {
+                    if let (Some(operation_id), Some(remote), Some(etag), Some(pending)) = (
+                        operation_id.as_ref(),
+                        current_bundle.as_ref(),
+                        etag.as_ref(),
+                        self.state.pending_identity_publication.clone(),
+                    ) {
+                        if pending.operation_id == *operation_id {
+                            if remote.publication_revision
+                                == pending.candidate_bundle.publication_revision
+                                && remote.bundle_share_id
+                                    == pending.candidate_bundle.bundle_share_id
+                                && remote.signature == pending.candidate_bundle.signature
+                            {
+                                self.state.local_bundle = Some(remote.clone());
+                                self.state.pending_identity_publication = None;
+                                return Ok(CoreOutput {
+                                    effects: vec![persist_effect(
+                                        &self.state,
+                                        vec![PersistOp::SaveDeployment],
+                                    )],
+                                    view_model: Some(CoreViewModel {
+                                        operation_results: vec![CoreOperationResult {
+                                            operation_id: operation_id.clone(),
+                                            status: CoreOperationStatus::Confirmed,
+                                            etag: Some(etag.clone()),
+                                            publication_revision: Some(remote.publication_revision),
+                                            failure: None,
+                                        }],
+                                        ..CoreViewModel::default()
+                                    }),
+                                    ..CoreOutput::default()
+                                });
+                            }
+                            if pending.attempt_count < 3 {
+                                let rebased = (|| -> CoreResult<IdentityBundle> {
+                                    IdentityManager::verify_identity_bundle(remote)?;
+                                    let local_identity =
+                                        self.state.local_identity.as_ref().ok_or_else(|| {
+                                            CoreError::invalid_state(
+                                                "local identity is unavailable",
+                                            )
+                                        })?;
+                                    let deployment =
+                                        self.state.deployment_bundle.as_ref().ok_or_else(|| {
+                                            CoreError::invalid_state("deployment is unavailable")
+                                        })?;
+                                    let local_device_id = &local_identity.device_identity.device_id;
+                                    let local_profile = pending
+                                        .candidate_bundle
+                                        .devices
+                                        .iter()
+                                        .find(|device| &device.device_id == local_device_id)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            CoreError::invalid_state(
+                                                "candidate local device is unavailable",
+                                            )
+                                        })?;
+                                    let now_ms = current_unix_millis(self.state.message_nonce);
+                                    let mut devices = remote
+                                        .devices
+                                        .iter()
+                                        .filter(|device| &device.device_id != local_device_id)
+                                        .cloned()
+                                        .collect::<Vec<_>>();
+                                    for device in &mut devices {
+                                        if device.keypackage_ref.as_ref().is_some_and(
+                                            |keypackage| !keypackage.is_usable_at(now_ms),
+                                        ) {
+                                            device.keypackage_ref = None;
+                                        }
+                                        if device.inbox_append_capability.as_ref().is_some_and(
+                                            |capability| capability.expires_at <= now_ms,
+                                        ) {
+                                            device.inbox_append_capability = None;
+                                        }
+                                    }
+                                    devices.push(local_profile);
+                                    devices.sort_by(|left, right| {
+                                        left.device_id.cmp(&right.device_id)
+                                    });
+                                    let mut signing_identity = local_identity.clone();
+                                    signing_identity.device_status.updated_at = remote
+                                        .publication_revision
+                                        .max(pending.candidate_bundle.publication_revision)
+                                        .saturating_add(1);
+                                    IdentityManager::export_identity_bundle_with_devices(
+                                        &signing_identity,
+                                        deployment,
+                                        devices,
+                                        pending.candidate_bundle.bundle_share_id.clone(),
+                                        self.state.local_display_name.clone(),
+                                    )
+                                })();
+                                if let Ok(candidate_bundle) = rebased {
+                                    let mut rebased_pending = pending;
+                                    rebased_pending.candidate_bundle = candidate_bundle.clone();
+                                    rebased_pending.expected_etag = Some(etag.clone());
+                                    rebased_pending.attempt_count =
+                                        rebased_pending.attempt_count.saturating_add(1);
+                                    rebased_pending.stage = crate::persistence::PendingIdentityPublicationStage::AwaitingPublish;
+                                    self.state.pending_identity_publication = Some(rebased_pending);
+                                    return Ok(CoreOutput {
+                                        effects: vec![
+                                            persist_effect(
+                                                &self.state,
+                                                vec![PersistOp::SaveDeployment],
+                                            ),
+                                            self.identity_bundle_publish_effect(
+                                                &candidate_bundle,
+                                                operation_id.clone(),
+                                                Some(etag),
+                                            )?,
+                                        ],
+                                        ..CoreOutput::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                let is_share_rotation = operation_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("contact_share_rotation:"));
+                let message = if is_share_rotation && failure.code == "contact_share_offline" {
+                    "Connect to your TapChat service before rotating the share link."
+                } else if is_share_rotation {
+                    "TapChat couldn't verify whether the link was rotated. Reconnect to check which link is active."
+                } else {
+                    "TapChat couldn't publish your secure contact information. It will retry when connected."
+                };
+                let mut operation_results = Vec::new();
+                let mut effects = Vec::new();
+                if let Some(operation_id) = operation_id {
+                    if let Some(pending) = self.state.pending_identity_publication.as_mut() {
+                        if pending.operation_id == operation_id {
+                            pending.attempt_count = pending.attempt_count.saturating_add(1);
+                            pending.stage = crate::persistence::PendingIdentityPublicationStage::AwaitingPublish;
+                            let retry_delay =
+                                30_000_u64.saturating_mul(1_u64 << pending.attempt_count.min(7));
+                            pending.next_retry_at = current_unix_millis(self.state.message_nonce)
+                                .saturating_add(retry_delay.min(24 * 60 * 60 * 1000));
+                            effects
+                                .push(persist_effect(&self.state, vec![PersistOp::SaveDeployment]));
+                            effects.push(CoreEffect::ScheduleTimer {
+                                timer: TimerEffect {
+                                    timer_id: "credential_maintenance".into(),
+                                    delay_ms: retry_delay.min(24 * 60 * 60 * 1000),
+                                },
+                            });
+                        }
+                    }
+                    operation_results.push(CoreOperationResult {
+                        operation_id,
+                        status: CoreOperationStatus::Failed,
+                        etag: None,
+                        publication_revision: None,
+                        failure: Some(failure),
+                    });
+                }
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                        ..CoreStateUpdate::default()
                     },
-                }],
-                view_model: None,
-            }),
+                    effects: {
+                        effects.push(CoreEffect::EmitUserNotification {
+                            notification: UserNotificationEffect {
+                                status: SystemStatus::TemporaryNetworkFailure,
+                                message: message.into(),
+                            },
+                        });
+                        effects
+                    },
+                    view_model: Some(CoreViewModel {
+                        operation_results,
+                        ..CoreViewModel::default()
+                    }),
+                })
+            }
             CoreEvent::AttachmentBytesLoaded { task_id, plaintext } => {
                 self.handle_attachment_bytes_loaded(task_id, plaintext)
             }
@@ -1309,9 +1572,8 @@ impl CoreEngine {
             } => self.handle_blob_downloaded(task_id, blob_ciphertext),
             CoreEvent::BlobTransferFailed {
                 task_id,
-                retryable,
-                detail,
-            } => self.handle_blob_transfer_failed(task_id, retryable, detail),
+                failure,
+            } => self.handle_blob_transfer_failed(task_id, failure.retryable, None),
             CoreEvent::TimerTriggered { timer_id } => self.handle_timer(timer_id),
             CoreEvent::UserConfirmedRebuild { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
@@ -1323,11 +1585,14 @@ impl CoreEngine {
             } => self.handle_group_outbox_records(group_id, records, to_seq),
             CoreEvent::GroupOutboxFetchFailed {
                 group_id,
-                retryable,
-                status,
-                code,
-                detail,
-            } => self.handle_group_sync_failed(group_id, retryable, status, code, detail),
+                failure,
+            } => self.handle_group_sync_failed(
+                group_id,
+                failure.retryable,
+                failure.http_status,
+                Some(failure.code),
+                None,
+            ),
             CoreEvent::GroupOutboxHeadFetched {
                 group_id,
                 head_seq,
@@ -1341,11 +1606,14 @@ impl CoreEngine {
             ),
             CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id,
-                retryable,
-                status,
-                code,
-                detail,
-            } => self.handle_group_sync_failed(group_id, retryable, status, code, detail),
+                failure,
+            } => self.handle_group_sync_failed(
+                group_id,
+                failure.retryable,
+                failure.http_status,
+                Some(failure.code),
+                None,
+            ),
             CoreEvent::GroupEnvelopeAppended {
                 group_id,
                 message_id,
@@ -1354,12 +1622,15 @@ impl CoreEngine {
             CoreEvent::GroupEnvelopeAppendFailed {
                 group_id,
                 message_id,
-                retryable,
-                status,
-                code,
-                detail,
-            } => self
-                .handle_group_append_failed(group_id, message_id, retryable, status, code, detail),
+                failure,
+            } => self.handle_group_append_failed(
+                group_id,
+                message_id,
+                failure.retryable,
+                failure.http_status,
+                Some(failure.code),
+                None,
+            ),
             CoreEvent::GroupTransitionAppended {
                 group_id,
                 transition_id,
@@ -1378,17 +1649,14 @@ impl CoreEngine {
             CoreEvent::GroupTransitionAppendFailed {
                 group_id,
                 transition_id,
-                retryable,
-                status,
-                code,
-                detail,
+                failure,
             } => self.handle_group_transition_failed(
                 group_id,
                 transition_id,
-                retryable,
-                status,
-                code,
-                detail,
+                failure.retryable,
+                failure.http_status,
+                Some(failure.code),
+                None,
             ),
             CoreEvent::GroupAuthorizationStateFetched {
                 group_id,
@@ -1407,29 +1675,28 @@ impl CoreEngine {
             ),
             CoreEvent::GroupAuthorizationStateFetchFailed {
                 group_id,
-                retryable,
-                status,
-                code,
-                detail,
-            } => self.handle_group_sync_failed(group_id, retryable, status, code, detail),
+                failure,
+            } => self.handle_group_sync_failed(
+                group_id,
+                failure.retryable,
+                failure.http_status,
+                Some(failure.code),
+                None,
+            ),
             CoreEvent::GroupAuthorizationInitialized {
                 group_id,
                 roster_version,
             } => self.handle_group_authorization_initialized(group_id, roster_version),
             CoreEvent::GroupAuthorizationInitializeFailed {
                 group_id,
-                retryable,
-                status,
-                code,
-                detail,
+                failure,
             } => {
                 log::warn!(
-                    "group authorization initialization failed: group_id={} retryable={} status={:?} code={:?} detail={:?}",
+                    "group authorization initialization failed: group_id={} retryable={} status={:?} code={}",
                     redact_id("group", &group_id),
-                    retryable,
-                    status,
-                    code,
-                    detail
+                    failure.retryable,
+                    failure.http_status,
+                    failure.code
                 );
                 Ok(CoreOutput {
                     state_update: CoreStateUpdate {
@@ -1439,12 +1706,7 @@ impl CoreEngine {
                     effects: vec![CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
                             status: SystemStatus::TemporaryNetworkFailure,
-                            message: format!(
-                                "group authorization initialization failed for {group_id}: {}",
-                                detail
-                                    .or(code)
-                                    .unwrap_or_else(|| "unknown transport error".into())
-                            ),
+                            message: "TapChat couldn't initialize group authorization. Try again.".into(),
                         },
                     }],
                     view_model: None,
@@ -1457,16 +1719,14 @@ impl CoreEngine {
             } => self.handle_welcome_pickup_fetched(descriptor, welcome_b64, manifest),
             CoreEvent::WelcomePickupFetchFailed {
                 descriptor,
-                retryable,
-                detail,
-            } => self.handle_welcome_pickup_fetch_failed(descriptor, retryable, detail),
+                failure,
+            } => self.handle_welcome_pickup_fetch_failed(descriptor, failure),
             CoreEvent::WelcomePickupPut { descriptor } => {
                 self.handle_welcome_pickup_put(descriptor)
             }
             CoreEvent::WelcomePickupPutFailed {
                 descriptor,
-                retryable: _,
-                detail,
+                failure: _,
             } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
@@ -1475,11 +1735,10 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail
-                            .map(|detail| format!("welcome pickup put failed: {detail}"))
-                            .unwrap_or_else(|| {
-                                format!("welcome pickup put failed for {}", descriptor.device_id)
-                            }),
+                        message: format!(
+                            "TapChat couldn't publish the group welcome for device {}.",
+                            descriptor.device_id
+                        ),
                     },
                 }],
                 view_model: None,
@@ -1744,10 +2003,10 @@ impl CoreEngine {
                     }),
                 })
             }
-            CoreEvent::GroupInviteCreateFailed { detail, .. }
-            | CoreEvent::GroupInviteFetchFailed { detail, .. }
-            | CoreEvent::GroupJoinRequestSubmitFailed { detail, .. }
-            | CoreEvent::GroupJoinDecisionFailed { detail, .. } => Ok(CoreOutput {
+            CoreEvent::GroupInviteCreateFailed { failure: _, .. }
+            | CoreEvent::GroupInviteFetchFailed { failure: _, .. }
+            | CoreEvent::GroupJoinRequestSubmitFailed { failure: _, .. }
+            | CoreEvent::GroupJoinDecisionFailed { failure: _, .. } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -1755,8 +2014,7 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: detail
-                            .unwrap_or_else(|| "group invite/join request failed".into()),
+                        message: "TapChat couldn't complete the group invite or join request. Try again.".into(),
                     },
                 }],
                 view_model: None,
@@ -1907,20 +2165,14 @@ impl CoreEngine {
             CoreEvent::GroupJoinClaimFailed {
                 group_id,
                 request_id,
-                retryable,
-                status: _,
-                code,
-                detail,
+                failure,
             } => {
-                let message = detail
-                    .or(code)
-                    .unwrap_or_else(|| "group join claim failed".into());
                 Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                         ..CoreStateUpdate::default()
                     },
-                    effects: if retryable {
+                    effects: if failure.retryable {
                         vec![CoreEffect::ScheduleTimer {
                             timer: TimerEffect {
                                 timer_id: format!("group_join_claim:{group_id}:{request_id}"),
@@ -1931,7 +2183,7 @@ impl CoreEngine {
                         vec![CoreEffect::EmitUserNotification {
                             notification: UserNotificationEffect {
                                 status: SystemStatus::TemporaryNetworkFailure,
-                                message,
+                                message: "TapChat couldn't claim this group join request.".into(),
                             },
                         }]
                     },
@@ -1941,16 +2193,13 @@ impl CoreEngine {
             CoreEvent::GroupJoinCompleteFailed {
                 group_id,
                 request_id,
-                retryable,
-                status: _,
-                code,
-                detail,
+                failure,
             } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
                 },
-                effects: if retryable {
+                effects: if failure.retryable {
                     vec![CoreEffect::ScheduleTimer {
                         timer: TimerEffect {
                             timer_id: format!("group_join_complete:{group_id}:{request_id}"),
@@ -1961,9 +2210,7 @@ impl CoreEngine {
                     vec![CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
                             status: SystemStatus::TemporaryNetworkFailure,
-                            message: detail
-                                .or(code)
-                                .unwrap_or_else(|| "group join completion failed".into()),
+                            message: "TapChat couldn't complete this group join request.".into(),
                         },
                     }]
                 },
@@ -2080,24 +2327,18 @@ impl CoreEngine {
             CoreEvent::GroupLeaveRequestSubmitFailed {
                 group_id,
                 request_id,
-                retryable,
-                status: _,
-                code,
-                detail,
+                failure,
             }
             | CoreEvent::GroupLeaveClaimFailed {
                 group_id,
                 request_id,
-                retryable,
-                status: _,
-                code,
-                detail,
+                failure,
             } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
                 },
-                effects: if retryable {
+                effects: if failure.retryable {
                     vec![CoreEffect::ScheduleTimer {
                         timer: TimerEffect {
                             timer_id: format!("group_leave:{group_id}:{request_id}"),
@@ -2108,9 +2349,7 @@ impl CoreEngine {
                     vec![CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
                             status: SystemStatus::TemporaryNetworkFailure,
-                            message: detail
-                                .or(code)
-                                .unwrap_or_else(|| "group leave operation failed".into()),
+                            message: "TapChat couldn't complete the group leave operation.".into(),
                         },
                     }]
                 },
@@ -2123,11 +2362,14 @@ impl CoreEngine {
             } => self.handle_group_outbox_sealed(group_id, sealed_at, was_already_sealed),
             CoreEvent::GroupOutboxSealFailed {
                 group_id,
-                retryable,
-                status,
-                code,
-                detail,
-            } => self.handle_group_outbox_seal_failed(group_id, retryable, status, code, detail),
+                failure,
+            } => self.handle_group_outbox_seal_failed(
+                group_id,
+                failure.retryable,
+                failure.http_status,
+                Some(failure.code),
+                None,
+            ),
         }
     }
 }
@@ -2285,6 +2527,8 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 deployment_bundle,
                 local_bundle: state.local_bundle.clone(),
                 published_key_package: state.published_key_package.clone(),
+                key_package_inventory: state.key_package_inventory.clone(),
+                pending_identity_publication: state.pending_identity_publication.clone(),
                 serialized_mls_bootstrap_state: if state.mls_summaries.is_empty() {
                     state
                         .mls_adapter
@@ -2326,6 +2570,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 retries: item.retries,
                 app_message_id: item.app_message_id.clone(),
                 plaintext_cache: item.plaintext_cache.clone(),
+                identity_refresh_attempted: item.identity_refresh_attempted,
             })
             .collect(),
         group_states: state.group_states.values().cloned().collect(),
@@ -2487,6 +2732,9 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
             base_view
                 .message_requests
                 .append(&mut next_view.message_requests);
+            base_view
+                .operation_results
+                .append(&mut next_view.operation_results);
             if next_view.allowlist.is_some() {
                 base_view.allowlist = next_view.allowlist.take();
             }
@@ -2720,6 +2968,8 @@ mod protected_application_message_tests {
                     plaintext: Some("hello protected".into()),
                     storage_refs: Vec::new(),
                     downloaded_blob_b64: None,
+                    delivery_state: None,
+                    message_request_id: None,
                 }],
                 last_message_type: Some(MessageType::MlsApplication),
                 peer_user_id: "user:alice".into(),
@@ -2801,9 +3051,9 @@ mod group_membership_security_tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "test".into(),
             inbox_http_endpoint: "https://example.test".into(),
             inbox_websocket_endpoint: "wss://example.test/ws".into(),

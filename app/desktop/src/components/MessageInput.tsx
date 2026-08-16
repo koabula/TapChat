@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   Clapperboard,
@@ -15,6 +14,8 @@ import {
 import {
   shouldSubmitComposerOnKeyDown,
 } from "@/lib/messageComposer";
+import { presentError } from "@/lib/errors";
+import { invokeApp as invoke } from "@/lib/tauri";
 
 const MAX_TEXTAREA_ROWS = 5;
 const TEXTAREA_LINE_HEIGHT_PX = 24;
@@ -31,7 +32,7 @@ interface SendMessageResult {
   sender_device_id: string;
   plaintext: string;
   created_at: number;
-  delivery_state?: "sending" | "sent" | "failed";
+  delivery_state?: "sending" | "sent" | "pending_approval" | "failed";
 }
 
 interface AttachmentInfo {
@@ -67,30 +68,7 @@ function attachmentId(): string {
 }
 
 function describeSendError(err: unknown): string {
-  const errorMsg = String(err);
-  const normalized = errorMsg.toLowerCase();
-  if (normalized.includes("relationship_closed:")) {
-    return "This chat is archived. Import a fresh share link to start a new chat.";
-  }
-  if (normalized.includes("temporary_failure:")) {
-    return "Temporary delivery failure. Sync and try again.";
-  }
-  if (normalized.includes("invalid_input:")) {
-    return errorMsg.replace(/^invalid_input:\s*/i, "");
-  }
-  if (
-    normalized.includes("network") ||
-    normalized.includes("transport") ||
-    normalized.includes("timeout") ||
-    normalized.includes("timed out") ||
-    normalized.includes("connect") ||
-    normalized.includes("connection") ||
-    normalized.includes("fetch failed") ||
-    normalized.includes("http")
-  ) {
-    return "Network error: Unable to deliver message. Check your connection and try again.";
-  }
-  return errorMsg;
+  return presentError(err).message;
 }
 
 function fileIcon(mimeType: string) {
@@ -143,8 +121,7 @@ export default function MessageInput({
         },
       ]);
     } catch (err) {
-      console.error(`[MessageInput] Failed to stage attachment: ${String(err)}`);
-      alert(`Unable to attach this file: ${String(err)}`);
+      alert(presentError(err).message);
     }
   }, []);
 
@@ -163,8 +140,7 @@ export default function MessageInput({
         },
       ]);
     } catch (err) {
-      console.error(`[MessageInput] Failed to read clipboard image: ${String(err)}`);
-      alert("Unable to attach this clipboard item. Try the attachment button instead.");
+      alert(presentError(err).message);
     }
   }, []);
 
@@ -241,7 +217,6 @@ export default function MessageInput({
         onSentRef.current?.();
       }
     } catch (err) {
-      console.error(`[MessageInput] Failed to send composer contents: ${String(err)}`);
       alert(describeSendError(err));
     } finally {
       setSending(false);
@@ -268,7 +243,7 @@ export default function MessageInput({
         })),
       ]);
     } catch (err) {
-      console.error(`[MessageInput] File selection failed: ${String(err)}`);
+      alert(presentError(err).message);
     }
   };
 

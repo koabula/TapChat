@@ -35,6 +35,22 @@ pub struct StoredMessage {
     pub plaintext: Option<String>,
     pub storage_refs: Vec<StorageRef>,
     pub downloaded_blob_b64: Option<String>,
+    /// Local delivery state for an outgoing application message. Incoming and
+    /// protocol messages leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_state: Option<StoredMessageDeliveryState>,
+    /// Inbox message-request identifier returned by the recipient runtime.
+    /// It binds a later signed contact-accepted control to the queued message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredMessageDeliveryState {
+    Sent,
+    PendingApproval,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +290,8 @@ impl ConversationManager {
             plaintext: None,
             storage_refs: envelope.storage_refs.clone(),
             downloaded_blob_b64: None,
+            delivery_state: None,
+            message_request_id: None,
         });
         state.last_message_type = Some(envelope.message_type);
         state.conversation.updated_at = envelope.created_at;

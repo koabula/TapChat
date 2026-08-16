@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useState, useEffect, type FormEvent } from "react";
 import { useNavigate } from "react-router";
 
@@ -52,7 +53,7 @@ export default function ContactList() {
         }));
         setContacts(mappedContacts);
       } catch (err) {
-        console.error(`[ContactList] Failed to load contacts: ${String(err)}`);
+        console.error(`[ContactList] Failed to load contacts: ${presentError(err).message}`);
       }
     }
     fetchContacts();
@@ -71,8 +72,8 @@ export default function ContactList() {
       const nextPreview = await previewContactLink(shareLinkInput);
       setPreview(nextPreview);
     } catch (err) {
-      console.error(`[ContactList] Failed to preview contact: ${String(err)}`);
-      setError(String(err));
+      console.error(`[ContactList] Failed to preview contact: ${presentError(err).message}`);
+      setError(presentError(err).message);
       setPreview(null);
     } finally {
       setPreviewing(false);
@@ -100,8 +101,8 @@ export default function ContactList() {
       setContacts(mappedContacts);
       navigate(`/chat/${result.conversation_id}`);
     } catch (err) {
-      console.error(`[ContactList] Failed to start direct chat: ${String(err)}`);
-      setError(String(err));
+      console.error(`[ContactList] Failed to start direct chat: ${presentError(err).message}`);
+      setError(presentError(err).message);
     } finally {
       setStartingChat(false);
     }

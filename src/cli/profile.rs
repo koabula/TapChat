@@ -2146,9 +2146,9 @@ mod tests {
         let bundle = crate::model::DeploymentBundle {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "test".into(),
             inbox_http_endpoint: "https://inbox.test".into(),
             inbox_websocket_endpoint: "wss://inbox.test".into(),

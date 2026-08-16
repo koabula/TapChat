@@ -1,5 +1,6 @@
+import { presentError } from "@/lib/errors";
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Check, Clipboard } from "lucide-react";
 import type { ContactLinkPreview } from "@/lib/types";
@@ -18,7 +19,7 @@ export default function Complete() {
   useEffect(() => {
     invoke<string | null>("get_share_link")
       .then(setShareLink)
-      .catch((err) => console.error(`[OnboardingComplete] Failed to get share link: ${String(err)}`));
+      .catch((err) => console.error(`[OnboardingComplete] Failed to get share link: ${presentError(err).message}`));
   }, []);
 
   const handleCopyShareLink = async () => {
@@ -28,7 +29,7 @@ export default function Complete() {
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
       } catch (err) {
-        console.error(`[OnboardingComplete] Failed to copy share link: ${String(err)}`);
+        console.error(`[OnboardingComplete] Failed to copy share link: ${presentError(err).message}`);
       }
     }
   };
@@ -45,7 +46,7 @@ export default function Complete() {
       setContactPreview(preview);
       setChatStarted(false);
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
       setContactPreview(null);
     } finally {
       setAddingContact(false);
@@ -64,7 +65,7 @@ export default function Complete() {
       setContactPreview(null);
       setChatStarted(true);
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     } finally {
       setAddingContact(false);
     }
@@ -78,7 +79,7 @@ export default function Complete() {
       // This will close the onboarding window and open the main window
       await invoke("complete_onboarding");
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
       setStarting(false);
     }
   };

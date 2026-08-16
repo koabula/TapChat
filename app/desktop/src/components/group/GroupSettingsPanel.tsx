@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useMemo, useState } from "react";
 import { X, Settings as SettingsIcon, AlertCircle } from "lucide-react";
 
@@ -86,7 +87,7 @@ export default function GroupSettingsPanel({
     void getGroupSnapshot(groupId)
       .then(setSnapshot)
       .catch((err) => {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(presentError(err).message);
       });
   }, [open, groupId, setSnapshot]);
 
@@ -146,7 +147,7 @@ export default function GroupSettingsPanel({
       setTitle(manifest.title);
       setJoinPolicy(manifest.join_policy);
       setMemberInvitePolicy(manifest.member_invite_policy);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setSubmitting(false);
     }

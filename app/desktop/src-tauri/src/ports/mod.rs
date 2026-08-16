@@ -9,9 +9,6 @@ pub mod transport;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use tapchat_core::external_fetch::{
     fetch_external_json, validate_group_invite_transport_binding, ExternalResourceKind,
 };
@@ -19,7 +16,6 @@ use tapchat_core::ffi_api::{
     CacheUploadedAttachmentEffect, CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect,
     ReadAttachmentBytesEffect, UserNotificationEffect, WriteDownloadedAttachmentEffect,
 };
-use tapchat_core::model::CURRENT_MODEL_VERSION;
 use tapchat_core::platform_ports::{
     BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
     TransportPort,
@@ -142,7 +138,7 @@ impl DesktopPlatformPorts {
 
     /// Build contact share URL for sender identification in message requests.
     /// This generates a signed URL that allows recipients to fetch the sender's identity bundle.
-    async fn build_contact_share_url(&self) -> Result<Option<String>> {
+    pub(crate) async fn build_contact_share_url(&self) -> Result<Option<String>> {
         let pm = self.transport.profile_inner.read().await;
 
         // Get active profile
@@ -199,15 +195,12 @@ impl DesktopPlatformPorts {
             return Ok(None);
         };
 
-        // Build signed token
-        let user_id = local_bundle.user_id.clone();
-        let token = sign_contact_share_token(&sharing_secret, &user_id, &share_id)?;
-
-        Ok(Some(format!(
-            "{}/v1/contact-share/{}",
-            base_url.trim_end_matches('/'),
-            token
-        )))
+        Ok(Some(tapchat_core::contact_share::encode_contact_share_url(
+            &base_url,
+            &sharing_secret,
+            &local_bundle.user_id,
+            &share_id,
+        )?))
     }
 
     async fn inbox_base_url(&self) -> Result<String> {
@@ -348,8 +341,9 @@ impl TransportPort for DesktopPlatformPorts {
                             Err(_) => {
                                 return Ok(vec![CoreEvent::HttpRequestFailed {
                                     request_id: request.request_id.clone(),
-                                    retryable: false,
-                                    detail: Some("contact_share:unavailable".into()),
+                                    failure: tapchat_core::AppErrorV1::from_registered_code(
+                                        "contact_share_offline",
+                                    ),
                                 }]);
                             }
                         };
@@ -428,8 +422,11 @@ impl TransportPort for DesktopPlatformPorts {
             }
             Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
-                retryable: error.code() == "external_fetch_timeout",
-                detail: Some(error.to_string()),
+                failure: if error.code() == "external_fetch_timeout" {
+                    tapchat_core::AppErrorV1::from_registered_code("request_timeout")
+                } else {
+                    tapchat_core::AppErrorV1::network_unavailable()
+                },
             }]),
         }
     }
@@ -542,20 +539,10 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
-                    let code = extract_error_code(&body);
-                    let detail = if status == 404 {
-                        "Cloudflare runtime does not support group outbox. Upgrade runtime."
-                            .to_string()
-                    } else {
-                        format!("HTTP {status}: {body}")
-                    };
                     return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                         group_id: append.group_id,
                         message_id: append.envelope.message_id,
-                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
-                        status: Some(status),
-                        code,
-                        detail: Some(detail),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -566,13 +553,10 @@ impl TransportPort for DesktopPlatformPorts {
                     seq: result.seq,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                 group_id: append.group_id,
                 message_id: append.envelope.message_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -610,10 +594,7 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
                         group_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -623,12 +604,9 @@ impl TransportPort for DesktopPlatformPorts {
                     roster_version: result.roster_version,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
                 group_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         };
         let events = events?;
@@ -673,14 +651,10 @@ impl TransportPort for DesktopPlatformPorts {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
-                    let code = extract_error_code(&body);
                     return Ok(vec![CoreEvent::GroupTransitionAppendFailed {
                         group_id,
                         transition_id,
-                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
-                        status: Some(status),
-                        code,
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -694,13 +668,10 @@ impl TransportPort for DesktopPlatformPorts {
                     last_commit_message_id: result.last_commit_message_id,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupTransitionAppendFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupTransitionAppendFailed {
                 group_id,
                 transition_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -736,10 +707,7 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
                         group_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -753,12 +721,9 @@ impl TransportPort for DesktopPlatformPorts {
                     materialized: result.materialized,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
                 group_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -804,10 +769,7 @@ impl TransportPort for DesktopPlatformPorts {
                     );
                     return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                         group_id: fetch.group_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -826,7 +788,7 @@ impl TransportPort for DesktopPlatformPorts {
                     to_seq: result.to_seq,
                 }])
             }
-            Err(error) => {
+            Err(_error) => {
                 log::warn!(
                     "[TransportPort] fetch_group_outbox request failed group_id={} from_seq={} endpoint={} error=request_failed",
                     group_ref,
@@ -835,10 +797,7 @@ impl TransportPort for DesktopPlatformPorts {
                 );
                 Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                     group_id: fetch.group_id,
-                    retryable: true,
-                    status: None,
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: tapchat_core::AppErrorV1::network_unavailable(),
                 }])
             }
         }
@@ -871,7 +830,7 @@ impl TransportPort for DesktopPlatformPorts {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
+            Err(_error) => {
                 log::warn!(
                     "[TransportPort] get_group_outbox_head request failed group_id={} endpoint={} error=request_failed",
                     group_ref,
@@ -879,10 +838,7 @@ impl TransportPort for DesktopPlatformPorts {
                 );
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
-                    retryable: true,
-                    status: None,
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: tapchat_core::AppErrorV1::network_unavailable(),
                 }]);
             }
         };
@@ -897,16 +853,13 @@ impl TransportPort for DesktopPlatformPorts {
             );
             return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id: get.group_id,
-                retryable: status >= 500,
-                status: Some(status),
-                code: extract_error_code(&body_text),
-                detail: Some(format!("HTTP {status}: {body_text}")),
+                failure: tapchat_core::AppErrorV1::from_http_response(status, &body_text),
             }]);
         }
         let body = to_snake_case_json_string(&body_text).unwrap_or(body_text);
         let result: GetGroupOutboxHeadResult = match serde_json::from_str(&body) {
             Ok(result) => result,
-            Err(error) => {
+            Err(_error) => {
                 log::warn!(
                     "[TransportPort] get_group_outbox_head decode failed group_id={} endpoint={} error=decode_failed",
                     group_ref,
@@ -914,10 +867,8 @@ impl TransportPort for DesktopPlatformPorts {
                 );
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
-                    retryable: false,
-                    status: Some(status),
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: tapchat_core::AppErrorV1::from_registered_code("unexpected_error")
+                        .with_http_status(status),
                 }]);
             }
         };
@@ -960,6 +911,7 @@ impl TransportPort for DesktopPlatformPorts {
             Ok(response) => {
                 let status = response.status().as_u16();
                 if !(200..300).contains(&status) {
+                    let body = response.text().await.unwrap_or_default();
                     log::warn!(
                         "[TransportPort] put_welcome_pickup failed group_id={} device_id={} status={}",
                         group_ref,
@@ -968,8 +920,7 @@ impl TransportPort for DesktopPlatformPorts {
                     );
                     return Ok(vec![CoreEvent::WelcomePickupPutFailed {
                         descriptor: put.descriptor,
-                        retryable: status >= 500,
-                        detail: Some(format!("HTTP {status}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
@@ -983,10 +934,9 @@ impl TransportPort for DesktopPlatformPorts {
                     descriptor: put.descriptor,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::WelcomePickupPutFailed {
+            Err(_error) => Ok(vec![CoreEvent::WelcomePickupPutFailed {
                 descriptor: put.descriptor,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1030,8 +980,7 @@ impl TransportPort for DesktopPlatformPorts {
                     );
                     return Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                         descriptor: fetch.descriptor,
-                        retryable: status >= 500,
-                        detail: Some(format!("HTTP {status}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1048,7 +997,7 @@ impl TransportPort for DesktopPlatformPorts {
                     manifest: result.manifest,
                 }])
             }
-            Err(error) => {
+            Err(_error) => {
                 log::warn!(
                     "[TransportPort] fetch_welcome_pickup transport error group_id={} device_id={} error=request_failed",
                     group_ref,
@@ -1056,8 +1005,7 @@ impl TransportPort for DesktopPlatformPorts {
                 );
                 Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                     descriptor: fetch.descriptor,
-                    retryable: true,
-                    detail: Some(error.to_string()),
+                    failure: tapchat_core::AppErrorV1::network_unavailable(),
                 }])
             }
         }
@@ -1090,8 +1038,7 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupInviteCreateFailed {
                         group_id: create.group_id,
-                        retryable: status >= 500,
-                        detail: Some(format!("HTTP {status}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1101,10 +1048,9 @@ impl TransportPort for DesktopPlatformPorts {
                     invite: result.invite,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupInviteCreateFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupInviteCreateFailed {
                 group_id: create.group_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1186,13 +1132,12 @@ impl TransportPort for DesktopPlatformPorts {
             Ok(body) => {
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupInviteResult = serde_json::from_str(&body)?;
-                if let Err(error) =
+                if let Err(_error) =
                     validate_group_invite_transport_binding(&fetch.invite_url, &result.invite)
                 {
                     return Ok(vec![CoreEvent::GroupInviteFetchFailed {
                         invite_url: fetch.invite_url,
-                        retryable: false,
-                        detail: Some(error.to_string()),
+                        failure: tapchat_core::AppErrorV1::from_registered_code("invalid_invite"),
                     }]);
                 }
                 Ok(vec![CoreEvent::GroupInviteFetched {
@@ -1202,8 +1147,11 @@ impl TransportPort for DesktopPlatformPorts {
             }
             Err(error) => Ok(vec![CoreEvent::GroupInviteFetchFailed {
                 invite_url: fetch.invite_url,
-                retryable: error.code() == "external_fetch_timeout",
-                detail: Some(error.to_string()),
+                failure: if error.code() == "external_fetch_timeout" {
+                    tapchat_core::AppErrorV1::from_registered_code("request_timeout")
+                } else {
+                    tapchat_core::AppErrorV1::network_unavailable()
+                },
             }]),
         }
     }
@@ -1227,8 +1175,7 @@ impl TransportPort for DesktopPlatformPorts {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
                         invite_url: submit.invite_token,
-                        retryable: status >= 500,
-                        detail: Some(format!("HTTP {status}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1237,10 +1184,9 @@ impl TransportPort for DesktopPlatformPorts {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
                 invite_url: submit.invite_token,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1335,8 +1281,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupJoinDecisionFailed {
                         group_id: decide.group_id,
                         request_id: decide.request_id,
-                        retryable: status >= 500,
-                        detail: Some(format!("HTTP {status}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1345,11 +1290,10 @@ impl TransportPort for DesktopPlatformPorts {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinDecisionFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinDecisionFailed {
                 group_id: decide.group_id,
                 request_id: decide.request_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1383,10 +1327,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupJoinClaimFailed {
                         group_id: claim.group_id,
                         request_id: claim.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1397,13 +1338,10 @@ impl TransportPort for DesktopPlatformPorts {
                     lease_expires_at: result.lease_expires_at,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinClaimFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinClaimFailed {
                 group_id: claim.group_id,
                 request_id: claim.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1439,10 +1377,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupJoinCompleteFailed {
                         group_id: complete.group_id,
                         request_id: complete.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1451,13 +1386,10 @@ impl TransportPort for DesktopPlatformPorts {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinCompleteFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinCompleteFailed {
                 group_id: complete.group_id,
                 request_id: complete.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1490,10 +1422,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
                         group_id: submit.group_id,
                         request_id: submit.request.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1502,13 +1431,10 @@ impl TransportPort for DesktopPlatformPorts {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
                 group_id: submit.group_id,
                 request_id: submit.request.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1577,10 +1503,7 @@ impl TransportPort for DesktopPlatformPorts {
                     return Ok(vec![CoreEvent::GroupLeaveClaimFailed {
                         group_id: claim.group_id,
                         request_id: claim.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let result: ClaimGroupLeaveResult =
@@ -1591,13 +1514,10 @@ impl TransportPort for DesktopPlatformPorts {
                     lease_expires_at: result.lease_expires_at,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupLeaveClaimFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupLeaveClaimFailed {
                 group_id: claim.group_id,
                 request_id: claim.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1623,13 +1543,10 @@ impl TransportPort for DesktopPlatformPorts {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(vec![CoreEvent::GroupOutboxSealFailed {
                     group_id: seal.group_id,
-                    retryable: true,
-                    status: None,
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: tapchat_core::AppErrorV1::network_unavailable(),
                 }]);
             }
         };
@@ -1661,34 +1578,25 @@ fn map_seal_group_outbox_response(
         }
         return vec![CoreEvent::GroupOutboxSealFailed {
             group_id,
-            retryable: false,
-            status: Some(status),
-            code,
-            detail: Some(format!("HTTP {status}")),
+            failure: tapchat_core::AppErrorV1::from_http_response(status, body_text),
         }];
     }
 
     if !(200..300).contains(&status) {
-        let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
         return vec![CoreEvent::GroupOutboxSealFailed {
             group_id,
-            retryable: status >= 500,
-            status: Some(status),
-            code: extract_error_code(&body),
-            detail: Some(format!("HTTP {status}")),
+            failure: tapchat_core::AppErrorV1::from_http_response(status, body_text),
         }];
     }
 
     let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
     let result: SealGroupOutboxResult = match serde_json::from_str(&body) {
         Ok(result) => result,
-        Err(error) => {
+        Err(_error) => {
             return vec![CoreEvent::GroupOutboxSealFailed {
                 group_id,
-                retryable: false,
-                status: Some(status),
-                code: None,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::from_registered_code("unexpected_error")
+                    .with_http_status(status),
             }];
         }
     };
@@ -1714,12 +1622,12 @@ fn extract_error_code(body: &str) -> Option<String> {
 
 fn blob_prepare_failed_event(task_id: &str, error: &anyhow::Error) -> CoreEvent {
     let detail = error.to_string().to_ascii_lowercase();
-    let (retryable, code) = if detail.contains("device_revoked") {
-        (false, "device_revoked")
+    let code = if detail.contains("device_revoked") {
+        "device_revoked"
     } else if detail.contains("runtime_mismatch") {
-        (false, "runtime_mismatch")
+        "runtime_mismatch"
     } else if detail.contains("enrollment_required") {
-        (false, "enrollment_required")
+        "enrollment_required"
     } else if detail.contains("status 400")
         || detail.contains("status 401")
         || detail.contains("status 403")
@@ -1728,57 +1636,56 @@ fn blob_prepare_failed_event(task_id: &str, error: &anyhow::Error) -> CoreEvent 
         || detail.contains("convert prepare")
         || detail.contains("no base url")
     {
-        (false, "prepare_invalid")
+        "invalid_input"
     } else if detail.contains("runtime_auth_expired") {
-        (true, "runtime_auth_expired")
+        "runtime_auth_expired"
     } else {
         // Network, response-body, rate-limit, conflict and 5xx failures are
         // safe to retry because prepare-upload is idempotent by task id.
-        (true, "prepare_unavailable")
+        "temporary_unavailable"
     };
+    let failure = tapchat_core::AppErrorV1::from_registered_code(code);
     log::warn!(
         "Blob prepare failed: task_id={} code={} retryable={}",
         redact_id("task", task_id),
         code,
-        retryable
+        failure.retryable
     );
     CoreEvent::BlobTransferFailed {
         task_id: task_id.to_string(),
-        retryable,
-        detail: Some(format!("blob_prepare:{code}")),
+        failure,
     }
 }
 
 fn runtime_auth_http_failure(request_id: &str, error: &anyhow::Error) -> CoreEvent {
     let detail = error.to_string().to_ascii_lowercase();
-    let (retryable, code) = if detail.contains("device_revoked") {
-        (false, "device_revoked")
+    let code = if detail.contains("device_revoked") {
+        "device_revoked"
     } else if detail.contains("runtime_mismatch") {
-        (false, "runtime_mismatch")
+        "runtime_mismatch"
     } else if detail.contains("enrollment_required") {
-        (false, "enrollment_required")
+        "enrollment_required"
     } else {
-        (true, "temporary_unavailable")
+        "temporary_unavailable"
     };
     CoreEvent::HttpRequestFailed {
         request_id: request_id.to_string(),
-        retryable,
-        detail: Some(format!("runtime_auth:{code}")),
+        failure: tapchat_core::AppErrorV1::from_registered_code(code),
     }
 }
 
 fn events_report_runtime_auth_expired(events: &[CoreEvent]) -> bool {
     events.iter().any(|event| match event {
-        CoreEvent::MessageRequestsFetchFailed { detail, .. }
-        | CoreEvent::MessageRequestActionFailed { detail, .. }
-        | CoreEvent::AllowlistFetchFailed { detail, .. }
-        | CoreEvent::AllowlistReplaceFailed { detail, .. }
-        | CoreEvent::SharedStatePublishFailed { detail, .. }
-        | CoreEvent::BlobTransferFailed { detail, .. } => detail
-            .as_deref()
-            .is_some_and(|value| value.contains("runtime_auth_expired")),
-        CoreEvent::GroupAuthorizationInitializeFailed { code, .. } => {
-            code.as_deref() == Some("runtime_auth_expired")
+        CoreEvent::MessageRequestsFetchFailed { failure, .. }
+        | CoreEvent::MessageRequestActionFailed { failure, .. }
+        | CoreEvent::AllowlistFetchFailed { failure, .. }
+        | CoreEvent::AllowlistReplaceFailed { failure, .. }
+        | CoreEvent::BlobTransferFailed { failure, .. } => failure.code == "runtime_auth_expired",
+        CoreEvent::SharedStatePublishFailed { failure, .. } => {
+            failure.code == "runtime_auth_expired"
+        }
+        CoreEvent::GroupAuthorizationInitializeFailed { failure, .. } => {
+            failure.code == "runtime_auth_expired"
         }
         _ => false,
     })
@@ -1867,8 +1774,9 @@ impl BlobIoPort for DesktopPlatformPorts {
             let Some(dir) = dir else {
                 return Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: read.task_id,
-                    retryable: false,
-                    detail: Some("blob_read:storage_unavailable".into()),
+                    failure: tapchat_core::AppErrorV1::from_registered_code(
+                        "storage_integrity_error",
+                    ),
                 }]);
             };
             let encrypted = match tokio::fs::read(
@@ -1881,8 +1789,7 @@ impl BlobIoPort for DesktopPlatformPorts {
                 Err(_) => {
                     return Ok(vec![CoreEvent::BlobTransferFailed {
                         task_id: read.task_id,
-                        retryable: false,
-                        detail: Some("blob_read:staging_missing".into()),
+                        failure: tapchat_core::AppErrorV1::from_registered_code("blob_not_found"),
                     }]);
                 }
             };
@@ -1891,8 +1798,7 @@ impl BlobIoPort for DesktopPlatformPorts {
                 let Some(profile) = pm.active_profile.as_ref() else {
                     return Ok(vec![CoreEvent::BlobTransferFailed {
                         task_id: read.task_id,
-                        retryable: false,
-                        detail: Some("blob_read:profile_unavailable".into()),
+                        failure: tapchat_core::AppErrorV1::from_registered_code("profile_required"),
                     }]);
                 };
                 match profile.decrypt_profile_document(
@@ -1903,8 +1809,9 @@ impl BlobIoPort for DesktopPlatformPorts {
                     Err(_) => {
                         return Ok(vec![CoreEvent::BlobTransferFailed {
                             task_id: read.task_id,
-                            retryable: false,
-                            detail: Some("blob_read:decrypt_failed".into()),
+                            failure: tapchat_core::AppErrorV1::from_registered_code(
+                                "storage_integrity_error",
+                            ),
                         }]);
                     }
                 }
@@ -2176,27 +2083,6 @@ impl NotificationPort for DesktopPlatformPorts {
 // --- SecureStoragePort (skeleton) ---
 impl SecureStoragePort for DesktopPlatformPorts {}
 
-/// Sign a contact share token using HMAC-SHA256.
-/// Format: base64url(payload).base64url(signature)
-fn sign_contact_share_token(secret: &str, user_id: &str, share_id: &str) -> Result<String> {
-    let payload = serde_json::json!({
-        "version": CURRENT_MODEL_VERSION,
-        "service": "contact_share",
-        "userId": user_id,
-        "shareId": share_id,
-    });
-    let payload_bytes = serde_json::to_vec(&payload)?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Failed to initialize HMAC: {}", e))?;
-    mac.update(&payload_bytes);
-    let signature = mac.finalize().into_bytes();
-    Ok(format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(payload_bytes),
-        URL_SAFE_NO_PAD.encode(signature)
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2213,7 +2099,10 @@ mod tests {
         assert!(matches!(
             retryable,
             CoreEvent::BlobTransferFailed {
-                retryable: true,
+                failure: tapchat_core::AppErrorV1 {
+                    retryable: true,
+                    ..
+                },
                 ..
             }
         ));
@@ -2224,7 +2113,10 @@ mod tests {
         assert!(matches!(
             revoked,
             CoreEvent::BlobTransferFailed {
-                retryable: false,
+                failure: tapchat_core::AppErrorV1 {
+                    retryable: false,
+                    ..
+                },
                 ..
             }
         ));
@@ -2311,7 +2203,10 @@ mod tests {
         assert!(matches!(
             temporary,
             CoreEvent::HttpRequestFailed {
-                retryable: true,
+                failure: tapchat_core::AppErrorV1 {
+                    retryable: true,
+                    ..
+                },
                 ..
             }
         ));
@@ -2322,7 +2217,10 @@ mod tests {
         assert!(matches!(
             revoked,
             CoreEvent::HttpRequestFailed {
-                retryable: false,
+                failure: tapchat_core::AppErrorV1 {
+                    retryable: false,
+                    ..
+                },
                 ..
             }
         ));

@@ -206,7 +206,11 @@ impl CoreEngine {
         let device_id = identity.device_identity.device_id.clone();
         self.state.local_identity = Some(identity);
         self.state.mls_adapter = Some(adapter);
-        self.state.published_key_package = Some(package);
+        self.state.key_package_inventory.clear();
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Retired,
+        );
         self.state.local_display_name = effective_display_name.clone();
         self.state
             .sync_states
@@ -243,6 +247,7 @@ impl CoreEngine {
         device_name: Option<String>,
         display_name: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        self.ensure_identity_publication_idle()?;
         let display_name_was_provided = display_name.is_some();
         let display_name = normalize_display_name(display_name)?;
         let effective_display_name = if display_name_was_provided {
@@ -268,7 +273,11 @@ impl CoreEngine {
         let device_id = identity.device_identity.device_id.clone();
         self.state.local_identity = Some(identity);
         self.state.mls_adapter = Some(adapter);
-        self.state.published_key_package = Some(package);
+        self.state.key_package_inventory.clear();
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Retired,
+        );
         self.state.local_display_name = effective_display_name.clone();
         self.state
             .sync_states
@@ -300,48 +309,392 @@ impl CoreEngine {
     }
 
     pub(super) fn rotate_local_key_package(&mut self) -> CoreResult<CoreOutput> {
+        if self.state.pending_identity_publication.is_some() {
+            return Err(CoreError::new(
+                "keypackage_refresh_pending",
+                "an identity publication is already awaiting confirmation",
+            ));
+        }
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        self.stage_local_key_package_rotation(now_ms, false)
+    }
+
+    pub(super) fn local_credential_maintenance_due(&self, now_ms: u64) -> bool {
+        if let Some(pending) = self.state.pending_identity_publication.as_ref() {
+            return now_ms >= pending.next_retry_at;
+        }
+        if self.state.deployment_bundle.is_none() || self.state.mls_adapter.is_none() {
+            return false;
+        }
+        let Some(device_id) = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.device_identity.device_id.as_str())
+        else {
+            return false;
+        };
+        let key_package_due = self
+            .state
+            .published_key_package
+            .as_ref()
+            .map(|package| package.should_rotate_at(now_ms, device_id))
+            .unwrap_or(true);
+        key_package_due || self.local_inbox_capability_due(now_ms, device_id)
+    }
+
+    pub(super) fn maintain_local_credentials(&mut self, now_ms: u64) -> CoreResult<CoreOutput> {
+        let timer = CoreEffect::ScheduleTimer {
+            timer: TimerEffect {
+                timer_id: "credential_maintenance".into(),
+                delay_ms: 24 * 60 * 60 * 1000,
+            },
+        };
+        if self.state.deployment_bundle.is_none() || self.state.mls_adapter.is_none() {
+            return Ok(CoreOutput {
+                effects: vec![timer],
+                ..CoreOutput::default()
+            });
+        }
+        if let Some(pending) = self.state.pending_identity_publication.clone() {
+            let mut effects = vec![timer];
+            if now_ms >= pending.next_retry_at {
+                effects.insert(
+                    0,
+                    self.identity_bundle_publish_effect(
+                        &pending.candidate_bundle,
+                        pending.operation_id,
+                        pending.expected_etag.as_deref(),
+                    )?,
+                );
+            }
+            return Ok(CoreOutput {
+                effects,
+                ..CoreOutput::default()
+            });
+        }
+        let device_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .device_identity
+            .device_id
+            .clone();
+        let key_package_due = self
+            .state
+            .published_key_package
+            .as_ref()
+            .map(|package| package.should_rotate_at(now_ms, &device_id))
+            .unwrap_or(true);
+        if key_package_due {
+            return self.stage_local_key_package_rotation(now_ms, true);
+        }
+        if self.local_inbox_capability_due(now_ms, &device_id) {
+            return self.stage_local_inbox_capability_renewal(now_ms, true);
+        }
+        {
+            return Ok(CoreOutput {
+                effects: vec![timer],
+                ..CoreOutput::default()
+            });
+        }
+    }
+
+    fn local_inbox_capability_due(&self, now_ms: u64, device_id: &str) -> bool {
+        self.state
+            .local_bundle
+            .as_ref()
+            .and_then(|bundle| {
+                bundle
+                    .devices
+                    .iter()
+                    .find(|device| device.device_id == device_id)
+            })
+            .and_then(|device| device.inbox_append_capability.as_ref())
+            .is_none_or(|capability| {
+                capability.expires_at
+                    <= now_ms.saturating_add(
+                        crate::capability::INBOX_APPEND_CAPABILITY_RENEWAL_WINDOW_MS,
+                    )
+            })
+    }
+
+    fn stage_local_key_package_rotation(
+        &mut self,
+        now_ms: u64,
+        schedule_next_check: bool,
+    ) -> CoreResult<CoreOutput> {
+        let previous_bundle = self.state.local_bundle.clone();
         let package = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .rotate_key_package(0)?;
-        self.state.published_key_package = Some(package);
-        self.refresh_local_bundle()?;
+            .rotate_key_package(now_ms)?;
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Retired,
+        );
+        let updated_at = self
+            .state
+            .local_bundle
+            .as_ref()
+            .map(|bundle| bundle.updated_at.saturating_add(1))
+            .unwrap_or(now_ms.max(1));
+        if let Some(identity) = self.state.local_identity.as_mut() {
+            identity.device_status.updated_at = updated_at;
+        }
+        self.refresh_local_bundle_with_updated_at_at(updated_at, now_ms)?;
+        let candidate_bundle =
+            self.state.local_bundle.clone().ok_or_else(|| {
+                CoreError::invalid_state("candidate identity bundle is unavailable")
+            })?;
+        let operation_id = format!(
+            "credential_maintenance:{}",
+            candidate_bundle.publication_revision
+        );
+        if candidate_bundle.identity_bundle_ref.is_some() {
+            if let Some(previous_bundle) = previous_bundle {
+                self.state.local_bundle = Some(previous_bundle.clone());
+                self.state.pending_identity_publication =
+                    Some(crate::persistence::PendingIdentityPublication {
+                        operation_id: operation_id.clone(),
+                        reason: "keypackage_rotation".into(),
+                        previous_bundle,
+                        candidate_bundle: candidate_bundle.clone(),
+                        expected_etag: None,
+                        stage: crate::persistence::PendingIdentityPublicationStage::AwaitingPublish,
+                        attempt_count: 0,
+                        next_retry_at: now_ms,
+                    });
+            }
+        }
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
+        )];
+        if candidate_bundle.identity_bundle_ref.is_some() {
+            effects.push(self.identity_bundle_publish_effect(
+                &candidate_bundle,
+                operation_id,
+                None,
+            )?);
+        }
+        if schedule_next_check {
+            effects.push(CoreEffect::ScheduleTimer {
+                timer: TimerEffect {
+                    timer_id: "credential_maintenance".into(),
+                    delay_ms: 24 * 60 * 60 * 1000,
+                },
+            });
+        }
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
-            view_model: None,
+            effects,
+            view_model: Some(CoreViewModel {
+                banners: vec![SystemBanner {
+                    status: SystemStatus::SyncInProgress,
+                    message: "TapChat is refreshing your secure contact information. Existing conversations still work.".into(),
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    fn stage_local_inbox_capability_renewal(
+        &mut self,
+        now_ms: u64,
+        schedule_next_check: bool,
+    ) -> CoreResult<CoreOutput> {
+        let previous_bundle = self
+            .state
+            .local_bundle
+            .clone()
+            .ok_or_else(|| CoreError::invalid_state("local identity bundle is unavailable"))?;
+        let updated_at = previous_bundle.updated_at.saturating_add(1);
+        if let Some(identity) = self.state.local_identity.as_mut() {
+            identity.device_status.updated_at = updated_at;
+        }
+        self.refresh_local_bundle_with_updated_at_at(updated_at, now_ms)?;
+        let candidate_bundle =
+            self.state.local_bundle.clone().ok_or_else(|| {
+                CoreError::invalid_state("candidate identity bundle is unavailable")
+            })?;
+        let operation_id = format!(
+            "credential_maintenance:{}",
+            candidate_bundle.publication_revision
+        );
+        if candidate_bundle.identity_bundle_ref.is_some() {
+            self.state.local_bundle = Some(previous_bundle.clone());
+            self.state.pending_identity_publication =
+                Some(crate::persistence::PendingIdentityPublication {
+                    operation_id: operation_id.clone(),
+                    reason: "inbox_capability_renewal".into(),
+                    previous_bundle,
+                    candidate_bundle: candidate_bundle.clone(),
+                    expected_etag: None,
+                    stage: crate::persistence::PendingIdentityPublicationStage::AwaitingPublish,
+                    attempt_count: 0,
+                    next_retry_at: now_ms,
+                });
+        }
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
+        )];
+        if candidate_bundle.identity_bundle_ref.is_some() {
+            effects.push(self.identity_bundle_publish_effect(
+                &candidate_bundle,
+                operation_id,
+                None,
+            )?);
+        }
+        if schedule_next_check {
+            effects.push(CoreEffect::ScheduleTimer {
+                timer: TimerEffect {
+                    timer_id: "credential_maintenance".into(),
+                    delay_ms: 24 * 60 * 60 * 1000,
+                },
+            });
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: Some(CoreViewModel {
+                banners: vec![SystemBanner {
+                    status: SystemStatus::SyncInProgress,
+                    message: "TapChat is refreshing your secure contact information. Existing conversations still work.".into(),
+                }],
+                ..CoreViewModel::default()
+            }),
         })
     }
 
     pub(super) fn rotate_local_key_package_after_welcome(&mut self) -> CoreResult<Vec<CoreEffect>> {
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        let pending = self.state.pending_identity_publication.clone();
+        let confirmed_bundle = self.state.local_bundle.clone();
+        if let Some(pending) = pending.as_ref() {
+            // A delayed Welcome may arrive while another identity publication is
+            // awaiting confirmation. Build on that candidate so the consumed
+            // KeyPackage replacement cannot overwrite a pending share-id or
+            // capability change, while keeping the confirmed bundle visible
+            // locally until the server acknowledges the combined candidate.
+            self.state.local_bundle = Some(pending.candidate_bundle.clone());
+        }
         let package = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .rotate_key_package(0)?;
-        self.state.published_key_package = Some(package);
+            .rotate_key_package(now_ms)?;
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Consumed,
+        );
         let updated_at = {
             let identity = self
                 .state
                 .local_identity
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-            identity.device_status.updated_at = identity.device_status.updated_at.saturating_add(1);
+            let candidate_revision = pending
+                .as_ref()
+                .map(|publication| publication.candidate_bundle.publication_revision)
+                .unwrap_or_default();
+            identity.device_status.updated_at = identity
+                .device_status
+                .updated_at
+                .max(candidate_revision)
+                .saturating_add(1);
             identity.device_status.updated_at
         };
-        self.refresh_local_bundle_with_updated_at(updated_at)?;
+        self.refresh_local_bundle_with_updated_at_at(updated_at, now_ms)?;
+        let candidate_bundle =
+            self.state.local_bundle.clone().ok_or_else(|| {
+                CoreError::invalid_state("candidate identity bundle is unavailable")
+            })?;
+
+        let (operation_id, expected_etag) = if let Some(mut pending) = pending {
+            let operation_id = pending.operation_id.clone();
+            let expected_etag = pending.expected_etag.clone();
+            pending.candidate_bundle = candidate_bundle.clone();
+            pending.stage = crate::persistence::PendingIdentityPublicationStage::AwaitingPublish;
+            pending.next_retry_at = now_ms;
+            self.state.pending_identity_publication = Some(pending);
+            self.state.local_bundle = confirmed_bundle;
+            (operation_id, expected_etag)
+        } else if candidate_bundle.identity_bundle_ref.is_some() {
+            let operation_id = format!(
+                "credential_maintenance:{}",
+                candidate_bundle.publication_revision
+            );
+            if let Some(previous_bundle) = confirmed_bundle {
+                self.state.local_bundle = Some(previous_bundle.clone());
+                self.state.pending_identity_publication =
+                    Some(crate::persistence::PendingIdentityPublication {
+                        operation_id: operation_id.clone(),
+                        reason: "keypackage_rotation_after_welcome".into(),
+                        previous_bundle,
+                        candidate_bundle: candidate_bundle.clone(),
+                        expected_etag: None,
+                        stage: crate::persistence::PendingIdentityPublicationStage::AwaitingPublish,
+                        attempt_count: 0,
+                        next_retry_at: now_ms,
+                    });
+            }
+            (operation_id, None)
+        } else {
+            (String::new(), None)
+        };
         let mut effects = vec![persist_effect(
             &self.state,
             vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
         )];
-        effects.extend(self.local_shared_state_publish_effects()?);
+        if candidate_bundle.identity_bundle_ref.is_some() {
+            effects.push(self.identity_bundle_publish_effect(
+                &candidate_bundle,
+                operation_id,
+                expected_etag.as_deref(),
+            )?);
+        }
         Ok(effects)
+    }
+
+    fn install_published_key_package(
+        &mut self,
+        mut package: crate::mls_adapter::PublishedKeyPackage,
+        prior_state: crate::mls_adapter::PublishedKeyPackageState,
+    ) {
+        if let Some(current) = self.state.published_key_package.as_ref() {
+            if let Some(existing) = self
+                .state
+                .key_package_inventory
+                .iter_mut()
+                .find(|item| item.key_package_ref == current.key_package_ref)
+            {
+                existing.state = prior_state;
+            } else {
+                let mut retained = current.clone();
+                retained.state = prior_state;
+                self.state.key_package_inventory.push(retained);
+            }
+        }
+        package.state = crate::mls_adapter::PublishedKeyPackageState::Advertised;
+        self.state
+            .key_package_inventory
+            .retain(|item| item.key_package_ref != package.key_package_ref);
+        self.state.key_package_inventory.push(package.clone());
+        self.state.published_key_package = Some(package);
     }
 
     pub(super) fn apply_local_device_status_update(
@@ -364,6 +717,7 @@ impl CoreEngine {
         target_device_id: String,
         status: crate::model::DeviceStatusKind,
     ) -> CoreResult<CoreOutput> {
+        self.ensure_identity_publication_idle()?;
         let local_device_id = self
             .state
             .local_identity
@@ -443,15 +797,40 @@ impl CoreEngine {
             return Err(Self::relationship_closed_error(&peer_user_id));
         }
         let contact_bundle = self.direct_peer_contact_bundle(&peer_user_id)?.clone();
+        let now_ms = current_unix_millis(self.state.message_nonce);
         let peer_device_ids: Vec<String> = contact_bundle
             .devices
             .iter()
-            .filter(|d| matches!(d.status, crate::model::DeviceStatusKind::Active))
+            .filter(|device| {
+                matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && device
+                        .keypackage_ref
+                        .as_ref()
+                        .is_some_and(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
+            })
             .map(|d| d.device_id.clone())
             .collect();
-        if peer_device_ids.is_empty() {
-            return Err(CoreError::invalid_input(
-                "peer identity bundle does not contain any active devices",
+        if peer_device_ids.is_empty()
+            && self
+                .active_direct_conversation_for_peer(&peer_user_id)
+                .is_none()
+        {
+            if contact_bundle.devices.iter().any(|device| {
+                matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && device.keypackage_ref.as_ref().is_some_and(|keypackage| {
+                        keypackage.created_at
+                            > now_ms
+                                .saturating_add(crate::mls_adapter::KEY_PACKAGE_CLOCK_TOLERANCE_MS)
+                    })
+            }) {
+                return Err(CoreError::new(
+                    "device_clock_invalid",
+                    "contact key package was created too far in the future",
+                ));
+            }
+            return Err(CoreError::new(
+                "keypackage_expired",
+                "peer identity bundle does not contain a usable key package",
             ));
         }
         if let Some((conversation_id, existing)) =
@@ -526,12 +905,16 @@ impl CoreEngine {
         let peer_keypackages: Vec<PeerDeviceKeyPackage> = contact_bundle
             .devices
             .iter()
-            .filter(|d| matches!(d.status, crate::model::DeviceStatusKind::Active))
-            .map(|device| PeerDeviceKeyPackage {
-                user_id: peer_user_id.clone(),
-                device_id: device.device_id.clone(),
-                device_public_key: device.device_public_key.clone(),
-                key_package_b64: device.keypackage_ref.object_ref.clone(),
+            .filter_map(|device| {
+                let keypackage_ref = device.keypackage_ref.as_ref()?;
+                (matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && keypackage_ref.is_usable_at(now_ms))
+                .then(|| PeerDeviceKeyPackage {
+                    user_id: peer_user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    device_public_key: device.device_public_key.clone(),
+                    key_package_b64: keypackage_ref.object_ref.clone(),
+                })
             })
             .collect();
         let artifacts = self
@@ -723,6 +1106,17 @@ impl CoreEngine {
         &mut self,
         updated_at: u64,
     ) -> CoreResult<()> {
+        self.refresh_local_bundle_with_updated_at_at(
+            updated_at,
+            current_unix_millis(self.state.message_nonce),
+        )
+    }
+
+    fn refresh_local_bundle_with_updated_at_at(
+        &mut self,
+        updated_at: u64,
+        now_ms: u64,
+    ) -> CoreResult<()> {
         let Some(local_identity) = self.state.local_identity.as_ref() else {
             return Ok(());
         };
@@ -750,17 +1144,37 @@ impl CoreEngine {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        for device in &mut devices {
+            if device
+                .keypackage_ref
+                .as_ref()
+                .is_some_and(|keypackage| !keypackage.is_usable_at(now_ms))
+            {
+                device.keypackage_ref = None;
+            }
+            if device
+                .inbox_append_capability
+                .as_ref()
+                .is_some_and(|capability| capability.expires_at <= now_ms)
+            {
+                device.inbox_append_capability = None;
+            }
+        }
         let bundle_share_id = self
             .state
             .local_bundle
             .as_ref()
             .and_then(|bundle| bundle.bundle_share_id.clone());
         devices.push(
-            crate::capability::CapabilityManager::build_device_contact_profile(
+            crate::capability::CapabilityManager::build_device_contact_profile_with_lifetime(
                 &signing_identity,
                 deployment,
                 package.key_package_ref.clone(),
+                package.lifecycle_version,
+                package.not_before,
+                package.created_at,
                 package.expires_at,
+                now_ms,
             )?,
         );
         devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
@@ -776,6 +1190,17 @@ impl CoreEngine {
     }
 
     pub(super) fn rotate_contact_share_link(&mut self) -> CoreResult<CoreOutput> {
+        if self.state.pending_identity_publication.is_some() {
+            return Err(CoreError::new(
+                "contact_share_rotation_unverified",
+                "another identity publication is awaiting verification",
+            ));
+        }
+        let previous_bundle = self
+            .state
+            .local_bundle
+            .clone()
+            .ok_or_else(|| CoreError::invalid_state("local identity bundle is unavailable"))?;
         let updated_at = self
             .state
             .local_bundle
@@ -789,19 +1214,32 @@ impl CoreEngine {
                     .unwrap_or(1)
             });
         self.refresh_local_bundle_with_share_id(updated_at, None)?;
+        let operation_id = format!("contact_share_rotation:{updated_at}");
+        let candidate_bundle =
+            self.state.local_bundle.clone().ok_or_else(|| {
+                CoreError::invalid_state("candidate identity bundle is unavailable")
+            })?;
+        self.state.local_bundle = Some(previous_bundle.clone());
+        self.state.pending_identity_publication =
+            Some(crate::persistence::PendingIdentityPublication {
+                operation_id: operation_id.clone(),
+                reason: "share_link_rotation".into(),
+                previous_bundle,
+                candidate_bundle: candidate_bundle.clone(),
+                expected_etag: None,
+                stage: crate::persistence::PendingIdentityPublicationStage::AwaitingPublish,
+                attempt_count: 0,
+                next_retry_at: current_unix_millis(self.state.message_nonce),
+            });
+        let mut effects = vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])];
+        effects.push(self.identity_bundle_publish_effect(&candidate_bundle, operation_id, None)?);
         Ok(CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
-            view_model: Some(CoreViewModel {
-                banners: vec![SystemBanner {
-                    status: SystemStatus::SyncInProgress,
-                    message: "contact link rotated".into(),
-                }],
-                ..CoreViewModel::default()
-            }),
+            effects,
+            view_model: None,
         })
     }
 
@@ -837,12 +1275,33 @@ impl CoreEngine {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        for device in &mut devices {
+            if device
+                .keypackage_ref
+                .as_ref()
+                .is_some_and(|keypackage| !keypackage.is_usable_at(now_ms))
+            {
+                device.keypackage_ref = None;
+            }
+            if device
+                .inbox_append_capability
+                .as_ref()
+                .is_some_and(|capability| capability.expires_at <= now_ms)
+            {
+                device.inbox_append_capability = None;
+            }
+        }
         devices.push(
-            crate::capability::CapabilityManager::build_device_contact_profile(
+            crate::capability::CapabilityManager::build_device_contact_profile_with_lifetime(
                 &signing_identity,
                 deployment,
                 package.key_package_ref.clone(),
+                package.lifecycle_version,
+                package.not_before,
+                package.created_at,
                 package.expires_at,
+                now_ms,
             )?,
         );
         devices.sort_by(|left, right| left.device_id.cmp(&right.device_id));
@@ -913,34 +1372,6 @@ impl CoreEngine {
             self.state.mls_summaries.contains_key(conversation_id),
             state.conversation.updated_at,
             Self::direct_relationship_nonce(conversation_id),
-        )
-    }
-
-    pub(super) fn promoted_conversation_selection_rank(
-        &self,
-        peer_user_id: &str,
-        conversation_id: &str,
-    ) -> (bool, bool, bool, bool, u64, u64, String) {
-        let Some(state) = self.state.conversations.get(conversation_id) else {
-            return (
-                false,
-                false,
-                false,
-                false,
-                0,
-                Self::direct_relationship_nonce(conversation_id),
-                conversation_id.to_string(),
-            );
-        };
-        (
-            state.peer_user_id == peer_user_id
-                && state.conversation.kind == ConversationKind::Direct,
-            state.conversation.state == ConversationState::Active,
-            state.recovery_status == RecoveryStatus::Healthy,
-            self.state.mls_summaries.contains_key(conversation_id),
-            state.conversation.updated_at,
-            Self::direct_relationship_nonce(conversation_id),
-            conversation_id.to_string(),
         )
     }
 
@@ -1043,6 +1474,8 @@ impl CoreEngine {
                 plaintext: Some("This legacy chat was archived.".into()),
                 storage_refs: Vec::new(),
                 downloaded_blob_b64: None,
+                delivery_state: None,
+                message_request_id: None,
             };
             if let Some(summary) = self.archive_conversation_with_message(
                 conversation_id,
@@ -1090,15 +1523,23 @@ impl CoreEngine {
 
     pub(super) fn peer_active_device_ids(&self, peer_user_id: &str) -> CoreResult<Vec<String>> {
         let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
+        let now_ms = current_unix_millis(self.state.message_nonce);
         let devices: Vec<String> = bundle
             .devices
             .iter()
-            .filter(|device| matches!(device.status, crate::model::DeviceStatusKind::Active))
+            .filter(|device| {
+                matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && device
+                        .keypackage_ref
+                        .as_ref()
+                        .is_some_and(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
+            })
             .map(|device| device.device_id.clone())
             .collect();
         if devices.is_empty() {
-            return Err(CoreError::invalid_input(
-                "peer identity bundle does not contain any active devices",
+            return Err(CoreError::new(
+                "keypackage_expired",
+                "peer identity bundle does not contain a usable key package",
             ));
         }
         Ok(devices)
@@ -1111,15 +1552,20 @@ impl CoreEngine {
     ) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
         let wanted: BTreeSet<String> = device_ids.iter().cloned().collect();
         let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
+        let now_ms = current_unix_millis(self.state.message_nonce);
         Ok(bundle
             .devices
             .iter()
-            .filter(|device| wanted.contains(&device.device_id))
-            .map(|device| PeerDeviceKeyPackage {
-                user_id: peer_user_id.to_string(),
-                device_id: device.device_id.clone(),
-                device_public_key: device.device_public_key.clone(),
-                key_package_b64: device.keypackage_ref.object_ref.clone(),
+            .filter_map(|device| {
+                let keypackage_ref = device.keypackage_ref.as_ref()?;
+                (wanted.contains(&device.device_id) && keypackage_ref.is_usable_at(now_ms)).then(
+                    || PeerDeviceKeyPackage {
+                        user_id: peer_user_id.to_string(),
+                        device_id: device.device_id.clone(),
+                        device_public_key: device.device_public_key.clone(),
+                        key_package_b64: keypackage_ref.object_ref.clone(),
+                    },
+                )
             })
             .collect())
     }
@@ -1194,6 +1640,7 @@ impl CoreEngine {
                 in_flight: false,
                 app_message_id: None,
                 plaintext_cache: None,
+                identity_refresh_attempted: false,
             });
         }
     }
@@ -1216,6 +1663,7 @@ impl CoreEngine {
                 in_flight: false,
                 app_message_id: app_message_id.clone(),
                 plaintext_cache: Some(plaintext.clone()),
+                identity_refresh_attempted: false,
             });
         }
     }
@@ -1415,6 +1863,8 @@ impl CoreEngine {
             plaintext: Some(plaintext),
             storage_refs: record.envelope.storage_refs.clone(),
             downloaded_blob_b64: None,
+            delivery_state: None,
+            message_request_id: None,
         });
         state.last_message_type = Some(record.envelope.message_type);
         state.conversation.updated_at = record.envelope.created_at;
@@ -1588,6 +2038,7 @@ impl CoreEngine {
         &mut self,
         display_name: Option<String>,
     ) -> CoreResult<CoreOutput> {
+        self.ensure_identity_publication_idle()?;
         let display_name = normalize_display_name(display_name)?;
         self.state.local_display_name = display_name.clone();
 
@@ -1666,6 +2117,21 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         })
+    }
+
+    fn ensure_identity_publication_idle(&self) -> CoreResult<()> {
+        let Some(pending) = self.state.pending_identity_publication.as_ref() else {
+            return Ok(());
+        };
+        let code = if pending.reason == "share_link_rotation" {
+            "contact_share_rotation_unverified"
+        } else {
+            "keypackage_refresh_pending"
+        };
+        Err(CoreError::new(
+            code,
+            "identity publication is awaiting server confirmation",
+        ))
     }
 
     pub(super) fn contact_summary(
@@ -1786,6 +2252,8 @@ impl CoreEngine {
             plaintext: Some(plaintext),
             storage_refs: Vec::new(),
             downloaded_blob_b64: None,
+            delivery_state: None,
+            message_request_id: None,
         }
     }
 
@@ -2034,6 +2502,7 @@ impl CoreEngine {
         peer_user_id: &str,
         promoted_conversation_ids: &[String],
     ) -> CoreResult<Vec<String>> {
+        const MAX_ACCEPTED_CONVERSATION_IDS: usize = 16;
         let mut conversation_ids = promoted_conversation_ids
             .iter()
             .filter(|conversation_id| !conversation_id.trim().is_empty())
@@ -2041,30 +2510,19 @@ impl CoreEngine {
             .collect::<Vec<_>>();
         conversation_ids.sort();
         conversation_ids.dedup();
-        if !conversation_ids.is_empty() {
-            if conversation_ids.len() > 1 {
-                log::warn!(
-                    "contact accept completed for {} with multiple promoted direct conversation ids; selecting one and ignoring superseded ids",
-                    redact_id("user", peer_user_id)
-                );
-            }
-            conversation_ids.sort_by_key(|conversation_id| {
-                self.promoted_conversation_selection_rank(peer_user_id, conversation_id)
-            });
-            if let Some(conversation_id) = conversation_ids.pop() {
-                return Ok(vec![conversation_id]);
-            }
-        }
-
         if let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id) {
-            return Ok(vec![conversation_id]);
+            if !conversation_ids.contains(&conversation_id) {
+                conversation_ids.insert(0, conversation_id);
+            }
         }
-
-        log::warn!(
-            "contact accept completed for {} without promoted conversation ids or local active direct conversation; skipping ControlContactAccepted fallback",
-            redact_id("user", peer_user_id)
-        );
-        Ok(Vec::new())
+        if conversation_ids.len() > MAX_ACCEPTED_CONVERSATION_IDS {
+            log::warn!(
+                "contact accept completed for {} with too many promoted direct conversation ids; truncating the compatibility fanout",
+                redact_id("user", peer_user_id)
+            );
+            conversation_ids.truncate(MAX_ACCEPTED_CONVERSATION_IDS);
+        }
+        Ok(conversation_ids)
     }
 
     pub(super) fn build_contact_accepted_envelopes(
@@ -2249,7 +2707,7 @@ impl CoreEngine {
         if Self::relationship_is_removed(&contact.relationship_status) {
             return true;
         }
-        !self.direct_relationship_open_for_record(peer_user_id, &record.envelope.conversation_id)
+        false
     }
 
     pub(super) fn ensure_archived_direct_conversation_for_control(
@@ -2354,6 +2812,8 @@ impl CoreEngine {
             plaintext: Some(format!("{peer_label} removed you. This chat was archived.")),
             storage_refs: Vec::new(),
             downloaded_blob_b64: None,
+            delivery_state: None,
+            message_request_id: None,
         };
         let message_summary = self.archive_conversation_with_message(
             &envelope.conversation_id,
@@ -2451,8 +2911,74 @@ impl CoreEngine {
                 "contact accepted control request_id is empty",
             ));
         }
+        let exact_conversation_is_open = self.direct_relationship_open_for_record(
+            &envelope.sender_user_id,
+            &envelope.conversation_id,
+        );
+        let request_matches_local_message = self.state.conversations.values().any(|conversation| {
+            conversation.conversation.kind == ConversationKind::Direct
+                && conversation.peer_user_id == envelope.sender_user_id
+                && conversation.messages.iter().any(|message| {
+                    message.message_request_id.as_deref() == Some(control.request_id.as_str())
+                })
+        });
+        if !exact_conversation_is_open && !request_matches_local_message {
+            log::info!(
+                "handle_contact_accepted_record: acking and ignoring unmatched accepted control conversation_id={} sender_user_id={} message_id={}",
+                envelope.conversation_id,
+                envelope.sender_user_id,
+                record.message_id
+            );
+            return Ok(CoreOutput::default());
+        }
 
-        self.promote_pending_outbound_contact(&envelope.sender_user_id, "contact_accepted_control")
+        let mut output = self.promote_pending_outbound_contact(
+            &envelope.sender_user_id,
+            "contact_accepted_control",
+        )?;
+        let mut changed_conversations = Vec::new();
+        for (conversation_id, conversation) in &mut self.state.conversations {
+            if conversation.conversation.kind != ConversationKind::Direct
+                || conversation.peer_user_id != envelope.sender_user_id
+            {
+                continue;
+            }
+            let mut changed = false;
+            for message in &mut conversation.messages {
+                if message.message_request_id.as_deref() == Some(control.request_id.as_str())
+                    && message.delivery_state
+                        == Some(crate::conversation::StoredMessageDeliveryState::PendingApproval)
+                {
+                    message.delivery_state =
+                        Some(crate::conversation::StoredMessageDeliveryState::Sent);
+                    changed = true;
+                }
+            }
+            if changed {
+                changed_conversations.push(conversation_id.clone());
+            }
+        }
+        if !changed_conversations.is_empty() {
+            output = merge_outputs(
+                output,
+                CoreOutput {
+                    state_update: CoreStateUpdate {
+                        messages_changed: true,
+                        conversations_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist_effect(
+                        &self.state,
+                        changed_conversations
+                            .into_iter()
+                            .map(|conversation_id| PersistOp::SaveConversation { conversation_id })
+                            .collect(),
+                    )],
+                    view_model: None,
+                },
+            );
+        }
+        Ok(output)
     }
 
     pub(super) fn delete_contact(&mut self, user_id: String) -> CoreResult<CoreOutput> {

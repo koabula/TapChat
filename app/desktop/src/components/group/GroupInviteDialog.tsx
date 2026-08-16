@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { writeText as clipboardWriteText } from "@tauri-apps/plugin-clipboard-manager";
@@ -93,7 +94,7 @@ export default function GroupInviteDialog({
       setJoinPolicy(policy);
       return policy;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
       return null;
     }
   };
@@ -103,7 +104,7 @@ export default function GroupInviteDialog({
       const rows = await listGroupInvites(groupId);
       setInvites(rows);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     }
   };
 
@@ -134,7 +135,7 @@ export default function GroupInviteDialog({
       await createGroupInviteLink(groupId, expiresAt, parsedMaxUses);
       await refreshInvites();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setCreating(false);
     }
@@ -149,7 +150,7 @@ export default function GroupInviteDialog({
         setCopiedId((current) => (current === invite.invite_id ? null : current));
       }, 2000);
     } catch (err) {
-      setCopyError(err instanceof Error ? err.message : String(err));
+      setCopyError(presentError(err).message);
       // Fallback: select the URL text so Ctrl+C still works.
       const input = urlInputRefs.current.get(invite.invite_id);
       if (input) {
@@ -169,7 +170,7 @@ export default function GroupInviteDialog({
       await revokeGroupInviteLink(groupId, invite.invite_id);
       await refreshInvites();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     }
   };
 

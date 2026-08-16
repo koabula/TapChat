@@ -408,10 +408,13 @@ impl CoreEngine {
             .device_id
             .clone();
         let output = merge_outputs(
-            self.migrate_legacy_removed_relationships()?,
+            self.maintain_local_credentials(current_unix_millis(self.state.message_nonce))?,
             merge_outputs(
-                self.sync_inbox(device_id, Some(reason.to_string()))?,
-                self.retry_pending_welcome_pickups()?,
+                self.migrate_legacy_removed_relationships()?,
+                merge_outputs(
+                    self.sync_inbox(device_id, Some(reason.to_string()))?,
+                    self.retry_pending_welcome_pickups()?,
+                ),
             ),
         );
         let output = merge_outputs(output, self.restore_degraded_output());

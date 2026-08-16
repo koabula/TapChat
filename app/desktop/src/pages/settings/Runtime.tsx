@@ -1,5 +1,6 @@
+import { presentError } from "@/lib/errors";
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { useNavigate } from "react-router";
 import { Check, Circle, Loader, X } from "lucide-react";
@@ -110,7 +111,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
       const result = await invoke<RuntimeStatus>("cloudflare_status");
       setStatus(result);
     } catch (err) {
-      console.error(`[RuntimeSettings] Failed to load runtime status: ${String(err)}`);
+      console.error(`[RuntimeSettings] Failed to load runtime status: ${presentError(err).message}`);
     } finally {
       setLoading(false);
     }
@@ -121,8 +122,8 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
       const result = await invoke<PreflightResult>("cloudflare_preflight");
       setPreflight(result);
     } catch (err) {
-      console.error(`[RuntimeSettings] Preflight check failed: ${String(err)}`);
-      setError(String(err));
+      console.error(`[RuntimeSettings] Preflight check failed: ${presentError(err).message}`);
+      setError(presentError(err).message);
     }
   };
 
@@ -136,7 +137,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
         setError(result.error || "Login failed");
       }
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     }
   };
 
@@ -154,7 +155,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
         await loadStatus();
       }
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     } finally {
       setDeploying(false);
     }
@@ -168,7 +169,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
         const refreshed = await invoke<RuntimeStatus>("cloudflare_refresh_runtime_auth");
         setStatus(refreshed);
       } catch (err) {
-        setError(String(err));
+        setError(presentError(err).message);
         await loadStatus();
       } finally {
         setDeploying(false);
@@ -196,7 +197,7 @@ export default function Runtime({ embedded = false }: RuntimeProps) {
       if (!result.success) setError(result.error || "Secret rotation failed");
       await loadStatus();
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     } finally {
       setDeploying(false);
     }

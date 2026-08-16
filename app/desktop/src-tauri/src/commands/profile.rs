@@ -11,7 +11,9 @@ use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::state::{AppState, LockReason, SessionState};
 
 #[tauri::command]
-pub async fn list_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileSummary>, String> {
+pub async fn list_profiles(
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<Vec<ProfileSummary>> {
     let pm = &state.inner.read().await.profile_manager;
     let profiles = pm.list_profiles().await;
     log::info!("list_profiles: returning {} profiles", profiles.len());
@@ -24,7 +26,7 @@ pub async fn create_profile(
     name: String,
     passphrase: Option<String>,
     protection_mode: Option<ProfileProtectionMode>,
-) -> Result<ProfileSummary, String> {
+) -> crate::errors::DesktopResult<ProfileSummary> {
     // Use default path: APPDATA/TapChat/profiles/{name}
     let data_dir =
         dirs::data_dir().ok_or_else(|| "Could not determine app data directory".to_string())?;
@@ -35,7 +37,7 @@ pub async fn create_profile(
     let pm = &state.inner.read().await.profile_manager;
     let existing = pm.list_profiles().await;
     if existing.iter().any(|p| p.name == name) {
-        return Err(format!("Profile '{}' already exists", name));
+        return Err(format!("Profile '{}' already exists", name).into());
     }
 
     let protection_mode = protection_mode.unwrap_or_else(|| {
@@ -45,9 +47,10 @@ pub async fn create_profile(
             ProfileProtectionMode::KeychainOnly
         }
     });
-    pm.create_profile(&name, path.clone(), passphrase, protection_mode)
+    Ok(pm
+        .create_profile(&name, path.clone(), passphrase, protection_mode)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?)
 }
 
 /// Start onboarding for a new profile.
@@ -57,7 +60,7 @@ pub async fn create_profile(
 pub async fn start_new_profile_onboarding(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     {
         let realtime = {
             let ports = state.ports.lock().await;
@@ -104,7 +107,8 @@ pub async fn activate_profile(
     state: State<'_, AppState>,
     path: PathBuf,
     passphrase: Option<String>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
+    let passphrase_supplied = passphrase.as_deref().is_some_and(|value| !value.is_empty());
     log::info!(
         "activate_profile: activating {}",
         redact_id("profile-path", &path.to_string_lossy())
@@ -115,7 +119,7 @@ pub async fn activate_profile(
         let pm = &state.inner.read().await.profile_manager;
         pm.activate_profile(&path, passphrase)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| profile_access_error(passphrase_supplied))?;
     }
 
     // Reload the engine from the new profile
@@ -130,7 +134,8 @@ pub async fn select_profile_for_restart(
     state: State<'_, AppState>,
     path: PathBuf,
     passphrase: Option<String>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
+    let passphrase_supplied = passphrase.as_deref().is_some_and(|value| !value.is_empty());
     log::info!(
         "select_profile_for_restart: selecting {} for next launch",
         redact_id("profile-path", &path.to_string_lossy())
@@ -138,7 +143,7 @@ pub async fn select_profile_for_restart(
     let pm = &state.inner.read().await.profile_manager;
     pm.select_profile_for_restart(&path, passphrase)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|_| profile_access_error(passphrase_supplied))?;
     log::info!("select_profile_for_restart: completed successfully");
     Ok(())
 }
@@ -148,7 +153,7 @@ pub async fn unlock_active_profile(
     app: AppHandle,
     state: State<'_, AppState>,
     passphrase: String,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     let path = {
         let inner = state.inner.read().await;
         let pm_inner = inner.profile_manager.inner.read().await;
@@ -162,9 +167,9 @@ pub async fn unlock_active_profile(
         let pm = &state.inner.read().await.profile_manager;
         pm.activate_profile(&path, Some(passphrase))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| profile_access_error(true))?;
     }
-    reload_engine_from_profile(&app, &state).await
+    Ok(reload_engine_from_profile(&app, &state).await?)
 }
 
 #[tauri::command]
@@ -172,12 +177,12 @@ pub async fn retry_locked_profile_startup(
     app: AppHandle,
     state: State<'_, AppState>,
     passphrase: Option<String>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     let reason = {
         let inner = state.inner.read().await;
         match &inner.session {
             SessionState::Locked { reason, .. } => *reason,
-            _ => return reload_engine_from_profile(&app, &state).await,
+            _ => return Ok(reload_engine_from_profile(&app, &state).await?),
         }
     };
 
@@ -185,7 +190,7 @@ pub async fn retry_locked_profile_startup(
         return unlock_active_profile(app, state, passphrase.unwrap_or_default()).await;
     }
 
-    reload_engine_from_profile(&app, &state).await
+    Ok(reload_engine_from_profile(&app, &state).await?)
 }
 
 #[tauri::command]
@@ -193,7 +198,7 @@ pub async fn delete_profile(
     app: AppHandle,
     state: State<'_, AppState>,
     path: PathBuf,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     // Check if this is the active profile
     let is_active = {
         let inner = state.inner.read().await;
@@ -213,7 +218,9 @@ pub async fn delete_profile(
 
     if is_active {
         return Err(
-            "Cannot delete the active profile. Switch to another profile first.".to_string(),
+            "Cannot delete the active profile. Switch to another profile first."
+                .to_string()
+                .into(),
         );
     }
 
@@ -228,8 +235,19 @@ pub async fn delete_profile(
 }
 
 #[tauri::command]
-pub async fn reload_engine(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    reload_engine_from_profile(&app, &state).await
+pub async fn reload_engine(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<()> {
+    Ok(reload_engine_from_profile(&app, &state).await?)
+}
+
+fn profile_access_error(passphrase_supplied: bool) -> crate::errors::DesktopError {
+    crate::errors::DesktopError::from(if passphrase_supplied {
+        "auth_failed"
+    } else {
+        "profile_passphrase_required"
+    })
 }
 
 /// Helper function to reload engine from current active profile

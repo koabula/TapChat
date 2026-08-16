@@ -403,8 +403,7 @@ mod tests {
             self.calls.push("execute_http_request");
             Ok(vec![CoreEvent::HttpRequestFailed {
                 request_id: "req".into(),
-                retryable: true,
-                detail: Some("fake".into()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }])
         }
 

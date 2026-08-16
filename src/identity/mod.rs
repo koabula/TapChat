@@ -213,15 +213,21 @@ impl IdentityManager {
         bundle.validate()?;
         let verifying_key = parse_verifying_key(&bundle.user_public_key)?;
         let signature = parse_signature(&bundle.signature)?;
-        verifying_key
+        let verified = verifying_key
             .verify(identity_bundle_payload(bundle).as_bytes(), &signature)
-            .or_else(|_| {
-                verifying_key.verify(
-                    legacy_identity_bundle_payload(bundle).as_bytes(),
-                    &signature,
-                )
-            })
-            .map_err(|_| CoreError::invalid_input("identity bundle signature mismatch"))?;
+            .is_ok()
+            || (bundle.publication_version == 0
+                && verifying_key
+                    .verify(
+                        legacy_identity_bundle_payload(bundle).as_bytes(),
+                        &signature,
+                    )
+                    .is_ok());
+        if !verified {
+            return Err(CoreError::invalid_input(
+                "identity bundle signature mismatch",
+            ));
+        }
         for device in &bundle.devices {
             Self::verify_device_binding(&bundle.user_public_key, &device.binding)?;
             CapabilityManager::verify_device_contact_profile(device)?;
@@ -276,6 +282,8 @@ impl IdentityManager {
             urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
         let unsigned = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
+            publication_version: 1,
+            publication_revision: local_identity.device_status.updated_at.max(1),
             user_id: local_identity.user_identity.user_id.clone(),
             user_public_key: local_identity.user_identity.user_public_key.clone(),
             devices,
@@ -408,6 +416,10 @@ fn identity_bundle_payload_with_display_name(
         bundle.user_id.clone(),
         bundle.user_public_key.clone(),
     ];
+    if bundle.publication_version > 0 {
+        parts.push(bundle.publication_version.to_string());
+        parts.push(bundle.publication_revision.to_string());
+    }
     if include_display_name {
         parts.push(bundle.display_name.clone().unwrap_or_default());
     }
@@ -431,9 +443,35 @@ fn identity_bundle_payload_with_display_name(
         parts.push(device.device_id.clone());
         parts.push(device.device_public_key.clone());
         parts.push(device.binding.signature.clone());
-        parts.push(device.inbox_append_capability.signature.clone());
-        parts.push(device.keypackage_ref.object_ref.clone());
-        parts.push(device.keypackage_ref.expires_at.to_string());
+        parts.push(
+            device
+                .inbox_append_capability
+                .as_ref()
+                .map(|capability| capability.signature.clone())
+                .unwrap_or_default(),
+        );
+        if bundle.publication_version > 0 {
+            if let Some(keypackage_ref) = &device.keypackage_ref {
+                parts.push(keypackage_ref.lifecycle_version.to_string());
+                parts.push(keypackage_ref.object_ref.clone());
+                parts.push(keypackage_ref.not_before.to_string());
+                parts.push(keypackage_ref.created_at.to_string());
+                parts.push(keypackage_ref.expires_at.to_string());
+            } else {
+                parts.extend([
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ]);
+            }
+        } else if let Some(keypackage_ref) = &device.keypackage_ref {
+            parts.push(keypackage_ref.object_ref.clone());
+            parts.push(keypackage_ref.expires_at.to_string());
+        } else {
+            parts.extend([String::new(), String::new()]);
+        }
     }
     parts.join("|")
 }
@@ -586,6 +624,8 @@ mod tests {
             .expect("identity");
         let mut bundle = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
+            publication_version: 0,
+            publication_revision: 0,
             user_id: identity.user_identity.user_id.clone(),
             user_public_key: identity.user_identity.user_public_key.clone(),
             display_name: None,
@@ -595,7 +635,7 @@ mod tests {
                 device_public_key: identity.device_identity.device_public_key.clone(),
                 binding: identity.device_identity.binding.clone(),
                 status: DeviceStatusKind::Active,
-                inbox_append_capability: InboxAppendCapability {
+                inbox_append_capability: Some(InboxAppendCapability {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     service: CapabilityService::Inbox,
                     user_id: identity.user_identity.user_id.clone(),
@@ -609,14 +649,17 @@ mod tests {
                         max_ops_per_minute: Some(10),
                     }),
                     signature: "cap-sig".into(),
-                },
-                keypackage_ref: KeyPackageRef {
+                }),
+                keypackage_ref: Some(KeyPackageRef {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     user_id: identity.user_identity.user_id.clone(),
                     device_id: identity.device_identity.device_id.clone(),
                     object_ref: "s3://keypackage".into(),
+                    lifecycle_version: 0,
+                    not_before: 0,
+                    created_at: 0,
                     expires_at: 999,
-                },
+                }),
             }],
             bundle_share_id: Some("share-id".into()),
             identity_bundle_ref: None,
@@ -636,11 +679,17 @@ mod tests {
     fn exported_identity_bundle_can_be_verified() {
         let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_millis() as u64;
+        let package = crate::mls_adapter::MlsAdapter::generate_key_package(&identity, now_ms)
+            .expect("key package");
         let bundle = IdentityManager::export_identity_bundle(
             &identity,
             &sample_deployment(),
-            "kp-ref".into(),
-            999,
+            package.key_package_b64,
+            package.expires_at,
         )
         .expect("bundle");
         IdentityManager::verify_identity_bundle(&bundle).expect("bundle should verify");
@@ -745,9 +794,9 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

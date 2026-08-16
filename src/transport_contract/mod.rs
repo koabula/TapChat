@@ -752,6 +752,8 @@ pub struct DeviceStatusDocument {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishSharedStateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
     pub reference: String,
     pub document_kind: SharedStateDocumentKind,
     pub body: String,

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { decode } from "blurhash";
 import { Image } from "lucide-react";
 
@@ -14,7 +14,7 @@ export interface ImageGridItem {
   blurHash?: string;
   previewAvailable?: boolean;
   attachmentState?: "pending" | "published";
-  uploadState?: "sending" | "sent" | "failed";
+  uploadState?: "sending" | "sent" | "pending_approval" | "failed";
 }
 
 interface OpenMediaResult { handle: string; url: string; expires_at: number }

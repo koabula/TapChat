@@ -32,8 +32,34 @@ pub struct PersistedDeployment {
     pub deployment_bundle: DeploymentBundle,
     pub local_bundle: Option<IdentityBundle>,
     pub published_key_package: Option<PublishedKeyPackage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_package_inventory: Vec<PublishedKeyPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_identity_publication: Option<PendingIdentityPublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serialized_mls_bootstrap_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingIdentityPublicationStage {
+    AwaitingPublish,
+    AwaitingVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingIdentityPublication {
+    pub operation_id: String,
+    pub reason: String,
+    pub previous_bundle: IdentityBundle,
+    pub candidate_bundle: IdentityBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_etag: Option<String>,
+    pub stage: PendingIdentityPublicationStage,
+    #[serde(default)]
+    pub attempt_count: u8,
+    #[serde(default)]
+    pub next_retry_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +121,8 @@ pub struct PersistedOutgoingEnvelope {
     pub app_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plaintext_cache: Option<String>,
+    #[serde(default)]
+    pub identity_refresh_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,7 +490,7 @@ pub struct CorePersistenceSnapshot {
     pub mls_state_persistence_blocked: bool,
 }
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotFileEnvelope {
@@ -912,7 +940,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> crate::CoreResult<CorePersistenceSnapsho
         crate::CoreError::invalid_input(format!("failed to decode persistence snapshot: {error}"))
     })?;
 
-    if envelope.format_version != SNAPSHOT_FORMAT_VERSION {
+    if !matches!(envelope.format_version, 1 | SNAPSHOT_FORMAT_VERSION) {
         return Err(crate::CoreError::unsupported(format!(
             "unsupported persistence snapshot format version {}",
             envelope.format_version
@@ -956,6 +984,8 @@ mod tests {
                 user_id: "user:bob".into(),
                 bundle: IdentityBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
+                    publication_version: 0,
+                    publication_revision: 0,
                     user_id: "user:bob".into(),
                     user_public_key: "pub".into(),
                     display_name: None,
@@ -1019,6 +1049,7 @@ mod tests {
                 retries: 0,
                 app_message_id: Some("app:conv:one:1:device:alice:phone".into()),
                 plaintext_cache: Some("test plaintext".into()),
+                identity_refresh_attempted: false,
             }],
             group_states: vec![],
             group_cursors: vec![],
@@ -1173,9 +1204,9 @@ mod tests {
                 deployment_bundle: DeploymentBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     runtime_id: "runtime:test".into(),
-                    protocol_version: 4,
+                    protocol_version: 5,
                     worker_build_id: "test-worker-v4".into(),
-                    registry_schema_version: 1,
+                    registry_schema_version: 2,
                     region: "local".into(),
                     inbox_http_endpoint: "https://example.com".into(),
                     inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -1196,6 +1227,8 @@ mod tests {
                 },
                 local_bundle: Some(IdentityBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
+                    publication_version: 0,
+                    publication_revision: 0,
                     user_id: "user:alice".into(),
                     user_public_key: "pub".into(),
                     display_name: None,
@@ -1211,12 +1244,16 @@ mod tests {
                     signature: "sig".into(),
                 }),
                 published_key_package: None,
+                key_package_inventory: vec![],
+                pending_identity_publication: None,
                 serialized_mls_bootstrap_state: None,
             }),
             contacts: vec![PersistedContact {
                 user_id: "user:bob".into(),
                 bundle: IdentityBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
+                    publication_version: 0,
+                    publication_revision: 0,
                     user_id: "user:bob".into(),
                     user_public_key: "pub-bob".into(),
                     display_name: None,
@@ -1304,6 +1341,31 @@ mod tests {
     }
 
     #[test]
+    fn version_one_snapshot_decodes_with_version_two_defaults() {
+        let bytes = serde_json::json!({
+            "format_version": 1,
+            "snapshot": {
+                "message_nonce": 7,
+                "contacts": [],
+                "conversations": [],
+                "sync_states": [],
+                "mls_states": [],
+                "pending_outbox": []
+            }
+        })
+        .to_string();
+
+        let snapshot = decode_snapshot(bytes.as_bytes()).expect("decode v1 snapshot");
+        assert_eq!(snapshot.message_nonce, 7);
+        assert!(snapshot
+            .deployment
+            .as_ref()
+            .and_then(|deployment| deployment.pending_identity_publication.as_ref())
+            .is_none());
+        assert!(snapshot.pending_group_outbox.is_empty());
+    }
+
+    #[test]
     fn snapshot_decode_rejects_invalid_json() {
         let error = decode_snapshot(b"{not json").expect_err("invalid json should fail");
         assert_eq!(error.code(), "invalid_input");
@@ -1383,7 +1445,7 @@ mod tests {
                 signature: "binding-sig".into(),
             },
             status: DeviceStatusKind::Active,
-            inbox_append_capability: crate::model::InboxAppendCapability {
+            inbox_append_capability: Some(crate::model::InboxAppendCapability {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 service: crate::model::CapabilityService::Inbox,
                 user_id: user_id.into(),
@@ -1394,14 +1456,17 @@ mod tests {
                 expires_at: 999,
                 constraints: None,
                 signature: "cap-sig".into(),
-            },
-            keypackage_ref: crate::model::KeyPackageRef {
+            }),
+            keypackage_ref: Some(crate::model::KeyPackageRef {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 user_id: user_id.into(),
                 device_id: device_id.into(),
                 object_ref: format!("ref:keypackage:{device_id}"),
+                lifecycle_version: 0,
+                not_before: 0,
+                created_at: 0,
                 expires_at: 999,
-            },
+            }),
         }
     }
 }

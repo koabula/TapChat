@@ -17,10 +17,25 @@ describe("chat header actions", () => {
     ]);
   });
 
-  it("maps refresh failures to a visible error status", () => {
+  it("does not expose unstructured refresh failure details", () => {
     expect(chatHeaderActionErrorStatus(new Error("Refresh unavailable"))).toEqual({
       kind: "error",
-      text: "Refresh unavailable",
+      text: "Something went wrong. Try again.",
+    });
+  });
+
+  it("maps structured refresh failures to the registered English message", () => {
+    expect(
+      chatHeaderActionErrorStatus({
+        version: 1,
+        code: "network_unavailable",
+        domain: "transport",
+        retryable: true,
+        action: "reconnect",
+      }),
+    ).toEqual({
+      kind: "error",
+      text: "Check your connection and try again.",
     });
   });
 });

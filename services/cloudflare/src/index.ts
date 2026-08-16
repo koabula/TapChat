@@ -2,6 +2,7 @@ import { GroupOutboxDurableObject } from "./group-outbox/durable";
 import { InboxDurableObject } from "./inbox/durable";
 import { DeviceRegistryDurableObject } from "./device-registry/durable";
 import { handleRequest } from "./routes/http";
+import { appErrorBody } from "./errors";
 import type { Env } from "./types/env";
 
 export { DeviceRegistryDurableObject, GroupOutboxDurableObject, InboxDurableObject };
@@ -50,7 +51,10 @@ export default {
         error_type: error instanceof Error ? error.name : "unknown"
       }));
       logServerFailure(request, 500);
-      return Response.json({ error: "internal_error" }, { status: 500 });
+      return Response.json(
+        appErrorBody(500, "unexpected_error", request.headers.get("cf-ray") ?? crypto.randomUUID()),
+        { status: 500 }
+      );
     }
   }
 } satisfies ExportedHandler<Env>;

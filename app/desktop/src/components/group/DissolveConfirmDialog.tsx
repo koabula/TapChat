@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 
@@ -51,7 +52,7 @@ export default function DissolveConfirmDialog({
       await dissolveGroup(groupId);
       onDissolved();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
       setSubmitting(false);
     }
   };

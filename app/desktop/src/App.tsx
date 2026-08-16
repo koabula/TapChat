@@ -1,7 +1,8 @@
+import { presentError } from "@/lib/errors";
 import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 
 import AppShell from "./pages/shell/AppShell";
 import GroupsPage from "./pages/groups/GroupsPage";
@@ -65,17 +66,6 @@ function summarizeSessionStatus(status: SessionStatus): string {
 
 function summarizeRealtimeEvent(event: RealtimeEventPayload): string {
   return `type=${event.event_type} device_id=${event.device_id}`;
-}
-
-function isRuntimeAuthError(detail: string | undefined | null): boolean {
-  const value = (detail ?? "").toLowerCase();
-  return (
-    value.includes("403") ||
-    value.includes("forbidden") ||
-    value.includes("capability_expired") ||
-    value.includes("invalid_capability") ||
-    value.includes("device runtime")
-  );
 }
 
 /**
@@ -143,7 +133,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
         session.setWsConnected(status.ws_connected);
         session.setDeviceId(status.device_id ?? null);
       } catch (err) {
-        setUnlockSubmitError(String(err));
+        setUnlockSubmitError(presentError(err).message);
       } finally {
         setUnlocking(false);
       }
@@ -154,7 +144,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
       try {
         setProfiles(await invoke<ProfileSummary[]>("list_profiles"));
       } catch (err) {
-        setUnlockSubmitError(String(err));
+        setUnlockSubmitError(presentError(err).message);
       } finally {
         setLoadingProfiles(false);
       }
@@ -168,7 +158,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
           passphrase: unlockPassphrase || null,
         });
       } catch (err) {
-        setUnlockSubmitError(String(err));
+        setUnlockSubmitError(presentError(err).message);
       } finally {
         setUnlocking(false);
       }
@@ -178,7 +168,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
       try {
         await invoke("start_new_profile_onboarding");
       } catch (err) {
-        setUnlockSubmitError(String(err));
+        setUnlockSubmitError(presentError(err).message);
       }
     };
 
@@ -382,9 +372,6 @@ function App() {
             console.warn("[App] unexpected frontend sync policy for websocket error event");
           }
           console.warn(`[App] websocket error ${event.payload.device_id}: ${event.payload.data ?? "unknown"}`);
-          if (isRuntimeAuthError(event.payload.data)) {
-            console.warn("[App] websocket auth error detected; waiting for explicit refresh instead of auto-retrying");
-          }
           break;
         case "message_request_changed":
           if (
@@ -399,7 +386,7 @@ function App() {
           // Refresh message requests from backend
           refreshMessageRequests()
             .catch((err) => {
-              console.error(`[App] failed to refresh message requests: ${String(err)}`);
+              console.error(`[App] failed to refresh message requests: ${presentError(err).message}`);
             });
           break;
         case "inbox_record_available":
@@ -439,8 +426,8 @@ function App() {
         setStatusResolved(true);
       })
       .catch((err) => {
-        console.error(`[App] failed to get session status: ${String(err)}`);
-        setStartupError(String(err));
+        console.error(`[App] failed to get session status: ${presentError(err).message}`);
+        setStartupError(presentError(err).message);
         setSessionState("bootstrapping");
         setStatusResolved(true);
       });

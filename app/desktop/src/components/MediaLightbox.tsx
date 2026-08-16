@@ -1,5 +1,6 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { decode } from "blurhash";
 import {
   Check,
@@ -27,7 +28,7 @@ export interface MediaItem {
   blurHash?: string;
   previewAvailable?: boolean;
   attachmentState?: "pending" | "published";
-  uploadState?: "sending" | "sent" | "failed";
+  uploadState?: "sending" | "sent" | "pending_approval" | "failed";
 }
 
 interface OpenMediaResult {
@@ -74,7 +75,7 @@ function useMedia(item: MediaItem, variant: "preview" | "original", enabled: boo
       handle = opened.handle;
       if (cancelled) void invoke("release_media", { handle });
       else setMedia(opened);
-    }).catch((reason) => !cancelled && setError(String(reason)));
+    }).catch((reason) => !cancelled && setError(presentError(reason).message));
     return () => {
       cancelled = true;
       if (handle) void invoke("release_media", { handle });
@@ -158,7 +159,7 @@ export default function MediaLightbox({ items, initialIndex, onClose }: {
     try {
       await invoke("open_file", { path: save.downloadedPath });
     } catch (reason) {
-      save.setError(String(reason));
+      save.setError(presentError(reason).message);
     }
   };
   const openSavedFolder = async () => {
@@ -166,7 +167,7 @@ export default function MediaLightbox({ items, initialIndex, onClose }: {
     try {
       await invoke("open_containing_folder", { path: save.downloadedPath });
     } catch (reason) {
-      save.setError(String(reason));
+      save.setError(presentError(reason).message);
     }
   };
   return <div className="fixed inset-0 z-50 flex flex-col bg-black/85" onClick={(event) => event.target === event.currentTarget && onClose()}>

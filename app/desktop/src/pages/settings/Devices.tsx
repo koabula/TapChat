@@ -1,5 +1,6 @@
+import { presentError } from "@/lib/errors";
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { useNavigate } from "react-router";
 import { AlertCircle } from "lucide-react";
 
@@ -52,7 +53,7 @@ export default function Devices({ embedded = false }: DevicesProps) {
         ]);
       }
     } catch (err) {
-      console.error(`[DeviceSettings] Failed to load devices: ${String(err)}`);
+      console.error(`[DeviceSettings] Failed to load devices: ${presentError(err).message}`);
     } finally {
       setLoading(false);
     }
@@ -72,8 +73,8 @@ export default function Devices({ embedded = false }: DevicesProps) {
       });
       loadDevices();
     } catch (err) {
-      console.error(`[DeviceSettings] Failed to revoke device: ${String(err)}`);
-      alert(String(err));
+      console.error(`[DeviceSettings] Failed to revoke device: ${presentError(err).message}`);
+      alert(presentError(err).message);
     } finally {
       setRevokingDevice(null);
     }

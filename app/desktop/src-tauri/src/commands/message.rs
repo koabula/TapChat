@@ -275,7 +275,7 @@ async fn register_staged_attachment(
 pub async fn stage_attachment(
     app: tauri::AppHandle,
     file_path: String,
-) -> Result<StagedAttachmentOutput, String> {
+) -> crate::errors::DesktopResult<StagedAttachmentOutput> {
     let path = std::path::PathBuf::from(&file_path);
     let file_name = path
         .file_name()
@@ -286,14 +286,14 @@ pub async fn stage_attachment(
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("failed to read attachment: {error}"))?;
-    register_staged_attachment(&app, bytes, file_name, mime_type).await
+    Ok(register_staged_attachment(&app, bytes, file_name, mime_type).await?)
 }
 
 #[tauri::command]
 #[cfg(feature = "gui")]
 pub async fn stage_attachments_from_dialog(
     app: tauri::AppHandle,
-) -> Result<Vec<StagedAttachmentOutput>, String> {
+) -> crate::errors::DesktopResult<Vec<StagedAttachmentOutput>> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -328,7 +328,7 @@ pub async fn stage_attachments_from_dialog(
 #[cfg(feature = "gui")]
 pub async fn stage_clipboard_image(
     app: tauri::AppHandle,
-) -> Result<StagedAttachmentOutput, String> {
+) -> crate::errors::DesktopResult<StagedAttachmentOutput> {
     let clipboard_app = app.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         let image = clipboard_app
@@ -347,14 +347,14 @@ pub async fn stage_clipboard_image(
     .await
     .map_err(|error| format!("Clipboard image task failed: {error}"))??;
     let file_name = format!("clipboard-image-{}.png", now_ms());
-    register_staged_attachment(&app, bytes, file_name, "image/png".into()).await
+    Ok(register_staged_attachment(&app, bytes, file_name, "image/png".into()).await?)
 }
 
 #[tauri::command]
 pub async fn release_staged_attachment(
     state: tauri::State<'_, AppState>,
     handle: String,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     if let Some(staged) = state.staged_attachments.lock().await.remove(&handle) {
         if let Some(preview_handle) = staged.preview_handle {
             state.media_handles.write().await.remove(&preview_handle);
@@ -471,7 +471,7 @@ pub async fn send_text(
     app: tauri::AppHandle,
     conversation_id: String,
     plaintext: String,
-) -> Result<SendMessageResult, String> {
+) -> crate::errors::DesktopResult<SendMessageResult> {
     let send_start = std::time::Instant::now();
     let abs_start = crate::ts_ms();
     timetest!(
@@ -554,7 +554,7 @@ pub async fn send_attachment(
     app: tauri::AppHandle,
     conversation_id: String,
     attachment_handle: String,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     let state = app.state::<AppState>();
     let staged = state
         .staged_attachments
@@ -627,7 +627,7 @@ pub async fn download_attachment(
     message_id: String,
     reference: String,
     destination: String,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     let destination_path = std::path::PathBuf::from(&destination);
     if !destination_path.is_absolute() {
         return Err("Attachment save destination must be an absolute path".into());
@@ -663,7 +663,7 @@ pub async fn download_attachment(
     .await
     .map_err(|e| normalize_attachment_error(&e.to_string()))?;
     if let Some(error) = attachment_download_failure(&output) {
-        return Err(normalize_attachment_error(&error));
+        return Err(normalize_attachment_error(&error).into());
     }
     if destination_path.is_file() {
         remember_saved_attachment_path(&app, destination_path).await;
@@ -704,7 +704,7 @@ pub async fn download_attachment_to_default_path(
     reference: String,
     file_name: Option<String>,
     mime_type: Option<String>,
-) -> Result<String, String> {
+) -> crate::errors::DesktopResult<String> {
     ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
     let requested_variant = if reference == "preview" {
         "preview"
@@ -986,7 +986,7 @@ pub async fn get_attachment_media_state(
     app: tauri::AppHandle,
     conversation_id: String,
     message_id: String,
-) -> Result<AttachmentMediaState, String> {
+) -> crate::errors::DesktopResult<AttachmentMediaState> {
     let manifest = attachment_metadata_from_snapshot(&app, &conversation_id, &message_id)
         .await?
         .ok_or_else(|| "Attachment metadata missing".to_string())?;
@@ -1032,7 +1032,7 @@ pub async fn open_media(
     conversation_id: String,
     message_id: String,
     variant: String,
-) -> Result<OpenMediaResult, String> {
+) -> crate::errors::DesktopResult<OpenMediaResult> {
     let descriptor =
         attachment_variant_from_snapshot(&app, &conversation_id, &message_id, &variant).await;
     let pending_source = if descriptor.is_err() {
@@ -1043,7 +1043,8 @@ pub async fn open_media(
     if descriptor.is_err() && pending_source.is_none() {
         return Err(descriptor
             .err()
-            .unwrap_or_else(|| "Attachment metadata missing".to_string()));
+            .unwrap_or_else(|| "Attachment metadata missing".to_string())
+            .into());
     }
     let state = app.state::<AppState>();
     let profile_before = state.inner.read().await.profile_path.clone();
@@ -1229,7 +1230,7 @@ async fn load_pending_attachment_bytes(
 pub async fn release_media(
     state: tauri::State<'_, AppState>,
     handle: String,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     state.media_handles.write().await.remove(&handle);
     Ok(())
 }
@@ -1514,7 +1515,7 @@ async fn load_media_variant_bytes(
 }
 
 #[tauri::command]
-pub async fn clear_attachment_cache(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn clear_attachment_cache(app: tauri::AppHandle) -> crate::errors::DesktopResult<()> {
     let attachments_dir = {
         let state = app.state::<AppState>();
         let persistence = {

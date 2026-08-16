@@ -253,7 +253,7 @@ export interface Message {
   storage_refs?: StorageRef[]; // opaque transport references for non-v2 messages
   attachment_manifest?: AttachmentManifestView;
   attachment_state?: "pending" | "published";
-  delivery_state?: "sending" | "sent" | "failed";
+  delivery_state?: "sending" | "sent" | "pending_approval" | "failed";
 }
 
 export interface MessagePage {

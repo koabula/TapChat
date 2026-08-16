@@ -1,4 +1,4 @@
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use crate::mls_adapter::PeerDeviceKeyPackage;
 use crate::model::{
     DeviceStatusKind, GroupCapabilityOperation, GroupMessageType, GroupRole, IdentityBundle,
@@ -73,15 +73,24 @@ pub(super) fn group_message_type_to_direct(message_type: GroupMessageType) -> Me
 pub(super) fn active_peer_key_packages(
     bundle: &IdentityBundle,
 ) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|_| CoreError::new("device_clock_invalid", "system clock is invalid"))?;
     Ok(bundle
         .devices
         .iter()
         .filter(|device| matches!(device.status, DeviceStatusKind::Active))
-        .map(|device| PeerDeviceKeyPackage {
-            user_id: bundle.user_id.clone(),
-            device_id: device.device_id.clone(),
-            device_public_key: device.device_public_key.clone(),
-            key_package_b64: device.keypackage_ref.object_ref.clone(),
+        .filter_map(|device| {
+            let keypackage_ref = device.keypackage_ref.as_ref()?;
+            keypackage_ref
+                .is_usable_at(now_ms)
+                .then(|| PeerDeviceKeyPackage {
+                    user_id: bundle.user_id.clone(),
+                    device_id: device.device_id.clone(),
+                    device_public_key: device.device_public_key.clone(),
+                    key_package_b64: keypackage_ref.object_ref.clone(),
+                })
         })
         .collect())
 }

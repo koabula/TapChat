@@ -7,11 +7,12 @@ use tapchat_core::attachment_crypto::{AttachmentKind, AttachmentManifestV2};
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::ConversationSummary;
 use tapchat_core::model::{ConversationKind, ConversationState, StorageRef};
-use tapchat_core::CoreCommand;
+use tapchat_core::{CoreCommand, ErrorDomain};
 
 use super::conversation_view::{
     application_plaintext_message_count, generate_last_message_preview, summarize_plaintext,
 };
+use crate::errors::{DesktopError, DesktopResult};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::{AppState, SessionState};
 
@@ -40,6 +41,7 @@ pub enum MessageDirection {
 pub enum MessageDeliveryState {
     Sending,
     Sent,
+    PendingApproval,
     Failed,
 }
 
@@ -86,7 +88,7 @@ pub struct MessageView {
 #[tauri::command]
 pub async fn list_conversations(
     state: State<'_, AppState>,
-) -> Result<Vec<ConversationSummary>, String> {
+) -> crate::errors::DesktopResult<Vec<ConversationSummary>> {
     let inner = state.inner.read().await;
 
     // Get snapshot from engine which contains all conversations
@@ -145,22 +147,51 @@ pub async fn list_conversations(
 pub async fn create_conversation(
     app: tauri::AppHandle,
     peer_user_id: String,
-) -> Result<CreateConversationResult, String> {
-    let output = drive_core_with_handle(
+) -> DesktopResult<CreateConversationResult> {
+    let first = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::CreateConversation {
-            peer_user_id,
+            peer_user_id: peer_user_id.clone(),
             conversation_kind: ConversationKind::Direct,
         }),
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
+    let output = match first {
+        Ok(output) => output,
+        Err(error)
+            if error
+                .downcast_ref::<tapchat_core::CoreError>()
+                .is_some_and(|core| core.code() == "keypackage_expired") =>
+        {
+            if drive_core_with_handle(
+                &app,
+                CoreInput::Command(CoreCommand::RefreshIdentityState {
+                    user_id: peer_user_id.clone(),
+                }),
+            )
+            .await
+            .is_err()
+            {
+                log::warn!("create_conversation: contact identity refresh did not produce a usable key package");
+            }
+            drive_core_with_handle(
+                &app,
+                CoreInput::Command(CoreCommand::CreateConversation {
+                    peer_user_id,
+                    conversation_kind: ConversationKind::Direct,
+                }),
+            )
+            .await
+            .map_err(DesktopError::from)?
+        }
+        Err(error) => return Err(DesktopError::from(error)),
+    };
 
     // Extract conversation_id from CoreOutput view_model
     let conversation_id = output
         .view_model
         .and_then(|vm| vm.conversations.first().map(|c| c.conversation_id.clone()))
-        .ok_or_else(|| "Failed to get conversation_id from response".to_string())?;
+        .ok_or_else(|| DesktopError::new("invalid_state", ErrorDomain::Core, false))?;
 
     Ok(CreateConversationResult { conversation_id })
 }
@@ -169,13 +200,13 @@ pub async fn create_conversation(
 pub async fn recover_conversation(
     app: tauri::AppHandle,
     conversation_id: String,
-) -> Result<tapchat_core::CoreOutput, String> {
-    drive_core_with_handle(
+) -> crate::errors::DesktopResult<tapchat_core::CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ReconcileConversationMembership { conversation_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[tauri::command]
@@ -184,7 +215,7 @@ pub async fn get_messages(
     conversation_id: String,
     before_cursor: Option<String>,
     limit: Option<usize>,
-) -> Result<MessagePage, String> {
+) -> crate::errors::DesktopResult<MessagePage> {
     let inner = state.inner.read().await;
 
     // Get snapshot to find the conversation and local device_id
@@ -298,8 +329,17 @@ pub async fn get_messages(
                         } else {
                             msg.storage_refs.clone()
                         },
-                        delivery_state: matches!(direction, MessageDirection::Sent)
-                            .then_some(MessageDeliveryState::Sent),
+                        delivery_state: matches!(direction, MessageDirection::Sent).then(|| {
+                            match msg.delivery_state {
+                                Some(
+                                    tapchat_core::conversation::StoredMessageDeliveryState::PendingApproval,
+                                ) => MessageDeliveryState::PendingApproval,
+                                Some(
+                                    tapchat_core::conversation::StoredMessageDeliveryState::Failed,
+                                ) => MessageDeliveryState::Failed,
+                                _ => MessageDeliveryState::Sent,
+                            }
+                        }),
                     }
                 })
                 .collect()

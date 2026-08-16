@@ -1,6 +1,7 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 
 import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
@@ -129,7 +130,7 @@ export function useCoreUpdate() {
           // Non-fatal — the snapshot will be refreshed on the next
           // core-update or foreground fetch.
           console.debug(
-            `[useCoreUpdate] getGroupSnapshot(${groupId}) failed: ${String(err)}`,
+            `[useCoreUpdate] getGroupSnapshot(${groupId}) failed: ${presentError(err).message}`,
           );
         });
     }, 250);
@@ -148,7 +149,7 @@ export function useCoreUpdate() {
       summaries = await listGroupConversations();
     } catch (err) {
       console.debug(
-        `[useCoreUpdate] listGroupConversations failed: ${String(err)}`,
+        `[useCoreUpdate] listGroupConversations failed: ${presentError(err).message}`,
       );
       return;
     }
@@ -207,7 +208,7 @@ export function useCoreUpdate() {
           setDeviceId(identity.device_id);
         }
       } catch (err) {
-        console.error(`[useCoreUpdate] failed to get identity info: ${String(err)}`);
+        console.error(`[useCoreUpdate] failed to get identity info: ${presentError(err).message}`);
       }
 
       const requestsResult = await invoke<{
@@ -225,7 +226,7 @@ export function useCoreUpdate() {
         );
       }
     } catch (err) {
-      console.error(`[useCoreUpdate] failed to fetch data: ${String(err)}`);
+      console.error(`[useCoreUpdate] failed to fetch data: ${presentError(err).message}`);
     }
   };
 
@@ -276,7 +277,7 @@ export function useCoreUpdate() {
             setContacts(nextContacts);
           } catch (err) {
             console.error(
-              `[useCoreUpdate] failed to refresh contacts from backend: ${String(err)}`,
+              `[useCoreUpdate] failed to refresh contacts from backend: ${presentError(err).message}`,
             );
           }
         }
@@ -297,7 +298,7 @@ export function useCoreUpdate() {
               state_update.messages_changed,
             ).catch((err) => {
               console.error(
-                `[useCoreUpdate] failed to refresh conversations from backend: ${String(err)}`,
+                `[useCoreUpdate] failed to refresh conversations from backend: ${presentError(err).message}`,
               );
             });
           }
@@ -308,7 +309,7 @@ export function useCoreUpdate() {
           // fan out per-group snapshot refreshes.
           void refreshGroupsFromBackend().catch((err) => {
             console.debug(
-              `[useCoreUpdate] failed to refresh groups from backend: ${String(err)}`,
+              `[useCoreUpdate] failed to refresh groups from backend: ${presentError(err).message}`,
             );
           });
         } else if (state_update.contacts_changed) {
@@ -337,7 +338,7 @@ export function useCoreUpdate() {
           );
         }
       })().catch((err) => {
-        console.error(`[useCoreUpdate] failed to handle core-update: ${String(err)}`);
+        console.error(`[useCoreUpdate] failed to handle core-update: ${presentError(err).message}`);
       });
     });
 

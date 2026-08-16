@@ -118,7 +118,7 @@ fn migrate_legacy_settings(profile: &Profile) -> Result<GroupSyncSettings, Strin
 #[tauri::command]
 pub async fn get_group_sync_settings(
     state: State<'_, AppState>,
-) -> Result<GroupSyncSettings, String> {
+) -> crate::errors::DesktopResult<GroupSyncSettings> {
     let inner = state.inner.read().await;
     let pm = inner.profile_manager.inner.read().await;
     match &pm.active_profile {
@@ -131,7 +131,7 @@ pub async fn get_group_sync_settings(
 pub async fn set_group_sync_settings(
     state: State<'_, AppState>,
     settings: GroupSyncSettings,
-) -> Result<GroupSyncSettings, String> {
+) -> crate::errors::DesktopResult<GroupSyncSettings> {
     let inner = state.inner.read().await;
     let pm = inner.profile_manager.inner.read().await;
     match &pm.active_profile {

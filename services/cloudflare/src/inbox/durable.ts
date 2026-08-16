@@ -14,6 +14,7 @@ import type {
 } from "../types/contracts";
 import type { Env } from "../types/env";
 import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../types/runtime";
+import { appErrorBody } from "../errors";
 
 class DurableObjectStorageAdapter implements DurableObjectStorageLike {
   private readonly storage: DurableObjectState["storage"];
@@ -254,19 +255,17 @@ export async function handleInboxDurableRequest(
       return jsonResponse(result);
     }
 
-    return jsonResponse({ error: "not_found" }, 404);
+    return jsonResponse(appErrorBody(404, "not_found", crypto.randomUUID()), 404);
   } catch (error) {
     if (error instanceof HttpError) {
       const retryAfter = error.details?.retryAfterSeconds;
       return jsonResponse(
-        { error: error.code, message: error.message },
+        appErrorBody(error.status, error.code, crypto.randomUUID()),
         error.status,
         typeof retryAfter === "number" ? { "Retry-After": String(retryAfter) } : undefined
       );
     }
-    const runtimeError = error as { message?: string };
-    const message = runtimeError.message ?? "internal error";
-    return jsonResponse({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse(appErrorBody(500, "temporary_unavailable", crypto.randomUUID()), 500);
   }
 }
 

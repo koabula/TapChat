@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import {
   Image,
   Music,

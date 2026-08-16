@@ -7,6 +7,7 @@ import {
   validateAnyDeviceRuntimeAuthorization
 } from "../auth/capability";
 import { assertRegisteredRuntimeToken } from "../device-registry/durable";
+import { appErrorBody } from "../errors";
 import type { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import {
   CONTROL_JSON_MAX_BYTES,
@@ -521,14 +522,12 @@ export async function handleGroupOutboxDurableRequest(
       );
     }
 
-    return jsonResponse({ error: "not_found" }, 404);
+    return jsonResponse(appErrorBody(404, "not_found", crypto.randomUUID()), 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse({ error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) }, error.status);
+      return jsonResponse(appErrorBody(error.status, error.code, crypto.randomUUID()), error.status);
     }
-    const runtimeError = error as { message?: string };
-    const message = runtimeError.message ?? "internal error";
-    return jsonResponse({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse(appErrorBody(500, "temporary_unavailable", crypto.randomUUID()), 500);
   }
 }
 
@@ -596,9 +595,9 @@ export class GroupOutboxDurableObject extends DurableObjectBase {
       deviceRuntimeSecrets = requireDeviceRuntimeSecrets(this.envRef);
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonResponse({ error: error.code, message: error.message }, error.status);
+        return jsonResponse(appErrorBody(error.status, error.code, crypto.randomUUID()), error.status);
       }
-      return jsonResponse({ error: "runtime_misconfigured", message: "sharing secret is invalid" }, 503);
+      return jsonResponse(appErrorBody(503, "runtime_misconfigured", crypto.randomUUID()), 503);
     }
     const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
     this.groupIdRef = groupId;

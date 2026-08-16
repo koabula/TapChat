@@ -134,9 +134,7 @@ export class InboxService {
     }
 
     if (authContext.mode !== "verified") {
-      const request = await this.queueMessageRequestWithLimit(input, now);
-      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
-      return request;
+      throw new HttpError(426, "upgrade_required", "verified append authorization is required");
     }
 
     if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {

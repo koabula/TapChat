@@ -52,6 +52,12 @@ use super::util::{
     extract_error_code, extract_sealed_at, to_camel_case_json_string, to_snake_case_json_string,
 };
 
+fn same_identity_publication(left: &IdentityBundle, right: &IdentityBundle) -> bool {
+    left.publication_revision == right.publication_revision
+        && left.bundle_share_id == right.bundle_share_id
+        && left.signature == right.signature
+}
+
 pub struct DriverRuntime {
     client: Client,
     websocket_tx: UnboundedSender<CoreEvent>,
@@ -599,10 +605,9 @@ impl CoreDriver {
                             body,
                         }])
                     }
-                    Err(error) => Ok(vec![CoreEvent::HttpRequestFailed {
+                    Err(_error) => Ok(vec![CoreEvent::HttpRequestFailed {
                         request_id: request.request_id,
-                        retryable: true,
-                        detail: Some(error.to_string()),
+                        failure: crate::AppErrorV1::network_unavailable(),
                     }]),
                 };
             }
@@ -640,10 +645,9 @@ impl CoreDriver {
                     body,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::HttpRequestFailed {
+            Err(_error) => Ok(vec![CoreEvent::HttpRequestFailed {
                 request_id: request.request_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -719,8 +723,11 @@ impl CoreDriver {
             }
             Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
-                retryable: error.code() == "external_fetch_timeout",
-                detail: Some(error.to_string()),
+                failure: if error.code() == "external_fetch_timeout" {
+                    crate::AppErrorV1::from_registered_code("request_timeout")
+                } else {
+                    crate::AppErrorV1::network_unavailable()
+                },
             }]),
         }
     }
@@ -748,16 +755,15 @@ impl CoreDriver {
                 )?;
                 Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
             }
-            Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-                retryable: false,
-                detail: Some(format!(
-                    "list message requests failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-                retryable: true,
-                detail: Some(error.to_string()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -830,20 +836,19 @@ impl CoreDriver {
                 };
                 Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
             }
-            Ok(response) => Ok(vec![CoreEvent::MessageRequestActionFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::MessageRequestActionFailed {
+                    request_id: action.request_id,
+                    action: action.action,
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
                 request_id: action.request_id,
                 action: action.action,
-                retryable: false,
-                detail: Some(format!(
-                    "message request action failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
-                request_id: action.request_id,
-                action: action.action,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -864,16 +869,15 @@ impl CoreDriver {
                 let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
                 Ok(vec![CoreEvent::AllowlistFetched { document }])
             }
-            Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
-                retryable: false,
-                detail: Some(format!(
-                    "get allowlist failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
-                retryable: true,
-                detail: Some(error.to_string()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::AllowlistFetchFailed {
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -903,16 +907,15 @@ impl CoreDriver {
                 let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
                 Ok(vec![CoreEvent::AllowlistReplaced { document }])
             }
-            Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                retryable: false,
-                detail: Some(format!(
-                    "put allowlist failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                retryable: true,
-                detail: Some(error.to_string()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -923,6 +926,79 @@ impl CoreDriver {
     ) -> Result<Vec<CoreEvent>> {
         let auth = publish.auth.clone();
         self.inject_runtime_authorization(&mut publish.headers, auth.as_ref())?;
+        if publish.document_kind
+            == crate::transport_contract::SharedStateDocumentKind::IdentityBundle
+        {
+            let candidate = serde_json::from_str::<IdentityBundle>(&publish.body).ok();
+            match self.runtime.client.get(&publish.reference).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let etag = response
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let remote = response.json::<IdentityBundle>().await.ok();
+                    if candidate.as_ref().is_some_and(|candidate| {
+                        remote
+                            .as_ref()
+                            .is_some_and(|remote| same_identity_publication(remote, candidate))
+                    }) {
+                        return Ok(vec![CoreEvent::SharedStatePublished {
+                            operation_id: publish.operation_id,
+                            document_kind: publish.document_kind,
+                            reference: publish.reference,
+                            etag,
+                            saved_bundle: remote,
+                        }]);
+                    }
+                    if !publish.headers.contains_key("If-Match") {
+                        if let Some(etag) = etag {
+                            publish.headers.insert("If-Match".into(), etag);
+                        }
+                    }
+                }
+                Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    return Ok(vec![CoreEvent::SharedStatePublishFailed {
+                        operation_id: publish.operation_id,
+                        document_kind: publish.document_kind,
+                        reference: publish.reference,
+                        failure: crate::error::AppErrorV1::new(
+                            "identity_bundle_refresh_required",
+                            crate::error::ErrorDomain::Identity,
+                            true,
+                        )
+                        .with_http_status(status),
+                        current_bundle: None,
+                        etag: None,
+                    }]);
+                }
+                Err(_) => {
+                    let code = if publish
+                        .operation_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("contact_share_rotation:"))
+                    {
+                        "contact_share_offline"
+                    } else {
+                        "network_unavailable"
+                    };
+                    return Ok(vec![CoreEvent::SharedStatePublishFailed {
+                        operation_id: publish.operation_id,
+                        document_kind: publish.document_kind,
+                        reference: publish.reference,
+                        failure: crate::error::AppErrorV1::new(
+                            code,
+                            crate::error::ErrorDomain::Transport,
+                            true,
+                        ),
+                        current_bundle: None,
+                        etag: None,
+                    }]);
+                }
+            }
+        }
         let mut request = self.runtime.client.put(publish.reference.clone());
         for (key, value) in &publish.headers {
             request = request.header(key, value);
@@ -934,25 +1010,74 @@ impl CoreDriver {
             .await
         {
             Ok(response) if response.status().is_success() => {
+                let etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let saved_bundle = if publish.document_kind
+                    == crate::transport_contract::SharedStateDocumentKind::IdentityBundle
+                {
+                    response.json::<IdentityBundle>().await.ok()
+                } else {
+                    None
+                };
                 Ok(vec![CoreEvent::SharedStatePublished {
+                    operation_id: publish.operation_id,
                     document_kind: publish.document_kind,
                     reference: publish.reference,
+                    etag,
+                    saved_bundle,
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let failure = response
+                    .json::<crate::error::AppErrorV1>()
+                    .await
+                    .unwrap_or_else(|_| {
+                        crate::error::AppErrorV1::new(
+                            "temporary_failure",
+                            crate::error::ErrorDomain::Transport,
+                            status >= 500,
+                        )
+                        .with_http_status(status)
+                    });
+                let (current_bundle, etag) = if failure.code == "identity_bundle_conflict" {
+                    match self.runtime.client.get(&publish.reference).send().await {
+                        Ok(current) if current.status().is_success() => {
+                            let etag = current
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            (current.json::<IdentityBundle>().await.ok(), etag)
+                        }
+                        _ => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+                Ok(vec![CoreEvent::SharedStatePublishFailed {
+                    operation_id: publish.operation_id,
+                    document_kind: publish.document_kind,
+                    reference: publish.reference,
+                    failure,
+                    current_bundle,
+                    etag,
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+                operation_id: publish.operation_id,
                 document_kind: publish.document_kind,
                 reference: publish.reference,
-                retryable: false,
-                detail: Some(format!(
-                    "shared state publish failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::SharedStatePublishFailed {
-                document_kind: publish.document_kind,
-                reference: publish.reference,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::error::AppErrorV1::new(
+                    "network_unavailable",
+                    crate::error::ErrorDomain::Transport,
+                    true,
+                ),
+                current_bundle: None,
+                etag: None,
             }]),
         }
     }
@@ -982,18 +1107,17 @@ impl CoreDriver {
                     result,
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobTransferFailed {
+                    task_id: upload.task_id,
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
-                retryable: false,
-                detail: Some(format!(
-                    "prepare upload failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: upload.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1020,15 +1144,17 @@ impl CoreDriver {
             Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::BlobUploaded {
                 task_id: upload.task_id,
             }]),
-            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobTransferFailed {
+                    task_id: upload.task_id,
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
-                retryable: false,
-                detail: Some(format!("upload failed with status {}", response.status())),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: upload.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1048,16 +1174,15 @@ impl CoreDriver {
             }
             Ok(response) => {
                 let status = response.status();
+                let body = response.text().await.unwrap_or_default();
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
-                    retryable: status.as_u16() == 403,
-                    detail: Some(format!("download failed with status {status}")),
+                    failure: crate::AppErrorV1::from_http_response(status.as_u16(), &body),
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
+            Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: download.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1207,14 +1332,10 @@ impl TransportPort for CoreDriver {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
-                    let code = extract_error_code(&body);
                     return Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                         group_id: append.group_id,
                         message_id: append.envelope.message_id,
-                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
-                        status: Some(status),
-                        code,
-                        detail: Some(body),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1225,13 +1346,10 @@ impl TransportPort for CoreDriver {
                     seq: result.seq,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupEnvelopeAppendFailed {
                 group_id: append.group_id,
                 message_id: append.envelope.message_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1276,10 +1394,7 @@ impl TransportPort for CoreDriver {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
                         group_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1289,12 +1404,9 @@ impl TransportPort for CoreDriver {
                     roster_version: result.roster_version,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupAuthorizationInitializeFailed {
                 group_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1339,14 +1451,10 @@ impl TransportPort for CoreDriver {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 if !(200..300).contains(&status) {
-                    let code = extract_error_code(&body);
                     return Ok(vec![CoreEvent::GroupTransitionAppendFailed {
                         group_id,
                         transition_id,
-                        retryable: status >= 500 || code.as_deref() == Some("capability_expired"),
-                        status: Some(status),
-                        code,
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1360,13 +1468,10 @@ impl TransportPort for CoreDriver {
                     last_commit_message_id: result.last_commit_message_id,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupTransitionAppendFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupTransitionAppendFailed {
                 group_id,
                 transition_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1408,10 +1513,7 @@ impl TransportPort for CoreDriver {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
                         group_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1425,12 +1527,9 @@ impl TransportPort for CoreDriver {
                     materialized: result.materialized,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupAuthorizationStateFetchFailed {
                 group_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1471,10 +1570,7 @@ impl TransportPort for CoreDriver {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                         group_id: fetch.group_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(body),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1485,12 +1581,9 @@ impl TransportPort for CoreDriver {
                     to_seq: result.to_seq,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                 group_id: fetch.group_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1526,13 +1619,10 @@ impl TransportPort for CoreDriver {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
-                    retryable: true,
-                    status: None,
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: crate::AppErrorV1::network_unavailable(),
                 }]);
             }
         };
@@ -1541,22 +1631,17 @@ impl TransportPort for CoreDriver {
         if !(200..300).contains(&status) {
             return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id: get.group_id,
-                retryable: status >= 500,
-                status: Some(status),
-                code: extract_error_code(&body_text),
-                detail: Some(body_text),
+                failure: crate::AppErrorV1::from_http_response(status, &body_text),
             }]);
         }
         let body = to_snake_case_json_string(&body_text).unwrap_or(body_text);
         let result: GetGroupOutboxHeadResult = match serde_json::from_str(&body) {
             Ok(result) => result,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(vec![CoreEvent::GroupOutboxHeadFetchFailed {
                     group_id: get.group_id,
-                    retryable: false,
-                    status: Some(status),
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: crate::AppErrorV1::from_registered_code("unexpected_error")
+                        .with_http_status(status),
                 }]);
             }
         };
@@ -1608,13 +1693,10 @@ impl TransportPort for CoreDriver {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
+            Err(_error) => {
                 return Ok(vec![CoreEvent::GroupOutboxSealFailed {
                     group_id: seal.group_id,
-                    retryable: true,
-                    status: None,
-                    code: None,
-                    detail: Some(error.to_string()),
+                    failure: crate::AppErrorV1::network_unavailable(),
                 }]);
             }
         };
@@ -1645,10 +1727,10 @@ impl TransportPort for CoreDriver {
             Ok(response) => {
                 let status = response.status().as_u16();
                 if !(200..300).contains(&status) {
+                    let body = response.text().await.unwrap_or_default();
                     return Ok(vec![CoreEvent::WelcomePickupPutFailed {
                         descriptor: put.descriptor,
-                        retryable: status >= 500,
-                        detail: response.text().await.ok(),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&response.text().await.unwrap_or_default())?;
@@ -1657,10 +1739,9 @@ impl TransportPort for CoreDriver {
                     descriptor: put.descriptor,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::WelcomePickupPutFailed {
+            Err(_error) => Ok(vec![CoreEvent::WelcomePickupPutFailed {
                 descriptor: put.descriptor,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1690,8 +1771,7 @@ impl TransportPort for CoreDriver {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                         descriptor: fetch.descriptor,
-                        retryable: status >= 500,
-                        detail: Some(body),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1702,10 +1782,9 @@ impl TransportPort for CoreDriver {
                     manifest: result.manifest,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::WelcomePickupFetchFailed {
+            Err(_error) => Ok(vec![CoreEvent::WelcomePickupFetchFailed {
                 descriptor: fetch.descriptor,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1743,8 +1822,7 @@ impl TransportPort for CoreDriver {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupInviteCreateFailed {
                         group_id: create.group_id,
-                        retryable: status >= 500,
-                        detail: Some(body),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1754,10 +1832,9 @@ impl TransportPort for CoreDriver {
                     invite: result.invite,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupInviteCreateFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupInviteCreateFailed {
                 group_id: create.group_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -1770,13 +1847,12 @@ impl TransportPort for CoreDriver {
             Ok(body) => {
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupInviteResult = serde_json::from_str(&body)?;
-                if let Err(error) =
+                if let Err(_error) =
                     validate_group_invite_transport_binding(&fetch.invite_url, &result.invite)
                 {
                     return Ok(vec![CoreEvent::GroupInviteFetchFailed {
                         invite_url: fetch.invite_url,
-                        retryable: false,
-                        detail: Some(error.to_string()),
+                        failure: crate::AppErrorV1::from_registered_code("invalid_invite"),
                     }]);
                 }
                 Ok(vec![CoreEvent::GroupInviteFetched {
@@ -1786,8 +1862,11 @@ impl TransportPort for CoreDriver {
             }
             Err(error) => Ok(vec![CoreEvent::GroupInviteFetchFailed {
                 invite_url: fetch.invite_url,
-                retryable: error.code() == "external_fetch_timeout",
-                detail: Some(error.to_string()),
+                failure: if error.code() == "external_fetch_timeout" {
+                    crate::AppErrorV1::from_registered_code("request_timeout")
+                } else {
+                    crate::AppErrorV1::network_unavailable()
+                },
             }]),
         }
     }
@@ -1812,8 +1891,7 @@ impl TransportPort for CoreDriver {
                 if !(200..300).contains(&status) {
                     return Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
                         invite_url: submit.invite_token,
-                        retryable: status >= 500,
-                        detail: Some(body),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -1822,10 +1900,9 @@ impl TransportPort for CoreDriver {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinRequestSubmitFailed {
                 invite_url: submit.invite_token,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -2011,8 +2088,7 @@ impl TransportPort for CoreDriver {
                     return Ok(vec![CoreEvent::GroupJoinDecisionFailed {
                         group_id: decide.group_id,
                         request_id: decide.request_id,
-                        retryable: status >= 500,
-                        detail: Some(body),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -2021,11 +2097,10 @@ impl TransportPort for CoreDriver {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinDecisionFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinDecisionFailed {
                 group_id: decide.group_id,
                 request_id: decide.request_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -2065,10 +2140,7 @@ impl TransportPort for CoreDriver {
                     return Ok(vec![CoreEvent::GroupJoinClaimFailed {
                         group_id: claim.group_id,
                         request_id: claim.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -2079,13 +2151,10 @@ impl TransportPort for CoreDriver {
                     lease_expires_at: result.lease_expires_at,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinClaimFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinClaimFailed {
                 group_id: claim.group_id,
                 request_id: claim.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -2127,10 +2196,7 @@ impl TransportPort for CoreDriver {
                     return Ok(vec![CoreEvent::GroupJoinCompleteFailed {
                         group_id: complete.group_id,
                         request_id: complete.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
@@ -2139,13 +2205,10 @@ impl TransportPort for CoreDriver {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupJoinCompleteFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupJoinCompleteFailed {
                 group_id: complete.group_id,
                 request_id: complete.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -2184,10 +2247,7 @@ impl TransportPort for CoreDriver {
                     return Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
                         group_id: submit.group_id,
                         request_id: submit.request.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let result: SubmitGroupLeaveResult =
@@ -2196,13 +2256,10 @@ impl TransportPort for CoreDriver {
                     request: result.request,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupLeaveRequestSubmitFailed {
                 group_id: submit.group_id,
                 request_id: submit.request.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -2283,10 +2340,7 @@ impl TransportPort for CoreDriver {
                     return Ok(vec![CoreEvent::GroupLeaveClaimFailed {
                         group_id: claim.group_id,
                         request_id: claim.request_id,
-                        retryable: status >= 500,
-                        status: Some(status),
-                        code: extract_error_code(&body),
-                        detail: Some(format!("HTTP {status}: {body}")),
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
                     }]);
                 }
                 let result: ClaimGroupLeaveResult =
@@ -2297,13 +2351,10 @@ impl TransportPort for CoreDriver {
                     lease_expires_at: result.lease_expires_at,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::GroupLeaveClaimFailed {
+            Err(_error) => Ok(vec![CoreEvent::GroupLeaveClaimFailed {
                 group_id: claim.group_id,
                 request_id: claim.request_id,
-                retryable: true,
-                status: None,
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -2426,36 +2477,25 @@ pub(crate) fn map_seal_group_outbox_response(
         }
         return vec![CoreEvent::GroupOutboxSealFailed {
             group_id,
-            retryable: false,
-            status: Some(status),
-            code,
-            detail: Some(body_text.to_string()),
+            failure: crate::AppErrorV1::from_http_response(status, body_text),
         }];
     }
 
     if !(200..300).contains(&status) {
-        let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
-        let code = extract_error_code(&body);
-        let retryable = status >= 500;
         return vec![CoreEvent::GroupOutboxSealFailed {
             group_id,
-            retryable,
-            status: Some(status),
-            code,
-            detail: Some(body_text.to_string()),
+            failure: crate::AppErrorV1::from_http_response(status, body_text),
         }];
     }
 
     let body = to_snake_case_json_string(body_text).unwrap_or_else(|_| body_text.to_string());
     let result: SealGroupOutboxResult = match serde_json::from_str(&body) {
         Ok(result) => result,
-        Err(error) => {
+        Err(_error) => {
             return vec![CoreEvent::GroupOutboxSealFailed {
                 group_id,
-                retryable: false,
-                status: Some(status),
-                code: None,
-                detail: Some(error.to_string()),
+                failure: crate::AppErrorV1::from_registered_code("unexpected_error")
+                    .with_http_status(status),
             }];
         }
     };
@@ -2707,17 +2747,11 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            crate::CoreEvent::GroupOutboxSealFailed {
-                group_id,
-                retryable,
-                status,
-                code,
-                detail: _,
-            } => {
+            crate::CoreEvent::GroupOutboxSealFailed { group_id, failure } => {
                 assert_eq!(group_id, "group:project");
-                assert!(!*retryable, "403 must be non-retryable");
-                assert_eq!(*status, Some(403));
-                assert_eq!(code.as_deref(), Some("unauthorized"));
+                assert!(!failure.retryable, "403 must be non-retryable");
+                assert_eq!(failure.http_status, Some(403));
+                assert_eq!(failure.code, "invalid_capability");
             }
             other => panic!("expected GroupOutboxSealFailed for 403, got {:?}", other),
         }
@@ -2732,17 +2766,11 @@ mod tests {
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            crate::CoreEvent::GroupOutboxSealFailed {
-                group_id,
-                retryable,
-                status,
-                code,
-                ..
-            } => {
+            crate::CoreEvent::GroupOutboxSealFailed { group_id, failure } => {
                 assert_eq!(group_id, "group:project");
-                assert!(*retryable, "5xx must be retryable");
-                assert_eq!(*status, Some(503));
-                assert_eq!(code.as_deref(), Some("temporary_unavailable"));
+                assert!(failure.retryable, "5xx must be retryable");
+                assert_eq!(failure.http_status, Some(503));
+                assert_eq!(failure.code, "temporary_unavailable");
             }
             other => panic!(
                 "expected retryable GroupOutboxSealFailed for 503, got {:?}",

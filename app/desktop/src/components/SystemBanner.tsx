@@ -1,7 +1,8 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { useNavigate } from "react-router";
 import {
   RefreshCw,
@@ -80,7 +81,7 @@ export default function SystemBanner() {
       invoke<CloudflareStatus>("cloudflare_status")
         .then(setRuntimeStatus)
         .catch((err) => {
-          console.debug(`[SystemBanner] cloudflare_status failed: ${String(err)}`);
+          console.debug(`[SystemBanner] cloudflare_status failed: ${presentError(err).message}`);
         });
     };
     refreshRuntime();
@@ -262,7 +263,7 @@ export function NetworkIndicator() {
         }
       })
       .catch((err) => {
-        console.error(`[NetworkIndicator] failed to get session status: ${String(err)}`);
+        console.error(`[NetworkIndicator] failed to get session status: ${presentError(err).message}`);
       });
 
     return () => {
@@ -280,7 +281,7 @@ export function NetworkIndicator() {
     try {
       await invoke("sync_now");
     } catch (err) {
-      console.error(`[NetworkIndicator] reconnect failed: ${String(err)}`);
+      console.error(`[NetworkIndicator] reconnect failed: ${presentError(err).message}`);
     }
   };
 

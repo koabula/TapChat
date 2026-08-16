@@ -1,6 +1,7 @@
+import { presentError } from "@/lib/errors";
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { useNavigate, useParams } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
@@ -50,7 +51,7 @@ interface SendMessageResult {
   sender_device_id: string;
   plaintext: string;
   created_at: number;
-  delivery_state?: "sending" | "sent" | "failed";
+  delivery_state?: "sending" | "sent" | "pending_approval" | "failed";
 }
 
 export default function ChatView() {
@@ -246,7 +247,7 @@ export default function ChatView() {
     cloudflareStatus()
       .then(setRuntimeStatus)
       .catch((err) => {
-        console.debug(`[ChatView] cloudflare_status failed: ${String(err)}`);
+        console.debug(`[ChatView] cloudflare_status failed: ${presentError(err).message}`);
       });
   }, [pendingGroupSetup]);
 
@@ -318,7 +319,7 @@ export default function ChatView() {
         if (container) container.scrollTop += container.scrollHeight - previousHeight;
       });
     } catch (error) {
-      console.error(`[ChatView] Failed to load older messages: ${String(error)}`);
+      console.error(`[ChatView] Failed to load older messages: ${presentError(error).message}`);
     } finally {
       setLoadingOlderMessages(false);
     }
@@ -340,7 +341,7 @@ export default function ChatView() {
   useEffect(() => {
     if (!isGroup || !activeConversation?.group_id) return;
     void refreshCurrentGroupSnapshot().catch((err) => {
-      console.debug(`[ChatView] group snapshot refresh failed: ${String(err)}`);
+      console.debug(`[ChatView] group snapshot refresh failed: ${presentError(err).message}`);
     });
   }, [isGroup, activeConversation?.group_id]);
 
@@ -367,8 +368,8 @@ export default function ChatView() {
       markGroupSynced(activeConversation.group_id);
       await refreshCurrentGroupSnapshot();
     } catch (err) {
-      markGroupSyncFailed(activeConversation.group_id, String(err));
-      setTransportError(err instanceof Error ? err.message : String(err));
+      markGroupSyncFailed(activeConversation.group_id, presentError(err).message);
+      setTransportError(presentError(err).message);
     } finally {
       setTransportBusy(false);
     }
@@ -384,8 +385,8 @@ export default function ChatView() {
       await refreshCurrentGroupSnapshot();
       setRuntimeStatus(await cloudflareStatus());
     } catch (err) {
-      markGroupSyncFailed(activeConversation.group_id, String(err));
-      setTransportError(err instanceof Error ? err.message : String(err));
+      markGroupSyncFailed(activeConversation.group_id, presentError(err).message);
+      setTransportError(presentError(err).message);
     } finally {
       setTransportBusy(false);
     }
@@ -407,7 +408,7 @@ export default function ChatView() {
       });
       await refreshMessages();
     } catch (err) {
-      setRecoveryError(err instanceof Error ? err.message : String(err));
+      setRecoveryError(presentError(err).message);
     } finally {
       setRecoveryBusy(false);
     }
@@ -427,9 +428,9 @@ export default function ChatView() {
       await refreshMessages();
       return true;
     } catch (err) {
-      markGroupSyncFailed(groupId, String(err));
+      markGroupSyncFailed(groupId, presentError(err).message);
       if (showBusy) {
-        setTransportError(err instanceof Error ? err.message : String(err));
+        setTransportError(presentError(err).message);
       }
       return false;
     } finally {
@@ -473,7 +474,7 @@ export default function ChatView() {
       setActiveGroupId(activeConversation.group_id);
       markGroupOpened(activeConversation.group_id);
       void syncCurrentGroup("view_opened").catch((err) => {
-        console.debug(`[ChatView] group view sync failed: ${String(err)}`);
+        console.debug(`[ChatView] group view sync failed: ${presentError(err).message}`);
       });
       return () => setActiveGroupId(null);
     }
@@ -511,7 +512,7 @@ export default function ChatView() {
         setGroupMessages([]);
       }
     } catch (err) {
-      console.error(`[ChatView] Failed to load messages: ${String(err)}`);
+      console.error(`[ChatView] Failed to load messages: ${presentError(err).message}`);
       setMessages([]);
       setGroupMessages([]);
     } finally {
@@ -531,7 +532,7 @@ export default function ChatView() {
         setNextMessageCursor((current) => current ?? page.next_cursor ?? null);
       }
     } catch (err) {
-      console.error(`[ChatView] Failed to refresh messages: ${String(err)}`);
+      console.error(`[ChatView] Failed to refresh messages: ${presentError(err).message}`);
     }
   };
 
@@ -762,6 +763,7 @@ export default function ChatView() {
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(message.created_at)}
             {sent && message.delivery_state === "sending" ? " · Sending…" : ""}
+            {sent && message.delivery_state === "pending_approval" ? " · Waiting for approval" : ""}
             {sent && message.delivery_state === "failed" ? " · Failed" : ""}
           </span>
         </div>
@@ -794,6 +796,8 @@ export default function ChatView() {
       const item = manifestToMediaItem(msg.attachment_manifest, msg.message_id, conversationId!, msg.attachment_state, msg.delivery_state);
       const status = msg.delivery_state === "sending"
         ? " · Sending…"
+        : msg.delivery_state === "pending_approval"
+          ? " · Waiting for approval"
         : msg.delivery_state === "failed"
           ? " · Upload failed"
           : "";
@@ -849,6 +853,7 @@ export default function ChatView() {
           <span className="block text-xs text-right mt-1 opacity-60">
             {formatTime(msg.created_at)}
             {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
+            {isSent && msg.delivery_state === "pending_approval" ? " · Waiting for approval" : ""}
             {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
           </span>
         </div>
@@ -864,6 +869,7 @@ export default function ChatView() {
         <span className="mt-1 block px-1 text-right text-xs opacity-60">
           {formatTime(msg.created_at)}
           {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
+          {isSent && msg.delivery_state === "pending_approval" ? " · Waiting for approval" : ""}
           {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
         </span>
       </div>
@@ -1251,7 +1257,7 @@ function manifestToMediaItem(
   messageId: string,
   conversationId: string,
   attachmentState: "pending" | "published" = "published",
-  uploadState: "sending" | "sent" | "failed" = "sent",
+  uploadState: "sending" | "sent" | "pending_approval" | "failed" = "sent",
 ): MediaItem {
   return {
     type: manifest.kind === "file" ? "other" : manifest.kind,

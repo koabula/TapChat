@@ -1,5 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { AppInvokeError, normalizeAppError } from "./errors";
 import type {
   CoreOutput,
   IdentityInfo,
@@ -19,8 +20,23 @@ import type {
   RecoveryPhraseRevealResult,
 } from "./types";
 
-// Re-export Tauri primitives
-export { invoke, listen };
+// Re-export the event primitive; command calls use the structured error boundary below.
+export { listen };
+
+export async function invokeApp<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  try {
+    return args === undefined
+      ? await tauriInvoke<T>(command)
+      : await tauriInvoke<T>(command, args);
+  } catch (error) {
+    throw new AppInvokeError(normalizeAppError(error));
+  }
+}
+
+const invoke = invokeApp;
 
 // Typed wrappers for common operations
 
@@ -57,7 +73,13 @@ export async function getShareLink(): Promise<string | null> {
   return invoke("get_share_link");
 }
 
-export async function rotateShareLink(): Promise<void> {
+export interface ShareLinkRotationResult {
+  url: string;
+  publicationRevision: number;
+  rotatedAt: number;
+}
+
+export async function rotateShareLink(): Promise<ShareLinkRotationResult> {
   return invoke("rotate_share_link");
 }
 
@@ -470,7 +492,7 @@ export type GroupMessageView =
       storage_refs: StorageRef[];
       attachment_manifest?: import("./types").AttachmentManifestView;
       raw_message_type: string;
-      delivery_state?: "sending" | "sent" | "failed";
+      delivery_state?: "sending" | "sent" | "pending_approval" | "failed";
     }
   | {
       kind: "system_banner";
@@ -511,7 +533,7 @@ export interface SendGroupTextResult {
   plaintext: string;
   created_at: number;
   pending_group_outbox: number;
-  delivery_state?: "sending" | "sent" | "failed";
+  delivery_state?: "sending" | "sent" | "pending_approval" | "failed";
 }
 
 export interface SyncGroupOutboxResult {

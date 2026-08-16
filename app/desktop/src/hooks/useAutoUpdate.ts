@@ -69,17 +69,8 @@ export function useAutoUpdate() {
           updateAvailable: false,
         }));
       }
-    } catch (err) {
-      if (isMissingUpdaterMetadataError(err)) {
-        await checkGitHubReleaseFallback();
-        return;
-      }
-      setState((prev) => ({
-        ...prev,
-        checking: false,
-        checked: true,
-        error: "Could not check for updates. Please try again later.",
-      }));
+    } catch {
+      await checkGitHubReleaseFallback();
     }
   };
 
@@ -106,8 +97,12 @@ export function useAutoUpdate() {
         }
       });
       await relaunch();
-    } catch (err) {
-      setState((prev) => ({ ...prev, downloading: false, error: String(err) }));
+    } catch {
+      setState((prev) => ({
+        ...prev,
+        downloading: false,
+        error: "The update could not be installed. Try again later.",
+      }));
     }
   };
 
@@ -116,10 +111,10 @@ export function useAutoUpdate() {
     if (!release) return;
     try {
       await open(release.htmlUrl);
-    } catch (err) {
+    } catch {
       setState((prev) => ({
         ...prev,
-        error: `Could not open the release page: ${String(err)}`,
+        error: "The release page could not be opened.",
       }));
     }
   };
@@ -191,16 +186,6 @@ export function useAutoUpdate() {
 }
 
 export const useManualUpdate = useAutoUpdate;
-
-function isMissingUpdaterMetadataError(error: unknown): boolean {
-  const message = String(error).toLowerCase();
-  return (
-    message.includes("valid release json") ||
-    message.includes("release json") ||
-    message.includes("updater") ||
-    message.includes("not found")
-  );
-}
 
 async function fetchLatestGitHubRelease(): Promise<ManualRelease | null> {
   const response = await fetch(GITHUB_LATEST_RELEASE_API, {

@@ -23,6 +23,7 @@ import {
   groupManifestSigningPayload,
   verifyIdentityBundle
 } from "../src/auth/capability";
+import { signSharingPayload } from "../src/storage/sharing";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const TMP_DIR = path.join(ROOT, "node_modules", ".cache", "tapchat-cloudflare-test-runtime");
@@ -32,7 +33,12 @@ const RUNTIME_ID = "runtime:integration";
 const SHARING_SECRET = "integration-sharing-secret-0123456789abcdef0123456789abcdef";
 const DEVICE_RUNTIME_SECRET = "integration-runtime-secret-0123456789abcdef0123456789abcdef";
 const DEVICE_RUNTIME_KEY_ID = "integration-runtime-current";
-const signedFixtures = new Map<string, { bundle: IdentityBundle; capability: InboxAppendCapability }>();
+const signedFixtures = new Map<string, {
+  bundle: IdentityBundle;
+  capability: InboxAppendCapability;
+  userSecret: Uint8Array;
+  deviceSecret: Uint8Array;
+}>();
 
 async function ensureWorkerBundle(): Promise<string> {
   await fs.mkdir(TMP_DIR, { recursive: true });
@@ -59,7 +65,7 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       RUNTIME_ID,
       OWNER_USER_ID: options?.ownerUserId ?? "user:bob",
       OWNER_USER_PUBLIC_KEY: bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(11))),
-      WORKER_BUILD_ID: "integration-worker-v4",
+      WORKER_BUILD_ID: "integration-worker-v5",
       DEPLOYMENT_REGION: "local",
       MAX_INLINE_BYTES: options?.maxInlineBytes ?? "128",
       RETENTION_DAYS: options?.retentionDays ?? "1",
@@ -96,9 +102,9 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   assert.deepEqual(await readyResponse.json(), {
     ready: true,
     runtimeId: RUNTIME_ID,
-    protocolVersion: 4,
-    workerBuildId: "integration-worker-v4",
-    registrySchemaVersion: 1
+    protocolVersion: 5,
+    workerBuildId: "integration-worker-v5",
+    registrySchemaVersion: 2
   });
   const challengeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/challenge`, {
     method: "POST",
@@ -170,7 +176,12 @@ function sampleCapability(deviceId: string): InboxAppendCapability {
   return fixture.capability;
 }
 
-function signedIdentityFixture(userId: string, deviceId: string): { bundle: IdentityBundle; capability: InboxAppendCapability; deviceSecret: Uint8Array } {
+function signedIdentityFixture(userId: string, deviceId: string): {
+  bundle: IdentityBundle;
+  capability: InboxAppendCapability;
+  userSecret: Uint8Array;
+  deviceSecret: Uint8Array;
+} {
   const now = Date.now();
   const userSecret = new Uint8Array(32).fill(11);
   const deviceSecret = new Uint8Array(32).fill(12);
@@ -199,8 +210,11 @@ function signedIdentityFixture(userId: string, deviceId: string): { bundle: Iden
   binding.signature = signHex(userSecret, `${CURRENT_MODEL_VERSION}:${userId}:${deviceId}:${devicePublicKey}:${now}`);
   const bundle: IdentityBundle = {
     version: CURRENT_MODEL_VERSION,
+    publicationVersion: 1,
+    publicationRevision: now,
     userId,
     userPublicKey,
+    bundleShareId: `share-${deviceId}`,
     updatedAt: now,
     identityBundleRef: `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`,
     deviceStatusRef: `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/device-status`,
@@ -213,16 +227,19 @@ function signedIdentityFixture(userId: string, deviceId: string): { bundle: Iden
       inboxAppendCapability: capability,
       keypackageRef: {
         version: CURRENT_MODEL_VERSION,
+        lifecycleVersion: 1,
         userId,
         deviceId,
         ref: `${BASE_URL}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/kp1`,
-        expiresAt: now + 60_000
+        notBefore: now - 60 * 60 * 1000,
+        createdAt: now,
+        expiresAt: now + 84 * 24 * 60 * 60 * 1000
       }
     }],
     signature: ""
   };
   bundle.signature = signHex(userSecret, identityBundlePayload(bundle));
-  return { bundle, capability, deviceSecret };
+  return { bundle, capability, userSecret, deviceSecret };
 }
 
 function capabilityPayload(capability: InboxAppendCapability): string {
@@ -244,6 +261,8 @@ function identityBundlePayload(bundle: IdentityBundle): string {
     bundle.version,
     bundle.userId,
     bundle.userPublicKey,
+    String(bundle.publicationVersion),
+    String(bundle.publicationRevision),
     "",
     String(bundle.updatedAt),
     bundle.bundleShareId ?? "",
@@ -253,8 +272,14 @@ function identityBundlePayload(bundle: IdentityBundle): string {
     bundle.storageProfile?.profileRef ?? ""
   ];
   for (const device of bundle.devices) {
-    parts.push(device.deviceId, device.devicePublicKey, device.binding.signature, device.inboxAppendCapability.signature);
-    parts.push(device.keypackageRef.ref, String(device.keypackageRef.expiresAt));
+    parts.push(device.deviceId, device.devicePublicKey, device.binding.signature, device.inboxAppendCapability!.signature);
+    parts.push(
+      String(device.keypackageRef!.lifecycleVersion),
+      device.keypackageRef!.ref,
+      String(device.keypackageRef!.notBefore),
+      String(device.keypackageRef!.createdAt),
+      String(device.keypackageRef!.expiresAt)
+    );
   }
   return parts.join("|");
 }
@@ -263,6 +288,197 @@ function signHex(secret: Uint8Array, payload: string | Uint8Array): string {
   const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
   return bytesToHex(ed25519.sign(encoded, secret));
 }
+
+test("identity publication enforces lifecycle CAS and atomically revokes the previous share link", async () => {
+  const mf = await createRuntime();
+  try {
+    const userId = "user:bob";
+    const deviceId = "device:bob:phone";
+    const deployment = await issueDeviceBundle(mf, userId, deviceId);
+    const fixture = signedFixtures.get(deviceId);
+    assert.ok(fixture);
+    const identityUrl = `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
+    const initial = await mf.dispatchFetch(identityUrl);
+    assert.equal(initial.status, 200);
+    const etag = initial.headers.get("etag");
+    assert.ok(etag);
+
+    const oldShareId = fixture.bundle.bundleShareId!;
+    const oldToken = await signSharingPayload(SHARING_SECRET, {
+      version: CURRENT_MODEL_VERSION,
+      service: "contact_share",
+      userId,
+      shareId: oldShareId
+    });
+    assert.equal((await mf.dispatchFetch(`${BASE_URL}/v1/contact-share/${encodeURIComponent(oldToken)}`)).status, 200);
+
+    const invalid = structuredClone(fixture.bundle);
+    invalid.publicationRevision = (invalid.publicationRevision ?? 0) + 1;
+    invalid.devices[0].keypackageRef!.expiresAt += 1;
+    invalid.signature = signHex(fixture.userSecret, identityBundlePayload(invalid));
+    const rejected = await mf.dispatchFetch(identityUrl, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(deployment.runtimeCredential.token),
+        "content-type": "application/json",
+        "if-match": etag
+      },
+      body: JSON.stringify(invalid)
+    });
+    assert.equal(rejected.status, 422);
+    assert.equal(((await rejected.json()) as { code: string }).code, "keypackage_lifetime_invalid");
+
+    const candidate = structuredClone(fixture.bundle);
+    candidate.publicationRevision = (candidate.publicationRevision ?? 0) + 1;
+    candidate.updatedAt += 1;
+    candidate.bundleShareId = "share-rotated";
+    candidate.signature = signHex(fixture.userSecret, identityBundlePayload(candidate));
+    const missingPrecondition = await mf.dispatchFetch(identityUrl, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(deployment.runtimeCredential.token),
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(candidate)
+    });
+    assert.equal(missingPrecondition.status, 412);
+    assert.equal(((await missingPrecondition.json()) as { code: string }).code, "identity_bundle_conflict");
+
+    const committed = await mf.dispatchFetch(identityUrl, {
+      method: "PUT",
+      headers: {
+        ...authHeaders(deployment.runtimeCredential.token),
+        "content-type": "application/json",
+        "if-match": etag
+      },
+      body: JSON.stringify(candidate)
+    });
+    assert.equal(committed.status, 200);
+    assert.equal((await mf.dispatchFetch(`${BASE_URL}/v1/contact-share/${encodeURIComponent(oldToken)}`)).status, 404);
+    const newToken = await signSharingPayload(SHARING_SECRET, {
+      version: CURRENT_MODEL_VERSION,
+      service: "contact_share",
+      userId,
+      shareId: candidate.bundleShareId
+    });
+    assert.equal((await mf.dispatchFetch(`${BASE_URL}/v1/contact-share/${encodeURIComponent(newToken)}`)).status, 200);
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test("legacy R2 identity bundle is lazily migrated into the authoritative registry", async () => {
+  const mf = await createRuntime();
+  try {
+    const userId = "user:bob";
+    const fixture = signedIdentityFixture(userId, "device:bob:phone");
+    const bucket = (await mf.getR2Bucket("TAPCHAT_STORAGE")) as unknown as {
+      put(key: string, value: string): Promise<void>;
+      delete(key: string): Promise<void>;
+    };
+    const legacyKey = `shared-state/${userId}/identity_bundle.json`;
+    await bucket.put(legacyKey, JSON.stringify(fixture.bundle));
+
+    const identityUrl = `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
+    const migrated = await mf.dispatchFetch(identityUrl);
+    assert.equal(migrated.status, 200);
+    assert.ok(migrated.headers.get("etag"));
+
+    await bucket.delete(legacyKey);
+    const authoritative = await mf.dispatchFetch(identityUrl);
+    assert.equal(authoritative.status, 200);
+    assert.deepEqual(await authoritative.json(), fixture.bundle);
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test("append authorization uses the registry bundle when the R2 mirror is stale", async (t) => {
+  const mf = await createRuntime();
+  t.after(async () => {
+    await mf.dispose();
+  });
+
+  const userId = "user:bob";
+  const deviceId = "device:bob:authority";
+  const deployment = await issueDeviceBundle(mf, userId, deviceId);
+  await setAllowlist(mf, deployment.runtimeCredential.token, deviceId, ["user:alice"]);
+  const fixture = signedFixtures.get(deviceId);
+  assert.ok(fixture);
+  const bucket = (await mf.getR2Bucket("TAPCHAT_STORAGE")) as unknown as {
+    put(key: string, value: string): Promise<void>;
+  };
+  await bucket.put(
+    `shared-state/${userId}/identity_bundle.json`,
+    JSON.stringify({ ...fixture.bundle, signature: "00" })
+  );
+
+  const delivered = await appendEnvelope(
+    mf,
+    deviceId,
+    "msg:authoritative-bundle",
+    "cipher-authoritative",
+    "user:alice"
+  );
+  assert.equal(delivered.status, 200);
+  assert.equal(delivered.deliveredTo, "inbox");
+});
+
+test("stale append capability requests an identity refresh without queuing a message request", async (t) => {
+  const mf = await createRuntime();
+  t.after(async () => {
+    await mf.dispose();
+  });
+
+  const userId = "user:bob";
+  const deviceId = "device:bob:rotated-capability";
+  const deployment = await issueDeviceBundle(mf, userId, deviceId);
+  const fixture = signedFixtures.get(deviceId);
+  assert.ok(fixture);
+  const identityUrl = `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
+  const currentResponse = await mf.dispatchFetch(identityUrl);
+  const etag = currentResponse.headers.get("etag");
+  assert.equal(currentResponse.status, 200);
+  assert.ok(etag);
+
+  const candidate = structuredClone(fixture.bundle);
+  const candidateCapability = candidate.devices[0].inboxAppendCapability!;
+  candidateCapability.expiresAt += 30_000;
+  candidateCapability.signature = signHex(
+    fixture.deviceSecret,
+    capabilityPayload(candidateCapability)
+  );
+  candidate.publicationRevision = (candidate.publicationRevision ?? 0) + 1;
+  candidate.updatedAt += 1;
+  candidate.signature = signHex(fixture.userSecret, identityBundlePayload(candidate));
+  const publish = await mf.dispatchFetch(identityUrl, {
+    method: "PUT",
+    headers: {
+      ...authHeaders(deployment.runtimeCredential.token),
+      "content-type": "application/json",
+      "if-match": etag
+    },
+    body: JSON.stringify(candidate)
+  });
+  assert.equal(publish.status, 200);
+
+  const staleAppend = await appendEnvelope(
+    mf,
+    deviceId,
+    "msg:stale-capability",
+    "cipher-stale",
+    "user:mallory"
+  );
+  assert.equal(staleAppend.status, 409);
+  assert.equal(staleAppend.code, "identity_refresh_required");
+
+  const requestsResponse = await mf.dispatchFetch(
+    `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests`,
+    { headers: authHeaders(deployment.runtimeCredential.token) }
+  );
+  const requests = (await requestsResponse.json()) as MessageRequestListResult;
+  assert.equal(requests.requests.length, 0);
+});
 
 function bytesToHex(input: Uint8Array): string {
   return Array.from(input, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -651,11 +867,22 @@ test("runtime integration: message request changes push over realtime and inbox 
   assert.equal(acceptedEvent.requestId, requests.requests[0].requestId);
   assert.equal(acceptedEvent.change, "accepted");
 
+  const deliveredAfterAccept = await appendEnvelope(
+    mf,
+    deviceId,
+    "msg:req-2",
+    "cipher-after-accept",
+    "user:mallory"
+  );
+  assert.equal(deliveredAfterAccept.status, 200);
+  assert.equal(deliveredAfterAccept.deliveredTo, "inbox");
+  assert.notEqual(deliveredAfterAccept.queuedAsRequest, true);
+
   const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
     headers: authHeaders(token)
   });
   const fetched = (await fetchResponse.json()) as { records: Array<{ messageId: string }> };
-  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1"]);
+  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1", "msg:req-2"]);
 
   socket.close(1000, "done");
 });
@@ -913,7 +1140,7 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
     }
   );
   assert.equal(incompleteTransition.status, 400);
-  assert.equal(((await incompleteTransition.json()) as { error: string }).error, "invalid_input");
+  assert.equal(((await incompleteTransition.json()) as { code: string }).code, "invalid_input");
 
   const complete = await mf.dispatchFetch(
     `${BASE_URL}/v1/groups/${encodeURIComponent(GROUP_ID)}/join-requests/${encodeURIComponent(requestId)}/complete`,
@@ -941,7 +1168,7 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
     }
   );
   assert.equal(complete.status, 409);
-  assert.equal(((await complete.json()) as { error: string }).error, "group_join_lease_invalid");
+  assert.equal(((await complete.json()) as { code: string }).code, "group_join_lease_invalid");
   socket.close(1000, "done");
 });
 

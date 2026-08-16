@@ -8,8 +8,9 @@ use tauri::{AppHandle, Manager, State};
 use zeroize::Zeroizing;
 
 use tapchat_core::model::DeviceStatusKind;
-use tapchat_core::{CoreCommand, CoreOutput};
+use tapchat_core::{CoreCommand, CoreOperationStatus, CoreOutput, ErrorDomain, RecoveryAction};
 
+use crate::errors::{DesktopError, DesktopResult};
 use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
 use crate::platform::log_sanitize::redact_id;
 use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
@@ -61,7 +62,7 @@ pub async fn init_onboarding_profile(
     profile_name: String,
     passphrase: Option<String>,
     protection_mode: Option<ProfileProtectionMode>,
-) -> Result<ProfileSummary, String> {
+) -> crate::errors::DesktopResult<ProfileSummary> {
     // Use default path: APPDATA/TapChat/profiles/{profile_name}
     let data_dir = dirs::data_dir().ok_or_else(|| {
         log::error!("Could not get data directory from dirs crate");
@@ -113,7 +114,7 @@ pub async fn create_or_load_identity(
     mnemonic: Option<String>,
     device_name: Option<String>,
     display_name: Option<String>,
-) -> Result<CreateIdentityResult, String> {
+) -> crate::errors::DesktopResult<CreateIdentityResult> {
     let supplied_mnemonic = mnemonic.is_some();
     let had_identity = state.inner.read().await.engine.local_identity().is_some();
     // First ensure profile exists
@@ -122,7 +123,8 @@ pub async fn create_or_load_identity(
         if inner.profile_manager.get_active_metadata().await.is_none() {
             return Err(
                 "profile_required: create a protected profile before creating or recovering an identity"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
     }
@@ -184,7 +186,9 @@ pub async fn create_or_load_identity(
 }
 
 #[tauri::command]
-pub async fn get_identity_info(state: State<'_, AppState>) -> Result<Option<IdentityInfo>, String> {
+pub async fn get_identity_info(
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<Option<IdentityInfo>> {
     let inner = state.inner.read().await;
 
     let identity = inner.engine.local_identity();
@@ -209,7 +213,7 @@ pub async fn get_identity_info(state: State<'_, AppState>) -> Result<Option<Iden
 #[tauri::command]
 pub async fn begin_recovery_phrase_reveal(
     state: State<'_, AppState>,
-) -> Result<RecoveryPhraseRevealChallenge, String> {
+) -> crate::errors::DesktopResult<RecoveryPhraseRevealChallenge> {
     const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 
     let (profile_path, auth_mode) = {
@@ -265,7 +269,7 @@ pub async fn complete_recovery_phrase_reveal(
     challenge_id: String,
     passphrase: Option<String>,
     confirmed: bool,
-) -> Result<RecoveryPhraseRevealResult, String> {
+) -> crate::errors::DesktopResult<RecoveryPhraseRevealResult> {
     let challenge = {
         let mut gate = state.recovery_phrase_gate.lock().await;
         consume_recovery_phrase_challenge(&mut *gate, &challenge_id, Instant::now())?
@@ -330,38 +334,157 @@ fn consume_recovery_phrase_challenge(
 }
 
 #[tauri::command]
-pub async fn get_share_link(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let inner = state.inner.read().await;
-
-    // Get the share link from the deployment bundle
-    let bundle = inner.engine.local_bundle();
-    let deployment = inner.engine.refresh_snapshot().deployment;
-
-    // The share link is typically constructed from the inbox_http_endpoint
-    // and user_id from the deployment bundle
-    match (bundle, deployment) {
-        (Some(b), Some(d)) => {
-            // Get HTTP endpoint from deployment bundle
-            let http_endpoint = d.deployment_bundle.inbox_http_endpoint;
-            // Construct share link: {endpoint}/v1/shared-state/{user_id}/identity-bundle
-            Ok(Some(format!(
-                "{}/v1/shared-state/{}/identity-bundle",
-                http_endpoint.trim_end_matches('/'),
-                b.user_id
-            )))
-        }
-        _ => Ok(None),
+pub async fn get_share_link(state: State<'_, AppState>) -> DesktopResult<Option<String>> {
+    if state.inner.read().await.engine.has_pending_share_rotation() {
+        return Err(DesktopError::new(
+            "contact_share_rotation_unverified",
+            ErrorDomain::Identity,
+            true,
+        )
+        .with_action(RecoveryAction::Reconnect));
     }
+    state
+        .ports
+        .lock()
+        .await
+        .build_contact_share_url()
+        .await
+        .map_err(DesktopError::from)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareLinkRotationResult {
+    pub url: String,
+    pub publication_revision: u64,
+    pub rotated_at: u64,
 }
 
 #[tauri::command]
-pub async fn rotate_share_link(app: AppHandle) -> Result<CoreOutput, String> {
+pub async fn rotate_share_link(app: AppHandle) -> DesktopResult<ShareLinkRotationResult> {
+    let state = app.state::<AppState>();
+    let current_url = state
+        .ports
+        .lock()
+        .await
+        .build_contact_share_url()
+        .await
+        .map_err(DesktopError::from)?
+        .ok_or_else(|| {
+            DesktopError::new("contact_share_offline", ErrorDomain::Identity, true)
+                .with_action(RecoveryAction::Reconnect)
+        })?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|_| DesktopError::new("network_unavailable", ErrorDomain::Transport, true))?;
+    let current = client.get(&current_url).send().await.map_err(|_| {
+        DesktopError::new("contact_share_offline", ErrorDomain::Identity, true)
+            .with_action(RecoveryAction::Reconnect)
+    })?;
+    if !current.status().is_success() {
+        return Err(
+            DesktopError::new("contact_share_offline", ErrorDomain::Identity, true)
+                .with_action(RecoveryAction::Reconnect),
+        );
+    }
+
     drive_core_with_handle(
+        &app,
+        CoreInput::Event(tapchat_core::CoreEvent::CredentialMaintenanceRequested {
+            now_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }),
+    )
+    .await
+    .map_err(DesktopError::from)?;
+
+    let output = drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RotateContactShareLink),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(DesktopError::from)?;
+    let operation = output
+        .view_model
+        .as_ref()
+        .and_then(|view| {
+            view.operation_results
+                .iter()
+                .find(|result| result.operation_id.starts_with("contact_share_rotation:"))
+        })
+        .ok_or_else(|| {
+            DesktopError::new(
+                "contact_share_rotation_unverified",
+                ErrorDomain::Identity,
+                true,
+            )
+            .with_action(RecoveryAction::Reconnect)
+        })?;
+    if operation.status == CoreOperationStatus::Failed {
+        return Err(operation
+            .failure
+            .clone()
+            .map(DesktopError::from)
+            .unwrap_or_else(|| {
+                DesktopError::new(
+                    "contact_share_rotation_unverified",
+                    ErrorDomain::Identity,
+                    true,
+                )
+                .with_action(RecoveryAction::Reconnect)
+            }));
+    }
+
+    let url = state
+        .ports
+        .lock()
+        .await
+        .build_contact_share_url()
+        .await
+        .map_err(DesktopError::from)?
+        .ok_or_else(|| {
+            DesktopError::new(
+                "contact_share_rotation_unverified",
+                ErrorDomain::Identity,
+                true,
+            )
+        })?;
+    let verification = client.get(&url).send().await.map_err(|_| {
+        DesktopError::new(
+            "contact_share_rotation_unverified",
+            ErrorDomain::Identity,
+            true,
+        )
+        .with_action(RecoveryAction::Reconnect)
+    })?;
+    if !verification.status().is_success() {
+        return Err(DesktopError::new(
+            "contact_share_rotation_unverified",
+            ErrorDomain::Identity,
+            true,
+        )
+        .with_action(RecoveryAction::Reconnect));
+    }
+    let publication_revision = state
+        .inner
+        .read()
+        .await
+        .engine
+        .local_bundle()
+        .map(|bundle| bundle.publication_revision)
+        .unwrap_or_default();
+    Ok(ShareLinkRotationResult {
+        url,
+        publication_revision,
+        rotated_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    })
 }
 
 #[tauri::command]
@@ -369,12 +492,12 @@ pub async fn update_device_status(
     app: AppHandle,
     target_device_id: String,
     status: String,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     // Parse status string to DeviceStatusKind
     let device_status = match status.to_lowercase().as_str() {
         "active" => DeviceStatusKind::Active,
         "revoked" => DeviceStatusKind::Revoked,
-        _ => return Err(format!("Invalid device status: {}", status)),
+        _ => return Err(format!("Invalid device status: {}", status).into()),
     };
 
     let mut output = drive_core_with_handle(
@@ -403,26 +526,26 @@ pub async fn update_device_status(
 pub async fn sync_groups_for_new_device(
     app: AppHandle,
     device_id: String,
-) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+) -> crate::errors::DesktopResult<CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::SyncGroupsForNewDevice { device_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[tauri::command]
 pub async fn sync_groups_for_removed_device(
     app: AppHandle,
     device_id: String,
-) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+) -> crate::errors::DesktopResult<CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::SyncGroupsForRemovedDevice { device_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 async fn group_sync_command_for_device_status(
@@ -456,13 +579,13 @@ async fn group_sync_command_for_device_status(
 pub async fn set_local_display_name(
     app: AppHandle,
     display_name: Option<String>,
-) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+) -> crate::errors::DesktopResult<CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::SetLocalDisplayName { display_name }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[cfg(test)]

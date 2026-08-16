@@ -66,16 +66,18 @@ export class SharedStateService {
     }
     const normalized: IdentityBundle = {
       ...bundle,
-      identityBundleRef: this.identityBundleUrl(userId),
-      deviceStatusRef: bundle.deviceStatusRef ?? this.deviceStatusUrl(userId),
       devices: bundle.devices.map((device) => ({
         ...device,
-        keypackageRef: {
-          ...device.keypackageRef,
-          userId,
-          deviceId: device.deviceId,
-          ref: device.keypackageRef.ref
-        }
+        ...(device.keypackageRef
+          ? {
+              keypackageRef: {
+                ...device.keypackageRef,
+                userId,
+                deviceId: device.deviceId,
+                ref: device.keypackageRef.ref
+              }
+            }
+          : {})
       }))
     };
     await this.store.putJson(this.identityBundleKey(userId), normalized);

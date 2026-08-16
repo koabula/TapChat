@@ -72,15 +72,14 @@ pub async fn read_attachment_bytes(
             task_id: read.task_id,
             plaintext: bytes,
         }]),
-        Err(e) => {
+        Err(_e) => {
             log::error!(
                 "Failed to read attachment {}: read_failed",
                 redact_id("attachment", &read.attachment_id)
             );
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: read.task_id,
-                retryable: false,
-                detail: Some(e.to_string()),
+                failure: tapchat_core::AppErrorV1::from_registered_code("blob_not_found"),
             }])
         }
     }
@@ -203,11 +202,7 @@ pub async fn upload_blob_with_progress(
 
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: upload.task_id,
-                    retryable,
-                    detail: Some(match code {
-                        Some(code) => format!("blob_upload:{code}"),
-                        None => format!("blob_upload:http_{status}"),
-                    }),
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                 }])
             }
         }
@@ -236,8 +231,11 @@ pub async fn upload_blob_with_progress(
 
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
-                retryable,
-                detail: Some(format!("blob_upload:{error_class}")),
+                failure: tapchat_core::AppErrorV1::new(
+                    "network_unavailable",
+                    tapchat_core::ErrorDomain::Transport,
+                    retryable,
+                ),
             }])
         }
     }
@@ -270,8 +268,9 @@ pub async fn download_blob(
                 if total_bytes > MAX_ATTACHMENT_CIPHERTEXT_BYTES {
                     return Ok(vec![CoreEvent::BlobTransferFailed {
                         task_id: download.task_id,
-                        retryable: false,
-                        detail: Some("blob_download:oversized".into()),
+                        failure: tapchat_core::AppErrorV1::from_registered_code(
+                            "payload_too_large",
+                        ),
                     }]);
                 }
                 let mut transferred_bytes = 0_u64;
@@ -283,8 +282,9 @@ pub async fn download_blob(
                     if transferred_bytes > MAX_ATTACHMENT_CIPHERTEXT_BYTES {
                         return Ok(vec![CoreEvent::BlobTransferFailed {
                             task_id: download.task_id,
-                            retryable: false,
-                            detail: Some("blob_download:oversized".into()),
+                            failure: tapchat_core::AppErrorV1::from_registered_code(
+                                "payload_too_large",
+                            ),
                         }]);
                     }
                     bytes.extend_from_slice(&chunk);
@@ -328,11 +328,7 @@ pub async fn download_blob(
                 );
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
-                    retryable,
-                    detail: Some(match code {
-                        Some(code) => format!("blob_download:{code}"),
-                        None => format!("blob_download:http_{status}"),
-                    }),
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &error_body),
                 }])
             }
         }
@@ -347,8 +343,11 @@ pub async fn download_blob(
             );
             Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: download.task_id,
-                retryable,
-                detail: Some(format!("blob_download:{error_class}")),
+                failure: tapchat_core::AppErrorV1::new(
+                    "network_unavailable",
+                    tapchat_core::ErrorDomain::Transport,
+                    retryable,
+                ),
             }])
         }
     }

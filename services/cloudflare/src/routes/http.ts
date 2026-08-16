@@ -1,7 +1,6 @@
 import {
   HttpError,
   APPEND_AUTH_CONTEXT_HEADER,
-  APPEND_AUTH_REASON_HEADER,
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
@@ -40,6 +39,7 @@ import {
   type PutWelcomePickupRequest,
   type WelcomePickupDescriptor
 } from "../types/contracts";
+import { appErrorBody } from "../errors";
 import type { Env } from "../types/env";
 import { assertRegisteredRuntimeToken, registryStub } from "../device-registry/durable";
 
@@ -64,6 +64,16 @@ function jsonResponse(body: unknown, status = 200): Response {
       "content-type": "application/json"
     }
   });
+}
+
+function structuredErrorResponse(
+  request: Request,
+  status: number,
+  code: string,
+  retryable?: boolean
+): Response {
+  const correlationId = request.headers.get("cf-ray") ?? crypto.randomUUID();
+  return jsonResponse(appErrorBody(status, code, correlationId, retryable), status);
 }
 
 function forwardRequestWithBody(request: Request, body: string): Request {
@@ -207,6 +217,51 @@ function runtimeIdentity(env: Env): { runtimeId: string; userId: string; userPub
   return { runtimeId, userId, userPublicKey };
 }
 
+async function authoritativeIdentityBundle(
+  env: Env,
+  sharedState: SharedStateService
+): Promise<IdentityBundle | null> {
+  const { userId } = runtimeIdentity(env);
+  const registry = registryStub(env);
+  const authoritative = await registry.fetch(
+    new Request("https://device-registry.internal/v2/device-registry/identity-bundle")
+  );
+  if (authoritative.ok) {
+    return await authoritative.json<IdentityBundle>();
+  }
+  if (authoritative.status !== 404) {
+    const error = await authoritative
+      .json<{ code?: string }>()
+      .catch((): { code?: string } => ({}));
+    throw new HttpError(
+      authoritative.status,
+      error.code ?? "temporary_unavailable",
+      "authoritative identity lookup failed"
+    );
+  }
+
+  const legacyBundle = await sharedState.getIdentityBundle(userId);
+  if (!legacyBundle) return null;
+  const migrated = await registry.fetch(
+    new Request("https://device-registry.internal/v2/device-registry/identity-bundle/migrate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bundle: legacyBundle })
+    })
+  );
+  if (!migrated.ok) {
+    const error = await migrated
+      .json<{ code?: string }>()
+      .catch((): { code?: string } => ({}));
+    throw new HttpError(
+      migrated.status,
+      error.code ?? "temporary_unavailable",
+      "legacy identity migration failed"
+    );
+  }
+  return await migrated.json<IdentityBundle>();
+}
+
 async function issueDeviceRuntimeAuth(
   env: Env,
   userId: string,
@@ -249,9 +304,9 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
   return {
     version: CURRENT_MODEL_VERSION,
     runtimeId,
-    protocolVersion: 4,
-    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v4-unknown",
-    registrySchemaVersion: 1,
+    protocolVersion: 5,
+    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+    registrySchemaVersion: 2,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
     inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
@@ -279,7 +334,10 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "group_membership_fsm_v2",
         "runtime_secret_rotation_v1",
         "device_runtime_refresh_v2",
-        "device_registry_v1"
+        "device_registry_v1",
+        "keypackage_lifecycle_v1",
+        "identity_bundle_cas_v1",
+        "structured_errors_v1"
       ]
     }
   };
@@ -326,13 +384,13 @@ async function authorizeSharedStateWrite(
   userId: string,
   objectKind: "identity_bundle" | "device_status",
   now: number
-): Promise<void> {
+): Promise<DeviceRuntimeToken> {
   try {
     const auth = await validateRegisteredRuntimeAuthorization(request, env, "shared_state_write", now);
     if (auth.userId !== userId) {
       throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
     }
-    return;
+    return auth;
   } catch (error) {
     if (
       !(error instanceof HttpError) ||
@@ -345,6 +403,7 @@ async function authorizeSharedStateWrite(
     }
   }
   await validateSharedStateWriteAuthorization(request, sharedStateSecret(env), userId, "", objectKind, now);
+  throw new HttpError(426, "upgrade_required", "device runtime authorization is required for shared-state writes");
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
@@ -374,10 +433,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           new Request("https://device-registry.internal/v2/device-registry/ready")
         );
       } catch {
-        return jsonResponse(
-          { error: "temporary_unavailable", message: "device registry is not ready" },
-          503
-        );
+        return structuredErrorResponse(request, 503, "temporary_unavailable", true);
       }
     }
 
@@ -395,9 +451,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (payload.service !== "contact_share" || !payload.userId || !payload.shareId) {
         throw new HttpError(403, "invalid_capability", "invalid contact share token");
       }
-      const bundle = await sharedState.getIdentityBundle(payload.userId);
-      if (!bundle || bundle.bundleShareId !== payload.shareId) {
-        return jsonResponse({ error: "not_found", message: "contact share not found" }, 404);
+      const bundle = await authoritativeIdentityBundle(env, sharedState);
+      if (
+        !bundle ||
+        bundle.userId !== payload.userId ||
+        bundle.bundleShareId !== payload.shareId
+      ) {
+        throw new HttpError(404, "contact_share_revoked", "contact share not found");
       }
       return jsonResponse(bundle);
     }
@@ -415,10 +475,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           body: bodyText
         }));
       } catch {
-        return jsonResponse(
-          { error: "temporary_unavailable", message: "device registry is not ready" },
-          503
-        );
+        return structuredErrorResponse(request, 503, "temporary_unavailable", true);
       }
     }
 
@@ -468,12 +525,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "POST" && operation === "messages") {
         const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         const body = JSON.parse(bodyText) as AppendEnvelopeRequest;
-        const appendAuth = await validateAppendAuthorization(request, deviceId, body, now, sharedState);
+        const appendAuth = await validateAppendAuthorization(
+          request,
+          deviceId,
+          body,
+          now,
+          () => authoritativeIdentityBundle(env, sharedState)
+        );
         const forwarded = forwardRequestWithBody(request, bodyText);
         forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, appendAuth.mode);
-        if (appendAuth.reason) {
-          forwarded.headers.set(APPEND_AUTH_REASON_HEADER, appendAuth.reason);
-        }
         return await stub.fetch(forwarded);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
@@ -689,24 +749,37 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (identityBundleMatch) {
       const userId = decodeURIComponent(identityBundleMatch[1]);
       if (request.method === "GET") {
-        const bundle = await sharedState.getIdentityBundle(userId);
-        if (!bundle) {
-          return jsonResponse({ error: "not_found", message: "identity bundle not found" }, 404);
-        }
-        return jsonResponse(bundle);
+        const authoritative = await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/identity-bundle")
+        );
+        if (authoritative.ok) return authoritative;
+        if (authoritative.status !== 404) return authoritative;
+        const legacyBundle = await sharedState.getIdentityBundle(userId);
+        if (!legacyBundle) throw new HttpError(404, "not_found", "identity bundle not found");
+        return registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/identity-bundle/migrate", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ bundle: legacyBundle })
+          })
+        );
       }
       if (request.method === "PUT") {
-        await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
+        const authorization = await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
         const body = await readJsonLimited<IdentityBundle>(request, CONTROL_JSON_MAX_BYTES);
         const synchronized = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/sync", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(body)
+          body: JSON.stringify({
+            bundle: body,
+            expectedEtag: request.headers.get("If-Match") ?? undefined,
+            writerDeviceId: authorization.deviceId
+          })
         }));
         if (!synchronized.ok) return synchronized;
-        await sharedState.putIdentityBundle(userId, body);
-        const saved = await sharedState.getIdentityBundle(userId);
-        return jsonResponse(saved);
+        const saved = await synchronized.clone().json<IdentityBundle>();
+        await sharedState.putIdentityBundle(userId, saved).catch(() => undefined);
+        return synchronized;
       }
     }
 
@@ -716,7 +789,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "GET") {
         const document = await sharedState.getDeviceStatus(userId);
         if (!document) {
-          return jsonResponse({ error: "not_found", message: "device status not found" }, 404);
+          return structuredErrorResponse(request, 404, "not_found", false);
         }
         return jsonResponse(document);
       }
@@ -734,7 +807,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const userId = decodeURIComponent(deviceListMatch[1]);
       const document = await sharedState.getDeviceList(userId);
       if (!document) {
-        return jsonResponse({ error: "not_found", message: "device list not found" }, 404);
+        return structuredErrorResponse(request, 404, "not_found", false);
       }
       return jsonResponse(document);
     }
@@ -746,7 +819,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "GET") {
         const document = await sharedState.getKeyPackageRefs(userId, deviceId);
         if (!document) {
-          return jsonResponse({ error: "not_found", message: "keypackage refs not found" }, 404);
+          return structuredErrorResponse(request, 404, "not_found", false);
         }
         return jsonResponse(document);
       }
@@ -776,7 +849,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       if (request.method === "GET") {
         const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
         if (!payload) {
-          return jsonResponse({ error: "not_found", message: "keypackage not found" }, 404);
+          return structuredErrorResponse(request, 404, "not_found", false);
         }
         return new Response(payload, {
           status: 200,
@@ -858,18 +931,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       });
     }
 
-    return jsonResponse({ error: "not_found", message: "route not found" }, 404);
+    return structuredErrorResponse(request, 404, "not_found", false);
   } catch (error) {
     if (error instanceof HttpError) {
-      const response = jsonResponse({ error: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) }, error.status);
+      const response = structuredErrorResponse(request, error.status, error.code);
       if (error.status === 416 && typeof error.details?.totalSize === "number") {
         response.headers.set("accept-ranges", "bytes");
         response.headers.set("content-range", `bytes */${error.details.totalSize}`);
       }
       return response;
     }
-    const runtimeError = error as { message?: string };
-    const message = runtimeError.message ?? "internal error";
-    return jsonResponse({ error: "temporary_unavailable", message }, 500);
+    return structuredErrorResponse(request, 500, "temporary_unavailable", true);
   }
 }

@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useMemo, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 
@@ -115,7 +116,7 @@ export function useGroupSyncScheduler() {
         }
       })
       .catch((err) => {
-        console.warn(`[GroupSync] failed to load settings: ${String(err)}`);
+        console.warn(`[GroupSync] failed to load settings: ${presentError(err).message}`);
         if (!cancelled) {
           setSettings(DEFAULT_GROUP_SYNC_SETTINGS);
           setLoaded(true);
@@ -140,7 +141,7 @@ export function useGroupSyncScheduler() {
     setGroupSyncSettings(next)
       .then(setSettings)
       .catch((err) => {
-        console.warn(`[GroupSync] failed to persist recent groups: ${String(err)}`);
+        console.warn(`[GroupSync] failed to persist recent groups: ${presentError(err).message}`);
       });
   }, [loaded, recentGroupIds, sessionState, setSettings, settings]);
 
@@ -148,7 +149,7 @@ export function useGroupSyncScheduler() {
     if (sessionState !== "active" || !loaded) return;
     setWebsocketPlan(websocketGroupIds);
     applyGroupRealtimePlan(websocketGroupIds).catch((err) => {
-      console.warn(`[GroupSync] failed to apply realtime plan: ${String(err)}`);
+      console.warn(`[GroupSync] failed to apply realtime plan: ${presentError(err).message}`);
     });
   }, [loaded, sessionState, setWebsocketPlan, websocketGroupIds]);
 
@@ -183,7 +184,7 @@ export function useGroupSyncScheduler() {
             await syncGroupOutbox(groupId, reason);
             markSynced(groupId);
           } catch (err) {
-            markSyncFailed(groupId, String(err));
+            markSyncFailed(groupId, presentError(err).message);
           } finally {
             inFlightRef.current.delete(groupId);
             oneShotSyncedRef.current.add(groupId);
@@ -219,7 +220,7 @@ export function useGroupSyncScheduler() {
             await syncGroupOutbox(groupId, "foreground");
             markSynced(groupId);
           } catch (err) {
-            markSyncFailed(groupId, String(err));
+            markSyncFailed(groupId, presentError(err).message);
           } finally {
             inFlightRef.current.delete(groupId);
           }
@@ -255,7 +256,7 @@ export function useGroupSyncScheduler() {
           await syncGroupOutbox(groupId, "poll");
           markSynced(groupId);
         } catch (err) {
-          markSyncFailed(groupId, String(err));
+          markSyncFailed(groupId, presentError(err).message);
         }
         const next = setTimeout(run, intervalMs);
         timersRef.current.push(next);
@@ -300,7 +301,7 @@ export function useGroupSyncScheduler() {
             setGroupSnapshot(snapshot);
             markSynced(payload.device_id);
           })
-          .catch((err) => markSyncFailed(payload.device_id, String(err)));
+          .catch((err) => markSyncFailed(payload.device_id, presentError(err).message));
       } else if (payload.event_type === "group_invites_changed") {
         // Core owns the authority refresh. An open invite dialog refreshes its
         // projection after that event; no parallel scheduler request is needed.
@@ -336,7 +337,7 @@ export function useGroupSyncScheduler() {
           setLoaded(true);
         })
         .catch((err) => {
-          console.warn(`[GroupSync] failed to reload settings: ${String(err)}`);
+          console.warn(`[GroupSync] failed to reload settings: ${presentError(err).message}`);
           setSettings(DEFAULT_GROUP_SYNC_SETTINGS);
           setLoaded(true);
         });

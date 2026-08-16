@@ -1,6 +1,7 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { ArrowLeft, Check, Circle, Cloud, Database, Loader, Server, X } from "lucide-react";
 
@@ -142,7 +143,7 @@ export default function CloudflareSetup() {
         setError(result.error);
       }
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     }
   };
 
@@ -157,7 +158,7 @@ export default function CloudflareSetup() {
         setError(result.error || "Login failed. Please try again.");
       }
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     } finally {
       setLoginInProgress(false);
     }
@@ -175,7 +176,7 @@ export default function CloudflareSetup() {
         setError(result.error || "Deployment failed.");
       }
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     } finally {
       setDeploying(false);
     }

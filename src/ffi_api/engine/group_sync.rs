@@ -2449,6 +2449,8 @@ impl CoreEngine {
             plaintext,
             storage_refs: record.envelope.storage_refs.clone(),
             downloaded_blob_b64: None,
+            delivery_state: None,
+            message_request_id: None,
         });
         state.last_message_type = Some(message_type);
         state.conversation.updated_at = record.envelope.created_at;
@@ -3175,25 +3177,23 @@ impl CoreEngine {
     pub(super) fn handle_welcome_pickup_fetch_failed(
         &mut self,
         descriptor: WelcomePickupDescriptor,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     ) -> CoreResult<CoreOutput> {
         let key = pending_welcome_pickup_key(&descriptor.group_id, &descriptor.device_id);
-        let message = detail
-            .clone()
-            .map(|detail| format!("welcome pickup fetch failed: {detail}"))
-            .unwrap_or_else(|| format!("welcome pickup fetch failed for {}", descriptor.device_id));
+        let diagnostic_code = failure.code.clone();
+        let message =
+            "TapChat couldn't fetch the group welcome. It will retry when connected.".to_string();
         let mut effects = Vec::new();
         let mut persist_ops = Vec::new();
 
         if let Some(pending) = self.state.pending_welcome_pickups.get_mut(&key) {
             pending.retries = pending.retries.saturating_add(1);
-            pending.last_error = Some(message.clone());
+            pending.last_error = Some(diagnostic_code);
             persist_ops.push(PersistOp::SavePendingWelcomePickup {
                 group_id: descriptor.group_id.clone(),
                 device_id: descriptor.device_id.clone(),
             });
-            if retryable && pending.retries < MAX_TRANSPORT_RETRIES {
+            if failure.retryable && pending.retries < MAX_TRANSPORT_RETRIES {
                 let timer_id = format!("{WELCOME_PICKUP_RETRY_TIMER_PREFIX}{key}");
                 effects.push(CoreEffect::ScheduleTimer {
                     timer: TimerEffect {

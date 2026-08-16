@@ -1,6 +1,7 @@
 #![cfg_attr(all(feature = "test-support", not(feature = "gui")), allow(dead_code))]
 
 mod commands;
+mod errors;
 mod lifecycle;
 mod platform;
 mod ports;

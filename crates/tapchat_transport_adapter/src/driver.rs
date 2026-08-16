@@ -34,6 +34,12 @@ use tapchat_core::transport_contract::json_case::{
     to_camel_case_json_string, to_snake_case_json_string,
 };
 
+fn same_identity_publication(left: &IdentityBundle, right: &IdentityBundle) -> bool {
+    left.publication_revision == right.publication_revision
+        && left.bundle_share_id == right.bundle_share_id
+        && left.signature == right.signature
+}
+
 pub struct DriverRuntime {
     client: Client,
     websocket_tx: UnboundedSender<CoreEvent>,
@@ -443,8 +449,11 @@ impl CoreDriver {
                     let retryable = failures.remove(0);
                     return Ok(vec![CoreEvent::HttpRequestFailed {
                         request_id: request.request_id,
-                        retryable,
-                        detail: Some(format!("injected sync fetch failure for {device_id}")),
+                        failure: tapchat_core::AppErrorV1::new(
+                            "temporary_failure",
+                            tapchat_core::ErrorDomain::Transport,
+                            retryable,
+                        ),
                     }]);
                 }
             }
@@ -503,10 +512,9 @@ impl CoreDriver {
                     body,
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::HttpRequestFailed {
+            Err(_error) => Ok(vec![CoreEvent::HttpRequestFailed {
                 request_id: request.request_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -575,8 +583,11 @@ impl CoreDriver {
                 let retryable = failures.remove(0);
                 return Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                     user_id: fetch.user_id,
-                    retryable,
-                    detail: Some("injected identity fetch failure".into()),
+                    failure: tapchat_core::AppErrorV1::new(
+                        "temporary_failure",
+                        tapchat_core::ErrorDomain::Transport,
+                        retryable,
+                    ),
                 }]);
             }
         }
@@ -594,8 +605,11 @@ impl CoreDriver {
             }
             Err(error) => Ok(vec![CoreEvent::IdentityBundleFetchFailed {
                 user_id: fetch.user_id,
-                retryable: error.code() == "external_fetch_timeout",
-                detail: Some(error.to_string()),
+                failure: if error.code() == "external_fetch_timeout" {
+                    tapchat_core::AppErrorV1::from_registered_code("request_timeout")
+                } else {
+                    tapchat_core::AppErrorV1::network_unavailable()
+                },
             }]),
         }
     }
@@ -621,16 +635,15 @@ impl CoreDriver {
                 )?;
                 Ok(vec![CoreEvent::MessageRequestsFetched { requests }])
             }
-            Ok(response) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-                retryable: false,
-                detail: Some(format!(
-                    "list message requests failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-                retryable: true,
-                detail: Some(error.to_string()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -701,20 +714,19 @@ impl CoreDriver {
                 };
                 Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
             }
-            Ok(response) => Ok(vec![CoreEvent::MessageRequestActionFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::MessageRequestActionFailed {
+                    request_id: action.request_id,
+                    action: action.action,
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
                 request_id: action.request_id,
                 action: action.action,
-                retryable: false,
-                detail: Some(format!(
-                    "message request action failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
-                request_id: action.request_id,
-                action: action.action,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -730,16 +742,15 @@ impl CoreDriver {
                 let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
                 Ok(vec![CoreEvent::AllowlistFetched { document }])
             }
-            Ok(response) => Ok(vec![CoreEvent::AllowlistFetchFailed {
-                retryable: false,
-                detail: Some(format!(
-                    "get allowlist failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
-                retryable: true,
-                detail: Some(error.to_string()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::AllowlistFetchFailed {
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -767,24 +778,96 @@ impl CoreDriver {
                 let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
                 Ok(vec![CoreEvent::AllowlistReplaced { document }])
             }
-            Ok(response) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                retryable: false,
-                detail: Some(format!(
-                    "put allowlist failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                retryable: true,
-                detail: Some(error.to_string()),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
 
     async fn publish_shared_state(
         &mut self,
-        publish: PublishSharedStateRequest,
+        mut publish: PublishSharedStateRequest,
     ) -> Result<Vec<CoreEvent>> {
+        if publish.document_kind
+            == tapchat_core::transport_contract::SharedStateDocumentKind::IdentityBundle
+        {
+            let candidate = serde_json::from_str::<IdentityBundle>(&publish.body).ok();
+            match self.runtime.client.get(&publish.reference).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let etag = response
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let remote = response.json::<IdentityBundle>().await.ok();
+                    if candidate.as_ref().is_some_and(|candidate| {
+                        remote
+                            .as_ref()
+                            .is_some_and(|remote| same_identity_publication(remote, candidate))
+                    }) {
+                        return Ok(vec![CoreEvent::SharedStatePublished {
+                            operation_id: publish.operation_id,
+                            document_kind: publish.document_kind,
+                            reference: publish.reference,
+                            etag,
+                            saved_bundle: remote,
+                        }]);
+                    }
+                    if !publish.headers.contains_key("If-Match") {
+                        if let Some(etag) = etag {
+                            publish.headers.insert("If-Match".into(), etag);
+                        }
+                    }
+                }
+                Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    return Ok(vec![CoreEvent::SharedStatePublishFailed {
+                        operation_id: publish.operation_id,
+                        document_kind: publish.document_kind,
+                        reference: publish.reference,
+                        failure: tapchat_core::AppErrorV1::new(
+                            "identity_bundle_refresh_required",
+                            tapchat_core::ErrorDomain::Identity,
+                            true,
+                        )
+                        .with_http_status(status),
+                        current_bundle: None,
+                        etag: None,
+                    }]);
+                }
+                Err(_) => {
+                    let code = if publish
+                        .operation_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("contact_share_rotation:"))
+                    {
+                        "contact_share_offline"
+                    } else {
+                        "network_unavailable"
+                    };
+                    return Ok(vec![CoreEvent::SharedStatePublishFailed {
+                        operation_id: publish.operation_id,
+                        document_kind: publish.document_kind,
+                        reference: publish.reference,
+                        failure: tapchat_core::AppErrorV1::new(
+                            code,
+                            tapchat_core::ErrorDomain::Transport,
+                            true,
+                        ),
+                        current_bundle: None,
+                        etag: None,
+                    }]);
+                }
+            }
+        }
         let mut request = self.runtime.client.put(publish.reference.clone());
         for (key, value) in &publish.headers {
             request = request.header(key, value);
@@ -796,25 +879,74 @@ impl CoreDriver {
             .await
         {
             Ok(response) if response.status().is_success() => {
+                let etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let saved_bundle = if publish.document_kind
+                    == tapchat_core::transport_contract::SharedStateDocumentKind::IdentityBundle
+                {
+                    response.json::<IdentityBundle>().await.ok()
+                } else {
+                    None
+                };
                 Ok(vec![CoreEvent::SharedStatePublished {
+                    operation_id: publish.operation_id,
                     document_kind: publish.document_kind,
                     reference: publish.reference,
+                    etag,
+                    saved_bundle,
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let failure = response
+                    .json::<tapchat_core::AppErrorV1>()
+                    .await
+                    .unwrap_or_else(|_| {
+                        tapchat_core::AppErrorV1::new(
+                            "temporary_failure",
+                            tapchat_core::ErrorDomain::Transport,
+                            status >= 500,
+                        )
+                        .with_http_status(status)
+                    });
+                let (current_bundle, etag) = if failure.code == "identity_bundle_conflict" {
+                    match self.runtime.client.get(&publish.reference).send().await {
+                        Ok(current) if current.status().is_success() => {
+                            let etag = current
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            (current.json::<IdentityBundle>().await.ok(), etag)
+                        }
+                        _ => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+                Ok(vec![CoreEvent::SharedStatePublishFailed {
+                    operation_id: publish.operation_id,
+                    document_kind: publish.document_kind,
+                    reference: publish.reference,
+                    failure,
+                    current_bundle,
+                    etag,
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+                operation_id: publish.operation_id,
                 document_kind: publish.document_kind,
                 reference: publish.reference,
-                retryable: false,
-                detail: Some(format!(
-                    "shared state publish failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::SharedStatePublishFailed {
-                document_kind: publish.document_kind,
-                reference: publish.reference,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::new(
+                    "network_unavailable",
+                    tapchat_core::ErrorDomain::Transport,
+                    true,
+                ),
+                current_bundle: None,
+                etag: None,
             }]),
         }
     }
@@ -842,18 +974,17 @@ impl CoreDriver {
                     result,
                 }])
             }
-            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobTransferFailed {
+                    task_id: upload.task_id,
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
-                retryable: false,
-                detail: Some(format!(
-                    "prepare upload failed with status {}",
-                    response.status()
-                )),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: upload.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -880,15 +1011,17 @@ impl CoreDriver {
             Ok(response) if response.status().is_success() => Ok(vec![CoreEvent::BlobUploaded {
                 task_id: upload.task_id,
             }]),
-            Ok(response) => Ok(vec![CoreEvent::BlobTransferFailed {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobTransferFailed {
+                    task_id: upload.task_id,
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: upload.task_id,
-                retryable: false,
-                detail: Some(format!("upload failed with status {}", response.status())),
-            }]),
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: upload.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
@@ -908,16 +1041,15 @@ impl CoreDriver {
             }
             Ok(response) => {
                 let status = response.status();
+                let body = response.text().await.unwrap_or_default();
                 Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: download.task_id,
-                    retryable: status.as_u16() == 403,
-                    detail: Some(format!("download failed with status {status}")),
+                    failure: tapchat_core::AppErrorV1::from_http_response(status.as_u16(), &body),
                 }])
             }
-            Err(error) => Ok(vec![CoreEvent::BlobTransferFailed {
+            Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
                 task_id: download.task_id,
-                retryable: true,
-                detail: Some(error.to_string()),
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }

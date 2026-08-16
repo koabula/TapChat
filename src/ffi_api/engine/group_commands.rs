@@ -48,16 +48,26 @@ impl CoreEngine {
         }];
         for user_id in &member_user_ids {
             let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
+            let now_ms = current_unix_millis(self.state.message_nonce);
+            let mut usable_device_found = false;
             for device in bundle
                 .devices
                 .iter()
                 .filter(|device| matches!(device.status, DeviceStatusKind::Active))
             {
+                let Some(keypackage_ref) = device
+                    .keypackage_ref
+                    .as_ref()
+                    .filter(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
+                else {
+                    continue;
+                };
+                usable_device_found = true;
                 peer_keypackages.push(PeerDeviceKeyPackage {
                     user_id: user_id.clone(),
                     device_id: device.device_id.clone(),
                     device_public_key: device.device_public_key.clone(),
-                    key_package_b64: device.keypackage_ref.object_ref.clone(),
+                    key_package_b64: keypackage_ref.object_ref.clone(),
                 });
                 member_devices.push(ConversationMember {
                     user_id: user_id.clone(),
@@ -70,10 +80,31 @@ impl CoreEngine {
                     status: GroupMemberStatus::Active,
                 });
             }
+            if !usable_device_found {
+                if bundle.devices.iter().any(|device| {
+                    matches!(device.status, DeviceStatusKind::Active)
+                        && device.keypackage_ref.as_ref().is_some_and(|keypackage| {
+                            keypackage.created_at
+                                > now_ms.saturating_add(
+                                    crate::mls_adapter::KEY_PACKAGE_CLOCK_TOLERANCE_MS,
+                                )
+                        })
+                }) {
+                    return Err(CoreError::new(
+                        "device_clock_invalid",
+                        "an invited contact key package was created too far in the future",
+                    ));
+                }
+                return Err(CoreError::new(
+                    "keypackage_expired",
+                    "an invited contact has no usable key package",
+                ));
+            }
         }
         if peer_keypackages.is_empty() {
-            return Err(CoreError::invalid_input(
-                "group must include at least one active invited device",
+            return Err(CoreError::new(
+                "keypackage_expired",
+                "invited contacts have no usable key packages",
             ));
         }
         let invitee_user_by_device: BTreeMap<String, String> = peer_keypackages
@@ -2406,11 +2437,23 @@ impl CoreEngine {
             .ok_or_else(|| {
                 CoreError::invalid_input("target device is not an active device of the local user")
             })?;
+        let keypackage_ref = device_profile
+            .keypackage_ref
+            .as_ref()
+            .filter(|keypackage_ref| {
+                keypackage_ref.is_usable_at(current_unix_millis(self.state.message_nonce))
+            })
+            .ok_or_else(|| {
+                CoreError::new(
+                    "keypackage_expired",
+                    "target device does not have a usable key package",
+                )
+            })?;
         let peer_keypackage = PeerDeviceKeyPackage {
             user_id: local_user_id.clone(),
             device_id: device_id.clone(),
             device_public_key: device_profile.device_public_key.clone(),
-            key_package_b64: device_profile.keypackage_ref.object_ref.clone(),
+            key_package_b64: keypackage_ref.object_ref.clone(),
         };
         let (artifacts, summary) = {
             let adapter = self

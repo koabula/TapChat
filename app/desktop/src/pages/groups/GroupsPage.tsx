@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import {
@@ -85,13 +86,13 @@ export default function GroupsPage() {
             setGroupSnapshot(snapshot);
           } catch (err) {
             console.debug(
-              `[GroupsPage] getGroupSnapshot(${summary.group_id}) failed: ${String(err)}`,
+              `[GroupsPage] getGroupSnapshot(${summary.group_id}) failed: ${presentError(err).message}`,
             );
           }
         }),
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -107,7 +108,7 @@ export default function GroupsPage() {
       const snapshot = await getGroupSnapshot(groupId);
       setGroupSnapshot(snapshot);
     } catch (err) {
-      console.debug(`[GroupsPage] preloading snapshot failed: ${String(err)}`);
+      console.debug(`[GroupsPage] preloading snapshot failed: ${presentError(err).message}`);
     }
     setMemberDrawerGroupId(groupId);
   };
@@ -118,7 +119,7 @@ export default function GroupsPage() {
       setGroupSnapshot(snapshot);
       setDissolveGroup(snapshot);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     }
   };
 
@@ -130,7 +131,7 @@ export default function GroupsPage() {
       const saved = await setGroupSyncSettings(next);
       setSyncSettings(saved);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
       setSyncSettings(syncSettings);
     } finally {
       setSavingSyncSettings(false);

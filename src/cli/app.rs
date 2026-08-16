@@ -2253,7 +2253,20 @@ fn load_driver(profile: &Profile) -> Result<CoreDriver> {
         .deployment
         .as_ref()
         .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone());
-    let mut driver = CoreDriver::from_snapshot(snapshot, base_url, None)?;
+    let runtime_secrets = profile.load_runtime_secrets()?;
+    let contact_share_url = snapshot.deployment.as_ref().and_then(|deployment| {
+        let bundle = deployment.local_bundle.as_ref()?;
+        let share_id = bundle.bundle_share_id.as_deref()?;
+        let secret = runtime_secrets.sharing_secret.as_deref()?;
+        crate::contact_share::encode_contact_share_url(
+            &deployment.deployment_bundle.inbox_http_endpoint,
+            secret,
+            &bundle.user_id,
+            share_id,
+        )
+        .ok()
+    });
+    let mut driver = CoreDriver::from_snapshot(snapshot, base_url, contact_share_url)?;
     driver.set_runtime_credential(profile.load_runtime_credential()?);
     Ok(driver)
 }

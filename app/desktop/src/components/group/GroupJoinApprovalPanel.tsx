@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { writeText as clipboardWriteText } from "@tauri-apps/plugin-clipboard-manager";
@@ -86,7 +87,7 @@ export default function GroupJoinApprovalPanel({
       const rows = await listGroupJoinRequests(groupId);
       setRequests(rows.filter((row) => row.status === "pending_approval"));
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setLoading(false);
     }
@@ -113,7 +114,7 @@ export default function GroupJoinApprovalPanel({
         // Non-fatal — core-update will refresh soon.
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setBusy(null);
     }
@@ -127,7 +128,7 @@ export default function GroupJoinApprovalPanel({
       await rejectGroupJoin(groupId, request.request_id, reason);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setBusy(null);
     }

@@ -201,12 +201,18 @@ impl Validate for InboxAppendCapability {
 #[serde(rename_all = "camelCase")]
 pub struct KeyPackageRef {
     pub version: String,
+    #[serde(default, alias = "lifecycle_version")]
+    pub lifecycle_version: u16,
     #[serde(alias = "user_id")]
     pub user_id: String,
     #[serde(alias = "device_id")]
     pub device_id: String,
     #[serde(rename = "ref", alias = "object_ref")]
     pub object_ref: String,
+    #[serde(default, alias = "not_before")]
+    pub not_before: u64,
+    #[serde(default, alias = "created_at")]
+    pub created_at: u64,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
 }
@@ -216,7 +222,35 @@ impl Validate for KeyPackageRef {
         validate_version(&self.version)?;
         validate_required("user_id", &self.user_id)?;
         validate_required("device_id", &self.device_id)?;
-        validate_required("ref", &self.object_ref)
+        validate_required("ref", &self.object_ref)?;
+        if self.lifecycle_version > 0 {
+            if self.not_before > self.created_at || self.created_at >= self.expires_at {
+                return Err(CoreError::new(
+                    "keypackage_lifetime_invalid",
+                    "key package lifetime metadata is not ordered",
+                ));
+            }
+            if self.expires_at.saturating_sub(self.created_at)
+                != crate::mls_adapter::KEY_PACKAGE_LIFETIME_MS
+            {
+                return Err(CoreError::new(
+                    "keypackage_lifetime_invalid",
+                    "key package lifetime does not match policy",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl KeyPackageRef {
+    pub fn is_usable_at(&self, now_ms: u64) -> bool {
+        self.lifecycle_version == crate::mls_adapter::KEY_PACKAGE_LIFECYCLE_VERSION
+            && self.created_at
+                <= now_ms.saturating_add(crate::mls_adapter::KEY_PACKAGE_CLOCK_TOLERANCE_MS)
+            && self.not_before
+                <= now_ms.saturating_add(crate::mls_adapter::KEY_PACKAGE_CLOCK_TOLERANCE_MS)
+            && now_ms < self.expires_at
     }
 }
 
@@ -368,10 +402,18 @@ pub struct DeviceContactProfile {
     pub device_public_key: String,
     pub binding: DeviceBinding,
     pub status: DeviceStatusKind,
-    #[serde(alias = "inbox_append_capability")]
-    pub inbox_append_capability: InboxAppendCapability,
-    #[serde(alias = "keypackage_ref")]
-    pub keypackage_ref: KeyPackageRef,
+    #[serde(
+        default,
+        alias = "inbox_append_capability",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inbox_append_capability: Option<InboxAppendCapability>,
+    #[serde(
+        default,
+        alias = "keypackage_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub keypackage_ref: Option<KeyPackageRef>,
 }
 
 impl Validate for DeviceContactProfile {
@@ -390,13 +432,23 @@ impl Validate for DeviceContactProfile {
                 "device binding device_public_key must match device profile device_public_key",
             ));
         }
-        self.inbox_append_capability.validate()?;
-        if self.inbox_append_capability.target_device_id != self.device_id {
-            return Err(CoreError::invalid_input(
-                "capability target_device_id must match device profile device_id",
-            ));
+        if let Some(capability) = &self.inbox_append_capability {
+            capability.validate()?;
+            if capability.target_device_id != self.device_id {
+                return Err(CoreError::invalid_input(
+                    "capability target_device_id must match device profile device_id",
+                ));
+            }
         }
-        self.keypackage_ref.validate()
+        if let Some(keypackage_ref) = &self.keypackage_ref {
+            keypackage_ref.validate()?;
+            if keypackage_ref.device_id != self.device_id {
+                return Err(CoreError::invalid_input(
+                    "key package ref device_id must match device profile device_id",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -429,6 +481,10 @@ pub enum RealtimeKind {
 #[serde(rename_all = "camelCase")]
 pub struct IdentityBundle {
     pub version: String,
+    #[serde(default, alias = "publication_version")]
+    pub publication_version: u16,
+    #[serde(default, alias = "publication_revision")]
+    pub publication_revision: u64,
     #[serde(alias = "user_id")]
     pub user_id: String,
     #[serde(alias = "user_public_key")]
@@ -498,20 +554,19 @@ impl Validate for IdentityBundle {
                     "device binding user_id must match bundle user_id",
                 ));
             }
-            if device.inbox_append_capability.user_id != self.user_id {
-                return Err(CoreError::invalid_input(
-                    "capability user_id must match bundle user_id",
-                ));
+            if let Some(capability) = &device.inbox_append_capability {
+                if capability.user_id != self.user_id {
+                    return Err(CoreError::invalid_input(
+                        "capability user_id must match bundle user_id",
+                    ));
+                }
             }
-            if device.keypackage_ref.user_id != self.user_id {
-                return Err(CoreError::invalid_input(
-                    "key package ref user_id must match bundle user_id",
-                ));
-            }
-            if device.keypackage_ref.device_id != device.device_id {
-                return Err(CoreError::invalid_input(
-                    "key package ref device_id must match device profile device_id",
-                ));
+            if let Some(keypackage_ref) = &device.keypackage_ref {
+                if keypackage_ref.user_id != self.user_id {
+                    return Err(CoreError::invalid_input(
+                        "key package ref user_id must match bundle user_id",
+                    ));
+                }
             }
         }
         Ok(())
@@ -1779,16 +1834,16 @@ impl Validate for DeploymentBundle {
     fn validate(&self) -> CoreResult<()> {
         validate_version(&self.version)?;
         validate_required("runtime_id", &self.runtime_id)?;
-        if self.protocol_version != 4 {
+        if self.protocol_version != 5 {
             return Err(CoreError::invalid_input(format!(
-                "unsupported runtime protocol {}, expected 4",
+                "unsupported runtime protocol {}, expected 5",
                 self.protocol_version
             )));
         }
         validate_required("worker_build_id", &self.worker_build_id)?;
-        if self.registry_schema_version != 1 {
+        if self.registry_schema_version != 2 {
             return Err(CoreError::invalid_input(format!(
-                "unsupported registry schema {}, expected 1",
+                "unsupported registry schema {}, expected 2",
                 self.registry_schema_version
             )));
         }
@@ -2375,9 +2430,9 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -2397,9 +2452,9 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -2449,9 +2504,9 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -2532,6 +2587,8 @@ mod tests {
     fn sample_identity_bundle() -> IdentityBundle {
         IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
+            publication_version: 0,
+            publication_revision: 0,
             user_id: "user:alice".into(),
             user_public_key: "alice-pub".into(),
             display_name: None,
@@ -2549,7 +2606,7 @@ mod tests {
                     signature: "binding-sig".into(),
                 },
                 status: DeviceStatusKind::Active,
-                inbox_append_capability: InboxAppendCapability {
+                inbox_append_capability: Some(InboxAppendCapability {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     service: CapabilityService::Inbox,
                     user_id: "user:alice".into(),
@@ -2563,14 +2620,17 @@ mod tests {
                         max_ops_per_minute: Some(60),
                     }),
                     signature: "cap-sig".into(),
-                },
-                keypackage_ref: KeyPackageRef {
+                }),
+                keypackage_ref: Some(KeyPackageRef {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     user_id: "user:alice".into(),
                     device_id: "device:alice:phone".into(),
                     object_ref: "s3://keypackages/alice-phone".into(),
+                    lifecycle_version: 0,
+                    not_before: 0,
+                    created_at: 0,
                     expires_at: 999,
-                },
+                }),
             }],
             identity_bundle_ref: Some(
                 "https://storage.example.com/state/user:alice/identity_bundle.json".into(),

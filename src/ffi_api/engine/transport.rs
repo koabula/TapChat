@@ -497,6 +497,10 @@ impl CoreEngine {
         if let Some(reference) = bundle.identity_bundle_ref.clone() {
             effects.push(CoreEffect::PublishSharedState {
                 publish: PublishSharedStateRequest {
+                    operation_id: Some(format!(
+                        "identity_publication:{}",
+                        bundle.publication_revision
+                    )),
                     reference,
                     document_kind: SharedStateDocumentKind::IdentityBundle,
                     body: serde_json::to_string(bundle).map_err(|error| {
@@ -513,6 +517,7 @@ impl CoreEngine {
             let document = self.local_device_status_document()?;
             effects.push(CoreEffect::PublishSharedState {
                 publish: PublishSharedStateRequest {
+                    operation_id: Some(format!("device_status:{}", bundle.publication_revision)),
                     reference,
                     document_kind: SharedStateDocumentKind::DeviceStatus,
                     body: serde_json::to_string(&document).map_err(|error| {
@@ -526,6 +531,35 @@ impl CoreEngine {
             });
         }
         Ok(effects)
+    }
+
+    pub(super) fn identity_bundle_publish_effect(
+        &self,
+        bundle: &IdentityBundle,
+        operation_id: String,
+        expected_etag: Option<&str>,
+    ) -> CoreResult<CoreEffect> {
+        let reference = bundle.identity_bundle_ref.clone().ok_or_else(|| {
+            CoreError::invalid_state("local identity bundle reference is unavailable")
+        })?;
+        let mut headers = BTreeMap::new();
+        if let Some(etag) = expected_etag {
+            headers.insert("If-Match".into(), etag.into());
+        }
+        Ok(CoreEffect::PublishSharedState {
+            publish: PublishSharedStateRequest {
+                operation_id: Some(operation_id),
+                reference,
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                body: serde_json::to_string(bundle).map_err(|error| {
+                    CoreError::invalid_input(format!(
+                        "failed to encode local identity bundle: {error}"
+                    ))
+                })?,
+                headers,
+                auth: Some(self.device_runtime_auth_requirement()?),
+            },
+        })
     }
 
     pub(super) fn list_message_requests(&mut self) -> CoreResult<CoreOutput> {
@@ -698,6 +732,9 @@ impl CoreEngine {
     }
 
     pub(super) fn handle_timer(&mut self, timer_id: String) -> CoreResult<CoreOutput> {
+        if timer_id == "credential_maintenance" {
+            return self.maintain_local_credentials(current_unix_millis(self.state.message_nonce));
+        }
         if let Some(device_id) = timer_id.strip_prefix("sync:") {
             return self.sync_inbox(device_id.to_string(), None);
         }
@@ -1090,6 +1127,7 @@ impl CoreEngine {
         for item in &mut self.state.pending_outbox {
             if !item.in_flight && item.retries >= MAX_TRANSPORT_RETRIES {
                 item.retries = 0;
+                item.identity_refresh_attempted = false;
                 persist_ops.push(PersistOp::SaveOutgoingEnvelope {
                     message_id: item.envelope.message_id.clone(),
                 });
@@ -1323,16 +1361,25 @@ impl CoreEngine {
             sender_display_name: self.local_display_name(),
         };
         let mut headers = BTreeMap::new();
+        let capability = device_profile
+            .inbox_append_capability
+            .as_ref()
+            .filter(|capability| {
+                capability.expires_at > current_unix_millis(self.state.message_nonce)
+            })
+            .ok_or_else(|| {
+                CoreError::new(
+                    "capability_expired",
+                    "recipient inbox append capability is missing or expired",
+                )
+            })?;
         headers.insert(
             "Authorization".into(),
-            format!(
-                "Bearer {}",
-                device_profile.inbox_append_capability.signature
-            ),
+            format!("Bearer {}", capability.signature),
         );
         headers.insert(
             "X-Tapchat-Capability".into(),
-            serde_json::to_string(&device_profile.inbox_append_capability).map_err(|error| {
+            serde_json::to_string(capability).map_err(|error| {
                 CoreError::invalid_input(format!("failed to encode append capability: {error}"))
             })?,
         );
@@ -1340,7 +1387,7 @@ impl CoreEngine {
         Ok(HttpRequestEffect {
             request_id,
             method: HttpMethod::Post,
-            url: device_profile.inbox_append_capability.endpoint.clone(),
+            url: capability.endpoint.clone(),
             headers,
             auth: None,
             body: Some(serde_json::to_string(&body).map_err(|error| {
@@ -1700,62 +1747,21 @@ impl CoreEngine {
     pub(super) fn handle_http_failure(
         &mut self,
         request_id: String,
-        retryable: bool,
-        detail: Option<String>,
+        failure: crate::error::AppErrorV1,
     ) -> CoreResult<CoreOutput> {
         let request = self
             .state
             .pending_requests
             .remove(&request_id)
             .ok_or_else(|| CoreError::invalid_input("unknown request_id"))?;
+        let retryable = failure.retryable;
+        // User notifications must not include raw transport or server details.
+        let detail: Option<String> = None;
         match request {
-            PendingRequest::AppendEnvelope { message_id, .. } => {
-                if let Some(item) = self
-                    .state
-                    .pending_outbox
-                    .iter_mut()
-                    .find(|item| item.envelope.message_id == message_id)
-                {
-                    item.in_flight = false;
-                    item.retries = item.retries.saturating_add(1);
-                    if !retryable {
-                        item.retries = MAX_TRANSPORT_RETRIES;
-                    }
-                    if retryable && item.retries < MAX_TRANSPORT_RETRIES {
-                        let timer_id = format!("retry_append:{message_id}");
-                        return Ok(CoreOutput {
-                            state_update: CoreStateUpdate {
-                                system_statuses_changed: vec![
-                                    SystemStatus::TemporaryNetworkFailure,
-                                ],
-                                ..CoreStateUpdate::default()
-                            },
-                            effects: vec![CoreEffect::ScheduleTimer {
-                                timer: TimerEffect {
-                                    delay_ms: retry_delay_ms(&timer_id, u32::from(item.retries)),
-                                    timer_id,
-                                },
-                            }],
-                            view_model: None,
-                        });
-                    }
-                }
-                Ok(CoreOutput {
-                    state_update: CoreStateUpdate {
-                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: vec![CoreEffect::EmitUserNotification {
-                        notification: UserNotificationEffect {
-                            status: SystemStatus::TemporaryNetworkFailure,
-                            message: detail.unwrap_or_else(|| {
-                                format!("append request failed for {message_id}")
-                            }),
-                        },
-                    }],
-                    view_model: None,
-                })
-            }
+            PendingRequest::AppendEnvelope {
+                message_id,
+                peer_user_id,
+            } => self.handle_append_request_failure(message_id, peer_user_id, failure),
             PendingRequest::Ack { device_id, .. } => {
                 if let Some(ack) = self.state.pending_acks.get_mut(&device_id) {
                     ack.in_flight = false;
@@ -1899,6 +1905,99 @@ impl CoreEngine {
                 view_model: None,
             }),
         }
+    }
+
+    fn handle_append_request_failure(
+        &mut self,
+        message_id: String,
+        peer_user_id: String,
+        failure: crate::error::AppErrorV1,
+    ) -> CoreResult<CoreOutput> {
+        let refreshable_capability = matches!(
+            failure.code.as_str(),
+            "capability_expired" | "identity_refresh_required"
+        );
+        let Some(index) = self
+            .state
+            .pending_outbox
+            .iter()
+            .position(|item| item.envelope.message_id == message_id)
+        else {
+            return Ok(CoreOutput::default());
+        };
+
+        if refreshable_capability && !self.state.pending_outbox[index].identity_refresh_attempted {
+            self.state.pending_outbox[index].in_flight = false;
+            self.state.pending_outbox[index].identity_refresh_attempted = true;
+            let persist = CoreOutput {
+                state_update: CoreStateUpdate {
+                    messages_changed: true,
+                    system_statuses_changed: vec![SystemStatus::IdentityRefreshNeeded],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![
+                    persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveOutgoingEnvelope {
+                            message_id: message_id.clone(),
+                        }],
+                    ),
+                    CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::IdentityRefreshNeeded,
+                            message:
+                                "TapChat is refreshing this contact before retrying your message."
+                                    .into(),
+                        },
+                    },
+                ],
+                view_model: None,
+            };
+            return Ok(merge_outputs(
+                persist,
+                self.refresh_identity_state(peer_user_id)?,
+            ));
+        }
+
+        let item = &mut self.state.pending_outbox[index];
+        item.in_flight = false;
+        item.retries = item.retries.saturating_add(1);
+        if !failure.retryable || refreshable_capability {
+            item.retries = MAX_TRANSPORT_RETRIES;
+        }
+        let should_retry = item.retries < MAX_TRANSPORT_RETRIES;
+        let attempt = item.retries;
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::SaveOutgoingEnvelope {
+                message_id: message_id.clone(),
+            }],
+        )];
+        if should_retry {
+            let timer_id = format!("retry_append:{message_id}");
+            effects.push(CoreEffect::ScheduleTimer {
+                timer: TimerEffect {
+                    delay_ms: retry_delay_ms(&timer_id, u32::from(attempt)),
+                    timer_id,
+                },
+            });
+        } else {
+            effects.push(CoreEffect::EmitUserNotification {
+                notification: UserNotificationEffect {
+                    status: SystemStatus::TemporaryNetworkFailure,
+                    message: "TapChat could not deliver this message. Try again.".into(),
+                },
+            });
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                messages_changed: true,
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            effects,
+            view_model: None,
+        })
     }
 
     pub(super) fn handle_blob_upload_prepared(
@@ -3332,59 +3431,17 @@ impl CoreEngine {
         body: Option<String>,
     ) -> CoreResult<CoreOutput> {
         match request {
-            PendingRequest::AppendEnvelope { message_id, .. } => {
-                if status >= 500 {
-                    if let Some(item) = self
-                        .state
-                        .pending_outbox
-                        .iter_mut()
-                        .find(|item| item.envelope.message_id == message_id)
-                    {
-                        item.in_flight = false;
-                        item.retries = item.retries.saturating_add(1);
-                        if item.retries < MAX_TRANSPORT_RETRIES {
-                            let timer_id = format!("retry_append:{message_id}");
-                            return Ok(CoreOutput {
-                                state_update: CoreStateUpdate {
-                                    system_statuses_changed: vec![
-                                        SystemStatus::TemporaryNetworkFailure,
-                                    ],
-                                    ..CoreStateUpdate::default()
-                                },
-                                effects: vec![CoreEffect::ScheduleTimer {
-                                    timer: TimerEffect {
-                                        delay_ms: retry_delay_ms(
-                                            &timer_id,
-                                            u32::from(item.retries),
-                                        ),
-                                        timer_id,
-                                    },
-                                }],
-                                view_model: None,
-                            });
-                        }
-                    }
-                } else {
-                    self.state
-                        .pending_outbox
-                        .retain(|item| item.envelope.message_id != message_id);
-                }
-                Ok(CoreOutput {
-                    state_update: CoreStateUpdate {
-                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: vec![CoreEffect::EmitUserNotification {
-                        notification: UserNotificationEffect {
-                            status: SystemStatus::TemporaryNetworkFailure,
-                            message: body.unwrap_or_else(|| {
-                                format!("append request returned status {status}")
-                            }),
-                        },
-                    }],
-                    view_model: None,
-                })
-            }
+            PendingRequest::AppendEnvelope {
+                message_id,
+                peer_user_id,
+            } => self.handle_append_request_failure(
+                message_id,
+                peer_user_id,
+                crate::error::AppErrorV1::from_http_response(
+                    status,
+                    body.as_deref().unwrap_or_default(),
+                ),
+            ),
             PendingRequest::Ack { device_id, .. } => {
                 if status >= 500 {
                     if let Some(ack) = self.state.pending_acks.get_mut(&device_id) {
@@ -3618,73 +3675,105 @@ impl CoreEngine {
             Vec::new()
         };
 
-        let mut saved_conversation_id = None;
+        if protocol_only_contact_control {
+            return AppendDeliveryOutput {
+                output: CoreOutput {
+                    state_update: CoreStateUpdate {
+                        contacts_changed: contact_changed,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![],
+                    view_model: Some(CoreViewModel {
+                        append_result: Some(append_result),
+                        contacts,
+                        ..CoreViewModel::default()
+                    }),
+                },
+                saved_conversation_id: None,
+            };
+        }
 
-        // When message is delivered to inbox, store it in conversation.messages
-        // This ensures the message is preserved even after pending_outbox is cleared
-        let messages_changed = if result.delivered_to == AppendDeliveryDisposition::Inbox {
-            if let Some(env) = &envelope {
-                if protocol_only_contact_control {
-                    return AppendDeliveryOutput {
-                        output: CoreOutput {
-                            state_update: CoreStateUpdate {
-                                contacts_changed: contact_changed,
-                                ..CoreStateUpdate::default()
-                            },
-                            effects: vec![],
-                            view_model: Some(CoreViewModel {
-                                append_result: Some(append_result),
-                                contacts,
-                                ..CoreViewModel::default()
-                            }),
-                        },
-                        saved_conversation_id: None,
-                    };
-                }
-                let conversation_id = env.conversation_id.clone();
-                if let Some(conv) = self.state.conversations.get_mut(&conversation_id) {
-                    // Check if message already exists (avoid duplicates)
-                    let duplicate = conv.messages.iter().any(|m| {
-                        m.message_id == message_id
-                            || app_message_id
-                                .as_deref()
-                                .is_some_and(|app_id| m.app_message_id.as_deref() == Some(app_id))
-                    });
-                    if !duplicate {
-                        conv.messages.push(crate::conversation::StoredMessage {
-                            message_id: message_id.to_string(),
-                            app_message_id: app_message_id.clone(),
-                            mls_ciphertext_sha256: None,
-                            sender_user_id: Some(env.sender_user_id.clone()),
-                            sender_device_id: env.sender_device_id.clone(),
-                            recipient_device_id: env.recipient_device_id.clone(),
-                            message_type: env.message_type,
-                            created_at: env.created_at,
-                            plaintext: plaintext_cache.clone(),
-                            storage_refs: env.storage_refs.clone(),
-                            downloaded_blob_b64: None,
-                        });
-                        conv.last_message_type = Some(env.message_type);
-                        log::info!(
-                            "handle_append_delivery_result: stored message {} in conversation {} with plaintext={}",
-                            redact_id("msg", message_id),
-                            redact_id("conversation", &conversation_id),
-                            plaintext_cache.is_some()
-                        );
-                        saved_conversation_id = Some(conversation_id);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
+        let mut saved_conversation_id = None;
+        let desired_delivery_state = match result.delivered_to {
+            AppendDeliveryDisposition::Inbox => {
+                crate::conversation::StoredMessageDeliveryState::Sent
             }
-        } else {
-            false
+            AppendDeliveryDisposition::MessageRequest => {
+                crate::conversation::StoredMessageDeliveryState::PendingApproval
+            }
+            AppendDeliveryDisposition::Rejected => {
+                crate::conversation::StoredMessageDeliveryState::Failed
+            }
         };
+        // A successful append result consumes its outbox row. Persist the local
+        // bubble for every terminal disposition so refresh/restart cannot make
+        // the sender's message disappear.
+        let messages_changed = envelope.as_ref().is_some_and(|env| {
+            let conversation_id = env.conversation_id.clone();
+            let Some(conv) = self.state.conversations.get_mut(&conversation_id) else {
+                return false;
+            };
+            let existing = conv.messages.iter_mut().find(|stored| {
+                stored.message_id == message_id
+                    || app_message_id
+                        .as_deref()
+                        .is_some_and(|app_id| stored.app_message_id.as_deref() == Some(app_id))
+            });
+            let changed = if let Some(stored) = existing {
+                let current = stored.delivery_state;
+                let merged = match (current, desired_delivery_state) {
+                    (Some(crate::conversation::StoredMessageDeliveryState::Sent), _) => current,
+                    (_, crate::conversation::StoredMessageDeliveryState::Sent) => {
+                        Some(crate::conversation::StoredMessageDeliveryState::Sent)
+                    }
+                    (
+                        Some(crate::conversation::StoredMessageDeliveryState::PendingApproval),
+                        crate::conversation::StoredMessageDeliveryState::Failed,
+                    ) => current,
+                    _ => Some(desired_delivery_state),
+                };
+                let request_id = if merged
+                    == Some(crate::conversation::StoredMessageDeliveryState::PendingApproval)
+                {
+                    result
+                        .request_id
+                        .clone()
+                        .or_else(|| stored.message_request_id.clone())
+                } else {
+                    None
+                };
+                let changed =
+                    stored.delivery_state != merged || stored.message_request_id != request_id;
+                stored.delivery_state = merged;
+                stored.message_request_id = request_id;
+                changed
+            } else {
+                conv.messages.push(crate::conversation::StoredMessage {
+                    message_id: message_id.to_string(),
+                    app_message_id: app_message_id.clone(),
+                    mls_ciphertext_sha256: None,
+                    sender_user_id: Some(env.sender_user_id.clone()),
+                    sender_device_id: env.sender_device_id.clone(),
+                    recipient_device_id: env.recipient_device_id.clone(),
+                    message_type: env.message_type,
+                    created_at: env.created_at,
+                    plaintext: plaintext_cache.clone(),
+                    storage_refs: env.storage_refs.clone(),
+                    downloaded_blob_b64: None,
+                    delivery_state: Some(desired_delivery_state),
+                    message_request_id: (desired_delivery_state
+                        == crate::conversation::StoredMessageDeliveryState::PendingApproval)
+                        .then(|| result.request_id.clone())
+                        .flatten(),
+                });
+                conv.last_message_type = Some(env.message_type);
+                true
+            };
+            if changed {
+                saved_conversation_id = Some(conversation_id);
+            }
+            changed
+        });
 
         let (status, message, banner) = match result.delivered_to {
             AppendDeliveryDisposition::Inbox => {
@@ -3708,19 +3797,21 @@ impl CoreEngine {
             }
             AppendDeliveryDisposition::MessageRequest => (
                 SystemStatus::MessageQueuedForApproval,
-                format!("message {message_id} for {peer_user_id} is queued as a message request"),
-                "message queued for recipient approval".to_string(),
+                "Your message is waiting for the contact to accept the request.".to_string(),
+                "Waiting for contact approval.".to_string(),
             ),
             AppendDeliveryDisposition::Rejected => (
                 SystemStatus::MessageRejectedByPolicy,
-                format!("message {message_id} for {peer_user_id} was rejected by inbox policy"),
-                "message rejected by recipient policy".to_string(),
+                "The contact did not accept this message.".to_string(),
+                "Message not accepted by the contact.".to_string(),
             ),
         };
         AppendDeliveryOutput {
             output: CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![status],
+                    messages_changed,
+                    conversations_changed: messages_changed,
                     contacts_changed: contact_changed,
                     ..CoreStateUpdate::default()
                 },

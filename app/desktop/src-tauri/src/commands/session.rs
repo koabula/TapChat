@@ -190,7 +190,7 @@ async fn run_gated_sync(
 pub async fn start_realtime_session(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
@@ -202,7 +202,7 @@ pub async fn start_realtime_session(
 pub async fn stop_realtime_session(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     let inner = state.inner.read().await;
 
     let device_id = match &inner.session {
@@ -232,15 +232,20 @@ pub async fn stop_realtime_session(
 }
 
 #[tauri::command]
-pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<CoreOutput, String> {
+pub async fn sync_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<CoreOutput> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    run_gated_sync(&app, &state, "manual").await
+    Ok(run_gated_sync(&app, &state, "manual").await?)
 }
 
 #[tauri::command]
-pub async fn get_session_status(state: State<'_, AppState>) -> Result<SessionStatus, String> {
+pub async fn get_session_status(
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<SessionStatus> {
     Ok(read_session_status_snapshot(&state).await)
 }
 

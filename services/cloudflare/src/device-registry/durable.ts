@@ -19,11 +19,23 @@ import {
   type IdentityBundle
 } from "../types/contracts";
 import type { Env } from "../types/env";
+import { appErrorBody } from "../errors";
 
 const CHALLENGE_TTL_MS = 5 * 60 * 1000;
 const CHALLENGE_PREFIX = "challenge:";
 const DEVICE_PREFIX = "device:";
+const IDENTITY_BUNDLE_KEY = "identity_bundle:v2";
 const MAX_ACTIVE_CHALLENGES = 8;
+const KEY_PACKAGE_LIFETIME_MS = 84 * 24 * 60 * 60 * 1000;
+const KEY_PACKAGE_NOT_BEFORE_SKEW_MS = 60 * 60 * 1000;
+const KEY_PACKAGE_MIN_REMAINING_MS = 7 * 24 * 60 * 60 * 1000;
+const CLOCK_TOLERANCE_MS = 5 * 60 * 1000;
+const INBOX_CAPABILITY_MAX_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
+
+interface StoredIdentityBundle {
+  bundle: IdentityBundle;
+  etag: string;
+}
 
 const DurableObjectBase: typeof CloudflareDurableObject<Env> =
   (globalThis as { DurableObject?: typeof CloudflareDurableObject<Env> }).DurableObject ??
@@ -33,6 +45,10 @@ const DurableObjectBase: typeof CloudflareDurableObject<Env> =
 
 function jsonResponse(body: unknown, status = 200): Response {
   return Response.json(body, { status });
+}
+
+function errorResponse(status: number, code: string): Response {
+  return jsonResponse(appErrorBody(status, code, crypto.randomUUID()), status);
 }
 
 function runtimeConfig(env: Env): { runtimeId: string; userId: string; userPublicKey: string } {
@@ -64,6 +80,64 @@ async function bindingHash(device: DeviceContactProfile): Promise<string> {
     new TextEncoder().encode(JSON.stringify(device.binding))
   );
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function identityBundleEtag(bundle: IdentityBundle): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(bundle))
+  );
+  const value = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `"${value}"`;
+}
+
+function validateIdentityBundleLifecycle(bundle: IdentityBundle, writerDeviceId: string, now: number): void {
+  if (bundle.publicationVersion !== 1 || !Number.isSafeInteger(bundle.publicationRevision) || bundle.publicationRevision! < 1) {
+    throw new HttpError(426, "upgrade_required", "identity bundle publication protocol is not supported");
+  }
+  const writer = bundle.devices.find((device) => device.deviceId === writerDeviceId);
+  if (!writer || writer.status !== "active") {
+    throw new HttpError(403, "device_revoked", "publishing device is not active in the identity bundle");
+  }
+  for (const device of bundle.devices) {
+    const keyPackage = device.keypackageRef;
+    if (keyPackage) {
+      if (keyPackage.createdAt! > now + CLOCK_TOLERANCE_MS || keyPackage.notBefore! > now + CLOCK_TOLERANCE_MS) {
+        throw new HttpError(422, "device_clock_invalid", "key package timestamps are too far in the future");
+      }
+      const validMetadata = keyPackage.lifecycleVersion === 1
+        && Number.isSafeInteger(keyPackage.notBefore)
+        && Number.isSafeInteger(keyPackage.createdAt)
+        && Number.isSafeInteger(keyPackage.expiresAt)
+        && keyPackage.userId === bundle.userId
+        && keyPackage.deviceId === device.deviceId
+        && keyPackage.expiresAt - keyPackage.createdAt! === KEY_PACKAGE_LIFETIME_MS
+        && keyPackage.notBefore === Math.max(0, keyPackage.createdAt! - KEY_PACKAGE_NOT_BEFORE_SKEW_MS);
+      if (!validMetadata) {
+        throw new HttpError(422, "keypackage_lifetime_invalid", "key package lifecycle metadata is invalid");
+      }
+      if (keyPackage.expiresAt <= now - CLOCK_TOLERANCE_MS) {
+        throw new HttpError(422, "keypackage_expired", "key package is expired");
+      }
+    }
+    const capability = device.inboxAppendCapability;
+    if (capability) {
+      if (
+        capability.userId !== bundle.userId ||
+        capability.targetDeviceId !== device.deviceId ||
+        capability.expiresAt <= now - CLOCK_TOLERANCE_MS ||
+        capability.expiresAt > now + INBOX_CAPABILITY_MAX_LIFETIME_MS + CLOCK_TOLERANCE_MS
+      ) {
+        throw new HttpError(422, "capability_expired", "inbox append capability lifecycle is invalid");
+      }
+    }
+  }
+  if (!writer.keypackageRef || writer.keypackageRef.expiresAt < now + KEY_PACKAGE_MIN_REMAINING_MS) {
+    throw new HttpError(422, "keypackage_expired", "publishing device key package has insufficient remaining lifetime");
+  }
+  if (!writer.inboxAppendCapability || writer.inboxAppendCapability.expiresAt <= now) {
+    throw new HttpError(422, "capability_expired", "publishing device inbox append capability is expired");
+  }
 }
 
 function assertChallengeScope(
@@ -130,12 +204,18 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
       if (request.method === "POST" && url.pathname.endsWith("/sync")) {
         return await this.syncIdentityBundle(request, now);
       }
-      return jsonResponse({ error: "not_found" }, 404);
+      if (request.method === "GET" && url.pathname.endsWith("/identity-bundle")) {
+        return await this.getIdentityBundle();
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/identity-bundle/migrate")) {
+        return await this.migrateIdentityBundle(request, now);
+      }
+      return errorResponse(404, "not_found");
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonResponse({ error: error.code, message: error.message }, error.status);
+        return errorResponse(error.status, error.code);
       }
-      return jsonResponse({ error: "temporary_unavailable", message: "device registry request failed" }, 500);
+      return errorResponse(500, "temporary_unavailable");
     }
   }
 
@@ -147,9 +227,9 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
     return jsonResponse({
       ready: true,
       runtimeId: config.runtimeId,
-      protocolVersion: 4,
-      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v4-unknown",
-      registrySchemaVersion: 1
+      protocolVersion: 5,
+      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+      registrySchemaVersion: 2
     });
   }
 
@@ -285,8 +365,17 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
   }
 
   private async syncIdentityBundle(request: Request, now: number): Promise<Response> {
-    const bundle = await readJsonLimited<IdentityBundle>(request, CONTROL_JSON_MAX_BYTES);
+    const body = await readJsonLimited<{
+      bundle?: IdentityBundle;
+      expectedEtag?: string;
+      writerDeviceId?: string;
+    }>(request, CONTROL_JSON_MAX_BYTES);
+    const bundle = body.bundle;
+    if (!bundle || !body.writerDeviceId) {
+      throw new HttpError(426, "upgrade_required", "structured identity publication is required");
+    }
     const config = runtimeConfig(this.envRef);
+    validateIdentityBundleLifecycle(bundle, body.writerDeviceId, now);
     if (
       bundle.userId !== config.userId ||
       bundle.userPublicKey !== config.userPublicKey ||
@@ -294,7 +383,7 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
     ) {
       throw new HttpError(403, "runtime_auth_invalid", "identity bundle does not match runtime owner");
     }
-    const changes: Array<{ key: string; record: DeviceRegistryRecord }> = [];
+    const preparedDevices: Array<{ device: DeviceContactProfile; key: string; hash: string }> = [];
     for (const device of bundle.devices) {
       if (
         device.binding.userId !== config.userId ||
@@ -306,23 +395,37 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
       }
       const key = deviceKey(device.deviceId);
       const hash = await bindingHash(device);
-      const existing = await this.stateRef.storage.get<DeviceRegistryRecord>(key);
-      if (existing && (existing.devicePublicKey !== device.devicePublicKey || existing.bindingHash !== hash)) {
-        throw new HttpError(403, "runtime_auth_invalid", "identity bundle attempts to replace a registered device key");
+      preparedDevices.push({ device, key, hash });
+    }
+    const etag = await identityBundleEtag(bundle);
+    await this.stateRef.storage.transaction(async (transaction) => {
+      const stored = await transaction.get<StoredIdentityBundle>(IDENTITY_BUNDLE_KEY);
+      if (stored) {
+        if (!body.expectedEtag || body.expectedEtag !== stored.etag) {
+          throw new HttpError(412, "identity_bundle_conflict", "identity bundle ETag does not match");
+        }
+        if ((bundle.publicationRevision ?? 0) <= (stored.bundle.publicationRevision ?? 0)) {
+          throw new HttpError(412, "identity_bundle_conflict", "identity bundle revision is not newer");
+        }
+      } else if (body.expectedEtag && body.expectedEtag !== "*") {
+        throw new HttpError(412, "identity_bundle_conflict", "identity bundle does not exist at the expected ETag");
       }
-      if (existing?.status === "revoked" && device.status === "active") {
-        throw new HttpError(403, "device_revoked", "identity bundle attempts to reactivate a revoked device");
-      }
-      const status = existing?.status === "revoked" || device.status === "revoked" ? "revoked" : "active";
-      changes.push({
-        key,
-        record: {
+      for (const prepared of preparedDevices) {
+        const existing = await transaction.get<DeviceRegistryRecord>(prepared.key);
+        if (existing && (existing.devicePublicKey !== prepared.device.devicePublicKey || existing.bindingHash !== prepared.hash)) {
+          throw new HttpError(403, "runtime_auth_invalid", "identity bundle attempts to replace a registered device key");
+        }
+        if (existing?.status === "revoked" && prepared.device.status === "active") {
+          throw new HttpError(403, "device_revoked", "identity bundle attempts to reactivate a revoked device");
+        }
+        const status = existing?.status === "revoked" || prepared.device.status === "revoked" ? "revoked" : "active";
+        await transaction.put(prepared.key, {
           version: CURRENT_MODEL_VERSION,
           runtimeId: config.runtimeId,
           userId: config.userId,
-          deviceId: device.deviceId,
-          devicePublicKey: device.devicePublicKey,
-          bindingHash: hash,
+          deviceId: prepared.device.deviceId,
+          devicePublicKey: prepared.device.devicePublicKey,
+          bindingHash: prepared.hash,
           status,
           registrationVersion:
             existing && existing.status !== status
@@ -330,13 +433,85 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
               : existing?.registrationVersion ?? 1,
           createdAt: existing?.createdAt ?? now,
           updatedAt: now
-        }
+        } satisfies DeviceRegistryRecord);
+      }
+      await transaction.put(IDENTITY_BUNDLE_KEY, { bundle, etag } satisfies StoredIdentityBundle);
+    });
+    const response = jsonResponse(bundle);
+    response.headers.set("etag", etag);
+    return response;
+  }
+
+  private async getIdentityBundle(): Promise<Response> {
+    const stored = await this.stateRef.storage.get<StoredIdentityBundle>(IDENTITY_BUNDLE_KEY);
+    if (!stored) return errorResponse(404, "not_found");
+    const response = jsonResponse(stored.bundle);
+    response.headers.set("etag", stored.etag);
+    return response;
+  }
+
+  private async migrateIdentityBundle(request: Request, now: number): Promise<Response> {
+    const body = await readJsonLimited<{ bundle?: IdentityBundle }>(request, CONTROL_JSON_MAX_BYTES);
+    const bundle = body.bundle;
+    const config = runtimeConfig(this.envRef);
+    if (
+      !bundle ||
+      bundle.userId !== config.userId ||
+      bundle.userPublicKey !== config.userPublicKey ||
+      !verifyIdentityBundle(bundle)
+    ) {
+      throw new HttpError(403, "runtime_auth_invalid", "legacy identity bundle is invalid");
+    }
+    const preparedDevices: Array<{ device: DeviceContactProfile; key: string; hash: string }> = [];
+    for (const device of bundle.devices) {
+      if (
+        device.binding.userId !== config.userId ||
+        device.binding.deviceId !== device.deviceId ||
+        device.binding.devicePublicKey !== device.devicePublicKey ||
+        !verifyDeviceBinding(config.userPublicKey, device.binding)
+      ) {
+        throw new HttpError(403, "runtime_auth_invalid", "legacy identity bundle contains an invalid device binding");
+      }
+      preparedDevices.push({
+        device,
+        key: deviceKey(device.deviceId),
+        hash: await bindingHash(device)
       });
     }
-    await this.stateRef.storage.transaction(async (transaction) => {
-      for (const change of changes) await transaction.put(change.key, change.record);
+    const etag = await identityBundleEtag(bundle);
+    const stored = await this.stateRef.storage.transaction(async (transaction) => {
+      const existingBundle = await transaction.get<StoredIdentityBundle>(IDENTITY_BUNDLE_KEY);
+      if (existingBundle) return existingBundle;
+      for (const prepared of preparedDevices) {
+        const existing = await transaction.get<DeviceRegistryRecord>(prepared.key);
+        if (
+          existing &&
+          (existing.devicePublicKey !== prepared.device.devicePublicKey || existing.bindingHash !== prepared.hash)
+        ) {
+          throw new HttpError(403, "runtime_auth_invalid", "legacy identity bundle conflicts with a registered device");
+        }
+        if (!existing) {
+          await transaction.put(prepared.key, {
+            version: CURRENT_MODEL_VERSION,
+            runtimeId: config.runtimeId,
+            userId: config.userId,
+            deviceId: prepared.device.deviceId,
+            devicePublicKey: prepared.device.devicePublicKey,
+            bindingHash: prepared.hash,
+            status: prepared.device.status,
+            registrationVersion: 1,
+            createdAt: now,
+            updatedAt: now
+          } satisfies DeviceRegistryRecord);
+        }
+      }
+      const migrated = { bundle, etag } satisfies StoredIdentityBundle;
+      await transaction.put(IDENTITY_BUNDLE_KEY, migrated);
+      return migrated;
     });
-    return jsonResponse({ synchronized: changes.length });
+    const response = jsonResponse(stored.bundle);
+    response.headers.set("etag", stored.etag);
+    return response;
   }
 }
 
@@ -354,9 +529,10 @@ export async function assertRegisteredRuntimeToken(env: Env, token: DeviceRuntim
     })
   );
   if (!response.ok) {
-    const body: { error?: string; message?: string } = await response
-      .json<{ error?: string; message?: string }>()
+    const body: { code?: string } = await response
+      .json<{ code?: string }>()
       .catch(() => ({}));
-    throw new HttpError(response.status, body.error ?? "runtime_auth_invalid", body.message ?? "device registry rejected token");
+    const code = body.code ?? "runtime_auth_invalid";
+    throw new HttpError(response.status, code, code);
   }
 }

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
+import { normalizeAppError, presentError } from "@/lib/errors";
 
 import { listGroupConversations } from "@/lib/tauri";
 import { useContactsStore } from "@/store/contacts";
@@ -56,8 +57,8 @@ export default function MessageRequests() {
         );
       }
     } catch (err) {
-      console.error(`[MessageRequests] Failed to load message requests: ${String(err)}`);
-      setActionNotice({ kind: "error", message: String(err) });
+      console.error(`[MessageRequests] Failed to load message requests: ${presentError(err).message}`);
+      setActionNotice({ kind: "error", message: presentError(err).message });
     } finally {
       setLoading(false);
     }
@@ -150,19 +151,16 @@ export default function MessageRequests() {
             });
           }
         } catch (err) {
-          console.error(`[MessageRequests] Failed to refresh after accept: ${String(err)}`);
-          setActionNotice({ kind: "error", message: String(err) });
+          console.error(`[MessageRequests] Failed to refresh after accept: ${presentError(err).message}`);
+          setActionNotice({ kind: "error", message: presentError(err).message });
         }
       } else if (action === "reject") {
         setActionNotice({ kind: "info", message: "Message request rejected." });
       }
     } catch (err) {
-      console.error(`[MessageRequests] Failed to ${action} request ${requestId}: ${String(err)}`);
-      setActionNotice({ kind: "error", message: String(err) });
-      if (
-        String(err).includes("message request not found") ||
-        String(err).includes("not_found")
-      ) {
+      console.error(`[MessageRequests] Failed to ${action} request ${requestId}: ${presentError(err).message}`);
+      setActionNotice({ kind: "error", message: presentError(err).message });
+      if (normalizeAppError(err).code === "not_found") {
         removeRequest(requestId);
       }
       void loadFromBackend();

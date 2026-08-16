@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useMemo, useState } from "react";
 import {
   X,
@@ -87,7 +88,7 @@ export default function GroupMemberDrawer({
         .then(setSnapshot)
         .catch((err) => {
           console.debug(
-            `[GroupMemberDrawer] getGroupSnapshot(${groupId}) failed: ${String(err)}`,
+            `[GroupMemberDrawer] getGroupSnapshot(${groupId}) failed: ${presentError(err).message}`,
           );
         });
     }
@@ -155,7 +156,7 @@ export default function GroupMemberDrawer({
       }
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
       return false;
     } finally {
       setBusy(null);

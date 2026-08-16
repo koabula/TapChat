@@ -19,7 +19,6 @@ import type {
 } from "../types/contracts";
 import { CURRENT_MODEL_VERSION } from "../types/contracts";
 import { verifySharingPayload } from "../storage/sharing";
-import type { SharedStateService } from "../storage/shared-state";
 import type { RotatingSecretSet } from "./runtime-security";
 
 export class HttpError extends Error {
@@ -60,7 +59,7 @@ export async function validateAppendAuthorization(
   deviceId: string,
   body: AppendEnvelopeRequest,
   now: number,
-  sharedState: SharedStateService
+  loadAuthoritativeIdentityBundle: () => Promise<IdentityBundle | null>
 ): Promise<AppendAuthContext> {
   if (body.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "append request version is not supported");
@@ -72,14 +71,14 @@ export async function validateAppendAuthorization(
   const authorization = request.headers.get("Authorization")?.trim();
   const capabilityHeader = request.headers.get("X-Tapchat-Capability");
   if (!authorization || !capabilityHeader) {
-    return { mode: "legacy_unverified", reason: "missing_append_grant" };
+    throw new HttpError(426, "upgrade_required", "append authorization is required");
   }
   if (!authorization.startsWith("Bearer ")) {
-    return { mode: "legacy_unverified", reason: "invalid_bearer" };
+    throw new HttpError(403, "invalid_capability", "append authorization must use Bearer");
   }
   const signature = authorization.slice("Bearer ".length).trim();
   if (!signature) {
-    return { mode: "legacy_unverified", reason: "invalid_bearer" };
+    throw new HttpError(403, "invalid_capability", "append authorization is empty");
   }
 
   let capability: InboxAppendCapability;
@@ -93,7 +92,7 @@ export async function validateAppendAuthorization(
     throw new HttpError(400, "unsupported_version", "append capability version is not supported");
   }
   if (capability.signature !== signature) {
-    return { mode: "legacy_unverified", reason: "bearer_mismatch" };
+    throw new HttpError(403, "invalid_capability", "append bearer does not match capability");
   }
   if (capability.service !== "inbox") {
     throw new HttpError(403, "invalid_capability", "capability service must be inbox");
@@ -108,9 +107,6 @@ export async function validateAppendAuthorization(
   if (capability.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
     throw new HttpError(403, "invalid_capability", "capability endpoint does not match request path");
   }
-  if (capability.expiresAt <= now) {
-    return { mode: "legacy_unverified", reason: "capability_expired" };
-  }
   if (capability.conversationScope?.length && !capability.conversationScope.includes(body.envelope.conversationId)) {
     throw new HttpError(403, "invalid_capability", "conversation is outside capability scope");
   }
@@ -118,37 +114,42 @@ export async function validateAppendAuthorization(
   if (capability.constraints?.maxBytes !== undefined && size > capability.constraints.maxBytes) {
     throw new HttpError(413, "payload_too_large", "envelope exceeds capability size limit");
   }
-  const bundle = await sharedState.getIdentityBundle(capability.userId);
+  const bundle = await loadAuthoritativeIdentityBundle();
   if (!bundle) {
-    return { mode: "legacy_unverified", reason: "identity_bundle_missing" };
+    throw new HttpError(409, "identity_refresh_required", "authoritative identity bundle is missing");
   }
   if (!verifyIdentityBundle(bundle)) {
-    return { mode: "legacy_unverified", reason: "identity_bundle_invalid" };
+    throw new HttpError(500, "storage_integrity_error", "authoritative identity bundle is invalid");
   }
   if (bundle.userId !== capability.userId) {
-    return { mode: "legacy_unverified", reason: "identity_bundle_scope_mismatch" };
+    throw new HttpError(403, "invalid_capability", "capability user does not match runtime owner");
   }
   const device = bundle.devices.find((item) => item.deviceId === capability.targetDeviceId);
   if (!device) {
-    return { mode: "legacy_unverified", reason: "device_missing" };
+    throw new HttpError(409, "identity_refresh_required", "recipient device authorization changed");
   }
   if (device.status !== "active") {
-    return { mode: "legacy_unverified", reason: "device_not_active" };
+    throw new HttpError(403, "device_revoked", "recipient device is revoked");
   }
   if (
     device.deviceId !== capability.targetDeviceId ||
     device.binding.userId !== bundle.userId ||
     device.binding.deviceId !== device.deviceId ||
-    device.binding.devicePublicKey !== device.devicePublicKey ||
-    device.inboxAppendCapability.signature !== capability.signature
+    device.binding.devicePublicKey !== device.devicePublicKey
   ) {
-    return { mode: "legacy_unverified", reason: "device_binding_mismatch" };
+    throw new HttpError(500, "storage_integrity_error", "recipient device binding is inconsistent");
   }
   if (!verifyDeviceBinding(bundle.userPublicKey, device.binding)) {
-    return { mode: "legacy_unverified", reason: "device_binding_invalid" };
+    throw new HttpError(500, "storage_integrity_error", "recipient device binding is invalid");
   }
   if (!verifyInboxAppendCapability(capability, device.devicePublicKey)) {
-    return { mode: "legacy_unverified", reason: "capability_signature_invalid" };
+    throw new HttpError(403, "invalid_capability", "append capability signature is invalid");
+  }
+  if (capability.expiresAt <= now) {
+    throw new HttpError(422, "capability_expired", "append capability is expired");
+  }
+  if (device.inboxAppendCapability?.signature !== capability.signature) {
+    throw new HttpError(409, "identity_refresh_required", "recipient append authorization changed");
   }
   return { mode: "verified" };
 }
@@ -187,6 +188,10 @@ function bindingPayload(binding: DeviceBinding): string {
 
 function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boolean): string {
   const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
+  if ((bundle.publicationVersion ?? 0) > 0) {
+    parts.push(String(bundle.publicationVersion));
+    parts.push(String(bundle.publicationRevision ?? 0));
+  }
   if (includeDisplayName) {
     parts.push(bundle.displayName ?? "");
   }
@@ -202,14 +207,23 @@ function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boole
     parts.push(device.deviceId);
     parts.push(device.devicePublicKey);
     parts.push(device.binding.signature);
-    parts.push(device.inboxAppendCapability.signature);
-    parts.push(keyPackageRefValue(device));
-    parts.push(String(device.keypackageRef.expiresAt));
+    parts.push(device.inboxAppendCapability?.signature ?? "");
+    if ((bundle.publicationVersion ?? 0) > 0) {
+      parts.push(String(device.keypackageRef?.lifecycleVersion ?? ""));
+      parts.push(keyPackageRefValue(device));
+      parts.push(String(device.keypackageRef?.notBefore ?? ""));
+      parts.push(String(device.keypackageRef?.createdAt ?? ""));
+      parts.push(String(device.keypackageRef?.expiresAt ?? ""));
+    } else {
+      parts.push(keyPackageRefValue(device));
+      parts.push(String(device.keypackageRef?.expiresAt ?? ""));
+    }
   }
   return parts.join("|");
 }
 
 function keyPackageRefValue(device: DeviceContactProfile): string {
+  if (!device.keypackageRef) return "";
   const keypackage = device.keypackageRef as DeviceContactProfile["keypackageRef"] & { objectRef?: string };
   return keypackage.ref ?? keypackage.objectRef ?? "";
 }
@@ -220,7 +234,8 @@ export function verifyIdentityBundle(bundle: IdentityBundle): boolean {
   }
   return (
     verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) ||
-    verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false))
+    ((bundle.publicationVersion ?? 0) === 0 &&
+      verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false)))
   );
 }
 

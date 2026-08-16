@@ -28,13 +28,15 @@ pub struct MessageRequestActionOutput {
 pub async fn list_message_requests(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListMessageRequests))
-        .await
-        .map_err(|e| e.to_string())
+    Ok(
+        drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListMessageRequests))
+            .await
+            .map_err(crate::errors::DesktopError::from)?,
+    )
 }
 
 #[tauri::command]
@@ -44,17 +46,17 @@ pub async fn act_on_message_request(
     request_id: String,
     action: String,
     sender_bundle_share_url: Option<String>,
-) -> Result<MessageRequestActionOutput, String> {
+) -> crate::errors::DesktopResult<MessageRequestActionOutput> {
     // Tauri's generated dispatcher already carries a sizeable stack frame on
     // Windows. Keep this command's multi-step async state machine on the heap.
-    Box::pin(act_on_message_request_impl(
+    Ok(Box::pin(act_on_message_request_impl(
         app,
         state,
         request_id,
         action,
         sender_bundle_share_url,
     ))
-    .await
+    .await?)
 }
 
 async fn act_on_message_request_impl(
@@ -257,13 +259,15 @@ async fn act_on_message_request_impl(
 pub async fn get_allowlist(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListAllowlist))
-        .await
-        .map_err(|e| e.to_string())
+    Ok(
+        drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListAllowlist))
+            .await
+            .map_err(crate::errors::DesktopError::from)?,
+    )
 }
 
 #[tauri::command]
@@ -271,16 +275,16 @@ pub async fn add_to_allowlist(
     app: AppHandle,
     state: State<'_, AppState>,
     user_id: String,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    drive_core_with_handle(
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::AddAllowlistUser { user_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[tauri::command]
@@ -288,14 +292,14 @@ pub async fn remove_from_allowlist(
     app: AppHandle,
     state: State<'_, AppState>,
     user_id: String,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     ensure_fresh_device_runtime_auth_for_state(state.inner())
         .await
         .map_err(|error| error.to_string())?;
-    drive_core_with_handle(
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RemoveAllowlistUser { user_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }

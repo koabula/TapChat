@@ -7,10 +7,12 @@ use anyhow::Result;
 use reqwest::Client;
 
 use tapchat_core::ffi_api::CoreEvent;
+use tapchat_core::model::IdentityBundle;
 use tapchat_core::transport_contract::{
     FetchAllowlistRequest, FetchMessageRequestsRequest, MessageRequestAction,
     MessageRequestActionRequest, PublishSharedStateRequest, ReplaceAllowlistRequest,
 };
+use tapchat_core::{AppErrorV1, ErrorDomain, RecoveryAction};
 
 /// Convert JSON keys from camelCase to snake_case for parsing
 fn to_snake_case_json_string(input: &str) -> Result<String> {
@@ -124,13 +126,11 @@ pub async fn fetch_message_requests(
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-                retryable: false,
-                detail: Some(format!("HTTP {status}: {body}")),
+                failure: AppErrorV1::from_http_response(status.as_u16(), &body),
             }])
         }
-        Err(error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
-            retryable: true,
-            detail: Some(error.to_string()),
+        Err(_error) => Ok(vec![CoreEvent::MessageRequestsFetchFailed {
+            failure: AppErrorV1::network_unavailable(),
         }]),
     }
 }
@@ -212,15 +212,13 @@ pub async fn act_on_message_request(
             Ok(vec![CoreEvent::MessageRequestActionFailed {
                 request_id: action.request_id,
                 action: action.action,
-                retryable: false,
-                detail: Some(format!("HTTP {status}: {body}")),
+                failure: AppErrorV1::from_http_response(status.as_u16(), &body),
             }])
         }
-        Err(error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
+        Err(_error) => Ok(vec![CoreEvent::MessageRequestActionFailed {
             request_id: action.request_id,
             action: action.action,
-            retryable: true,
-            detail: Some(error.to_string()),
+            failure: AppErrorV1::network_unavailable(),
         }]),
     }
 }
@@ -245,13 +243,11 @@ pub async fn fetch_allowlist(
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             Ok(vec![CoreEvent::AllowlistFetchFailed {
-                retryable: false,
-                detail: Some(format!("HTTP {status}: {body}")),
+                failure: AppErrorV1::from_http_response(status.as_u16(), &body),
             }])
         }
-        Err(error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
-            retryable: true,
-            detail: Some(error.to_string()),
+        Err(_error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+            failure: AppErrorV1::network_unavailable(),
         }]),
     }
 }
@@ -286,13 +282,11 @@ pub async fn replace_allowlist(
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                retryable: false,
-                detail: Some(format!("HTTP {status}: {body}")),
+                failure: AppErrorV1::from_http_response(status.as_u16(), &body),
             }])
         }
-        Err(error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-            retryable: true,
-            detail: Some(error.to_string()),
+        Err(_error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
+            failure: AppErrorV1::network_unavailable(),
         }]),
     }
 }
@@ -300,8 +294,77 @@ pub async fn replace_allowlist(
 /// Publish shared state to backend.
 pub async fn publish_shared_state(
     client: &Client,
-    publish: PublishSharedStateRequest,
+    mut publish: PublishSharedStateRequest,
 ) -> Result<Vec<CoreEvent>> {
+    if publish.document_kind
+        == tapchat_core::transport_contract::SharedStateDocumentKind::IdentityBundle
+    {
+        let candidate = serde_json::from_str::<IdentityBundle>(&publish.body).ok();
+        match client.get(&publish.reference).send().await {
+            Ok(response) if response.status().is_success() => {
+                let etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let remote = response.json::<IdentityBundle>().await.ok();
+                if candidate.as_ref().is_some_and(|candidate| {
+                    remote
+                        .as_ref()
+                        .is_some_and(|remote| same_identity_publication(remote, candidate))
+                }) {
+                    return Ok(vec![CoreEvent::SharedStatePublished {
+                        operation_id: publish.operation_id,
+                        document_kind: publish.document_kind,
+                        reference: publish.reference,
+                        etag,
+                        saved_bundle: remote,
+                    }]);
+                }
+                if !publish.headers.contains_key("If-Match") {
+                    if let Some(etag) = etag {
+                        publish.headers.insert("If-Match".into(), etag);
+                    }
+                }
+            }
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {}
+            Ok(response) => {
+                let status = response.status().as_u16();
+                return Ok(vec![CoreEvent::SharedStatePublishFailed {
+                    operation_id: publish.operation_id,
+                    document_kind: publish.document_kind,
+                    reference: publish.reference,
+                    failure: structured_transport_error(
+                        "identity_bundle_refresh_required",
+                        status,
+                        true,
+                    ),
+                    current_bundle: None,
+                    etag: None,
+                }]);
+            }
+            Err(_) => {
+                let code = if publish
+                    .operation_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("contact_share_rotation:"))
+                {
+                    "contact_share_offline"
+                } else {
+                    "network_unavailable"
+                };
+                return Ok(vec![CoreEvent::SharedStatePublishFailed {
+                    operation_id: publish.operation_id,
+                    document_kind: publish.document_kind,
+                    reference: publish.reference,
+                    failure: structured_transport_error(code, 0, true),
+                    current_bundle: None,
+                    etag: None,
+                }]);
+            }
+        }
+    }
+
     let mut request = client.put(&publish.reference);
     for (key, value) in &publish.headers {
         request = request.header(key, value);
@@ -314,26 +377,88 @@ pub async fn publish_shared_state(
         .await
     {
         Ok(response) if response.status().is_success() => {
+            let etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let saved_bundle = if publish.document_kind
+                == tapchat_core::transport_contract::SharedStateDocumentKind::IdentityBundle
+            {
+                response.json::<IdentityBundle>().await.ok()
+            } else {
+                None
+            };
             Ok(vec![CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
                 document_kind: publish.document_kind,
                 reference: publish.reference,
+                etag,
+                saved_bundle,
             }])
         }
         Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let status = response.status().as_u16();
+            let failure = response.json::<AppErrorV1>().await.unwrap_or_else(|_| {
+                structured_transport_error("temporary_failure", status, status >= 500)
+            });
+            let (current_bundle, etag) = if failure.code == "identity_bundle_conflict" {
+                match client.get(&publish.reference).send().await {
+                    Ok(current) if current.status().is_success() => {
+                        let etag = current
+                            .headers()
+                            .get(reqwest::header::ETAG)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        (current.json::<IdentityBundle>().await.ok(), etag)
+                    }
+                    _ => (None, None),
+                }
+            } else {
+                (None, None)
+            };
             Ok(vec![CoreEvent::SharedStatePublishFailed {
+                operation_id: publish.operation_id,
                 document_kind: publish.document_kind,
                 reference: publish.reference,
-                retryable: false,
-                detail: Some(format!("HTTP {status}: {body}")),
+                failure,
+                current_bundle,
+                etag,
             }])
         }
-        Err(error) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+        Err(_) => Ok(vec![CoreEvent::SharedStatePublishFailed {
+            operation_id: publish.operation_id,
             document_kind: publish.document_kind,
             reference: publish.reference,
-            retryable: true,
-            detail: Some(error.to_string()),
+            failure: structured_transport_error("network_unavailable", 0, true),
+            current_bundle: None,
+            etag: None,
         }]),
     }
+}
+
+fn same_identity_publication(left: &IdentityBundle, right: &IdentityBundle) -> bool {
+    left.publication_revision == right.publication_revision
+        && left.bundle_share_id == right.bundle_share_id
+        && left.signature == right.signature
+}
+
+fn structured_transport_error(code: &str, status: u16, retryable: bool) -> AppErrorV1 {
+    let domain = if code.starts_with("identity_") || code.starts_with("contact_share_") {
+        ErrorDomain::Identity
+    } else if code.starts_with("keypackage_") {
+        ErrorDomain::Mls
+    } else {
+        ErrorDomain::Transport
+    };
+    let mut failure = AppErrorV1::new(code, domain, retryable);
+    failure.http_status = (status > 0).then_some(status);
+    failure.action = Some(if code == "identity_bundle_conflict" {
+        RecoveryAction::RefreshIdentity
+    } else if code == "contact_share_offline" {
+        RecoveryAction::Reconnect
+    } else {
+        RecoveryAction::Retry
+    });
+    failure
 }

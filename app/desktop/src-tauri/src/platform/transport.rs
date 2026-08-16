@@ -174,8 +174,9 @@ impl DesktopTransport {
                         );
                         return Ok(vec![CoreEvent::HttpRequestFailed {
                             request_id: request.request_id,
-                            retryable: true,
-                            detail: Some(format!("response_body:{error_class}")),
+                            failure: tapchat_core::AppErrorV1::from_registered_code(
+                                "temporary_failure",
+                            ),
                         }]);
                     }
                 };
@@ -215,8 +216,11 @@ impl DesktopTransport {
                 );
                 Ok(vec![CoreEvent::HttpRequestFailed {
                     request_id: request.request_id,
-                    retryable,
-                    detail: Some(format!("request_error:{error_class}")),
+                    failure: tapchat_core::AppErrorV1::new(
+                        "network_unavailable",
+                        tapchat_core::ErrorDomain::Transport,
+                        retryable,
+                    ),
                 }])
             }
         }

@@ -83,7 +83,7 @@ fn migrate_legacy_settings(profile: &Profile) -> Result<AttachmentSettings, Stri
 #[tauri::command]
 pub async fn get_attachment_settings(
     state: State<'_, AppState>,
-) -> Result<AttachmentSettings, String> {
+) -> crate::errors::DesktopResult<AttachmentSettings> {
     let inner = state.inner.read().await;
     let pm = inner.profile_manager.inner.read().await;
     match &pm.active_profile {
@@ -96,18 +96,20 @@ pub async fn get_attachment_settings(
 pub async fn set_attachment_settings(
     state: State<'_, AppState>,
     settings: AttachmentSettings,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     let inner = state.inner.read().await;
     let pm = inner.profile_manager.inner.read().await;
     match &pm.active_profile {
-        Some(profile) => save_settings(profile, &settings),
+        Some(profile) => Ok(save_settings(profile, &settings)?),
         None => Err("No active profile".into()),
     }
 }
 
 /// Returns the cache directory path for downloaded attachments.
 #[tauri::command]
-pub async fn get_attachment_cache_dir(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn get_attachment_cache_dir(
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<String> {
     let persistence = {
         let ports = state.ports.lock().await;
         ports.persistence.clone()

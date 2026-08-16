@@ -323,7 +323,7 @@ fn dedupe_pending_join_request_views<'a>(
 pub async fn apply_group_realtime_plan(
     app: AppHandle,
     websocket_group_ids: Vec<String>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ApplyGroupRealtimePlan {
@@ -359,8 +359,8 @@ fn notification_message_from_output(output: &CoreOutput) -> Option<String> {
 #[tauri::command]
 pub async fn list_group_conversations(
     state: State<'_, AppState>,
-) -> Result<Vec<GroupConversationSummary>, String> {
-    list_group_conversations_impl(state.inner()).await
+) -> crate::errors::DesktopResult<Vec<GroupConversationSummary>> {
+    Ok(list_group_conversations_impl(state.inner()).await?)
 }
 
 /// Shared body for [`list_group_conversations`] and the test-path
@@ -416,8 +416,8 @@ pub async fn list_group_conversations_impl(
 pub async fn get_group_snapshot(
     state: State<'_, AppState>,
     group_id: String,
-) -> Result<GroupSnapshotView, String> {
-    get_group_snapshot_impl(state.inner(), group_id).await
+) -> crate::errors::DesktopResult<GroupSnapshotView> {
+    Ok(get_group_snapshot_impl(state.inner(), group_id).await?)
 }
 
 /// Shared body for [`get_group_snapshot`]. Mirrors the production
@@ -511,8 +511,8 @@ pub async fn get_group_snapshot_impl(
 pub async fn get_group_messages(
     state: State<'_, AppState>,
     conversation_id: String,
-) -> Result<Vec<GroupMessageView>, String> {
-    get_group_messages_impl(state.inner(), conversation_id).await
+) -> crate::errors::DesktopResult<Vec<GroupMessageView>> {
+    Ok(get_group_messages_impl(state.inner(), conversation_id).await?)
 }
 
 /// Shared body for [`get_group_messages`]. Identical snapshot walk;
@@ -754,7 +754,7 @@ pub async fn create_group_conversation(
     app: AppHandle,
     title: String,
     member_user_ids: Vec<String>,
-) -> Result<CreateGroupConversationResult, String> {
+) -> crate::errors::DesktopResult<CreateGroupConversationResult> {
     let (trimmed_title, members) = normalize_create_group_inputs(&title, &member_user_ids)?;
     let deployment = {
         let state = app.state::<AppState>();
@@ -763,7 +763,7 @@ pub async fn create_group_conversation(
     };
     let runtime_status = runtime_status_for_deployment(deployment).await;
     if let Some(message) = runtime_missing_group_outbox_message(&runtime_status) {
-        return Err(message);
+        return Err(message.into());
     }
 
     for member_user_id in &members {
@@ -885,7 +885,7 @@ pub async fn send_group_text_message(
     app: AppHandle,
     conversation_id: String,
     plaintext: String,
-) -> Result<SendGroupTextResult, String> {
+) -> crate::errors::DesktopResult<SendGroupTextResult> {
     if plaintext.is_empty() {
         return Err("plaintext must not be empty".into());
     }
@@ -975,7 +975,7 @@ pub async fn sync_group_outbox(
     app: AppHandle,
     group_id: String,
     reason: Option<String>,
-) -> Result<SyncGroupOutboxResult, String> {
+) -> crate::errors::DesktopResult<SyncGroupOutboxResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1025,7 +1025,7 @@ pub async fn invite_to_group(
     app: AppHandle,
     group_id: String,
     invitee_user_ids: Vec<String>,
-) -> Result<InviteToGroupResult, String> {
+) -> crate::errors::DesktopResult<InviteToGroupResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1104,7 +1104,7 @@ pub async fn create_group_invite_link(
     group_id: String,
     expires_at: u64,
     max_uses: Option<u64>,
-) -> Result<CreateGroupInviteLinkResult, String> {
+) -> crate::errors::DesktopResult<CreateGroupInviteLinkResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1167,7 +1167,7 @@ pub async fn revoke_group_invite_link(
     app: AppHandle,
     group_id: String,
     invite_id: String,
-) -> Result<RevokeGroupInviteLinkResult, String> {
+) -> crate::errors::DesktopResult<RevokeGroupInviteLinkResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1195,7 +1195,7 @@ pub async fn revoke_group_invite_link(
 pub async fn list_group_invites(
     app: AppHandle,
     group_id: String,
-) -> Result<Vec<GroupInviteView>, String> {
+) -> crate::errors::DesktopResult<Vec<GroupInviteView>> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1242,7 +1242,7 @@ pub struct SubmitGroupJoinRequestResult {
 pub async fn submit_group_join_request(
     app: AppHandle,
     invite_url: String,
-) -> Result<SubmitGroupJoinRequestResult, String> {
+) -> crate::errors::DesktopResult<SubmitGroupJoinRequestResult> {
     let trimmed = invite_url.trim().to_string();
     if trimmed.is_empty() {
         return Err("invite_url must not be empty".into());
@@ -1310,7 +1310,7 @@ pub async fn submit_group_join_request(
             sanitize_url_for_log(&trimmed),
             "redacted"
         );
-        return Err(detail);
+        return Err(detail.into());
     }
 
     let request = if let Some(request) = output
@@ -1350,7 +1350,7 @@ pub async fn submit_group_join_request(
 pub async fn list_group_join_requests(
     app: AppHandle,
     group_id: String,
-) -> Result<Vec<GroupJoinRequestView>, String> {
+) -> crate::errors::DesktopResult<Vec<GroupJoinRequestView>> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1390,7 +1390,7 @@ pub async fn get_group_join_request_status(
     app: AppHandle,
     group_id: String,
     request_id: String,
-) -> Result<GroupJoinStatusView, String> {
+) -> crate::errors::DesktopResult<GroupJoinStatusView> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1450,7 +1450,7 @@ pub async fn approve_group_join(
     app: AppHandle,
     group_id: String,
     request_id: String,
-) -> Result<ApproveGroupJoinResult, String> {
+) -> crate::errors::DesktopResult<ApproveGroupJoinResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1487,7 +1487,7 @@ pub async fn approve_group_join(
                     welcome_pickups: Vec::new(),
                 });
             }
-            return Err(detail);
+            return Err(detail.into());
         }
     };
 
@@ -1523,7 +1523,7 @@ pub struct ProcessGroupJoinRequestsResult {
 pub async fn process_group_join_requests(
     app: AppHandle,
     group_id: String,
-) -> Result<ProcessGroupJoinRequestsResult, String> {
+) -> crate::errors::DesktopResult<ProcessGroupJoinRequestsResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1548,7 +1548,7 @@ pub async fn process_group_join_requests(
         .find(|state| state.group_id == group_id)
         .cloned()
     else {
-        return Err(format!("group '{group_id}' not found in local snapshot"));
+        return Err(format!("group '{group_id}' not found in local snapshot").into());
     };
     let role = group.local_role.unwrap_or(GroupRole::Member);
     if !matches!(role, GroupRole::Owner | GroupRole::Admin)
@@ -1621,7 +1621,7 @@ pub async fn process_group_join_requests(
 }
 
 #[tauri::command]
-pub async fn retry_pending_welcome_pickups(app: AppHandle) -> Result<(), String> {
+pub async fn retry_pending_welcome_pickups(app: AppHandle) -> crate::errors::DesktopResult<()> {
     drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RetryPendingWelcomePickups),
@@ -1637,7 +1637,7 @@ pub async fn reject_group_join(
     group_id: String,
     request_id: String,
     reason: Option<String>,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1662,7 +1662,7 @@ pub async fn reject_group_join(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub async fn leave_group(app: AppHandle, group_id: String) -> Result<(), String> {
+pub async fn leave_group(app: AppHandle, group_id: String) -> crate::errors::DesktopResult<()> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1679,7 +1679,7 @@ pub async fn leave_group(app: AppHandle, group_id: String) -> Result<(), String>
 pub async fn list_group_leave_requests(
     app: AppHandle,
     group_id: String,
-) -> Result<Vec<GroupLeaveRequestView>, String> {
+) -> crate::errors::DesktopResult<Vec<GroupLeaveRequestView>> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1705,7 +1705,7 @@ pub async fn approve_group_leave(
     app: AppHandle,
     group_id: String,
     request_id: String,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     if group_id.trim().is_empty() || request_id.trim().is_empty() {
         return Err("group_id and request_id must not be empty".into());
     }
@@ -1734,7 +1734,7 @@ pub async fn remove_group_member(
     app: AppHandle,
     group_id: String,
     target_user_id: String,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1758,7 +1758,7 @@ pub async fn transfer_group_ownership(
     app: AppHandle,
     group_id: String,
     new_owner_user_id: String,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1783,7 +1783,7 @@ pub async fn set_group_admin(
     group_id: String,
     target_user_id: String,
     is_admin: bool,
-) -> Result<(), String> {
+) -> crate::errors::DesktopResult<()> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1850,7 +1850,7 @@ pub async fn update_group_metadata(
     title: Option<String>,
     join_policy: Option<String>,
     member_invite_policy: Option<String>,
-) -> Result<UpdateGroupMetadataResult, String> {
+) -> crate::errors::DesktopResult<UpdateGroupMetadataResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -1931,7 +1931,7 @@ pub struct DissolveGroupResult {
 pub async fn dissolve_group(
     app: AppHandle,
     group_id: String,
-) -> Result<DissolveGroupResult, String> {
+) -> crate::errors::DesktopResult<DissolveGroupResult> {
     if group_id.trim().is_empty() {
         return Err("group_id must not be empty".into());
     }
@@ -2089,7 +2089,7 @@ pub async fn create_group_conversation_impl(
     state: &AppState,
     title: String,
     member_user_ids: Vec<String>,
-) -> Result<CreateGroupConversationResult, String> {
+) -> crate::errors::DesktopResult<CreateGroupConversationResult> {
     let (trimmed_title, members) = normalize_create_group_inputs(&title, &member_user_ids)?;
     let deployment = {
         let inner = state.inner.read().await;
@@ -2097,7 +2097,7 @@ pub async fn create_group_conversation_impl(
     };
     let runtime_status = runtime_status_for_deployment(deployment).await;
     if let Some(message) = runtime_missing_group_outbox_message(&runtime_status) {
-        return Err(message);
+        return Err(message.into());
     }
 
     for member_user_id in &members {

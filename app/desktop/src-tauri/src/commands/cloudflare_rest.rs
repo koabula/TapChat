@@ -738,7 +738,7 @@ mod tests {
             public_base_url: None,
             deployment_region: "test".into(),
             bucket_name: "tapchat-storage".into(),
-            worker_build_id: "tapchat-worker-v4-test".into(),
+            worker_build_id: "tapchat-worker-v5-test".into(),
             sharing_token_secret: "sharing".into(),
             runtime_id: "runtime-test".into(),
             owner_user_id: "user:test".into(),

@@ -18,7 +18,6 @@ use crate::cli::runtime::{
     resolve_service_root, CloudflareDeployOverrides, CloudflarePreflight,
     ResolvedCloudflareDeployConfig,
 };
-use crate::cli::util::sign_hmac_token;
 use crate::contact_workflows::{
     accept_message_request_with_bundle_import, fetch_identity_bundle_from_url,
     import_identity_bundle_into_profile, list_message_requests, message_request_action_from_output,
@@ -1029,9 +1028,44 @@ pub async fn contact_share_link_rotate(
 ) -> Result<ContactShareLinkView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
-    driver
+    let current_bundle = driver
+        .local_bundle()
+        .cloned()
+        .ok_or_else(|| anyhow!("contact_share_offline"))?;
+    let current_url = build_contact_share_url(&profile, &current_bundle)?;
+    let preflight = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(12))
+        .build()?
+        .get(current_url)
+        .send()
+        .await
+        .map_err(|_| anyhow!("contact_share_offline"))?;
+    if !preflight.status().is_success() {
+        return Err(anyhow!("contact_share_offline"));
+    }
+    let output = driver
         .run_command_until_idle(CoreCommand::RotateContactShareLink)
         .await?;
+    let operation = output.view_model.as_ref().and_then(|view| {
+        view.operation_results
+            .iter()
+            .find(|result| result.operation_id.starts_with("contact_share_rotation:"))
+    });
+    match operation {
+        Some(result) if result.status == crate::CoreOperationStatus::Confirmed => {}
+        Some(result) => {
+            return Err(anyhow!(
+                "{}",
+                result
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.code.as_str())
+                    .unwrap_or("contact_share_rotation_unverified")
+            ));
+        }
+        None => return Err(anyhow!("contact_share_rotation_unverified")),
+    }
     persist_driver(&mut profile, &driver)?;
     contact_share_link_get(profile.root()).await
 }
@@ -2408,24 +2442,12 @@ fn build_contact_share_url_from_base_url(
         .bundle_share_id
         .clone()
         .ok_or_else(|| anyhow!("bundle share id is not recorded"))?;
-    let token = sign_hmac_token(
+    Ok(crate::contact_share::encode_contact_share_url(
+        base_url,
         &secret,
-        &contact_share_token_payload(&bundle.user_id, &share_id),
-    )?;
-    Ok(format!(
-        "{}/v1/contact-share/{}",
-        base_url.trim_end_matches('/'),
-        token
-    ))
-}
-
-fn contact_share_token_payload(user_id: &str, share_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "version": crate::model::CURRENT_MODEL_VERSION,
-        "service": "contact_share",
-        "userId": user_id,
-        "shareId": share_id,
-    })
+        &bundle.user_id,
+        &share_id,
+    )?)
 }
 
 fn map_message_request(item: MessageRequestItem) -> MessageRequestItemView {
@@ -2893,22 +2915,15 @@ mod tests {
     }
 
     #[test]
-    fn contact_share_token_payload_uses_cloudflare_field_names() {
-        let payload = contact_share_token_payload("user:alice", "share-123");
-        assert_eq!(payload["service"], "contact_share");
-        assert_eq!(payload["userId"], "user:alice");
-        assert_eq!(payload["shareId"], "share-123");
-        assert!(payload.get("user_id").is_none());
-        assert!(payload.get("share_id").is_none());
-    }
-
-    #[test]
     fn contact_share_token_encodes_cloudflare_payload_shape() {
-        let token = sign_hmac_token(
+        let url = crate::contact_share::encode_contact_share_url(
+            "https://runtime.example",
             "secret",
-            &contact_share_token_payload("user:alice", "share-123"),
+            "user:alice",
+            "share-123",
         )
         .expect("token should be signed");
+        let token = url.rsplit('/').next().expect("token path segment");
         let payload = token.split('.').next().expect("payload segment");
         let decoded = URL_SAFE_NO_PAD
             .decode(payload)

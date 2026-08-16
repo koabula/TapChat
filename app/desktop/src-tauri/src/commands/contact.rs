@@ -45,7 +45,9 @@ async fn fetch_contact_bundle(
 }
 
 #[tauri::command]
-pub async fn preview_contact_link(share_link: String) -> Result<ContactLinkPreview, String> {
+pub async fn preview_contact_link(
+    share_link: String,
+) -> crate::errors::DesktopResult<ContactLinkPreview> {
     let link = share_link.trim().to_string();
     if link.is_empty() {
         return Err("share link must not be empty".into());
@@ -64,7 +66,7 @@ pub async fn start_direct_chat_from_link(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     share_link: String,
-) -> Result<StartDirectChatResult, String> {
+) -> crate::errors::DesktopResult<StartDirectChatResult> {
     let link = share_link.trim().to_string();
     if link.is_empty() {
         return Err("share link must not be empty".into());
@@ -80,7 +82,7 @@ pub async fn start_direct_chat_from_link(
         }),
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(crate::errors::DesktopError::from)?;
 
     let output = drive_core_with_handle(
         &app,
@@ -122,14 +124,14 @@ pub async fn start_direct_chat_from_link(
 pub async fn import_contact_by_link(
     app: tauri::AppHandle,
     share_link: String,
-) -> Result<CoreOutput, String> {
+) -> crate::errors::DesktopResult<CoreOutput> {
     let link = share_link.trim().to_string();
     if link.is_empty() {
         return Err("share link must not be empty".into());
     }
     let bundle = fetch_contact_bundle(&link).await?;
 
-    drive_core_with_handle(
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
             bundle,
@@ -137,11 +139,13 @@ pub async fn import_contact_by_link(
         }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[tauri::command]
-pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactSummary>, String> {
+pub async fn list_contacts(
+    state: State<'_, AppState>,
+) -> crate::errors::DesktopResult<Vec<ContactSummary>> {
     let inner = state.inner.read().await;
 
     // Get snapshot from engine which contains all contacts
@@ -164,13 +168,16 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactSumm
 }
 
 #[tauri::command]
-pub async fn refresh_contact(app: tauri::AppHandle, user_id: String) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+pub async fn refresh_contact(
+    app: tauri::AppHandle,
+    user_id: String,
+) -> crate::errors::DesktopResult<CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::RefreshIdentityState { user_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[tauri::command]
@@ -178,8 +185,8 @@ pub async fn set_contact_display_name(
     app: tauri::AppHandle,
     user_id: String,
     display_name: Option<String>,
-) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+) -> crate::errors::DesktopResult<CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::SetContactDisplayName {
             user_id,
@@ -187,15 +194,18 @@ pub async fn set_contact_display_name(
         }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }
 
 #[tauri::command]
-pub async fn delete_contact(app: tauri::AppHandle, user_id: String) -> Result<CoreOutput, String> {
-    drive_core_with_handle(
+pub async fn delete_contact(
+    app: tauri::AppHandle,
+    user_id: String,
+) -> crate::errors::DesktopResult<CoreOutput> {
+    Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::DeleteContact { user_id }),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(crate::errors::DesktopError::from)?)
 }

@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run check:security && tsc && vite build && node scripts/check-bundle-size.mjs",
+    "build": "npm run check:error-contract && npm run check:tauri-errors && npm run check:error-presentation && npm run check:security && tsc && vite build && node scripts/check-bundle-size.mjs",
+    "check:error-contract": "node ../../scripts/check-error-contract.mjs",
+    "check:tauri-errors": "node ../../scripts/check-tauri-command-errors.mjs",
+    "check:error-presentation": "node ../../scripts/check-desktop-error-presentation.mjs",
     "check:security": "node scripts/check-security-config.mjs",
     "preview": "vite preview",
     "tauri": "node ./scripts/with-strawberry-perl.mjs tauri",

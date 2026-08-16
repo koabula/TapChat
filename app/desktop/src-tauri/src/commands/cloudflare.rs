@@ -33,7 +33,7 @@ use crate::timetest;
 static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const AUTH_ROTATION_GRACE_MS: u64 = 48 * 60 * 60 * 1000;
 const AUTH_ROTATION_INTERVAL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v4-", env!("CARGO_PKG_VERSION"));
+const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v5-", env!("CARGO_PKG_VERSION"));
 
 fn generate_runtime_key_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 8];
@@ -213,8 +213,8 @@ pub async fn runtime_status_for_deployment(
     };
     let endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
     let local_features = deployment.deployment_bundle.runtime_config.features.clone();
-    if deployment.deployment_bundle.protocol_version != 4
-        || deployment.deployment_bundle.registry_schema_version != 1
+    if deployment.deployment_bundle.protocol_version != 5
+        || deployment.deployment_bundle.registry_schema_version != 2
         || deployment
             .deployment_bundle
             .worker_build_id
@@ -279,8 +279,8 @@ pub async fn runtime_status_for_deployment(
                 Ok(manifest)
                     if manifest.ready
                         && manifest.runtime_id == deployment.deployment_bundle.runtime_id
-                        && manifest.protocol_version == 4
-                        && manifest.registry_schema_version == 1
+                        && manifest.protocol_version == 5
+                        && manifest.registry_schema_version == 2
                         && manifest.worker_build_id
                             == deployment.deployment_bundle.worker_build_id =>
                 {
@@ -449,7 +449,7 @@ fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathB
 
 /// Check preflight status
 #[tauri::command]
-pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, String> {
+pub async fn cloudflare_preflight(app: AppHandle) -> crate::errors::DesktopResult<PreflightResult> {
     let app_ref = Some(&app);
 
     // Check if embedded runtime is available
@@ -496,7 +496,7 @@ pub async fn cloudflare_preflight(app: AppHandle) -> Result<PreflightResult, Str
 
 /// Perform OAuth login
 #[tauri::command]
-pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
+pub async fn cloudflare_login(app: AppHandle) -> crate::errors::DesktopResult<LoginResult> {
     // Emit progress
     let _ = app.emit(
         "cloudflare-progress",
@@ -538,7 +538,8 @@ pub async fn cloudflare_login(app: AppHandle) -> Result<LoginResult, String> {
 }
 
 #[tauri::command]
-pub async fn cloudflare_import_legacy_wrangler_token() -> Result<LoginResult, String> {
+pub async fn cloudflare_import_legacy_wrangler_token() -> crate::errors::DesktopResult<LoginResult>
+{
     crate::commands::cloudflare_oauth::import_legacy_wrangler_token()
         .map_err(|error| error.to_string())?;
     let whoami = crate::commands::cloudflare_oauth::whoami()
@@ -558,7 +559,7 @@ pub async fn cloudflare_import_legacy_wrangler_token() -> Result<LoginResult, St
 pub async fn cloudflare_deploy(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<DeployResult, String> {
+) -> crate::errors::DesktopResult<DeployResult> {
     if CLOUDFLARE_DEPLOY_IN_PROGRESS
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -864,7 +865,7 @@ pub async fn cloudflare_deploy(
             )
             .await?
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     };
 
     if !result.success {
@@ -1181,7 +1182,7 @@ async fn prepare_runtime_secret_rotation(state: &State<'_, AppState>) -> Result<
 pub async fn cloudflare_rotate_runtime_secrets(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<DeployResult, String> {
+) -> crate::errors::DesktopResult<DeployResult> {
     prepare_runtime_secret_rotation(&state).await?;
     cloudflare_deploy(app, state).await
 }
@@ -1190,7 +1191,7 @@ pub async fn cloudflare_rotate_runtime_secrets(
 pub async fn cloudflare_resume_secret_rotation(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<DeployResult, String> {
+) -> crate::errors::DesktopResult<DeployResult> {
     cloudflare_deploy(app, state).await
 }
 
@@ -1198,7 +1199,7 @@ pub async fn cloudflare_resume_secret_rotation(
 pub async fn cloudflare_finalize_secret_rotation(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<DeployResult, String> {
+) -> crate::errors::DesktopResult<DeployResult> {
     let worker_name = {
         let inner = state.inner.read().await;
         let pm_inner = inner.profile_manager.inner.read().await;
@@ -1447,8 +1448,8 @@ async fn restart_runtime_session_after_deploy(
 #[tauri::command]
 pub async fn cloudflare_status(
     state: State<'_, AppState>,
-) -> Result<CloudflareRuntimeStatus, String> {
-    cloudflare_status_impl(&state).await
+) -> crate::errors::DesktopResult<CloudflareRuntimeStatus> {
+    Ok(cloudflare_status_impl(&state).await?)
 }
 
 async fn cloudflare_status_impl(
@@ -1618,7 +1619,7 @@ async fn cloudflare_status_impl(
 #[tauri::command]
 pub async fn cloudflare_refresh_runtime_auth(
     state: State<'_, AppState>,
-) -> Result<CloudflareRuntimeStatus, String> {
+) -> crate::errors::DesktopResult<CloudflareRuntimeStatus> {
     let profile_manager = {
         let inner = state.inner.read().await;
         inner.profile_manager.clone()
@@ -1628,5 +1629,5 @@ pub async fn cloudflare_refresh_runtime_auth(
         .ensure(&profile_manager, true)
         .await
         .map_err(|error| error.to_string())?;
-    cloudflare_status_impl(&state).await
+    Ok(cloudflare_status_impl(&state).await?)
 }

@@ -6,7 +6,8 @@
   "scripts": {
     "types": "wrangler types worker-configuration.d.ts --config wrangler.jsonc --env-interface CloudflareBindings --include-runtime --no-strict-vars",
     "types:check": "wrangler types --config wrangler.jsonc --env-interface CloudflareBindings --include-runtime --no-strict-vars --check",
-    "check": "npm run types:check && tsc --noEmit",
+    "check": "npm run check:error-contract && npm run types:check && tsc --noEmit",
+    "check:error-contract": "node ../../scripts/check-error-contract.mjs",
     "test": "tsx --test test/cloudflare.test.ts test/group-contract-parity.test.ts",
     "test:integration": "tsx --test --test-force-exit test/*.integration.test.ts",
     "build:embedded": "node scripts/build-embedded-worker.mjs",

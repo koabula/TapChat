@@ -38,6 +38,20 @@ mod tests {
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    fn test_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_millis() as u64
+    }
+
+    fn test_failure(code: &str, retryable: bool, status: Option<u16>) -> crate::AppErrorV1 {
+        let mut failure = crate::AppErrorV1::from_registered_code(code);
+        failure.retryable = retryable;
+        failure.http_status = status;
+        failure
+    }
     const CAROL_MNEMONIC: &str =
         "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
     const DANA_MNEMONIC: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
@@ -157,6 +171,129 @@ mod tests {
     }
 
     #[test]
+    fn share_rotation_commits_only_after_server_confirmation_and_survives_failure() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let previous_share_id = engine
+            .local_bundle()
+            .and_then(|bundle| bundle.bundle_share_id.clone())
+            .expect("previous share id");
+        let output = engine
+            .handle_command(CoreCommand::RotateContactShareLink)
+            .expect("stage share rotation");
+        let publish = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+                {
+                    Some(publish.clone())
+                }
+                _ => None,
+            })
+            .expect("candidate publish effect");
+        let candidate: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("candidate bundle");
+        assert_ne!(candidate.bundle_share_id.as_ref(), Some(&previous_share_id));
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.bundle_share_id.as_ref()),
+            Some(&previous_share_id)
+        );
+        assert!(engine.has_pending_share_rotation());
+
+        engine
+            .handle_event(CoreEvent::SharedStatePublishFailed {
+                operation_id: publish.operation_id.clone(),
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference.clone(),
+                failure: crate::error::AppErrorV1::new(
+                    "network_unavailable",
+                    crate::error::ErrorDomain::Transport,
+                    true,
+                ),
+                current_bundle: None,
+                etag: None,
+            })
+            .expect("record failed publication");
+        let restored = CoreEngine::try_from_restored_state(engine.refresh_snapshot())
+            .expect("restore pending publication");
+        assert!(restored.has_pending_share_rotation());
+
+        engine
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference,
+                etag: Some("\"candidate\"".into()),
+                saved_bundle: Some(candidate.clone()),
+            })
+            .expect("confirm publication");
+        assert!(!engine.has_pending_share_rotation());
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.bundle_share_id.as_ref()),
+            candidate.bundle_share_id.as_ref()
+        );
+    }
+
+    #[test]
+    fn share_rotation_reconciles_a_lost_put_response_from_authoritative_state() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let output = engine
+            .handle_command(CoreCommand::RotateContactShareLink)
+            .expect("stage share rotation");
+        let publish = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+                {
+                    Some(publish.clone())
+                }
+                _ => None,
+            })
+            .expect("candidate publish effect");
+        let candidate: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("candidate bundle");
+        let operation_id = publish.operation_id.clone().expect("operation id");
+
+        let reconciled = engine
+            .handle_event(CoreEvent::SharedStatePublishFailed {
+                operation_id: Some(operation_id.clone()),
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference,
+                failure: test_failure("identity_bundle_conflict", false, Some(412)),
+                current_bundle: Some(candidate.clone()),
+                etag: Some("\"committed\"".into()),
+            })
+            .expect("reconcile committed publication");
+
+        let result = reconciled
+            .view_model
+            .expect("operation result")
+            .operation_results
+            .into_iter()
+            .find(|result| result.operation_id == operation_id)
+            .expect("matching operation result");
+        assert_eq!(
+            result.status,
+            crate::ffi_api::CoreOperationStatus::Confirmed
+        );
+        assert!(result.failure.is_none());
+        assert!(!engine.has_pending_share_rotation());
+        assert_eq!(
+            engine
+                .local_bundle()
+                .and_then(|bundle| bundle.bundle_share_id.as_ref()),
+            candidate.bundle_share_id.as_ref()
+        );
+    }
+
+    #[test]
     fn append_request_includes_sender_display_name() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
@@ -174,7 +311,7 @@ mod tests {
 
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
+                conversation_id: conversation_id.clone(),
                 plaintext: "hello".into(),
             })
             .expect("send text");
@@ -288,7 +425,8 @@ mod tests {
         let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
         let deployment = sample_deployment();
-        let package = MlsAdapter::generate_key_package(&identity, 0).expect("key package");
+        let package =
+            MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("key package");
         let mut bundle = IdentityManager::export_identity_bundle(
             &identity,
             &deployment,
@@ -296,6 +434,8 @@ mod tests {
             package.expires_at,
         )
         .expect("bundle");
+        bundle.publication_version = 0;
+        bundle.publication_revision = 0;
         bundle.display_name = Some("Alice".into());
         bundle.signature = String::new();
         let signature = identity
@@ -458,8 +598,7 @@ mod tests {
         let output = engine
             .handle_event(CoreEvent::WelcomePickupFetchFailed {
                 descriptor,
-                retryable: true,
-                detail: Some("timeout".into()),
+                failure: test_failure("request_timeout", true, None),
             })
             .expect("welcome pickup failure");
 
@@ -469,11 +608,7 @@ mod tests {
             .get(&key)
             .expect("pending welcome pickup remains");
         assert_eq!(pending.retries, 1);
-        assert!(pending
-            .last_error
-            .as_deref()
-            .unwrap_or("")
-            .contains("timeout"));
+        assert_eq!(pending.last_error.as_deref(), Some("request_timeout"));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ScheduleTimer { timer }
@@ -534,10 +669,7 @@ mod tests {
         };
         let failed = CoreEvent::GroupOutboxSealFailed {
             group_id: "group:project".into(),
-            retryable: false,
-            status: Some(403),
-            code: Some("unauthorized".into()),
-            detail: Some("capability does not authorize seal_group".into()),
+            failure: test_failure("invalid_capability", false, Some(403)),
         };
 
         let sealed_json = serde_json::to_string(&sealed).expect("serialize sealed");
@@ -840,10 +972,7 @@ mod tests {
             .handle_event(CoreEvent::GroupTransitionAppendFailed {
                 group_id: group_id.clone(),
                 transition_id,
-                retryable: false,
-                status: Some(409),
-                code: Some("group_transition_conflict".into()),
-                detail: None,
+                failure: test_failure("group_transition_conflict", false, Some(409)),
             })
             .expect("conflict enters reconciliation");
         let state = &alice.state.group_states[&group_id];
@@ -1004,10 +1133,7 @@ mod tests {
             .handle_event(CoreEvent::GroupEnvelopeAppendFailed {
                 group_id: group_id.clone(),
                 message_id: message_id.clone(),
-                retryable: true,
-                status: Some(403),
-                code: Some("capability_expired".into()),
-                detail: None,
+                failure: test_failure("capability_expired", true, Some(403)),
             })
             .expect("expired capability is retryable");
         assert!(failed.effects.iter().any(|effect| matches!(
@@ -1068,10 +1194,7 @@ mod tests {
             .handle_event(CoreEvent::GroupEnvelopeAppendFailed {
                 group_id: group_id.clone(),
                 message_id: pending_ids[0].clone(),
-                retryable: false,
-                status: Some(403),
-                code: Some("group_membership_revoked".into()),
-                detail: None,
+                failure: test_failure("group_membership_revoked", false, Some(403)),
             })
             .expect("membership revoked is terminal");
 
@@ -1616,10 +1739,7 @@ mod tests {
         let retry_output = alice
             .handle_event(CoreEvent::GroupOutboxSealFailed {
                 group_id: group_id.clone(),
-                retryable: true,
-                status: Some(503),
-                code: None,
-                detail: Some("upstream unavailable".into()),
+                failure: test_failure("temporary_unavailable", true, Some(503)),
             })
             .expect("handle retryable seal failure");
         assert!(
@@ -1647,10 +1767,7 @@ mod tests {
         let terminal_output = alice
             .handle_event(CoreEvent::GroupOutboxSealFailed {
                 group_id: group_id.clone(),
-                retryable: false,
-                status: Some(403),
-                code: Some("unauthorized".into()),
-                detail: Some("capability rejected".into()),
+                failure: test_failure("invalid_capability", false, Some(403)),
             })
             .expect("handle terminal seal failure");
         assert!(
@@ -2819,8 +2936,7 @@ mod tests {
         alice
             .handle_event(CoreEvent::HttpRequestFailed {
                 request_id,
-                retryable: false,
-                detail: Some("runtime_auth:device_revoked".into()),
+                failure: test_failure("device_revoked", false, Some(403)),
             })
             .expect("terminal append failure");
         let pending = alice
@@ -3357,7 +3473,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_with_multiple_promoted_direct_conversations_sends_one_control() {
+    fn accept_with_multiple_promoted_direct_conversations_sends_compatibility_controls() {
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         let bob = local_engine(BOB_MNEMONIC, "phone");
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
@@ -3384,16 +3500,32 @@ mod tests {
             .iter()
             .filter(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
             .collect::<Vec<_>>();
-        assert_eq!(accepted_envelopes.len(), 1);
-        let payload_b64 = accepted_envelopes[0]
-            .envelope
-            .inline_ciphertext
-            .as_deref()
-            .expect("accepted payload");
-        let payload = STANDARD.decode(payload_b64).expect("payload base64");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&payload).expect("accepted payload json");
-        assert_eq!(payload["conversation_id"], "conv:user:alice:user:bob:rel:2");
+        assert_eq!(accepted_envelopes.len(), 2);
+        let mut conversation_ids = accepted_envelopes
+            .iter()
+            .map(|item| {
+                let payload_b64 = item
+                    .envelope
+                    .inline_ciphertext
+                    .as_deref()
+                    .expect("accepted payload");
+                let payload = STANDARD.decode(payload_b64).expect("payload base64");
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("accepted payload json");
+                payload["conversation_id"]
+                    .as_str()
+                    .expect("conversation id")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        conversation_ids.sort();
+        assert_eq!(
+            conversation_ids,
+            vec![
+                "conv:user:alice:user:bob:rel:1".to_string(),
+                "conv:user:alice:user:bob:rel:2".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3659,6 +3791,30 @@ mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        let bob_sender_device_id = bob.local_device_id().expect("bob device").to_string();
+        let alice_recipient_device_id = alice.local_device_id().expect("alice device").to_string();
+        bob.state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .messages
+            .push(crate::conversation::StoredMessage {
+                message_id: "msg:pending-approval".into(),
+                app_message_id: Some("app:pending-approval".into()),
+                mls_ciphertext_sha256: None,
+                sender_user_id: Some(bob_bundle.user_id.clone()),
+                sender_device_id: bob_sender_device_id,
+                recipient_device_id: alice_recipient_device_id,
+                message_type: MessageType::MlsApplication,
+                created_at: 1,
+                plaintext: Some("hello".into()),
+                storage_refs: Vec::new(),
+                downloaded_blob_b64: None,
+                delivery_state: Some(
+                    crate::conversation::StoredMessageDeliveryState::PendingApproval,
+                ),
+                message_request_id: Some("request:pending".into()),
+            });
 
         let output = alice
             .handle_event(CoreEvent::MessageRequestActionCompleted {
@@ -3703,13 +3859,23 @@ mod tests {
                 .relationship_status,
             ContactRelationshipStatus::Available
         );
-        assert!(
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages[0]
+                .delivery_state,
+            Some(crate::conversation::StoredMessageDeliveryState::Sent)
+        );
+        assert_eq!(
             bob.state
                 .conversations
                 .get(&conversation_id)
                 .expect("conversation")
                 .messages
-                .is_empty(),
+                .len(),
+            1,
             "accepted control must stay protocol-only"
         );
     }
@@ -4583,8 +4749,7 @@ mod tests {
         let failed = alice
             .handle_event(CoreEvent::BlobTransferFailed {
                 task_id: task_id.clone(),
-                retryable: false,
-                detail: Some("denied".into()),
+                failure: test_failure("invalid_capability", false, Some(403)),
             })
             .expect("upload failure");
 
@@ -4638,6 +4803,8 @@ mod tests {
                     ),
                     storage_refs: vec![],
                     downloaded_blob_b64: None,
+                    delivery_state: None,
+                    message_request_id: None,
                 }],
                 last_message_type: Some(MessageType::MlsApplication),
                 peer_user_id: bob_user_id,
@@ -4903,8 +5070,7 @@ mod tests {
         let first_failure = engine
             .handle_event(CoreEvent::HttpRequestFailed {
                 request_id: first_request_id,
-                retryable: true,
-                detail: Some("network".into()),
+                failure: test_failure("network_unavailable", true, None),
             })
             .expect("first failure");
         let timer_id = format!("sync:{device_id}");
@@ -4919,8 +5085,7 @@ mod tests {
         let second_failure = engine
             .handle_event(CoreEvent::HttpRequestFailed {
                 request_id: second_request_id,
-                retryable: true,
-                detail: Some("network".into()),
+                failure: test_failure("network_unavailable", true, None),
             })
             .expect("second failure");
         let second_delay = scheduled_timer_delay(&second_failure, &timer_id).expect("second timer");
@@ -4948,8 +5113,7 @@ mod tests {
         engine
             .handle_event(CoreEvent::HttpRequestFailed {
                 request_id,
-                retryable: true,
-                detail: Some("network".into()),
+                failure: test_failure("network_unavailable", true, None),
             })
             .expect("failure");
         assert_eq!(
@@ -5215,13 +5379,102 @@ mod tests {
     }
 
     #[test]
-    fn append_message_request_result_emits_policy_notification_and_clears_outbox() {
+    fn stale_append_capability_refreshes_contact_and_retries_once() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id,
+                plaintext: "refresh and retry".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+        let pending_message_id = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.plaintext_cache.as_deref() == Some("refresh and retry"))
+            .expect("in-flight append")
+            .envelope
+            .message_id
+            .clone();
+
+        let refresh = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 409,
+                body: Some(
+                    r#"{"version":1,"code":"identity_refresh_required","domain":"identity","retryable":true}"#
+                        .into(),
+                ),
+            })
+            .expect("structured refresh response");
+        let pending = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_id == pending_message_id)
+            .expect("message remains pending");
+        assert!(!pending.in_flight);
+        assert!(pending.identity_refresh_attempted);
+        assert!(refresh.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchIdentityBundle { fetch }
+                if fetch.user_id == bob_bundle.user_id
+        )));
+
+        let refreshed_bob_bundle = bob_bundle.clone();
+        let retried = alice
+            .handle_event(CoreEvent::IdentityBundleFetched {
+                user_id: refreshed_bob_bundle.user_id.clone(),
+                bundle: refreshed_bob_bundle,
+            })
+            .expect("identity refresh applies");
+        let retry_request_id = retried
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.url.ends_with("/messages") =>
+                {
+                    Some(request.request_id.clone())
+                }
+                _ => None,
+            })
+            .expect("append retried after refresh");
+
+        let failed = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: retry_request_id,
+                status: 409,
+                body: Some(
+                    r#"{"version":1,"code":"identity_refresh_required","domain":"identity","retryable":true}"#
+                        .into(),
+                ),
+            })
+            .expect("second stale response is terminal");
+        assert!(failed
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, CoreEffect::FetchIdentityBundle { .. })));
+        let pending = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_id == pending_message_id)
+            .expect("failed message remains visible");
+        assert_eq!(pending.retries, MAX_TRANSPORT_RETRIES);
+    }
+
+    #[test]
+    fn append_message_request_result_emits_policy_notification_and_clears_outbox() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
                 plaintext: "hello".into(),
             })
             .expect("send");
@@ -5258,7 +5511,7 @@ mod tests {
             effect,
             CoreEffect::EmitUserNotification { notification }
             if notification.status == crate::ffi_api::SystemStatus::MessageQueuedForApproval
-                && notification.message.contains("queued as a message request")
+                && notification.message.contains("waiting for the contact")
         )));
         let append_result = output
             .view_model
@@ -5283,6 +5536,23 @@ mod tests {
                 .expect("bob contact")
                 .relationship_status,
             ContactRelationshipStatus::PendingOutbound
+        );
+        let stored = alice
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation")
+            .messages
+            .iter()
+            .find(|message| message.message_id == pending_message_id)
+            .expect("pending approval message remains visible");
+        assert_eq!(
+            stored.delivery_state,
+            Some(crate::conversation::StoredMessageDeliveryState::PendingApproval)
+        );
+        assert_eq!(
+            stored.message_request_id.as_deref(),
+            Some("request:user:bob")
         );
     }
 
@@ -5328,7 +5598,7 @@ mod tests {
             effect,
             CoreEffect::EmitUserNotification { notification }
             if notification.status == crate::ffi_api::SystemStatus::MessageRejectedByPolicy
-                && notification.message.contains("rejected by inbox policy")
+                && notification.message.contains("did not accept")
         )));
         let append_result = output
             .view_model
@@ -6219,8 +6489,7 @@ mod tests {
             let output = alice
                 .handle_event(CoreEvent::IdentityBundleFetchFailed {
                     user_id: bob_bundle.user_id.clone(),
-                    retryable: true,
-                    detail: Some("network".into()),
+                    failure: test_failure("network_unavailable", true, None),
                 })
                 .expect("refresh failure");
             if attempt + 1 < crate::ffi_api::MAX_TRANSPORT_RETRIES {
@@ -6496,8 +6765,7 @@ mod tests {
         let output = alice
             .handle_event(CoreEvent::IdentityBundleFetchFailed {
                 user_id: bob_bundle.user_id.clone(),
-                retryable: true,
-                detail: Some("network".into()),
+                failure: test_failure("network_unavailable", true, None),
             })
             .expect("refresh failure");
 
@@ -6604,6 +6872,8 @@ mod tests {
                     ),
                     storage_refs: vec![],
                     downloaded_blob_b64: None,
+                    delivery_state: None,
+                    message_request_id: None,
                 }],
                 last_message_type: Some(MessageType::MlsApplication),
                 peer_user_id: "user:bob".into(),
@@ -6633,8 +6903,7 @@ mod tests {
             let output = engine
                 .handle_event(CoreEvent::BlobTransferFailed {
                     task_id: task_id.clone(),
-                    retryable: true,
-                    detail: Some("download failed".into()),
+                    failure: test_failure("network_unavailable", true, None),
                 })
                 .expect("blob failure");
             if attempt + 1 < crate::ffi_api::MAX_TRANSPORT_RETRIES {
@@ -6758,6 +7027,8 @@ mod tests {
                 .expect("local bundle")
                 .devices[0]
                 .keypackage_ref
+                .as_ref()
+                .expect("key package reference")
                 .object_ref
         );
         assert!(
@@ -6823,7 +7094,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_local_key_package_updates_local_bundle_reference() {
+    fn manual_key_package_rotation_commits_only_after_publication_confirmation() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let before = engine
@@ -6833,13 +7104,46 @@ mod tests {
             .expect("local bundle")
             .devices[0]
             .keypackage_ref
+            .as_ref()
+            .expect("key package reference")
             .object_ref
             .clone();
 
-        engine
+        let output = engine
             .handle_command(CoreCommand::RotateLocalKeyPackage)
             .expect("rotate key package");
+        let publish = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+                {
+                    Some(publish.clone())
+                }
+                _ => None,
+            })
+            .expect("identity publication");
+        let candidate: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("candidate bundle");
+        let candidate_ref = candidate.devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("candidate key package")
+            .object_ref
+            .clone();
+        assert_ne!(before, candidate_ref);
+        assert_eq!(local_key_package_ref(&engine), before);
 
+        engine
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference,
+                etag: Some("\"rotated\"".into()),
+                saved_bundle: Some(candidate),
+            })
+            .expect("confirm key package publication");
         let after = engine
             .state
             .local_bundle
@@ -6847,9 +7151,195 @@ mod tests {
             .expect("local bundle")
             .devices[0]
             .keypackage_ref
+            .as_ref()
+            .expect("key package reference")
             .object_ref
             .clone();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn expired_key_package_recovers_after_offline_publication_failure_and_restore() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let previous_ref = local_key_package_ref(&engine);
+        let expired_at = engine
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("published key package")
+            .expires_at;
+        let output = engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms: expired_at })
+            .expect("stage expired key package recovery");
+        let publish = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+                {
+                    Some(publish.clone())
+                }
+                _ => None,
+            })
+            .expect("identity publication");
+        let candidate: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("candidate bundle");
+        assert_eq!(local_key_package_ref(&engine), previous_ref);
+
+        engine
+            .handle_event(CoreEvent::SharedStatePublishFailed {
+                operation_id: publish.operation_id.clone(),
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference.clone(),
+                failure: crate::error::AppErrorV1::new(
+                    "network_unavailable",
+                    crate::error::ErrorDomain::Transport,
+                    true,
+                ),
+                current_bundle: None,
+                etag: None,
+            })
+            .expect("record offline publication failure");
+        let mut restored = CoreEngine::try_from_restored_state(engine.refresh_snapshot())
+            .expect("restore pending credential publication");
+        assert_eq!(local_key_package_ref(&restored), previous_ref);
+
+        let retry = restored
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms: u64::MAX })
+            .expect("retry after reconnect");
+        let retried = retry.effects.iter().find_map(|effect| match effect {
+            CoreEffect::PublishSharedState { publish } => Some(publish),
+            _ => None,
+        });
+        assert_eq!(
+            retried.and_then(|publish| publish.operation_id.as_ref()),
+            publish.operation_id.as_ref()
+        );
+
+        restored
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference,
+                etag: Some("\"recovered\"".into()),
+                saved_bundle: Some(candidate),
+            })
+            .expect("confirm recovered publication");
+        assert_ne!(local_key_package_ref(&restored), previous_ref);
+        assert!(restored.state.pending_identity_publication.is_none());
+    }
+
+    #[test]
+    fn restored_legacy_2100_key_package_rotates_on_first_online_maintenance() {
+        let engine = local_engine(ALICE_MNEMONIC, "phone");
+        let previous_ref = local_key_package_ref(&engine);
+        let mut snapshot = engine.refresh_snapshot();
+        let deployment = snapshot.deployment.as_mut().expect("deployment snapshot");
+        let package = deployment
+            .published_key_package
+            .as_mut()
+            .expect("published key package");
+        package.lifecycle_version = 0;
+        package.not_before = 0;
+        package.created_at = 0;
+        package.expires_at = 4_102_444_800_000;
+        deployment.key_package_inventory.clear();
+
+        let mut restored = CoreEngine::try_from_restored_state(snapshot)
+            .expect("restore legacy key package snapshot");
+        let output = restored
+            .handle_event(CoreEvent::AppStarted)
+            .expect("startup maintenance");
+        let candidate = output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::PublishSharedState { publish }
+                if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+            {
+                serde_json::from_str::<IdentityBundle>(&publish.body).ok()
+            }
+            _ => None,
+        });
+        let candidate = candidate.expect("legacy package rotation publication");
+        assert_ne!(
+            candidate.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("candidate key package")
+                .object_ref,
+            previous_ref
+        );
+        assert!(restored.state.pending_identity_publication.is_some());
+    }
+
+    #[test]
+    fn inbox_append_capability_renews_with_thirty_days_remaining() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let now_ms = engine
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("published key package")
+            .created_at;
+        let previous_key_package = local_key_package_ref(&engine);
+        let previous_expiry =
+            now_ms.saturating_add(crate::capability::INBOX_APPEND_CAPABILITY_RENEWAL_WINDOW_MS);
+        engine
+            .state
+            .local_bundle
+            .as_mut()
+            .expect("local bundle")
+            .devices[0]
+            .inbox_append_capability
+            .as_mut()
+            .expect("inbox capability")
+            .expires_at = previous_expiry;
+
+        let output = engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms })
+            .expect("renew inbox capability");
+        let candidate = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+                {
+                    serde_json::from_str::<IdentityBundle>(&publish.body).ok()
+                }
+                _ => None,
+            })
+            .expect("identity publication");
+        let candidate_device = &candidate.devices[0];
+        assert_eq!(
+            candidate_device
+                .keypackage_ref
+                .as_ref()
+                .expect("candidate key package")
+                .object_ref,
+            previous_key_package
+        );
+        assert_eq!(
+            candidate_device
+                .inbox_append_capability
+                .as_ref()
+                .expect("renewed capability")
+                .expires_at,
+            now_ms.saturating_add(crate::capability::INBOX_APPEND_CAPABILITY_LIFETIME_MS)
+        );
+        assert_eq!(
+            engine
+                .state
+                .local_bundle
+                .as_ref()
+                .expect("confirmed bundle")
+                .devices[0]
+                .inbox_append_capability
+                .as_ref()
+                .expect("confirmed capability")
+                .expires_at,
+            previous_expiry,
+            "renewed capability must remain pending until the server confirms it"
+        );
     }
 
     #[test]
@@ -6864,7 +7354,13 @@ mod tests {
         create_direct_conversation(&mut alice, bob_user_id);
         let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
 
-        let after = local_key_package_ref(&bob);
+        let after = bob
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("replacement published key package")
+            .key_package_ref
+            .clone();
         assert_ne!(
             before, after,
             "welcome import must publish a fresh KeyPackage"
@@ -6879,20 +7375,96 @@ mod tests {
                 .key_package_ref,
             after
         );
+        let pending = deployment
+            .pending_identity_publication
+            .expect("welcome rotation publication remains pending");
+        assert_eq!(
+            pending.candidate_bundle.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("key package reference")
+                .object_ref,
+            after
+        );
         assert_eq!(
             deployment
                 .local_bundle
-                .expect("persisted local bundle")
+                .expect("persisted confirmed local bundle")
                 .devices[0]
                 .keypackage_ref
+                .as_ref()
+                .expect("confirmed key package reference")
                 .object_ref,
-            after
+            before,
+            "the advertised package must not switch before server confirmation"
         );
         assert!(
             publish_shared_state_effects(&output)
                 .iter()
                 .any(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle),
             "rotated identity bundle should be republished after welcome"
+        );
+    }
+
+    #[test]
+    fn delayed_welcome_rebases_an_unconfirmed_share_rotation() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let confirmed_share_id = bob
+            .local_bundle()
+            .and_then(|bundle| bundle.bundle_share_id.clone())
+            .expect("confirmed share id");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let bob_user_id = bob_bundle.user_id.clone();
+
+        let staged = bob
+            .handle_command(CoreCommand::RotateContactShareLink)
+            .expect("stage share rotation");
+        let staged_publish = publish_shared_state_effects(&staged)
+            .into_iter()
+            .find(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle)
+            .expect("staged identity publication")
+            .clone();
+        let staged_candidate: IdentityBundle =
+            serde_json::from_str(&staged_publish.body).expect("staged bundle");
+        let staged_share_id = staged_candidate
+            .bundle_share_id
+            .clone()
+            .expect("rotated share id");
+
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        create_direct_conversation(&mut alice, bob_user_id);
+        let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        let rebased_publish = publish_shared_state_effects(&output)
+            .into_iter()
+            .find(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle)
+            .expect("rebased identity publication");
+        let rebased_candidate: IdentityBundle =
+            serde_json::from_str(&rebased_publish.body).expect("rebased bundle");
+
+        assert_eq!(rebased_publish.operation_id, staged_publish.operation_id);
+        assert_eq!(
+            rebased_candidate.bundle_share_id.as_deref(),
+            Some(staged_share_id.as_str()),
+            "the delayed Welcome must preserve the pending share-id change"
+        );
+        assert_ne!(
+            rebased_candidate.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("replacement key package")
+                .object_ref,
+            staged_candidate.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("staged key package")
+                .object_ref
+        );
+        assert_eq!(
+            bob.local_bundle()
+                .and_then(|bundle| bundle.bundle_share_id.as_deref()),
+            Some(confirmed_share_id.as_str()),
+            "the local share link remains confirmed-only until publication succeeds"
         );
     }
 
@@ -6904,7 +7476,24 @@ mod tests {
 
         create_direct_conversation(&mut alice.engine, bob.bundle.user_id.clone());
         let bob_device_id = bob.bundle.devices[0].device_id.clone();
-        deliver_pending_outbox_to_device(&mut bob.engine, &alice.engine, &bob_device_id);
+        let welcome_output =
+            deliver_pending_outbox_to_device(&mut bob.engine, &alice.engine, &bob_device_id);
+        let publish = publish_shared_state_effects(&welcome_output)
+            .into_iter()
+            .find(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle)
+            .expect("rotated identity publication")
+            .clone();
+        let saved_bundle: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("rotated identity bundle");
+        bob.engine
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+                etag: Some("\"direct-welcome\"".into()),
+                saved_bundle: Some(saved_bundle),
+            })
+            .expect("confirm rotated identity publication");
         bob.bundle = bob
             .engine
             .local_bundle()
@@ -6998,7 +7587,7 @@ mod tests {
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
-            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
         let bob_laptop_profile =
             crate::capability::CapabilityManager::build_device_contact_profile(
                 &bob_laptop,
@@ -7046,7 +7635,7 @@ mod tests {
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
-            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
         let bob_laptop_profile =
             crate::capability::CapabilityManager::build_device_contact_profile(
                 &bob_laptop,
@@ -7089,9 +7678,9 @@ mod tests {
         let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
         let bob_phone_package =
-            MlsAdapter::generate_key_package(&bob_phone, 0).expect("phone package");
+            MlsAdapter::generate_key_package(&bob_phone, test_now_ms()).expect("phone package");
         let bob_laptop_package =
-            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
         let deployment = sample_deployment();
         let mut bob_phone_profile =
             crate::capability::CapabilityManager::build_device_contact_profile(
@@ -7170,7 +7759,7 @@ mod tests {
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
-            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
         let bob_laptop_profile =
             crate::capability::CapabilityManager::build_device_contact_profile(
                 &bob_laptop,
@@ -7213,7 +7802,7 @@ mod tests {
             .expect("bob laptop identity");
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
-            MlsAdapter::generate_key_package(&bob_laptop, 0).expect("laptop package");
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
         let bob_laptop_profile =
             crate::capability::CapabilityManager::build_device_contact_profile(
                 &bob_laptop,
@@ -7640,10 +8229,11 @@ mod tests {
                             user.engine
                                 .handle_event(CoreEvent::GroupOutboxHeadFetchFailed {
                                     group_id: get.group_id,
-                                    retryable: false,
-                                    status: Some(403),
-                                    code: Some("group_membership_revoked".into()),
-                                    detail: Some("membership revoked".into()),
+                                    failure: test_failure(
+                                        "group_membership_revoked",
+                                        false,
+                                        Some(403),
+                                    ),
                                 })
                                 .expect("group membership revoked")
                         } else {
@@ -7948,15 +8538,27 @@ mod tests {
                             .expect("identity bundle fetched")
                     }
                     CoreEffect::PublishSharedState { publish } => {
-                        if publish.document_kind == SharedStateDocumentKind::IdentityBundle {
-                            let bundle: IdentityBundle = serde_json::from_str(&publish.body)
-                                .expect("published identity bundle");
-                            self.bundles.insert(bundle.user_id.clone(), bundle.clone());
-                            if bundle.user_id == user.bundle.user_id {
-                                user.bundle = bundle;
-                            }
-                        }
-                        CoreOutput::default()
+                        let saved_bundle =
+                            if publish.document_kind == SharedStateDocumentKind::IdentityBundle {
+                                let bundle: IdentityBundle = serde_json::from_str(&publish.body)
+                                    .expect("published identity bundle");
+                                self.bundles.insert(bundle.user_id.clone(), bundle.clone());
+                                if bundle.user_id == user.bundle.user_id {
+                                    user.bundle = bundle.clone();
+                                }
+                                Some(bundle)
+                            } else {
+                                None
+                            };
+                        user.engine
+                            .handle_event(CoreEvent::SharedStatePublished {
+                                operation_id: publish.operation_id,
+                                document_kind: publish.document_kind,
+                                reference: publish.reference,
+                                etag: Some("\"group-harness\"".into()),
+                                saved_bundle,
+                            })
+                            .expect("shared state published")
                     }
                     CoreEffect::ReadAttachmentBytes { read } => {
                         let bytes = std::fs::read(&read.attachment_id).expect("attachment bytes");
@@ -8507,6 +9109,8 @@ mod tests {
             .expect("local bundle")
             .devices[0]
             .keypackage_ref
+            .as_ref()
+            .expect("key package reference")
             .object_ref
             .clone()
     }
@@ -8569,7 +9173,7 @@ mod tests {
     fn sample_identity_bundle(mnemonic: &str, device_name: &str) -> IdentityBundle {
         let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
             .expect("identity");
-        let package = MlsAdapter::generate_key_package(&identity, 0).expect("package");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
         IdentityManager::export_identity_bundle(
             &identity,
             &sample_deployment(),
@@ -8585,7 +9189,7 @@ mod tests {
     ) -> IdentityBundle {
         let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
             .expect("identity");
-        let package = MlsAdapter::generate_key_package(&identity, 0).expect("package");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
         let mut deployment = sample_deployment();
         deployment.runtime_config.identity_bundle_ref = None;
 
@@ -8763,9 +9367,9 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { X, Link2, AlertCircle, Loader } from "lucide-react";
@@ -95,7 +96,7 @@ export default function GroupJoinByLinkDialog({
       setStatus(result.status);
       startPolling(result.group_id, result.request_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
       setStatus("error");
     } finally {
       setSubmitting(false);
@@ -131,7 +132,7 @@ export default function GroupJoinByLinkDialog({
     } catch (err) {
       // Transient errors are non-fatal; log and keep polling.
       console.debug(
-        `[GroupJoinByLinkDialog] status poll error: ${String(err)}`,
+        `[GroupJoinByLinkDialog] status poll error: ${presentError(err).message}`,
       );
     }
   };

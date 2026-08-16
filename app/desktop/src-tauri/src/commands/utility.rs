@@ -40,7 +40,7 @@ pub fn get_app_metadata() -> AppMetadata {
 
 /// Get file metadata (size and mime type from extension).
 #[tauri::command]
-pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
+pub fn get_file_metadata(path: String) -> crate::errors::DesktopResult<FileMetadata> {
     let metadata =
         std::fs::metadata(&path).map_err(|e| format!("Failed to read file metadata: {}", e))?;
 
@@ -98,7 +98,7 @@ fn infer_mime_type(path: &str) -> String {
 
 #[tauri::command]
 #[allow(deprecated)] // TODO: migrate to tauri-plugin-opener
-pub fn open_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub fn open_file(app: tauri::AppHandle, path: String) -> crate::errors::DesktopResult<()> {
     let shell = app.shell();
 
     shell.open(&path, None).map_err(|e| e.to_string())?;
@@ -112,14 +112,16 @@ pub fn path_exists(path: String) -> bool {
 }
 
 #[tauri::command]
-pub fn check_notification_permission(app: tauri::AppHandle) -> Result<bool, String> {
+pub fn check_notification_permission(app: tauri::AppHandle) -> crate::errors::DesktopResult<bool> {
     let notification = app.notification();
     let state = notification.permission_state().map_err(|e| e.to_string())?;
     Ok(state == tauri_plugin_notification::PermissionState::Granted)
 }
 
 #[tauri::command]
-pub fn request_notification_permission(app: tauri::AppHandle) -> Result<bool, String> {
+pub fn request_notification_permission(
+    app: tauri::AppHandle,
+) -> crate::errors::DesktopResult<bool> {
     let notification = app.notification();
     let state = notification
         .request_permission()
@@ -128,7 +130,11 @@ pub fn request_notification_permission(app: tauri::AppHandle) -> Result<bool, St
 }
 
 #[tauri::command]
-pub fn show_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+pub fn show_notification(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> crate::errors::DesktopResult<()> {
     let notification = app.notification();
     notification
         .builder()
@@ -160,7 +166,10 @@ pub fn get_debug_mode() -> bool {
 
 #[tauri::command]
 #[allow(deprecated)]
-pub async fn open_containing_folder(app: tauri::AppHandle, path: String) -> Result<(), String> {
+pub async fn open_containing_folder(
+    app: tauri::AppHandle,
+    path: String,
+) -> crate::errors::DesktopResult<()> {
     let file = std::path::PathBuf::from(path);
     if !file.is_absolute() || !file.is_file() {
         return Err("Saved attachment path must be an existing absolute file".into());
@@ -178,7 +187,8 @@ pub async fn open_containing_folder(app: tauri::AppHandle, path: String) -> Resu
         .parent()
         .filter(|parent| parent.is_dir())
         .ok_or_else(|| "Saved attachment folder is unavailable".to_string())?;
-    app.shell()
+    Ok(app
+        .shell()
         .open(parent.to_string_lossy().as_ref(), None)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?)
 }

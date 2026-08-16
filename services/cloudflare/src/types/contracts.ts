@@ -736,9 +736,12 @@ export type DeviceStatusKind = "active" | "revoked";
 
 export interface KeyPackageRef {
   version: string;
+  lifecycleVersion?: number;
   userId: string;
   deviceId: string;
   ref: string;
+  notBefore?: number;
+  createdAt?: number;
   expiresAt: number;
 }
 
@@ -748,8 +751,8 @@ export interface DeviceContactProfile {
   devicePublicKey: string;
   binding: DeviceBinding;
   status: DeviceStatusKind;
-  inboxAppendCapability: InboxAppendCapability;
-  keypackageRef: KeyPackageRef;
+  inboxAppendCapability?: InboxAppendCapability;
+  keypackageRef?: KeyPackageRef;
 }
 
 export interface StorageProfile {
@@ -759,6 +762,8 @@ export interface StorageProfile {
 
 export interface IdentityBundle {
   version: string;
+  publicationVersion?: number;
+  publicationRevision?: number;
   userId: string;
   userPublicKey: string;
   devices: DeviceContactProfile[];
@@ -856,6 +861,28 @@ export interface DeviceRuntimeRefreshChallenge {
 export interface DeviceRuntimeRefreshProof {
   challenge: DeviceRuntimeRefreshChallenge;
   signature: string;
+}
+
+export type AppErrorDomain =
+  | "core"
+  | "validation"
+  | "identity"
+  | "mls"
+  | "transport"
+  | "runtime"
+  | "storage"
+  | "security"
+  | "group";
+
+export interface AppErrorV1 {
+  version: 1;
+  code: string;
+  domain: AppErrorDomain;
+  retryable: boolean;
+  action?: string;
+  args?: Record<string, string>;
+  httpStatus?: number;
+  correlationId?: string;
 }
 
 export interface DeviceRuntimeEnrollmentProof extends DeviceRuntimeRefreshProof {

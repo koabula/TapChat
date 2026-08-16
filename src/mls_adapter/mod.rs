@@ -14,6 +14,21 @@ use crate::model::{MessageType, MlsStateStatus, MlsStateSummary};
 
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+pub const KEY_PACKAGE_LIFECYCLE_VERSION: u16 = 1;
+pub const KEY_PACKAGE_LIFETIME_MS: u64 = 84 * 24 * 60 * 60 * 1000;
+pub const KEY_PACKAGE_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
+pub const KEY_PACKAGE_CLOCK_TOLERANCE_MS: u64 = 5 * 60 * 1000;
+pub const KEY_PACKAGE_ROTATION_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+pub const KEY_PACKAGE_ROTATION_JITTER_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SerdeDeserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishedKeyPackageState {
+    #[default]
+    Advertised,
+    Consumed,
+    Retired,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MlsAdapterModule;
@@ -28,8 +43,44 @@ impl MlsAdapterModule {
 pub struct PublishedKeyPackage {
     pub key_package_ref: String,
     pub key_package_b64: String,
+    #[serde(default)]
+    pub lifecycle_version: u16,
+    #[serde(default)]
+    pub not_before: u64,
+    #[serde(default)]
+    pub created_at: u64,
     pub expires_at: u64,
+    #[serde(default)]
+    pub state: PublishedKeyPackageState,
     pub credential_identity: String,
+}
+
+impl PublishedKeyPackage {
+    pub fn is_legacy(&self) -> bool {
+        self.lifecycle_version != KEY_PACKAGE_LIFECYCLE_VERSION
+            || self.not_before == 0
+            || self.created_at == 0
+            || self.expires_at.saturating_sub(self.created_at) != KEY_PACKAGE_LIFETIME_MS
+    }
+
+    pub fn is_expired_at(&self, now_ms: u64) -> bool {
+        now_ms >= self.expires_at
+    }
+
+    pub fn should_rotate_at(&self, now_ms: u64, device_id: &str) -> bool {
+        if self.is_legacy() || self.is_expired_at(now_ms) {
+            return true;
+        }
+        let threshold = KEY_PACKAGE_ROTATION_WINDOW_MS
+            .saturating_add(key_package_rotation_jitter_ms(device_id));
+        now_ms >= self.expires_at.saturating_sub(threshold)
+    }
+}
+
+pub fn key_package_rotation_jitter_ms(device_id: &str) -> u64 {
+    let digest = Sha256::digest(device_id.as_bytes());
+    let sample = u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix"));
+    sample % (KEY_PACKAGE_ROTATION_JITTER_MAX_MS + 1)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,6 +395,7 @@ impl MlsAdapter {
             &signer,
             credential_with_key.clone(),
             credential_identity.clone(),
+            current_unix_time_ms()?,
         )?;
 
         let adapter = Self {
@@ -360,18 +412,37 @@ impl MlsAdapter {
 
     pub fn generate_key_package(
         local_identity: &LocalIdentityState,
-        _now: u64,
+        now: u64,
     ) -> CoreResult<PublishedKeyPackage> {
-        let (_, package) = Self::bootstrap(local_identity)?;
-        Ok(package)
+        let provider = OpenMlsRustCrypto::default();
+        let signer =
+            SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).map_err(|error| {
+                CoreError::invalid_state(format!("failed to generate MLS signer: {error}"))
+            })?;
+        signer.store(provider.storage()).map_err(|error| {
+            CoreError::invalid_state(format!("failed to store MLS signer: {error}"))
+        })?;
+        let credential_identity = build_credential_identity(local_identity);
+        let credential = BasicCredential::new(credential_identity.clone().into_bytes());
+        Self::build_published_key_package(
+            &provider,
+            &signer,
+            CredentialWithKey {
+                credential: credential.into(),
+                signature_key: signer.to_public_vec().into(),
+            },
+            credential_identity,
+            now,
+        )
     }
 
-    pub fn rotate_key_package(&mut self, _now: u64) -> CoreResult<PublishedKeyPackage> {
+    pub fn rotate_key_package(&mut self, now: u64) -> CoreResult<PublishedKeyPackage> {
         Self::build_published_key_package(
             &self.provider,
             &self.signer,
             self.credential_with_key.clone(),
             self.credential_identity.clone(),
+            now,
         )
     }
 
@@ -1211,8 +1282,17 @@ impl MlsAdapter {
         signer: &SignatureKeyPair,
         credential_with_key: CredentialWithKey,
         credential_identity: String,
+        now_ms: u64,
     ) -> CoreResult<PublishedKeyPackage> {
+        let now_seconds = now_ms / 1000;
+        let not_before_seconds = now_ms.saturating_sub(KEY_PACKAGE_CLOCK_SKEW_MS) / 1000;
+        let not_after_ms = now_ms
+            .checked_add(KEY_PACKAGE_LIFETIME_MS)
+            .ok_or_else(|| CoreError::invalid_input("key package lifetime overflows timestamp"))?;
+        let not_after_seconds = not_after_ms / 1000;
+        let lifetime = Lifetime::init(not_before_seconds, not_after_seconds);
         let key_package_bundle = KeyPackage::builder()
+            .key_package_lifetime(lifetime)
             .build(DEFAULT_CIPHERSUITE, provider, signer, credential_with_key)
             .map_err(|error| {
                 CoreError::invalid_state(format!("failed to build key package: {error}"))
@@ -1227,10 +1307,21 @@ impl MlsAdapter {
         Ok(PublishedKeyPackage {
             key_package_ref: key_package_b64.clone(),
             key_package_b64,
-            expires_at: 4_102_444_800_000,
+            lifecycle_version: KEY_PACKAGE_LIFECYCLE_VERSION,
+            not_before: not_before_seconds.saturating_mul(1000),
+            created_at: now_seconds.saturating_mul(1000),
+            expires_at: not_after_seconds.saturating_mul(1000),
+            state: PublishedKeyPackageState::Advertised,
             credential_identity,
         })
     }
+}
+
+fn current_unix_time_ms() -> CoreResult<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|_| CoreError::invalid_state("system clock is before the Unix epoch"))
 }
 
 fn build_credential_identity(local_identity: &LocalIdentityState) -> String {
@@ -1324,15 +1415,61 @@ fn decode_key_package(payload_b64: &str) -> CoreResult<KeyPackage> {
     }
 }
 
+pub fn validate_published_key_package_lifetime(
+    payload_b64: &str,
+    lifecycle_version: u16,
+    not_before_ms: u64,
+    created_at_ms: u64,
+    expires_at_ms: u64,
+) -> CoreResult<()> {
+    if lifecycle_version != KEY_PACKAGE_LIFECYCLE_VERSION
+        || expires_at_ms.saturating_sub(created_at_ms) != KEY_PACKAGE_LIFETIME_MS
+        || not_before_ms != created_at_ms.saturating_sub(KEY_PACKAGE_CLOCK_SKEW_MS)
+    {
+        return Err(CoreError::new(
+            "keypackage_lifetime_invalid",
+            "key package lifecycle metadata is invalid",
+        ));
+    }
+    let key_package = decode_key_package(payload_b64).map_err(|_| {
+        CoreError::new(
+            "keypackage_lifetime_invalid",
+            "key package payload is invalid",
+        )
+    })?;
+    let lifetime = key_package.life_time();
+    if lifetime.not_before().saturating_mul(1000) != not_before_ms
+        || lifetime.not_after().saturating_mul(1000) != expires_at_ms
+    {
+        return Err(CoreError::new(
+            "keypackage_lifetime_invalid",
+            "key package metadata does not match the MLS lifetime",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage};
+    use super::{
+        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, IngestResult,
+        MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
+        KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
+        KEY_PACKAGE_ROTATION_WINDOW_MS,
+    };
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+
+    fn test_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_millis() as u64
+    }
 
     #[test]
     fn module_name_is_stable() {
@@ -1343,8 +1480,71 @@ mod tests {
     fn key_package_can_be_generated() {
         let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
-        let package = MlsAdapter::generate_key_package(&identity, 0).expect("package");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
         assert!(!package.key_package_b64.is_empty());
+    }
+
+    #[test]
+    fn key_package_uses_explicit_84_day_mls_lifetime() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
+        assert_eq!(package.lifecycle_version, KEY_PACKAGE_LIFECYCLE_VERSION);
+        assert_eq!(
+            package.expires_at - package.created_at,
+            KEY_PACKAGE_LIFETIME_MS
+        );
+        assert_eq!(
+            package.created_at - package.not_before,
+            KEY_PACKAGE_CLOCK_SKEW_MS
+        );
+        validate_published_key_package_lifetime(
+            &package.key_package_b64,
+            package.lifecycle_version,
+            package.not_before,
+            package.created_at,
+            package.expires_at,
+        )
+        .expect("outer metadata must match MLS lifetime");
+    }
+
+    #[test]
+    fn rotation_boundary_and_device_jitter_are_stable() {
+        let device_id = "device:alice:phone";
+        let jitter = key_package_rotation_jitter_ms(device_id);
+        assert_eq!(jitter, key_package_rotation_jitter_ms(device_id));
+        let package = PublishedKeyPackage {
+            key_package_ref: "ref".into(),
+            key_package_b64: "payload".into(),
+            lifecycle_version: KEY_PACKAGE_LIFECYCLE_VERSION,
+            not_before: 1,
+            created_at: KEY_PACKAGE_CLOCK_SKEW_MS + 1,
+            expires_at: KEY_PACKAGE_CLOCK_SKEW_MS + 1 + KEY_PACKAGE_LIFETIME_MS,
+            state: Default::default(),
+            credential_identity: "device:alice:phone".into(),
+        };
+        let threshold = package
+            .expires_at
+            .saturating_sub(KEY_PACKAGE_ROTATION_WINDOW_MS + jitter);
+        assert!(!package.should_rotate_at(threshold - 1, device_id));
+        assert!(package.should_rotate_at(threshold, device_id));
+        assert!(package.should_rotate_at(package.expires_at, device_id));
+    }
+
+    #[test]
+    fn mismatched_outer_lifetime_is_rejected() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
+        let error = validate_published_key_package_lifetime(
+            &package.key_package_b64,
+            package.lifecycle_version,
+            package.not_before,
+            package.created_at,
+            package.expires_at + 1_000,
+        )
+        .expect_err("mismatched outer expiry must fail");
+        assert_eq!(error.code(), "keypackage_lifetime_invalid");
     }
 
     #[test]
@@ -1494,8 +1694,8 @@ mod tests {
             IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
 
         let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
-        let first_bob_package =
-            MlsAdapter::generate_key_package(&bob_identity, 0).expect("first bob package");
+        let first_bob_package = MlsAdapter::generate_key_package(&bob_identity, test_now_ms())
+            .expect("first bob package");
         alice_adapter
             .create_conversation(
                 "conv:alice:bob",
@@ -1512,7 +1712,8 @@ mod tests {
             .delete_group("conv:alice:bob")
             .expect("delete group");
         let second_bob_package =
-            MlsAdapter::generate_key_package(&bob_identity, 1).expect("second bob package");
+            MlsAdapter::generate_key_package(&bob_identity, test_now_ms().saturating_add(1_000))
+                .expect("second bob package");
         alice_adapter
             .create_conversation(
                 "conv:alice:bob",

@@ -286,9 +286,9 @@ pub async fn wait_for_runtime_ready(
                 let ready = parse_runtime_ready_manifest(&body)?;
                 if ready.ready
                     && ready.runtime_id == runtime_id
-                    && ready.protocol_version == 4
+                    && ready.protocol_version == 5
                     && ready.worker_build_id == worker_build_id
-                    && ready.registry_schema_version == 1
+                    && ready.registry_schema_version == 2
                 {
                     return Ok(());
                 }
@@ -584,13 +584,13 @@ mod tests {
 
     #[test]
     fn readiness_manifest_parses_worker_camel_case_contract() {
-        let body = r#"{"ready":true,"runtimeId":"runtime-1","protocolVersion":4,"workerBuildId":"tapchat-worker-v4-0.1.15","registrySchemaVersion":1}"#;
+        let body = r#"{"ready":true,"runtimeId":"runtime-1","protocolVersion":5,"workerBuildId":"tapchat-worker-v5-0.1.15","registrySchemaVersion":2}"#;
         let manifest = parse_runtime_ready_manifest(body).expect("parse readiness manifest");
         assert!(manifest.ready);
         assert_eq!(manifest.runtime_id, "runtime-1");
-        assert_eq!(manifest.protocol_version, 4);
-        assert_eq!(manifest.worker_build_id, "tapchat-worker-v4-0.1.15");
-        assert_eq!(manifest.registry_schema_version, 1);
+        assert_eq!(manifest.protocol_version, 5);
+        assert_eq!(manifest.worker_build_id, "tapchat-worker-v5-0.1.15");
+        assert_eq!(manifest.registry_schema_version, 2);
     }
 
     #[test]

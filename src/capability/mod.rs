@@ -7,6 +7,9 @@ use crate::model::{
     DeviceContactProfile, InboxAppendCapability, KeyPackageRef, Validate, CURRENT_MODEL_VERSION,
 };
 
+pub const INBOX_APPEND_CAPABILITY_LIFETIME_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+pub const INBOX_APPEND_CAPABILITY_RENEWAL_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CapabilityModule;
 
@@ -59,11 +62,35 @@ impl CapabilityManager {
         key_package_ref: String,
         expires_at: u64,
     ) -> KeyPackageRef {
+        let created_at = expires_at.saturating_sub(crate::mls_adapter::KEY_PACKAGE_LIFETIME_MS);
         KeyPackageRef {
             version: CURRENT_MODEL_VERSION.to_string(),
+            lifecycle_version: crate::mls_adapter::KEY_PACKAGE_LIFECYCLE_VERSION,
             user_id: local_identity.user_identity.user_id.clone(),
             device_id: local_identity.device_identity.device_id.clone(),
             object_ref: key_package_ref,
+            not_before: created_at.saturating_sub(crate::mls_adapter::KEY_PACKAGE_CLOCK_SKEW_MS),
+            created_at,
+            expires_at,
+        }
+    }
+
+    pub fn build_key_package_ref_with_lifetime(
+        local_identity: &LocalIdentityState,
+        key_package_ref: String,
+        lifecycle_version: u16,
+        not_before: u64,
+        created_at: u64,
+        expires_at: u64,
+    ) -> KeyPackageRef {
+        KeyPackageRef {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            lifecycle_version,
+            user_id: local_identity.user_identity.user_id.clone(),
+            device_id: local_identity.device_identity.device_id.clone(),
+            object_ref: key_package_ref,
+            not_before,
+            created_at,
             expires_at,
         }
     }
@@ -74,10 +101,35 @@ impl CapabilityManager {
         key_package_ref: String,
         key_package_expires_at: u64,
     ) -> CoreResult<DeviceContactProfile> {
+        let now_ms =
+            key_package_expires_at.saturating_sub(crate::mls_adapter::KEY_PACKAGE_LIFETIME_MS);
+        Self::build_device_contact_profile_with_lifetime(
+            local_identity,
+            deployment,
+            key_package_ref,
+            crate::mls_adapter::KEY_PACKAGE_LIFECYCLE_VERSION,
+            now_ms.saturating_sub(crate::mls_adapter::KEY_PACKAGE_CLOCK_SKEW_MS),
+            now_ms,
+            key_package_expires_at,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_device_contact_profile_with_lifetime(
+        local_identity: &LocalIdentityState,
+        deployment: &DeploymentBundle,
+        key_package_ref: String,
+        lifecycle_version: u16,
+        key_package_not_before: u64,
+        key_package_created_at: u64,
+        key_package_expires_at: u64,
+        now_ms: u64,
+    ) -> CoreResult<DeviceContactProfile> {
         let capability = Self::build_inbox_append_capability(
             local_identity,
             deployment,
-            key_package_expires_at,
+            now_ms.saturating_add(INBOX_APPEND_CAPABILITY_LIFETIME_MS),
         )?;
         Ok(DeviceContactProfile {
             version: CURRENT_MODEL_VERSION.to_string(),
@@ -85,12 +137,15 @@ impl CapabilityManager {
             device_public_key: local_identity.device_identity.device_public_key.clone(),
             binding: local_identity.device_identity.binding.clone(),
             status: local_identity.device_status.status,
-            inbox_append_capability: capability,
-            keypackage_ref: Self::build_key_package_ref(
+            inbox_append_capability: Some(capability),
+            keypackage_ref: Some(Self::build_key_package_ref_with_lifetime(
                 local_identity,
                 key_package_ref,
+                lifecycle_version,
+                key_package_not_before,
+                key_package_created_at,
                 key_package_expires_at,
-            ),
+            )),
         })
     }
 
@@ -109,14 +164,24 @@ impl CapabilityManager {
 
     pub fn verify_device_contact_profile(profile: &DeviceContactProfile) -> CoreResult<()> {
         profile.validate()?;
-        Self::verify_inbox_append_capability(
-            &profile.inbox_append_capability,
-            &profile.device_public_key,
-        )?;
-        if profile.keypackage_ref.device_id != profile.device_id {
-            return Err(CoreError::invalid_input(
-                "key package ref device_id must match device profile",
-            ));
+        if let Some(capability) = &profile.inbox_append_capability {
+            Self::verify_inbox_append_capability(capability, &profile.device_public_key)?;
+        }
+        if let Some(keypackage_ref) = &profile.keypackage_ref {
+            if keypackage_ref.device_id != profile.device_id {
+                return Err(CoreError::invalid_input(
+                    "key package ref device_id must match device profile",
+                ));
+            }
+            if keypackage_ref.lifecycle_version > 0 {
+                crate::mls_adapter::validate_published_key_package_lifetime(
+                    &keypackage_ref.object_ref,
+                    keypackage_ref.lifecycle_version,
+                    keypackage_ref.not_before,
+                    keypackage_ref.created_at,
+                    keypackage_ref.expires_at,
+                )?;
+            }
         }
         Ok(())
     }
@@ -172,11 +237,17 @@ mod tests {
         let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
             .expect("identity");
         let deployment = sample_deployment();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_millis() as u64;
+        let package = crate::mls_adapter::MlsAdapter::generate_key_package(&identity, now_ms)
+            .expect("key package");
         let profile = CapabilityManager::build_device_contact_profile(
             &identity,
             &deployment,
-            "kp-ref".into(),
-            42,
+            package.key_package_b64,
+            package.expires_at,
         )
         .expect("profile");
         CapabilityManager::verify_device_contact_profile(&profile).expect("profile should verify");
@@ -186,9 +257,9 @@ mod tests {
         DeploymentBundle {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 4,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 1,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

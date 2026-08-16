@@ -1,3 +1,4 @@
+import { presentError } from "@/lib/errors";
 export type ChatHeaderActionId =
   | "contact_details"
   | "refresh_contact"
@@ -18,7 +19,7 @@ export interface ChatHeaderActionStatus {
 export function chatHeaderActionErrorStatus(error: unknown): ChatHeaderActionStatus {
   return {
     kind: "error",
-    text: error instanceof Error ? error.message : String(error),
+    text: presentError(error).message,
   };
 }
 

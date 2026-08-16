@@ -1,3 +1,4 @@
+import { normalizeAppError, presentError } from "@/lib/errors";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { writeText as clipboardWriteText } from "@tauri-apps/plugin-clipboard-manager";
@@ -109,8 +110,8 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
       );
       setCreated(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (message.includes("runtime_missing_group_outbox")) {
+      const message = presentError(err).message;
+      if (normalizeAppError(err).code === "runtime_missing_group_outbox") {
         setRuntimeUpgradeRequired(true);
         setError("Cloudflare runtime needs an upgrade before group creation.");
       } else {
@@ -146,7 +147,7 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
       setRuntimeUpgradeRequired(false);
       setError(null);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(presentError(err).message);
     } finally {
       setRuntimeBusy(false);
     }
@@ -162,7 +163,7 @@ export default function GroupCreateDialog({ open, onClose }: GroupCreateDialogPr
         setCopiedUrl((current) => (current === url ? null : current));
       }, 2000);
     } catch (err) {
-      setCopyError(err instanceof Error ? err.message : String(err));
+      setCopyError(presentError(err).message);
     }
   };
 

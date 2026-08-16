@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ComponentType } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -22,6 +21,7 @@ import {
 
 import { useManualUpdate } from "@/hooks/useAutoUpdate";
 import { clearClipboardIfUnchanged } from "@/lib/clipboardSecurity";
+import { normalizeAppError, presentError } from "@/lib/errors";
 import { THEME_OPTIONS, type ResolvedTheme } from "@/lib/theme";
 import { useThemeStore } from "@/store/theme";
 import Devices from "./Devices";
@@ -44,6 +44,7 @@ import {
   getAppMetadata,
   beginRecoveryPhraseReveal,
   completeRecoveryPhraseReveal,
+  invokeApp,
 } from "@/lib/tauri";
 import type {
   AppMetadata,
@@ -115,6 +116,10 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
   const [developerClickCount, setDeveloperClickCount] = useState(0);
   const [showAboutDetails, setShowAboutDetails] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [shareLinkBusy, setShareLinkBusy] = useState(false);
+  const [shareLinkStatus, setShareLinkStatus] = useState<
+    { kind: "success" | "error"; message: string } | null
+  >(null);
   const [switchingProfile, setSwitchingProfile] = useState<string | null>(null);
   const update = useManualUpdate();
 
@@ -208,7 +213,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       setIdentity(result);
       setDisplayNameInput(result?.display_name || "");
     } catch (err) {
-      console.error(`[Settings] Failed to get identity: ${String(err)}`);
+      console.error(`[Settings] Failed to get identity: ${presentError(err).message}`);
     }
   };
 
@@ -216,7 +221,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
     try {
       setAppMetadata(await getAppMetadata());
     } catch (err) {
-      console.error(`[Settings] Failed to get app metadata: ${String(err)}`);
+      console.error(`[Settings] Failed to get app metadata: ${presentError(err).message}`);
     }
   };
 
@@ -224,7 +229,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
     try {
       setProfiles(await listProfiles());
     } catch (err) {
-      console.error(`[Settings] Failed to load profiles: ${String(err)}`);
+      console.error(`[Settings] Failed to load profiles: ${presentError(err).message}`);
     }
   };
 
@@ -235,7 +240,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
         setAllowlist(result.view_model.allowlist.allowed_sender_user_ids || []);
       }
     } catch (err) {
-      console.error(`[Settings] Failed to load allowlist: ${String(err)}`);
+      console.error(`[Settings] Failed to load allowlist: ${presentError(err).message}`);
     }
   };
 
@@ -285,6 +290,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
   };
 
   const handleCopyShareLink = async () => {
+    setShareLinkStatus(null);
     try {
       const link = await getShareLink();
       if (link) {
@@ -293,17 +299,23 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
         setTimeout(() => setCopied(false), 2000);
       }
     } catch (err) {
-      console.error(`[Settings] Failed to copy share link: ${String(err)}`);
+      setShareLinkStatus({ kind: "error", message: presentError(err).message });
     }
   };
 
   const handleRotateLink = async () => {
+    setShareLinkBusy(true);
+    setShareLinkStatus(null);
     try {
       await rotateShareLink();
-      alert("Share link rotated. Share the new link with your contacts.");
+      setShareLinkStatus({
+        kind: "success",
+        message: "Share link rotated. Previous links no longer work.",
+      });
     } catch (err) {
-      console.error(`[Settings] Failed to rotate share link: ${String(err)}`);
-      alert(String(err));
+      setShareLinkStatus({ kind: "error", message: presentError(err).message });
+    } finally {
+      setShareLinkBusy(false);
     }
   };
 
@@ -346,7 +358,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       setRecoveryPassphrase("");
       setRecoveryConfirmed(false);
       setRecoveryError(
-        String(error).includes("auth_failed")
+        normalizeAppError(error).code === "auth_failed"
           ? "The profile passphrase is incorrect. Start again to retry."
           : "The sensitive-action challenge expired. Start again to retry.",
       );
@@ -372,7 +384,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       setNewAllowlistUser("");
       void loadAllowlist();
     } catch (err) {
-      console.error(`[Settings] Failed to add allowlist entry: ${String(err)}`);
+      console.error(`[Settings] Failed to add allowlist entry: ${presentError(err).message}`);
     }
   };
 
@@ -381,7 +393,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       await removeFromAllowlist(userId);
       void loadAllowlist();
     } catch (err) {
-      console.error(`[Settings] Failed to remove allowlist entry: ${String(err)}`);
+      console.error(`[Settings] Failed to remove allowlist entry: ${presentError(err).message}`);
     }
   };
 
@@ -407,8 +419,8 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       setEditingDisplayName(false);
       void loadIdentity();
     } catch (err) {
-      console.error(`[Settings] Failed to save display name: ${String(err)}`);
-      alert(String(err));
+      console.error(`[Settings] Failed to save display name: ${presentError(err).message}`);
+      alert(presentError(err).message);
     } finally {
       setSavingDisplayName(false);
     }
@@ -416,12 +428,12 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
 
   const handleSwitchProfile = async (path: string) => {
     setSwitchingProfile(path);
+    let profileSelected = false;
     try {
       try {
         await selectProfileForRestart(path);
       } catch (err) {
-        const errorMsg = String(err);
-        if (!errorMsg.toLowerCase().includes("passphrase")) {
+        if (normalizeAppError(err).code !== "profile_passphrase_required") {
           throw err;
         }
         const passphrase = window.prompt("Enter the profile passphrase");
@@ -430,17 +442,15 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
         }
         await selectProfileForRestart(path, passphrase);
       }
+      profileSelected = true;
       await relaunch();
     } catch (err) {
-      console.error(`[Settings] Profile switch error: ${String(err)}`);
-      const errorMsg = String(err);
-      if (errorMsg !== "") {
-        if (errorMsg.toLowerCase().includes("restart") || errorMsg.toLowerCase().includes("relaunch")) {
-          alert(`Profile selected. Please restart TapChat manually to finish switching.\n\n${errorMsg}`);
-        } else {
-          alert(errorMsg);
-        }
-      }
+      console.error(`[Settings] Profile switch error: ${presentError(err).message}`);
+      alert(
+        profileSelected
+          ? "Profile selected. Please restart TapChat manually to finish switching."
+          : presentError(err).message,
+      );
     } finally {
       void loadProfiles();
       setSwitchingProfile(null);
@@ -453,8 +463,8 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       await startNewProfileOnboarding();
       setShowCreateConfirm(false);
     } catch (err) {
-      console.error(`[Settings] Failed to start onboarding: ${String(err)}`);
-      alert(String(err));
+      console.error(`[Settings] Failed to start onboarding: ${presentError(err).message}`);
+      alert(presentError(err).message);
     } finally {
       setStartingOnboarding(false);
     }
@@ -473,8 +483,8 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       await deleteProfile(path);
       void loadProfiles();
     } catch (err) {
-      console.error(`[Settings] Failed to delete profile: ${String(err)}`);
-      alert(String(err));
+      console.error(`[Settings] Failed to delete profile: ${presentError(err).message}`);
+      alert(presentError(err).message);
     } finally {
       setDeletingProfile(null);
     }
@@ -633,7 +643,11 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
               <h3 className="font-medium text-primary-color">Identity</h3>
               <p className="text-xs text-muted-color">Local name and share link</p>
             </div>
-            <button className="btn btn-secondary text-sm" onClick={handleCopyShareLink}>
+            <button
+              className="btn btn-secondary text-sm"
+              onClick={handleCopyShareLink}
+              disabled={shareLinkBusy}
+            >
               {copied ? "Copied!" : "Copy Share Link"}
             </button>
           </div>
@@ -681,10 +695,27 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
           <InfoRow label="User ID" value={identity?.user_id ?? "Loading..."} />
           <InfoRow label="Device ID" value={identity?.device_id ?? "Loading..."} />
           <div className="flex gap-2">
-            <button className="btn btn-ghost" onClick={handleRotateLink}>
-              Rotate Link
+            <button
+              className="btn btn-ghost"
+              onClick={handleRotateLink}
+              disabled={shareLinkBusy}
+            >
+              {shareLinkBusy ? "Rotating..." : "Rotate Link"}
             </button>
           </div>
+          {shareLinkStatus && (
+            <div
+              className={
+                shareLinkStatus.kind === "success"
+                  ? "rounded-lg bg-green-500/10 p-3 text-sm text-green-500"
+                  : "rounded-lg bg-red-500/10 p-3 text-sm text-red-500"
+              }
+              role={shareLinkStatus.kind === "error" ? "alert" : "status"}
+              aria-live="polite"
+            >
+              {shareLinkStatus.message}
+            </div>
+          )}
         </section>
 
         <section className="card space-y-2">
@@ -1152,7 +1183,7 @@ function AttachmentsSettings() {
 
   const loadSettings = async () => {
     try {
-      const s = await invoke<{ prefetch_previews: boolean; always_ask_save_path: boolean }>("get_attachment_settings");
+      const s = await invokeApp<{ prefetch_previews: boolean; always_ask_save_path: boolean }>("get_attachment_settings");
       setLocalSettings(s);
     } catch (err) {
       console.error("[Settings] Failed to load attachment settings:", err);
@@ -1161,7 +1192,7 @@ function AttachmentsSettings() {
 
   const loadCacheDir = async () => {
     try {
-      setCacheDir(await invoke<string>("get_attachment_cache_dir"));
+      setCacheDir(await invokeApp<string>("get_attachment_cache_dir"));
     } catch {
       // not critical
     }
@@ -1173,7 +1204,7 @@ function AttachmentsSettings() {
     setLocalSettings(next);
     setSaving(true);
     try {
-      await invoke("set_attachment_settings", { settings: next });
+      await invokeApp("set_attachment_settings", { settings: next });
     } catch (err) {
       console.error("[Settings] Failed to save attachment settings:", err);
       setLocalSettings(settings);
@@ -1188,7 +1219,7 @@ function AttachmentsSettings() {
     setLocalSettings(next);
     setSaving(true);
     try {
-      await invoke("set_attachment_settings", { settings: next });
+      await invokeApp("set_attachment_settings", { settings: next });
     } catch (err) {
       console.error("[Settings] Failed to save attachment settings:", err);
       setLocalSettings(settings);

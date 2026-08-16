@@ -1,5 +1,6 @@
+import { presentError } from "@/lib/errors";
 import { useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 
 /**
  * Desktop notifications are emitted directly by the Tauri notification port.
@@ -22,7 +23,7 @@ export async function ensureNotificationPermission(): Promise<boolean> {
     }
     return granted;
   } catch (err) {
-    console.error(`[Notifications] Failed to check notification permission: ${String(err)}`);
+    console.error(`[Notifications] Failed to check notification permission: ${presentError(err).message}`);
     return false;
   }
 }

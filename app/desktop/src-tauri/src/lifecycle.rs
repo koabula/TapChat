@@ -908,6 +908,7 @@ fn merge_view_models(base: &mut CoreViewModel, mut next: CoreViewModel) {
     base.contacts.append(&mut next.contacts);
     base.banners.append(&mut next.banners);
     base.message_requests.append(&mut next.message_requests);
+    base.operation_results.append(&mut next.operation_results);
     if next.allowlist.is_some() {
         base.allowlist = next.allowlist;
     }
@@ -931,7 +932,7 @@ fn merge_view_models(base: &mut CoreViewModel, mut next: CoreViewModel) {
 /// Transition from onboarding to active session.
 /// Called when onboarding completes successfully.
 #[tauri::command]
-pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
+pub async fn complete_onboarding(app: AppHandle) -> crate::errors::DesktopResult<()> {
     let state = app.state::<AppState>();
 
     // Hide setup immediately so the active route never renders in the setup window.
@@ -1005,7 +1006,7 @@ pub async fn complete_onboarding(app: AppHandle) -> Result<(), String> {
 
 /// Update onboarding step. Called by frontend when advancing through setup.
 #[tauri::command]
-pub async fn set_onboarding_step(app: AppHandle, step: String) -> Result<(), String> {
+pub async fn set_onboarding_step(app: AppHandle, step: String) -> crate::errors::DesktopResult<()> {
     let state = app.state::<AppState>();
 
     // Parse step string to OnboardingStep enum
@@ -1016,7 +1017,7 @@ pub async fn set_onboarding_step(app: AppHandle, step: String) -> Result<(), Str
         "backup_mnemonic" | "backupmnemonic" => crate::state::OnboardingStep::BackupMnemonic,
         "cloudflare_setup" | "cloudflaresetup" => crate::state::OnboardingStep::CloudflareSetup,
         "complete" => crate::state::OnboardingStep::Complete,
-        _ => return Err(format!("Invalid onboarding step: {}", step)),
+        _ => return Err(format!("Invalid onboarding step: {}", step).into()),
     };
 
     let mut inner = state.inner.write().await;

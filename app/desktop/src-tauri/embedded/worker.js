@@ -2051,7 +2051,7 @@ function getBearerToken(request) {
   }
   return token;
 }
-async function validateAppendAuthorization(request, deviceId, body, now, sharedState) {
+async function validateAppendAuthorization(request, deviceId, body, now, loadAuthoritativeIdentityBundle) {
   if (body.version !== CURRENT_MODEL_VERSION) {
     throw new HttpError(400, "unsupported_version", "append request version is not supported");
   }
@@ -2061,14 +2061,14 @@ async function validateAppendAuthorization(request, deviceId, body, now, sharedS
   const authorization = request.headers.get("Authorization")?.trim();
   const capabilityHeader = request.headers.get("X-Tapchat-Capability");
   if (!authorization || !capabilityHeader) {
-    return { mode: "legacy_unverified", reason: "missing_append_grant" };
+    throw new HttpError(426, "upgrade_required", "append authorization is required");
   }
   if (!authorization.startsWith("Bearer ")) {
-    return { mode: "legacy_unverified", reason: "invalid_bearer" };
+    throw new HttpError(403, "invalid_capability", "append authorization must use Bearer");
   }
   const signature = authorization.slice("Bearer ".length).trim();
   if (!signature) {
-    return { mode: "legacy_unverified", reason: "invalid_bearer" };
+    throw new HttpError(403, "invalid_capability", "append authorization is empty");
   }
   let capability;
   try {
@@ -2080,7 +2080,7 @@ async function validateAppendAuthorization(request, deviceId, body, now, sharedS
     throw new HttpError(400, "unsupported_version", "append capability version is not supported");
   }
   if (capability.signature !== signature) {
-    return { mode: "legacy_unverified", reason: "bearer_mismatch" };
+    throw new HttpError(403, "invalid_capability", "append bearer does not match capability");
   }
   if (capability.service !== "inbox") {
     throw new HttpError(403, "invalid_capability", "capability service must be inbox");
@@ -2095,9 +2095,6 @@ async function validateAppendAuthorization(request, deviceId, body, now, sharedS
   if (capability.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
     throw new HttpError(403, "invalid_capability", "capability endpoint does not match request path");
   }
-  if (capability.expiresAt <= now) {
-    return { mode: "legacy_unverified", reason: "capability_expired" };
-  }
   if (capability.conversationScope?.length && !capability.conversationScope.includes(body.envelope.conversationId)) {
     throw new HttpError(403, "invalid_capability", "conversation is outside capability scope");
   }
@@ -2105,31 +2102,37 @@ async function validateAppendAuthorization(request, deviceId, body, now, sharedS
   if (capability.constraints?.maxBytes !== void 0 && size > capability.constraints.maxBytes) {
     throw new HttpError(413, "payload_too_large", "envelope exceeds capability size limit");
   }
-  const bundle = await sharedState.getIdentityBundle(capability.userId);
+  const bundle = await loadAuthoritativeIdentityBundle();
   if (!bundle) {
-    return { mode: "legacy_unverified", reason: "identity_bundle_missing" };
+    throw new HttpError(409, "identity_refresh_required", "authoritative identity bundle is missing");
   }
   if (!verifyIdentityBundle(bundle)) {
-    return { mode: "legacy_unverified", reason: "identity_bundle_invalid" };
+    throw new HttpError(500, "storage_integrity_error", "authoritative identity bundle is invalid");
   }
   if (bundle.userId !== capability.userId) {
-    return { mode: "legacy_unverified", reason: "identity_bundle_scope_mismatch" };
+    throw new HttpError(403, "invalid_capability", "capability user does not match runtime owner");
   }
   const device = bundle.devices.find((item) => item.deviceId === capability.targetDeviceId);
   if (!device) {
-    return { mode: "legacy_unverified", reason: "device_missing" };
+    throw new HttpError(409, "identity_refresh_required", "recipient device authorization changed");
   }
   if (device.status !== "active") {
-    return { mode: "legacy_unverified", reason: "device_not_active" };
+    throw new HttpError(403, "device_revoked", "recipient device is revoked");
   }
-  if (device.deviceId !== capability.targetDeviceId || device.binding.userId !== bundle.userId || device.binding.deviceId !== device.deviceId || device.binding.devicePublicKey !== device.devicePublicKey || device.inboxAppendCapability.signature !== capability.signature) {
-    return { mode: "legacy_unverified", reason: "device_binding_mismatch" };
+  if (device.deviceId !== capability.targetDeviceId || device.binding.userId !== bundle.userId || device.binding.deviceId !== device.deviceId || device.binding.devicePublicKey !== device.devicePublicKey) {
+    throw new HttpError(500, "storage_integrity_error", "recipient device binding is inconsistent");
   }
   if (!verifyDeviceBinding(bundle.userPublicKey, device.binding)) {
-    return { mode: "legacy_unverified", reason: "device_binding_invalid" };
+    throw new HttpError(500, "storage_integrity_error", "recipient device binding is invalid");
   }
   if (!verifyInboxAppendCapability(capability, device.devicePublicKey)) {
-    return { mode: "legacy_unverified", reason: "capability_signature_invalid" };
+    throw new HttpError(403, "invalid_capability", "append capability signature is invalid");
+  }
+  if (capability.expiresAt <= now) {
+    throw new HttpError(422, "capability_expired", "append capability is expired");
+  }
+  if (device.inboxAppendCapability?.signature !== capability.signature) {
+    throw new HttpError(409, "identity_refresh_required", "recipient append authorization changed");
   }
   return { mode: "verified" };
 }
@@ -2160,6 +2163,10 @@ function bindingPayload(binding) {
 }
 function identityBundlePayload(bundle, includeDisplayName) {
   const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
+  if ((bundle.publicationVersion ?? 0) > 0) {
+    parts.push(String(bundle.publicationVersion));
+    parts.push(String(bundle.publicationRevision ?? 0));
+  }
   if (includeDisplayName) {
     parts.push(bundle.displayName ?? "");
   }
@@ -2175,13 +2182,22 @@ function identityBundlePayload(bundle, includeDisplayName) {
     parts.push(device.deviceId);
     parts.push(device.devicePublicKey);
     parts.push(device.binding.signature);
-    parts.push(device.inboxAppendCapability.signature);
-    parts.push(keyPackageRefValue(device));
-    parts.push(String(device.keypackageRef.expiresAt));
+    parts.push(device.inboxAppendCapability?.signature ?? "");
+    if ((bundle.publicationVersion ?? 0) > 0) {
+      parts.push(String(device.keypackageRef?.lifecycleVersion ?? ""));
+      parts.push(keyPackageRefValue(device));
+      parts.push(String(device.keypackageRef?.notBefore ?? ""));
+      parts.push(String(device.keypackageRef?.createdAt ?? ""));
+      parts.push(String(device.keypackageRef?.expiresAt ?? ""));
+    } else {
+      parts.push(keyPackageRefValue(device));
+      parts.push(String(device.keypackageRef?.expiresAt ?? ""));
+    }
   }
   return parts.join("|");
 }
 function keyPackageRefValue(device) {
+  if (!device.keypackageRef) return "";
   const keypackage = device.keypackageRef;
   return keypackage.ref ?? keypackage.objectRef ?? "";
 }
@@ -2189,7 +2205,7 @@ function verifyIdentityBundle(bundle) {
   if (bundle.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
-  return verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) || verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false));
+  return verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) || (bundle.publicationVersion ?? 0) === 0 && verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false));
 }
 function verifyDeviceBinding(userPublicKey, binding) {
   if (binding.version !== CURRENT_MODEL_VERSION) {
@@ -2612,17 +2628,113 @@ function deviceRuntimeSigningPayload(challenge) {
   ].join("\n");
 }
 
+// src/error-codes.generated.ts
+var ERROR_DEFAULTS = {
+  invalid_input: ["validation", false, null],
+  invalid_state: ["core", false, "restart_app"],
+  unsupported: ["core", false, "upgrade_app"],
+  temporary_failure: ["transport", true, "retry"],
+  temporary_unavailable: ["transport", true, "retry"],
+  network_unavailable: ["transport", true, "reconnect"],
+  request_timeout: ["transport", true, "retry"],
+  restore_failed: ["storage", false, "copy_diagnostics"],
+  storage_integrity_error: ["storage", false, "copy_diagnostics"],
+  not_found: ["transport", false, null],
+  conflict: ["transport", true, "sync_now"],
+  rate_limited: ["transport", true, "retry_later"],
+  request_too_large: ["validation", false, null],
+  payload_too_large: ["validation", false, null],
+  invalid_capability: ["security", false, "refresh_identity"],
+  capability_expired: ["security", true, "refresh_identity"],
+  runtime_auth_expired: ["runtime", true, "reconnect_runtime"],
+  runtime_auth_invalid: ["runtime", false, "reconnect_runtime"],
+  runtime_misconfigured: ["runtime", false, "upgrade_runtime"],
+  runtime_mismatch: ["runtime", false, "reconnect_runtime"],
+  runtime_missing_group_outbox: ["runtime", false, "upgrade_runtime"],
+  enrollment_required: ["runtime", false, "reconnect_runtime"],
+  device_revoked: ["security", false, null],
+  upgrade_required: ["runtime", false, "upgrade_runtime"],
+  keypackage_expired: ["mls", true, "refresh_identity"],
+  keypackage_lifetime_invalid: ["mls", false, "refresh_identity"],
+  keypackage_refresh_pending: ["mls", true, "reconnect"],
+  keypackage_publish_failed: ["mls", true, "retry"],
+  device_clock_invalid: ["security", false, null],
+  identity_bundle_conflict: ["identity", true, "sync_now"],
+  identity_refresh_required: ["identity", true, "refresh_identity"],
+  contact_share_offline: ["identity", true, "reconnect"],
+  contact_share_publish_failed: ["identity", true, "retry"],
+  contact_share_rotation_unverified: ["identity", true, "reconnect"],
+  contact_share_revoked: ["identity", false, null],
+  relationship_closed: ["identity", false, null],
+  group_transition_conflict: ["group", true, "sync_now"],
+  roster_version_conflict: ["group", true, "sync_now"],
+  already_sealed: ["group", false, null],
+  challenge_replayed: ["security", false, "reconnect_runtime"],
+  group_authorization_conflict: ["group", true, "sync_now"],
+  group_authorization_uninitialized: ["group", true, "sync_now"],
+  group_join_claimed: ["group", true, "retry_later"],
+  group_join_lease_invalid: ["group", true, "retry"],
+  group_join_terminal: ["group", false, null],
+  group_leave_claimed: ["group", true, "retry_later"],
+  group_leave_lease_invalid: ["group", true, "retry"],
+  group_leave_terminal: ["group", false, null],
+  group_membership_revoked: ["group", false, null],
+  group_membership_uninitialized: ["group", true, "sync_now"],
+  group_sealed: ["group", false, null],
+  group_transition_invalid: ["group", false, "sync_now"],
+  group_transition_required: ["group", true, "sync_now"],
+  invalid_ack: ["validation", false, "sync_now"],
+  invalid_invite: ["validation", false, null],
+  message_request_capacity_exceeded: ["transport", true, "retry_later"],
+  range_not_satisfiable: ["validation", false, null],
+  unsupported_version: ["runtime", false, "upgrade_runtime"],
+  blob_not_found: ["storage", false, null],
+  profile_required: ["core", false, null],
+  profile_locked: ["security", false, "retry"],
+  profile_passphrase_required: ["security", false, "retry"],
+  auth_failed: ["security", false, "retry"],
+  unexpected_error: ["core", true, "retry"]
+};
+
+// src/errors.ts
+function registeredCode(code) {
+  return Object.prototype.hasOwnProperty.call(ERROR_DEFAULTS, code) ? code : "unexpected_error";
+}
+function appErrorBody(status, code, correlationId, retryableOverride) {
+  const safeCode = registeredCode(code);
+  const [domain, defaultRetryable, defaultAction] = ERROR_DEFAULTS[safeCode];
+  const retryable = retryableOverride ?? defaultRetryable;
+  return {
+    version: 1,
+    code: safeCode,
+    domain,
+    retryable,
+    ...defaultAction ? { action: defaultAction } : {},
+    httpStatus: status,
+    correlationId
+  };
+}
+
 // src/device-registry/durable.ts
 var CHALLENGE_TTL_MS = 5 * 60 * 1e3;
 var CHALLENGE_PREFIX = "challenge:";
 var DEVICE_PREFIX = "device:";
+var IDENTITY_BUNDLE_KEY = "identity_bundle:v2";
 var MAX_ACTIVE_CHALLENGES = 8;
+var KEY_PACKAGE_LIFETIME_MS = 84 * 24 * 60 * 60 * 1e3;
+var KEY_PACKAGE_NOT_BEFORE_SKEW_MS = 60 * 60 * 1e3;
+var KEY_PACKAGE_MIN_REMAINING_MS = 7 * 24 * 60 * 60 * 1e3;
+var CLOCK_TOLERANCE_MS = 5 * 60 * 1e3;
+var INBOX_CAPABILITY_MAX_LIFETIME_MS = 365 * 24 * 60 * 60 * 1e3;
 var DurableObjectBase = globalThis.DurableObject ?? class {
   constructor(_state, _env) {
   }
 };
 function jsonResponse(body, status = 200) {
   return Response.json(body, { status });
+}
+function errorResponse(status, code) {
+  return jsonResponse(appErrorBody(status, code, crypto.randomUUID()), status);
 }
 function runtimeConfig(env) {
   const runtimeId = env.RUNTIME_ID?.trim();
@@ -2649,6 +2761,50 @@ async function bindingHash(device) {
     new TextEncoder().encode(JSON.stringify(device.binding))
   );
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function identityBundleEtag(bundle) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(bundle))
+  );
+  const value = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `"${value}"`;
+}
+function validateIdentityBundleLifecycle(bundle, writerDeviceId, now) {
+  if (bundle.publicationVersion !== 1 || !Number.isSafeInteger(bundle.publicationRevision) || bundle.publicationRevision < 1) {
+    throw new HttpError(426, "upgrade_required", "identity bundle publication protocol is not supported");
+  }
+  const writer = bundle.devices.find((device) => device.deviceId === writerDeviceId);
+  if (!writer || writer.status !== "active") {
+    throw new HttpError(403, "device_revoked", "publishing device is not active in the identity bundle");
+  }
+  for (const device of bundle.devices) {
+    const keyPackage = device.keypackageRef;
+    if (keyPackage) {
+      if (keyPackage.createdAt > now + CLOCK_TOLERANCE_MS || keyPackage.notBefore > now + CLOCK_TOLERANCE_MS) {
+        throw new HttpError(422, "device_clock_invalid", "key package timestamps are too far in the future");
+      }
+      const validMetadata = keyPackage.lifecycleVersion === 1 && Number.isSafeInteger(keyPackage.notBefore) && Number.isSafeInteger(keyPackage.createdAt) && Number.isSafeInteger(keyPackage.expiresAt) && keyPackage.userId === bundle.userId && keyPackage.deviceId === device.deviceId && keyPackage.expiresAt - keyPackage.createdAt === KEY_PACKAGE_LIFETIME_MS && keyPackage.notBefore === Math.max(0, keyPackage.createdAt - KEY_PACKAGE_NOT_BEFORE_SKEW_MS);
+      if (!validMetadata) {
+        throw new HttpError(422, "keypackage_lifetime_invalid", "key package lifecycle metadata is invalid");
+      }
+      if (keyPackage.expiresAt <= now - CLOCK_TOLERANCE_MS) {
+        throw new HttpError(422, "keypackage_expired", "key package is expired");
+      }
+    }
+    const capability = device.inboxAppendCapability;
+    if (capability) {
+      if (capability.userId !== bundle.userId || capability.targetDeviceId !== device.deviceId || capability.expiresAt <= now - CLOCK_TOLERANCE_MS || capability.expiresAt > now + INBOX_CAPABILITY_MAX_LIFETIME_MS + CLOCK_TOLERANCE_MS) {
+        throw new HttpError(422, "capability_expired", "inbox append capability lifecycle is invalid");
+      }
+    }
+  }
+  if (!writer.keypackageRef || writer.keypackageRef.expiresAt < now + KEY_PACKAGE_MIN_REMAINING_MS) {
+    throw new HttpError(422, "keypackage_expired", "publishing device key package has insufficient remaining lifetime");
+  }
+  if (!writer.inboxAppendCapability || writer.inboxAppendCapability.expiresAt <= now) {
+    throw new HttpError(422, "capability_expired", "publishing device inbox append capability is expired");
+  }
 }
 function assertChallengeScope(challenge, purpose, config, now) {
   if (challenge.version !== CURRENT_MODEL_VERSION || challenge.purpose !== purpose || challenge.runtimeId !== config.runtimeId || challenge.userId !== config.userId || !challenge.deviceId || !challenge.nonce || challenge.expiresAt <= now) {
@@ -2688,12 +2844,18 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
       if (request.method === "POST" && url.pathname.endsWith("/sync")) {
         return await this.syncIdentityBundle(request, now);
       }
-      return jsonResponse({ error: "not_found" }, 404);
+      if (request.method === "GET" && url.pathname.endsWith("/identity-bundle")) {
+        return await this.getIdentityBundle();
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/identity-bundle/migrate")) {
+        return await this.migrateIdentityBundle(request, now);
+      }
+      return errorResponse(404, "not_found");
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonResponse({ error: error.code, message: error.message }, error.status);
+        return errorResponse(error.status, error.code);
       }
-      return jsonResponse({ error: "temporary_unavailable", message: "device registry request failed" }, 500);
+      return errorResponse(500, "temporary_unavailable");
     }
   }
   async ready() {
@@ -2702,9 +2864,9 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
     return jsonResponse({
       ready: true,
       runtimeId: config.runtimeId,
-      protocolVersion: 4,
-      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v4-unknown",
-      registrySchemaVersion: 1
+      protocolVersion: 5,
+      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+      registrySchemaVersion: 2
     });
   }
   async issueChallenge(request, now) {
@@ -2811,46 +2973,122 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
     return jsonResponse({ active: true });
   }
   async syncIdentityBundle(request, now) {
-    const bundle = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const bundle = body.bundle;
+    if (!bundle || !body.writerDeviceId) {
+      throw new HttpError(426, "upgrade_required", "structured identity publication is required");
+    }
     const config = runtimeConfig(this.envRef);
+    validateIdentityBundleLifecycle(bundle, body.writerDeviceId, now);
     if (bundle.userId !== config.userId || bundle.userPublicKey !== config.userPublicKey || !verifyIdentityBundle(bundle)) {
       throw new HttpError(403, "runtime_auth_invalid", "identity bundle does not match runtime owner");
     }
-    const changes = [];
+    const preparedDevices = [];
     for (const device of bundle.devices) {
       if (device.binding.userId !== config.userId || device.binding.deviceId !== device.deviceId || device.binding.devicePublicKey !== device.devicePublicKey || !verifyDeviceBinding(config.userPublicKey, device.binding)) {
         throw new HttpError(403, "runtime_auth_invalid", "identity bundle contains an invalid device binding");
       }
       const key = deviceKey(device.deviceId);
       const hash = await bindingHash(device);
-      const existing = await this.stateRef.storage.get(key);
-      if (existing && (existing.devicePublicKey !== device.devicePublicKey || existing.bindingHash !== hash)) {
-        throw new HttpError(403, "runtime_auth_invalid", "identity bundle attempts to replace a registered device key");
+      preparedDevices.push({ device, key, hash });
+    }
+    const etag = await identityBundleEtag(bundle);
+    await this.stateRef.storage.transaction(async (transaction) => {
+      const stored = await transaction.get(IDENTITY_BUNDLE_KEY);
+      if (stored) {
+        if (!body.expectedEtag || body.expectedEtag !== stored.etag) {
+          throw new HttpError(412, "identity_bundle_conflict", "identity bundle ETag does not match");
+        }
+        if ((bundle.publicationRevision ?? 0) <= (stored.bundle.publicationRevision ?? 0)) {
+          throw new HttpError(412, "identity_bundle_conflict", "identity bundle revision is not newer");
+        }
+      } else if (body.expectedEtag && body.expectedEtag !== "*") {
+        throw new HttpError(412, "identity_bundle_conflict", "identity bundle does not exist at the expected ETag");
       }
-      if (existing?.status === "revoked" && device.status === "active") {
-        throw new HttpError(403, "device_revoked", "identity bundle attempts to reactivate a revoked device");
-      }
-      const status = existing?.status === "revoked" || device.status === "revoked" ? "revoked" : "active";
-      changes.push({
-        key,
-        record: {
+      for (const prepared of preparedDevices) {
+        const existing = await transaction.get(prepared.key);
+        if (existing && (existing.devicePublicKey !== prepared.device.devicePublicKey || existing.bindingHash !== prepared.hash)) {
+          throw new HttpError(403, "runtime_auth_invalid", "identity bundle attempts to replace a registered device key");
+        }
+        if (existing?.status === "revoked" && prepared.device.status === "active") {
+          throw new HttpError(403, "device_revoked", "identity bundle attempts to reactivate a revoked device");
+        }
+        const status = existing?.status === "revoked" || prepared.device.status === "revoked" ? "revoked" : "active";
+        await transaction.put(prepared.key, {
           version: CURRENT_MODEL_VERSION,
           runtimeId: config.runtimeId,
           userId: config.userId,
-          deviceId: device.deviceId,
-          devicePublicKey: device.devicePublicKey,
-          bindingHash: hash,
+          deviceId: prepared.device.deviceId,
+          devicePublicKey: prepared.device.devicePublicKey,
+          bindingHash: prepared.hash,
           status,
           registrationVersion: existing && existing.status !== status ? existing.registrationVersion + 1 : existing?.registrationVersion ?? 1,
           createdAt: existing?.createdAt ?? now,
           updatedAt: now
-        }
+        });
+      }
+      await transaction.put(IDENTITY_BUNDLE_KEY, { bundle, etag });
+    });
+    const response = jsonResponse(bundle);
+    response.headers.set("etag", etag);
+    return response;
+  }
+  async getIdentityBundle() {
+    const stored = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    if (!stored) return errorResponse(404, "not_found");
+    const response = jsonResponse(stored.bundle);
+    response.headers.set("etag", stored.etag);
+    return response;
+  }
+  async migrateIdentityBundle(request, now) {
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const bundle = body.bundle;
+    const config = runtimeConfig(this.envRef);
+    if (!bundle || bundle.userId !== config.userId || bundle.userPublicKey !== config.userPublicKey || !verifyIdentityBundle(bundle)) {
+      throw new HttpError(403, "runtime_auth_invalid", "legacy identity bundle is invalid");
+    }
+    const preparedDevices = [];
+    for (const device of bundle.devices) {
+      if (device.binding.userId !== config.userId || device.binding.deviceId !== device.deviceId || device.binding.devicePublicKey !== device.devicePublicKey || !verifyDeviceBinding(config.userPublicKey, device.binding)) {
+        throw new HttpError(403, "runtime_auth_invalid", "legacy identity bundle contains an invalid device binding");
+      }
+      preparedDevices.push({
+        device,
+        key: deviceKey(device.deviceId),
+        hash: await bindingHash(device)
       });
     }
-    await this.stateRef.storage.transaction(async (transaction) => {
-      for (const change of changes) await transaction.put(change.key, change.record);
+    const etag = await identityBundleEtag(bundle);
+    const stored = await this.stateRef.storage.transaction(async (transaction) => {
+      const existingBundle = await transaction.get(IDENTITY_BUNDLE_KEY);
+      if (existingBundle) return existingBundle;
+      for (const prepared of preparedDevices) {
+        const existing = await transaction.get(prepared.key);
+        if (existing && (existing.devicePublicKey !== prepared.device.devicePublicKey || existing.bindingHash !== prepared.hash)) {
+          throw new HttpError(403, "runtime_auth_invalid", "legacy identity bundle conflicts with a registered device");
+        }
+        if (!existing) {
+          await transaction.put(prepared.key, {
+            version: CURRENT_MODEL_VERSION,
+            runtimeId: config.runtimeId,
+            userId: config.userId,
+            deviceId: prepared.device.deviceId,
+            devicePublicKey: prepared.device.devicePublicKey,
+            bindingHash: prepared.hash,
+            status: prepared.device.status,
+            registrationVersion: 1,
+            createdAt: now,
+            updatedAt: now
+          });
+        }
+      }
+      const migrated = { bundle, etag };
+      await transaction.put(IDENTITY_BUNDLE_KEY, migrated);
+      return migrated;
     });
-    return jsonResponse({ synchronized: changes.length });
+    const response = jsonResponse(stored.bundle);
+    response.headers.set("etag", stored.etag);
+    return response;
   }
 };
 function registryStub(env) {
@@ -2867,7 +3105,8 @@ async function assertRegisteredRuntimeToken(env, token) {
   );
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
-    throw new HttpError(response.status, body.error ?? "runtime_auth_invalid", body.message ?? "device registry rejected token");
+    const code = body.code ?? "runtime_auth_invalid";
+    throw new HttpError(response.status, code, code);
   }
 }
 
@@ -4787,14 +5026,12 @@ async function handleGroupOutboxDurableRequest(request, deps) {
         })
       );
     }
-    return jsonResponse2({ error: "not_found" }, 404);
+    return jsonResponse2(appErrorBody(404, "not_found", crypto.randomUUID()), 404);
   } catch (error) {
     if (error instanceof HttpError) {
-      return jsonResponse2({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
+      return jsonResponse2(appErrorBody(error.status, error.code, crypto.randomUUID()), error.status);
     }
-    const runtimeError = error;
-    const message = runtimeError.message ?? "internal error";
-    return jsonResponse2({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse2(appErrorBody(500, "temporary_unavailable", crypto.randomUUID()), 500);
   }
 }
 async function verifyInviteToken(secret, token, now) {
@@ -4853,9 +5090,9 @@ var GroupOutboxDurableObject = class extends DurableObjectBase2 {
       deviceRuntimeSecrets2 = requireDeviceRuntimeSecrets(this.envRef);
     } catch (error) {
       if (error instanceof HttpError) {
-        return jsonResponse2({ error: error.code, message: error.message }, error.status);
+        return jsonResponse2(appErrorBody(error.status, error.code, crypto.randomUUID()), error.status);
       }
-      return jsonResponse2({ error: "runtime_misconfigured", message: "sharing secret is invalid" }, 503);
+      return jsonResponse2(appErrorBody(503, "runtime_misconfigured", crypto.randomUUID()), 503);
     }
     const groupId = await groupIdFromGroupOutboxRequestUrl(url, sharingSecret, Date.now());
     this.groupIdRef = groupId;
@@ -5002,9 +5239,7 @@ var InboxService = class {
       return rejected;
     }
     if (authContext.mode !== "verified") {
-      const request2 = await this.queueMessageRequestWithLimit(input, now);
-      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request2);
-      return request2;
+      throw new HttpError(426, "upgrade_required", "verified append authorization is required");
     }
     if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
       const delivered = await this.deliverEnvelope(input, now);
@@ -5820,19 +6055,17 @@ async function handleInboxDurableRequest(request, deps) {
       const result = await service.getHead();
       return jsonResponse3(result);
     }
-    return jsonResponse3({ error: "not_found" }, 404);
+    return jsonResponse3(appErrorBody(404, "not_found", crypto.randomUUID()), 404);
   } catch (error) {
     if (error instanceof HttpError) {
       const retryAfter = error.details?.retryAfterSeconds;
       return jsonResponse3(
-        { error: error.code, message: error.message },
+        appErrorBody(error.status, error.code, crypto.randomUUID()),
         error.status,
         typeof retryAfter === "number" ? { "Retry-After": String(retryAfter) } : void 0
       );
     }
-    const runtimeError = error;
-    const message = runtimeError.message ?? "internal error";
-    return jsonResponse3({ error: "temporary_unavailable", message }, 500);
+    return jsonResponse3(appErrorBody(500, "temporary_unavailable", crypto.randomUUID()), 500);
   }
 }
 var InboxDurableObject = class extends DurableObjectBase3 {
@@ -6011,16 +6244,16 @@ var SharedStateService = class {
     }
     const normalized = {
       ...bundle,
-      identityBundleRef: this.identityBundleUrl(userId),
-      deviceStatusRef: bundle.deviceStatusRef ?? this.deviceStatusUrl(userId),
       devices: bundle.devices.map((device) => ({
         ...device,
-        keypackageRef: {
-          ...device.keypackageRef,
-          userId,
-          deviceId: device.deviceId,
-          ref: device.keypackageRef.ref
-        }
+        ...device.keypackageRef ? {
+          keypackageRef: {
+            ...device.keypackageRef,
+            userId,
+            deviceId: device.deviceId,
+            ref: device.keypackageRef.ref
+          }
+        } : {}
       }))
     };
     await this.store.putJson(this.identityBundleKey(userId), normalized);
@@ -6333,6 +6566,10 @@ function jsonResponse4(body, status = 200) {
     }
   });
 }
+function structuredErrorResponse(request, status, code, retryable) {
+  const correlationId = request.headers.get("cf-ray") ?? crypto.randomUUID();
+  return jsonResponse4(appErrorBody(status, code, correlationId, retryable), status);
+}
 function forwardRequestWithBody(request, body) {
   return new Request(request.url, {
     method: request.method,
@@ -6438,6 +6675,42 @@ function runtimeIdentity(env) {
   }
   return { runtimeId, userId, userPublicKey };
 }
+async function authoritativeIdentityBundle(env, sharedState) {
+  const { userId } = runtimeIdentity(env);
+  const registry = registryStub(env);
+  const authoritative = await registry.fetch(
+    new Request("https://device-registry.internal/v2/device-registry/identity-bundle")
+  );
+  if (authoritative.ok) {
+    return await authoritative.json();
+  }
+  if (authoritative.status !== 404) {
+    const error = await authoritative.json().catch(() => ({}));
+    throw new HttpError(
+      authoritative.status,
+      error.code ?? "temporary_unavailable",
+      "authoritative identity lookup failed"
+    );
+  }
+  const legacyBundle = await sharedState.getIdentityBundle(userId);
+  if (!legacyBundle) return null;
+  const migrated = await registry.fetch(
+    new Request("https://device-registry.internal/v2/device-registry/identity-bundle/migrate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bundle: legacyBundle })
+    })
+  );
+  if (!migrated.ok) {
+    const error = await migrated.json().catch(() => ({}));
+    throw new HttpError(
+      migrated.status,
+      error.code ?? "temporary_unavailable",
+      "legacy identity migration failed"
+    );
+  }
+  return await migrated.json();
+}
 async function issueDeviceRuntimeAuth(env, userId, deviceId, registrationVersion, now) {
   const { runtimeId } = runtimeIdentity(env);
   const expiresAt = now + 24 * 60 * 60 * 1e3;
@@ -6473,9 +6746,9 @@ function publicDeploymentBundle(request, env) {
   return {
     version: CURRENT_MODEL_VERSION,
     runtimeId,
-    protocolVersion: 4,
-    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v4-unknown",
-    registrySchemaVersion: 1,
+    protocolVersion: 5,
+    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+    registrySchemaVersion: 2,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
     inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
@@ -6503,7 +6776,10 @@ function publicDeploymentBundle(request, env) {
         "group_membership_fsm_v2",
         "runtime_secret_rotation_v1",
         "device_runtime_refresh_v2",
-        "device_registry_v1"
+        "device_registry_v1",
+        "keypackage_lifecycle_v1",
+        "identity_bundle_cas_v1",
+        "structured_errors_v1"
       ]
     }
   };
@@ -6536,13 +6812,14 @@ async function authorizeSharedStateWrite(request, env, userId, objectKind, now) 
     if (auth.userId !== userId) {
       throw new HttpError(403, "invalid_capability", "device runtime token scope does not match request path");
     }
-    return;
+    return auth;
   } catch (error) {
     if (!(error instanceof HttpError) || error.code === "runtime_auth_expired" || error.code === "device_revoked" || error.code === "runtime_mismatch" || error.code === "enrollment_required") {
       throw error;
     }
   }
   await validateSharedStateWriteAuthorization(request, sharedStateSecret(env), userId, "", objectKind, now);
+  throw new HttpError(426, "upgrade_required", "device runtime authorization is required for shared-state writes");
 }
 async function handleRequest(request, env) {
   try {
@@ -6569,10 +6846,7 @@ async function handleRequest(request, env) {
           new Request("https://device-registry.internal/v2/device-registry/ready")
         );
       } catch {
-        return jsonResponse4(
-          { error: "temporary_unavailable", message: "device registry is not ready" },
-          503
-        );
+        return structuredErrorResponse(request, 503, "temporary_unavailable", true);
       }
     }
     const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
@@ -6582,9 +6856,9 @@ async function handleRequest(request, env) {
       if (payload.service !== "contact_share" || !payload.userId || !payload.shareId) {
         throw new HttpError(403, "invalid_capability", "invalid contact share token");
       }
-      const bundle = await sharedState.getIdentityBundle(payload.userId);
-      if (!bundle || bundle.bundleShareId !== payload.shareId) {
-        return jsonResponse4({ error: "not_found", message: "contact share not found" }, 404);
+      const bundle = await authoritativeIdentityBundle(env, sharedState);
+      if (!bundle || bundle.userId !== payload.userId || bundle.bundleShareId !== payload.shareId) {
+        throw new HttpError(404, "contact_share_revoked", "contact share not found");
       }
       return jsonResponse4(bundle);
     }
@@ -6601,10 +6875,7 @@ async function handleRequest(request, env) {
           body: bodyText
         }));
       } catch {
-        return jsonResponse4(
-          { error: "temporary_unavailable", message: "device registry is not ready" },
-          503
-        );
+        return structuredErrorResponse(request, 503, "temporary_unavailable", true);
       }
     }
     if (request.method === "POST" && url.pathname === "/v2/runtime-auth/enroll") {
@@ -6650,12 +6921,15 @@ async function handleRequest(request, env) {
       if (request.method === "POST" && operation === "messages") {
         const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         const body = JSON.parse(bodyText);
-        const appendAuth = await validateAppendAuthorization(request, deviceId, body, now, sharedState);
+        const appendAuth = await validateAppendAuthorization(
+          request,
+          deviceId,
+          body,
+          now,
+          () => authoritativeIdentityBundle(env, sharedState)
+        );
         const forwarded = forwardRequestWithBody(request, bodyText);
         forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, appendAuth.mode);
-        if (appendAuth.reason) {
-          forwarded.headers.set(APPEND_AUTH_REASON_HEADER, appendAuth.reason);
-        }
         return await stub.fetch(forwarded);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
@@ -6851,24 +7125,37 @@ async function handleRequest(request, env) {
     if (identityBundleMatch) {
       const userId = decodeURIComponent(identityBundleMatch[1]);
       if (request.method === "GET") {
-        const bundle = await sharedState.getIdentityBundle(userId);
-        if (!bundle) {
-          return jsonResponse4({ error: "not_found", message: "identity bundle not found" }, 404);
-        }
-        return jsonResponse4(bundle);
+        const authoritative = await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/identity-bundle")
+        );
+        if (authoritative.ok) return authoritative;
+        if (authoritative.status !== 404) return authoritative;
+        const legacyBundle = await sharedState.getIdentityBundle(userId);
+        if (!legacyBundle) throw new HttpError(404, "not_found", "identity bundle not found");
+        return registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/identity-bundle/migrate", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ bundle: legacyBundle })
+          })
+        );
       }
       if (request.method === "PUT") {
-        await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
+        const authorization = await authorizeSharedStateWrite(request, env, userId, "identity_bundle", now);
         const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
         const synchronized = await registryStub(env).fetch(new Request("https://device-registry.internal/v2/device-registry/sync", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify(body)
+          body: JSON.stringify({
+            bundle: body,
+            expectedEtag: request.headers.get("If-Match") ?? void 0,
+            writerDeviceId: authorization.deviceId
+          })
         }));
         if (!synchronized.ok) return synchronized;
-        await sharedState.putIdentityBundle(userId, body);
-        const saved = await sharedState.getIdentityBundle(userId);
-        return jsonResponse4(saved);
+        const saved = await synchronized.clone().json();
+        await sharedState.putIdentityBundle(userId, saved).catch(() => void 0);
+        return synchronized;
       }
     }
     const deviceStatusMatch = url.pathname.match(/^\/v1\/shared-state\/([^/]+)\/device-status$/);
@@ -6877,7 +7164,7 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const document = await sharedState.getDeviceStatus(userId);
         if (!document) {
-          return jsonResponse4({ error: "not_found", message: "device status not found" }, 404);
+          return structuredErrorResponse(request, 404, "not_found", false);
         }
         return jsonResponse4(document);
       }
@@ -6894,7 +7181,7 @@ async function handleRequest(request, env) {
       const userId = decodeURIComponent(deviceListMatch[1]);
       const document = await sharedState.getDeviceList(userId);
       if (!document) {
-        return jsonResponse4({ error: "not_found", message: "device list not found" }, 404);
+        return structuredErrorResponse(request, 404, "not_found", false);
       }
       return jsonResponse4(document);
     }
@@ -6905,7 +7192,7 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const document = await sharedState.getKeyPackageRefs(userId, deviceId);
         if (!document) {
-          return jsonResponse4({ error: "not_found", message: "keypackage refs not found" }, 404);
+          return structuredErrorResponse(request, 404, "not_found", false);
         }
         return jsonResponse4(document);
       }
@@ -6934,7 +7221,7 @@ async function handleRequest(request, env) {
       if (request.method === "GET") {
         const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
         if (!payload) {
-          return jsonResponse4({ error: "not_found", message: "keypackage not found" }, 404);
+          return structuredErrorResponse(request, 404, "not_found", false);
         }
         return new Response(payload, {
           status: 200,
@@ -7010,19 +7297,17 @@ async function handleRequest(request, env) {
         headers
       });
     }
-    return jsonResponse4({ error: "not_found", message: "route not found" }, 404);
+    return structuredErrorResponse(request, 404, "not_found", false);
   } catch (error) {
     if (error instanceof HttpError) {
-      const response = jsonResponse4({ error: error.code, message: error.message, ...error.details ? { details: error.details } : {} }, error.status);
+      const response = structuredErrorResponse(request, error.status, error.code);
       if (error.status === 416 && typeof error.details?.totalSize === "number") {
         response.headers.set("accept-ranges", "bytes");
         response.headers.set("content-range", `bytes */${error.details.totalSize}`);
       }
       return response;
     }
-    const runtimeError = error;
-    const message = runtimeError.message ?? "internal error";
-    return jsonResponse4({ error: "temporary_unavailable", message }, 500);
+    return structuredErrorResponse(request, 500, "temporary_unavailable", true);
   }
 }
 
@@ -7069,7 +7354,10 @@ var index_default = {
         error_type: error instanceof Error ? error.name : "unknown"
       }));
       logServerFailure(request, 500);
-      return Response.json({ error: "internal_error" }, { status: 500 });
+      return Response.json(
+        appErrorBody(500, "unexpected_error", request.headers.get("cf-ray") ?? crypto.randomUUID()),
+        { status: 500 }
+      );
     }
   }
 };

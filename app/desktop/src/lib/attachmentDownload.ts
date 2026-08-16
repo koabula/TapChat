@@ -1,4 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
+import { normalizeAppError, presentError } from "@/lib/errors";
+import { invokeApp as invoke } from "./tauri";
 import { save } from "@tauri-apps/plugin-dialog";
 
 export interface AttachmentDownloadRequest {
@@ -41,20 +42,11 @@ export function attachmentDefaultFileName(fileName: string | undefined, mimeType
 }
 
 export function formatAttachmentDownloadError(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error);
-  const lower = text.toLowerCase();
-  if (
-    lower.includes("capability_expired") ||
-    lower.includes("sharing token expired") ||
-    lower.includes("http 403") ||
-    lower.includes("link may have expired")
-  ) {
+  const code = normalizeAppError(error).code;
+  if (code === "capability_expired" || code === "invalid_capability") {
     return "Attachment link expired";
   }
-  if (lower.includes("metadata is missing") || lower.includes("attachment metadata missing")) {
-    return "Attachment metadata missing";
-  }
-  return text;
+  return presentError(error).message;
 }
 
 function isAbsoluteDestination(path: string): boolean {

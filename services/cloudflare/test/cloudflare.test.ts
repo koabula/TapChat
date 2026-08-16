@@ -76,6 +76,7 @@ const TEST_SHARING_SECRET = "test-sharing-secret-0123456789abcdef0123456789abcde
 const TEST_BOOTSTRAP_SECRET = "test-bootstrap-secret-0123456789abcdef0123456789abcdef";
 const TEST_DEVICE_RUNTIME_SECRET = "test-runtime-secret-0123456789abcdef0123456789abcdef";
 const TEST_DEVICE_RUNTIME_KEY_ID = "test-runtime-current";
+const DEFAULT_IDENTITY_FIXTURE_NOW = Date.now();
 
 test("observability route families never include stable path identifiers", () => {
   assert.equal(
@@ -381,6 +382,7 @@ class FakeDeviceRegistryStub {
   private readonly challenges = new Map<string, DeviceRuntimeRefreshChallenge>();
   private readonly records = new Map<string, { status: "active" | "revoked"; registrationVersion: number }>();
   private readonly config: () => { runtimeId: string; userId: string; workerBuildId: string };
+  private identityBundle: IdentityBundle | null = null;
 
   constructor(config: () => { runtimeId: string; userId: string; workerBuildId: string }) {
     this.config = config;
@@ -395,21 +397,21 @@ class FakeDeviceRegistryStub {
       return Response.json({
         ready: true,
         runtimeId: config.runtimeId,
-        protocolVersion: 4,
+        protocolVersion: 5,
         workerBuildId: config.workerBuildId,
-        registrySchemaVersion: 1
+        registrySchemaVersion: 2
       });
     }
     if (path.endsWith("/challenge")) {
       if (body.userId !== config.userId || (body.purpose !== "enroll" && body.purpose !== "refresh")) {
-        return Response.json({ error: "runtime_auth_invalid" }, { status: 400 });
+        return fakeAppError("runtime_auth_invalid", "runtime", 400);
       }
       const record = this.records.get(body.deviceId);
       if (body.purpose === "refresh" && !record) {
-        return Response.json({ error: "enrollment_required" }, { status: 403 });
+        return fakeAppError("enrollment_required", "runtime", 403);
       }
       if (record?.status === "revoked") {
-        return Response.json({ error: "device_revoked" }, { status: 403 });
+        return fakeAppError("device_revoked", "security", 403);
       }
       const challenge: DeviceRuntimeRefreshChallenge = {
         version: CURRENT_MODEL_VERSION,
@@ -427,25 +429,26 @@ class FakeDeviceRegistryStub {
       const challenge = body.challenge as DeviceRuntimeRefreshChallenge;
       const stored = this.challenges.get(challenge?.nonce);
       if (!stored || JSON.stringify(stored) !== JSON.stringify(challenge)) {
-        return Response.json({ error: "challenge_replayed" }, { status: 403 });
+        return fakeAppError("challenge_replayed", "security", 403);
       }
       if (challenge.expiresAt <= Date.now()) {
-        return Response.json({ error: "runtime_auth_invalid" }, { status: 403 });
+        return fakeAppError("runtime_auth_invalid", "runtime", 403);
       }
       this.challenges.delete(challenge.nonce);
       if (path.endsWith("/enroll")) this.records.set(challenge.deviceId, { status: "active", registrationVersion: 1 });
       const record = this.records.get(challenge.deviceId);
-      if (!record) return Response.json({ error: "enrollment_required" }, { status: 403 });
-      if (record.status === "revoked") return Response.json({ error: "device_revoked" }, { status: 403 });
+      if (!record) return fakeAppError("enrollment_required", "runtime", 403);
+      if (record.status === "revoked") return fakeAppError("device_revoked", "security", 403);
       return Response.json({ registrationVersion: record.registrationVersion });
     }
     if (path.endsWith("/authorize")) {
       const record = this.records.get(body.deviceId);
-      if (record?.status === "revoked") return Response.json({ error: "device_revoked" }, { status: 403 });
+      if (record?.status === "revoked") return fakeAppError("device_revoked", "security", 403);
       return Response.json({ active: true });
     }
     if (path.endsWith("/sync")) {
-      for (const device of body.devices ?? []) {
+      const identityBundle = body.bundle as IdentityBundle;
+      for (const device of identityBundle.devices ?? []) {
         const existing = this.records.get(device.deviceId);
         const status = existing?.status === "revoked" || device.status === "revoked" ? "revoked" : "active";
         this.records.set(device.deviceId, {
@@ -453,10 +456,33 @@ class FakeDeviceRegistryStub {
           registrationVersion: existing && existing.status !== status ? existing.registrationVersion + 1 : existing?.registrationVersion ?? 1
         });
       }
-      return Response.json({ synchronized: body.devices?.length ?? 0 });
+      this.identityBundle = identityBundle;
+      return Response.json(identityBundle, { headers: { etag: `"${identityBundle.publicationRevision ?? 0}"` } });
     }
-    return Response.json({ error: "not_found" }, { status: 404 });
+    if (path.endsWith("/identity-bundle/migrate") && request.method === "POST") {
+      this.identityBundle = body.bundle as IdentityBundle;
+      return Response.json(this.identityBundle, {
+        headers: { etag: `"${this.identityBundle.publicationRevision ?? 0}"` }
+      });
+    }
+    if (path.endsWith("/identity-bundle") && request.method === "GET") {
+      return this.identityBundle
+        ? Response.json(this.identityBundle, { headers: { etag: `"${this.identityBundle.publicationRevision ?? 0}"` } })
+        : fakeAppError("not_found", "transport", 404);
+    }
+    return fakeAppError("not_found", "transport", 404);
   }
+}
+
+function fakeAppError(code: string, domain: string, status: number): Response {
+  return Response.json({
+    version: 1,
+    code,
+    domain,
+    retryable: false,
+    httpStatus: status,
+    correlationId: "test-request"
+  }, { status });
 }
 
 function createEnv(options?: {
@@ -617,7 +643,7 @@ function signedIdentityFixture(options?: {
   userId?: string;
   deviceId?: string;
 }) {
-  const now = Date.now();
+  const now = DEFAULT_IDENTITY_FIXTURE_NOW;
   const userSecret = new Uint8Array(32).fill(1);
   const deviceSecret = new Uint8Array(32).fill(2);
   const userId = options?.userId ?? "user:bob";
@@ -723,9 +749,9 @@ function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boole
     parts.push(device.deviceId);
     parts.push(device.devicePublicKey);
     parts.push(device.binding.signature);
-    parts.push(device.inboxAppendCapability.signature);
-    parts.push(device.keypackageRef.ref);
-    parts.push(String(device.keypackageRef.expiresAt));
+    parts.push(device.inboxAppendCapability!.signature);
+    parts.push(device.keypackageRef!.ref);
+    parts.push(String(device.keypackageRef!.expiresAt));
   }
   return parts.join("|");
 }
@@ -844,7 +870,7 @@ test("stale group transitions are classified as roster conflicts before proof va
   );
   const responseBody = await response.text();
   assert.equal(response.status, 409, responseBody);
-  assert.equal((JSON.parse(responseBody) as { error?: string }).error, "roster_version_conflict");
+  assert.equal((JSON.parse(responseBody) as { code?: string }).code, "roster_version_conflict");
 });
 
 interface GroupIdentityFixture {
@@ -1124,7 +1150,12 @@ async function issueDeviceBundle(env: Env, userId = "user:bob", deviceId = "devi
 }
 
 async function appendWithCapability(env: Env, append = sampleAppend()): Promise<Response> {
-  const capability = sampleCapability(append.recipientDeviceId);
+  const fixture = signedIdentityFixture({ deviceId: append.recipientDeviceId });
+  const capability = fixture.capability;
+  await env.TAPCHAT_STORAGE.put(
+    `shared-state/${fixture.userId}/identity_bundle.json`,
+    JSON.stringify(fixture.bundle)
+  );
   return handleRequest(
     new Request(`https://example.com/v1/inbox/${append.recipientDeviceId}/messages`, {
       method: "POST",
@@ -1168,9 +1199,9 @@ test("runtime readiness checks the device registry and reports its audience", as
   assert.deepEqual(await response.json(), {
     ready: true,
     runtimeId: "runtime:test",
-    protocolVersion: 4,
+    protocolVersion: 5,
     workerBuildId: "test-worker-v4",
-    registrySchemaVersion: 1
+    registrySchemaVersion: 2
   });
 });
 
@@ -1182,7 +1213,7 @@ test("runtime readiness reports a retryable error while the registry binding pro
     env
   );
   assert.equal(response.status, 503);
-  assert.equal((await response.json() as { error: string }).error, "temporary_unavailable");
+  assert.equal((await response.json() as { code: string }).code, "temporary_unavailable");
 });
 
 test("issues device deployment bundle with runtime auth and security features", async () => {
@@ -1382,7 +1413,7 @@ test("v2 device-signed runtime refresh issues 24h audience-bound credentials and
 
   const replay = await handleRequest(refreshRequest(), env);
   assert.equal(replay.status, 403);
-  assert.equal((await replay.json() as { error: string }).error, "challenge_replayed");
+  assert.equal((await replay.json() as { code: string }).code, "challenge_replayed");
 
 });
 
@@ -1439,7 +1470,7 @@ test("verified append capability delivers allowlisted sender to inbox", async ()
   assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 1 });
 });
 
-test("tampered append grant stays in message requests even when sender is allowlisted", async () => {
+test("tampered append grant is rejected even when sender is allowlisted", async () => {
   const { env, bucket } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
@@ -1461,18 +1492,11 @@ test("tampered append grant stays in message requests even when sender is allowl
     env
   );
 
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {
-    version: CURRENT_MODEL_VERSION,
-    accepted: true,
-    seq: 0,
-    deliveredTo: "message_request",
-    queuedAsRequest: true,
-    requestId: "request:user:alice"
-  });
+  assert.equal(response.status, 403);
+  assert.equal(((await response.json()) as { code: string }).code, "invalid_capability");
 });
 
-test("expired signed append grant stays in message requests even when sender is allowlisted", async () => {
+test("expired signed append grant requests a capability refresh", async () => {
   const { env, bucket } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
@@ -1493,15 +1517,8 @@ test("expired signed append grant stays in message requests even when sender is 
     env
   );
 
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {
-    version: CURRENT_MODEL_VERSION,
-    accepted: true,
-    seq: 0,
-    deliveredTo: "message_request",
-    queuedAsRequest: true,
-    requestId: "request:user:alice"
-  });
+  assert.equal(response.status, 422);
+  assert.equal(((await response.json()) as { code: string }).code, "capability_expired");
 
   const head = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/head`, {
@@ -1554,7 +1571,7 @@ test("signed append grant with mismatched target or endpoint is rejected", async
   }
 });
 
-test("routes append requests without capability header to message requests", async () => {
+test("append requests without capability header require an upgraded client", async () => {
   const { env } = createEnv();
   const response = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
@@ -1568,15 +1585,8 @@ test("routes append requests without capability header to message requests", asy
     env
   );
 
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {
-    version: CURRENT_MODEL_VERSION,
-    accepted: true,
-    seq: 0,
-    deliveredTo: "message_request",
-    queuedAsRequest: true,
-    requestId: "request:user:alice"
-  });
+  assert.equal(response.status, 426);
+  assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
 });
 
 test("enforces append conversation scope and payload size", async () => {
@@ -1658,10 +1668,8 @@ test("message requests stay out of inbox until accepted and reject blocks future
   assert.deepEqual(await allowlistedAppend.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 0,
-    deliveredTo: "message_request",
-    queuedAsRequest: true,
-    requestId: "request:user:alice"
+    seq: 3,
+    deliveredTo: "inbox"
   });
 
   const rejectList = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-3", "conv:alice:bob", "user:mallory"));
@@ -1761,7 +1769,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
     new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(token) }),
     env
   );
-  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 1 });
 
   const fetch = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", {
@@ -1771,7 +1779,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
   );
   const fetched = (await fetch.json()) as { version: string; records: Array<{ seq: number }> };
   assert.equal(fetched.version, CURRENT_MODEL_VERSION);
-  assert.deepEqual(fetched.records.map((record) => record.seq), []);
+  assert.deepEqual(fetched.records.map((record) => record.seq), [1]);
 
   const ack = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/ack", {
@@ -1825,10 +1833,8 @@ test("rate limit is per recipient sender pair and idempotent retries do not cons
   assert.deepEqual(await duplicate.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 0,
-    deliveredTo: "message_request",
-    queuedAsRequest: true,
-    requestId: "request:user:alice"
+    seq: 1,
+    deliveredTo: "inbox"
   });
 
   const limited = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-2", "conv:alice:bob", "user:alice"));
@@ -2313,7 +2319,7 @@ test("group outbox fails closed until authorization is initialized", async () =>
     }
   );
   assert.equal(response.status, 428);
-  assert.equal(((await response.json()) as { error: string }).error, "group_authorization_uninitialized");
+  assert.equal(((await response.json()) as { code: string }).code, "group_authorization_uninitialized");
 });
 
 test("group outbox ignores self-reported owner role and rejects forged seal capability", async () => {
@@ -2334,7 +2340,7 @@ test("group outbox ignores self-reported owner role and rejects forged seal capa
     env
   );
   assert.equal(response.status, 403);
-  assert.equal(((await response.json()) as { error: string }).error, "invalid_capability");
+  assert.equal(((await response.json()) as { code: string }).code, "invalid_capability");
 });
 
 test("group outbox subscribe allows members with subscribe operation only", async () => {
@@ -2655,7 +2661,7 @@ test("group outbox spills large records to R2 and fetches them back", async () =
     env
   );
   assert.equal(missingSpill.status, 500);
-  assert.equal(((await missingSpill.json()) as { error: string }).error, "storage_integrity_error");
+  assert.equal(((await missingSpill.json()) as { code: string }).code, "storage_integrity_error");
 });
 
 test("welcome pickup stores and fetches a device-scoped welcome", async () => {
@@ -2875,8 +2881,8 @@ test("group outbox seal returns 409 already_sealed on repeat", async () => {
     env
   );
   assert.equal(repeat.status, 409);
-  const body = (await repeat.json()) as { error?: string; message?: string };
-  assert.equal(body.error, "already_sealed");
+  const body = (await repeat.json()) as { code?: string };
+  assert.equal(body.code, "already_sealed");
 });
 
 test("group outbox seal rejects non-owner capability with 403 unauthorized", async () => {
@@ -2906,8 +2912,8 @@ test("group outbox seal rejects non-owner capability with 403 unauthorized", asy
     env
   );
   assert.equal(adminResp.status, 403);
-  const adminBody = (await adminResp.json()) as { error?: string };
-  assert.equal(adminBody.error, "invalid_capability");
+  const adminBody = (await adminResp.json()) as { code?: string };
+  assert.equal(adminBody.code, "invalid_capability");
 
   const ownerResp = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/seal", {
@@ -2918,8 +2924,8 @@ test("group outbox seal rejects non-owner capability with 403 unauthorized", asy
     env
   );
   assert.equal(ownerResp.status, 403);
-  const ownerBody = (await ownerResp.json()) as { error?: string };
-  assert.equal(ownerBody.error, "invalid_capability");
+  const ownerBody = (await ownerResp.json()) as { code?: string };
+  assert.equal(ownerBody.code, "invalid_capability");
 });
 
 test("group outbox append after seal returns 403 group_sealed", async () => {
@@ -3044,8 +3050,8 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
     env
   );
   assert.equal(postSealAppend.status, 403);
-  const appendBody = (await postSealAppend.json()) as { error?: string };
-  assert.equal(appendBody.error, "group_sealed");
+  const appendBody = (await postSealAppend.json()) as { code?: string };
+  assert.equal(appendBody.code, "group_sealed");
 
   const postSealInvite = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/invites", {
@@ -3065,7 +3071,7 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
     env
   );
   assert.equal(postSealInvite.status, 403);
-  assert.equal(((await postSealInvite.json()) as { error?: string }).error, "group_sealed");
+  assert.equal(((await postSealInvite.json()) as { code?: string }).code, "group_sealed");
 
   const postSealRevoke = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/invites/invite%3Apre-seal/revoke", {
@@ -3084,7 +3090,7 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
     env
   );
   assert.equal(postSealRevoke.status, 403);
-  assert.equal(((await postSealRevoke.json()) as { error?: string }).error, "group_sealed");
+  assert.equal(((await postSealRevoke.json()) as { code?: string }).code, "group_sealed");
 
   const postSealJoin = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/join-requests", {
@@ -3104,7 +3110,7 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
     env
   );
   assert.equal(postSealJoin.status, 403);
-  assert.equal(((await postSealJoin.json()) as { error?: string }).error, "group_sealed");
+  assert.equal(((await postSealJoin.json()) as { code?: string }).code, "group_sealed");
 
   const postSealDecision = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/join-requests/req%3Apre-seal/decision", {
@@ -3125,7 +3131,7 @@ test("group outbox append after seal returns 403 group_sealed", async () => {
     env
   );
   assert.equal(postSealDecision.status, 403);
-  assert.equal(((await postSealDecision.json()) as { error?: string }).error, "group_sealed");
+  assert.equal(((await postSealDecision.json()) as { code?: string }).code, "group_sealed");
 
   // Reads continue to work: fetch the pre-seal record, and head remains
   // the final pre-seal seq.
@@ -3186,14 +3192,14 @@ test("runtime secrets fail closed when missing, short, or placeholders", async (
     env.SHARING_INTERNAL_SECRET = invalid;
     const response = await handleRequest(new Request("https://example.com/v1/deployment-bundle"), env);
     assert.equal(response.status, 503);
-    assert.equal(((await response.json()) as { error: string }).error, "runtime_misconfigured");
+    assert.equal(((await response.json()) as { code: string }).code, "runtime_misconfigured");
   }
 
   const { env } = createEnv();
   env.DEVICE_RUNTIME_SECRET = "replace-me";
   const response = await handleRequest(new Request("https://example.com/v1/deployment-bundle"), env);
   assert.equal(response.status, 503);
-  assert.equal(((await response.json()) as { error: string }).error, "runtime_misconfigured");
+  assert.equal(((await response.json()) as { code: string }).code, "runtime_misconfigured");
 });
 
 test("append request body limit checks actual streamed bytes", async () => {
@@ -3209,7 +3215,7 @@ test("append request body limit checks actual streamed bytes", async () => {
     env
   );
   assert.equal(response.status, 413);
-  assert.equal(((await response.json()) as { error: string }).error, "request_too_large");
+  assert.equal(((await response.json()) as { code: string }).code, "request_too_large");
 });
 
 test("message request quotas, global rate limit, expiry, and capacity recovery work", async () => {
@@ -3229,21 +3235,21 @@ test("message request quotas, global rate limit, expiry, and capacity recovery w
     messageRequestRateLimitHour: 20
   });
 
-  await service.appendEnvelope(sampleAppend(undefined, "msg:q1", undefined, "user:one"), 1_000, { mode: "legacy_unverified" });
-  await service.appendEnvelope(sampleAppend(undefined, "msg:q2", undefined, "user:one"), 1_001, { mode: "legacy_unverified" });
+  await service.appendEnvelope(sampleAppend(undefined, "msg:q1", undefined, "user:one"), 1_000, { mode: "verified" });
+  await service.appendEnvelope(sampleAppend(undefined, "msg:q2", undefined, "user:one"), 1_001, { mode: "verified" });
   await assert.rejects(
-    () => service.appendEnvelope(sampleAppend(undefined, "msg:q3", undefined, "user:one"), 1_002, { mode: "legacy_unverified" }),
+    () => service.appendEnvelope(sampleAppend(undefined, "msg:q3", undefined, "user:one"), 1_002, { mode: "verified" }),
     (error: unknown) => (error as { code?: string }).code === "message_request_capacity_exceeded"
   );
   await assert.rejects(
-    () => service.appendEnvelope(sampleAppend(undefined, "msg:q4", undefined, "user:two"), 1_003, { mode: "legacy_unverified" }),
+    () => service.appendEnvelope(sampleAppend(undefined, "msg:q4", undefined, "user:two"), 1_003, { mode: "verified" }),
     (error: unknown) => (error as { code?: string }).code === "message_request_capacity_exceeded"
   );
 
   const queued = await service.listMessageRequests(1_002);
   assert.equal(queued.length, 1);
   await service.rejectMessageRequest(queued[0].requestId, 1_004);
-  await service.appendEnvelope(sampleAppend(undefined, "msg:q5", undefined, "user:two"), 1_005, { mode: "legacy_unverified" });
+  await service.appendEnvelope(sampleAppend(undefined, "msg:q5", undefined, "user:two"), 1_005, { mode: "verified" });
   assert.equal((await service.listMessageRequests(1_006)).length, 1);
   assert.equal((await service.listMessageRequests(11_006)).length, 0);
 
@@ -3261,10 +3267,10 @@ test("message request quotas, global rate limit, expiry, and capacity recovery w
     messageRequestRateLimitMinute: 2,
     messageRequestRateLimitHour: 20
   });
-  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r1", undefined, "user:one"), 1_000, { mode: "legacy_unverified" });
-  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r2", undefined, "user:two"), 1_001, { mode: "legacy_unverified" });
+  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r1", undefined, "user:one"), 1_000, { mode: "verified" });
+  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r2", undefined, "user:two"), 1_001, { mode: "verified" });
   await assert.rejects(
-    () => rateService.appendEnvelope(sampleAppend(undefined, "msg:r3", undefined, "user:three"), 1_002, { mode: "legacy_unverified" }),
+    () => rateService.appendEnvelope(sampleAppend(undefined, "msg:r3", undefined, "user:three"), 1_002, { mode: "verified" }),
     (error: unknown) => (error as { code?: string; details?: { retryAfterSeconds?: number } }).code === "message_request_rate_limited" &&
       Number((error as { details?: { retryAfterSeconds?: number } }).details?.retryAfterSeconds) > 0
   );

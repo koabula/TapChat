@@ -1,6 +1,7 @@
+import { presentError } from "@/lib/errors";
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
-import { invoke } from "@tauri-apps/api/core";
+import { invokeApp as invoke } from "@/lib/tauri";
 import { evaluatePassphraseStrength } from "@/lib/passphraseStrength";
 
 interface ProfileSummary {
@@ -87,7 +88,7 @@ export default function Identity() {
       // Move to identity step
       setStep("identity");
     } catch (err) {
-      console.error(`[OnboardingIdentity] Failed to create profile: ${String(err)}`);
+      console.error(`[OnboardingIdentity] Failed to create profile: ${presentError(err).message}`);
       // Handle different error formats
       const errorMsg = typeof err === 'string' ? err :
         (err instanceof Error ? err.message :
@@ -118,7 +119,7 @@ export default function Identity() {
         navigate("/onboarding/cloudflare");
       }
     } catch (err) {
-      setError(String(err));
+      setError(presentError(err).message);
     } finally {
       setLoading(false);
     }

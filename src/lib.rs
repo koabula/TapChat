@@ -1,10 +1,12 @@
 pub mod attachment_crypto;
 pub mod capability;
 pub mod cli;
+pub mod contact_share;
 pub mod contact_workflows;
 pub mod conversation;
 pub mod desktop_app;
 pub mod error;
+pub mod error_codes_generated;
 pub mod external_fetch;
 pub mod ffi_api;
 pub(crate) mod fs_util;
@@ -23,8 +25,11 @@ pub mod transport_contract;
 
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub use error::{CoreError, CoreResult};
-pub use ffi_api::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, CoreStateUpdate};
+pub use error::{AppErrorV1, CoreError, CoreResult, ErrorDomain, RecoveryAction};
+pub use ffi_api::{
+    CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOperationResult, CoreOperationStatus,
+    CoreOutput, CoreStateUpdate,
+};
 pub use logging::{LogLevel, Logger, NoopLogger};
 
 #[cfg(test)]
