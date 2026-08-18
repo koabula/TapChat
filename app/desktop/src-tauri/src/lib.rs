@@ -7,6 +7,7 @@ mod platform;
 mod ports;
 mod runtime_auth;
 mod state;
+mod storage_layout;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -40,31 +41,6 @@ pub fn ts_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-#[cfg(feature = "gui")]
-fn prune_old_log_files(logs_dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(logs_dir) else {
-        return;
-    };
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(7 * 24 * 60 * 60))
-        .unwrap_or(std::time::UNIX_EPOCH);
-
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        if modified < cutoff {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
 }
 
 /// Emit a `[TIMETEST]` log line. No-op when debug mode is off.
@@ -130,13 +106,6 @@ pub fn run() {
     // Updater public key for signature verification
     let updater_pubkey = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExOTAyMUI4NTBDM0U1QjAKUldTdzVjTlF1Q0dRb1VPeGZYQ3M1dC9kcEJ5S1hidHNFVFQrZVRzWks2RGQ3NEZWSGI0YkpTQVQK";
 
-    // Create AppState based on startup config
-    let app_state = if let Some(name) = &config.profile_name {
-        AppState::with_profile_name(name)
-    } else {
-        AppState::new()
-    };
-
     // Build Tauri app
     let builder = tauri::Builder::default().register_asynchronous_uri_scheme_protocol(
         "tapchat-media",
@@ -174,11 +143,6 @@ pub fn run() {
 
     // Determine log file name based on profile (multi-instance mode)
     let log_file_name = config.profile_name.as_ref().map(|n| format!("{}.log", n));
-    let log_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("TapChat")
-        .join("logs");
-    prune_old_log_files(&log_dir);
 
     let builder = builder.plugin(tauri_plugin_notification::init());
     #[cfg(feature = "gui")]
@@ -200,8 +164,7 @@ pub fn run() {
                 .level_for("tapchat_attachment", log::LevelFilter::Info)
                 .max_file_size(10_000_000)
                 .targets([tauri_plugin_log::Target::new(
-                    tauri_plugin_log::TargetKind::Folder {
-                        path: log_dir,
+                    tauri_plugin_log::TargetKind::LogDir {
                         file_name: log_file_name,
                     },
                 )])
@@ -213,9 +176,16 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_process::init())
-        .manage(app_state)
         .setup(move |app| {
             let handle = app.handle().clone();
+            let storage_layout = storage_layout::DesktopStorageLayout::from_app(&handle)?;
+            storage_layout.ensure_base_dirs()?;
+            let app_state = if let Some(name) = &config.profile_name {
+                AppState::with_profile_name_and_storage_layout(name, storage_layout)
+            } else {
+                AppState::with_storage_layout(storage_layout)
+            };
+            app.manage(app_state);
 
             // Log startup mode for debugging
             if config.multi_instance {
@@ -247,7 +217,20 @@ pub fn run() {
                             }
                         }
                         "quit" => {
-                            app.exit(0);
+                            let handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let state = handle.state::<AppState>();
+                                let profile_manager = {
+                                    let inner = state.inner.read().await;
+                                    inner.profile_manager.clone()
+                                };
+                                if let Err(error) =
+                                    profile_manager.checkpoint_active_profile().await
+                                {
+                                    log::warn!("profile checkpoint before exit failed: {error}");
+                                }
+                                handle.exit(0);
+                            });
                         }
                         _ => {}
                     })

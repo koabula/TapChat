@@ -246,16 +246,14 @@ fn cli_profile_short_passphrase_stdin_shows_storage_diagnostics() -> Result<()> 
     )?;
     assert_eq!(shown["profile"]["name"].as_str(), Some("short"));
     assert_eq!(shown["storage"]["state_db_exists"], Value::Bool(true));
-    assert_eq!(shown["storage"]["schema_version"].as_u64(), Some(1));
-    assert_eq!(shown["storage"]["migration_complete"], Value::Bool(true));
+    assert_eq!(shown["storage"]["schema_version"].as_u64(), Some(2));
+    assert_eq!(shown["storage"]["migration_complete"], Value::Bool(false));
     assert_eq!(
         shown["storage"]["encrypted_snapshot_exists"],
-        Value::Bool(true)
+        Value::Bool(false)
     );
     assert!(shown["storage"]["state_db_size_bytes"].as_u64().is_some());
-    assert!(shown["storage"]["encrypted_snapshot_size_bytes"]
-        .as_u64()
-        .is_some());
+    assert!(shown["storage"]["encrypted_snapshot_size_bytes"].is_null());
     assert!(shown["storage"]["legacy_files_present"]
         .as_array()
         .is_some_and(|value| value.is_empty()));

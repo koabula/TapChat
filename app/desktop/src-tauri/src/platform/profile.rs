@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use tapchat_core::cli::profile::{
-    Profile, ProfileInitOptions, ProfileMetadata, ProfileRegistry, RuntimeMetadata,
+    Profile, ProfileInitOptions, ProfileMetadata, ProfileOpenOptions, ProfileRegistry,
+    RuntimeMetadata,
 };
 use tapchat_core::persistence::CorePersistenceSnapshot;
 
 use crate::platform::log_sanitize::redact_id;
+use crate::storage_layout::DesktopStorageLayout;
 
 /// Desktop profile manager - wraps CLI ProfileRegistry and provides
 /// async access for the Tauri app.
@@ -24,6 +26,7 @@ pub struct ProfileManagerInner {
     pub active_profile: Option<Profile>,
     pub locked_profile_path: Option<PathBuf>,
     pub unlock_error: Option<String>,
+    pub storage_layout: DesktopStorageLayout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,9 +100,18 @@ pub struct SessionStartupCheck {
 
 impl ProfileManager {
     pub fn new() -> Self {
-        let registry = ProfileRegistry::load().unwrap_or_default();
+        let layout = DesktopStorageLayout::system_default()
+            .expect("desktop storage directories must be available");
+        Self::with_layout(layout)
+    }
+
+    pub fn with_layout(layout: DesktopStorageLayout) -> Self {
+        if let Err(error) = layout.ensure_base_dirs() {
+            log::error!("Failed to initialize desktop storage layout: {error}");
+        }
+        let registry = ProfileRegistry::load_from(&layout.registry_path).unwrap_or_default();
         let (active_profile, locked_profile_path, unlock_error) =
-            load_registry_active_profile(&registry);
+            load_registry_active_profile(&registry, &layout);
 
         Self {
             inner: Arc::new(RwLock::new(ProfileManagerInner {
@@ -107,6 +119,7 @@ impl ProfileManager {
                 active_profile,
                 locked_profile_path,
                 unlock_error,
+                storage_layout: layout,
             })),
         }
     }
@@ -114,7 +127,16 @@ impl ProfileManager {
     /// Create ProfileManager with a specific profile name (for multi-instance mode).
     /// This loads the named profile instead of the registry's active_profile.
     pub fn with_profile_name(name: &str) -> Self {
-        let registry = ProfileRegistry::load().unwrap_or_default();
+        let layout = DesktopStorageLayout::system_default()
+            .expect("desktop storage directories must be available");
+        Self::with_profile_name_and_layout(name, layout)
+    }
+
+    pub fn with_profile_name_and_layout(name: &str, layout: DesktopStorageLayout) -> Self {
+        if let Err(error) = layout.ensure_base_dirs() {
+            log::error!("Failed to initialize desktop storage layout: {error}");
+        }
+        let registry = ProfileRegistry::load_from(&layout.registry_path).unwrap_or_default();
 
         // Find profile by name in registry
         let selected_path = registry
@@ -123,7 +145,7 @@ impl ProfileManager {
             .find(|entry| entry.name == name)
             .map(|entry| entry.root_dir.clone());
         let (profile, locked_profile_path, unlock_error) = match selected_path {
-            Some(path) => match Profile::open(&path) {
+            Some(path) => match open_managed_profile(&layout, &path, None) {
                 Ok(profile) => (Some(profile), None, None),
                 Err(error) => {
                     log::error!(
@@ -150,6 +172,7 @@ impl ProfileManager {
                 active_profile: profile,
                 locked_profile_path,
                 unlock_error,
+                storage_layout: layout,
             })),
         }
     }
@@ -257,7 +280,7 @@ impl ProfileManager {
                         .and_then(|p| p.load_runtime_metadata().ok())
                         .map(|r| r.base_url.is_some())
                 } else {
-                    Profile::open(&entry.root_dir)
+                    open_managed_profile(&inner.storage_layout, &entry.root_dir, None)
                         .ok()
                         .and_then(|p| p.load_runtime_metadata().ok())
                         .map(|r| r.base_url.is_some())
@@ -279,26 +302,31 @@ impl ProfileManager {
     pub async fn create_profile(
         &self,
         name: &str,
-        root: PathBuf,
         passphrase: Option<String>,
         protection_mode: ProfileProtectionMode,
     ) -> Result<ProfileSummary> {
         let mut inner = self.inner.write().await;
         let init_options = protection_mode.init_options(passphrase)?;
+        let (profile_id, storage_paths) = inner.storage_layout.new_profile();
+        let root = storage_paths.profile_root.clone();
+        let registry_path = inner.storage_layout.registry_path.clone();
 
-        // Profile::init calls sync_registry_entry which saves registry to disk.
-        // We need to reload the registry from disk to sync our in-memory state.
-        let profile = Profile::init_with_options(name, &root, init_options)?;
+        let profile = Profile::init_with_storage(
+            name,
+            profile_id,
+            storage_paths,
+            Some(registry_path.clone()),
+            init_options,
+        )?;
 
-        // Reload registry to get the entry that was just saved by sync_registry_entry
-        inner.registry = tapchat_core::cli::profile::ProfileRegistry::load()
+        inner.registry = ProfileRegistry::load_from(&registry_path)
             .map_err(|e| anyhow!("Failed to reload registry after profile init: {}", e))?;
 
         inner.registry.active_profile = Some(root.clone());
         inner.active_profile = Some(profile);
         inner.locked_profile_path = None;
         inner.unlock_error = None;
-        inner.registry.save()?;
+        inner.registry.save_to(&registry_path)?;
         let is_active = true;
 
         let entry = inner
@@ -320,11 +348,17 @@ impl ProfileManager {
     /// Activate an existing profile.
     pub async fn activate_profile(&self, path: &PathBuf, passphrase: Option<String>) -> Result<()> {
         let mut inner = self.inner.write().await;
+        let profile = open_managed_profile(&inner.storage_layout, path, passphrase)?;
+        if let Some(current) = inner.active_profile.as_ref() {
+            current.checkpoint_local_store()?;
+        }
         inner.registry.set_active(path)?;
-        inner.active_profile = Some(Profile::open_with_passphrase(path, passphrase)?);
+        inner.active_profile = Some(profile);
         inner.locked_profile_path = None;
         inner.unlock_error = None;
-        inner.registry.save()?;
+        inner
+            .registry
+            .save_to(&inner.storage_layout.registry_path)?;
         Ok(())
     }
 
@@ -354,13 +388,14 @@ impl ProfileManager {
             }
         }
 
-        let profile = Profile::open_with_passphrase(path, passphrase)?;
+        let layout = { self.inner.read().await.storage_layout.clone() };
+        let profile = open_managed_profile(&layout, path, passphrase)?;
         drop(profile);
 
         let mut inner = self.inner.write().await;
         let mut registry = inner.registry.clone();
         registry.set_active(path)?;
-        registry.save()?;
+        registry.save_to(&inner.storage_layout.registry_path)?;
         inner.registry = registry;
         Ok(())
     }
@@ -385,17 +420,34 @@ impl ProfileManager {
             return Err(anyhow!("Profile not found in registry"));
         }
 
+        let storage_paths = inner.storage_layout.profile_paths_for_root(path)?;
+        let transfer_root = storage_paths
+            .transfer_staging_dir
+            .parent()
+            .ok_or_else(|| anyhow!("invalid transfer staging path"))?
+            .to_path_buf();
+
         Profile::cleanup_profile_keychain_entries(path)?;
 
-        // Delete the directory
+        // Every target is derived from a validated UUID profile root.
         if path.exists() {
             std::fs::remove_dir_all(path)
                 .map_err(|e| anyhow!("Failed to delete profile directory: {}", e))?;
         }
+        if transfer_root.exists() {
+            std::fs::remove_dir_all(&transfer_root)
+                .map_err(|e| anyhow!("Failed to delete profile transfer directory: {}", e))?;
+        }
+        if storage_paths.attachment_cache_dir.exists() {
+            std::fs::remove_dir_all(&storage_paths.attachment_cache_dir)
+                .map_err(|e| anyhow!("Failed to delete profile cache directory: {}", e))?;
+        }
 
         // Remove from registry after keychain and directory deletion succeed.
         inner.registry.remove(path);
-        inner.registry.save()?;
+        inner
+            .registry
+            .save_to(&inner.storage_layout.registry_path)?;
 
         Ok(())
     }
@@ -427,7 +479,7 @@ impl ProfileManager {
             profile.update_identity(user_id, device_id)?;
             // Reload registry from disk to sync in-memory state
             // (profile.update_identity saves to disk but we need to update our in-memory copy)
-            inner.registry = tapchat_core::cli::profile::ProfileRegistry::load()
+            inner.registry = ProfileRegistry::load_from(&inner.storage_layout.registry_path)
                 .map_err(|e| anyhow!("Failed to reload registry: {}", e))?;
         }
         Ok(())
@@ -460,6 +512,14 @@ impl ProfileManager {
         Ok(())
     }
 
+    pub async fn checkpoint_active_profile(&self) -> Result<()> {
+        let inner = self.inner.read().await;
+        if let Some(profile) = inner.active_profile.as_ref() {
+            profile.checkpoint_local_store()?;
+        }
+        Ok(())
+    }
+
     /// Get the base URL for API calls from runtime metadata.
     pub async fn get_base_url(&self) -> Option<String> {
         self.get_runtime_metadata().await.and_then(|r| r.base_url)
@@ -475,11 +535,12 @@ impl ProfileManager {
 
 fn load_registry_active_profile(
     registry: &ProfileRegistry,
+    layout: &DesktopStorageLayout,
 ) -> (Option<Profile>, Option<PathBuf>, Option<String>) {
     let Some(path) = registry.active_profile.as_ref() else {
         return (None, None, None);
     };
-    match Profile::open(path) {
+    match open_managed_profile(layout, path, None) {
         Ok(profile) => (Some(profile), None, None),
         Err(error) => {
             log::error!(
@@ -489,6 +550,18 @@ fn load_registry_active_profile(
             (None, Some(path.clone()), Some(error.to_string()))
         }
     }
+}
+
+fn open_managed_profile(
+    layout: &DesktopStorageLayout,
+    path: &PathBuf,
+    passphrase: Option<String>,
+) -> Result<Profile> {
+    Profile::open_with_storage(
+        layout.profile_paths_for_root(path)?,
+        Some(layout.registry_path.clone()),
+        ProfileOpenOptions { passphrase },
+    )
 }
 
 impl Default for ProfileManager {
@@ -501,11 +574,10 @@ impl Default for ProfileManager {
 mod tests {
     use std::path::PathBuf;
 
-    use tapchat_core::cli::profile::{
-        override_profile_registry_path_for_test, Profile, ProfileInitOptions, ProfileRegistry,
-    };
+    use tapchat_core::cli::profile::{Profile, ProfileInitOptions, ProfileRegistry};
 
     use super::{ProfileManager, ProfileProtectionMode};
+    use crate::storage_layout::DesktopStorageLayout;
 
     #[test]
     fn profile_protection_modes_require_the_expected_passphrase_and_keychain() {
@@ -542,23 +614,29 @@ mod tests {
     #[tokio::test]
     async fn select_profile_for_restart_rejects_wrong_passphrase_without_saving_active_profile() {
         let dir = test_dir();
-        let registry_path = dir.join("config").join("profiles.json");
-        let _registry_override = override_profile_registry_path_for_test(&registry_path);
-
-        let alice_root = dir.join("alice");
-        let bob_root = dir.join("bob");
-        let alice = Profile::init_with_options(
+        let layout =
+            DesktopStorageLayout::from_roots(dir.join("data"), dir.join("cache"), dir.join("logs"));
+        layout.ensure_base_dirs().expect("layout");
+        let (alice_id, alice_paths) = layout.new_profile();
+        let (bob_id, bob_paths) = layout.new_profile();
+        let alice_root = alice_paths.profile_root.clone();
+        let bob_root = bob_paths.profile_root.clone();
+        let alice = Profile::init_with_storage(
             "alice",
-            &alice_root,
+            alice_id,
+            alice_paths,
+            Some(layout.registry_path.clone()),
             ProfileInitOptions {
                 passphrase: Some("alice-passphrase".into()),
                 use_keychain: false,
             },
         )
         .expect("init alice");
-        let bob = Profile::init_with_options(
+        let bob = Profile::init_with_storage(
             "bob",
-            &bob_root,
+            bob_id,
+            bob_paths,
+            Some(layout.registry_path.clone()),
             ProfileInitOptions {
                 passphrase: Some("bob-passphrase".into()),
                 use_keychain: false,
@@ -568,7 +646,7 @@ mod tests {
         drop(alice);
         drop(bob);
 
-        let manager = ProfileManager::new();
+        let manager = ProfileManager::with_layout(layout.clone());
         let error = manager
             .select_profile_for_restart(&bob_root, Some("wrong".into()))
             .await
@@ -577,7 +655,7 @@ mod tests {
         assert!(error
             .to_string()
             .contains("failed to unlock encrypted profile"));
-        let registry = ProfileRegistry::load().expect("load registry");
+        let registry = ProfileRegistry::load_from(&layout.registry_path).expect("load registry");
         assert_eq!(
             registry.active_profile.as_deref(),
             Some(alice_root.as_path())
@@ -589,23 +667,28 @@ mod tests {
     #[tokio::test]
     async fn select_profile_for_restart_saves_target_as_next_active_profile() {
         let dir = test_dir();
-        let registry_path = dir.join("config").join("profiles.json");
-        let _registry_override = override_profile_registry_path_for_test(&registry_path);
-
-        let alice_root = dir.join("alice");
-        let bob_root = dir.join("bob");
-        let alice = Profile::init_with_options(
+        let layout =
+            DesktopStorageLayout::from_roots(dir.join("data"), dir.join("cache"), dir.join("logs"));
+        layout.ensure_base_dirs().expect("layout");
+        let (alice_id, alice_paths) = layout.new_profile();
+        let (bob_id, bob_paths) = layout.new_profile();
+        let bob_root = bob_paths.profile_root.clone();
+        let alice = Profile::init_with_storage(
             "alice",
-            &alice_root,
+            alice_id,
+            alice_paths,
+            Some(layout.registry_path.clone()),
             ProfileInitOptions {
                 passphrase: Some("alice-passphrase".into()),
                 use_keychain: false,
             },
         )
         .expect("init alice");
-        let bob = Profile::init_with_options(
+        let bob = Profile::init_with_storage(
             "bob",
-            &bob_root,
+            bob_id,
+            bob_paths,
+            Some(layout.registry_path.clone()),
             ProfileInitOptions {
                 passphrase: Some("bob-passphrase".into()),
                 use_keychain: false,
@@ -615,13 +698,13 @@ mod tests {
         drop(alice);
         drop(bob);
 
-        let manager = ProfileManager::new();
+        let manager = ProfileManager::with_layout(layout.clone());
         manager
             .select_profile_for_restart(&bob_root, Some("bob-passphrase".into()))
             .await
             .expect("select bob");
 
-        let registry = ProfileRegistry::load().expect("load registry");
+        let registry = ProfileRegistry::load_from(&layout.registry_path).expect("load registry");
         assert_eq!(registry.active_profile.as_deref(), Some(bob_root.as_path()));
 
         let _ = std::fs::remove_dir_all(&dir);

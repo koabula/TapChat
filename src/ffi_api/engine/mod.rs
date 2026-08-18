@@ -444,6 +444,7 @@ impl CoreEngine {
 
         let mut pending_blob_uploads = BTreeMap::new();
         let mut pending_blob_downloads = BTreeMap::new();
+        let mut pending_blob_deletions = BTreeMap::new();
         for transfer in snapshot.pending_blob_transfers {
             match transfer {
                 PersistedPendingBlobTransfer::Upload {
@@ -500,6 +501,25 @@ impl CoreEngine {
                             reference,
                             destination_id,
                             blob_descriptor,
+                            retries,
+                            in_flight: false,
+                        },
+                    );
+                }
+                PersistedPendingBlobTransfer::Delete {
+                    task_id,
+                    blob_ref,
+                    delete_target,
+                    delete_capability,
+                    retries,
+                } => {
+                    pending_blob_deletions.insert(
+                        task_id.clone(),
+                        PendingBlobDeletion {
+                            task_id,
+                            blob_ref,
+                            delete_target,
+                            delete_capability,
                             retries,
                             in_flight: false,
                         },
@@ -645,6 +665,7 @@ impl CoreEngine {
                 pending_acks,
                 pending_blob_uploads,
                 pending_blob_downloads,
+                pending_blob_deletions,
                 realtime_sessions,
                 group_realtime_sessions,
                 mls_adapter: restored_mls.adapter,
@@ -1177,9 +1198,11 @@ impl CoreEngine {
             )
         });
         output.view_model = None;
+        let snapshot = build_persistence_snapshot(&self.state);
         for effect in &mut output.effects {
             if let CoreEffect::PersistState { persist } = effect {
-                persist.snapshot = Some(build_persistence_snapshot(&self.state));
+                persist.mutations = persistence_mutations(&snapshot, &persist.ops);
+                persist.snapshot = None;
             }
         }
         output = merge_outputs(output, self.flush_group_outbox()?);
@@ -1219,6 +1242,10 @@ impl CoreEngine {
                 records,
                 to_seq,
             } => self.handle_inbox_records(device_id, records, to_seq),
+            CoreEvent::InboxHistoryFloorAdvanced {
+                device_id,
+                history_floor_seq,
+            } => self.handle_inbox_history_floor(device_id, history_floor_seq),
             CoreEvent::HttpResponseReceived {
                 request_id,
                 status,
@@ -1574,6 +1601,10 @@ impl CoreEngine {
                 task_id,
                 failure,
             } => self.handle_blob_transfer_failed(task_id, failure.retryable, None),
+            CoreEvent::BlobDeleted { task_id } => self.handle_blob_deleted(task_id),
+            CoreEvent::BlobDeleteFailed { task_id, failure } => {
+                self.handle_blob_delete_failed(task_id, failure.retryable)
+            }
             CoreEvent::TimerTriggered { timer_id } => self.handle_timer(timer_id),
             CoreEvent::UserConfirmedRebuild { conversation_id } => {
                 self.rebuild_conversation(conversation_id)
@@ -1583,6 +1614,10 @@ impl CoreEngine {
                 records,
                 to_seq,
             } => self.handle_group_outbox_records(group_id, records, to_seq),
+            CoreEvent::GroupHistoryFloorAdvanced {
+                group_id,
+                history_floor_seq,
+            } => self.handle_group_history_floor(&group_id, history_floor_seq),
             CoreEvent::GroupOutboxFetchFailed {
                 group_id,
                 failure,
@@ -2478,10 +2513,13 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
     let mut unique = BTreeSet::new();
     unique.extend(ops);
+    let ops = unique.into_iter().collect::<Vec<_>>();
+    let snapshot = build_persistence_snapshot(state);
     CoreEffect::PersistState {
-        persist: PersistStateEffect {
-            ops: unique.into_iter().collect(),
-            snapshot: Some(build_persistence_snapshot(state)),
+        persist: PersistenceBatch {
+            mutations: persistence_mutations(&snapshot, &ops),
+            ops,
+            snapshot: None,
         },
     }
 }
@@ -2490,9 +2528,441 @@ fn refresh_persist_effect_snapshots(output: &mut CoreOutput, state: &CoreState) 
     let snapshot = build_persistence_snapshot(state);
     for effect in &mut output.effects {
         if let CoreEffect::PersistState { persist } = effect {
-            persist.snapshot = Some(snapshot.clone());
+            persist.mutations = persistence_mutations(&snapshot, &persist.ops);
+            persist.snapshot = None;
         }
     }
+}
+
+fn persistence_mutations(
+    snapshot: &CorePersistenceSnapshot,
+    ops: &[PersistOp],
+) -> Vec<PersistenceMutation> {
+    fn positioned<T: Clone, F: Fn(&T) -> String>(
+        values: &[T],
+        key: &str,
+        key_fn: F,
+    ) -> Option<(usize, T)> {
+        values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| key_fn(value) == key)
+            .map(|(position, value)| (position, value.clone()))
+    }
+    fn save_or_delete(
+        mutations: &mut Vec<PersistenceMutation>,
+        table: PersistenceTable,
+        key: String,
+        value: Option<(usize, PersistenceValue)>,
+    ) {
+        match value {
+            Some((position, value)) => mutations.push(PersistenceMutation::Save {
+                table,
+                key,
+                position,
+                value,
+            }),
+            None => mutations.push(PersistenceMutation::Delete { table, key }),
+        }
+    }
+
+    fn save_conversation_mutations(
+        mutations: &mut Vec<PersistenceMutation>,
+        snapshot: &CorePersistenceSnapshot,
+        conversation_id: &str,
+    ) {
+        let Some((position, conversation)) =
+            positioned(&snapshot.conversations, conversation_id, |value| {
+                value.conversation_id.clone()
+            })
+        else {
+            mutations.push(PersistenceMutation::Delete {
+                table: PersistenceTable::Conversations,
+                key: conversation_id.to_string(),
+            });
+            return;
+        };
+
+        let message_count = conversation.state.messages.len() as u64;
+        let last_visible_message = conversation
+            .state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.plaintext.is_some() || !message.storage_refs.is_empty())
+            .cloned();
+        let mut summary = conversation.clone();
+        summary.state.messages.clear();
+        mutations.push(PersistenceMutation::Save {
+            table: PersistenceTable::Conversations,
+            key: conversation_id.to_string(),
+            position,
+            value: PersistenceValue::ConversationSummary(PersistedConversationSummary {
+                conversation: summary,
+                message_count,
+                last_visible_message,
+            }),
+        });
+
+        // A conversation save may be generated from a compact bootstrap index
+        // containing years of message IDs. Keep every batch bounded to the
+        // mutable tail plus non-terminal delivery rows.
+        const MUTABLE_MESSAGE_TAIL: usize = 16;
+        let tail_start = conversation
+            .state
+            .messages
+            .len()
+            .saturating_sub(MUTABLE_MESSAGE_TAIL);
+        let mut selected = BTreeSet::new();
+        for message in conversation.state.messages.iter().skip(tail_start).chain(
+            conversation.state.messages.iter().filter(|message| {
+                matches!(
+                    message.delivery_state,
+                    Some(
+                        crate::conversation::StoredMessageDeliveryState::Sending
+                            | crate::conversation::StoredMessageDeliveryState::PendingApproval
+                            | crate::conversation::StoredMessageDeliveryState::Failed
+                    )
+                )
+            }),
+        ) {
+            if !selected.insert(message.message_id.clone()) {
+                continue;
+            }
+            mutations.push(PersistenceMutation::InsertMessage {
+                conversation_id: conversation_id.to_string(),
+                message: message.clone(),
+            });
+            mutations.push(PersistenceMutation::UpdateMessageDelivery {
+                conversation_id: conversation_id.to_string(),
+                message_id: message.message_id.clone(),
+                delivery_state: message.delivery_state,
+                message_request_id: message.message_request_id.clone(),
+            });
+
+            let is_attachment = message.message_id.ends_with(":attachment")
+                || message
+                    .storage_refs
+                    .iter()
+                    .any(|reference| reference.kind.starts_with("attachment_"))
+                || message.plaintext.as_deref().is_some_and(|plaintext| {
+                    serde_json::from_str::<AttachmentManifestV2>(plaintext).is_ok()
+                });
+            if is_attachment {
+                let attachment_state = match message.delivery_state {
+                    Some(crate::conversation::StoredMessageDeliveryState::Failed) => {
+                        PersistedMessageAttachmentState::Failed
+                    }
+                    _ if message.plaintext.is_some() || !message.storage_refs.is_empty() => {
+                        PersistedMessageAttachmentState::Published
+                    }
+                    _ => PersistedMessageAttachmentState::Sending,
+                };
+                mutations.push(PersistenceMutation::UpdateAttachmentState {
+                    conversation_id: conversation_id.to_string(),
+                    message_id: message.message_id.clone(),
+                    attachment_state,
+                    plaintext: message.plaintext.clone(),
+                    storage_refs: message.storage_refs.clone(),
+                });
+            }
+        }
+    }
+
+    let mut mutations = vec![PersistenceMutation::SaveMetadata {
+        message_nonce: snapshot.message_nonce,
+        local_display_name: snapshot.local_display_name.clone(),
+        mls_state_persistence_blocked: snapshot.mls_state_persistence_blocked,
+    }];
+    for op in ops {
+        match op {
+            PersistOp::SaveLocalIdentity => save_or_delete(
+                &mut mutations,
+                PersistenceTable::Identity,
+                "local".into(),
+                snapshot
+                    .local_identity
+                    .clone()
+                    .map(|value| (0, PersistenceValue::LocalIdentity(value))),
+            ),
+            PersistOp::SaveDeployment => save_or_delete(
+                &mut mutations,
+                PersistenceTable::Deployment,
+                "active".into(),
+                snapshot
+                    .deployment
+                    .clone()
+                    .map(|value| (0, PersistenceValue::Deployment(value))),
+            ),
+            PersistOp::SaveContact { user_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::Contacts,
+                user_id.clone(),
+                positioned(&snapshot.contacts, user_id, |value| value.user_id.clone())
+                    .map(|(position, value)| (position, PersistenceValue::Contact(value))),
+            ),
+            PersistOp::DeleteContact { user_id } => mutations.push(PersistenceMutation::Delete {
+                table: PersistenceTable::Contacts,
+                key: user_id.clone(),
+            }),
+            PersistOp::SaveConversation { conversation_id } => {
+                save_conversation_mutations(&mut mutations, snapshot, conversation_id)
+            }
+            PersistOp::DeleteConversation { conversation_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::Conversations,
+                    key: conversation_id.clone(),
+                })
+            }
+            PersistOp::SaveSyncState { device_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::SyncCheckpoints,
+                device_id.clone(),
+                positioned(&snapshot.sync_states, device_id, |value| {
+                    value.device_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::SyncState(value))),
+            ),
+            PersistOp::DeleteSyncState { device_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::SyncCheckpoints,
+                    key: device_id.clone(),
+                })
+            }
+            PersistOp::SaveMlsState { conversation_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::MlsStates,
+                conversation_id.clone(),
+                positioned(&snapshot.mls_states, conversation_id, |value| {
+                    value.conversation_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::MlsState(value))),
+            ),
+            PersistOp::DeleteMlsState { conversation_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::MlsStates,
+                    key: conversation_id.clone(),
+                })
+            }
+            PersistOp::SaveOutgoingEnvelope { message_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::PendingOutbox,
+                message_id.clone(),
+                positioned(&snapshot.pending_outbox, message_id, |value| {
+                    value.message_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::OutgoingEnvelope(value))),
+            ),
+            PersistOp::DeleteOutgoingEnvelope { message_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::PendingOutbox,
+                    key: message_id.clone(),
+                })
+            }
+            PersistOp::SaveGroupState { group_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::GroupStates,
+                group_id.clone(),
+                positioned(&snapshot.group_states, group_id, |value| {
+                    value.group_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::GroupState(value))),
+            ),
+            PersistOp::DeleteGroupState { group_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::GroupStates,
+                    key: group_id.clone(),
+                })
+            }
+            PersistOp::SaveGroupCursor { group_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::GroupCursors,
+                group_id.clone(),
+                positioned(&snapshot.group_cursors, group_id, |value| {
+                    value.group_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::GroupCursor(value))),
+            ),
+            PersistOp::DeleteGroupCursor { group_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::GroupCursors,
+                    key: group_id.clone(),
+                })
+            }
+            PersistOp::SaveOutgoingGroupEnvelope { message_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::PendingGroupOutbox,
+                message_id.clone(),
+                positioned(&snapshot.pending_group_outbox, message_id, |value| {
+                    value.message_id.clone()
+                })
+                .map(|(position, value)| {
+                    (position, PersistenceValue::OutgoingGroupEnvelope(value))
+                }),
+            ),
+            PersistOp::DeleteOutgoingGroupEnvelope { message_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::PendingGroupOutbox,
+                    key: message_id.clone(),
+                })
+            }
+            PersistOp::SavePendingGroupSeal { group_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::PendingGroupSeal,
+                group_id.clone(),
+                positioned(&snapshot.pending_group_seal, group_id, |value| {
+                    value.group_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::PendingGroupSeal(value))),
+            ),
+            PersistOp::DeletePendingGroupSeal { group_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::PendingGroupSeal,
+                    key: group_id.clone(),
+                })
+            }
+            PersistOp::SaveGroupInvite { invite_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::GroupInvites,
+                invite_id.clone(),
+                positioned(&snapshot.group_invites, invite_id, |value| {
+                    value.invite_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::GroupInvite(value))),
+            ),
+            PersistOp::DeleteGroupInvite { invite_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::GroupInvites,
+                    key: invite_id.clone(),
+                })
+            }
+            PersistOp::SaveGroupJoinRequest { request_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::GroupJoinRequests,
+                request_id.clone(),
+                positioned(&snapshot.group_join_requests, request_id, |value| {
+                    value.request_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::GroupJoinRequest(value))),
+            ),
+            PersistOp::DeleteGroupJoinRequest { request_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::GroupJoinRequests,
+                    key: request_id.clone(),
+                })
+            }
+            PersistOp::SavePendingGroupJoinApproval { request_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::PendingGroupJoinApprovals,
+                request_id.clone(),
+                positioned(
+                    &snapshot.pending_group_join_approvals,
+                    request_id,
+                    |value| value.request_id.clone(),
+                )
+                .map(|(position, value)| {
+                    (position, PersistenceValue::PendingGroupJoinApproval(value))
+                }),
+            ),
+            PersistOp::DeletePendingGroupJoinApproval { request_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::PendingGroupJoinApprovals,
+                    key: request_id.clone(),
+                })
+            }
+            PersistOp::SavePendingWelcomePickup {
+                group_id,
+                device_id,
+            } => {
+                let key = format!("{group_id}::{device_id}");
+                save_or_delete(
+                    &mut mutations,
+                    PersistenceTable::PendingWelcomePickups,
+                    key.clone(),
+                    positioned(&snapshot.pending_welcome_pickups, &key, |value| {
+                        format!("{}::{}", value.group_id, value.device_id)
+                    })
+                    .map(|(position, value)| {
+                        (position, PersistenceValue::PendingWelcomePickup(value))
+                    }),
+                );
+            }
+            PersistOp::DeletePendingWelcomePickup {
+                group_id,
+                device_id,
+            } => mutations.push(PersistenceMutation::Delete {
+                table: PersistenceTable::PendingWelcomePickups,
+                key: format!("{group_id}::{device_id}"),
+            }),
+            PersistOp::SavePendingAck { device_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::PendingAcks,
+                device_id.clone(),
+                positioned(&snapshot.pending_acks, device_id, |value| {
+                    value.device_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::PendingAck(value))),
+            ),
+            PersistOp::DeletePendingAck { device_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::PendingAcks,
+                    key: device_id.clone(),
+                })
+            }
+            PersistOp::SavePendingBlobTransfer { task_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::PendingBlobTransfers,
+                task_id.clone(),
+                positioned(
+                    &snapshot.pending_blob_transfers,
+                    task_id,
+                    |value| match value {
+                        PersistedPendingBlobTransfer::Upload { task_id, .. }
+                        | PersistedPendingBlobTransfer::Download { task_id, .. }
+                        | PersistedPendingBlobTransfer::Delete { task_id, .. } => task_id.clone(),
+                    },
+                )
+                .map(|(position, value)| (position, PersistenceValue::PendingBlobTransfer(value))),
+            ),
+            PersistOp::DeletePendingBlobTransfer { task_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::PendingBlobTransfers,
+                    key: task_id.clone(),
+                })
+            }
+            PersistOp::SaveRecoveryContext { conversation_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::RecoveryContexts,
+                conversation_id.clone(),
+                positioned(&snapshot.recovery_contexts, conversation_id, |value| {
+                    value.conversation_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::RecoveryContext(value))),
+            ),
+            PersistOp::DeleteRecoveryContext { conversation_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::RecoveryContexts,
+                    key: conversation_id.clone(),
+                })
+            }
+            PersistOp::SaveRealtimeSession { device_id } => save_or_delete(
+                &mut mutations,
+                PersistenceTable::RealtimeSessions,
+                device_id.clone(),
+                positioned(&snapshot.realtime_sessions, device_id, |value| {
+                    value.device_id.clone()
+                })
+                .map(|(position, value)| (position, PersistenceValue::RealtimeSession(value))),
+            ),
+            PersistOp::DeleteRealtimeSession { device_id } => {
+                mutations.push(PersistenceMutation::Delete {
+                    table: PersistenceTable::RealtimeSessions,
+                    key: device_id.clone(),
+                })
+            }
+        }
+    }
+    mutations
 }
 
 fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
@@ -2637,6 +3107,15 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                     reference: task.reference.clone(),
                     destination_id: task.destination_id.clone(),
                     blob_descriptor: task.blob_descriptor.clone(),
+                    retries: task.retries,
+                }
+            }))
+            .chain(state.pending_blob_deletions.values().map(|task| {
+                PersistedPendingBlobTransfer::Delete {
+                    task_id: task.task_id.clone(),
+                    blob_ref: task.blob_ref.clone(),
+                    delete_target: task.delete_target.clone(),
+                    delete_capability: task.delete_capability.clone(),
                     retries: task.retries,
                 }
             }))
@@ -2967,7 +3446,6 @@ mod protected_application_message_tests {
                     created_at: 1,
                     plaintext: Some("hello protected".into()),
                     storage_refs: Vec::new(),
-                    downloaded_blob_b64: None,
                     delivery_state: None,
                     message_request_id: None,
                 }],

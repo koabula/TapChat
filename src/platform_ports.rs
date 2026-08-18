@@ -243,6 +243,11 @@ pub trait BlobIoPort {
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>>;
 
+    async fn delete_blob(
+        &mut self,
+        delete: crate::ffi_api::DeleteBlobRequest,
+    ) -> Result<Vec<CoreEvent>>;
+
     async fn write_downloaded_attachment(
         &mut self,
         write: WriteDownloadedAttachmentEffect,
@@ -251,6 +256,13 @@ pub trait BlobIoPort {
     async fn cache_uploaded_attachment(
         &mut self,
         _cache: crate::ffi_api::CacheUploadedAttachmentEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn release_staged_attachment(
+        &mut self,
+        _release: crate::ffi_api::ReleaseStagedAttachmentEffect,
     ) -> Result<Vec<CoreEvent>> {
         Ok(Vec::new())
     }
@@ -360,11 +372,15 @@ where
             CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
             CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,
             CoreEffect::DownloadBlob { download } => ports.download_blob(download).await,
+            CoreEffect::DeleteBlob { delete } => ports.delete_blob(delete).await,
             CoreEffect::WriteDownloadedAttachment { write } => {
                 ports.write_downloaded_attachment(write).await
             }
             CoreEffect::CacheUploadedAttachment { cache } => {
                 ports.cache_uploaded_attachment(cache).await
+            }
+            CoreEffect::ReleaseStagedAttachment { release } => {
+                ports.release_staged_attachment(release).await
             }
             CoreEffect::PersistState { persist } => {
                 ports.persist_state(persist).await?;
@@ -503,6 +519,14 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn delete_blob(
+            &mut self,
+            _delete: crate::ffi_api::DeleteBlobRequest,
+        ) -> Result<Vec<CoreEvent>> {
+            self.calls.push("delete_blob");
+            Ok(Vec::new())
+        }
+
         async fn write_downloaded_attachment(
             &mut self,
             _write: WriteDownloadedAttachmentEffect,
@@ -618,6 +642,7 @@ mod tests {
             &mut ports,
             CoreEffect::PersistState {
                 persist: PersistStateEffect {
+                    mutations: vec![],
                     ops: vec![],
                     snapshot: None,
                 },
@@ -640,6 +665,7 @@ mod tests {
             &mut ports,
             CoreEffect::PersistState {
                 persist: PersistStateEffect {
+                    mutations: vec![],
                     ops: vec![],
                     snapshot: None,
                 },

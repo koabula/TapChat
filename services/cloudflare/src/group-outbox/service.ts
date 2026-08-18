@@ -48,6 +48,7 @@ import {
 
 interface GroupOutboxMeta {
   headSeq: number;
+  historyFloorSeq?: number;
   retentionDays: number;
   maxInlineBytes: number;
   /**
@@ -99,6 +100,7 @@ const LEAVE_REQUEST_PREFIX = "leave-request:";
 const LEAVE_REQUEST_IDEMPOTENCY_PREFIX = "leave-request-idempotency:";
 const TRANSITION_PREFIX = "transition:";
 const INVITE_REVISION_KEY = "invite-revision";
+const CLEANUP_BATCH_SIZE = 128;
 
 interface StoredGroupTransition {
   fingerprint: string;
@@ -499,11 +501,13 @@ export class GroupOutboxService {
     }
 
     const meta = await this.getMeta();
+    const historyFloorSeq = meta.historyFloorSeq ?? 0;
+    const start = Math.max(input.fromSeq, historyFloorSeq + 1);
     const records: GroupOutboxRecord[] = [];
-    const firstIndex = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${input.fromSeq}`);
+    const firstIndex = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${start}`);
     if (
       firstIndex?.transitionStartSeq !== undefined &&
-      firstIndex.transitionStartSeq !== input.fromSeq
+      firstIndex.transitionStartSeq !== start
     ) {
       throw new HttpError(
         409,
@@ -512,12 +516,12 @@ export class GroupOutboxService {
         { bundleStartSeq: firstIndex.transitionStartSeq }
       );
     }
-    let upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
+    let upper = Math.min(meta.headSeq, start + input.limit - 1);
     const boundaryIndex = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${upper}`);
     if (boundaryIndex?.transitionEndSeq !== undefined) {
       upper = Math.min(meta.headSeq, Math.max(upper, boundaryIndex.transitionEndSeq));
     }
-    for (let seq = input.fromSeq; seq <= upper; seq += 1) {
+    for (let seq = start; seq <= upper; seq += 1) {
       const index = await this.state.get<StoredGroupRecordIndex>(`${RECORD_PREFIX}${seq}`);
       if (!index) {
         throw new HttpError(500, "storage_integrity_error", `group record index is missing at seq ${seq}`);
@@ -545,7 +549,10 @@ export class GroupOutboxService {
     }
 
     return {
-      toSeq: records.length > 0 ? records[records.length - 1].seq : meta.headSeq,
+      toSeq: records.length > 0
+        ? records[records.length - 1].seq
+        : Math.max(historyFloorSeq, Math.min(meta.headSeq, start - 1)),
+      historyFloorSeq,
       records
     };
   }
@@ -1031,6 +1038,29 @@ export class GroupOutboxService {
 
   async processAlarm(now: number): Promise<void> {
     const entries: Record<string, unknown> = {};
+    const deleteKeys: string[] = [];
+    const meta = await this.getMeta();
+    const records = await this.state.list<StoredGroupRecordIndex>({ prefix: RECORD_PREFIX });
+    const expiredRecords = Array.from(records.entries())
+      .filter(([, record]) => record.expiresAt !== undefined && record.expiresAt <= now)
+      .sort((left, right) => left[1].seq - right[1].seq)
+      .slice(0, CLEANUP_BATCH_SIZE);
+    for (const [key, record] of expiredRecords) {
+      if (record.payloadRef) await this.spillStore.delete(record.payloadRef);
+      deleteKeys.push(key, `${IDEMPOTENCY_PREFIX}${record.messageId}`);
+      if (record.transitionId && record.transitionEndSeq === record.seq) {
+        deleteKeys.push(`${TRANSITION_PREFIX}${record.transitionId}`);
+      }
+    }
+    if (expiredRecords.length > 0) {
+      entries[META_KEY] = {
+        ...meta,
+        historyFloorSeq: Math.max(
+          meta.historyFloorSeq ?? 0,
+          ...expiredRecords.map(([, record]) => record.seq)
+        )
+      } satisfies GroupOutboxMeta;
+    }
     let inviteChanged = false;
     const invites = await this.state.list<StoredGroupInvite>({ prefix: INVITE_PREFIX });
     for (const [key, stored] of invites) {
@@ -1061,12 +1091,22 @@ export class GroupOutboxService {
       entries[INVITE_REVISION_KEY] = revision + 1;
       this.publish({ event: "group_invites_changed", groupId: this.groupId, revision: revision + 1 });
     }
-    if (Object.keys(entries).length > 0) await this.state.putEntries(entries);
+    if (Object.keys(entries).length > 0 || deleteKeys.length > 0) {
+      await this.state.mutateEntries(entries, deleteKeys);
+    }
+    if (expiredRecords.length === CLEANUP_BATCH_SIZE) {
+      await this.state.setAlarm(now + 1);
+      return;
+    }
     await this.scheduleNextAlarm(now);
   }
 
   private async scheduleNextAlarm(now: number): Promise<void> {
     const deadlines: number[] = [];
+    const records = await this.state.list<StoredGroupRecordIndex>({ prefix: RECORD_PREFIX });
+    for (const record of records.values()) {
+      if (record.expiresAt !== undefined && record.expiresAt > now) deadlines.push(record.expiresAt);
+    }
     const invites = await this.state.list<StoredGroupInvite>({ prefix: INVITE_PREFIX });
     for (const stored of invites.values()) {
       if (stored.revokedAt === undefined && stored.expiredAt === undefined && stored.document.expiresAt > now) deadlines.push(stored.document.expiresAt);

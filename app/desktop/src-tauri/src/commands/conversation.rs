@@ -9,9 +9,7 @@ use tapchat_core::ffi_api::ConversationSummary;
 use tapchat_core::model::{ConversationKind, ConversationState, StorageRef};
 use tapchat_core::{CoreCommand, ErrorDomain};
 
-use super::conversation_view::{
-    application_plaintext_message_count, generate_last_message_preview, summarize_plaintext,
-};
+use super::conversation_view::{generate_last_message_preview, summarize_plaintext};
 use crate::errors::{DesktopError, DesktopResult};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::{AppState, SessionState};
@@ -99,6 +97,18 @@ pub async fn list_conversations(
         .map(|diagnostics| (diagnostics.conversation_id.clone(), diagnostics))
         .collect();
     let snapshot = inner.engine.refresh_snapshot();
+    let message_summaries: BTreeMap<_, _> = {
+        let pm = inner.profile_manager.inner.read().await;
+        pm.active_profile
+            .as_ref()
+            .map(|profile| profile.load_conversation_message_summaries())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|summary| (summary.conversation_id.clone(), summary))
+            .collect()
+    };
 
     // Build conversation summaries from snapshot
     let summaries: Vec<ConversationSummary> = snapshot
@@ -129,11 +139,14 @@ pub async fn list_conversations(
             member_count: None,
             group_role: None,
             group_cursor: None,
-            last_message_preview: generate_last_message_preview(&persisted.state.messages),
+            last_message_preview: message_summaries
+                .get(&persisted.conversation_id)
+                .and_then(|summary| summary.last_visible_message.as_ref())
+                .and_then(|message| generate_last_message_preview(std::slice::from_ref(message))),
             last_message_type: persisted.state.last_message_type,
-            message_count: Some(application_plaintext_message_count(
-                &persisted.state.messages,
-            )),
+            message_count: message_summaries
+                .get(&persisted.conversation_id)
+                .map(|summary| summary.message_count.min(usize::MAX as u64) as usize),
             recovery: recovery_by_conversation
                 .get(&persisted.conversation_id)
                 .cloned(),
@@ -236,115 +249,119 @@ pub async fn get_messages(
             }
         });
 
+    let repository_page = {
+        let pm = inner.profile_manager.inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "No active profile".to_string())?;
+        profile
+            .query_messages(&tapchat_core::local_store::MessageQuery {
+                conversation_id: conversation_id.clone(),
+                before_cursor: before_cursor.clone(),
+                limit: limit.unwrap_or(50).clamp(1, 100),
+            })
+            .map_err(|error| error.to_string())?
+    };
+
     // Log for debugging
     log::debug!(
         "get_messages: conversation_id={}, local_device_id={}, messages_count={}",
         conversation_id,
         local_device_id.as_deref().unwrap_or("NONE"),
-        snapshot
-            .conversations
-            .iter()
-            .find(|c| c.conversation_id == conversation_id)
-            .map(|p| p.state.messages.len())
-            .unwrap_or(0)
+        repository_page.messages.len()
     );
 
     // Find the conversation and extract messages
     // Filter out MLS protocol messages (Welcome, Commit) - they have no plaintext and shouldn't be displayed
-    let conversation_messages: Vec<MessageView> = snapshot
-        .conversations
+    let conversation_messages: Vec<MessageView> = repository_page
+        .messages
         .iter()
-        .find(|c| c.conversation_id == conversation_id)
-        .map(|persisted| {
-            persisted
-                .state
-                .messages
-                .iter()
-                .filter(|msg| {
-                    // Show application messages plus direct lifecycle system
-                    // messages that carry plaintext. MLS protocol messages
-                    // remain hidden.
-                    (matches!(
-                        msg.message_type,
-                        tapchat_core::model::MessageType::MlsApplication
-                    ) && msg.plaintext.is_some())
-                        || (msg.plaintext.is_some()
-                            && matches!(
-                                msg.message_type,
-                                tapchat_core::model::MessageType::ControlContactRemoved
-                                    | tapchat_core::model::MessageType::ControlIdentityStateUpdated
-                            ))
-                })
-                .map(|msg| {
-                    let logical_message_id =
-                        msg.app_message_id.as_deref().unwrap_or(&msg.message_id);
-                    let attachment_manifest = msg
-                        .plaintext
-                        .as_deref()
-                        .and_then(|plaintext| {
-                            serde_json::from_str::<
-                                tapchat_core::attachment_crypto::AttachmentManifestV2,
-                            >(plaintext)
-                            .ok()
-                        })
-                        .filter(|manifest| manifest.version == 2)
-                        .map(attachment_manifest_view);
-                    // Log plaintext status for debugging
-                    log::debug!(
-                        "get_messages: message_id={}, message_type={:?}, {}",
-                        msg.message_id,
-                        msg.message_type,
-                        summarize_plaintext(msg.plaintext.as_deref())
-                    );
-                    // Determine if this is a sent or received message
-                    let direction = if matches!(
+        .filter(|msg| {
+            // Show application messages plus direct lifecycle system
+            // messages that carry plaintext. MLS protocol messages
+            // remain hidden.
+            (matches!(
+                msg.message_type,
+                tapchat_core::model::MessageType::MlsApplication
+            ) && msg.plaintext.is_some())
+                || (msg.plaintext.is_some()
+                    && matches!(
                         msg.message_type,
                         tapchat_core::model::MessageType::ControlContactRemoved
                             | tapchat_core::model::MessageType::ControlIdentityStateUpdated
-                    ) {
-                        MessageDirection::System
-                    } else if local_device_id.as_ref() == Some(&msg.sender_device_id) {
-                        MessageDirection::Sent
-                    } else {
-                        MessageDirection::Received
-                    };
-                    let has_manifest = attachment_manifest.is_some();
-                    MessageView {
-                        message_id: logical_message_id.to_string(),
-                        sender_device_id: msg.sender_device_id.clone(),
-                        recipient_device_id: msg.recipient_device_id.clone(),
-                        message_type: direction,
-                        raw_message_type: format!("{:?}", msg.message_type).to_lowercase(),
-                        created_at: msg.created_at,
-                        plaintext: if has_manifest {
-                            None
-                        } else {
-                            msg.plaintext.clone()
-                        },
-                        attachment_manifest,
-                        attachment_state: has_manifest.then_some(MessageAttachmentState::Published),
-                        has_attachment: !msg.storage_refs.is_empty() || has_manifest,
-                        storage_refs: if has_manifest {
-                            Vec::new()
-                        } else {
-                            msg.storage_refs.clone()
-                        },
-                        delivery_state: matches!(direction, MessageDirection::Sent).then(|| {
-                            match msg.delivery_state {
-                                Some(
-                                    tapchat_core::conversation::StoredMessageDeliveryState::PendingApproval,
-                                ) => MessageDeliveryState::PendingApproval,
-                                Some(
-                                    tapchat_core::conversation::StoredMessageDeliveryState::Failed,
-                                ) => MessageDeliveryState::Failed,
-                                _ => MessageDeliveryState::Sent,
-                            }
-                        }),
-                    }
-                })
-                .collect()
+                    ))
         })
-        .unwrap_or_default();
+        .map(|msg| {
+            let logical_message_id = msg.app_message_id.as_deref().unwrap_or(&msg.message_id);
+            let attachment_manifest = msg
+                .plaintext
+                .as_deref()
+                .and_then(|plaintext| {
+                    serde_json::from_str::<tapchat_core::attachment_crypto::AttachmentManifestV2>(
+                        plaintext,
+                    )
+                    .ok()
+                })
+                .filter(|manifest| manifest.version == 2)
+                .map(attachment_manifest_view);
+            // Log plaintext status for debugging
+            log::debug!(
+                "get_messages: message_id={}, message_type={:?}, {}",
+                msg.message_id,
+                msg.message_type,
+                summarize_plaintext(msg.plaintext.as_deref())
+            );
+            // Determine if this is a sent or received message
+            let direction = if matches!(
+                msg.message_type,
+                tapchat_core::model::MessageType::ControlContactRemoved
+                    | tapchat_core::model::MessageType::ControlIdentityStateUpdated
+            ) {
+                MessageDirection::System
+            } else if local_device_id.as_ref() == Some(&msg.sender_device_id) {
+                MessageDirection::Sent
+            } else {
+                MessageDirection::Received
+            };
+            let has_manifest = attachment_manifest.is_some();
+            MessageView {
+                message_id: logical_message_id.to_string(),
+                sender_device_id: msg.sender_device_id.clone(),
+                recipient_device_id: msg.recipient_device_id.clone(),
+                message_type: direction,
+                raw_message_type: format!("{:?}", msg.message_type).to_lowercase(),
+                created_at: msg.created_at,
+                plaintext: if has_manifest {
+                    None
+                } else {
+                    msg.plaintext.clone()
+                },
+                attachment_manifest,
+                attachment_state: has_manifest.then_some(MessageAttachmentState::Published),
+                has_attachment: !msg.storage_refs.is_empty() || has_manifest,
+                storage_refs: if has_manifest {
+                    Vec::new()
+                } else {
+                    msg.storage_refs.clone()
+                },
+                delivery_state: matches!(direction, MessageDirection::Sent).then(|| {
+                    match msg.delivery_state {
+                        Some(tapchat_core::conversation::StoredMessageDeliveryState::Sending) => {
+                            MessageDeliveryState::Sending
+                        }
+                        Some(
+                            tapchat_core::conversation::StoredMessageDeliveryState::PendingApproval,
+                        ) => MessageDeliveryState::PendingApproval,
+                        Some(tapchat_core::conversation::StoredMessageDeliveryState::Failed) => {
+                            MessageDeliveryState::Failed
+                        }
+                        _ => MessageDeliveryState::Sent,
+                    }
+                }),
+            }
+        })
+        .collect();
 
     // Blob preparation happens before an envelope exists. Surface one local
     // placeholder per attachment message so reliable background retries are
@@ -489,30 +506,27 @@ pub async fn get_messages(
     // placeholder deterministically, with persisted conversation state taking
     // precedence over outbox state and outbox over the placeholder.
     let mut messages_by_id = BTreeMap::<String, MessageView>::new();
-    for message in pending_attachment_messages
+    let include_pending = before_cursor.is_none();
+    for message in (include_pending
+        .then_some(pending_attachment_messages)
         .into_iter()
-        .chain(outbox_messages)
-        .chain(conversation_messages)
+        .flatten())
+    .chain(
+        include_pending
+            .then_some(outbox_messages)
+            .into_iter()
+            .flatten(),
+    )
+    .chain(conversation_messages)
     {
         messages_by_id.insert(message.message_id.clone(), message);
     }
     let mut all_messages = messages_by_id.into_values().collect::<Vec<_>>();
     all_messages.sort_by_key(|message| message.created_at);
 
-    let end = before_cursor
-        .as_deref()
-        .and_then(|cursor| {
-            all_messages
-                .iter()
-                .position(|message| message.message_id == cursor)
-        })
-        .unwrap_or(all_messages.len());
-    let limit = limit.unwrap_or(50).clamp(1, 100);
-    let start = end.saturating_sub(limit);
-    let next_cursor = (start > 0).then(|| all_messages[start].message_id.clone());
     Ok(MessagePage {
-        items: all_messages[start..end].to_vec(),
-        next_cursor,
+        items: all_messages,
+        next_cursor: repository_page.next_cursor,
     })
 }
 

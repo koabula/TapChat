@@ -335,10 +335,11 @@ impl DesktopTransport {
         let result: FetchMessagesResult = response.json().await.context("parse fetch result")?;
         let record_count = result.records.len();
         timetest!(
-            "fetch_done device_id={} from_seq={} to_seq={} records={} elapsed_ms={} ts={}",
+            "fetch_done device_id={} from_seq={} to_seq={} history_floor_seq={} records={} elapsed_ms={} ts={}",
             device_ref,
             from_seq,
             result.to_seq,
+            result.history_floor_seq,
             record_count,
             elapsed_ms,
             crate::ts_ms()
@@ -508,6 +509,8 @@ impl DesktopTransport {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct FetchMessagesResult {
     to_seq: u64,
+    #[serde(default)]
+    history_floor_seq: u64,
     records: Vec<InboxRecord>,
 }
 

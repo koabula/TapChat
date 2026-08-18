@@ -22,22 +22,35 @@ impl DesktopPersistence {
         Self { profile_inner }
     }
 
-    /// Get the attachments directory.
-    pub async fn attachments_dir(&self) -> Option<PathBuf> {
+    /// Get the per-profile discardable encrypted attachment cache root.
+    pub async fn attachment_cache_dir(&self) -> Option<PathBuf> {
         let pm = self.profile_inner.read().await;
         pm.active_profile
             .as_ref()
-            .map(|p| p.metadata().attachments_dir.clone())
+            .map(|p| p.storage_paths().attachment_cache_dir.clone())
+    }
+
+    /// Get the durable encrypted transfer staging directory.
+    pub async fn transfer_staging_dir(&self) -> Option<PathBuf> {
+        let pm = self.profile_inner.read().await;
+        pm.active_profile
+            .as_ref()
+            .map(|p| p.storage_paths().transfer_staging_dir.clone())
+    }
+
+    /// Deprecated cache alias retained for non-staging call sites.
+    pub async fn attachments_dir(&self) -> Option<PathBuf> {
+        self.attachment_cache_dir().await
     }
 
     /// Get the inbox attachments directory (deprecated alias for attachments_dir).
     pub async fn inbox_attachments_dir(&self) -> Option<PathBuf> {
-        self.attachments_dir().await
+        self.attachment_cache_dir().await
     }
 
     /// Get the outbox attachments directory (deprecated alias for attachments_dir).
     pub async fn outbox_attachments_dir(&self) -> Option<PathBuf> {
-        self.attachments_dir().await
+        self.attachment_cache_dir().await
     }
 
     /// Handle PersistState effect from CoreEngine.

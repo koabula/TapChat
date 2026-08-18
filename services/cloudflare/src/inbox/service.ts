@@ -17,6 +17,7 @@ import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../ty
 interface InboxMeta {
   headSeq: number;
   ackedSeq: number;
+  historyFloorSeq?: number;
   retentionDays: number;
   maxInlineBytes: number;
   rateLimitPerMinute: number;
@@ -157,9 +158,11 @@ export class InboxService {
     }
 
     const meta = await this.getMeta();
+    const historyFloorSeq = meta.historyFloorSeq ?? 0;
+    const start = Math.max(input.fromSeq, historyFloorSeq + 1);
     const records: InboxRecord[] = [];
-    const upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
-    for (let seq = input.fromSeq; seq <= upper; seq += 1) {
+    const upper = Math.min(meta.headSeq, start + input.limit - 1);
+    for (let seq = start; seq <= upper; seq += 1) {
       const index = await this.state.get<StoredRecordIndex>(`${RECORD_PREFIX}${seq}`);
       if (!index) {
         // Records at or below the acknowledged cursor may already have been
@@ -192,7 +195,10 @@ export class InboxService {
       records.push(record);
     }
     return {
-      toSeq: records.length > 0 ? records[records.length - 1].seq : meta.headSeq,
+      toSeq: records.length > 0
+        ? records[records.length - 1].seq
+        : Math.max(historyFloorSeq, meta.ackedSeq, Math.min(meta.headSeq, start - 1)),
+      historyFloorSeq,
       records
     };
   }
@@ -212,8 +218,12 @@ export class InboxService {
       throw new HttpError(409, "invalid_ack", "ack_seq must not move beyond inbox head_seq");
     }
     const ackSeq = input.ack.ackSeq;
-    if (ackSeq > meta.ackedSeq) {
-      await this.state.put(META_KEY, { ...meta, ackedSeq: ackSeq });
+    if (ackSeq > meta.ackedSeq || (meta.historyFloorSeq ?? 0) > 0) {
+      await this.state.put(META_KEY, {
+        ...meta,
+        ackedSeq: ackSeq,
+        historyFloorSeq: ackSeq >= (meta.historyFloorSeq ?? 0) ? undefined : meta.historyFloorSeq
+      });
       await this.state.setAlarm(Date.now());
     }
     return { accepted: true, ackSeq };
@@ -345,15 +355,30 @@ export class InboxService {
     const meta = await this.getMeta();
     const stored = await this.state.list<StoredRecordIndex>({ prefix: RECORD_PREFIX });
     const eligible = Array.from(stored.entries())
-      .filter(([, index]) => index.seq <= meta.ackedSeq && index.expiresAt !== undefined && index.expiresAt <= now)
+      .filter(([, index]) => index.expiresAt !== undefined && index.expiresAt <= now)
       .sort((left, right) => left[1].seq - right[1].seq);
 
-    for (const [key, index] of eligible.slice(0, CLEANUP_BATCH_SIZE)) {
+    const expired = eligible.slice(0, CLEANUP_BATCH_SIZE);
+    const deleteKeys: string[] = [];
+    for (const [key, index] of expired) {
       if (index.payloadRef) {
         await this.spillStore.delete(index.payloadRef);
       }
-      await this.state.delete(key);
-      await this.state.delete(`${IDEMPOTENCY_PREFIX}${index.messageId}`);
+      deleteKeys.push(
+        key,
+        `${IDEMPOTENCY_PREFIX}${index.messageId}`,
+        `${APPEND_RESULT_PREFIX}${index.messageId}`
+      );
+    }
+    if (expired.length > 0) {
+      const historyFloorSeq = Math.max(
+        meta.historyFloorSeq ?? 0,
+        ...expired.map(([, index]) => index.seq)
+      );
+      await this.state.mutateEntries(
+        { [META_KEY]: { ...meta, historyFloorSeq } satisfies InboxMeta },
+        deleteKeys
+      );
     }
 
     if (eligible.length > CLEANUP_BATCH_SIZE) {
@@ -777,7 +802,7 @@ export class InboxService {
     let nextAt: number | undefined;
 
     for (const record of records.values()) {
-      if (record.seq > meta.ackedSeq || record.expiresAt === undefined) {
+      if (record.expiresAt === undefined) {
         continue;
       }
       nextAt = nextAt === undefined ? record.expiresAt : Math.min(nextAt, record.expiresAt);

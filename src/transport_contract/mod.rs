@@ -67,6 +67,8 @@ pub struct FetchMessagesRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchMessagesResult {
     pub to_seq: u64,
+    #[serde(default)]
+    pub history_floor_seq: u64,
     pub records: Vec<InboxRecord>,
 }
 
@@ -222,6 +224,8 @@ pub struct FetchGroupOutboxRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchGroupOutboxResult {
     pub to_seq: u64,
+    #[serde(default)]
+    pub history_floor_seq: u64,
     pub records: Vec<GroupOutboxRecord>,
 }
 
@@ -585,7 +589,13 @@ pub struct PrepareBlobUploadResult {
     pub read_capability: String,
     pub download_target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<u64>,
+    pub upload_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob_expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_capability: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -877,6 +887,7 @@ mod tests {
 
         let fetch = FetchGroupOutboxResult {
             to_seq: 7,
+            history_floor_seq: 0,
             records: vec![GroupOutboxRecord {
                 seq: 7,
                 group_id: "group:project".into(),

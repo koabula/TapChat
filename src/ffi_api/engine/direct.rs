@@ -1473,7 +1473,6 @@ impl CoreEngine {
                 created_at: current_unix_millis(nonce),
                 plaintext: Some("This legacy chat was archived.".into()),
                 storage_refs: Vec::new(),
-                downloaded_blob_b64: None,
                 delivery_state: None,
                 message_request_id: None,
             };
@@ -1862,7 +1861,6 @@ impl CoreEngine {
             created_at: record.envelope.created_at,
             plaintext: Some(plaintext),
             storage_refs: record.envelope.storage_refs.clone(),
-            downloaded_blob_b64: None,
             delivery_state: None,
             message_request_id: None,
         });
@@ -2251,7 +2249,6 @@ impl CoreEngine {
             created_at: current_unix_millis(nonce),
             plaintext: Some(plaintext),
             storage_refs: Vec::new(),
-            downloaded_blob_b64: None,
             delivery_state: None,
             message_request_id: None,
         }
@@ -2811,7 +2808,6 @@ impl CoreEngine {
             created_at: envelope.created_at,
             plaintext: Some(format!("{peer_label} removed you. This chat was archived.")),
             storage_refs: Vec::new(),
-            downloaded_blob_b64: None,
             delivery_state: None,
             message_request_id: None,
         };

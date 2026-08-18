@@ -267,6 +267,11 @@ pub async fn on_app_ready(app: &AppHandle) {
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             let app_started_at = Instant::now();
+            if let Err(error) =
+                crate::commands::message::run_attachment_maintenance(&app_clone).await
+            {
+                log::warn!("startup attachment maintenance failed: {error}");
+            }
             // Fire AppStarted to kick off sync
             if let Err(_error) =
                 drive_core_with_handle(&app_clone, CoreInput::Event(CoreEvent::AppStarted)).await
@@ -284,6 +289,7 @@ pub async fn on_app_ready(app: &AppHandle) {
             );
         });
         spawn_runtime_auth_scheduler(app.clone());
+        spawn_attachment_maintenance_scheduler(app.clone());
     }
 
     log::info!(
@@ -353,6 +359,19 @@ fn spawn_runtime_auth_scheduler(app: AppHandle) {
                             .unwrap_or_else(|| "none".into())
                     );
                 }
+            }
+        }
+    });
+}
+
+fn spawn_attachment_maintenance_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = crate::commands::message::run_attachment_maintenance(&app).await {
+                log::warn!("scheduled attachment maintenance failed: {error}");
             }
         }
     });
@@ -453,6 +472,10 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
                     drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppForegrounded)).await
                 {
                     log::warn!("foreground sync failed");
+                }
+                if let Err(error) = crate::commands::message::run_attachment_maintenance(&app).await
+                {
+                    log::warn!("foreground attachment maintenance failed: {error}");
                 }
                 if let Err(_error) =
                     crate::commands::cloudflare::maybe_run_due_secret_rotation(&app).await
@@ -699,6 +722,7 @@ mod deferred_send_tests {
     fn persistence_prefix_is_removed_without_reordering_transport() {
         let persist = || CoreEffect::PersistState {
             persist: PersistStateEffect {
+                mutations: vec![],
                 ops: Vec::new(),
                 snapshot: None,
             },

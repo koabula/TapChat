@@ -2,19 +2,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::attachment_crypto::{AttachmentVariant, EncryptedBlobDescriptor};
-use crate::conversation::LocalConversationState;
-use crate::conversation::RecoveryStatus;
+use crate::conversation::{
+    LocalConversationState, RecoveryStatus, StoredMessage, StoredMessageDeliveryState,
+};
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
 use crate::model::{
     Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope,
     GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupRole, IdentityBundle,
-    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, WelcomePickupDescriptor,
+    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, StorageRef, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
-    PersistedGroupInvite, PersistedGroupJoinRequest, PersistedPendingGroupJoinApproval,
-    PersistedPendingWelcomePickup,
+    PersistedConversation, PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite,
+    PersistedGroupJoinRequest, PersistedGroupRealtimeSession, PersistedGroupState,
+    PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
+    PersistedPendingGroupJoinApproval, PersistedPendingWelcomePickup, PersistedRealtimeSession,
+    PersistedRecoveryContext, PersistedSyncState,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
@@ -275,6 +280,10 @@ pub enum CoreEvent {
         records: Vec<InboxRecord>,
         to_seq: u64,
     },
+    InboxHistoryFloorAdvanced {
+        device_id: String,
+        history_floor_seq: u64,
+    },
     HttpResponseReceived {
         request_id: String,
         status: u16,
@@ -354,6 +363,13 @@ pub enum CoreEvent {
         task_id: String,
         failure: crate::error::AppErrorV1,
     },
+    BlobDeleted {
+        task_id: String,
+    },
+    BlobDeleteFailed {
+        task_id: String,
+        failure: crate::error::AppErrorV1,
+    },
     TimerTriggered {
         timer_id: String,
     },
@@ -364,6 +380,10 @@ pub enum CoreEvent {
         group_id: String,
         records: Vec<crate::model::GroupOutboxRecord>,
         to_seq: u64,
+    },
+    GroupHistoryFloorAdvanced {
+        group_id: String,
+        history_floor_seq: u64,
     },
     GroupOutboxFetchFailed {
         group_id: String,
@@ -651,6 +671,19 @@ pub struct CacheUploadedAttachmentEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseStagedAttachmentEffect {
+    pub attachment_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteBlobRequest {
+    pub task_id: String,
+    pub blob_ref: String,
+    pub delete_target: String,
+    pub delete_capability: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpMethod {
     Get,
@@ -677,13 +710,129 @@ pub struct RealtimeConnectionEffect {
     pub subscription: RealtimeSubscriptionRequest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistenceTable {
+    Identity,
+    Deployment,
+    Contacts,
+    Conversations,
+    SyncCheckpoints,
+    MlsStates,
+    PendingOutbox,
+    GroupStates,
+    GroupCursors,
+    PendingGroupOutbox,
+    PendingGroupSeal,
+    GroupInvites,
+    GroupJoinRequests,
+    PendingGroupJoinApprovals,
+    PendingWelcomePickups,
+    PendingAcks,
+    PendingBlobTransfers,
+    RecoveryContexts,
+    RealtimeSessions,
+    GroupRealtimeSessions,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistStateEffect {
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum PersistenceValue {
+    LocalIdentity(PersistedLocalIdentity),
+    Deployment(PersistedDeployment),
+    Contact(PersistedContact),
+    Conversation(PersistedConversation),
+    ConversationSummary(PersistedConversationSummary),
+    SyncState(PersistedSyncState),
+    MlsState(PersistedMlsState),
+    OutgoingEnvelope(PersistedOutgoingEnvelope),
+    GroupState(PersistedGroupState),
+    GroupCursor(PersistedGroupCursor),
+    OutgoingGroupEnvelope(PersistedOutgoingGroupEnvelope),
+    PendingGroupSeal(SealGroupOutboxRequest),
+    GroupInvite(PersistedGroupInvite),
+    GroupJoinRequest(PersistedGroupJoinRequest),
+    PendingGroupJoinApproval(PersistedPendingGroupJoinApproval),
+    PendingWelcomePickup(PersistedPendingWelcomePickup),
+    PendingAck(PersistedPendingAck),
+    PendingBlobTransfer(PersistedPendingBlobTransfer),
+    RecoveryContext(PersistedRecoveryContext),
+    RealtimeSession(PersistedRealtimeSession),
+    GroupRealtimeSession(PersistedGroupRealtimeSession),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedConversationSummary {
+    pub conversation: PersistedConversation,
+    pub message_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_visible_message: Option<StoredMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PersistenceMutation {
+    SaveMetadata {
+        message_nonce: u64,
+        local_display_name: Option<String>,
+        mls_state_persistence_blocked: bool,
+    },
+    Save {
+        table: PersistenceTable,
+        key: String,
+        position: usize,
+        value: PersistenceValue,
+    },
+    Delete {
+        table: PersistenceTable,
+        key: String,
+    },
+    InsertMessage {
+        conversation_id: String,
+        message: StoredMessage,
+    },
+    UpdateMessageDelivery {
+        conversation_id: String,
+        message_id: String,
+        delivery_state: Option<StoredMessageDeliveryState>,
+        message_request_id: Option<String>,
+    },
+    UpdateAttachmentState {
+        conversation_id: String,
+        message_id: String,
+        attachment_state: PersistedMessageAttachmentState,
+        plaintext: Option<String>,
+        storage_refs: Vec<StorageRef>,
+    },
+    DeleteMessage {
+        conversation_id: String,
+        message_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedMessageAttachmentState {
+    Sending,
+    Published,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PersistenceBatch {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutations: Vec<PersistenceMutation>,
+    /// Transitional diagnostic list retained for callers and logs. SQLCipher
+    /// applies `mutations` and never reverse-resolves these keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ops: Vec<PersistOp>,
+    /// Transitional copy used only by old tests/adapters that construct a
+    /// batch manually. Newly emitted batches persist typed mutations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<CorePersistenceSnapshot>,
 }
+
+pub type PersistStateEffect = PersistenceBatch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimerEffect {
@@ -817,8 +966,14 @@ pub enum CoreEffect {
     CacheUploadedAttachment {
         cache: CacheUploadedAttachmentEffect,
     },
+    ReleaseStagedAttachment {
+        release: ReleaseStagedAttachmentEffect,
+    },
+    DeleteBlob {
+        delete: DeleteBlobRequest,
+    },
     PersistState {
-        persist: PersistStateEffect,
+        persist: PersistenceBatch,
     },
     ScheduleTimer {
         timer: TimerEffect,
@@ -1090,6 +1245,16 @@ pub(crate) struct PendingBlobDownload {
     pub(crate) in_flight: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingBlobDeletion {
+    pub(crate) task_id: String,
+    pub(crate) blob_ref: String,
+    pub(crate) delete_target: String,
+    pub(crate) delete_capability: String,
+    pub(crate) retries: u8,
+    pub(crate) in_flight: bool,
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RealtimeSessionState {
     pub(crate) connected: bool,
@@ -1152,6 +1317,7 @@ pub(crate) struct CoreState {
     pub(crate) pending_acks: BTreeMap<String, PendingAckState>,
     pub(crate) pending_blob_uploads: BTreeMap<String, PendingBlobUpload>,
     pub(crate) pending_blob_downloads: BTreeMap<String, PendingBlobDownload>,
+    pub(crate) pending_blob_deletions: BTreeMap<String, PendingBlobDeletion>,
     pub(crate) realtime_sessions: BTreeMap<String, RealtimeSessionState>,
     pub(crate) group_realtime_sessions: BTreeMap<String, GroupRealtimeSessionState>,
     pub(crate) mls_adapter: Option<MlsAdapter>,
@@ -1322,6 +1488,7 @@ impl Default for CoreState {
             pending_acks: BTreeMap::new(),
             pending_blob_uploads: BTreeMap::new(),
             pending_blob_downloads: BTreeMap::new(),
+            pending_blob_deletions: BTreeMap::new(),
             realtime_sessions: BTreeMap::new(),
             group_realtime_sessions: BTreeMap::new(),
             mls_adapter: None,

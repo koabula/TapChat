@@ -3,7 +3,7 @@
 //! Uses Rust Cloudflare OAuth and REST API deployment.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::{rngs::OsRng, RngCore};
@@ -403,10 +403,12 @@ mod tests {
 /// 3. `embedded/` next to the current executable
 /// 4. `CARGO_MANIFEST_DIR/embedded` (development mode)
 fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    let contains_worker = |path: &Path| path.join("worker.js").is_file();
+
     // 1. Environment variable override (highest priority)
     if let Ok(root) = std::env::var("TAPCHAT_DESKTOP_RUNTIME_ROOT") {
         let path = PathBuf::from(&root);
-        if path.exists() {
+        if contains_worker(&path) {
             return Some(path);
         }
     }
@@ -417,11 +419,11 @@ fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathB
     if let Some(handle) = app_handle {
         if let Ok(resource_dir) = handle.path().resource_dir() {
             let embedded = resource_dir.join("embedded");
-            if embedded.exists() {
+            if contains_worker(&embedded) {
                 return Some(embedded);
             }
-            // If resources were flattened, resource_dir itself may contain wrangler/
-            if resource_dir.join("wrangler").exists() {
+            // Some bundle formats flatten a single explicitly listed resource.
+            if contains_worker(&resource_dir) {
                 return Some(resource_dir);
             }
         }
@@ -431,7 +433,7 @@ fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathB
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let embedded = exe_dir.join("embedded");
-            if embedded.exists() {
+            if contains_worker(&embedded) {
                 return Some(embedded);
             }
         }
@@ -440,7 +442,7 @@ fn resolve_embedded_runtime_root(app_handle: Option<&AppHandle>) -> Option<PathB
     // 4. Development mode: check project source tree
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dev_embedded = manifest_dir.join("embedded");
-    if dev_embedded.exists() {
+    if contains_worker(&dev_embedded) {
         return Some(dev_embedded);
     }
 

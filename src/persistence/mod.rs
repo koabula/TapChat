@@ -377,6 +377,13 @@ pub enum PersistedPendingBlobTransfer {
         blob_descriptor: EncryptedBlobDescriptor,
         retries: u8,
     },
+    Delete {
+        task_id: String,
+        blob_ref: String,
+        delete_target: String,
+        delete_capability: String,
+        retries: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -716,7 +723,8 @@ impl InMemoryPersistence {
             .map(|transfer| {
                 let key = match &transfer {
                     PersistedPendingBlobTransfer::Upload { task_id, .. }
-                    | PersistedPendingBlobTransfer::Download { task_id, .. } => task_id.clone(),
+                    | PersistedPendingBlobTransfer::Download { task_id, .. }
+                    | PersistedPendingBlobTransfer::Delete { task_id, .. } => task_id.clone(),
                 };
                 (key, transfer)
             })
@@ -881,7 +889,8 @@ impl OutgoingQueueRepository for InMemoryPersistence {
     fn save_pending_blob_transfer(&mut self, transfer: PersistedPendingBlobTransfer) {
         let key = match &transfer {
             PersistedPendingBlobTransfer::Upload { task_id, .. }
-            | PersistedPendingBlobTransfer::Download { task_id, .. } => task_id.clone(),
+            | PersistedPendingBlobTransfer::Download { task_id, .. }
+            | PersistedPendingBlobTransfer::Delete { task_id, .. } => task_id.clone(),
         };
         self.pending_blob_transfers.insert(key, transfer);
     }

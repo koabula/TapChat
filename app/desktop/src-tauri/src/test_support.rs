@@ -111,6 +111,7 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         active_profile: Some(profile),
         locked_profile_path: None,
         unlock_error: None,
+        storage_layout: crate::storage_layout::DesktopStorageLayout::system_default()?,
     }));
     let profile_manager = ProfileManager::from_inner(inner_lock.clone());
 

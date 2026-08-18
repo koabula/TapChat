@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 const CACHE_NAMESPACE: &str = "attachment-cache";
+const CACHE_OBJECTS_DIR: &str = "objects";
 const CACHE_EXTENSION: &str = ".enc";
 const CACHE_ID_LEN: usize = 64;
 
@@ -57,7 +58,7 @@ impl EncryptedCacheDestination {
     }
 
     pub(crate) fn relative_path(&self) -> PathBuf {
-        PathBuf::from(CACHE_NAMESPACE).join(format!("{}{CACHE_EXTENSION}", self.cache_id))
+        PathBuf::from(CACHE_OBJECTS_DIR).join(format!("{}{CACHE_EXTENSION}", self.cache_id))
     }
 }
 
@@ -88,7 +89,7 @@ mod tests {
             assert_eq!(parsed.cache_id(), CACHE_ID);
             assert_eq!(
                 parsed.relative_path(),
-                PathBuf::from("attachment-cache").join(format!("{CACHE_ID}.enc"))
+                PathBuf::from("objects").join(format!("{CACHE_ID}.enc"))
             );
         }
     }

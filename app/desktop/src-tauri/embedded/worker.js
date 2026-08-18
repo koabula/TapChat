@@ -3757,6 +3757,7 @@ var LEAVE_REQUEST_PREFIX = "leave-request:";
 var LEAVE_REQUEST_IDEMPOTENCY_PREFIX = "leave-request-idempotency:";
 var TRANSITION_PREFIX = "transition:";
 var INVITE_REVISION_KEY = "invite-revision";
+var CLEANUP_BATCH_SIZE = 128;
 var JOIN_LEASE_MS = 2 * 60 * 1e3;
 function canonicalJson2(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson2).join(",")}]`;
@@ -4039,9 +4040,11 @@ var GroupOutboxService = class {
       throw new HttpError(400, "invalid_input", "limit must be greater than zero");
     }
     const meta = await this.getMeta();
+    const historyFloorSeq = meta.historyFloorSeq ?? 0;
+    const start = Math.max(input.fromSeq, historyFloorSeq + 1);
     const records = [];
-    const firstIndex = await this.state.get(`${RECORD_PREFIX}${input.fromSeq}`);
-    if (firstIndex?.transitionStartSeq !== void 0 && firstIndex.transitionStartSeq !== input.fromSeq) {
+    const firstIndex = await this.state.get(`${RECORD_PREFIX}${start}`);
+    if (firstIndex?.transitionStartSeq !== void 0 && firstIndex.transitionStartSeq !== start) {
       throw new HttpError(
         409,
         "group_cursor_invalid",
@@ -4049,12 +4052,12 @@ var GroupOutboxService = class {
         { bundleStartSeq: firstIndex.transitionStartSeq }
       );
     }
-    let upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
+    let upper = Math.min(meta.headSeq, start + input.limit - 1);
     const boundaryIndex = await this.state.get(`${RECORD_PREFIX}${upper}`);
     if (boundaryIndex?.transitionEndSeq !== void 0) {
       upper = Math.min(meta.headSeq, Math.max(upper, boundaryIndex.transitionEndSeq));
     }
-    for (let seq = input.fromSeq; seq <= upper; seq += 1) {
+    for (let seq = start; seq <= upper; seq += 1) {
       const index = await this.state.get(`${RECORD_PREFIX}${seq}`);
       if (!index) {
         throw new HttpError(500, "storage_integrity_error", `group record index is missing at seq ${seq}`);
@@ -4081,7 +4084,8 @@ var GroupOutboxService = class {
       records.push(record);
     }
     return {
-      toSeq: records.length > 0 ? records[records.length - 1].seq : meta.headSeq,
+      toSeq: records.length > 0 ? records[records.length - 1].seq : Math.max(historyFloorSeq, Math.min(meta.headSeq, start - 1)),
+      historyFloorSeq,
       records
     };
   }
@@ -4475,6 +4479,26 @@ var GroupOutboxService = class {
   }
   async processAlarm(now) {
     const entries = {};
+    const deleteKeys = [];
+    const meta = await this.getMeta();
+    const records = await this.state.list({ prefix: RECORD_PREFIX });
+    const expiredRecords = Array.from(records.entries()).filter(([, record]) => record.expiresAt !== void 0 && record.expiresAt <= now).sort((left, right) => left[1].seq - right[1].seq).slice(0, CLEANUP_BATCH_SIZE);
+    for (const [key, record] of expiredRecords) {
+      if (record.payloadRef) await this.spillStore.delete(record.payloadRef);
+      deleteKeys.push(key, `${IDEMPOTENCY_PREFIX}${record.messageId}`);
+      if (record.transitionId && record.transitionEndSeq === record.seq) {
+        deleteKeys.push(`${TRANSITION_PREFIX}${record.transitionId}`);
+      }
+    }
+    if (expiredRecords.length > 0) {
+      entries[META_KEY] = {
+        ...meta,
+        historyFloorSeq: Math.max(
+          meta.historyFloorSeq ?? 0,
+          ...expiredRecords.map(([, record]) => record.seq)
+        )
+      };
+    }
     let inviteChanged = false;
     const invites = await this.state.list({ prefix: INVITE_PREFIX });
     for (const [key, stored] of invites) {
@@ -4505,11 +4529,21 @@ var GroupOutboxService = class {
       entries[INVITE_REVISION_KEY] = revision + 1;
       this.publish({ event: "group_invites_changed", groupId: this.groupId, revision: revision + 1 });
     }
-    if (Object.keys(entries).length > 0) await this.state.putEntries(entries);
+    if (Object.keys(entries).length > 0 || deleteKeys.length > 0) {
+      await this.state.mutateEntries(entries, deleteKeys);
+    }
+    if (expiredRecords.length === CLEANUP_BATCH_SIZE) {
+      await this.state.setAlarm(now + 1);
+      return;
+    }
     await this.scheduleNextAlarm(now);
   }
   async scheduleNextAlarm(now) {
     const deadlines = [];
+    const records = await this.state.list({ prefix: RECORD_PREFIX });
+    for (const record of records.values()) {
+      if (record.expiresAt !== void 0 && record.expiresAt > now) deadlines.push(record.expiresAt);
+    }
     const invites = await this.state.list({ prefix: INVITE_PREFIX });
     for (const stored of invites.values()) {
       if (stored.revokedAt === void 0 && stored.expiredAt === void 0 && stored.document.expiresAt > now) deadlines.push(stored.document.expiresAt);
@@ -5206,7 +5240,7 @@ var MESSAGE_REQUEST_PREFIX = "message-request:";
 var RATE_LIMIT_PREFIX = "rate-limit:";
 var MESSAGE_REQUEST_META_KEY = `${MESSAGE_REQUEST_PREFIX}meta`;
 var MESSAGE_REQUEST_RATE_LIMIT_KEY = `${MESSAGE_REQUEST_PREFIX}rate-limit`;
-var CLEANUP_BATCH_SIZE = 128;
+var CLEANUP_BATCH_SIZE2 = 128;
 var InboxService = class {
   deviceId;
   state;
@@ -5258,9 +5292,11 @@ var InboxService = class {
       throw new HttpError(400, "invalid_input", "limit must be greater than zero");
     }
     const meta = await this.getMeta();
+    const historyFloorSeq = meta.historyFloorSeq ?? 0;
+    const start = Math.max(input.fromSeq, historyFloorSeq + 1);
     const records = [];
-    const upper = Math.min(meta.headSeq, input.fromSeq + input.limit - 1);
-    for (let seq = input.fromSeq; seq <= upper; seq += 1) {
+    const upper = Math.min(meta.headSeq, start + input.limit - 1);
+    for (let seq = start; seq <= upper; seq += 1) {
       const index = await this.state.get(`${RECORD_PREFIX2}${seq}`);
       if (!index) {
         if (seq <= meta.ackedSeq) {
@@ -5290,7 +5326,8 @@ var InboxService = class {
       records.push(record);
     }
     return {
-      toSeq: records.length > 0 ? records[records.length - 1].seq : meta.headSeq,
+      toSeq: records.length > 0 ? records[records.length - 1].seq : Math.max(historyFloorSeq, meta.ackedSeq, Math.min(meta.headSeq, start - 1)),
+      historyFloorSeq,
       records
     };
   }
@@ -5309,8 +5346,12 @@ var InboxService = class {
       throw new HttpError(409, "invalid_ack", "ack_seq must not move beyond inbox head_seq");
     }
     const ackSeq = input.ack.ackSeq;
-    if (ackSeq > meta.ackedSeq) {
-      await this.state.put(META_KEY2, { ...meta, ackedSeq: ackSeq });
+    if (ackSeq > meta.ackedSeq || (meta.historyFloorSeq ?? 0) > 0) {
+      await this.state.put(META_KEY2, {
+        ...meta,
+        ackedSeq: ackSeq,
+        historyFloorSeq: ackSeq >= (meta.historyFloorSeq ?? 0) ? void 0 : meta.historyFloorSeq
+      });
       await this.state.setAlarm(Date.now());
     }
     return { accepted: true, ackSeq };
@@ -5432,15 +5473,30 @@ var InboxService = class {
     await this.pruneExpiredMessageRequests(now);
     const meta = await this.getMeta();
     const stored = await this.state.list({ prefix: RECORD_PREFIX2 });
-    const eligible = Array.from(stored.entries()).filter(([, index]) => index.seq <= meta.ackedSeq && index.expiresAt !== void 0 && index.expiresAt <= now).sort((left, right) => left[1].seq - right[1].seq);
-    for (const [key, index] of eligible.slice(0, CLEANUP_BATCH_SIZE)) {
+    const eligible = Array.from(stored.entries()).filter(([, index]) => index.expiresAt !== void 0 && index.expiresAt <= now).sort((left, right) => left[1].seq - right[1].seq);
+    const expired = eligible.slice(0, CLEANUP_BATCH_SIZE2);
+    const deleteKeys = [];
+    for (const [key, index] of expired) {
       if (index.payloadRef) {
         await this.spillStore.delete(index.payloadRef);
       }
-      await this.state.delete(key);
-      await this.state.delete(`${IDEMPOTENCY_PREFIX2}${index.messageId}`);
+      deleteKeys.push(
+        key,
+        `${IDEMPOTENCY_PREFIX2}${index.messageId}`,
+        `${APPEND_RESULT_PREFIX}${index.messageId}`
+      );
     }
-    if (eligible.length > CLEANUP_BATCH_SIZE) {
+    if (expired.length > 0) {
+      const historyFloorSeq = Math.max(
+        meta.historyFloorSeq ?? 0,
+        ...expired.map(([, index]) => index.seq)
+      );
+      await this.state.mutateEntries(
+        { [META_KEY2]: { ...meta, historyFloorSeq } },
+        deleteKeys
+      );
+    }
+    if (eligible.length > CLEANUP_BATCH_SIZE2) {
       await this.state.setAlarm(now + 1);
       return;
     }
@@ -5814,7 +5870,7 @@ var InboxService = class {
     const messageRequestSenders = await this.state.get(this.messageRequestIndexKey()) ?? [];
     let nextAt;
     for (const record of records.values()) {
-      if (record.seq > meta.ackedSeq || record.expiresAt === void 0) {
+      if (record.expiresAt === void 0) {
         continue;
       }
       nextAt = nextAt === void 0 ? record.expiresAt : Math.min(nextAt, record.expiresAt);
@@ -6040,6 +6096,7 @@ async function handleInboxDurableRequest(request, deps) {
       });
       return jsonResponse3({
         toSeq: result.toSeq,
+        historyFloorSeq: result.historyFloorSeq,
         records: result.records
       });
     }
@@ -6315,6 +6372,8 @@ var SharedStateService = class {
 var MAX_BLOB_BYTES = 25 * 1024 * 1024 + 1024;
 var SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1e3;
 var CAPABILITY_METADATA_KEY = "read-capability-sha256";
+var DELETE_CAPABILITY_METADATA_KEY = "delete-capability-sha256";
+var BLOB_EXPIRY_METADATA_KEY = "blob-expires-at";
 function sanitizeSegment2(value) {
   return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
 }
@@ -6346,10 +6405,12 @@ var StorageService = class {
   store;
   baseUrl;
   secret;
-  constructor(store, baseUrl2, secret) {
+  retentionMs;
+  constructor(store, baseUrl2, secret, retentionDays = 30) {
     this.store = store;
     this.baseUrl = baseUrl2;
     this.secret = secret;
+    this.retentionMs = Math.max(1, Math.floor(retentionDays)) * 24 * 60 * 60 * 1e3;
   }
   async prepareUpload(input, owner, now) {
     const taskId = requireNonEmpty(input.taskId, "taskId");
@@ -6378,15 +6439,20 @@ var StorageService = class {
       sanitizeSegment2(conversationId),
       `${sanitizeSegment2(messageId)}-${sanitizeSegment2(taskId)}`
     ].join("/");
-    const expiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
+    const uploadExpiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
+    const blobExpiresAt = now + this.retentionMs;
     const readCapability = randomCapability();
+    const deleteCapability = randomCapability();
     const readCapabilityHash = await capabilityHash(readCapability);
+    const deleteCapabilityHash = await capabilityHash(deleteCapability);
     const uploadToken = await signSharingPayload(this.secret, {
       action: "upload",
       blobKey,
       sizeBytes: input.sizeBytes,
       readCapabilityHash,
-      expiresAt
+      deleteCapabilityHash,
+      blobExpiresAt,
+      expiresAt: uploadExpiresAt
     });
     return {
       blobRef: blobKey,
@@ -6396,7 +6462,10 @@ var StorageService = class {
       },
       readCapability,
       downloadTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}`,
-      expiresAt
+      uploadExpiresAt,
+      blobExpiresAt,
+      deleteTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}`,
+      deleteCapability
     };
   }
   async uploadBlob(blobKey, token, body, contentLength, now) {
@@ -6407,11 +6476,13 @@ var StorageService = class {
     if (!Number.isSafeInteger(payload.sizeBytes) || contentLength !== payload.sizeBytes) {
       throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
-    if (!payload.readCapabilityHash) {
+    if (!payload.readCapabilityHash || !payload.deleteCapabilityHash || !Number.isSafeInteger(payload.blobExpiresAt)) {
       throw new HttpError(403, "invalid_capability", "upload token is missing blob capability binding");
     }
     const stored = await this.store.putStream(blobKey, body, {
       [CAPABILITY_METADATA_KEY]: payload.readCapabilityHash,
+      [DELETE_CAPABILITY_METADATA_KEY]: payload.deleteCapabilityHash,
+      [BLOB_EXPIRY_METADATA_KEY]: String(payload.blobExpiresAt),
       "content-type": "application/octet-stream"
     });
     if (stored.size !== payload.sizeBytes) {
@@ -6419,13 +6490,18 @@ var StorageService = class {
       throw new HttpError(400, "invalid_input", "stored upload size does not match prepared size");
     }
   }
-  async fetchBlob(blobKey, capability, rangeHeader, includeBody = true) {
+  async fetchBlob(blobKey, capability, rangeHeader, includeBody = true, now = Date.now()) {
     if (!capability) {
       throw new HttpError(403, "invalid_capability", "blob capability cannot be verified");
     }
     const metadata = await this.store.headBytes(blobKey);
     if (!metadata) {
       throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    const blobExpiresAt = Number(metadata.customMetadata[BLOB_EXPIRY_METADATA_KEY]);
+    if (!Number.isSafeInteger(blobExpiresAt) || blobExpiresAt <= now) {
+      await this.store.delete(blobKey);
+      throw new HttpError(410, "capability_expired", "blob retention period has expired");
     }
     const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);
@@ -6453,6 +6529,19 @@ var StorageService = class {
       ...range ? { range } : {},
       ...object.httpEtag ? { httpEtag: object.httpEtag } : metadata.httpEtag ? { httpEtag: metadata.httpEtag } : {}
     };
+  }
+  async deleteBlob(blobKey, capability) {
+    if (!capability) {
+      throw new HttpError(403, "invalid_capability", "delete capability cannot be verified");
+    }
+    const metadata = await this.store.headBytes(blobKey);
+    if (!metadata) return;
+    const expectedHash = metadata.customMetadata[DELETE_CAPABILITY_METADATA_KEY];
+    const actualHash = await capabilityHash(capability);
+    if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
+      throw new HttpError(403, "invalid_capability", "delete capability is not valid for this object");
+    }
+    await this.store.delete(blobKey);
   }
   async verifyToken(token, now) {
     try {
@@ -6832,7 +6921,8 @@ async function handleRequest(request, env) {
     const store = new StorageService(
       new R2JsonBlobStore3(env.TAPCHAT_STORAGE),
       baseUrl(request, env),
-      sharingSecret
+      sharingSecret,
+      Number(env.RETENTION_DAYS ?? "30")
     );
     const sharedState = new SharedStateService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE), baseUrl(request, env));
     const welcomePickup = new WelcomePickupService(new R2JsonBlobStore3(env.TAPCHAT_STORAGE));
@@ -7278,7 +7368,8 @@ async function handleRequest(request, env) {
         blobKey,
         capability,
         request.headers.get("Range") ?? void 0,
-        request.method === "GET"
+        request.method === "GET",
+        now
       );
       const headers = new Headers({
         "content-type": "application/octet-stream",
@@ -7296,6 +7387,15 @@ async function handleRequest(request, env) {
         status: payload.range ? 206 : 200,
         headers
       });
+    }
+    if (request.method === "DELETE" && blobMatch) {
+      const blobKey = decodeURIComponent(blobMatch[1]);
+      const header = request.headers.get("Authorization")?.trim();
+      if (!header?.startsWith("TapChat-Delete ")) {
+        throw new HttpError(401, "invalid_capability", "missing blob delete capability");
+      }
+      await store.deleteBlob(blobKey, header.slice("TapChat-Delete ".length).trim());
+      return new Response(null, { status: 204 });
     }
     return structuredErrorResponse(request, 404, "not_found", false);
   } catch (error) {

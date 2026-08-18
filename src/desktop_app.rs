@@ -2536,10 +2536,9 @@ fn map_message(
         storage_refs: message.storage_refs.clone(),
         has_attachment: !message.storage_refs.is_empty(),
         attachment_count: message.storage_refs.len(),
-        downloaded_attachment_available: message.downloaded_blob_b64.is_some()
-            || primary_attachment_local_path
-                .as_ref()
-                .is_some_and(|path| path.exists()),
+        downloaded_attachment_available: primary_attachment_local_path
+            .as_ref()
+            .is_some_and(|path| path.exists()),
         attachment_refs: message.storage_refs.clone(),
         primary_attachment_previewable,
         primary_attachment_local_path,
@@ -2737,6 +2736,7 @@ fn attachment_transfer_counts(profile_path: impl AsRef<Path>) -> Result<Attachme
             PersistedPendingBlobTransfer::Download { .. } => {
                 pending_downloads = pending_downloads.saturating_add(1);
             }
+            PersistedPendingBlobTransfer::Delete { .. } => {}
         }
     }
     Ok(AttachmentTransferCounts {
@@ -2810,6 +2810,7 @@ fn map_transfer(
                 opened: Some(false),
             })
         }
+        PersistedPendingBlobTransfer::Delete { .. } => None,
     }
 }
 

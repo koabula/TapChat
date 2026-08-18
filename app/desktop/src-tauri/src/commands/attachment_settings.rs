@@ -114,7 +114,7 @@ pub async fn get_attachment_cache_dir(
         let ports = state.ports.lock().await;
         ports.persistence.clone()
     };
-    let dir = persistence.attachments_dir().await;
+    let dir = persistence.attachment_cache_dir().await;
     match dir {
         Some(path) => Ok(path.to_string_lossy().into()),
         None => Err("No profile active".into()),

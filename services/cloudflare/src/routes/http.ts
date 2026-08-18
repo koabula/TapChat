@@ -417,7 +417,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const store = new StorageService(
       new R2JsonBlobStore(env.TAPCHAT_STORAGE),
       baseUrl(request, env),
-      sharingSecret
+      sharingSecret,
+      Number(env.RETENTION_DAYS ?? "30")
     );
     const sharedState = new SharedStateService(new R2JsonBlobStore(env.TAPCHAT_STORAGE), baseUrl(request, env));
     const welcomePickup = new WelcomePickupService(new R2JsonBlobStore(env.TAPCHAT_STORAGE));
@@ -912,6 +913,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         capability,
         request.headers.get("Range") ?? undefined,
         request.method === "GET",
+        now,
       );
       const headers = new Headers({
         "content-type": "application/octet-stream",
@@ -929,6 +931,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         status: payload.range ? 206 : 200,
         headers,
       });
+    }
+    if (request.method === "DELETE" && blobMatch) {
+      const blobKey = decodeURIComponent(blobMatch[1]);
+      const header = request.headers.get("Authorization")?.trim();
+      if (!header?.startsWith("TapChat-Delete ")) {
+        throw new HttpError(401, "invalid_capability", "missing blob delete capability");
+      }
+      await store.deleteBlob(blobKey, header.slice("TapChat-Delete ".length).trim());
+      return new Response(null, { status: 204 });
     }
 
     return structuredErrorResponse(request, 404, "not_found", false);

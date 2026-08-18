@@ -12,6 +12,12 @@ use std::path::Path;
 /// Cloudflare API base URL
 const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const WORKER_COMPATIBILITY_DATE: &str = "2026-07-09";
+const TAPCHAT_LIFECYCLE_RULE_IDS: &[&str] = &[
+    "tapchat-blobs-retention-v1",
+    "tapchat-inbox-spill-retention-v1",
+    "tapchat-group-spill-retention-v1",
+    "tapchat-group-transition-spill-retention-v1",
+];
 
 fn reject_unauthorized(status: StatusCode) -> Result<(), String> {
     if status == StatusCode::UNAUTHORIZED {
@@ -21,7 +27,7 @@ fn reject_unauthorized(status: StatusCode) -> Result<(), String> {
     }
 }
 
-/// OAuth login result from login.mjs
+/// OAuth token result used by the native Rust login flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthTokens {
     pub success: bool,
@@ -39,7 +45,7 @@ pub struct OAuthTokens {
     pub error: Option<String>,
 }
 
-/// Whoami result from whoami.mjs
+/// Account query result used by the native Rust REST flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoamiResult {
     pub authenticated: bool,
@@ -328,6 +334,91 @@ pub async fn create_r2_bucket(
     ))
 }
 
+fn merge_tapchat_lifecycle_rules(mut existing: Vec<Value>, retention_days: u32) -> Vec<Value> {
+    existing.retain(|rule| {
+        !rule
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| TAPCHAT_LIFECYCLE_RULE_IDS.contains(&id))
+    });
+    let max_age = u64::from(retention_days.max(1)) * 24 * 60 * 60;
+    for (id, prefix) in [
+        ("tapchat-blobs-retention-v1", "blobs/"),
+        ("tapchat-inbox-spill-retention-v1", "inbox-payload/"),
+        ("tapchat-group-spill-retention-v1", "group-outbox-payload/"),
+        (
+            "tapchat-group-transition-spill-retention-v1",
+            "group-outbox-transition/",
+        ),
+    ] {
+        existing.push(serde_json::json!({
+            "id": id,
+            "enabled": true,
+            "conditions": { "prefix": prefix },
+            "deleteObjectsTransition": {
+                "condition": { "type": "Age", "maxAge": max_age }
+            }
+        }));
+    }
+    existing
+}
+
+/// Merge TapChat-owned retention rules without replacing rules created by the
+/// bucket owner. Deployment fails closed when lifecycle configuration cannot
+/// be read or written, because an unbounded transport bucket is unsafe.
+pub async fn configure_r2_lifecycle(
+    client: &Client,
+    api_token: &str,
+    account_id: &str,
+    bucket_name: &str,
+    retention_days: u32,
+) -> Result<(), String> {
+    let url = format!(
+        "{}/accounts/{}/r2/buckets/{}/lifecycle",
+        CF_API_BASE, account_id, bucket_name
+    );
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|error| format!("R2 lifecycle read request failed: {error}"))?;
+    reject_unauthorized(response.status())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to read lifecycle rules for bucket {bucket_name}: HTTP {}",
+            response.status()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to decode R2 lifecycle rules: {error}"))?;
+    let existing = body
+        .get("result")
+        .and_then(|result| result.get("rules"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rules = merge_tapchat_lifecycle_rules(existing, retention_days);
+
+    let response = client
+        .put(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&serde_json::json!({ "rules": rules }))
+        .send()
+        .await
+        .map_err(|error| format!("R2 lifecycle update request failed: {error}"))?;
+    reject_unauthorized(response.status())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to configure lifecycle rules for bucket {bucket_name}: HTTP {}",
+            response.status()
+        ));
+    }
+    Ok(())
+}
+
 /// Upload Worker script via REST API
 ///
 /// Cloudflare Workers API uses PUT /accounts/{account_id}/workers/scripts/{script_name}
@@ -602,6 +693,14 @@ pub async fn deploy_via_rest_api(
     });
 
     create_r2_bucket(&client, api_token, account_id, &config.bucket_name).await?;
+    configure_r2_lifecycle(
+        &client,
+        api_token,
+        account_id,
+        &config.bucket_name,
+        config.retention_days,
+    )
+    .await?;
 
     // Phase 2: Upload Worker script
     progress_callback(DeployProgress {
@@ -730,7 +829,10 @@ pub async fn get_accounts(api_token: &str) -> Result<Vec<AccountInfo>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_worker_metadata, WorkerDeployConfig, WORKER_COMPATIBILITY_DATE};
+    use super::{
+        build_worker_metadata, merge_tapchat_lifecycle_rules, WorkerDeployConfig,
+        WORKER_COMPATIBILITY_DATE,
+    };
 
     fn deploy_config() -> WorkerDeployConfig {
         WorkerDeployConfig {
@@ -812,5 +914,41 @@ mod tests {
                 .iter()
                 .any(|binding| { binding["type"] == "secret_text" && binding["name"] == name }));
         }
+    }
+
+    #[test]
+    fn lifecycle_merge_preserves_user_rules_and_replaces_only_tapchat_rules() {
+        let rules = merge_tapchat_lifecycle_rules(
+            vec![
+                serde_json::json!({
+                    "id": "owner-rule",
+                    "enabled": true,
+                    "conditions": { "prefix": "archive/" }
+                }),
+                serde_json::json!({
+                    "id": "tapchat-blobs-retention-v1",
+                    "enabled": false,
+                    "conditions": { "prefix": "old/" }
+                }),
+            ],
+            30,
+        );
+        assert!(rules.iter().any(|rule| rule["id"] == "owner-rule"));
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|rule| rule["id"] == "tapchat-blobs-retention-v1")
+                .count(),
+            1
+        );
+        let blob_rule = rules
+            .iter()
+            .find(|rule| rule["id"] == "tapchat-blobs-retention-v1")
+            .expect("blob rule");
+        assert_eq!(blob_rule["conditions"]["prefix"], "blobs/");
+        assert_eq!(
+            blob_rule["deleteObjectsTransition"]["condition"]["maxAge"],
+            30 * 24 * 60 * 60
+        );
     }
 }

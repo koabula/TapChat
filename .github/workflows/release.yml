@@ -135,7 +135,7 @@ jobs:
 
     runs-on: ${{ matrix.runner }}
     env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      CARGO_TARGET_DIR: ${{ runner.temp }}/tapchat-target-${{ matrix.platform }}
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -158,39 +158,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf dbus-x11 gnome-keyring libdbus-1-dev
-
-      - name: Bundle Linux Node.js runtime
-        if: matrix.platform == 'linux'
-        run: |
-          NODE_VERSION="22.17.1"
-          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz
-          tar -xJf /tmp/node.tar.xz -C /tmp
-          mkdir -p app/desktop/src-tauri/embedded/node
-          cp /tmp/node-v${NODE_VERSION}-linux-x64/bin/node app/desktop/src-tauri/embedded/node/node
-          chmod +x app/desktop/src-tauri/embedded/node/node
-          echo "Bundled Node.js $(app/desktop/src-tauri/embedded/node/node --version)"
-
-      - name: Bundle macOS Node.js runtime (Intel)
-        if: matrix.platform == 'macos-intel'
-        run: |
-          NODE_VERSION="22.17.1"
-          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-x64.tar.gz" -o /tmp/node.tar.gz
-          tar -xzf /tmp/node.tar.gz -C /tmp
-          mkdir -p app/desktop/src-tauri/embedded/node
-          cp /tmp/node-v${NODE_VERSION}-darwin-x64/bin/node app/desktop/src-tauri/embedded/node/node
-          chmod +x app/desktop/src-tauri/embedded/node/node
-          echo "Bundled Node.js $(app/desktop/src-tauri/embedded/node/node --version)"
-
-      - name: Bundle macOS Node.js runtime (ARM)
-        if: matrix.platform == 'macos-arm'
-        run: |
-          NODE_VERSION="22.17.1"
-          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-darwin-arm64.tar.gz" -o /tmp/node.tar.gz
-          tar -xzf /tmp/node.tar.gz -C /tmp
-          mkdir -p app/desktop/src-tauri/embedded/node
-          cp /tmp/node-v${NODE_VERSION}-darwin-arm64/bin/node app/desktop/src-tauri/embedded/node/node
-          chmod +x app/desktop/src-tauri/embedded/node/node
-          echo "Bundled Node.js $(app/desktop/src-tauri/embedded/node/node --version)"
 
       - name: Generate macOS icon.icns from PNG
         if: matrix.platform == 'macos-intel' || matrix.platform == 'macos-arm'
@@ -216,6 +183,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
+          cache-targets: false
           workspaces: |
             .
             app/desktop/src-tauri
@@ -262,9 +230,78 @@ jobs:
           tagName: ${{ needs.validate.outputs.release_tag }}
           releaseName: 'TapChat ${{ needs.validate.outputs.release_tag }}'
           releaseBody: 'See assets below for platform-specific installers.'
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.build_args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Verify bundled runtime resources
+        shell: pwsh
+        run: |
+          $embeddedRoot = Join-Path $env:GITHUB_WORKSPACE "app/desktop/src-tauri/embedded"
+          $worker = Join-Path $embeddedRoot "worker.js"
+          if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
+            throw "embedded/worker.js is missing"
+          }
+          $unexpectedEmbedded = Get-ChildItem -LiteralPath $embeddedRoot -Recurse -File | Where-Object {
+            $_.FullName -ne $worker
+          }
+          if ($unexpectedEmbedded) {
+            $unexpectedEmbedded.FullName | ForEach-Object { Write-Error "Unexpected embedded resource: $_" }
+            throw "Desktop source resources must contain only embedded/worker.js"
+          }
+
+          $bundleDirectories = Get-ChildItem -LiteralPath $env:CARGO_TARGET_DIR -Recurse -Directory | Where-Object {
+            $_.Name -eq "bundle"
+          }
+          if (-not $bundleDirectories) {
+            throw "Tauri bundle output directory is missing"
+          }
+          $bundleFiles = $bundleDirectories | ForEach-Object {
+            Get-ChildItem -LiteralPath $_.FullName -Recurse -File
+          }
+          $stagedWorkers = Get-ChildItem -LiteralPath $env:CARGO_TARGET_DIR -Recurse -File -Filter "worker.js"
+          if (-not $stagedWorkers) {
+            throw "Tauri target output does not contain bundled worker.js"
+          }
+
+          switch ("${{ matrix.platform }}") {
+            "windows" {
+              if (-not ($bundleFiles | Where-Object Extension -eq ".msi")) { throw "Windows MSI is missing" }
+              if (-not ($bundleFiles | Where-Object Extension -eq ".exe")) { throw "Windows NSIS installer is missing" }
+            }
+            "linux" {
+              foreach ($extension in @(".AppImage", ".deb", ".rpm")) {
+                if (-not ($bundleFiles | Where-Object Extension -eq $extension)) {
+                  throw "Linux $extension bundle is missing"
+                }
+              }
+            }
+            default {
+              if (-not ($bundleDirectories | ForEach-Object {
+                Get-ChildItem -LiteralPath $_.FullName -Recurse -Directory -Filter "*.app"
+              })) { throw "macOS app bundle is missing" }
+              if (-not ($bundleFiles | Where-Object Extension -eq ".dmg")) { throw "macOS DMG is missing" }
+            }
+          }
+
+          $forbidden = Get-ChildItem -LiteralPath $env:CARGO_TARGET_DIR -Recurse -File | Where-Object {
+            $_.Name -in @("node", "node.exe", "login.mjs", "whoami.mjs", "tapchat_desktop_lib.dll", "libtapchat_desktop_lib.so", "libtapchat_desktop_lib.dylib") -or
+              $_.FullName -match '[\\/]embedded[\\/]wrangler([\\/]|$)'
+          }
+          if ($forbidden) {
+            $forbidden.FullName | ForEach-Object { Write-Error "Forbidden bundled artifact: $_" }
+            throw "Desktop bundle contains removed runtime artifacts"
+          }
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish completed cross-platform release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false

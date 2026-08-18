@@ -237,6 +237,7 @@ export async function handleInboxDurableRequest(
       } as FetchMessagesRequest);
       return jsonResponse({
         toSeq: result.toSeq,
+        historyFloorSeq: result.historyFloorSeq,
         records: result.records
       });
     }

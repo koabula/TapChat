@@ -1476,6 +1476,28 @@ impl CoreEngine {
         })
     }
 
+    pub(super) fn handle_group_history_floor(
+        &mut self,
+        group_id: &str,
+        history_floor_seq: u64,
+    ) -> CoreResult<CoreOutput> {
+        let current = self
+            .state
+            .group_cursors
+            .get(group_id)
+            .map(|cursor| cursor.last_fetched_seq)
+            .unwrap_or(0);
+        if history_floor_seq <= current {
+            return Ok(CoreOutput::default());
+        }
+        self.block_group_needs_rebuild(
+            group_id,
+            &format!(
+                "remote history before sequence {history_floor_seq} expired before this device synchronized"
+            ),
+        )
+    }
+
     pub(super) fn handle_group_outbox_records(
         &mut self,
         group_id: String,
@@ -2448,7 +2470,6 @@ impl CoreEngine {
             created_at: record.envelope.created_at,
             plaintext,
             storage_refs: record.envelope.storage_refs.clone(),
-            downloaded_blob_b64: None,
             delivery_state: None,
             message_request_id: None,
         });

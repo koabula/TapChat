@@ -71,6 +71,43 @@ impl CoreEngine {
                 },
             );
         }
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is missing"))?;
+        let sender_user_id = local_identity.user_identity.user_id.clone();
+        let sender_device_id = local_identity.device_identity.device_id.clone();
+        let recipient_device_id = if is_group {
+            String::new()
+        } else {
+            self.recipient_device_ids(&conversation_id)?
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+        };
+        let conversation = self
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation not found"))?;
+        conversation
+            .messages
+            .push(crate::conversation::StoredMessage {
+                message_id: message_id.clone(),
+                app_message_id: Some(message_id.clone()),
+                mls_ciphertext_sha256: None,
+                sender_user_id: Some(sender_user_id),
+                sender_device_id,
+                recipient_device_id,
+                message_type: MessageType::MlsApplication,
+                created_at,
+                plaintext: None,
+                storage_refs: Vec::new(),
+                delivery_state: Some(crate::conversation::StoredMessageDeliveryState::Sending),
+                message_request_id: None,
+            });
+        conversation.last_message_type = Some(MessageType::MlsApplication);
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -78,11 +115,16 @@ impl CoreEngine {
             },
             effects: vec![persist_effect(
                 &self.state,
-                task_ids
-                    .iter()
-                    .cloned()
-                    .map(|task_id| PersistOp::SavePendingBlobTransfer { task_id })
-                    .collect(),
+                std::iter::once(PersistOp::SaveConversation {
+                    conversation_id: conversation_id.clone(),
+                })
+                .chain(
+                    task_ids
+                        .iter()
+                        .cloned()
+                        .map(|task_id| PersistOp::SavePendingBlobTransfer { task_id }),
+                )
+                .collect(),
             )],
             view_model: Some(CoreViewModel {
                 messages: vec![MessageSummary {
@@ -391,6 +433,7 @@ impl CoreEngine {
                 },
                 CoreEffect::PersistState {
                     persist: PersistStateEffect {
+                        mutations: vec![],
                         ops: vec![PersistOp::SaveSyncState {
                             device_id: device_id.clone(),
                         }],
@@ -812,6 +855,12 @@ impl CoreEngine {
             }
             return self.flush_pending_transport();
         }
+        if let Some(task_id) = timer_id.strip_prefix("retry_blob_delete:") {
+            if let Some(task) = self.state.pending_blob_deletions.get_mut(task_id) {
+                task.in_flight = false;
+            }
+            return self.flush_pending_transport();
+        }
         if let Some(key) = timer_id.strip_prefix(WELCOME_PICKUP_RETRY_TIMER_PREFIX) {
             if let Some(pending) = self.state.pending_welcome_pickups.get(key).cloned() {
                 if self.state.group_states.contains_key(&pending.group_id)
@@ -852,6 +901,7 @@ impl CoreEngine {
         output = merge_outputs(output, self.flush_pending_acks()?);
         output = merge_outputs(output, self.flush_blob_uploads()?);
         output = merge_outputs(output, self.flush_blob_downloads()?);
+        output = merge_outputs(output, self.flush_blob_deletions()?);
         Ok(output)
     }
 
@@ -1328,6 +1378,89 @@ impl CoreEngine {
         })
     }
 
+    pub(super) fn flush_blob_deletions(&mut self) -> CoreResult<CoreOutput> {
+        let keys = self
+            .state
+            .pending_blob_deletions
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut effects = Vec::new();
+        for task_id in keys {
+            let Some(task) = self.state.pending_blob_deletions.get(&task_id).cloned() else {
+                continue;
+            };
+            if task.in_flight || task.retries >= MAX_TRANSPORT_RETRIES {
+                continue;
+            }
+            effects.push(CoreEffect::DeleteBlob {
+                delete: DeleteBlobRequest {
+                    task_id: task.task_id.clone(),
+                    blob_ref: task.blob_ref,
+                    delete_target: task.delete_target,
+                    delete_capability: task.delete_capability,
+                },
+            });
+            if let Some(entry) = self.state.pending_blob_deletions.get_mut(&task_id) {
+                entry.in_flight = true;
+            }
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects,
+            view_model: None,
+        })
+    }
+
+    pub(super) fn handle_blob_deleted(&mut self, task_id: String) -> CoreResult<CoreOutput> {
+        self.state.pending_blob_deletions.remove(&task_id);
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::DeletePendingBlobTransfer { task_id }],
+            )],
+            view_model: None,
+        })
+    }
+
+    pub(super) fn handle_blob_delete_failed(
+        &mut self,
+        task_id: String,
+        retryable: bool,
+    ) -> CoreResult<CoreOutput> {
+        let Some(task) = self.state.pending_blob_deletions.get_mut(&task_id) else {
+            return Ok(CoreOutput::default());
+        };
+        task.in_flight = false;
+        task.retries = task.retries.saturating_add(1);
+        if !retryable {
+            task.retries = MAX_TRANSPORT_RETRIES;
+        }
+        let retries = task.retries;
+        let _ = task;
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::SavePendingBlobTransfer {
+                task_id: task_id.clone(),
+            }],
+        )];
+        if retries < MAX_TRANSPORT_RETRIES {
+            let timer_id = format!("retry_blob_delete:{task_id}");
+            effects.push(CoreEffect::ScheduleTimer {
+                timer: TimerEffect {
+                    delay_ms: retry_delay_ms(&timer_id, u32::from(retries)),
+                    timer_id,
+                },
+            });
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects,
+            view_model: None,
+        })
+    }
+
     pub(super) fn build_append_request(
         &mut self,
         item: &PendingOutboxItem,
@@ -1529,7 +1662,14 @@ impl CoreEngine {
                 .map_err(|error| {
                     CoreError::invalid_input(format!("failed to decode fetch response: {error}"))
                 })?;
-                self.handle_inbox_records(device_id, response.records, response.to_seq)
+                let floor = self.handle_inbox_history_floor(
+                    device_id.clone(),
+                    response.history_floor_seq,
+                )?;
+                Ok(merge_outputs(
+                    floor,
+                    self.handle_inbox_records(device_id, response.records, response.to_seq)?,
+                ))
             }
             PendingRequest::AppendEnvelope {
                 message_id,
@@ -1675,7 +1815,14 @@ impl CoreEngine {
                         "failed to decode group fetch response: {error}"
                     ))
                 })?;
-                self.handle_group_outbox_records(group_id, response.records, response.to_seq)
+                let floor = self.handle_group_history_floor(
+                    &group_id,
+                    response.history_floor_seq,
+                )?;
+                Ok(merge_outputs(
+                    floor,
+                    self.handle_group_outbox_records(group_id, response.records, response.to_seq)?,
+                ))
             }
             PendingRequest::PutWelcomePickup { .. } => {
                 let result: PutWelcomePickupResult =
@@ -2148,7 +2295,10 @@ impl CoreEngine {
                     size_bytes: descriptor.ciphertext_size,
                     mime_type: "application/octet-stream".into(),
                     file_name: None,
-                    expires_at: None,
+                    expires_at: task
+                        .prepared_upload
+                        .as_ref()
+                        .and_then(|prepared| prepared.blob_expires_at),
                 })
             })
             .collect::<CoreResult<Vec<_>>>()?;
@@ -2423,19 +2573,66 @@ impl CoreEngine {
                 });
             }
             let message_id = task.message_id.clone();
-            let failed_task_ids = self
+            let conversation_id = task.conversation_id.clone();
+            let failed_tasks = self
                 .state
                 .pending_blob_uploads
-                .values_mut()
+                .values()
                 .filter(|pending| pending.message_id == message_id)
-                .map(|pending| {
-                    pending.in_flight = false;
-                    pending.retries = MAX_TRANSPORT_RETRIES;
-                    pending.task_id.clone()
-                })
+                .cloned()
                 .collect::<Vec<_>>();
-            return Ok(CoreOutput {
+            let staged_attachment_ids = failed_tasks
+                .iter()
+                .map(|failed| failed.source.attachment_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut persist_ops = Vec::new();
+            for failed in &failed_tasks {
+                self.state.pending_blob_uploads.remove(&failed.task_id);
+                persist_ops.push(PersistOp::DeletePendingBlobTransfer {
+                    task_id: failed.task_id.clone(),
+                });
+                let Some(prepared) = failed.prepared_upload.as_ref() else {
+                    continue;
+                };
+                let (Some(delete_target), Some(delete_capability)) = (
+                    prepared.delete_target.clone(),
+                    prepared.delete_capability.clone(),
+                ) else {
+                    continue;
+                };
+                let deletion_task_id = format!("blob-delete:{}", failed.task_id);
+                self.state.pending_blob_deletions.insert(
+                    deletion_task_id.clone(),
+                    PendingBlobDeletion {
+                        task_id: deletion_task_id.clone(),
+                        blob_ref: prepared.blob_ref.clone(),
+                        delete_target,
+                        delete_capability,
+                        retries: 0,
+                        in_flight: false,
+                    },
+                );
+                persist_ops.push(PersistOp::SavePendingBlobTransfer {
+                    task_id: deletion_task_id,
+                });
+            }
+            if let Some(conversation) = self.state.conversations.get_mut(&conversation_id) {
+                if let Some(message) = conversation.messages.iter_mut().find(|message| {
+                    message.message_id == message_id
+                        || message.app_message_id.as_deref() == Some(message_id.as_str())
+                }) {
+                    message.delivery_state =
+                        Some(crate::conversation::StoredMessageDeliveryState::Failed);
+                }
+                persist_ops.push(PersistOp::SaveConversation {
+                    conversation_id: conversation_id.clone(),
+                });
+            }
+            let output = CoreOutput {
                 state_update: CoreStateUpdate {
+                    messages_changed: true,
                     system_statuses_changed: vec![SystemStatus::AttachmentUploadFailed],
                     ..CoreStateUpdate::default()
                 },
@@ -2446,16 +2643,16 @@ impl CoreEngine {
                             message: detail.unwrap_or_else(|| "attachment upload failed".into()),
                         },
                     },
-                    persist_effect(
-                        &self.state,
-                        failed_task_ids
-                            .into_iter()
-                            .map(|task_id| PersistOp::SavePendingBlobTransfer { task_id })
-                            .collect(),
-                    ),
+                    persist_effect(&self.state, persist_ops),
+                    CoreEffect::ReleaseStagedAttachment {
+                        release: ReleaseStagedAttachmentEffect {
+                            attachment_ids: staged_attachment_ids,
+                        },
+                    },
                 ],
                 view_model: None,
-            });
+            };
+            return Ok(merge_outputs(output, self.flush_blob_deletions()?));
         }
         if let Some(task) = self.state.pending_blob_downloads.get_mut(&task_id) {
             task.in_flight = false;
@@ -2509,6 +2706,98 @@ impl CoreEngine {
             effects: vec![],
             view_model: None,
         })
+    }
+
+    pub(super) fn handle_inbox_history_floor(
+        &mut self,
+        device_id: String,
+        history_floor_seq: u64,
+    ) -> CoreResult<CoreOutput> {
+        if history_floor_seq == 0 {
+            return Ok(CoreOutput::default());
+        }
+        let current = self
+            .state
+            .sync_states
+            .get(&device_id)
+            .map(|state| state.checkpoint.last_fetched_seq)
+            .unwrap_or(0);
+        if history_floor_seq <= current {
+            return Ok(CoreOutput::default());
+        }
+
+        let ack = {
+            let sync_state = self
+                .state
+                .sync_states
+                .entry(device_id.clone())
+                .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+            sync_state.checkpoint.last_fetched_seq = history_floor_seq;
+            sync_state.last_head_seq = sync_state.last_head_seq.max(history_floor_seq);
+            sync_state
+                .pending_records
+                .retain(|seq, _| *seq > history_floor_seq);
+            sync_state
+                .pending_record_seqs
+                .retain(|seq| *seq > history_floor_seq);
+            sync_state.pending_retry = !sync_state.pending_record_seqs.is_empty();
+            SyncEngine::ack_up_to(sync_state, history_floor_seq)
+        };
+        self.state.pending_acks.insert(
+            device_id.clone(),
+            PendingAckState {
+                ack,
+                retries: 0,
+                in_flight: false,
+            },
+        );
+
+        let affected: Vec<String> = self
+            .state
+            .conversations
+            .iter()
+            .filter(|(_, state)| state.conversation.kind == ConversationKind::Direct)
+            .map(|(conversation_id, _)| conversation_id.clone())
+            .collect();
+        for conversation_id in &affected {
+            self.mark_recovery_needed(conversation_id, RecoveryReason::MissingCommit);
+            if let Some(summary) = self.state.mls_summaries.get_mut(conversation_id) {
+                summary.status = MlsStateStatus::NeedsRecovery;
+            }
+        }
+
+        let mut persist_ops = vec![
+            PersistOp::SaveSyncState {
+                device_id: device_id.clone(),
+            },
+            PersistOp::SavePendingAck {
+                device_id: device_id.clone(),
+            },
+        ];
+        for conversation_id in affected {
+            persist_ops.extend([
+                PersistOp::SaveConversation {
+                    conversation_id: conversation_id.clone(),
+                },
+                PersistOp::SaveMlsState {
+                    conversation_id: conversation_id.clone(),
+                },
+                PersistOp::SaveRecoveryContext { conversation_id },
+            ]);
+        }
+        Ok(merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    checkpoints_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(&self.state, persist_ops)],
+                view_model: None,
+            },
+            self.flush_pending_acks()?,
+        ))
     }
 
     pub(super) fn handle_inbox_records(
@@ -3742,10 +4031,17 @@ impl CoreEngine {
                 } else {
                     None
                 };
-                let changed =
-                    stored.delivery_state != merged || stored.message_request_id != request_id;
+                let changed = stored.delivery_state != merged
+                    || stored.message_request_id != request_id
+                    || stored.plaintext != plaintext_cache
+                    || stored.storage_refs != env.storage_refs;
                 stored.delivery_state = merged;
                 stored.message_request_id = request_id;
+                stored.plaintext = plaintext_cache.clone();
+                stored.storage_refs = env.storage_refs.clone();
+                stored.sender_user_id = Some(env.sender_user_id.clone());
+                stored.sender_device_id = env.sender_device_id.clone();
+                stored.recipient_device_id = env.recipient_device_id.clone();
                 changed
             } else {
                 conv.messages.push(crate::conversation::StoredMessage {
@@ -3759,7 +4055,6 @@ impl CoreEngine {
                     created_at: env.created_at,
                     plaintext: plaintext_cache.clone(),
                     storage_refs: env.storage_refs.clone(),
-                    downloaded_blob_b64: None,
                     delivery_state: Some(desired_delivery_state),
                     message_request_id: (desired_delivery_state
                         == crate::conversation::StoredMessageDeliveryState::PendingApproval)

@@ -34,7 +34,6 @@ pub struct StoredMessage {
     pub created_at: u64,
     pub plaintext: Option<String>,
     pub storage_refs: Vec<StorageRef>,
-    pub downloaded_blob_b64: Option<String>,
     /// Local delivery state for an outgoing application message. Incoming and
     /// protocol messages leave this unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +47,7 @@ pub struct StoredMessage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredMessageDeliveryState {
+    Sending,
     Sent,
     PendingApproval,
     Failed,
@@ -289,7 +289,6 @@ impl ConversationManager {
             created_at: envelope.created_at,
             plaintext: None,
             storage_refs: envelope.storage_refs.clone(),
-            downloaded_blob_b64: None,
             delivery_state: None,
             message_request_id: None,
         });

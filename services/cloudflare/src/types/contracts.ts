@@ -316,6 +316,7 @@ export interface FetchGroupOutboxRequest {
 
 export interface FetchGroupOutboxResult {
   toSeq: number;
+  historyFloorSeq: number;
   records: GroupOutboxRecord[];
 }
 
@@ -623,6 +624,7 @@ export interface FetchMessagesRequest {
 
 export interface FetchMessagesResult {
   toSeq: number;
+  historyFloorSeq: number;
   records: InboxRecord[];
 }
 
@@ -655,7 +657,10 @@ export interface PrepareBlobUploadResult {
   uploadHeaders: Record<string, string>;
   readCapability: string;
   downloadTarget: string;
-  expiresAt?: number;
+  uploadExpiresAt: number;
+  blobExpiresAt: number;
+  deleteTarget: string;
+  deleteCapability: string;
 }
 
 export interface StorageBaseInfo {

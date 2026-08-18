@@ -1347,6 +1347,8 @@ mod tests {
             active_profile: None,
             locked_profile_path: None,
             unlock_error: None,
+            storage_layout: crate::storage_layout::DesktopStorageLayout::system_default()
+                .expect("desktop storage layout"),
         })));
 
         let first = manager

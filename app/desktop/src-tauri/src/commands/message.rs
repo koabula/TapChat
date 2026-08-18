@@ -16,6 +16,9 @@ use tapchat_core::{CoreCommand, CoreOutput};
 
 const ATTACHMENT_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 const ATTACHMENT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const ATTACHMENT_CACHE_GLOBAL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const ATTACHMENT_CACHE_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
+const ATTACHMENT_MAX_BYTES: u64 = 25 * 1024 * 1024;
 const IMAGE_PREVIEW_INITIAL_EDGE: u32 = 1280;
 const IMAGE_PREVIEW_MIN_EDGE: u32 = 512;
 const IMAGE_PREVIEW_INITIAL_QUALITY: f32 = 75.0;
@@ -49,7 +52,7 @@ struct PreparedImageAttachment {
     width: u32,
     height: u32,
     blur_hash: Option<String>,
-    preview_bytes: Vec<u8>,
+    preview_bytes: std::sync::Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -64,7 +67,7 @@ pub struct StagedAttachmentOutput {
 async fn stage_attachment_bytes(app: &tauri::AppHandle, bytes: &[u8]) -> Result<String, String> {
     let staging_id = uuid::Uuid::new_v4().to_string();
     let state = app.state::<AppState>();
-    let (attachments_dir, encrypted) = {
+    let (staging_dir, encrypted) = {
         let inner = state.inner.read().await;
         let pm = inner.profile_manager.inner.read().await;
         let profile = pm
@@ -74,11 +77,12 @@ async fn stage_attachment_bytes(app: &tauri::AppHandle, bytes: &[u8]) -> Result<
         let encrypted = profile
             .encrypt_profile_document(&format!("attachment-staging/{staging_id}"), &bytes)
             .map_err(|error| error.to_string())?;
-        (profile.metadata().attachments_dir.clone(), encrypted)
+        (
+            profile.storage_paths().transfer_staging_dir.clone(),
+            encrypted,
+        )
     };
-    let path = attachments_dir
-        .join("attachment-staging")
-        .join(format!("{staging_id}.enc"));
+    let path = staging_dir.join(format!("{staging_id}.enc"));
     write_atomic_sync(&path, &encrypted)
         .map_err(|error| format!("failed to stage encrypted attachment: {error}"))?;
     Ok(format!("encrypted-staging:{staging_id}"))
@@ -86,7 +90,7 @@ async fn stage_attachment_bytes(app: &tauri::AppHandle, bytes: &[u8]) -> Result<
 
 async fn prepare_image_attachment(
     app: &tauri::AppHandle,
-    source_bytes: Vec<u8>,
+    source_bytes: std::sync::Arc<Vec<u8>>,
     mime_type: &str,
 ) -> Result<Option<PreparedImageAttachment>, String> {
     if !mime_type.starts_with("image/") {
@@ -105,8 +109,7 @@ async fn prepare_image_attachment(
         return Ok(None);
     };
     let staging_id = uuid::Uuid::new_v4().to_string();
-    let relative = std::path::PathBuf::from("attachment-staging").join(format!("{staging_id}.enc"));
-    let (attachments_dir, encrypted) = {
+    let (staging_dir, encrypted) = {
         let inner = state.inner.read().await;
         let pm = inner.profile_manager.inner.read().await;
         let profile = pm
@@ -116,9 +119,12 @@ async fn prepare_image_attachment(
         let encrypted = profile
             .encrypt_profile_document(&format!("attachment-staging/{staging_id}"), &preview)
             .map_err(|error| error.to_string())?;
-        (profile.metadata().attachments_dir.clone(), encrypted)
+        (
+            profile.storage_paths().transfer_staging_dir.clone(),
+            encrypted,
+        )
     };
-    let path = attachments_dir.join(&relative);
+    let path = staging_dir.join(format!("{staging_id}.enc"));
     write_atomic_sync(&path, &encrypted)
         .map_err(|error| format!("failed to stage encrypted image preview: {error}"))?;
     Ok(Some(PreparedImageAttachment {
@@ -127,7 +133,7 @@ async fn prepare_image_attachment(
         width,
         height,
         blur_hash: Some(blur_hash),
-        preview_bytes: preview,
+        preview_bytes: std::sync::Arc::new(preview),
     }))
 }
 
@@ -193,6 +199,20 @@ fn attachment_mime_type(file_name: &str) -> String {
     .into()
 }
 
+async fn validate_attachment_file_metadata(path: &std::path::Path) -> Result<(), String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("failed to inspect attachment: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Attachment is not a regular file".into());
+    }
+    match metadata.len() {
+        0 => Err("Attachment is empty".into()),
+        size if size > ATTACHMENT_MAX_BYTES => Err("Attachment exceeds the 25 MiB limit".into()),
+        _ => Ok(()),
+    }
+}
+
 fn media_url(handle: &str) -> String {
     #[cfg(target_os = "windows")]
     return format!("http://tapchat-media.localhost/{handle}");
@@ -209,15 +229,19 @@ async fn register_staged_attachment(
     if bytes.is_empty() {
         return Err("Attachment is empty".into());
     }
+    if bytes.len() as u64 > ATTACHMENT_MAX_BYTES {
+        return Err("Attachment exceeds the 25 MiB limit".into());
+    }
     cleanup_orphaned_staging(app).await;
     let state = app.state::<AppState>();
     let profile_path = state.inner.read().await.profile_path.clone();
     let profile_generation = state
         .profile_generation
         .load(std::sync::atomic::Ordering::SeqCst);
-    let size_bytes = bytes.len() as u64;
-    let prepared = prepare_image_attachment(app, bytes.clone(), &mime_type).await?;
-    let original_source = stage_attachment_bytes(app, &bytes).await?;
+    let source_bytes = std::sync::Arc::new(bytes);
+    let size_bytes = source_bytes.len() as u64;
+    let prepared = prepare_image_attachment(app, source_bytes.clone(), &mime_type).await?;
+    let original_source = stage_attachment_bytes(app, &source_bytes).await?;
     let descriptor = AttachmentDescriptor {
         attachment_id: original_source,
         mime_type: mime_type.clone(),
@@ -243,7 +267,7 @@ async fn register_staged_attachment(
             handle.clone(),
             crate::state::MediaHandle {
                 source: crate::state::MediaHandleSource::InMemory {
-                    bytes: std::sync::Arc::new(preview_bytes.clone()),
+                    bytes: preview_bytes.clone(),
                 },
                 mime_type: "image/webp".into(),
                 profile_path: profile_path.clone(),
@@ -283,6 +307,7 @@ pub async fn stage_attachment(
         .unwrap_or("attachment")
         .to_string();
     let mime_type = attachment_mime_type(&file_name);
+    validate_attachment_file_metadata(&path).await?;
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|error| format!("failed to read attachment: {error}"))?;
@@ -316,6 +341,7 @@ pub async fn stage_attachments_from_dialog(
             .unwrap_or("attachment")
             .to_string();
         let mime_type = attachment_mime_type(&file_name);
+        validate_attachment_file_metadata(&path).await?;
         let bytes = tokio::fs::read(&path)
             .await
             .map_err(|error| format!("failed to read attachment: {error}"))?;
@@ -359,19 +385,18 @@ pub async fn release_staged_attachment(
         if let Some(preview_handle) = staged.preview_handle {
             state.media_handles.write().await.remove(&preview_handle);
         }
-        let attachments_dir = {
+        let staging_dir = {
             let inner = state.inner.read().await;
             let pm = inner.profile_manager.inner.read().await;
             pm.active_profile.as_ref().and_then(|profile| {
                 (Some(profile.root().to_path_buf()) == staged.profile_path)
-                    .then(|| profile.metadata().attachments_dir.clone())
+                    .then(|| profile.storage_paths().transfer_staging_dir.clone())
             })
         };
-        if let Some(attachments_dir) = attachments_dir {
-            remove_encrypted_staging_source(&attachments_dir, &staged.descriptor.attachment_id)
-                .await?;
+        if let Some(staging_dir) = staging_dir {
+            remove_encrypted_staging_source(&staging_dir, &staged.descriptor.attachment_id).await?;
             if let Some(preview) = staged.descriptor.preview.as_ref() {
-                remove_encrypted_staging_source(&attachments_dir, &preview.attachment_id).await?;
+                remove_encrypted_staging_source(&staging_dir, &preview.attachment_id).await?;
             }
         }
     }
@@ -379,7 +404,7 @@ pub async fn release_staged_attachment(
 }
 
 async fn remove_encrypted_staging_source(
-    attachments_dir: &std::path::Path,
+    staging_dir: &std::path::Path,
     attachment_id: &str,
 ) -> Result<(), String> {
     let Some(staging_id) = attachment_id
@@ -388,9 +413,7 @@ async fn remove_encrypted_staging_source(
     else {
         return Ok(());
     };
-    let path = attachments_dir
-        .join("attachment-staging")
-        .join(format!("{staging_id}.enc"));
+    let path = staging_dir.join(format!("{staging_id}.enc"));
     match tokio::fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -418,7 +441,7 @@ async fn cleanup_orphaned_staging(app: &tauri::AppHandle) {
             }
         }
     }
-    let attachments_dir = {
+    let staging_dir = {
         let inner = state.inner.read().await;
         for transfer in inner.engine.refresh_snapshot().pending_blob_transfers {
             if let tapchat_core::persistence::PersistedPendingBlobTransfer::Upload {
@@ -433,9 +456,9 @@ async fn cleanup_orphaned_staging(app: &tauri::AppHandle) {
         let pm = inner.profile_manager.inner.read().await;
         pm.active_profile
             .as_ref()
-            .map(|profile| profile.metadata().attachments_dir.clone())
+            .map(|profile| profile.storage_paths().transfer_staging_dir.clone())
     };
-    let Some(staging_dir) = attachments_dir.map(|dir| dir.join("attachment-staging")) else {
+    let Some(staging_dir) = staging_dir else {
         return;
     };
     let Ok(mut entries) = tokio::fs::read_dir(staging_dir).await else {
@@ -1195,17 +1218,15 @@ async fn load_pending_attachment_bytes(
         .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
         .ok_or_else(|| "Attachment local staging handle is invalid".to_string())?;
     let state = app.state::<AppState>();
-    let attachments_dir = {
+    let staging_dir = {
         let inner = state.inner.read().await;
         let pm = inner.profile_manager.inner.read().await;
         pm.active_profile
             .as_ref()
-            .map(|profile| profile.metadata().attachments_dir.clone())
+            .map(|profile| profile.storage_paths().transfer_staging_dir.clone())
     }
     .ok_or_else(|| "No active profile".to_string())?;
-    let encrypted_path = attachments_dir
-        .join("attachment-staging")
-        .join(format!("{staging_id}.enc"));
+    let encrypted_path = staging_dir.join(format!("{staging_id}.enc"));
     let encrypted = tokio::fs::read(&encrypted_path)
         .await
         .map_err(|_| "Attachment local staging data is unavailable".to_string())?;
@@ -1452,10 +1473,11 @@ async fn load_media_variant_bytes(
         .load(std::sync::atomic::Ordering::SeqCst);
     let attachments_dir = {
         let ports = state.ports.lock().await;
-        ports.persistence.attachments_dir().await
+        ports.persistence.attachment_cache_dir().await
     }
     .ok_or_else(|| "no attachments directory configured".to_string())?;
     cleanup_encrypted_attachment_cache(app, &attachments_dir).await?;
+    ensure_attachment_cache_has_space(&attachments_dir)?;
     let cache_id = attachment_cache_id(descriptor);
     let cache_destination = EncryptedCacheDestination::from_cache_id(&cache_id)
         .map_err(|_| "invalid encrypted media cache destination".to_string())?;
@@ -1522,13 +1544,12 @@ pub async fn clear_attachment_cache(app: tauri::AppHandle) -> crate::errors::Des
             let ports = state.ports.lock().await;
             ports.persistence.clone()
         };
-        persistence.attachments_dir().await
+        persistence.attachment_cache_dir().await
     }
     .ok_or_else(|| "no attachments directory configured".to_string())?;
 
-    let cache_dir = attachments_dir.join("attachment-cache");
-    if cache_dir.exists() {
-        std::fs::remove_dir_all(&cache_dir)
+    if attachments_dir.exists() {
+        std::fs::remove_dir_all(&attachments_dir)
             .map_err(|e| format!("failed to clear attachment cache: {e}"))?;
     }
     let state = app.state::<AppState>();
@@ -1555,7 +1576,7 @@ async fn attachment_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathB
     let state = app.state::<AppState>();
     let directory = {
         let ports = state.ports.lock().await;
-        ports.persistence.attachments_dir().await
+        ports.persistence.attachment_cache_dir().await
     }
     .ok_or_else(|| "no attachments directory configured".to_string())?;
     Ok(directory)
@@ -1575,8 +1596,7 @@ fn chunk_cache_relative_path(
     descriptor: &EncryptedBlobDescriptor,
     index: u32,
 ) -> std::path::PathBuf {
-    std::path::PathBuf::from("attachment-cache")
-        .join("chunks")
+    std::path::PathBuf::from("chunks")
         .join(attachment_cache_id(descriptor))
         .join(format!("{index}.chunk"))
 }
@@ -1666,6 +1686,7 @@ async fn write_ciphertext_chunk(
     bytes: &[u8],
 ) -> Result<(), String> {
     let attachments_dir = attachment_cache_dir(app).await?;
+    ensure_attachment_cache_has_space(&attachments_dir)?;
     let path = attachments_dir.join(chunk_cache_relative_path(descriptor, index));
     write_atomic_sync(&path, bytes)
         .map_err(|error| format!("failed to cache encrypted video chunk: {error}"))?;
@@ -2069,6 +2090,18 @@ async fn cleanup_encrypted_attachment_cache(
     attachments_dir: &std::path::Path,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let protected_cache_ids: std::collections::HashSet<String> = state
+        .media_handles
+        .read()
+        .await
+        .values()
+        .filter_map(|handle| match &handle.source {
+            crate::state::MediaHandleSource::ChunkedVideo { descriptor, .. } => {
+                Some(attachment_cache_id(descriptor))
+            }
+            crate::state::MediaHandleSource::InMemory { .. } => None,
+        })
+        .collect();
     let inner = state.inner.read().await;
     let pm = inner.profile_manager.inner.read().await;
     let Some(profile) = pm.active_profile.as_ref() else {
@@ -2079,6 +2112,7 @@ async fn cleanup_encrypted_attachment_cache(
         .map_err(|e| e.to_string())?;
     let now = now_ms();
     let ttl_ms = ATTACHMENT_CACHE_TTL_SECS.saturating_mul(1000);
+    let global_cache_root = pm.storage_layout.attachments_cache_root.clone();
 
     entries.retain(|entry| {
         if !is_safe_relative_path(&entry.relative_path) {
@@ -2097,15 +2131,138 @@ async fn cleanup_encrypted_attachment_cache(
 
     entries.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
     let mut total = 0_u64;
-    for entry in entries {
+    let mut indexed_paths = std::collections::HashSet::new();
+    for entry in &entries {
         total = total.saturating_add(entry.size_bytes.unwrap_or_default());
-        if total <= ATTACHMENT_CACHE_MAX_BYTES {
+        let is_leased = protected_cache_ids
+            .iter()
+            .any(|cache_id| entry.relative_path.to_string_lossy().contains(cache_id));
+        if total <= ATTACHMENT_CACHE_MAX_BYTES || is_leased {
+            indexed_paths.insert(entry.relative_path.clone());
             continue;
         }
         if is_safe_relative_path(&entry.relative_path) {
             let _ = std::fs::remove_file(attachments_dir.join(&entry.relative_path));
         }
         let _ = profile.delete_attachment_cache_entry(&entry.cache_id);
+    }
+
+    // Reconcile the other direction: files without an index are cache
+    // orphans. Keep a 24-hour crash-recovery grace period, while stale temp
+    // files can be removed after one hour.
+    for file in collect_cache_files(attachments_dir) {
+        let Ok(relative) = file.strip_prefix(attachments_dir) else {
+            continue;
+        };
+        if indexed_paths.contains(relative) {
+            continue;
+        }
+        let age = std::fs::metadata(&file)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age.as_secs())
+            .unwrap_or_default();
+        let is_temp = file.extension().and_then(|value| value.to_str()) == Some("tmp");
+        let grace = if is_temp { 60 * 60 } else { 24 * 60 * 60 };
+        if age >= grace
+            && !protected_cache_ids
+                .iter()
+                .any(|cache_id| relative.to_string_lossy().contains(cache_id))
+        {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+    remove_empty_cache_dirs(attachments_dir);
+
+    // Enforce the cross-profile cap using file modification time as the LRU
+    // fallback. Other profiles reconcile their DB index on next activation.
+    let mut global_files = collect_cache_files(&global_cache_root)
+        .into_iter()
+        .filter_map(|path| {
+            let metadata = std::fs::metadata(&path).ok()?;
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            Some((modified, metadata.len(), path))
+        })
+        .collect::<Vec<_>>();
+    let mut global_total = global_files
+        .iter()
+        .fold(0_u64, |sum, (_, size, _)| sum.saturating_add(*size));
+    global_files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, size, path) in global_files {
+        if global_total <= ATTACHMENT_CACHE_GLOBAL_MAX_BYTES {
+            break;
+        }
+        if protected_cache_ids
+            .iter()
+            .any(|cache_id| path.to_string_lossy().contains(cache_id))
+        {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            global_total = global_total.saturating_sub(size);
+            if let Ok(relative) = path.strip_prefix(attachments_dir) {
+                if let Some(entry) = entries.iter().find(|entry| entry.relative_path == relative) {
+                    let _ = profile.delete_attachment_cache_entry(&entry.cache_id);
+                }
+            }
+        }
+    }
+    remove_empty_cache_dirs(&global_cache_root);
+    Ok(())
+}
+
+fn collect_cache_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
+            files.push(entry.path());
+        } else if file_type.is_dir() {
+            files.extend(collect_cache_files(&entry.path()));
+        }
+    }
+    files
+}
+
+fn remove_empty_cache_dirs(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_empty_cache_dirs(&entry.path());
+            let _ = std::fs::remove_dir(entry.path());
+        }
+    }
+}
+
+pub(crate) fn ensure_attachment_cache_has_space(
+    cache_root: &std::path::Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(cache_root)
+        .map_err(|error| format!("failed to create attachment cache: {error}"))?;
+    let free = fs2::available_space(cache_root)
+        .map_err(|error| format!("failed to inspect free disk space: {error}"))?;
+    if free < ATTACHMENT_CACHE_MIN_FREE_BYTES {
+        return Err("Attachment cache is disabled because less than 1 GiB is available".into());
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_attachment_maintenance(app: &tauri::AppHandle) -> Result<(), String> {
+    cleanup_orphaned_staging(app).await;
+    if let Ok(cache_dir) = attachment_cache_dir(app).await {
+        cleanup_encrypted_attachment_cache(app, &cache_dir).await?;
     }
     Ok(())
 }

@@ -1887,6 +1887,8 @@ test("prepare-upload requires runtime auth and blob-scoped capability gates acce
     version: string;
     uploadTarget: string;
     downloadTarget: string;
+    deleteTarget: string;
+    deleteCapability: string;
     readCapability: string;
     blobRef: string;
   };
@@ -1973,6 +1975,22 @@ test("prepare-upload requires runtime auth and blob-scoped capability gates acce
   }), env);
   assert.equal(invalidRange.status, 416);
   assert.equal(invalidRange.headers.get("content-range"), "bytes */4");
+
+  const wrongDelete = await handleRequest(new Request(prepared.deleteTarget, {
+    method: "DELETE",
+    headers: { Authorization: "TapChat-Delete wrong-delete-capability" },
+  }), env);
+  assert.equal(wrongDelete.status, 403);
+  const deleted = await handleRequest(new Request(prepared.deleteTarget, {
+    method: "DELETE",
+    headers: { Authorization: `TapChat-Delete ${prepared.deleteCapability}` },
+  }), env);
+  assert.equal(deleted.status, 204);
+  const deletedAgain = await handleRequest(new Request(prepared.deleteTarget, {
+    method: "DELETE",
+    headers: { Authorization: `TapChat-Delete ${prepared.deleteCapability}` },
+  }), env);
+  assert.equal(deletedAgain.status, 204);
 });
 
 test("shared-state writes accept device runtime auth", async () => {
@@ -2053,7 +2071,7 @@ test("group outbox appends fetches and returns head with authorized capability",
     env
   );
   assert.equal(empty.status, 200);
-  assert.deepEqual(await empty.json(), { version: CURRENT_MODEL_VERSION, toSeq: 2, records: [] });
+  assert.deepEqual(await empty.json(), { version: CURRENT_MODEL_VERSION, toSeq: 2, historyFloorSeq: 0, records: [] });
 });
 
 test("group outbox append is idempotent by message id", async () => {
@@ -2717,7 +2735,7 @@ test("welcome pickup stores and fetches a device-scoped welcome", async () => {
   assert.equal(rejected.status, 403);
 });
 
-test("ack semantics reject backwards ack and cleanup only removes expired acked records", async () => {
+test("inbox hard retention advances history floor even while the client is offline", async () => {
   const state = new MemoryState();
   const spillStore = new MemoryR2Store();
   const service = new InboxService("device:bob:phone", state, spillStore, [], {
@@ -2767,7 +2785,10 @@ test("ack semantics reject backwards ack and cleanup only removes expired acked 
 
   await service.cleanExpiredRecords(1_000 + 2 * 24 * 60 * 60 * 1000);
   const withoutAck = await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 });
-  assert.equal(withoutAck.records.length, 1);
+  assert.equal(withoutAck.records.length, 0);
+  assert.equal(withoutAck.historyFloorSeq, 1);
+  assert.equal(withoutAck.toSeq, 1);
+  assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), false);
 
   await service.ack({
     ack: {
@@ -2788,14 +2809,10 @@ test("ack semantics reject backwards ack and cleanup only removes expired acked 
     /ack_seq must not move backwards/
   );
 
-  await service.cleanExpiredRecords(1_000 + 12 * 60 * 60 * 1000);
-  const beforeExpiry = await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 });
-  assert.equal(beforeExpiry.records.length, 1);
-
-  await service.cleanExpiredRecords(1_000 + 2 * 24 * 60 * 60 * 1000);
   const afterExpiry = await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 });
   assert.equal(afterExpiry.records.length, 0);
-  assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), false);
+  assert.equal(afterExpiry.historyFloorSeq, 0);
+  assert.equal(afterExpiry.toSeq, 1);
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
 });
 
@@ -2819,6 +2836,35 @@ test("inbox fetch fails closed when an R2 spill payload is missing", async () =>
     () => service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 }),
     /inbox spill payload is missing at seq 1/
   );
+});
+
+test("group hard retention keeps one compact history floor and expires idempotency", async () => {
+  const state = new MemoryState();
+  const spillStore = new MemoryR2Store();
+  const service = new GroupOutboxService(
+    "group:project",
+    state,
+    spillStore,
+    { headSeq: 0, retentionDays: 1, maxInlineBytes: 1 },
+  );
+  const capability = sampleGroupCapability();
+  const request = sampleGroupAppend(
+    "group:project",
+    "msg:group:expired",
+    "mls_application",
+    capability,
+  );
+  assert.equal((await service.appendEnvelope(request, 1_000)).seq, 1);
+  await service.processAlarm(1_000 + 2 * 24 * 60 * 60 * 1000);
+  const fetched = await service.fetchOutbox({
+    groupId: "group:project",
+    fromSeq: 1,
+    limit: 10,
+    capability,
+  });
+  assert.equal(fetched.historyFloorSeq, 1);
+  assert.equal(fetched.records.length, 0);
+  assert.equal((await service.appendEnvelope(request, 1_000 + 3 * 24 * 60 * 60 * 1000)).seq, 2);
 });
 
 test("group outbox seal succeeds for owner and records sealed timestamp", async () => {

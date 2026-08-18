@@ -9,7 +9,7 @@ mod tests {
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput,
-        FfiApiModule, RealtimeEvent,
+        FfiApiModule, PersistenceMutation, RealtimeEvent,
     };
     use crate::identity::IdentityManager;
     use crate::mls_adapter::MlsAdapter;
@@ -22,10 +22,7 @@ mod tests {
         InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
         WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
-    use crate::persistence::{
-        ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp,
-        PersistedPendingWelcomePickup,
-    };
+    use crate::persistence::{ContactRelationshipStatus, PersistOp, PersistedPendingWelcomePickup};
     use crate::transport_contract::{
         GroupJoinDecision, MessageRequestAction, MessageRequestActionResult,
         SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
@@ -372,7 +369,7 @@ mod tests {
             1
         );
 
-        let persisted = extract_snapshot(&output);
+        let persisted = alice.refresh_snapshot();
         assert_eq!(persisted.pending_outbox.len(), pending_before_send + 1);
         assert_eq!(
             persisted
@@ -1079,7 +1076,7 @@ mod tests {
             .expect_err("removed local member cannot send");
         assert_eq!(send_error.code(), "invalid_input");
 
-        let mut snapshot = extract_snapshot(&output);
+        let mut snapshot = alice.refresh_snapshot();
         for group_state in &mut snapshot.group_states {
             group_state.local_role = None;
         }
@@ -3809,7 +3806,6 @@ mod tests {
                 created_at: 1,
                 plaintext: Some("hello".into()),
                 storage_refs: Vec::new(),
-                downloaded_blob_b64: None,
                 delivery_state: Some(
                     crate::conversation::StoredMessageDeliveryState::PendingApproval,
                 ),
@@ -4235,7 +4231,12 @@ mod tests {
                     read_capability: "read-capability".into(),
                     download_target:
                         "https://storage.example.com/v1/storage/blob/blob%3Aattachment-1".into(),
-                    expires_at: Some(99),
+                    upload_expires_at: Some(99),
+                    blob_expires_at: Some(999),
+                    delete_target: Some(
+                        "https://storage.example.com/v1/storage/blob/blob%3Aattachment-1".into(),
+                    ),
+                    delete_capability: Some("delete-attachment-1".into()),
                 },
             })
             .expect("blob prepared");
@@ -4269,6 +4270,10 @@ mod tests {
             .find(|item| !item.envelope.storage_refs.is_empty())
             .expect("attachment outbox");
         let message_id = outbox_item.envelope.message_id.clone();
+        let logical_message_id = outbox_item
+            .app_message_id
+            .clone()
+            .unwrap_or_else(|| message_id.clone());
         let plaintext_cache = outbox_item
             .plaintext_cache
             .as_deref()
@@ -4305,22 +4310,38 @@ mod tests {
         )));
 
         let request_id = find_http_request_id(&output, "/messages");
-        alice
+        let append_output = alice
             .handle_event(CoreEvent::HttpResponseReceived {
                 request_id,
                 status: 200,
                 body: Some(r#"{"accepted":true,"seq":3,"delivered_to":"inbox"}"#.into()),
             })
             .expect("append inbox response");
-        let stored = alice
-            .state
-            .conversations
-            .get(&conversation_id)
-            .expect("conversation")
-            .messages
+        let stored = append_output
+            .effects
             .iter()
-            .find(|message| message.message_id == message_id)
-            .expect("stored sent attachment");
+            .find_map(|effect| match effect {
+                CoreEffect::PersistState { persist } => {
+                    persist
+                        .mutations
+                        .iter()
+                        .find_map(|mutation| match mutation {
+                            PersistenceMutation::InsertMessage {
+                                conversation_id: persisted_conversation_id,
+                                message,
+                            } if persisted_conversation_id == &conversation_id
+                                && (message.message_id == logical_message_id
+                                    || message.app_message_id.as_deref()
+                                        == Some(logical_message_id.as_str())) =>
+                            {
+                                Some(message)
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            })
+            .expect("persisted sent attachment mutation");
         let stored_metadata: AttachmentPayloadMetadata = serde_json::from_str(
             stored
                 .plaintext
@@ -4377,7 +4398,12 @@ mod tests {
                     read_capability: "read-video".into(),
                     download_target:
                         "https://storage.example.com/v1/storage/blob/blob%3Avideo-chunked".into(),
-                    expires_at: Some(99),
+                    upload_expires_at: Some(99),
+                    blob_expires_at: Some(999),
+                    delete_target: Some(
+                        "https://storage.example.com/v1/storage/blob/blob%3Avideo-chunked".into(),
+                    ),
+                    delete_capability: Some("delete-video".into()),
                 },
             })
             .expect("prepare video");
@@ -4500,7 +4526,12 @@ mod tests {
                     read_capability: "read-original".into(),
                     download_target:
                         "https://storage.example.com/v1/storage/blob/blob%3Aimage-original".into(),
-                    expires_at: Some(99),
+                    upload_expires_at: Some(99),
+                    blob_expires_at: Some(999),
+                    delete_target: Some(
+                        "https://storage.example.com/v1/storage/blob/blob%3Aimage-original".into(),
+                    ),
+                    delete_capability: Some("delete-original".into()),
                 },
             })
             .expect("prepare original");
@@ -4536,7 +4567,12 @@ mod tests {
                     read_capability: "read-preview".into(),
                     download_target:
                         "https://storage.example.com/v1/storage/blob/blob%3Aimage-preview".into(),
-                    expires_at: Some(99),
+                    upload_expires_at: Some(99),
+                    blob_expires_at: Some(999),
+                    delete_target: Some(
+                        "https://storage.example.com/v1/storage/blob/blob%3Aimage-preview".into(),
+                    ),
+                    delete_capability: Some("delete-preview".into()),
                 },
             })
             .expect("prepare preview");
@@ -4606,7 +4642,12 @@ mod tests {
                     read_capability: "read-long-idle".into(),
                     download_target: "https://storage.example.com/v1/storage/blob/blob%3Along-idle"
                         .into(),
-                    expires_at: Some(15),
+                    upload_expires_at: Some(15),
+                    blob_expires_at: Some(999),
+                    delete_target: Some(
+                        "https://storage.example.com/v1/storage/blob/blob%3Along-idle".into(),
+                    ),
+                    delete_capability: Some("delete-long-idle".into()),
                 },
             })
             .expect("blob prepared");
@@ -4727,7 +4768,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_attachment_upload_failure_keeps_retryable_local_placeholder() {
+    fn terminal_attachment_upload_failure_keeps_failed_message_and_releases_transfer() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -4753,20 +4794,30 @@ mod tests {
             })
             .expect("upload failure");
 
-        let pending = alice
+        assert!(!alice.state.pending_blob_uploads.contains_key(&task_id));
+        let failed_message = alice
             .state
-            .pending_blob_uploads
-            .get(&task_id)
-            .expect("failed upload remains visible and recoverable");
-        assert_eq!(pending.retries, MAX_TRANSPORT_RETRIES);
-        assert!(!pending.in_flight);
+            .conversations
+            .values()
+            .flat_map(|conversation| &conversation.messages)
+            .find(|message| {
+                message.delivery_state
+                    == Some(crate::conversation::StoredMessageDeliveryState::Failed)
+            })
+            .expect("failed message placeholder remains visible");
+        assert!(failed_message.plaintext.is_none());
         assert!(failed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::PersistState { persist }
                 if persist.ops.iter().any(|op| matches!(
-                    op,
-                    PersistOp::SavePendingBlobTransfer { task_id: saved } if saved == &task_id
+                    op, PersistOp::DeletePendingBlobTransfer { task_id: deleted }
+                        if deleted == &task_id
                 ))
+        )));
+        assert!(failed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ReleaseStagedAttachment { release }
+                if !release.attachment_ids.is_empty()
         )));
     }
 
@@ -4802,7 +4853,6 @@ mod tests {
                         serde_json::to_string(&legacy_metadata).expect("attachment metadata"),
                     ),
                     storage_refs: vec![],
-                    downloaded_blob_b64: None,
                     delivery_state: None,
                     message_request_id: None,
                 }],
@@ -5287,7 +5337,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_effect_uses_typed_ops_and_snapshot() {
+    fn persist_effect_uses_typed_mutations_without_snapshot() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -5308,7 +5358,14 @@ mod tests {
             .ops
             .iter()
             .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. })));
-        assert!(persist.snapshot.is_some());
+        assert!(persist.mutations.iter().any(|mutation| matches!(
+            mutation,
+            PersistenceMutation::Save {
+                table: crate::ffi_api::PersistenceTable::PendingOutbox,
+                ..
+            }
+        )));
+        assert!(persist.snapshot.is_none());
     }
 
     #[test]
@@ -5316,13 +5373,13 @@ mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let output = alice
+        let _output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id,
                 plaintext: "hello".into(),
             })
             .expect("send");
-        let snapshot = extract_snapshot(&output);
+        let snapshot = alice.refresh_snapshot();
 
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
@@ -5340,13 +5397,13 @@ mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let output = alice
+        let _output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id,
                 plaintext: "hello".into(),
             })
             .expect("send");
-        let snapshot = extract_snapshot(&output);
+        let snapshot = alice.refresh_snapshot();
 
         assert!(!snapshot.mls_state_persistence_blocked);
         assert!(snapshot
@@ -5711,7 +5768,7 @@ mod tests {
             PersistOp::SaveConversation { conversation_id: saved }
                 if saved == &conversation_id
         )));
-        let snapshot = extract_snapshot(&output);
+        let snapshot = alice.refresh_snapshot();
         assert!(!snapshot
             .pending_outbox
             .iter()
@@ -5899,13 +5956,13 @@ mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut engine, bob_bundle.user_id.clone());
-        let upload_output = engine
+        let _upload_output = engine
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id,
                 attachment_descriptor: sample_attachment_descriptor(),
             })
             .expect("attachment");
-        let mut snapshot = extract_snapshot(&upload_output);
+        let mut snapshot = engine.refresh_snapshot();
         let device_id = engine
             .state
             .local_identity
@@ -5961,13 +6018,13 @@ mod tests {
                 _ => None,
             })
             .expect("read attachment effect");
-        let prepared_output = engine
+        let _prepared_output = engine
             .handle_event(CoreEvent::AttachmentBytesLoaded {
                 task_id: task_id.clone(),
                 plaintext: vec![1_u8, 2, 3, 4],
             })
             .expect("attachment bytes loaded");
-        let mut snapshot = extract_snapshot(&prepared_output);
+        let mut snapshot = engine.refresh_snapshot();
         if let Some(crate::persistence::PersistedPendingBlobTransfer::Upload {
             encrypted_descriptor,
             prepared_upload,
@@ -5982,7 +6039,12 @@ mod tests {
                 read_capability: "read-prepared".into(),
                 download_target: "https://storage.example.com/v1/storage/blob/blob%3Aprepared"
                     .into(),
-                expires_at: Some(42),
+                upload_expires_at: Some(42),
+                blob_expires_at: Some(999),
+                delete_target: Some(
+                    "https://storage.example.com/v1/storage/blob/blob%3Aprepared".into(),
+                ),
+                delete_capability: Some("delete-prepared".into()),
             });
         } else {
             panic!("missing persisted upload task");
@@ -6012,13 +6074,13 @@ mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let output = alice
+        let _output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "hello".into(),
             })
             .expect("send");
-        let mut snapshot = extract_snapshot(&output);
+        let mut snapshot = alice.refresh_snapshot();
         snapshot.mls_states[0].serialized_group_state = Some("{broken".into());
 
         let error = CoreEngine::try_from_restored_state(snapshot)
@@ -6031,13 +6093,13 @@ mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let output = alice
+        let _output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "hello".into(),
             })
             .expect("send");
-        let mut snapshot = extract_snapshot(&output);
+        let mut snapshot = alice.refresh_snapshot();
         snapshot
             .conversations
             .iter_mut()
@@ -6260,7 +6322,7 @@ mod tests {
             "local state must be persisted before acking inbox records"
         );
 
-        let snapshot = extract_snapshot(&output);
+        let snapshot = bob.refresh_snapshot();
         assert!(snapshot
             .mls_states
             .iter()
@@ -6447,7 +6509,7 @@ mod tests {
             op,
             PersistOp::SaveSyncState { device_id } if device_id == &bob_device_id
         )));
-        let snapshot = extract_snapshot(&output);
+        let snapshot = bob.refresh_snapshot();
         assert!(!snapshot
             .pending_acks
             .iter()
@@ -6632,12 +6694,12 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let rebuild_output = alice
+        let _rebuild_output = alice
             .handle_command(CoreCommand::RebuildConversation {
                 conversation_id: conversation_id.clone(),
             })
             .expect("rebuild conversation");
-        let snapshot = extract_snapshot(&rebuild_output);
+        let snapshot = alice.refresh_snapshot();
         let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
 
         let recovery = restored
@@ -6716,7 +6778,7 @@ mod tests {
             op,
             PersistOp::SaveMlsState { conversation_id: id } if id == &conversation_id
         )));
-        let snapshot = extract_snapshot(&output);
+        let snapshot = alice.refresh_snapshot();
         assert!(!snapshot
             .recovery_contexts
             .iter()
@@ -6871,7 +6933,6 @@ mod tests {
                             .expect("attachment metadata"),
                     ),
                     storage_refs: vec![],
-                    downloaded_blob_b64: None,
                     delivery_state: None,
                     message_request_id: None,
                 }],
@@ -6988,14 +7049,14 @@ mod tests {
                 bundle: sample_deployment(),
             })
             .expect("deployment");
-        let create_output = laptop
+        let _create_output = laptop
             .handle_command(CoreCommand::CreateAdditionalDeviceIdentity {
                 mnemonic: Some(BOB_MNEMONIC.into()),
                 device_name: Some("laptop".into()),
                 display_name: None,
             })
             .expect("additional device");
-        let snapshot = extract_snapshot(&create_output);
+        let snapshot = laptop.refresh_snapshot();
         let deployment = snapshot
             .deployment
             .as_ref()
@@ -7366,7 +7427,7 @@ mod tests {
             "welcome import must publish a fresh KeyPackage"
         );
 
-        let snapshot = extract_snapshot(&output);
+        let snapshot = bob.refresh_snapshot();
         let deployment = snapshot.deployment.expect("persisted deployment");
         assert_eq!(
             deployment
@@ -7820,12 +7881,12 @@ mod tests {
         )
         .expect("merged bundle");
 
-        let refresh_output = alice
+        let _refresh_output = alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
             .expect("apply bundle update");
         let pending_after_refresh = alice.state.pending_outbox.len();
 
-        let snapshot = extract_snapshot(&refresh_output);
+        let snapshot = alice.refresh_snapshot();
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         restored
             .handle_command(CoreCommand::ReconcileConversationMembership {
@@ -7842,13 +7903,13 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let create_output = alice
+        let _create_output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "before rebuild".into(),
             })
             .expect("send");
-        let mut snapshot = extract_snapshot(&create_output);
+        let mut snapshot = alice.refresh_snapshot();
         snapshot
             .mls_states
             .first_mut()
@@ -8593,12 +8654,18 @@ mod tests {
                             .handle_event(CoreEvent::BlobUploadPrepared {
                                 task_id: upload.task_id,
                                 result: crate::transport_contract::PrepareBlobUploadResult {
-                                    blob_ref,
+                                    blob_ref: blob_ref.clone(),
                                     upload_target: "memory-upload".into(),
                                     upload_headers: BTreeMap::new(),
                                     read_capability: "test-read-capability".into(),
                                     download_target,
-                                    expires_at: Some(u64::MAX / 2),
+                                    upload_expires_at: Some(u64::MAX / 2),
+                                    blob_expires_at: Some(u64::MAX / 2),
+                                    delete_target: Some(format!(
+                                        "{storage_origin}/v1/storage/blob/{}",
+                                        urlencoding::encode(&blob_ref)
+                                    )),
+                                    delete_capability: Some("test-delete-capability".into()),
                                 },
                             })
                             .expect("blob upload prepared")
@@ -9337,17 +9404,6 @@ mod tests {
             .effects
             .iter()
             .position(|effect| matches!(effect, CoreEffect::PersistState { .. }))
-    }
-
-    fn extract_snapshot(output: &crate::ffi_api::CoreOutput) -> CorePersistenceSnapshot {
-        output
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.snapshot.clone(),
-                _ => None,
-            })
-            .expect("persist snapshot")
     }
 
     fn publish_shared_state_effects(

@@ -16,4 +16,5 @@ export type Env = Omit<CloudflareBindings, "PUBLIC_BASE_URL"> & {
   DEVICE_RUNTIME_SECRET_PREVIOUS?: string;
   DEVICE_RUNTIME_SECRET_PREVIOUS_KEY_ID?: string;
   AUTH_ROTATION_GRACE_UNTIL_MS?: string;
+  RETENTION_DAYS?: string;
 };

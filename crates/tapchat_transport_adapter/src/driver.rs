@@ -346,6 +346,7 @@ impl CoreDriver {
     pub async fn run_command_until_idle(&mut self, command: CoreCommand) -> Result<CoreOutput> {
         let output = self.engine.handle_command(command)?;
         let output = self.execute_until_idle(output).await?;
+        self.runtime.latest_snapshot = Some(self.engine.refresh_snapshot());
         self.record_observed_output(&output);
         Ok(output)
     }
@@ -353,12 +354,14 @@ impl CoreDriver {
     pub async fn inject_event_until_idle(&mut self, event: CoreEvent) -> Result<CoreOutput> {
         let output = self.engine.handle_event(event)?;
         let output = self.execute_until_idle(output).await?;
+        self.runtime.latest_snapshot = Some(self.engine.refresh_snapshot());
         self.record_observed_output(&output);
         Ok(output)
     }
 
     pub fn inject_event_without_effects(&mut self, event: CoreEvent) -> Result<CoreOutput> {
         let output = self.engine.handle_event(event)?;
+        self.runtime.latest_snapshot = Some(self.engine.refresh_snapshot());
         self.record_observed_output(&output);
         Ok(output)
     }
@@ -395,6 +398,7 @@ impl CoreDriver {
             reason: Some("manual close".into()),
         })?;
         let _ = self.execute_until_idle(output).await?;
+        self.runtime.latest_snapshot = Some(self.engine.refresh_snapshot());
         Ok(())
     }
 
@@ -1054,6 +1058,41 @@ impl CoreDriver {
         }
     }
 
+    async fn delete_blob(
+        &self,
+        delete: tapchat_core::ffi_api::DeleteBlobRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        match self
+            .runtime
+            .client
+            .delete(&delete.delete_target)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("TapChat-Delete {}", delete.delete_capability),
+            )
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() || response.status().as_u16() == 404 => {
+                Ok(vec![CoreEvent::BlobDeleted {
+                    task_id: delete.task_id,
+                }])
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobDeleteFailed {
+                    task_id: delete.task_id,
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::BlobDeleteFailed {
+                task_id: delete.task_id,
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
+            }]),
+        }
+    }
+
     async fn write_downloaded_attachment(
         &self,
         write: tapchat_core::ffi_api::WriteDownloadedAttachmentEffect,
@@ -1065,10 +1104,7 @@ impl CoreDriver {
         Ok(Vec::new())
     }
 
-    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
-        if let Some(snapshot) = persist.snapshot {
-            self.runtime.latest_snapshot = Some(snapshot);
-        }
+    fn persist_state(&mut self, _persist: PersistStateEffect) -> Result<()> {
         Ok(())
     }
 
@@ -1170,6 +1206,13 @@ impl BlobIoPort for CoreDriver {
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
         CoreDriver::download_blob(self, download).await
+    }
+
+    async fn delete_blob(
+        &mut self,
+        delete: tapchat_core::ffi_api::DeleteBlobRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::delete_blob(self, delete).await
     }
 
     async fn write_downloaded_attachment(

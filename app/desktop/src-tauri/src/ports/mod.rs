@@ -13,8 +13,9 @@ use tapchat_core::external_fetch::{
     fetch_external_json, validate_group_invite_transport_binding, ExternalResourceKind,
 };
 use tapchat_core::ffi_api::{
-    CacheUploadedAttachmentEffect, CoreEvent, HttpMethod, HttpRequestEffect, PersistStateEffect,
-    ReadAttachmentBytesEffect, UserNotificationEffect, WriteDownloadedAttachmentEffect,
+    CacheUploadedAttachmentEffect, CoreEvent, DeleteBlobRequest, HttpMethod, HttpRequestEffect,
+    PersistStateEffect, ReadAttachmentBytesEffect, UserNotificationEffect,
+    WriteDownloadedAttachmentEffect,
 };
 use tapchat_core::platform_ports::{
     BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
@@ -782,11 +783,19 @@ impl TransportPort for DesktopPlatformPorts {
                     result.to_seq,
                     result.records.len()
                 );
-                Ok(vec![CoreEvent::GroupOutboxFetched {
+                let mut events = Vec::new();
+                if result.history_floor_seq > 0 {
+                    events.push(CoreEvent::GroupHistoryFloorAdvanced {
+                        group_id: fetch.group_id.clone(),
+                        history_floor_seq: result.history_floor_seq,
+                    });
+                }
+                events.push(CoreEvent::GroupOutboxFetched {
                     group_id: fetch.group_id,
                     records: result.records,
                     to_seq: result.to_seq,
-                }])
+                });
+                Ok(events)
             }
             Err(_error) => {
                 log::warn!(
@@ -1754,8 +1763,7 @@ impl BlobIoPort for DesktopPlatformPorts {
         &mut self,
         read: ReadAttachmentBytesEffect,
     ) -> Result<Vec<CoreEvent>> {
-        // Read from inbox/outbox attachments dir via persistence
-        let dir = self.persistence.attachments_dir().await;
+        let staging_dir = self.persistence.transfer_staging_dir().await;
 
         // Emit progress event if we have app handle
         if let Some(app) = &self.app_handle {
@@ -1771,7 +1779,7 @@ impl BlobIoPort for DesktopPlatformPorts {
         }
 
         if let Some(staging_id) = read.attachment_id.strip_prefix("encrypted-staging:") {
-            let Some(dir) = dir else {
+            let Some(staging_dir) = staging_dir else {
                 return Ok(vec![CoreEvent::BlobTransferFailed {
                     task_id: read.task_id,
                     failure: tapchat_core::AppErrorV1::from_registered_code(
@@ -1779,11 +1787,8 @@ impl BlobIoPort for DesktopPlatformPorts {
                     ),
                 }]);
             };
-            let encrypted = match tokio::fs::read(
-                dir.join("attachment-staging")
-                    .join(format!("{staging_id}.enc")),
-            )
-            .await
+            let encrypted = match tokio::fs::read(staging_dir.join(format!("{staging_id}.enc")))
+                .await
             {
                 Ok(encrypted) => encrypted,
                 Err(_) => {
@@ -1821,7 +1826,7 @@ impl BlobIoPort for DesktopPlatformPorts {
                 plaintext: bytes,
             }]);
         }
-        blob_io::read_attachment_bytes(read, dir).await
+        blob_io::read_attachment_bytes(read, self.persistence.attachment_cache_dir().await).await
     }
 
     async fn prepare_blob_upload(
@@ -1936,15 +1941,48 @@ impl BlobIoPort for DesktopPlatformPorts {
         result
     }
 
+    async fn delete_blob(&mut self, delete: DeleteBlobRequest) -> Result<Vec<CoreEvent>> {
+        let response = self
+            .client
+            .delete(&delete.delete_target)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("TapChat-Delete {}", delete.delete_capability),
+            )
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() || response.status().as_u16() == 404 => {
+                Ok(vec![CoreEvent::BlobDeleted {
+                    task_id: delete.task_id,
+                }])
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobDeleteFailed {
+                    task_id: delete.task_id,
+                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::BlobDeleteFailed {
+                task_id: delete.task_id,
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
+            }]),
+        }
+    }
+
     async fn write_downloaded_attachment(
         &mut self,
         write: WriteDownloadedAttachmentEffect,
     ) -> Result<Vec<CoreEvent>> {
-        let dir = self.persistence.outbox_attachments_dir().await;
+        let dir = self.persistence.attachment_cache_dir().await;
         if let Some(destination) =
             media_cache::EncryptedCacheDestination::parse(&write.destination_id)?
         {
             let dir = dir.ok_or_else(|| anyhow::anyhow!("no attachments directory configured"))?;
+            crate::commands::message::ensure_attachment_cache_has_space(&dir)
+                .map_err(anyhow::Error::msg)?;
             let encrypted = {
                 let pm = self.transport.profile_inner.read().await;
                 let profile = pm
@@ -1988,7 +2026,7 @@ impl BlobIoPort for DesktopPlatformPorts {
         };
         let dir = self
             .persistence
-            .outbox_attachments_dir()
+            .attachment_cache_dir()
             .await
             .ok_or_else(|| anyhow::anyhow!("no attachments directory configured"))?;
         let cache_id = tapchat_core::attachment_crypto::blob_cache_id(
@@ -2011,6 +2049,8 @@ impl BlobIoPort for DesktopPlatformPorts {
                 .context("encrypt uploaded attachment cache")?
         };
         let destination = dir.join(&relative_path);
+        crate::commands::message::ensure_attachment_cache_has_space(&dir)
+            .map_err(anyhow::Error::msg)?;
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -2037,13 +2077,39 @@ impl BlobIoPort for DesktopPlatformPorts {
                 },
             )?;
         }
-        let staging_path = dir
-            .join("attachment-staging")
-            .join(format!("{staging_id}.enc"));
+        let staging_dir = self
+            .persistence
+            .transfer_staging_dir()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no transfer staging directory configured"))?;
+        let staging_path = staging_dir.join(format!("{staging_id}.enc"));
         match tokio::fs::remove_file(staging_path).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
+        }
+        Ok(Vec::new())
+    }
+
+    async fn release_staged_attachment(
+        &mut self,
+        release: tapchat_core::ffi_api::ReleaseStagedAttachmentEffect,
+    ) -> Result<Vec<CoreEvent>> {
+        let Some(staging_dir) = self.persistence.transfer_staging_dir().await else {
+            return Ok(Vec::new());
+        };
+        for attachment_id in release.attachment_ids {
+            let Some(staging_id) = attachment_id
+                .strip_prefix("encrypted-staging:")
+                .filter(|value| !value.is_empty() && !value.contains('/') && !value.contains('\\'))
+            else {
+                continue;
+            };
+            match tokio::fs::remove_file(staging_dir.join(format!("{staging_id}.enc"))).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(Vec::new())
     }
@@ -2143,6 +2209,8 @@ mod tests {
             active_profile: Some(profile),
             locked_profile_path: None,
             unlock_error: None,
+            storage_layout: crate::storage_layout::DesktopStorageLayout::system_default()
+                .expect("desktop storage layout"),
         }));
         let mut ports =
             DesktopPlatformPorts::new(profile_inner.clone(), RuntimeAuthManager::default());
@@ -2171,7 +2239,7 @@ mod tests {
                 .expect("write encrypted cache through desktop port");
 
             let path = attachments_dir
-                .join("attachment-cache")
+                .join("objects")
                 .join(format!("{cache_id}.enc"));
             let encrypted = std::fs::read(path).expect("read encrypted cache");
             assert!(!encrypted

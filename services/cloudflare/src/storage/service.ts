@@ -11,6 +11,8 @@ import { signSharingPayload, verifySharingPayload } from "./sharing";
 const MAX_BLOB_BYTES = 25 * 1024 * 1024 + 1024;
 const SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1000;
 const CAPABILITY_METADATA_KEY = "read-capability-sha256";
+const DELETE_CAPABILITY_METADATA_KEY = "delete-capability-sha256";
+const BLOB_EXPIRY_METADATA_KEY = "blob-expires-at";
 
 function sanitizeSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
@@ -48,11 +50,13 @@ export class StorageService {
   private readonly store: BinaryBlobStore;
   private readonly baseUrl: string;
   private readonly secret: string;
+  private readonly retentionMs: number;
 
-  constructor(store: BinaryBlobStore, baseUrl: string, secret: string) {
+  constructor(store: BinaryBlobStore, baseUrl: string, secret: string, retentionDays = 30) {
     this.store = store;
     this.baseUrl = baseUrl;
     this.secret = secret;
+    this.retentionMs = Math.max(1, Math.floor(retentionDays)) * 24 * 60 * 60 * 1000;
   }
 
   async prepareUpload(
@@ -86,15 +90,20 @@ export class StorageService {
       sanitizeSegment(conversationId),
       `${sanitizeSegment(messageId)}-${sanitizeSegment(taskId)}`
     ].join("/");
-    const expiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
+    const uploadExpiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
+    const blobExpiresAt = now + this.retentionMs;
     const readCapability = randomCapability();
+    const deleteCapability = randomCapability();
     const readCapabilityHash = await capabilityHash(readCapability);
+    const deleteCapabilityHash = await capabilityHash(deleteCapability);
     const uploadToken = await signSharingPayload(this.secret, {
       action: "upload",
       blobKey,
       sizeBytes: input.sizeBytes,
       readCapabilityHash,
-      expiresAt
+      deleteCapabilityHash,
+      blobExpiresAt,
+      expiresAt: uploadExpiresAt
     });
 
     return {
@@ -105,7 +114,10 @@ export class StorageService {
       },
       readCapability,
       downloadTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}`,
-      expiresAt
+      uploadExpiresAt,
+      blobExpiresAt,
+      deleteTarget: `${this.baseUrl}/v1/storage/blob/${encodeURIComponent(blobKey)}`,
+      deleteCapability
     };
   }
 
@@ -116,18 +128,27 @@ export class StorageService {
     contentLength: number,
     now: number,
   ): Promise<void> {
-    const payload = await this.verifyToken<{ action: string; blobKey: string; sizeBytes?: number; readCapabilityHash?: string }>(token, now);
+    const payload = await this.verifyToken<{
+      action: string;
+      blobKey: string;
+      sizeBytes?: number;
+      readCapabilityHash?: string;
+      deleteCapabilityHash?: string;
+      blobExpiresAt?: number;
+    }>(token, now);
     if (payload.action !== "upload" || payload.blobKey !== blobKey) {
       throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
     }
     if (!Number.isSafeInteger(payload.sizeBytes) || contentLength !== payload.sizeBytes) {
       throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
-    if (!payload.readCapabilityHash) {
+    if (!payload.readCapabilityHash || !payload.deleteCapabilityHash || !Number.isSafeInteger(payload.blobExpiresAt)) {
       throw new HttpError(403, "invalid_capability", "upload token is missing blob capability binding");
     }
     const stored = await this.store.putStream(blobKey, body, {
       [CAPABILITY_METADATA_KEY]: payload.readCapabilityHash,
+      [DELETE_CAPABILITY_METADATA_KEY]: payload.deleteCapabilityHash,
+      [BLOB_EXPIRY_METADATA_KEY]: String(payload.blobExpiresAt),
       "content-type": "application/octet-stream"
     });
     if (stored.size !== payload.sizeBytes) {
@@ -141,6 +162,7 @@ export class StorageService {
     capability: string,
     rangeHeader?: string,
     includeBody = true,
+    now = Date.now(),
   ): Promise<{
     body: ReadableStream | null;
     size: number;
@@ -154,6 +176,11 @@ export class StorageService {
     const metadata = await this.store.headBytes(blobKey);
     if (!metadata) {
       throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    const blobExpiresAt = Number(metadata.customMetadata[BLOB_EXPIRY_METADATA_KEY]);
+    if (!Number.isSafeInteger(blobExpiresAt) || blobExpiresAt <= now) {
+      await this.store.delete(blobKey);
+      throw new HttpError(410, "capability_expired", "blob retention period has expired");
     }
     const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);
@@ -182,6 +209,20 @@ export class StorageService {
       ...(range ? { range } : {}),
       ...(object.httpEtag ? { httpEtag: object.httpEtag } : metadata.httpEtag ? { httpEtag: metadata.httpEtag } : {}),
     };
+  }
+
+  async deleteBlob(blobKey: string, capability: string): Promise<void> {
+    if (!capability) {
+      throw new HttpError(403, "invalid_capability", "delete capability cannot be verified");
+    }
+    const metadata = await this.store.headBytes(blobKey);
+    if (!metadata) return;
+    const expectedHash = metadata.customMetadata[DELETE_CAPABILITY_METADATA_KEY];
+    const actualHash = await capabilityHash(capability);
+    if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
+      throw new HttpError(403, "invalid_capability", "delete capability is not valid for this object");
+    }
+    await this.store.delete(blobKey);
   }
 
   private async verifyToken<T>(token: string, now: number): Promise<T> {

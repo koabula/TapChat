@@ -1187,6 +1187,41 @@ impl CoreDriver {
         }
     }
 
+    async fn delete_blob(
+        &self,
+        delete: crate::ffi_api::DeleteBlobRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        match self
+            .runtime
+            .client
+            .delete(&delete.delete_target)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("TapChat-Delete {}", delete.delete_capability),
+            )
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() || response.status().as_u16() == 404 => {
+                Ok(vec![CoreEvent::BlobDeleted {
+                    task_id: delete.task_id,
+                }])
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                Ok(vec![CoreEvent::BlobDeleteFailed {
+                    task_id: delete.task_id,
+                    failure: crate::AppErrorV1::from_http_response(status, &body),
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::BlobDeleteFailed {
+                task_id: delete.task_id,
+                failure: crate::AppErrorV1::network_unavailable(),
+            }]),
+        }
+    }
+
     async fn write_downloaded_attachment(
         &self,
         write: crate::ffi_api::WriteDownloadedAttachmentEffect,
@@ -1198,10 +1233,10 @@ impl CoreDriver {
         Ok(Vec::new())
     }
 
-    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
-        if let Some(snapshot) = persist.snapshot {
-            self.runtime.latest_snapshot = Some(snapshot);
-        }
+    fn persist_state(&mut self, _persist: PersistStateEffect) -> Result<()> {
+        // The driver refreshes its in-memory diagnostic snapshot directly
+        // from Core after each command/event. Durable profiles apply typed
+        // mutations through ProfileStorageSession.
         Ok(())
     }
 
@@ -1575,11 +1610,19 @@ impl TransportPort for CoreDriver {
                 }
                 let body = to_snake_case_json_string(&body).unwrap_or(body);
                 let result: FetchGroupOutboxResult = serde_json::from_str(&body)?;
-                Ok(vec![CoreEvent::GroupOutboxFetched {
+                let mut events = Vec::new();
+                if result.history_floor_seq > 0 {
+                    events.push(CoreEvent::GroupHistoryFloorAdvanced {
+                        group_id: fetch.group_id.clone(),
+                        history_floor_seq: result.history_floor_seq,
+                    });
+                }
+                events.push(CoreEvent::GroupOutboxFetched {
                     group_id: fetch.group_id,
                     records: result.records,
                     to_seq: result.to_seq,
-                }])
+                });
+                Ok(events)
             }
             Err(_error) => Ok(vec![CoreEvent::GroupOutboxFetchFailed {
                 group_id: fetch.group_id,
@@ -2397,6 +2440,13 @@ impl BlobIoPort for CoreDriver {
 
     async fn download_blob(&mut self, download: BlobDownloadRequest) -> Result<Vec<CoreEvent>> {
         CoreDriver::download_blob(self, download).await
+    }
+
+    async fn delete_blob(
+        &mut self,
+        delete: crate::ffi_api::DeleteBlobRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::delete_blob(self, delete).await
     }
 
     async fn write_downloaded_attachment(

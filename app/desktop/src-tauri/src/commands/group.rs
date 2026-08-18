@@ -372,7 +372,6 @@ pub async fn list_group_conversations_impl(
 ) -> Result<Vec<GroupConversationSummary>, String> {
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
-
     // Index conversations by id for O(1) lookup.
     let mut conversations_by_id: BTreeMap<&str, &tapchat_core::persistence::PersistedConversation> =
         BTreeMap::new();
@@ -524,8 +523,22 @@ pub async fn get_group_messages_impl(
 ) -> Result<Vec<GroupMessageView>, String> {
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
+    let repository_page = {
+        let pm = inner.profile_manager.inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "No active profile".to_string())?;
+        profile
+            .query_messages(&tapchat_core::local_store::MessageQuery {
+                conversation_id: conversation_id.clone(),
+                before_cursor: None,
+                limit: 200,
+            })
+            .map_err(|error| error.to_string())?
+    };
 
-    let conversation = snapshot
+    let _conversation = snapshot
         .conversations
         .iter()
         .find(|c| c.conversation_id == conversation_id)
@@ -545,8 +558,8 @@ pub async fn get_group_messages_impl(
         .unwrap_or_default();
 
     let mut out =
-        Vec::with_capacity(conversation.state.messages.len() + snapshot.pending_group_outbox.len());
-    for message in &conversation.state.messages {
+        Vec::with_capacity(repository_page.messages.len() + snapshot.pending_group_outbox.len());
+    for message in &repository_page.messages {
         match message.message_type {
             tapchat_core::model::MessageType::MlsApplication => {
                 let attachment_manifest = message

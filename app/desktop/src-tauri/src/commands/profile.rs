@@ -27,12 +27,6 @@ pub async fn create_profile(
     passphrase: Option<String>,
     protection_mode: Option<ProfileProtectionMode>,
 ) -> crate::errors::DesktopResult<ProfileSummary> {
-    // Use default path: APPDATA/TapChat/profiles/{name}
-    let data_dir =
-        dirs::data_dir().ok_or_else(|| "Could not determine app data directory".to_string())?;
-
-    let path = data_dir.join("TapChat").join("profiles").join(&name);
-
     // Check if profile with this name already exists
     let pm = &state.inner.read().await.profile_manager;
     let existing = pm.list_profiles().await;
@@ -48,7 +42,7 @@ pub async fn create_profile(
         }
     });
     Ok(pm
-        .create_profile(&name, path.clone(), passphrase, protection_mode)
+        .create_profile(&name, passphrase, protection_mode)
         .await
         .map_err(|e| e.to_string())?)
 }
@@ -108,6 +102,9 @@ pub async fn activate_profile(
     path: PathBuf,
     passphrase: Option<String>,
 ) -> crate::errors::DesktopResult<()> {
+    if let Err(error) = crate::commands::message::run_attachment_maintenance(&app).await {
+        log::warn!("pre-switch attachment maintenance failed: {error}");
+    }
     let passphrase_supplied = passphrase.as_deref().is_some_and(|value| !value.is_empty());
     log::info!(
         "activate_profile: activating {}",
@@ -124,6 +121,9 @@ pub async fn activate_profile(
 
     // Reload the engine from the new profile
     reload_engine_from_profile(&app, &state).await?;
+    if let Err(error) = crate::commands::message::run_attachment_maintenance(&app).await {
+        log::warn!("post-switch attachment maintenance failed: {error}");
+    }
 
     log::info!("activate_profile: completed successfully");
     Ok(())

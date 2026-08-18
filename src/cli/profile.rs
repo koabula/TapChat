@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -20,8 +20,8 @@ use zeroize::Zeroizing;
 use crate::ffi_api::PersistStateEffect;
 use crate::fs_util::write_atomic_unique;
 use crate::local_store::{
-    active_store, inspect_storage, migrate_snapshot_to_state_db, LocalStoreDiagnostics,
-    PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
+    inspect_storage, LocalStoreDiagnostics, ProfileStorageSession, PRIVATE_STATE_DOCUMENT_KIND,
+    STATE_DB_FILE_NAME,
 };
 use crate::log_sanitize::redact_id;
 use crate::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
@@ -47,11 +47,15 @@ pub struct ProfileMetadata {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub profile_id: String,
     pub root_dir: PathBuf,
+    #[serde(default, skip_serializing)]
     pub bundles_dir: PathBuf,
+    #[serde(default, skip_serializing)]
     pub inbox_attachments_dir: PathBuf,
+    #[serde(default, skip_serializing)]
     pub outbox_attachments_dir: PathBuf,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub attachments_dir: PathBuf,
+    #[serde(default, skip_serializing)]
     pub runtime_dir: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
@@ -61,6 +65,28 @@ pub struct ProfileMetadata {
     pub deployment_bundle_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<ProfileEncryptionMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileStoragePaths {
+    pub profile_root: PathBuf,
+    pub bundles_dir: PathBuf,
+    pub runtime_dir: PathBuf,
+    pub transfer_staging_dir: PathBuf,
+    pub attachment_cache_dir: PathBuf,
+}
+
+impl ProfileStoragePaths {
+    pub fn for_cli_root(root: impl AsRef<Path>) -> Self {
+        let profile_root = root.as_ref().to_path_buf();
+        Self {
+            bundles_dir: profile_root.join("bundles"),
+            runtime_dir: profile_root.join("runtime"),
+            transfer_staging_dir: profile_root.join("transfers").join("attachment-staging"),
+            attachment_cache_dir: profile_root.join("cache").join("attachments"),
+            profile_root,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -244,7 +270,10 @@ pub struct ProfileRegistry {
 pub struct Profile {
     root: PathBuf,
     meta: ProfileMetadata,
+    storage_paths: ProfileStoragePaths,
+    registry_path: Option<PathBuf>,
     pdek: Zeroizing<[u8; PDEK_LEN]>,
+    storage_session: Arc<ProfileStorageSession>,
     _lock: ProfileLockGuard,
 }
 
@@ -383,7 +412,27 @@ impl Profile {
         root: impl AsRef<Path>,
         options: ProfileInitOptions,
     ) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
+        let profile_id = format!("profile:{}", Uuid::new_v4());
+        Self::init_with_storage(
+            name,
+            profile_id,
+            ProfileStoragePaths::for_cli_root(root),
+            None,
+            options,
+        )
+    }
+
+    pub fn init_with_storage(
+        name: &str,
+        profile_id: String,
+        storage_paths: ProfileStoragePaths,
+        registry_path: Option<PathBuf>,
+        options: ProfileInitOptions,
+    ) -> Result<Self> {
+        if profile_id.trim().is_empty() {
+            bail!("profile_id must not be empty");
+        }
+        let root = storage_paths.profile_root.clone();
         let mut created_keychain_refs = Vec::new();
         let init_result = (|| -> Result<Self> {
             fs::create_dir_all(&root).context("create profile root")?;
@@ -400,7 +449,6 @@ impl Profile {
                     root.display()
                 );
             }
-            let profile_id = format!("profile:{}", Uuid::new_v4());
             let pdek = generate_pdek();
             let mut wrappers = Vec::new();
 
@@ -454,29 +502,31 @@ impl Profile {
             let meta = ProfileMetadata {
                 name: name.to_string(),
                 profile_id: profile_id.clone(),
-                bundles_dir: root.join("bundles"),
-                inbox_attachments_dir: root.join("attachments"),
-                outbox_attachments_dir: root.join("attachments"),
-                attachments_dir: root.join("attachments"),
-                runtime_dir: root.join("runtime"),
+                bundles_dir: storage_paths.bundles_dir.clone(),
+                inbox_attachments_dir: storage_paths.attachment_cache_dir.clone(),
+                outbox_attachments_dir: storage_paths.attachment_cache_dir.clone(),
+                attachments_dir: storage_paths.attachment_cache_dir.clone(),
+                runtime_dir: storage_paths.runtime_dir.clone(),
                 root_dir: root.clone(),
                 user_id: None,
                 device_id: None,
                 deployment_bundle_path: None,
                 encryption: Some(default_encryption_metadata(wrappers)),
             };
+            let storage_session =
+                Arc::new(ProfileStorageSession::open(&root, &profile_id, &*pdek)?);
             let profile = Self {
                 root: root.clone(),
                 meta,
+                storage_paths: storage_paths.clone(),
+                registry_path: registry_path.clone(),
                 pdek,
+                storage_session,
                 _lock: profile_lock,
             };
             profile.ensure_layout()?;
             profile.save_metadata()?;
-            if !profile.snapshot_path().exists() {
-                profile.save_snapshot(&CorePersistenceSnapshot::default())?;
-            }
-            profile.ensure_local_store_migrated()?;
+            profile.save_snapshot(&CorePersistenceSnapshot::default())?;
             profile.sync_registry_entry()?;
             Ok(profile)
         })();
@@ -498,7 +548,16 @@ impl Profile {
     }
 
     pub fn open_with_options(root: impl AsRef<Path>, options: ProfileOpenOptions) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
+        let storage_paths = ProfileStoragePaths::for_cli_root(root);
+        Self::open_with_storage(storage_paths, None, options)
+    }
+
+    pub fn open_with_storage(
+        storage_paths: ProfileStoragePaths,
+        registry_path: Option<PathBuf>,
+        options: ProfileOpenOptions,
+    ) -> Result<Self> {
+        let root = storage_paths.profile_root.clone();
         let meta_path = root.join(PROFILE_METADATA_FILE_NAME);
         if !meta_path.exists() {
             bail!("profile.json not found at {}", meta_path.display());
@@ -507,12 +566,12 @@ impl Profile {
         let mut meta: ProfileMetadata =
             serde_json::from_slice(&fs::read(&meta_path).context("read profile metadata")?)
                 .context("decode profile metadata")?;
-        // Backward compat: old profiles don't have attachments_dir; derive from root
-        if meta.attachments_dir.as_os_str().is_empty() {
-            meta.attachments_dir = root.join("attachments");
-            meta.inbox_attachments_dir = meta.attachments_dir.clone();
-            meta.outbox_attachments_dir = meta.attachments_dir.clone();
-        }
+        meta.root_dir = root.clone();
+        meta.bundles_dir = storage_paths.bundles_dir.clone();
+        meta.runtime_dir = storage_paths.runtime_dir.clone();
+        meta.attachments_dir = storage_paths.attachment_cache_dir.clone();
+        meta.inbox_attachments_dir = storage_paths.attachment_cache_dir.clone();
+        meta.outbox_attachments_dir = storage_paths.attachment_cache_dir.clone();
         if meta.profile_id.is_empty() || meta.encryption.is_none() {
             if root.join(LEGACY_SNAPSHOT_FILE_NAME).exists() {
                 bail!(
@@ -531,20 +590,36 @@ impl Profile {
             &meta,
             options.passphrase.as_deref().or(env_passphrase.as_deref()),
         )?;
+        if !root.join(STATE_DB_FILE_NAME).exists() {
+            bail!(
+                "profile state.db is missing; legacy profile layouts are not opened by schema v2"
+            );
+        }
+        let storage_session = Arc::new(ProfileStorageSession::open(
+            &root,
+            &meta.profile_id,
+            &*pdek,
+        )?);
         let profile = Self {
             root,
             meta,
+            storage_paths,
+            registry_path,
             pdek,
+            storage_session,
             _lock: profile_lock,
         };
         profile.ensure_layout()?;
-        profile.ensure_local_store_migrated()?;
         profile.scrub_legacy_plaintext_state()?;
         Ok(profile)
     }
 
     pub fn metadata(&self) -> &ProfileMetadata {
         &self.meta
+    }
+
+    pub fn storage_paths(&self) -> &ProfileStoragePaths {
+        &self.storage_paths
     }
 
     pub fn has_passphrase_wrapper(&self) -> bool {
@@ -623,15 +698,15 @@ impl Profile {
     }
 
     pub fn load_snapshot(&self) -> Result<CorePersistenceSnapshot> {
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek).load_snapshot()
+        self.storage_session.load_snapshot()
     }
 
     pub fn save_snapshot(&self, snapshot: &CorePersistenceSnapshot) -> Result<()> {
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek).save_snapshot(snapshot)
+        self.storage_session.save_snapshot(snapshot)
     }
 
     pub fn persist_state(&self, persist: &PersistStateEffect) -> Result<()> {
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek).persist_state(persist)
+        self.storage_session.persist_state(persist)
     }
 
     pub fn save_deployment_bundle(&mut self, bundle: &DeploymentBundle) -> Result<PathBuf> {
@@ -815,7 +890,8 @@ impl Profile {
     }
 
     pub fn load_private_state(&self) -> Result<ProfilePrivateState> {
-        let Some(bytes) = active_store(&self.root, &self.meta.profile_id, &*self.pdek)
+        let Some(bytes) = self
+            .storage_session
             .load_document(PRIVATE_STATE_DOCUMENT_KIND)?
         else {
             return Ok(ProfilePrivateState::default());
@@ -825,13 +901,13 @@ impl Profile {
 
     pub fn save_private_state(&self, private: &ProfilePrivateState) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(private)?;
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek)
+        self.storage_session
             .save_document(PRIVATE_STATE_DOCUMENT_KIND, &bytes)
     }
 
     pub fn load_attachment_cache_entries(&self) -> Result<Vec<AttachmentCacheEntry>> {
-        let store = active_store(&self.root, &self.meta.profile_id, &*self.pdek);
-        let mut entries = store
+        let mut entries = self
+            .storage_session
             .load_attachment_cache_entries()?
             .into_iter()
             .map(|bytes| serde_json::from_slice::<AttachmentCacheEntry>(&bytes))
@@ -842,7 +918,7 @@ impl Profile {
             if !entries.is_empty() && self.state_db_path().exists() {
                 for entry in &entries {
                     let bytes = serde_json::to_vec(entry)?;
-                    store.save_attachment_cache_entry(
+                    self.storage_session.save_attachment_cache_entry(
                         &entry.cache_id,
                         &bytes,
                         entry.mime_type.as_deref(),
@@ -857,8 +933,23 @@ impl Profile {
     }
 
     pub fn save_attachment_cache_entry(&self, entry: &AttachmentCacheEntry) -> Result<()> {
+        const ACCESS_WRITE_INTERVAL_MS: u64 = 60 * 60 * 1000;
+        if self
+            .load_attachment_cache_entries()?
+            .into_iter()
+            .find(|existing| existing.cache_id == entry.cache_id)
+            .is_some_and(|existing| {
+                existing.relative_path == entry.relative_path
+                    && existing.mime_type == entry.mime_type
+                    && existing.size_bytes == entry.size_bytes
+                    && entry.updated_at_ms.saturating_sub(existing.updated_at_ms)
+                        < ACCESS_WRITE_INTERVAL_MS
+            })
+        {
+            return Ok(());
+        }
         let bytes = serde_json::to_vec(entry)?;
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek).save_attachment_cache_entry(
+        self.storage_session.save_attachment_cache_entry(
             &entry.cache_id,
             &bytes,
             entry.mime_type.as_deref(),
@@ -867,19 +958,34 @@ impl Profile {
     }
 
     pub fn delete_attachment_cache_entry(&self, cache_id: &str) -> Result<()> {
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek)
-            .delete_attachment_cache_entry(cache_id)
+        self.storage_session.delete_attachment_cache_entry(cache_id)
     }
 
     pub fn clear_attachment_cache_entries(&self) -> Result<()> {
-        active_store(&self.root, &self.meta.profile_id, &*self.pdek)
-            .clear_attachment_cache_entries()?;
+        self.storage_session.clear_attachment_cache_entries()?;
         let mut private = self.load_private_state()?;
         if !private.attachment_cache.is_empty() {
             private.attachment_cache.clear();
             self.save_private_state(&private)?;
         }
         Ok(())
+    }
+
+    pub fn query_messages(
+        &self,
+        query: &crate::local_store::MessageQuery,
+    ) -> Result<crate::local_store::MessagePage> {
+        self.storage_session.query_messages(query)
+    }
+
+    pub fn checkpoint_local_store(&self) -> Result<()> {
+        self.storage_session.checkpoint()
+    }
+
+    pub fn load_conversation_message_summaries(
+        &self,
+    ) -> Result<Vec<crate::local_store::ConversationMessageSummary>> {
+        self.storage_session.load_conversation_message_summaries()
     }
 
     pub fn encrypt_profile_document(&self, document_kind: &str, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -893,9 +999,10 @@ impl Profile {
     }
 
     fn ensure_layout(&self) -> Result<()> {
-        fs::create_dir_all(&self.meta.bundles_dir)?;
-        fs::create_dir_all(&self.meta.attachments_dir)?;
-        fs::create_dir_all(&self.meta.runtime_dir)?;
+        fs::create_dir_all(&self.storage_paths.bundles_dir)?;
+        fs::create_dir_all(&self.storage_paths.runtime_dir)?;
+        fs::create_dir_all(&self.storage_paths.transfer_staging_dir)?;
+        fs::create_dir_all(&self.storage_paths.attachment_cache_dir)?;
         Ok(())
     }
 
@@ -904,10 +1011,6 @@ impl Profile {
             &self.root.join(PROFILE_METADATA_FILE_NAME),
             &serde_json::to_vec_pretty(&self.meta)?,
         )
-    }
-
-    fn ensure_local_store_migrated(&self) -> Result<()> {
-        migrate_snapshot_to_state_db(&self.root, &self.meta.profile_id, &*self.pdek)
     }
 
     fn scrub_legacy_plaintext_state(&self) -> Result<()> {
@@ -919,12 +1022,18 @@ impl Profile {
     }
 
     pub fn sync_registry_entry(&self) -> Result<()> {
-        let mut registry = ProfileRegistry::load()?;
+        let mut registry = match self.registry_path.as_deref() {
+            Some(path) => ProfileRegistry::load_from(path)?,
+            None => ProfileRegistry::load()?,
+        };
         registry.upsert(self.registry_entry());
         if registry.active_profile.is_none() {
             registry.active_profile = Some(self.root.clone());
         }
-        registry.save()
+        match self.registry_path.as_deref() {
+            Some(path) => registry.save_to(path),
+            None => registry.save(),
+        }
     }
 
     fn registry_entry(&self) -> ProfileRegistryEntry {
@@ -954,6 +1063,10 @@ impl Profile {
 impl ProfileRegistry {
     pub fn load() -> Result<Self> {
         let path = profile_registry_path()?;
+        Self::load_from(&path)
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -970,15 +1083,19 @@ impl ProfileRegistry {
 
     pub fn save(&self) -> Result<()> {
         let path = profile_registry_path()?;
+        self.save_to(&path)
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         if path.exists() {
-            let previous = fs::read(&path).context("read previous profile registry for backup")?;
+            let previous = fs::read(path).context("read previous profile registry for backup")?;
             if !previous.is_empty() {
                 let backup_path = path.with_extension("json.bak");
                 write_atomic_unique(&backup_path, &previous)
                     .context("write profile registry backup")?;
             }
         }
-        write_atomic_unique(&path, &serde_json::to_vec_pretty(self)?)
+        write_atomic_unique(path, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn upsert(&mut self, entry: ProfileRegistryEntry) {
@@ -1872,7 +1989,7 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_profile_layout_and_snapshot() {
+    fn init_creates_profile_layout_and_schema_v2_database() {
         let _guard = env_lock();
         let dir = tempdir().expect("tempdir");
         unsafe {
@@ -1890,7 +2007,7 @@ mod tests {
             },
         )
         .expect("init profile");
-        assert!(profile.snapshot_path().exists());
+        assert!(!profile.snapshot_path().exists());
         assert!(profile.state_db_path().exists());
         assert!(!dir.path().join("snapshot.json").exists());
         assert!(profile.metadata().bundles_dir.exists());
@@ -1936,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_snapshot_does_not_contain_plaintext_marker() {
+    fn sqlcipher_database_does_not_contain_plaintext_marker() {
         let _guard = env_lock();
         let dir = tempdir().expect("tempdir");
         unsafe {
@@ -1964,10 +2081,14 @@ mod tests {
             });
         profile.save_snapshot(&snapshot).expect("save snapshot");
 
-        let bytes = std::fs::read(profile.snapshot_path()).expect("read encrypted snapshot");
+        profile
+            .checkpoint_local_store()
+            .expect("checkpoint state db");
+        let bytes = std::fs::read(profile.state_db_path()).expect("read encrypted state db");
         assert!(!bytes
             .windows("visible-marker".len())
             .any(|window| window == b"visible-marker"));
+        drop(profile);
 
         let reopened =
             Profile::open_with_passphrase(dir.path().join("alice"), Some("test-passphrase".into()))
@@ -2003,8 +2124,8 @@ mod tests {
         .expect("init profile");
         let diagnostics = profile.storage_diagnostics().expect("storage diagnostics");
         assert!(diagnostics.state_db_exists);
-        assert_eq!(diagnostics.schema_version, Some(1));
-        assert_eq!(diagnostics.migration_complete, Some(true));
+        assert_eq!(diagnostics.schema_version, Some(2));
+        assert_eq!(diagnostics.migration_complete, Some(false));
         drop(profile);
 
         let reopened = Profile::open_with_passphrase(dir.path().join("short"), Some("abc".into()))

@@ -63,17 +63,6 @@ pub async fn init_onboarding_profile(
     passphrase: Option<String>,
     protection_mode: Option<ProfileProtectionMode>,
 ) -> crate::errors::DesktopResult<ProfileSummary> {
-    // Use default path: APPDATA/TapChat/profiles/{profile_name}
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        log::error!("Could not get data directory from dirs crate");
-        "Could not determine app data directory. Please ensure APPDATA environment variable is set."
-            .to_string()
-    })?;
-
-    let path = data_dir
-        .join("TapChat")
-        .join("profiles")
-        .join(&profile_name);
     let profile_ref = redact_id("profile", &profile_name);
     log::info!("Creating profile {}", profile_ref);
 
@@ -87,7 +76,7 @@ pub async fn init_onboarding_profile(
                 ProfileProtectionMode::KeychainOnly
             }
         });
-        pm.create_profile(&profile_name, path.clone(), passphrase, protection_mode)
+        pm.create_profile(&profile_name, passphrase, protection_mode)
             .await
             .map_err(|e| {
                 log::error!("Failed to create profile {}", profile_ref);
@@ -100,7 +89,7 @@ pub async fn init_onboarding_profile(
     // Update profile_path in state
     {
         let mut inner = state.inner.write().await;
-        inner.profile_path = Some(path);
+        inner.profile_path = Some(summary.path.clone());
     }
 
     Ok(summary)

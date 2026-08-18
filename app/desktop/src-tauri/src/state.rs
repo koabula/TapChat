@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;
 use crate::runtime_auth::RuntimeAuthManager;
+use crate::storage_layout::DesktopStorageLayout;
 
 /// Startup phase to track initialization progress.
 /// Prevents race conditions where frontend queries session status before backend is ready.
@@ -179,43 +180,23 @@ pub struct RecoveryPhraseGate {
 
 impl AppState {
     pub fn new() -> Self {
-        let profile_manager = ProfileManager::new();
-        let inner_arc = profile_manager.inner_arc();
-        let runtime_auth = RuntimeAuthManager::default();
-        let ports = DesktopPlatformPorts::new(inner_arc, runtime_auth.clone());
-        let (deferred_transport_tx, deferred_transport_rx) =
-            mpsc::channel(DEFERRED_TRANSPORT_QUEUE_CAPACITY);
-        Self {
-            inner: Arc::new(RwLock::new(AppStateInner {
-                engine: CoreEngine::new(),
-                profile_manager,
-                session: SessionState::Uninitialized,
-                profile_path: None,
-                startup_phase: StartupPhase::NotStarted,
-            })),
-            ports: Arc::new(Mutex::new(ports)),
-            sync_gate: Arc::new(Mutex::new(SyncGateState::default())),
-            ws_status: Arc::new(RwLock::new(WsStatusSnapshot::default())),
-            foreground_sync_gate: Arc::new(Mutex::new(ForegroundSyncGate::default())),
-            recovery_phrase_gate: Arc::new(Mutex::new(RecoveryPhraseGate::default())),
-            deferred_transport_tx,
-            deferred_transport_rx: Arc::new(Mutex::new(Some(deferred_transport_rx))),
-            deferred_send_gate: Arc::new(Mutex::new(())),
-            runtime_auth,
-            media_handles: Arc::new(RwLock::new(HashMap::new())),
-            staged_attachments: Arc::new(Mutex::new(HashMap::new())),
-            saved_attachment_paths: Arc::new(RwLock::new(HashSet::new())),
-            media_inflight: Arc::new(Mutex::new(HashMap::new())),
-            media_network_limit: Arc::new(Semaphore::new(3)),
-            media_decode_limit: Arc::new(Semaphore::new(2)),
-            preview_prefetch_running: Arc::new(AtomicBool::new(false)),
-            profile_generation: Arc::new(AtomicU64::new(0)),
-        }
+        Self::with_profile_manager(ProfileManager::new())
+    }
+
+    pub fn with_storage_layout(layout: DesktopStorageLayout) -> Self {
+        Self::with_profile_manager(ProfileManager::with_layout(layout))
     }
 
     /// Create AppState with a specific profile name (for multi-instance mode).
     pub fn with_profile_name(name: &str) -> Self {
-        let profile_manager = ProfileManager::with_profile_name(name);
+        Self::with_profile_manager(ProfileManager::with_profile_name(name))
+    }
+
+    pub fn with_profile_name_and_storage_layout(name: &str, layout: DesktopStorageLayout) -> Self {
+        Self::with_profile_manager(ProfileManager::with_profile_name_and_layout(name, layout))
+    }
+
+    fn with_profile_manager(profile_manager: ProfileManager) -> Self {
         let inner_arc = profile_manager.inner_arc();
         let runtime_auth = RuntimeAuthManager::default();
         let ports = DesktopPlatformPorts::new(inner_arc, runtime_auth.clone());

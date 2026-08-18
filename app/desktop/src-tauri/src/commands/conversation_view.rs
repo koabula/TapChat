@@ -44,15 +44,6 @@ pub(super) fn visible_plaintext_preview(plaintext: &str) -> String {
     }
 }
 
-pub(super) fn application_plaintext_message_count(messages: &[StoredMessage]) -> usize {
-    messages
-        .iter()
-        .filter(|msg| {
-            matches!(msg.message_type, MessageType::MlsApplication) && msg.plaintext.is_some()
-        })
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::visible_plaintext_preview;
