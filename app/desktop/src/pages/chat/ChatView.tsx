@@ -36,6 +36,7 @@ import {
   listContacts,
   listConversations,
   refreshContact,
+  syncNow,
   syncGroupOutbox,
   type GroupMessageView,
 } from "@/lib/tauri";
@@ -43,6 +44,7 @@ import type { Message, MessagePage, CoreUpdateEvent, CloudflareStatus, StorageRe
 import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
 import { findMessageMatches, moveSearchIndex } from "@/lib/messageSearch";
 import { mergeMessagePage, reconcileLatestMessagePage } from "@/lib/messageMerge";
+import { relationshipUiPolicy } from "@/lib/relationshipUi";
 
 interface SendMessageResult {
   message_id: string;
@@ -110,6 +112,14 @@ export default function ChatView() {
   }, [activeConversation, contacts]);
   const directPendingOutbound =
     !isGroup && activeDirectContact?.relationship_status === "pending_outbound";
+  const relationship = !isGroup ? activeConversation?.relationship : undefined;
+  const relationshipUi = relationshipUiPolicy(relationship, conversationId);
+  const relationshipRetryingExpired = relationshipUi.retryingExpired;
+  const relationshipPoolExhausted = relationshipUi.poolExhausted;
+  const relationshipJoining = relationshipUi.joining;
+  const relationshipJoinFailed = relationshipUi.joinFailed;
+  const accountAcceptedDevicePending = relationshipUi.accountAcceptedDevicePending;
+  const relationshipSendBlocked = relationshipUi.sendBlocked;
   const conversationRecovery = activeConversation?.recovery ?? null;
   const conversationRecovering =
     Boolean(activeConversation) &&
@@ -129,6 +139,16 @@ export default function ChatView() {
       : directClosed
         ? "This chat is closed."
         : undefined;
+
+  useEffect(() => {
+    if (
+      relationshipUi.canonicalConversationId
+    ) {
+      navigate(`/chat/${encodeURIComponent(relationshipUi.canonicalConversationId)}`, {
+        replace: true,
+      });
+    }
+  }, [navigate, relationshipUi.canonicalConversationId]);
 
   const searchMatches = useMemo(
     () => (isGroup ? [] : findMessageMatches(messages, searchQuery)),
@@ -218,6 +238,7 @@ export default function ChatView() {
       : 0;
   const composerDisabled =
     directPendingOutbound ||
+    relationshipSendBlocked ||
     conversationRecovering ||
     directClosed ||
     dissolved ||
@@ -226,8 +247,10 @@ export default function ChatView() {
       (groupSnapshot?.local_role == null ||
         localMember?.status === "removed" ||
         localMember?.status === "left"));
-  const composerTooltip = directPendingOutbound
-    ? "Waiting for contact to accept request."
+  const composerTooltip = relationshipUi.composerTooltip
+    ? relationshipUi.composerTooltip
+    : directPendingOutbound
+      ? "Waiting for contact to accept request."
     : conversationRecovering
       ? "Secure chat needs recovery before sending."
     : directClosed
@@ -998,7 +1021,23 @@ export default function ChatView() {
               </>
             ) : (
               <>
-                {directPendingOutbound ? (
+                {relationshipRetryingExpired ? (
+                  <span className="text-yellow-500">{relationshipUi.statusText}</span>
+                ) : relationshipPoolExhausted ? (
+                  <span className="text-yellow-500">{relationshipUi.statusText}</span>
+                ) : accountAcceptedDevicePending ? (
+                  <span className="text-yellow-500">{relationshipUi.statusText}</span>
+                ) : relationshipJoining ? (
+                  <span className="text-yellow-500">{relationshipUi.statusText}</span>
+                ) : relationshipJoinFailed ? (
+                  <button
+                    type="button"
+                    className="text-red-500 underline underline-offset-2"
+                    onClick={() => void syncNow().catch((error) => presentError(error))}
+                  >
+                    {relationshipUi.statusText}
+                  </button>
+                ) : directPendingOutbound ? (
                   <span className="text-muted-color">Waiting for accept</span>
                 ) : conversationRecovering ? (
                   <span className="text-yellow-500">Needs recovery</span>

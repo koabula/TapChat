@@ -20,7 +20,7 @@ pub(crate) fn sanitize_url_for_log(raw: &str) -> String {
     format!("{}://{}{}", url.scheme(), host, coarse_route(url.path()))
 }
 
-fn short_hash(value: &str) -> String {
+pub(crate) fn short_hash(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest[..6]
         .iter()

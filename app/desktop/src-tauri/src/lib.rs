@@ -53,30 +53,39 @@ macro_rules! timetest {
 
 /// Startup configuration parsed from command line arguments.
 #[cfg(feature = "gui")]
+#[derive(Debug)]
 struct StartupConfig {
-    /// Specific profile name to load (enables multi-instance mode).
-    profile_name: Option<String>,
+    /// Specific profile name, id, or registered path to load.
+    profile_selector: Option<String>,
     /// Force multi-instance mode even without --profile.
     multi_instance: bool,
 }
 
 /// Parse command line arguments to determine startup mode.
 #[cfg(feature = "gui")]
-fn parse_startup_args() -> StartupConfig {
-    let args: Vec<String> = std::env::args().collect();
-    let mut profile_name = None;
+fn parse_startup_args() -> Result<StartupConfig, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_startup_args_from(&args)
+}
+
+#[cfg(feature = "gui")]
+fn parse_startup_args_from(args: &[String]) -> Result<StartupConfig, String> {
+    let mut profile_selector = None;
     let mut multi_instance = false;
 
-    let mut i = 1;
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--profile" | "-p" => {
-                if i + 1 < args.len() {
-                    profile_name = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    i += 1;
+            "--profile" | "-p" | "--profile-id" | "--profile-path" => {
+                if profile_selector.is_some() {
+                    return Err("specify only one profile selector".to_string());
                 }
+                let value = args
+                    .get(i + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| format!("{} requires a value", args[i]))?;
+                profile_selector = Some(value.clone());
+                i += 2;
             }
             "--multi-instance" | "-m" => {
                 multi_instance = true;
@@ -87,21 +96,27 @@ fn parse_startup_args() -> StartupConfig {
     }
 
     // If a profile is specified, implicitly enable multi-instance mode
-    if profile_name.is_some() {
+    if profile_selector.is_some() {
         multi_instance = true;
     }
 
-    StartupConfig {
-        profile_name,
+    Ok(StartupConfig {
+        profile_selector,
         multi_instance,
-    }
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 #[cfg(feature = "gui")]
 pub fn run() {
     // Parse startup arguments
-    let config = parse_startup_args();
+    let config = match parse_startup_args() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("TapChat startup error: {error}");
+            return;
+        }
+    };
 
     // Updater public key for signature verification
     let updater_pubkey = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEExOTAyMUI4NTBDM0U1QjAKUldTdzVjTlF1Q0dRb1VPeGZYQ3M1dC9kcEJ5S1hidHNFVFQrZVRzWks2RGQ3NEZWSGI0YkpTQVQK";
@@ -142,7 +157,12 @@ pub fn run() {
     };
 
     // Determine log file name based on profile (multi-instance mode)
-    let log_file_name = config.profile_name.as_ref().map(|n| format!("{}.log", n));
+    let log_file_name = config.profile_selector.as_ref().map(|selector| {
+        format!(
+            "profile-{}.log",
+            crate::platform::log_sanitize::short_hash(selector)
+        )
+    });
 
     let builder = builder.plugin(tauri_plugin_notification::init());
     #[cfg(feature = "gui")]
@@ -180,8 +200,8 @@ pub fn run() {
             let handle = app.handle().clone();
             let storage_layout = storage_layout::DesktopStorageLayout::from_app(&handle)?;
             storage_layout.ensure_base_dirs()?;
-            let app_state = if let Some(name) = &config.profile_name {
-                AppState::with_profile_name_and_storage_layout(name, storage_layout)
+            let app_state = if let Some(selector) = &config.profile_selector {
+                AppState::with_profile_selector_and_storage_layout(selector, storage_layout)
             } else {
                 AppState::with_storage_layout(storage_layout)
             };
@@ -190,10 +210,10 @@ pub fn run() {
             // Log startup mode for debugging
             if config.multi_instance {
                 log::info!("TapChat started in multi-instance mode");
-                if let Some(name) = &config.profile_name {
+                if let Some(selector) = &config.profile_selector {
                     log::info!(
                         "Loading profile {}",
-                        crate::platform::log_sanitize::redact_id("profile", name)
+                        crate::platform::log_sanitize::redact_id("profile", selector)
                     );
                 }
             }
@@ -367,4 +387,44 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running TapChat");
+}
+
+#[cfg(all(test, feature = "gui"))]
+mod startup_args_tests {
+    use super::parse_startup_args_from;
+
+    #[test]
+    fn profile_selector_enables_multi_instance() {
+        let args = vec!["--profile".to_string(), "default".to_string()];
+        let config = parse_startup_args_from(&args).expect("startup args");
+
+        assert_eq!(config.profile_selector.as_deref(), Some("default"));
+        assert!(config.multi_instance);
+    }
+
+    #[test]
+    fn explicit_profile_id_is_accepted() {
+        let args = vec![
+            "--profile-id".to_string(),
+            "profile:00000000-0000-4000-8000-000000000001".to_string(),
+        ];
+        let config = parse_startup_args_from(&args).expect("startup args");
+
+        assert_eq!(
+            config.profile_selector.as_deref(),
+            Some("profile:00000000-0000-4000-8000-000000000001")
+        );
+    }
+
+    #[test]
+    fn missing_profile_selector_value_is_rejected() {
+        let args = vec!["--profile".to_string()];
+
+        assert_eq!(
+            parse_startup_args_from(&args)
+                .expect_err("missing value")
+                .as_str(),
+            "--profile requires a value"
+        );
+    }
 }

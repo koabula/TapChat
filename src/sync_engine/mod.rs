@@ -59,7 +59,14 @@ impl SyncEngine {
     pub fn select_fresh(state: &DeviceSyncState, records: &[InboxRecord]) -> Vec<InboxRecord> {
         records
             .iter()
-            .filter(|record| !state.seen_message_ids.contains(&record.message_id))
+            // An applied message may be fetched again when its ACK response
+            // was lost. Records above the durable ACK boundary must reach the
+            // authenticated inbound classifier so it can return Duplicate and
+            // advance the contiguous ACK.
+            .filter(|record| {
+                record.seq > state.checkpoint.last_acked_seq
+                    || !state.seen_message_ids.contains(&record.message_id)
+            })
             .cloned()
             .collect()
     }
@@ -148,6 +155,12 @@ mod tests {
         assert_eq!(state.checkpoint.last_fetched_seq, 0);
         SyncEngine::commit_fetched_record(&mut state, &record);
         assert_eq!(state.checkpoint.last_fetched_seq, 1);
+        assert_eq!(
+            SyncEngine::select_fresh(&state, std::slice::from_ref(&record)).len(),
+            1,
+            "a fetched record above the durable ACK boundary must reach authenticated duplicate classification"
+        );
+        SyncEngine::ack_up_to(&mut state, 1);
         assert!(SyncEngine::select_fresh(&state, &[record]).is_empty());
     }
 
@@ -223,6 +236,9 @@ mod tests {
             received_at: seq,
             expires_at: None,
             state: InboxRecordState::Available,
+            envelope_v2: None,
+            sender_identity_bundle: None,
+            relationship_proposal: None,
             envelope: Envelope {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 message_id: message_id.into(),

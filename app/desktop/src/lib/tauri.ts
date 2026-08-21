@@ -119,8 +119,8 @@ export async function deleteProfile(path: string): Promise<void> {
   return invoke("delete_profile", { path });
 }
 
-export async function startNewProfileOnboarding(): Promise<void> {
-  return invoke("start_new_profile_onboarding");
+export async function startNewProfileOnboarding(mode?: "create" | "recover"): Promise<void> {
+  return invoke("start_new_profile_onboarding", { mode: mode ?? null });
 }
 
 export async function initOnboardingProfile(

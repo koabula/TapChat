@@ -76,6 +76,27 @@ export interface ConversationSummary {
   last_message_type?: string;
   message_count?: number;
   recovery?: RecoveryDiagnostics;
+  relationship?: RelationshipViewState;
+}
+
+export type RelationshipAccountState = "pending" | "accepted" | "rejected" | "removed";
+export type RelationshipSetupState =
+  | "claiming"
+  | "delivering"
+  | "waiting_acceptance"
+  | "retrying_expired"
+  | "pool_exhausted"
+  | "ready"
+  | "superseded";
+export type RelationshipDeviceJoinState = "waiting_welcome" | "joining" | "ready" | "failed";
+
+export interface RelationshipViewState {
+  relationship_id: string;
+  generation: number;
+  account_state: RelationshipAccountState;
+  setup_state: RelationshipSetupState;
+  local_device_join_state?: RelationshipDeviceJoinState;
+  canonical_conversation_id: string;
 }
 
 export interface MessageSummary {

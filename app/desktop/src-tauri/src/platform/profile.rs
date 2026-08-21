@@ -124,44 +124,38 @@ impl ProfileManager {
         }
     }
 
-    /// Create ProfileManager with a specific profile name (for multi-instance mode).
-    /// This loads the named profile instead of the registry's active_profile.
-    pub fn with_profile_name(name: &str) -> Self {
+    /// Create ProfileManager with a specific profile selector (for multi-instance mode).
+    pub fn with_profile_selector(selector: &str) -> Self {
         let layout = DesktopStorageLayout::system_default()
             .expect("desktop storage directories must be available");
-        Self::with_profile_name_and_layout(name, layout)
+        Self::with_profile_selector_and_layout(selector, layout)
     }
 
-    pub fn with_profile_name_and_layout(name: &str, layout: DesktopStorageLayout) -> Self {
+    pub fn with_profile_selector_and_layout(selector: &str, layout: DesktopStorageLayout) -> Self {
         if let Err(error) = layout.ensure_base_dirs() {
             log::error!("Failed to initialize desktop storage layout: {error}");
         }
         let registry = ProfileRegistry::load_from(&layout.registry_path).unwrap_or_default();
 
-        // Find profile by name in registry
-        let selected_path = registry
-            .profiles
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| entry.root_dir.clone());
+        let selected_path = resolve_profile_selector(&registry, &layout, selector);
         let (profile, locked_profile_path, unlock_error) = match selected_path {
-            Some(path) => match open_managed_profile(&layout, &path, None) {
+            Ok(path) => match open_managed_profile(&layout, &path, None) {
                 Ok(profile) => (Some(profile), None, None),
                 Err(error) => {
                     log::error!(
                         "Failed to unlock profile {}: unlock_failed",
-                        redact_id("profile", &format!("{name}:{}", path.display()))
+                        redact_id("profile", &format!("{selector}:{}", path.display()))
                     );
                     (None, Some(path), Some(error.to_string()))
                 }
             },
-            None => (None, None, None),
+            Err(error) => (None, None, Some(error)),
         };
 
-        if profile.is_none() {
+        if profile.is_none() && locked_profile_path.is_none() {
             log::warn!(
-                "Profile {} not found in registry; available_profile_count={}",
-                redact_id("profile", name),
+                "Profile selector {} could not be resolved; available_profile_count={}",
+                redact_id("profile", selector),
                 registry.profiles.len()
             );
         }
@@ -231,7 +225,11 @@ impl ProfileManager {
             .unwrap_or(false);
 
         let startup_error = unlock_error.clone().or(snapshot_load_error);
-        let lock_reason = if unlock_error.is_some() {
+        let lock_reason = if unlock_error.as_deref().is_some_and(|error| {
+            error.starts_with("profile_not_found:") || error.starts_with("profile_ambiguous:")
+        }) {
+            Some("profile_selection_required".to_string())
+        } else if unlock_error.is_some() {
             Some("profile_locked".to_string())
         } else if startup_error.is_some() {
             Some("snapshot_load_failed".to_string())
@@ -533,6 +531,48 @@ impl ProfileManager {
     }
 }
 
+fn resolve_profile_selector(
+    registry: &ProfileRegistry,
+    layout: &DesktopStorageLayout,
+    selector: &str,
+) -> std::result::Result<PathBuf, String> {
+    if selector.starts_with("profile:") {
+        let path = layout
+            .profile_paths_for_id(selector)
+            .map_err(|_| "profile_not_found: profile id is invalid".to_string())?
+            .profile_root;
+        return registry
+            .profiles
+            .iter()
+            .any(|entry| entry.root_dir == path)
+            .then_some(path)
+            .ok_or_else(|| "profile_not_found: profile id is not registered".to_string());
+    }
+
+    let candidate_path = PathBuf::from(selector);
+    if registry
+        .profiles
+        .iter()
+        .any(|entry| entry.root_dir == candidate_path)
+    {
+        return Ok(candidate_path);
+    }
+
+    let matches: Vec<_> = registry
+        .profiles
+        .iter()
+        .filter(|entry| entry.name == selector)
+        .collect();
+    match matches.as_slice() {
+        [] => Err("profile_not_found: no registered profile matches the selector".to_string()),
+        [entry] => Ok(entry.root_dir.clone()),
+        _ => Err(
+            "profile_ambiguous: multiple profiles share this name; select by profile id or path"
+                .to_string(),
+        ),
+    }
+}
+
 fn load_registry_active_profile(
     registry: &ProfileRegistry,
     layout: &DesktopStorageLayout,
@@ -574,9 +614,11 @@ impl Default for ProfileManager {
 mod tests {
     use std::path::PathBuf;
 
-    use tapchat_core::cli::profile::{Profile, ProfileInitOptions, ProfileRegistry};
+    use tapchat_core::cli::profile::{
+        Profile, ProfileInitOptions, ProfileRegistry, ProfileRegistryEntry,
+    };
 
-    use super::{ProfileManager, ProfileProtectionMode};
+    use super::{resolve_profile_selector, ProfileManager, ProfileProtectionMode};
     use crate::storage_layout::DesktopStorageLayout;
 
     #[test]
@@ -609,6 +651,54 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create test dir");
         dir
+    }
+
+    #[test]
+    fn profile_selector_requires_unique_names_but_accepts_profile_ids() {
+        let dir = test_dir();
+        let layout =
+            DesktopStorageLayout::from_roots(dir.join("data"), dir.join("cache"), dir.join("logs"));
+        let (alice_id, alice_paths) = layout.new_profile();
+        let (_other_id, other_paths) = layout.new_profile();
+        let mut registry = ProfileRegistry::default();
+        registry.profiles = vec![
+            ProfileRegistryEntry {
+                name: "default".into(),
+                root_dir: alice_paths.profile_root.clone(),
+                user_id: None,
+                device_id: None,
+            },
+            ProfileRegistryEntry {
+                name: "default".into(),
+                root_dir: other_paths.profile_root,
+                user_id: None,
+                device_id: None,
+            },
+        ];
+
+        let error = resolve_profile_selector(&registry, &layout, "default")
+            .expect_err("duplicate display names must be ambiguous");
+        assert!(error.starts_with("profile_ambiguous:"));
+        assert_eq!(
+            resolve_profile_selector(&registry, &layout, &alice_id).expect("profile id"),
+            alice_paths.profile_root
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_selector_reports_missing_profiles_instead_of_falling_back_to_onboarding() {
+        let dir = test_dir();
+        let layout =
+            DesktopStorageLayout::from_roots(dir.join("data"), dir.join("cache"), dir.join("logs"));
+        let registry = ProfileRegistry::default();
+
+        let error = resolve_profile_selector(&registry, &layout, "missing")
+            .expect_err("missing selector must fail");
+        assert!(error.starts_with("profile_not_found:"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

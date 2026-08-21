@@ -29,6 +29,18 @@ export class WelcomePickupService {
     if (!request.welcomeB64?.trim()) {
       throw new HttpError(400, "invalid_input", "welcome_b64 must not be empty");
     }
+    const digestBytes = new Uint8Array(await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(request.welcomeB64)
+    ));
+    const actualDigest = btoa(String.fromCharCode(...digestBytes));
+    if (request.descriptor.welcomeDigest !== actualDigest) {
+      throw new HttpError(
+        403,
+        "relationship_proposal_invalid",
+        "welcome digest does not match descriptor"
+      );
+    }
     await this.store.putJson(pickupKey(request.descriptor.groupId, request.descriptor.deviceId, request.descriptor.requestId), {
       descriptor: request.descriptor,
       welcomeB64: request.welcomeB64,
@@ -44,7 +56,11 @@ export class WelcomePickupService {
     if (!stored) {
       throw new HttpError(404, "not_found", "welcome pickup not found");
     }
-    if (stored.descriptor.capability !== descriptor.capability) {
+    if (
+      stored.descriptor.capability !== descriptor.capability ||
+      stored.descriptor.claimId !== descriptor.claimId ||
+      stored.descriptor.welcomeDigest !== descriptor.welcomeDigest
+    ) {
       throw new HttpError(403, "invalid_capability", "welcome pickup capability does not match stored descriptor");
     }
     if (stored.descriptor.expiresAt <= now) {
@@ -55,7 +71,14 @@ export class WelcomePickupService {
   }
 
   private validateDescriptor(descriptor: WelcomePickupDescriptor, now: number): void {
-    if (!descriptor.groupId || !descriptor.deviceId || !descriptor.endpoint || !descriptor.capability) {
+    if (
+      !descriptor.groupId ||
+      !descriptor.deviceId ||
+      !descriptor.endpoint ||
+      !descriptor.capability ||
+      !descriptor.claimId ||
+      !descriptor.welcomeDigest
+    ) {
       throw new HttpError(400, "invalid_input", "welcome pickup descriptor is missing required fields");
     }
     if (descriptor.expiresAt <= now) {

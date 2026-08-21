@@ -4,11 +4,227 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::model::{
-    Ack, Envelope, GroupCapability, GroupCursor, GroupEnvelope, GroupInviteDocument,
+    Ack, Envelope, EnvelopeV2, GroupCapability, GroupCursor, GroupEnvelope, GroupInviteDocument,
     GroupJoinRequest, GroupLeaveRequest, GroupManifest, GroupOutboxRecord,
     GroupTransitionOperation, GroupTransitionRequestBinding, IdentityBundle, InboxRecord,
-    WelcomePickupDescriptor,
+    KeyPackageClaimCapability, PersistedRelationship, RelationshipDecisionProofV2,
+    RelationshipProposalV2, RelationshipTicket, WelcomePickupDescriptor,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendEnvelopeRequestV2 {
+    pub version: String,
+    pub recipient_device_id: String,
+    pub envelope: EnvelopeV2,
+    pub sender_identity_bundle: IdentityBundle,
+    pub recipient_capability: crate::model::InboxAppendCapability,
+    pub relationship_proposal: RelationshipProposalV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedKeyPackageV2 {
+    pub key_package_id: String,
+    pub key_package_b64: String,
+    pub lifecycle_version: u16,
+    pub not_before: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub mls_signature_public_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishKeyPackageBatchRequest {
+    pub version: String,
+    pub device_id: String,
+    pub packages: Vec<PublishedKeyPackageV2>,
+    pub idempotency_key: String,
+    pub signature: String,
+}
+
+impl PublishKeyPackageBatchRequest {
+    pub fn signing_payload(&self) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([
+            "tapchat-key-package-publish-v2",
+            self.version,
+            self.device_id,
+            self.idempotency_key,
+            self.packages
+                .iter()
+                .map(|item| serde_json::json!([
+                    item.key_package_id,
+                    item.key_package_b64,
+                    item.lifecycle_version,
+                    item.not_before,
+                    item.created_at,
+                    item.expires_at,
+                    item.mls_signature_public_key,
+                ]))
+                .collect::<Vec<_>>(),
+        ]))
+        .expect("fixed KeyPackage publication payload is serializable")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishKeyPackageBatchResult {
+    pub accepted: bool,
+    pub idempotency_key: String,
+    pub published: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackagePoolStatus {
+    pub device_id: String,
+    pub available: usize,
+    pub claimed: usize,
+    pub expired: usize,
+    pub target: usize,
+    pub refill_threshold: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyPackageClaimPurpose {
+    Direct,
+    GroupInvite,
+    DeviceReconcile,
+    Recovery,
+    SelfJoin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyPackageClaimTarget {
+    pub device_id: String,
+    pub capability: KeyPackageClaimCapability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimKeyPackagesRequest {
+    pub version: String,
+    pub purpose: KeyPackageClaimPurpose,
+    pub idempotency_key: String,
+    pub requester_bundle: IdentityBundle,
+    pub proposal: RelationshipProposalV2,
+    pub targets: Vec<KeyPackageClaimTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimedKeyPackage {
+    pub claim_id: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub key_package_id: String,
+    pub key_package_b64: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimKeyPackagesResult {
+    pub idempotency_key: String,
+    pub claims: Vec<ClaimedKeyPackage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<RelationshipTicket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRelationshipsResult {
+    pub relationships: Vec<AccountRelationshipRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRelationshipRecord {
+    pub relationship: PersistedRelationship,
+    pub peer_bundle: IdentityBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertOutboundRelationshipRequest {
+    pub version: String,
+    pub relationship: PersistedRelationship,
+    pub peer_bundle: IdentityBundle,
+    pub ticket: RelationshipTicket,
+    pub ticket_status_endpoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertOutboundRelationshipResult {
+    pub canonical: bool,
+    pub relationship: PersistedRelationship,
+    pub peer_bundle: IdentityBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRelationshipDeviceJoinStateRequest {
+    pub version: String,
+    pub state: crate::model::DeviceJoinState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveRelationshipRequest {
+    pub version: String,
+    pub relationship_id: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipRequestItemV2 {
+    pub ticket_id: String,
+    pub relationship_id: String,
+    pub generation: u64,
+    pub attempt: u32,
+    pub peer_bundle: IdentityBundle,
+    pub peer_bundle_digest: String,
+    pub proposal: RelationshipProposalV2,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRelationshipRequestsResult {
+    pub requests: Vec<RelationshipRequestItemV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipDecisionRequest {
+    pub version: String,
+    pub decision: String,
+    pub proof: RelationshipDecisionProofV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipDecisionResult {
+    pub accepted: bool,
+    pub ticket_id: String,
+    pub relationship_id: String,
+    pub generation: u64,
+    pub account_state: crate::model::RelationshipAccountState,
+    pub local_device_join_states: BTreeMap<String, crate::model::DeviceJoinState>,
+    pub proof: RelationshipDecisionProofV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipTicketStatusResult {
+    pub ticket_id: String,
+    pub status: String,
+    pub relationship_id: String,
+    pub generation: u64,
+    pub canonical_proposal: RelationshipProposalV2,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_proof: Option<RelationshipDecisionProofV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmRelationshipPeerDecisionRequest {
+    pub version: String,
+    pub proof: RelationshipDecisionProofV2,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEnvelopeRequest {
@@ -909,6 +1125,8 @@ mod tests {
                 device_id: "device:bob:phone".into(),
                 endpoint: "https://example.com/welcome/group%3Aproject/device%3Abob%3Aphone".into(),
                 capability: "cap:welcome:1".into(),
+                claim_id: None,
+                welcome_digest: None,
                 expires_at: 99,
                 start_seq: None,
                 roster_version: None,

@@ -383,8 +383,25 @@ where
                 ports.release_staged_attachment(release).await
             }
             CoreEffect::PersistState { persist } => {
-                ports.persist_state(persist).await?;
-                Ok(Vec::new())
+                let commit_id = persist.commit_id.clone();
+                match ports.persist_state(persist).await {
+                    Ok(()) => Ok(commit_id
+                        .map(|commit_id| CoreEvent::PersistenceCommitted { commit_id })
+                        .into_iter()
+                        .collect()),
+                    Err(error) => {
+                        if let Some(commit_id) = commit_id {
+                            Ok(vec![CoreEvent::PersistenceFailed {
+                                commit_id,
+                                failure: crate::error::AppErrorV1::from_registered_code(
+                                    "temporary_failure",
+                                ),
+                            }])
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
             }
             CoreEffect::ScheduleTimer { timer } => {
                 ports.schedule_timer(timer.timer_id, timer.delay_ms)
@@ -642,6 +659,7 @@ mod tests {
             &mut ports,
             CoreEffect::PersistState {
                 persist: PersistStateEffect {
+                    commit_id: None,
                     mutations: vec![],
                     ops: vec![],
                     snapshot: None,
@@ -665,6 +683,7 @@ mod tests {
             &mut ports,
             CoreEffect::PersistState {
                 persist: PersistStateEffect {
+                    commit_id: None,
                     mutations: vec![],
                     ops: vec![],
                     snapshot: None,

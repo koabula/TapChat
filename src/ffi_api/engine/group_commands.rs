@@ -35,7 +35,32 @@ impl CoreEngine {
             ));
         }
 
-        let mut peer_keypackages = Vec::new();
+        let claim_targets = member_user_ids
+            .iter()
+            .map(|user_id| {
+                let bundle = self.direct_peer_contact_bundle(user_id)?;
+                let device_ids = bundle
+                    .devices
+                    .iter()
+                    .filter(|device| device.status == DeviceStatusKind::Active)
+                    .map(|device| device.device_id.clone())
+                    .collect::<Vec<_>>();
+                Ok((user_id.clone(), device_ids))
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let claimed_keypackages = match self.claim_key_packages_for_operation(
+            crate::transport_contract::KeyPackageClaimPurpose::GroupInvite,
+            PersistedKeyPackageClaimContinuation::CreateGroup {
+                title: title.clone(),
+                member_user_ids: member_user_ids.clone(),
+            },
+            claim_targets,
+        )? {
+            key_packages::KeyPackageClaimReadiness::Deferred(output) => return Ok(output),
+            key_packages::KeyPackageClaimReadiness::Ready(claimed) => claimed,
+        };
+        let claim_ids_by_device = claimed_keypackages.claim_ids_by_device;
+        let peer_keypackages = claimed_keypackages.packages;
         let mut member_devices = vec![ConversationMember {
             user_id: local_identity.user_identity.user_id.clone(),
             device_id: local_identity.device_identity.device_id.clone(),
@@ -46,66 +71,17 @@ impl CoreEngine {
             device_id: local_identity.device_identity.device_id.clone(),
             status: GroupMemberStatus::Active,
         }];
-        for user_id in &member_user_ids {
-            let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
-            let now_ms = current_unix_millis(self.state.message_nonce);
-            let mut usable_device_found = false;
-            for device in bundle
-                .devices
-                .iter()
-                .filter(|device| matches!(device.status, DeviceStatusKind::Active))
-            {
-                let Some(keypackage_ref) = device
-                    .keypackage_ref
-                    .as_ref()
-                    .filter(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
-                else {
-                    continue;
-                };
-                usable_device_found = true;
-                peer_keypackages.push(PeerDeviceKeyPackage {
-                    user_id: user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    device_public_key: device.device_public_key.clone(),
-                    key_package_b64: keypackage_ref.object_ref.clone(),
-                });
-                member_devices.push(ConversationMember {
-                    user_id: user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    status: DeviceStatusKind::Active,
-                });
-                manifest_member_devices.push(GroupMemberDevice {
-                    user_id: user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    status: GroupMemberStatus::Active,
-                });
-            }
-            if !usable_device_found {
-                if bundle.devices.iter().any(|device| {
-                    matches!(device.status, DeviceStatusKind::Active)
-                        && device.keypackage_ref.as_ref().is_some_and(|keypackage| {
-                            keypackage.created_at
-                                > now_ms.saturating_add(
-                                    crate::mls_adapter::KEY_PACKAGE_CLOCK_TOLERANCE_MS,
-                                )
-                        })
-                }) {
-                    return Err(CoreError::new(
-                        "device_clock_invalid",
-                        "an invited contact key package was created too far in the future",
-                    ));
-                }
-                return Err(CoreError::new(
-                    "keypackage_expired",
-                    "an invited contact has no usable key package",
-                ));
-            }
-        }
-        if peer_keypackages.is_empty() {
-            return Err(CoreError::new(
-                "keypackage_expired",
-                "invited contacts have no usable key packages",
-            ));
+        for package in &peer_keypackages {
+            member_devices.push(ConversationMember {
+                user_id: package.user_id.clone(),
+                device_id: package.device_id.clone(),
+                status: DeviceStatusKind::Active,
+            });
+            manifest_member_devices.push(GroupMemberDevice {
+                user_id: package.user_id.clone(),
+                device_id: package.device_id.clone(),
+                status: GroupMemberStatus::Active,
+            });
         }
         let invitee_user_by_device: BTreeMap<String, String> = peer_keypackages
             .iter()
@@ -335,8 +311,16 @@ impl CoreEngine {
         ];
         let mut pending_welcomes = Vec::new();
         for welcome in artifacts.welcomes {
-            let descriptor =
-                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            let claim_id = claim_ids_by_device
+                .get(&welcome.recipient_device_id)
+                .ok_or_else(|| CoreError::invalid_state("group Welcome is missing its claim ID"))?;
+            let welcome_digest = STANDARD.encode(Sha256::digest(welcome.payload_b64.as_bytes()));
+            let descriptor = self.welcome_pickup_descriptor(
+                &group_id,
+                &welcome.recipient_device_id,
+                claim_id,
+                &welcome_digest,
+            )?;
             log::info!(
                 "create_group_conversation: prepared welcome pickup group_id={} recipient_device_id={} endpoint={}",
                 group_id,
@@ -898,12 +882,25 @@ impl CoreEngine {
             })?
             .bundle
             .clone();
-        let peer_devices = active_peer_key_packages(&contact)?;
-        if peer_devices.is_empty() {
-            return Err(CoreError::invalid_state(
-                "joiner has no active key packages",
-            ));
-        }
+        let target_device_ids = contact
+            .devices
+            .iter()
+            .filter(|device| device.status == DeviceStatusKind::Active)
+            .map(|device| device.device_id.clone())
+            .collect::<Vec<_>>();
+        let claimed_keypackages = match self.claim_key_packages_for_operation(
+            crate::transport_contract::KeyPackageClaimPurpose::GroupInvite,
+            PersistedKeyPackageClaimContinuation::ApproveGroupJoin {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+            },
+            vec![(join.joiner_user_id.clone(), target_device_ids)],
+        )? {
+            key_packages::KeyPackageClaimReadiness::Deferred(output) => return Ok(output),
+            key_packages::KeyPackageClaimReadiness::Ready(claimed) => claimed,
+        };
+        let claim_ids_by_device = claimed_keypackages.claim_ids_by_device;
+        let peer_devices = claimed_keypackages.packages;
         let adapter = self
             .state
             .mls_adapter
@@ -1033,8 +1030,16 @@ impl CoreEngine {
             ],
         )];
         for welcome in artifacts.welcomes {
-            let mut descriptor =
-                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            let claim_id = claim_ids_by_device
+                .get(&welcome.recipient_device_id)
+                .ok_or_else(|| CoreError::invalid_state("group Welcome is missing its claim ID"))?;
+            let welcome_digest = STANDARD.encode(Sha256::digest(welcome.payload_b64.as_bytes()));
+            let mut descriptor = self.welcome_pickup_descriptor(
+                &group_id,
+                &welcome.recipient_device_id,
+                claim_id,
+                &welcome_digest,
+            )?;
             descriptor.request_id = Some(request_id.clone());
             effects.push(CoreEffect::PutWelcomePickup {
                 put: PutWelcomePickupRequest {
@@ -1156,25 +1161,34 @@ impl CoreEngine {
                 "all invitees are already active members of this group",
             ));
         }
-        let mut peer_keypackages = Vec::new();
-        for user_id in &invitee_user_ids {
-            if existing_ids.contains(user_id) {
-                continue;
-            }
-            let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
-            let kps = active_peer_key_packages(&bundle)?;
-            if kps.is_empty() {
-                return Err(CoreError::invalid_state(format!(
-                    "invitee {user_id} has no active key packages",
-                )));
-            }
-            peer_keypackages.extend(kps);
-        }
-        if peer_keypackages.is_empty() {
-            return Err(CoreError::invalid_input(
-                "no active key packages found for any invitee",
-            ));
-        }
+        let claim_targets = new_ids
+            .iter()
+            .map(|user_id| {
+                let bundle = self.direct_peer_contact_bundle(user_id)?;
+                Ok((
+                    (*user_id).clone(),
+                    bundle
+                        .devices
+                        .iter()
+                        .filter(|device| device.status == DeviceStatusKind::Active)
+                        .map(|device| device.device_id.clone())
+                        .collect::<Vec<_>>(),
+                ))
+            })
+            .collect::<CoreResult<Vec<_>>>()?;
+        let claimed_keypackages = match self.claim_key_packages_for_operation(
+            crate::transport_contract::KeyPackageClaimPurpose::GroupInvite,
+            PersistedKeyPackageClaimContinuation::InviteToGroup {
+                group_id: group_id.clone(),
+                invitee_user_ids: invitee_user_ids.clone(),
+            },
+            claim_targets,
+        )? {
+            key_packages::KeyPackageClaimReadiness::Deferred(output) => return Ok(output),
+            key_packages::KeyPackageClaimReadiness::Ready(claimed) => claimed,
+        };
+        let claim_ids_by_device = claimed_keypackages.claim_ids_by_device;
+        let peer_keypackages = claimed_keypackages.packages;
         let adapter = self
             .state
             .mls_adapter
@@ -1284,8 +1298,16 @@ impl CoreEngine {
             ],
         )];
         for welcome in artifacts.welcomes {
-            let descriptor =
-                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            let claim_id = claim_ids_by_device
+                .get(&welcome.recipient_device_id)
+                .ok_or_else(|| CoreError::invalid_state("group Welcome is missing its claim ID"))?;
+            let welcome_digest = STANDARD.encode(Sha256::digest(welcome.payload_b64.as_bytes()));
+            let descriptor = self.welcome_pickup_descriptor(
+                &group_id,
+                &welcome.recipient_device_id,
+                claim_id,
+                &welcome_digest,
+            )?;
             effects.push(CoreEffect::PutWelcomePickup {
                 put: PutWelcomePickupRequest {
                     descriptor,
@@ -2426,35 +2448,28 @@ impl CoreEngine {
                 "device is already an active member of this group",
             ));
         }
-        let bundle =
-            self.state.local_bundle.as_ref().ok_or_else(|| {
-                CoreError::invalid_state("local identity bundle is not initialized")
-            })?;
-        let device_profile = bundle
-            .devices
-            .iter()
-            .find(|d| d.device_id == device_id && matches!(d.status, DeviceStatusKind::Active))
-            .ok_or_else(|| {
-                CoreError::invalid_input("target device is not an active device of the local user")
-            })?;
-        let keypackage_ref = device_profile
-            .keypackage_ref
-            .as_ref()
-            .filter(|keypackage_ref| {
-                keypackage_ref.is_usable_at(current_unix_millis(self.state.message_nonce))
-            })
-            .ok_or_else(|| {
-                CoreError::new(
-                    "keypackage_expired",
-                    "target device does not have a usable key package",
-                )
-            })?;
-        let peer_keypackage = PeerDeviceKeyPackage {
-            user_id: local_user_id.clone(),
-            device_id: device_id.clone(),
-            device_public_key: device_profile.device_public_key.clone(),
-            key_package_b64: keypackage_ref.object_ref.clone(),
+        let claimed_keypackages = match self.claim_key_packages_for_operation(
+            crate::transport_contract::KeyPackageClaimPurpose::DeviceReconcile,
+            PersistedKeyPackageClaimContinuation::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
+            },
+            vec![(local_user_id.clone(), vec![device_id.clone()])],
+        )? {
+            key_packages::KeyPackageClaimReadiness::Deferred(output) => return Ok(output),
+            key_packages::KeyPackageClaimReadiness::Ready(claimed) => claimed,
         };
+        let claim_ids_by_device = claimed_keypackages.claim_ids_by_device;
+        let mut claimed = claimed_keypackages.packages;
+        let peer_keypackage = claimed.pop().ok_or_else(|| {
+            CoreError::invalid_state("device reconciliation claim returned no KeyPackage")
+        })?;
+        if !claimed.is_empty() {
+            return Err(CoreError::invalid_input(
+                "device reconciliation claim returned an unexpected target set",
+            ));
+        }
         let (artifacts, summary) = {
             let adapter = self
                 .state
@@ -2568,8 +2583,16 @@ impl CoreEngine {
             ],
         )];
         for welcome in artifacts.welcomes {
-            let descriptor =
-                self.welcome_pickup_descriptor(&group_id, &welcome.recipient_device_id)?;
+            let claim_id = claim_ids_by_device
+                .get(&welcome.recipient_device_id)
+                .ok_or_else(|| CoreError::invalid_state("group Welcome is missing its claim ID"))?;
+            let welcome_digest = STANDARD.encode(Sha256::digest(welcome.payload_b64.as_bytes()));
+            let descriptor = self.welcome_pickup_descriptor(
+                &group_id,
+                &welcome.recipient_device_id,
+                claim_id,
+                &welcome_digest,
+            )?;
             effects.push(CoreEffect::PutWelcomePickup {
                 put: PutWelcomePickupRequest {
                     descriptor,

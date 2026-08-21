@@ -1,0 +1,86 @@
+{
+  "mlsDeviceKeyBinding": {
+    "version": "0.1",
+    "userId": "user:alice",
+    "deviceId": "device:alice:phone",
+    "devicePublicKey": "1111111111111111111111111111111111111111111111111111111111111111",
+    "mlsSignaturePublicKey": "2222222222222222222222222222222222222222222222222222222222222222",
+    "ciphersuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+    "createdAt": 1700000000000,
+    "signature": "vector-signature"
+  },
+  "mlsDeviceKeyBindingSigningPayload": "[\"tapchat-mls-device-key-binding-v2\",\"0.1\",\"user:alice\",\"device:alice:phone\",\"1111111111111111111111111111111111111111111111111111111111111111\",\"2222222222222222222222222222222222222222222222222222222222222222\",\"MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519\",1700000000000]",
+  "identityBundle": {
+    "version": "0.1",
+    "publicationVersion": 2,
+    "publicationRevision": 7,
+    "userId": "user:8a88e3dd7409f195",
+    "userPublicKey": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "devices": [
+      {
+        "version": "0.1",
+        "deviceId": "device:vector:revoked",
+        "devicePublicKey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "binding": {
+          "version": "0.1",
+          "userId": "user:8a88e3dd7409f195",
+          "deviceId": "device:vector:revoked",
+          "devicePublicKey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+          "createdAt": 1700000000100,
+          "signature": "74a6044db2d31cc5ba56b353fea9ee90acd1725014e6e35689d7e766192ad87c9c80349c5e78bab92a0595680816a110188816e1252b92c11e237d2c3a3f7b08"
+        },
+        "status": "revoked",
+        "mlsDeviceKeyBinding": {
+          "version": "0.1",
+          "userId": "user:8a88e3dd7409f195",
+          "deviceId": "device:vector:revoked",
+          "devicePublicKey": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+          "mlsSignaturePublicKey": "3333333333333333333333333333333333333333333333333333333333333333",
+          "ciphersuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+          "createdAt": 1700000000100,
+          "signature": "fc6bf7e5944fddfac3c9e32baa1b30f79be82c5481c5b1323e0f3f327d436d7222792ad5ee72102a1b729e35d5d9aa7161c156f8421e6332fee5b30e4fd09e07"
+        }
+      }
+    ],
+    "displayName": "Alice",
+    "updatedAt": 1700000000200,
+    "signature": "633d71328cd531ed01ac91e780afdf445b318884b072b51381b1fc6dd8d29e977aa09c72c8bc245d070929cbfb55d47eb64b384dd5a5862c707e072a655ffb04"
+  },
+  "identityBundleSigningPayload": "[\"tapchat-identity-bundle-v2\",\"0.1\",2,7,\"user:8a88e3dd7409f195\",\"8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c\",[[\"0.1\",\"device:vector:revoked\",\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",[\"0.1\",\"user:8a88e3dd7409f195\",\"device:vector:revoked\",\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",1700000000100,\"74a6044db2d31cc5ba56b353fea9ee90acd1725014e6e35689d7e766192ad87c9c80349c5e78bab92a0595680816a110188816e1252b92c11e237d2c3a3f7b08\"],\"revoked\",null,null,[\"0.1\",\"user:8a88e3dd7409f195\",\"device:vector:revoked\",\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"3333333333333333333333333333333333333333333333333333333333333333\",\"MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519\",1700000000100,\"fc6bf7e5944fddfac3c9e32baa1b30f79be82c5481c5b1323e0f3f327d436d7222792ad5ee72102a1b729e35d5d9aa7161c156f8421e6332fee5b30e4fd09e07\"]]],null,null,null,null,null,\"Alice\",1700000000200]",
+  "identityBundleDigest": "sha256:b13db0952a0555b55921ed85e19db330c27301d3162f67f8b0e845b90d1e725c",
+  "envelope": {
+    "version": "2",
+    "messageId": "msg:vector",
+    "conversationId": "conv:direct:v2:rel-vector:g3",
+    "relationshipId": "rel-vector",
+    "generation": 3,
+    "attempt": 2,
+    "proposalId": "proposal-vector",
+    "claimId": "claim-vector",
+    "senderUserId": "user:alice",
+    "senderDeviceId": "device:alice:phone",
+    "recipientUserId": "user:bob",
+    "recipientDeviceId": "device:bob:laptop",
+    "createdAt": 1700000000123,
+    "messageType": "mls_welcome",
+    "inlineCiphertext": "AQID",
+    "storageRefs": [
+      {
+        "kind": "attachment",
+        "ref": "storage:one",
+        "sizeBytes": 7,
+        "mimeType": "application/octet-stream",
+        "fileName": "a.bin",
+        "expiresAt": 999
+      }
+    ],
+    "deliveryClass": "normal",
+    "wakeHint": { "latestSeqHint": 9 },
+    "senderBundleDigest": "sha256:bundle-vector",
+    "senderProof": {
+      "type": "ed25519_device_v2",
+      "value": "vector-proof"
+    }
+  },
+  "envelopeSigningPayload": "[\"tapchat-envelope-v2\",\"2\",\"msg:vector\",\"conv:direct:v2:rel-vector:g3\",\"rel-vector\",3,2,\"proposal-vector\",\"claim-vector\",\"user:alice\",\"device:alice:phone\",\"user:bob\",\"device:bob:laptop\",1700000000123,\"mls_welcome\",\"normal\",9,\"sha256:b70035bb783a47bf61ac3ff70b005308e167ee984365690e638c1481b8ca2936\",\"sha256:ca77b50a69b626e5318ee8411b8ffcf6f4a9ee182cd6df9097b5e3c514b2c97e\",\"sha256:bundle-vector\"]"
+}

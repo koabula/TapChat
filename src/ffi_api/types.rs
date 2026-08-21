@@ -13,13 +13,13 @@ use crate::model::{
     InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, StorageRef, WelcomePickupDescriptor,
 };
 use crate::persistence::{
-    ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
-    PersistedConversation, PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite,
-    PersistedGroupJoinRequest, PersistedGroupRealtimeSession, PersistedGroupState,
-    PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    ContactRelationshipStatus, CorePersistenceSnapshot, PendingKeyPackagePublish, PersistOp,
+    PersistedContact, PersistedConversation, PersistedDeployment, PersistedGroupCursor,
+    PersistedGroupInvite, PersistedGroupJoinRequest, PersistedGroupRealtimeSession,
+    PersistedGroupState, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
     PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
-    PersistedPendingGroupJoinApproval, PersistedPendingWelcomePickup, PersistedRealtimeSession,
-    PersistedRecoveryContext, PersistedSyncState,
+    PersistedPendingGroupJoinApproval, PersistedPendingWelcomePickup, PersistedQuarantineRecord,
+    PersistedRealtimeSession, PersistedRecoveryContext, PersistedSyncState,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
@@ -279,6 +279,13 @@ pub enum CoreEvent {
         device_id: String,
         records: Vec<InboxRecord>,
         to_seq: u64,
+    },
+    PersistenceCommitted {
+        commit_id: String,
+    },
+    PersistenceFailed {
+        commit_id: String,
+        failure: crate::error::AppErrorV1,
     },
     InboxHistoryFloorAdvanced {
         device_id: String,
@@ -820,6 +827,11 @@ pub enum PersistedMessageAttachmentState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PersistenceBatch {
+    /// Present for staged inbound commits. The platform must emit exactly one
+    /// matching `PersistenceCommitted` or `PersistenceFailed` event after the
+    /// storage transaction finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutations: Vec<PersistenceMutation>,
     /// Transitional diagnostic list retained for callers and logs. SQLCipher
@@ -1040,6 +1052,19 @@ pub struct ConversationSummary {
     pub message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<RelationshipViewState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipViewState {
+    pub relationship_id: String,
+    pub generation: u64,
+    pub account_state: crate::model::RelationshipAccountState,
+    pub setup_state: crate::model::RelationshipSetupState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_device_join_state: Option<crate::model::DeviceJoinState>,
+    pub canonical_conversation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1185,6 +1210,8 @@ pub struct CoreOperationResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingOutboxItem {
     pub(crate) envelope: Envelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) envelope_v2: Option<crate::model::EnvelopeV2>,
     pub(crate) peer_user_id: String,
     pub(crate) retries: u8,
     pub(crate) in_flight: bool,
@@ -1324,6 +1351,11 @@ pub(crate) struct CoreState {
     pub(crate) mls_summaries: BTreeMap<String, MlsStateSummary>,
     pub(crate) published_key_package: Option<PublishedKeyPackage>,
     pub(crate) key_package_inventory: Vec<PublishedKeyPackage>,
+    pub(crate) pending_key_package_publish: Option<PendingKeyPackagePublish>,
+    pub(crate) relationships: BTreeMap<String, crate::model::PersistedRelationship>,
+    pub(crate) key_package_claim_operations:
+        BTreeMap<String, crate::persistence::PersistedKeyPackageClaimOperation>,
+    pub(crate) quarantine: Vec<PersistedQuarantineRecord>,
     pub(crate) pending_identity_publication: Option<crate::persistence::PendingIdentityPublication>,
     pub(crate) pending_requests: BTreeMap<String, PendingRequest>,
     pub(crate) request_nonce: u64,
@@ -1389,6 +1421,53 @@ pub(crate) enum PendingRequest {
     Ack {
         device_id: String,
         ack_seq: u64,
+    },
+    PublishKeyPackages {
+        idempotency_key: String,
+        package_ids: Vec<String>,
+    },
+    KeyPackagePoolStatus {
+        device_id: String,
+    },
+    ClaimKeyPackages {
+        purpose: crate::transport_contract::KeyPackageClaimPurpose,
+        peer_user_id: String,
+        relationship_id: String,
+        proposal_id: String,
+        idempotency_key: String,
+        claim_endpoint: String,
+    },
+    ClaimOperationKeyPackages {
+        operation_id: String,
+        target_user_id: String,
+        idempotency_key: String,
+    },
+    FetchRelationshipRequests {
+        device_id: String,
+    },
+    DecideRelationship {
+        ticket_id: String,
+        action: crate::transport_contract::MessageRequestAction,
+    },
+    FetchRelationships {
+        device_id: String,
+    },
+    UpsertOutboundRelationship {
+        relationship_id: String,
+    },
+    UpdateRelationshipDeviceJoinState {
+        relationship_id: String,
+        device_id: String,
+    },
+    RemoveRelationship {
+        relationship_id: String,
+    },
+    ConfirmRelationshipPeerDecision {
+        relationship_id: String,
+    },
+    FetchRelationshipTicketStatus {
+        relationship_id: String,
+        ticket_id: String,
     },
 }
 
@@ -1495,6 +1574,10 @@ impl Default for CoreState {
             mls_summaries: BTreeMap::new(),
             published_key_package: None,
             key_package_inventory: Vec::new(),
+            pending_key_package_publish: None,
+            relationships: BTreeMap::new(),
+            key_package_claim_operations: BTreeMap::new(),
+            quarantine: Vec::new(),
             pending_identity_publication: None,
             pending_requests: BTreeMap::new(),
             request_nonce: 0,

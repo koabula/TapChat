@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
@@ -255,17 +257,18 @@ impl KeyPackageRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageRef {
     pub kind: String,
     #[serde(rename = "ref", alias = "object_ref")]
     pub object_ref: String,
-    #[serde(alias = "sizeBytes")]
+    #[serde(alias = "size_bytes")]
     pub size_bytes: u64,
-    #[serde(alias = "mimeType")]
+    #[serde(alias = "mime_type")]
     pub mime_type: String,
-    #[serde(alias = "fileName", skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "file_name", skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
-    #[serde(alias = "expiresAt", skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "expires_at", skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 }
 
@@ -381,8 +384,13 @@ impl Validate for ProtectedAppMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct WakeHint {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "latest_seq_hint",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub latest_seq_hint: Option<u64>,
 }
 
@@ -408,6 +416,18 @@ pub struct DeviceContactProfile {
         skip_serializing_if = "Option::is_none"
     )]
     pub inbox_append_capability: Option<InboxAppendCapability>,
+    #[serde(
+        default,
+        alias = "key_package_claim_capability",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub key_package_claim_capability: Option<KeyPackageClaimCapability>,
+    #[serde(
+        default,
+        alias = "mls_device_key_binding",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mls_device_key_binding: Option<MlsDeviceKeyBinding>,
     #[serde(
         default,
         alias = "keypackage_ref",
@@ -440,6 +460,24 @@ impl Validate for DeviceContactProfile {
                 ));
             }
         }
+        if let Some(capability) = &self.key_package_claim_capability {
+            capability.validate()?;
+            if capability.target_device_id != self.device_id {
+                return Err(CoreError::invalid_input(
+                    "key package claim capability target_device_id must match device profile device_id",
+                ));
+            }
+        }
+        if let Some(binding) = &self.mls_device_key_binding {
+            binding.validate()?;
+            if binding.device_id != self.device_id
+                || binding.device_public_key != self.device_public_key
+            {
+                return Err(CoreError::invalid_input(
+                    "MLS device key binding must match device profile identity",
+                ));
+            }
+        }
         if let Some(keypackage_ref) = &self.keypackage_ref {
             keypackage_ref.validate()?;
             if keypackage_ref.device_id != self.device_id {
@@ -449,6 +487,73 @@ impl Validate for DeviceContactProfile {
             }
         }
         Ok(())
+    }
+}
+
+pub const IDENTITY_PUBLICATION_VERSION_V2: u16 = 2;
+pub const ENVELOPE_VERSION_V2: &str = "2";
+pub const ENVELOPE_SENDER_PROOF_V2: &str = "ed25519_device_v2";
+pub const MLS_CIPHERSUITE_V2: &str = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MlsDeviceKeyBinding {
+    pub version: String,
+    #[serde(alias = "user_id")]
+    pub user_id: String,
+    #[serde(alias = "device_id")]
+    pub device_id: String,
+    #[serde(alias = "device_public_key")]
+    pub device_public_key: String,
+    #[serde(alias = "mls_signature_public_key")]
+    pub mls_signature_public_key: String,
+    pub ciphersuite: String,
+    #[serde(alias = "created_at")]
+    pub created_at: u64,
+    pub signature: String,
+}
+
+impl Validate for MlsDeviceKeyBinding {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        validate_required("user_id", &self.user_id)?;
+        validate_required("device_id", &self.device_id)?;
+        validate_required("device_public_key", &self.device_public_key)?;
+        validate_required("mls_signature_public_key", &self.mls_signature_public_key)?;
+        validate_required("ciphersuite", &self.ciphersuite)?;
+        validate_required("signature", &self.signature)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPackageClaimCapability {
+    pub version: String,
+    pub service: String,
+    #[serde(alias = "user_id")]
+    pub user_id: String,
+    #[serde(alias = "target_device_id")]
+    pub target_device_id: String,
+    pub endpoint: String,
+    #[serde(alias = "expires_at")]
+    pub expires_at: u64,
+    pub nonce: String,
+    pub signature: String,
+}
+
+impl Validate for KeyPackageClaimCapability {
+    fn validate(&self) -> CoreResult<()> {
+        validate_version(&self.version)?;
+        if self.service != "key_package_claim" {
+            return Err(CoreError::invalid_input(
+                "key package claim capability service must be key_package_claim",
+            ));
+        }
+        validate_required("user_id", &self.user_id)?;
+        validate_required("target_device_id", &self.target_device_id)?;
+        validate_required("endpoint", &self.endpoint)?;
+        validate_required("nonce", &self.nonce)?;
+        validate_required("signature", &self.signature)
     }
 }
 
@@ -561,10 +666,39 @@ impl Validate for IdentityBundle {
                     ));
                 }
             }
+            if let Some(capability) = &device.key_package_claim_capability {
+                if capability.user_id != self.user_id {
+                    return Err(CoreError::invalid_input(
+                        "key package claim capability user_id must match bundle user_id",
+                    ));
+                }
+            }
+            if let Some(binding) = &device.mls_device_key_binding {
+                if binding.user_id != self.user_id {
+                    return Err(CoreError::invalid_input(
+                        "MLS device key binding user_id must match bundle user_id",
+                    ));
+                }
+            }
             if let Some(keypackage_ref) = &device.keypackage_ref {
                 if keypackage_ref.user_id != self.user_id {
                     return Err(CoreError::invalid_input(
                         "key package ref user_id must match bundle user_id",
+                    ));
+                }
+            }
+        }
+        if self.publication_version >= IDENTITY_PUBLICATION_VERSION_V2 {
+            for device in self
+                .devices
+                .iter()
+                .filter(|device| device.status == DeviceStatusKind::Active)
+            {
+                if device.mls_device_key_binding.is_none()
+                    || device.key_package_claim_capability.is_none()
+                {
+                    return Err(CoreError::invalid_input(
+                        "IdentityBundle V2 active devices require MLS and KeyPackage claim bindings",
                     ));
                 }
             }
@@ -622,6 +756,283 @@ pub struct Envelope {
     pub sender_proof: SenderProof,
 }
 
+/// Direct/identity transport envelope used by every V2 Inbox append.  This is
+/// intentionally distinct from the retained V1 `Envelope` used only while old
+/// records are drained and quarantined during the hard-cut migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvelopeV2 {
+    pub version: String,
+    #[serde(alias = "message_id")]
+    pub message_id: String,
+    #[serde(alias = "conversation_id")]
+    pub conversation_id: String,
+    #[serde(alias = "relationship_id")]
+    pub relationship_id: String,
+    pub generation: u64,
+    pub attempt: u32,
+    #[serde(alias = "proposal_id")]
+    pub proposal_id: String,
+    #[serde(default, alias = "claim_id", skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    #[serde(alias = "sender_user_id")]
+    pub sender_user_id: String,
+    #[serde(alias = "sender_device_id")]
+    pub sender_device_id: String,
+    #[serde(alias = "recipient_user_id")]
+    pub recipient_user_id: String,
+    #[serde(alias = "recipient_device_id")]
+    pub recipient_device_id: String,
+    #[serde(alias = "created_at")]
+    pub created_at: u64,
+    #[serde(alias = "message_type")]
+    pub message_type: MessageType,
+    #[serde(
+        default,
+        alias = "inline_ciphertext",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inline_ciphertext: Option<String>,
+    #[serde(default, alias = "storage_refs", skip_serializing_if = "Vec::is_empty")]
+    pub storage_refs: Vec<StorageRef>,
+    #[serde(alias = "delivery_class")]
+    pub delivery_class: DeliveryClass,
+    #[serde(default, alias = "wake_hint", skip_serializing_if = "Option::is_none")]
+    pub wake_hint: Option<WakeHint>,
+    #[serde(alias = "sender_bundle_digest")]
+    pub sender_bundle_digest: String,
+    #[serde(alias = "sender_proof")]
+    pub sender_proof: SenderProof,
+}
+
+impl EnvelopeV2 {
+    /// A read-only compatibility projection used by diagnostics and the CLI
+    /// harness while V1 records are drained.  This must never be serialized
+    /// back onto the wire because doing so would discard V2 relationship
+    /// metadata covered by the device signature.
+    pub fn legacy_shadow(&self) -> Envelope {
+        Envelope {
+            version: self.version.clone(),
+            message_id: self.message_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            sender_user_id: self.sender_user_id.clone(),
+            sender_device_id: self.sender_device_id.clone(),
+            recipient_device_id: self.recipient_device_id.clone(),
+            created_at: self.created_at,
+            message_type: self.message_type.clone(),
+            inline_ciphertext: self.inline_ciphertext.clone(),
+            storage_refs: self.storage_refs.clone(),
+            delivery_class: self.delivery_class.clone(),
+            wake_hint: self.wake_hint.clone(),
+            sender_proof: self.sender_proof.clone(),
+        }
+    }
+}
+
+impl Validate for EnvelopeV2 {
+    fn validate(&self) -> CoreResult<()> {
+        if self.version != ENVELOPE_VERSION_V2 {
+            return Err(CoreError::invalid_input("Envelope V2 version must be 2"));
+        }
+        validate_required("message_id", &self.message_id)?;
+        validate_required("conversation_id", &self.conversation_id)?;
+        validate_required("relationship_id", &self.relationship_id)?;
+        validate_required("proposal_id", &self.proposal_id)?;
+        validate_required("sender_user_id", &self.sender_user_id)?;
+        validate_required("sender_device_id", &self.sender_device_id)?;
+        validate_required("recipient_user_id", &self.recipient_user_id)?;
+        validate_required("recipient_device_id", &self.recipient_device_id)?;
+        validate_required("sender_bundle_digest", &self.sender_bundle_digest)?;
+        if self.attempt == 0 {
+            return Err(CoreError::invalid_input(
+                "Envelope V2 attempt must be positive",
+            ));
+        }
+        if self.sender_proof.proof_type != ENVELOPE_SENDER_PROOF_V2 {
+            return Err(CoreError::invalid_input(
+                "Envelope V2 sender proof type must be ed25519_device_v2",
+            ));
+        }
+        self.sender_proof.validate()?;
+        if self.inline_ciphertext.is_none() && self.storage_refs.is_empty() {
+            return Err(CoreError::invalid_input(
+                "Envelope V2 must include inline_ciphertext or a storage_ref",
+            ));
+        }
+        for reference in &self.storage_refs {
+            reference.validate()?;
+        }
+        let expected = format!(
+            "conv:direct:v2:{}:g{}",
+            self.relationship_id, self.generation
+        );
+        if self.conversation_id != expected {
+            return Err(CoreError::invalid_input(
+                "Envelope V2 conversation_id does not match relationship generation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipAccountState {
+    Pending,
+    Accepted,
+    Rejected,
+    Removed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipSetupState {
+    Claiming,
+    Delivering,
+    WaitingAcceptance,
+    RetryingExpired,
+    PoolExhausted,
+    Ready,
+    Superseded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceJoinState {
+    WaitingWelcome,
+    Joining,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipProposalV2 {
+    pub proposal_id: String,
+    pub initiator_user_id: String,
+    pub initiator_device_id: String,
+    pub relationship_id_candidate: String,
+    pub generation: u64,
+    pub attempt: u32,
+    pub peer_user_id: String,
+    pub sender_bundle_digest: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub signature: String,
+}
+
+impl RelationshipProposalV2 {
+    pub fn canonical_rank(&self) -> (&str, &str, &str) {
+        (
+            self.initiator_user_id.as_str(),
+            self.relationship_id_candidate.as_str(),
+            self.proposal_id.as_str(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipAttempt {
+    pub attempt: u32,
+    pub proposal_id: String,
+    pub ticket_id: String,
+    #[serde(default)]
+    pub ticket_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_status_endpoint: Option<String>,
+    #[serde(default)]
+    pub remote_claim_idempotency_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_claim_idempotency_key: Option<String>,
+    #[serde(default)]
+    pub claim_retry_count: u32,
+    pub claim_ids: Vec<String>,
+    pub welcome_digests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_sets: Vec<KeyPackageClaimSet>,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipTicket {
+    pub ticket_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket_secret: Option<String>,
+    pub relationship_id: String,
+    pub generation: u64,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationshipDecisionProofV2 {
+    pub version: String,
+    pub ticket_id: String,
+    pub relationship_id: String,
+    pub generation: u64,
+    pub proposal_id: String,
+    pub decision: String,
+    pub actor_user_id: String,
+    pub actor_device_id: String,
+    pub peer_user_id: String,
+    pub peer_bundle_digest: String,
+    pub decided_at: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPackageClaim {
+    pub claim_id: String,
+    pub user_id: String,
+    pub device_id: String,
+    pub key_package_id: String,
+    pub key_package_b64: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyPackageClaimSet {
+    pub purpose: String,
+    pub idempotency_key: String,
+    pub claims: Vec<KeyPackageClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<RelationshipTicket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedRelationship {
+    pub relationship_id: String,
+    pub peer_user_id: String,
+    pub peer_root_public_key: String,
+    pub peer_bundle_digest: String,
+    pub peer_bundle_revision: u64,
+    pub generation: u64,
+    pub canonical_proposal: RelationshipProposalV2,
+    pub account_state: RelationshipAccountState,
+    pub setup_state: RelationshipSetupState,
+    pub local_device_join_states: BTreeMap<String, DeviceJoinState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<RelationshipAttempt>,
+    pub version: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome", content = "reason")]
+pub enum RecordApplyOutcome {
+    Applied,
+    Duplicate,
+    Retryable(String),
+    Quarantined(String),
+}
+
 impl Validate for Envelope {
     fn validate(&self) -> CoreResult<()> {
         validate_version(&self.version)?;
@@ -664,7 +1075,7 @@ pub enum InboxRecordState {
     Available,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InboxRecord {
     pub seq: u64,
     pub recipient_device_id: String,
@@ -674,13 +1085,89 @@ pub struct InboxRecord {
     pub expires_at: Option<u64>,
     pub state: InboxRecordState,
     pub envelope: Envelope,
+    #[serde(skip_serializing)]
+    pub envelope_v2: Option<EnvelopeV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_identity_bundle: Option<IdentityBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_proposal: Option<RelationshipProposalV2>,
+}
+
+impl<'de> Deserialize<'de> for InboxRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRecord {
+            seq: u64,
+            #[serde(alias = "recipientDeviceId")]
+            recipient_device_id: String,
+            #[serde(alias = "messageId")]
+            message_id: String,
+            #[serde(alias = "receivedAt")]
+            received_at: u64,
+            #[serde(default, alias = "expiresAt")]
+            expires_at: Option<u64>,
+            state: InboxRecordState,
+            envelope: serde_json::Value,
+            #[serde(default, alias = "senderIdentityBundle")]
+            sender_identity_bundle: Option<IdentityBundle>,
+            #[serde(default, alias = "relationshipProposal")]
+            relationship_proposal: Option<RelationshipProposalV2>,
+        }
+        let wire = WireRecord::deserialize(deserializer)?;
+        let envelope_v2 = wire
+            .envelope
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .filter(|version| *version == ENVELOPE_VERSION_V2)
+            .map(|_| serde_json::from_value::<EnvelopeV2>(wire.envelope.clone()))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let envelope = if let Some(v2) = envelope_v2.as_ref() {
+            Envelope {
+                version: CURRENT_MODEL_VERSION.to_string(),
+                message_id: v2.message_id.clone(),
+                conversation_id: v2.conversation_id.clone(),
+                sender_user_id: v2.sender_user_id.clone(),
+                sender_device_id: v2.sender_device_id.clone(),
+                recipient_device_id: v2.recipient_device_id.clone(),
+                created_at: v2.created_at,
+                message_type: v2.message_type,
+                inline_ciphertext: v2.inline_ciphertext.clone(),
+                storage_refs: v2.storage_refs.clone(),
+                delivery_class: v2.delivery_class,
+                wake_hint: v2.wake_hint.clone(),
+                sender_proof: v2.sender_proof.clone(),
+            }
+        } else {
+            serde_json::from_value(wire.envelope).map_err(serde::de::Error::custom)?
+        };
+        Ok(Self {
+            seq: wire.seq,
+            recipient_device_id: wire.recipient_device_id,
+            message_id: wire.message_id,
+            received_at: wire.received_at,
+            expires_at: wire.expires_at,
+            state: wire.state,
+            envelope,
+            envelope_v2,
+            sender_identity_bundle: wire.sender_identity_bundle,
+            relationship_proposal: wire.relationship_proposal,
+        })
+    }
 }
 
 impl Validate for InboxRecord {
     fn validate(&self) -> CoreResult<()> {
         validate_required("recipient_device_id", &self.recipient_device_id)?;
         validate_required("message_id", &self.message_id)?;
-        self.envelope.validate()?;
+        if let Some(envelope) = &self.envelope_v2 {
+            envelope.validate()?;
+        } else {
+            self.envelope.validate()?;
+        }
         if self.message_id != self.envelope.message_id {
             return Err(CoreError::invalid_input(
                 "inbox record message_id must match envelope message_id",
@@ -1288,6 +1775,14 @@ pub struct WelcomePickupDescriptor {
     pub device_id: String,
     pub endpoint: String,
     pub capability: String,
+    #[serde(default, alias = "claim_id", skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    #[serde(
+        default,
+        alias = "welcome_digest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub welcome_digest: Option<String>,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
     #[serde(default, alias = "start_seq", skip_serializing_if = "Option::is_none")]
@@ -1834,16 +2329,16 @@ impl Validate for DeploymentBundle {
     fn validate(&self) -> CoreResult<()> {
         validate_version(&self.version)?;
         validate_required("runtime_id", &self.runtime_id)?;
-        if self.protocol_version != 5 {
+        if self.protocol_version != 6 {
             return Err(CoreError::invalid_input(format!(
-                "unsupported runtime protocol {}, expected 5",
+                "unsupported runtime protocol {}, expected 6",
                 self.protocol_version
             )));
         }
         validate_required("worker_build_id", &self.worker_build_id)?;
-        if self.registry_schema_version != 2 {
+        if self.registry_schema_version != 3 {
             return Err(CoreError::invalid_input(format!(
-                "unsupported registry schema {}, expected 2",
+                "unsupported registry schema {}, expected 3",
                 self.registry_schema_version
             )));
         }
@@ -2185,6 +2680,9 @@ mod tests {
             expires_at: None,
             state: InboxRecordState::Available,
             envelope: sample_envelope(),
+            envelope_v2: None,
+            sender_identity_bundle: None,
+            relationship_proposal: None,
         };
         record.envelope.recipient_device_id = "device:bob:laptop".into();
         let error = record
@@ -2203,6 +2701,9 @@ mod tests {
             expires_at: Some(10),
             state: InboxRecordState::Available,
             envelope: sample_envelope(),
+            envelope_v2: None,
+            sender_identity_bundle: None,
+            relationship_proposal: None,
         };
         let json = serde_json::to_string(&record).expect("serialize record");
         let decoded: InboxRecord = serde_json::from_str(&json).expect("deserialize record");
@@ -2281,6 +2782,8 @@ mod tests {
                 "https://example.com/v1/groups/group%3A7f3a/welcome-pickup/device%3Abob%3Aphone"
                     .into(),
             capability: "cap-bob-123".into(),
+            claim_id: None,
+            welcome_digest: None,
             expires_at: 1_775_004_800_000,
             start_seq: None,
             roster_version: None,
@@ -2621,6 +3124,8 @@ mod tests {
                     }),
                     signature: "cap-sig".into(),
                 }),
+                key_package_claim_capability: None,
+                mls_device_key_binding: None,
                 keypackage_ref: Some(KeyPackageRef {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     user_id: "user:alice".into(),

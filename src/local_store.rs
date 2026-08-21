@@ -2454,6 +2454,7 @@ mod tests {
         let after = sample_snapshot("device:alice:phone", 2);
         store
             .persist_state(&PersistStateEffect {
+                commit_id: None,
                 mutations: vec![
                     PersistenceMutation::SaveMetadata {
                         message_nonce: after.message_nonce,
@@ -2486,6 +2487,7 @@ mod tests {
         store.save_snapshot(&before).expect("save before");
 
         let result = store.persist_state(&PersistStateEffect {
+            commit_id: None,
             mutations: vec![
                 PersistenceMutation::SaveMetadata {
                     message_nonce: 99,
@@ -2536,6 +2538,7 @@ mod tests {
         };
         store
             .persist_state(&PersistStateEffect {
+                commit_id: None,
                 mutations: vec![],
                 ops: vec![PersistOp::SavePendingGroupSeal {
                     group_id: "group:seal".into(),
@@ -2547,6 +2550,7 @@ mod tests {
 
         store
             .persist_state(&PersistStateEffect {
+                commit_id: None,
                 mutations: vec![],
                 ops: vec![PersistOp::DeletePendingGroupSeal {
                     group_id: "group:seal".into(),
@@ -2617,6 +2621,7 @@ mod tests {
 
         store
             .persist_state(&PersistStateEffect {
+                commit_id: None,
                 mutations: vec![
                     PersistenceMutation::UpdateMessageDelivery {
                         conversation_id: conversation_id.clone(),
@@ -2665,6 +2670,7 @@ mod tests {
 
         store
             .persist_state(&PersistStateEffect {
+                commit_id: None,
                 mutations: vec![PersistenceMutation::DeleteMessage {
                     conversation_id: conversation_id.clone(),
                     message_id: message_id.clone(),
@@ -2827,6 +2833,7 @@ mod tests {
         assert_eq!(mutations.len(), 4, "one append has a fixed mutation count");
         store
             .persist_state(&PersistStateEffect {
+                commit_id: None,
                 mutations,
                 ops: vec![],
                 snapshot: None,

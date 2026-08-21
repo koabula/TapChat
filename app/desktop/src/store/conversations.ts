@@ -4,6 +4,7 @@ import type {
   GroupCursor,
   GroupRole,
   RecoveryDiagnostics,
+  RelationshipViewState,
 } from "../lib/types";
 import type { GroupConversationSummary } from "../lib/tauri";
 
@@ -28,6 +29,7 @@ export interface Conversation {
   group_role: GroupRole | null;
   group_cursor: GroupCursor | null;
   recovery: RecoveryDiagnostics | null;
+  relationship?: RelationshipViewState | null;
   /**
    * Unix ms timestamp when the group was dissolved (owner-only atomic
    * seal, PLAN_GROUP Phase 6 / Wave A). `null` for active groups and
@@ -156,6 +158,7 @@ function mergeConversationState(
       group_role: conversation.group_role ?? prior?.group_role ?? null,
       group_cursor: conversation.group_cursor ?? prior?.group_cursor ?? null,
       recovery: conversation.recovery ?? null,
+      relationship: conversation.relationship ?? prior?.relationship ?? null,
       dissolved_at: conversation.dissolved_at ?? prior?.dissolved_at ?? null,
     };
   });
@@ -208,6 +211,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         group_role: conversation.group_role ?? null,
         group_cursor: conversation.group_cursor ?? null,
         recovery: conversation.recovery ?? null,
+        relationship: conversation.relationship ?? null,
         // `ConversationSummary` does not currently carry `dissolved_at`;
         // the `useCoreUpdate` hook fans out to `getGroupSnapshot` for
         // groups and merges the authoritative dissolved_at via the
@@ -282,6 +286,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           group_role: group.local_role,
           group_cursor: null,
           recovery: null,
+          relationship: null,
           dissolved_at: group.dissolved_at,
         }));
       return { conversations: [...conversations, ...missingGroups] };

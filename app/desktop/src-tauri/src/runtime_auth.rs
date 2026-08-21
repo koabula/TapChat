@@ -286,9 +286,9 @@ pub async fn wait_for_runtime_ready(
                 let ready = parse_runtime_ready_manifest(&body)?;
                 if ready.ready
                     && ready.runtime_id == runtime_id
-                    && ready.protocol_version == 5
+                    && ready.protocol_version == 6
                     && ready.worker_build_id == worker_build_id
-                    && ready.registry_schema_version == 2
+                    && ready.registry_schema_version == 3
                 {
                     return Ok(());
                 }

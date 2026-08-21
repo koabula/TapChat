@@ -19,10 +19,10 @@ use tapchat_core::platform_ports::{
     TransportPort, execute_platform_effect,
 };
 use tapchat_core::transport_contract::{
-    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
-    PrepareBlobUploadRequest, PublishSharedStateRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest,
+    AppendEnvelopeRequest, AppendEnvelopeRequestV2, BlobDownloadRequest, BlobUploadRequest,
+    FetchAllowlistRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -479,8 +479,18 @@ impl CoreDriver {
         }
         if let Some(body) = request.body.as_deref() {
             if request.url.contains("/messages") {
-                let append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
-                self.runtime.recent_appends.push(append_request.envelope);
+                let version = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|value| value.get("version")?.as_str().map(str::to_owned));
+                if version.as_deref() == Some("2") {
+                    let append_request: AppendEnvelopeRequestV2 = serde_json::from_str(body)?;
+                    self.runtime
+                        .recent_appends
+                        .push(append_request.envelope.legacy_shadow());
+                } else {
+                    let append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
+                    self.runtime.recent_appends.push(append_request.envelope);
+                }
             }
             let converted = if looks_like_json(body) {
                 to_camel_case_json_string(body)?

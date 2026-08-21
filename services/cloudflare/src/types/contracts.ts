@@ -58,7 +58,9 @@ export interface InboxRecord {
   receivedAt: number;
   expiresAt?: number;
   state: "available";
-  envelope: Envelope;
+  envelope: Envelope | EnvelopeV2;
+  senderIdentityBundle?: IdentityBundle;
+  relationshipProposal?: RelationshipProposalV2;
 }
 
 export type GroupRole = "owner" | "admin" | "member";
@@ -175,6 +177,29 @@ export interface GroupMembershipProof {
   signature: string;
 }
 
+export interface EnvelopeV2 {
+  version: "2";
+  messageId: string;
+  conversationId: string;
+  relationshipId: string;
+  generation: number;
+  attempt: number;
+  proposalId: string;
+  claimId?: string;
+  senderUserId: string;
+  senderDeviceId: string;
+  recipientUserId: string;
+  recipientDeviceId: string;
+  createdAt: number;
+  messageType: MessageType;
+  inlineCiphertext?: string;
+  storageRefs?: StorageRef[];
+  deliveryClass: "normal";
+  wakeHint?: WakeHint;
+  senderBundleDigest: string;
+  senderProof: SenderProof & { type: "ed25519_device_v2" };
+}
+
 export type GroupStateEventKind =
   | "member_joined"
   | "member_left"
@@ -238,6 +263,8 @@ export interface WelcomePickupDescriptor {
   deviceId: string;
   endpoint: string;
   capability: string;
+  claimId?: string;
+  welcomeDigest?: string;
   expiresAt: number;
   startSeq?: number;
   rosterVersion?: number;
@@ -602,7 +629,9 @@ export interface Ack {
 export interface AppendEnvelopeRequest {
   version: string;
   recipientDeviceId: string;
-  envelope: Envelope;
+  envelope: Envelope | EnvelopeV2;
+  senderIdentityBundle?: IdentityBundle;
+  relationshipProposal?: RelationshipProposalV2;
   senderBundleShareUrl?: string;
   senderBundleHash?: string;
   senderDisplayName?: string;
@@ -626,6 +655,16 @@ export interface FetchMessagesResult {
   toSeq: number;
   historyFloorSeq: number;
   records: InboxRecord[];
+}
+
+export interface AppendEnvelopeRequestV2 {
+  version: "2";
+  recipientDeviceId: string;
+  envelope: EnvelopeV2;
+  senderIdentityBundle: IdentityBundle;
+  recipientCapability: InboxAppendCapability;
+  relationshipTicketId?: string;
+  relationshipProposal: RelationshipProposalV2;
 }
 
 export interface AckRequest {
@@ -750,6 +789,28 @@ export interface KeyPackageRef {
   expiresAt: number;
 }
 
+export interface MlsDeviceKeyBinding {
+  version: string;
+  userId: string;
+  deviceId: string;
+  devicePublicKey: string;
+  mlsSignaturePublicKey: string;
+  ciphersuite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+  createdAt: number;
+  signature: string;
+}
+
+export interface KeyPackageClaimCapability {
+  version: string;
+  service: "key_package_claim";
+  userId: string;
+  targetDeviceId: string;
+  endpoint: string;
+  expiresAt: number;
+  nonce: string;
+  signature: string;
+}
+
 export interface DeviceContactProfile {
   version: string;
   deviceId: string;
@@ -757,6 +818,8 @@ export interface DeviceContactProfile {
   binding: DeviceBinding;
   status: DeviceStatusKind;
   inboxAppendCapability?: InboxAppendCapability;
+  keyPackageClaimCapability?: KeyPackageClaimCapability;
+  mlsDeviceKeyBinding?: MlsDeviceKeyBinding;
   keypackageRef?: KeyPackageRef;
 }
 
@@ -851,6 +914,188 @@ export interface DeviceRuntimeToken {
   expiresAt: number;
   registrationVersion: number;
   keyId?: string;
+}
+
+export type KeyPackagePoolState = "available" | "claimed" | "expired";
+
+export interface PublishedKeyPackageV2 {
+  keyPackageId: string;
+  keyPackageB64: string;
+  lifecycleVersion: number;
+  notBefore: number;
+  createdAt: number;
+  expiresAt: number;
+  mlsSignaturePublicKey: string;
+}
+
+export interface PublishKeyPackageBatchRequest {
+  version: "2";
+  deviceId: string;
+  packages: PublishedKeyPackageV2[];
+  idempotencyKey: string;
+  signature: string;
+}
+
+export interface PublishKeyPackageBatchResult {
+  accepted: true;
+  idempotencyKey: string;
+  published: number;
+}
+
+export interface KeyPackagePoolStatus {
+  deviceId: string;
+  available: number;
+  claimed: number;
+  expired: number;
+  target: 16;
+  refillThreshold: 8;
+}
+
+export interface RelationshipProposalV2 {
+  proposalId: string;
+  initiatorUserId: string;
+  initiatorDeviceId: string;
+  relationshipIdCandidate: string;
+  generation: number;
+  attempt: number;
+  peerUserId: string;
+  senderBundleDigest: string;
+  createdAt: number;
+  expiresAt: number;
+  signature: string;
+}
+
+export type RelationshipAccountState = "pending" | "accepted" | "rejected" | "removed";
+export type RelationshipSetupState =
+  | "claiming"
+  | "delivering"
+  | "waiting_acceptance"
+  | "retrying_expired"
+  | "pool_exhausted"
+  | "ready"
+  | "superseded";
+export type DeviceJoinState = "waiting_welcome" | "joining" | "ready" | "failed";
+
+export interface RelationshipTicket {
+  ticketId: string;
+  ticketSecret?: string;
+  relationshipId: string;
+  generation: number;
+  attempt: number;
+}
+
+export interface PersistedRelationship {
+  relationshipId: string;
+  peerUserId: string;
+  peerRootPublicKey: string;
+  peerBundleDigest: string;
+  peerBundleRevision: number;
+  generation: number;
+  canonicalProposal: RelationshipProposalV2;
+  accountState: RelationshipAccountState;
+  setupState: RelationshipSetupState;
+  localDeviceJoinStates: Record<string, DeviceJoinState>;
+  attempts?: RelationshipAttempt[];
+  version: number;
+  updatedAt: number;
+}
+
+export interface RelationshipAttempt {
+  attempt: number;
+  proposalId: string;
+  ticketId: string;
+  ticketSecret?: string;
+  ticketStatusEndpoint?: string;
+  remoteClaimIdempotencyKey?: string;
+  selfClaimIdempotencyKey?: string;
+  claimRetryCount?: number;
+  claimIds: string[];
+  welcomeDigests: string[];
+  claimSets?: KeyPackageClaimSet[];
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface KeyPackageClaimSet {
+  purpose: string;
+  idempotencyKey: string;
+  claims: ClaimedKeyPackage[];
+  ticket?: RelationshipTicket;
+}
+
+export interface AccountRelationshipRecord {
+  relationship: PersistedRelationship;
+  peerBundle: IdentityBundle;
+}
+
+export interface UpsertOutboundRelationshipRequest {
+  version: "2";
+  relationship: PersistedRelationship;
+  peerBundle: IdentityBundle;
+  ticket: RelationshipTicket;
+  ticketStatusEndpoint: string;
+}
+
+export interface RemoveRelationshipRequest {
+  version: "2";
+  relationshipId: string;
+  generation: number;
+}
+
+export interface KeyPackageClaimTarget {
+  deviceId: string;
+  capability: KeyPackageClaimCapability;
+}
+
+export interface ClaimKeyPackagesRequest {
+  version: "2";
+  purpose: "direct" | "group_invite" | "device_reconcile" | "recovery" | "self_join";
+  idempotencyKey: string;
+  requesterBundle: IdentityBundle;
+  proposal: RelationshipProposalV2;
+  targets: KeyPackageClaimTarget[];
+}
+
+export interface ClaimedKeyPackage {
+  claimId: string;
+  userId: string;
+  deviceId: string;
+  keyPackageId: string;
+  keyPackageB64: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface ClaimKeyPackagesResult {
+  idempotencyKey: string;
+  claims: ClaimedKeyPackage[];
+  ticket?: RelationshipTicket;
+}
+
+export interface RelationshipDecisionRequest {
+  version: "2";
+  decision: "accept" | "reject";
+  proof: RelationshipDecisionProofV2;
+}
+
+export interface RelationshipDecisionProofV2 {
+  version: "2";
+  ticketId: string;
+  relationshipId: string;
+  generation: number;
+  proposalId: string;
+  decision: "accept" | "reject";
+  actorUserId: string;
+  actorDeviceId: string;
+  peerUserId: string;
+  peerBundleDigest: string;
+  decidedAt: number;
+  signature: string;
+}
+
+export interface ConfirmRelationshipPeerDecisionRequest {
+  version: "2";
+  proof: RelationshipDecisionProofV2;
 }
 
 export interface DeviceRuntimeRefreshChallenge {

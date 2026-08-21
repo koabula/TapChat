@@ -6,21 +6,39 @@ import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
+  type AppendEnvelopeRequestV2,
+  type ClaimKeyPackagesRequest,
+  type ClaimKeyPackagesResult,
   CURRENT_MODEL_VERSION,
   type DeploymentBundle,
   type DeviceRuntimeAuth,
   type DeviceRuntimeRefreshChallenge,
   type DeviceBinding,
+  type EnvelopeV2,
   type GroupCapability,
   type GroupManifest,
   type IdentityBundle,
   type InboxAppendCapability,
-  type MessageRequestListResult,
-  type PrepareBlobUploadRequest
+  type KeyPackageClaimCapability,
+  type MlsDeviceKeyBinding,
+  type PrepareBlobUploadRequest,
+  type PublishKeyPackageBatchRequest,
+  type PublishKeyPackageBatchResult,
+  type PublishedKeyPackageV2,
+  type RelationshipDecisionProofV2,
+  type RelationshipProposalV2
 } from "../src/types/contracts";
 import {
+  envelopeV2SigningPayload,
   groupCapabilitySigningPayload,
   groupManifestSigningPayload,
+  identityBundleDigest,
+  identityBundleV2SigningPayload,
+  keyPackageClaimCapabilitySigningPayload,
+  mlsDeviceKeyBindingSigningPayload,
+  publishKeyPackageBatchSigningPayload,
+  relationshipDecisionProofSigningPayload,
+  relationshipProposalSigningPayload,
   verifyIdentityBundle
 } from "../src/auth/capability";
 import { signSharingPayload } from "../src/storage/sharing";
@@ -33,6 +51,8 @@ const RUNTIME_ID = "runtime:integration";
 const SHARING_SECRET = "integration-sharing-secret-0123456789abcdef0123456789abcdef";
 const DEVICE_RUNTIME_SECRET = "integration-runtime-secret-0123456789abcdef0123456789abcdef";
 const DEVICE_RUNTIME_KEY_ID = "integration-runtime-current";
+const OWNER_USER_PUBLIC_KEY = bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(11)));
+const OWNER_USER_ID = `user:${OWNER_USER_PUBLIC_KEY.slice(0, 16)}`;
 const signedFixtures = new Map<string, {
   bundle: IdentityBundle;
   capability: InboxAppendCapability;
@@ -63,9 +83,9 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
     bindings: {
       PUBLIC_BASE_URL: BASE_URL,
       RUNTIME_ID,
-      OWNER_USER_ID: options?.ownerUserId ?? "user:bob",
-      OWNER_USER_PUBLIC_KEY: bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(11))),
-      WORKER_BUILD_ID: "integration-worker-v5",
+      OWNER_USER_ID: options?.ownerUserId ?? OWNER_USER_ID,
+      OWNER_USER_PUBLIC_KEY,
+      WORKER_BUILD_ID: "integration-worker-v6",
       DEPLOYMENT_REGION: "local",
       MAX_INLINE_BYTES: options?.maxInlineBytes ?? "128",
       RETENTION_DAYS: options?.retentionDays ?? "1",
@@ -92,7 +112,7 @@ function authHeaders(token: string): Record<string, string> {
 
 type IssuedDeployment = DeploymentBundle & { runtimeCredential: DeviceRuntimeAuth };
 
-async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = "device:bob:phone"): Promise<IssuedDeployment> {
+async function issueDeviceBundle(mf: Miniflare, userId = OWNER_USER_ID, deviceId = "device:bob:phone"): Promise<IssuedDeployment> {
   const fixture = signedIdentityFixture(userId, deviceId);
   const deploymentResponse = await mf.dispatchFetch(`${BASE_URL}/v1/deployment-bundle`);
   assert.equal(deploymentResponse.status, 200);
@@ -102,9 +122,9 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   assert.deepEqual(await readyResponse.json(), {
     ready: true,
     runtimeId: RUNTIME_ID,
-    protocolVersion: 5,
-    workerBuildId: "integration-worker-v5",
-    registrySchemaVersion: 2
+    protocolVersion: 6,
+    workerBuildId: "integration-worker-v6",
+    registrySchemaVersion: 3
   });
   const challengeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/challenge`, {
     method: "POST",
@@ -146,55 +166,32 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   return { ...deployment, runtimeCredential };
 }
 
-function sampleAppend(deviceId: string, messageId: string, ciphertext: string, senderUserId = "user:alice") {
-  return {
-    version: CURRENT_MODEL_VERSION,
-    recipientDeviceId: deviceId,
-    envelope: {
-      version: CURRENT_MODEL_VERSION,
-      messageId,
-      conversationId: "conv:alice:bob",
-      senderUserId,
-      senderDeviceId: `${senderUserId.replace("user", "device")}:phone`,
-      recipientDeviceId: deviceId,
-      createdAt: Date.now(),
-      messageType: "mls_application",
-      inlineCiphertext: ciphertext,
-      storageRefs: [],
-      deliveryClass: "normal",
-      senderProof: {
-        type: "signature",
-        value: "sig"
-      }
-    }
-  };
-}
-
-function sampleCapability(deviceId: string): InboxAppendCapability {
-  const fixture = signedFixtures.get(deviceId);
-  assert.ok(fixture, `signed identity fixture missing for ${deviceId}`);
-  return fixture.capability;
-}
-
-function signedIdentityFixture(userId: string, deviceId: string): {
+function signedIdentityFixture(userId: string, deviceId: string, seed?: number): {
+  bundle: IdentityBundle;
+  capability: InboxAppendCapability;
+  userSecret: Uint8Array;
+  deviceSecret: Uint8Array;
+};
+function signedIdentityFixture(userId: string, deviceId: string, seed = 11): {
   bundle: IdentityBundle;
   capability: InboxAppendCapability;
   userSecret: Uint8Array;
   deviceSecret: Uint8Array;
 } {
   const now = Date.now();
-  const userSecret = new Uint8Array(32).fill(11);
-  const deviceSecret = new Uint8Array(32).fill(12);
+  const userSecret = new Uint8Array(32).fill(seed);
+  const deviceSecret = new Uint8Array(32).fill(seed + 1);
+  const mlsSecret = new Uint8Array(32).fill(seed + 2);
   const userPublicKey = bytesToHex(ed25519.getPublicKey(userSecret));
   const devicePublicKey = bytesToHex(ed25519.getPublicKey(deviceSecret));
+  const mlsSignaturePublicKey = bytesToHex(ed25519.getPublicKey(mlsSecret));
   const capability: InboxAppendCapability = {
     version: CURRENT_MODEL_VERSION,
     service: "inbox",
     userId,
     targetDeviceId: deviceId,
-    endpoint: `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages`,
+    endpoint: `${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/messages`,
     operations: ["append"],
-    conversationScope: ["conv:alice:bob"],
     expiresAt: now + 60_000,
     signature: ""
   };
@@ -208,9 +205,37 @@ function signedIdentityFixture(userId: string, deviceId: string): {
     signature: ""
   };
   binding.signature = signHex(userSecret, `${CURRENT_MODEL_VERSION}:${userId}:${deviceId}:${devicePublicKey}:${now}`);
+  const mlsDeviceKeyBinding: MlsDeviceKeyBinding = {
+    version: CURRENT_MODEL_VERSION,
+    userId,
+    deviceId,
+    devicePublicKey,
+    mlsSignaturePublicKey,
+    ciphersuite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
+    createdAt: now,
+    signature: ""
+  };
+  mlsDeviceKeyBinding.signature = signHex(
+    deviceSecret,
+    mlsDeviceKeyBindingSigningPayload(mlsDeviceKeyBinding)
+  );
+  const keyPackageClaimCapability: KeyPackageClaimCapability = {
+    version: CURRENT_MODEL_VERSION,
+    service: "key_package_claim",
+    userId,
+    targetDeviceId: deviceId,
+    endpoint: `${BASE_URL}/v2/key-packages/claims`,
+    expiresAt: now + 365 * 24 * 60 * 60 * 1000,
+    nonce: bytesToHex(new Uint8Array(32).fill(seed + 3)),
+    signature: ""
+  };
+  keyPackageClaimCapability.signature = signHex(
+    deviceSecret,
+    keyPackageClaimCapabilitySigningPayload(keyPackageClaimCapability)
+  );
   const bundle: IdentityBundle = {
     version: CURRENT_MODEL_VERSION,
-    publicationVersion: 1,
+    publicationVersion: 2,
     publicationRevision: now,
     userId,
     userPublicKey,
@@ -225,16 +250,8 @@ function signedIdentityFixture(userId: string, deviceId: string): {
       binding,
       status: "active",
       inboxAppendCapability: capability,
-      keypackageRef: {
-        version: CURRENT_MODEL_VERSION,
-        lifecycleVersion: 1,
-        userId,
-        deviceId,
-        ref: `${BASE_URL}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/kp1`,
-        notBefore: now - 60 * 60 * 1000,
-        createdAt: now,
-        expiresAt: now + 84 * 24 * 60 * 60 * 1000
-      }
+      keyPackageClaimCapability,
+      mlsDeviceKeyBinding
     }],
     signature: ""
   };
@@ -257,6 +274,9 @@ function capabilityPayload(capability: InboxAppendCapability): string {
 }
 
 function identityBundlePayload(bundle: IdentityBundle): string {
+  if ((bundle.publicationVersion ?? 0) >= 2) {
+    return identityBundleV2SigningPayload(bundle);
+  }
   const parts = [
     bundle.version,
     bundle.userId,
@@ -292,7 +312,7 @@ function signHex(secret: Uint8Array, payload: string | Uint8Array): string {
 test("identity publication enforces lifecycle CAS and atomically revokes the previous share link", async () => {
   const mf = await createRuntime();
   try {
-    const userId = "user:bob";
+    const userId = OWNER_USER_ID;
     const deviceId = "device:bob:phone";
     const deployment = await issueDeviceBundle(mf, userId, deviceId);
     const fixture = signedFixtures.get(deviceId);
@@ -314,7 +334,16 @@ test("identity publication enforces lifecycle CAS and atomically revokes the pre
 
     const invalid = structuredClone(fixture.bundle);
     invalid.publicationRevision = (invalid.publicationRevision ?? 0) + 1;
-    invalid.devices[0].keypackageRef!.expiresAt += 1;
+    invalid.devices[0].keypackageRef = {
+      version: CURRENT_MODEL_VERSION,
+      lifecycleVersion: 1,
+      userId,
+      deviceId,
+      ref: `${BASE_URL}/v1/shared-state/keypackages/legacy`,
+      notBefore: Date.now() - 60 * 60 * 1000,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 84 * 24 * 60 * 60 * 1000
+    };
     invalid.signature = signHex(fixture.userSecret, identityBundlePayload(invalid));
     const rejected = await mf.dispatchFetch(identityUrl, {
       method: "PUT",
@@ -325,8 +354,8 @@ test("identity publication enforces lifecycle CAS and atomically revokes the pre
       },
       body: JSON.stringify(invalid)
     });
-    assert.equal(rejected.status, 422);
-    assert.equal(((await rejected.json()) as { code: string }).code, "keypackage_lifetime_invalid");
+    assert.equal(rejected.status, 426);
+    assert.equal(((await rejected.json()) as { code: string }).code, "upgrade_required");
 
     const candidate = structuredClone(fixture.bundle);
     candidate.publicationRevision = (candidate.publicationRevision ?? 0) + 1;
@@ -370,14 +399,30 @@ test("identity publication enforces lifecycle CAS and atomically revokes the pre
 test("legacy R2 identity bundle is lazily migrated into the authoritative registry", async () => {
   const mf = await createRuntime();
   try {
-    const userId = "user:bob";
+    const userId = OWNER_USER_ID;
     const fixture = signedIdentityFixture(userId, "device:bob:phone");
+    const legacyBundle = structuredClone(fixture.bundle);
+    legacyBundle.publicationVersion = 1;
+    delete legacyBundle.devices[0].mlsDeviceKeyBinding;
+    delete legacyBundle.devices[0].keyPackageClaimCapability;
+    const createdAt = Date.now();
+    legacyBundle.devices[0].keypackageRef = {
+      version: CURRENT_MODEL_VERSION,
+      lifecycleVersion: 1,
+      userId,
+      deviceId: legacyBundle.devices[0].deviceId,
+      ref: `${BASE_URL}/v1/shared-state/keypackages/legacy`,
+      notBefore: createdAt - 60 * 60 * 1000,
+      createdAt,
+      expiresAt: createdAt + 84 * 24 * 60 * 60 * 1000
+    };
+    legacyBundle.signature = signHex(fixture.userSecret, identityBundlePayload(legacyBundle));
     const bucket = (await mf.getR2Bucket("TAPCHAT_STORAGE")) as unknown as {
       put(key: string, value: string): Promise<void>;
       delete(key: string): Promise<void>;
     };
     const legacyKey = `shared-state/${userId}/identity_bundle.json`;
-    await bucket.put(legacyKey, JSON.stringify(fixture.bundle));
+    await bucket.put(legacyKey, JSON.stringify(legacyBundle));
 
     const identityUrl = `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
     const migrated = await mf.dispatchFetch(identityUrl);
@@ -387,7 +432,7 @@ test("legacy R2 identity bundle is lazily migrated into the authoritative regist
     await bucket.delete(legacyKey);
     const authoritative = await mf.dispatchFetch(identityUrl);
     assert.equal(authoritative.status, 200);
-    assert.deepEqual(await authoritative.json(), fixture.bundle);
+    assert.deepEqual(await authoritative.json(), legacyBundle);
   } finally {
     await mf.dispose();
   }
@@ -399,10 +444,12 @@ test("append authorization uses the registry bundle when the R2 mirror is stale"
     await mf.dispose();
   });
 
-  const userId = "user:bob";
+  const userId = OWNER_USER_ID;
   const deviceId = "device:bob:authority";
   const deployment = await issueDeviceBundle(mf, userId, deviceId);
-  await setAllowlist(mf, deployment.runtimeCredential.token, deviceId, ["user:alice"]);
+  const relationship = await prepareIncomingRelationship(mf, deployment, deviceId, 31);
+  const decision = await decideIncomingRelationship(mf, relationship);
+  assert.equal(decision.status, 200, await decision.clone().text());
   const fixture = signedFixtures.get(deviceId);
   assert.ok(fixture);
   const bucket = (await mf.getR2Bucket("TAPCHAT_STORAGE")) as unknown as {
@@ -413,12 +460,11 @@ test("append authorization uses the registry bundle when the R2 mirror is stale"
     JSON.stringify({ ...fixture.bundle, signature: "00" })
   );
 
-  const delivered = await appendEnvelope(
+  const delivered = await appendEnvelopeV2(
     mf,
-    deviceId,
+    relationship,
     "msg:authoritative-bundle",
-    "cipher-authoritative",
-    "user:alice"
+    "cipher-authoritative"
   );
   assert.equal(delivered.status, 200);
   assert.equal(delivered.deliveredTo, "inbox");
@@ -430,11 +476,12 @@ test("stale append capability requests an identity refresh without queuing a mes
     await mf.dispose();
   });
 
-  const userId = "user:bob";
+  const userId = OWNER_USER_ID;
   const deviceId = "device:bob:rotated-capability";
   const deployment = await issueDeviceBundle(mf, userId, deviceId);
   const fixture = signedFixtures.get(deviceId);
   assert.ok(fixture);
+  const relationship = await prepareIncomingRelationship(mf, deployment, deviceId, 41);
   const identityUrl = `${BASE_URL}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
   const currentResponse = await mf.dispatchFetch(identityUrl);
   const etag = currentResponse.headers.get("etag");
@@ -462,22 +509,22 @@ test("stale append capability requests an identity refresh without queuing a mes
   });
   assert.equal(publish.status, 200);
 
-  const staleAppend = await appendEnvelope(
+  const staleAppend = await appendEnvelopeV2(
     mf,
-    deviceId,
+    relationship,
     "msg:stale-capability",
     "cipher-stale",
-    "user:mallory"
+    "mls_welcome"
   );
   assert.equal(staleAppend.status, 409);
   assert.equal(staleAppend.code, "identity_refresh_required");
 
-  const requestsResponse = await mf.dispatchFetch(
-    `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests`,
+  const headResponse = await mf.dispatchFetch(
+    `${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/head`,
     { headers: authHeaders(deployment.runtimeCredential.token) }
   );
-  const requests = (await requestsResponse.json()) as MessageRequestListResult;
-  assert.equal(requests.requests.length, 0);
+  assert.equal(headResponse.status, 200);
+  assert.equal(((await headResponse.json()) as { headSeq: number }).headSeq, 0);
 });
 
 function bytesToHex(input: Uint8Array): string {
@@ -485,7 +532,7 @@ function bytesToHex(input: Uint8Array): string {
 }
 
 const GROUP_ID = "group:integration";
-const GROUP_OWNER_USER_ID = "user:owner";
+const GROUP_OWNER_USER_ID = OWNER_USER_ID;
 const GROUP_OWNER_DEVICE_ID = "device:owner:desktop";
 const GROUP_OWNER_DEVICE_SECRET = new Uint8Array(32).fill(12);
 
@@ -550,40 +597,221 @@ function groupHeaders(capability: GroupCapability): Record<string, string> {
   };
 }
 
-async function appendEnvelope(
+function opaqueHex(marker: number): string {
+  return bytesToHex(new Uint8Array(32).fill(marker));
+}
+
+interface IncomingRelationshipContext {
+  deployment: IssuedDeployment;
+  owner: ReturnType<typeof signedIdentityFixture>;
+  sender: ReturnType<typeof signedIdentityFixture>;
+  proposal: RelationshipProposalV2;
+  claim: ClaimKeyPackagesResult;
+  recipientDeviceId: string;
+  recipientCapability: InboxAppendCapability;
+}
+
+async function prepareIncomingRelationship(
   mf: Miniflare,
-  deviceId: string,
-  messageId: string,
-  ciphertext: string,
-  senderUserId = "user:alice"
-): Promise<Record<string, unknown>> {
-  const capability = sampleCapability(deviceId);
-  const request = sampleAppend(deviceId, messageId, ciphertext, senderUserId);
-  const response = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages`, {
+  deployment: IssuedDeployment,
+  recipientDeviceId: string,
+  marker: number
+): Promise<IncomingRelationshipContext> {
+  const owner = signedFixtures.get(recipientDeviceId);
+  assert.ok(owner, `owner fixture missing for ${recipientDeviceId}`);
+  const ownerDevice = owner.bundle.devices.find((device) => device.deviceId === recipientDeviceId);
+  assert.ok(ownerDevice?.mlsDeviceKeyBinding);
+  assert.ok(ownerDevice.keyPackageClaimCapability);
+
+  const createdAt = Date.now();
+  const item: PublishedKeyPackageV2 = {
+    keyPackageId: opaqueHex(marker),
+    keyPackageB64: btoa(`key-package-${recipientDeviceId}-${marker}`),
+    lifecycleVersion: 1,
+    notBefore: Math.max(0, createdAt - 60 * 60 * 1000),
+    createdAt,
+    expiresAt: createdAt + 84 * 24 * 60 * 60 * 1000,
+    mlsSignaturePublicKey: ownerDevice.mlsDeviceKeyBinding.mlsSignaturePublicKey
+  };
+  const publish: PublishKeyPackageBatchRequest = {
+    version: "2",
+    deviceId: recipientDeviceId,
+    packages: [item],
+    idempotencyKey: opaqueHex(marker + 1),
+    signature: ""
+  };
+  publish.signature = signHex(owner.deviceSecret, publishKeyPackageBatchSigningPayload(publish));
+  const published = await mf.dispatchFetch(`${BASE_URL}/v2/device-registry/key-packages`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${capability.signature}`,
-      "X-Tapchat-Capability": JSON.stringify(capability),
+      ...authHeaders(deployment.runtimeCredential.token),
       "content-type": "application/json"
     },
-    body: JSON.stringify(request)
+    body: JSON.stringify(publish)
   });
+  assert.equal(published.status, 200, await published.clone().text());
+  const publishResult = await published.json() as PublishKeyPackageBatchResult;
+  assert.deepEqual(publishResult, {
+    accepted: true,
+    idempotencyKey: publish.idempotencyKey,
+    published: publish.packages.length
+  });
+
+  const replayed = await mf.dispatchFetch(`${BASE_URL}/v2/device-registry/key-packages`, {
+    method: "POST",
+    headers: {
+      ...authHeaders(deployment.runtimeCredential.token),
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(publish)
+  });
+  assert.equal(replayed.status, 200, await replayed.clone().text());
+  assert.deepEqual(await replayed.json(), publishResult);
+
+  const senderSeed = marker + 20;
+  const senderUserPublicKey = bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(senderSeed)));
+  const senderUserId = `user:${senderUserPublicKey.slice(0, 16)}`;
+  const sender = signedIdentityFixture(senderUserId, `device:sender:${marker}`, senderSeed);
+  const senderBundleDigest = await identityBundleDigest(sender.bundle);
+  const now = Date.now();
+  const proposal: RelationshipProposalV2 = {
+    proposalId: opaqueHex(marker + 2),
+    initiatorUserId: sender.bundle.userId,
+    initiatorDeviceId: sender.bundle.devices[0].deviceId,
+    relationshipIdCandidate: opaqueHex(marker + 3),
+    generation: 1,
+    attempt: 1,
+    peerUserId: owner.bundle.userId,
+    senderBundleDigest,
+    createdAt: now,
+    expiresAt: now + 7 * 24 * 60 * 60 * 1000,
+    signature: ""
+  };
+  proposal.signature = signHex(sender.deviceSecret, relationshipProposalSigningPayload(proposal));
+  const claimRequest: ClaimKeyPackagesRequest = {
+    version: "2",
+    purpose: "direct",
+    idempotencyKey: opaqueHex(marker + 4),
+    requesterBundle: sender.bundle,
+    proposal,
+    targets: [{
+      deviceId: recipientDeviceId,
+      capability: ownerDevice.keyPackageClaimCapability
+    }]
+  };
+  const claimed = await mf.dispatchFetch(`${BASE_URL}/v2/key-packages/claims`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(claimRequest)
+  });
+  assert.equal(claimed.status, 200, await claimed.clone().text());
+  const claim = await claimed.json() as ClaimKeyPackagesResult;
+  assert.equal(claim.claims.length, 1);
+  assert.ok(claim.ticket);
+  return {
+    deployment,
+    owner,
+    sender,
+    proposal,
+    claim,
+    recipientDeviceId,
+    recipientCapability: owner.capability
+  };
+}
+
+async function decideIncomingRelationship(
+  mf: Miniflare,
+  context: IncomingRelationshipContext,
+  decision: "accept" | "reject" = "accept"
+) {
+  const proof: RelationshipDecisionProofV2 = {
+    version: "2",
+    ticketId: context.claim.ticket!.ticketId,
+    relationshipId: context.proposal.relationshipIdCandidate,
+    generation: context.proposal.generation,
+    proposalId: context.proposal.proposalId,
+    decision,
+    actorUserId: context.owner.bundle.userId,
+    actorDeviceId: context.recipientDeviceId,
+    peerUserId: context.sender.bundle.userId,
+    peerBundleDigest: context.proposal.senderBundleDigest,
+    decidedAt: Date.now(),
+    signature: ""
+  };
+  proof.signature = signHex(
+    context.owner.deviceSecret,
+    relationshipDecisionProofSigningPayload(proof)
+  );
+  return mf.dispatchFetch(
+    `${BASE_URL}/v2/relationships/${encodeURIComponent(context.claim.ticket!.ticketId)}/decision`,
+    {
+      method: "POST",
+      headers: {
+        ...authHeaders(context.deployment.runtimeCredential.token),
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ version: "2", decision, proof })
+    }
+  );
+}
+
+async function appendEnvelopeV2(
+  mf: Miniflare,
+  context: IncomingRelationshipContext,
+  messageId: string,
+  ciphertext: string,
+  messageType: EnvelopeV2["messageType"] = "mls_application"
+): Promise<Record<string, unknown>> {
+  const envelope: EnvelopeV2 = {
+    version: "2",
+    messageId,
+    conversationId: `conv:direct:v2:${context.proposal.relationshipIdCandidate}:g${context.proposal.generation}`,
+    relationshipId: context.proposal.relationshipIdCandidate,
+    generation: context.proposal.generation,
+    attempt: context.proposal.attempt,
+    proposalId: context.proposal.proposalId,
+    claimId: context.claim.claims[0].claimId,
+    senderUserId: context.sender.bundle.userId,
+    senderDeviceId: context.sender.bundle.devices[0].deviceId,
+    recipientUserId: context.owner.bundle.userId,
+    recipientDeviceId: context.recipientDeviceId,
+    createdAt: Date.now(),
+    messageType,
+    inlineCiphertext: ciphertext,
+    storageRefs: [],
+    deliveryClass: "normal",
+    senderBundleDigest: context.proposal.senderBundleDigest,
+    senderProof: { type: "ed25519_device_v2", value: "" }
+  };
+  envelope.senderProof.value = signHex(
+    context.sender.deviceSecret,
+    await envelopeV2SigningPayload(envelope)
+  );
+  const request: AppendEnvelopeRequestV2 = {
+    version: "2",
+    recipientDeviceId: context.recipientDeviceId,
+    envelope,
+    senderIdentityBundle: context.sender.bundle,
+    recipientCapability: context.recipientCapability,
+    relationshipTicketId: context.claim.ticket?.ticketId,
+    relationshipProposal: context.proposal
+  };
+  const response = await mf.dispatchFetch(
+    `${BASE_URL}/v2/inbox/${encodeURIComponent(context.recipientDeviceId)}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${context.recipientCapability.signature}`,
+        "X-Tapchat-Capability": JSON.stringify(context.recipientCapability),
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(request)
+    }
+  );
   return {
     status: response.status,
     ...(await response.json() as object)
   };
-}
-
-async function setAllowlist(mf: Miniflare, token: string, deviceId: string, allowedSenderUserIds: string[]): Promise<void> {
-  const response = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/allowlist`, {
-    method: "PUT",
-    headers: {
-      ...authHeaders(token),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({ allowedSenderUserIds, rejectedSenderUserIds: [] })
-  });
-  assert.equal(response.status, 200);
 }
 
 type RuntimeWebSocket = {
@@ -626,7 +854,7 @@ async function waitForCleanup(mf: Miniflare, token: string, deviceId: string, fr
   const bucket = ((await mf.getR2Bucket("TAPCHAT_STORAGE")) as unknown as { get(key: string): Promise<unknown | null> });
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
+    const headResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/head`, {
       headers: authHeaders(token)
     });
     assert.equal(headResponse.status, 200);
@@ -635,7 +863,7 @@ async function waitForCleanup(mf: Miniflare, token: string, deviceId: string, fr
       throw new Error(`expected headSeq to remain 2, got ${head.headSeq}`);
     }
 
-    const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=${fromSeq}&limit=10`, {
+    const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=${fromSeq}&limit=10`, {
       headers: authHeaders(token)
     });
     assert.equal(fetchResponse.status, 200);
@@ -656,11 +884,13 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   });
 
   const deviceId = "device:bob:phone";
-  const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
+  const bundle = await issueDeviceBundle(mf, OWNER_USER_ID, deviceId);
   const token = bundle.runtimeCredential.token;
-  await setAllowlist(mf, token, deviceId, ["user:alice"]);
+  const relationship = await prepareIncomingRelationship(mf, bundle, deviceId, 51);
+  const relationshipDecision = await decideIncomingRelationship(mf, relationship);
+  assert.equal(relationshipDecision.status, 200, await relationshipDecision.clone().text());
 
-  const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
+  const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
     headers: {
       ...authHeaders(token),
       Upgrade: "websocket",
@@ -673,7 +903,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   await waitForSubscribeReady(socket);
   const firstMessage = waitForWebSocketMessage(socket);
 
-  const append1 = await appendEnvelope(mf, deviceId, "msg:1", "cipher-1");
+  const append1 = await appendEnvelopeV2(mf, relationship, "msg:1", "cipher-1");
   assert.equal(append1.accepted, true);
   assert.equal(append1.seq, 1);
   assert.equal(append1.deliveredTo, "inbox");
@@ -689,17 +919,17 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   socket.close(1000, "test reconnect");
 
   const bigCiphertext = "x".repeat(1_024);
-  const append2 = await appendEnvelope(mf, deviceId, "msg:2", bigCiphertext);
+  const append2 = await appendEnvelopeV2(mf, relationship, "msg:2", bigCiphertext);
   assert.equal(append2.seq, 2);
 
-  const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
+  const headResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/head`, {
     headers: authHeaders(token)
   });
   assert.equal(headResponse.status, 200);
   const head = (await headResponse.json()) as { headSeq: number };
   assert.equal(head.headSeq, 2);
 
-  const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=2&limit=10`, {
+  const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=2&limit=10`, {
     headers: authHeaders(token)
   });
   assert.equal(fetchResponse.status, 200);
@@ -710,7 +940,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   assert.equal(fetched.records[0].messageId, "msg:2");
   assert.equal(fetched.records[0].envelope.inlineCiphertext, bigCiphertext);
 
-  const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/ack`, {
+  const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/ack`, {
     method: "POST",
     headers: {
       ...authHeaders(token),
@@ -740,16 +970,18 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
   });
 
   const deviceId = "device:bob:cleanup";
-  const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
+  const bundle = await issueDeviceBundle(mf, OWNER_USER_ID, deviceId);
   const token = bundle.runtimeCredential.token;
-  await setAllowlist(mf, token, deviceId, ["user:alice"]);
+  const relationship = await prepareIncomingRelationship(mf, bundle, deviceId, 61);
+  const relationshipDecision = await decideIncomingRelationship(mf, relationship);
+  assert.equal(relationshipDecision.status, 200, await relationshipDecision.clone().text());
 
-  const append1 = await appendEnvelope(mf, deviceId, "msg:cleanup-1", "cipher-cleanup-1");
-  const append2 = await appendEnvelope(mf, deviceId, "msg:cleanup-2", "cipher-cleanup-2");
+  const append1 = await appendEnvelopeV2(mf, relationship, "msg:cleanup-1", "cipher-cleanup-1");
+  const append2 = await appendEnvelopeV2(mf, relationship, "msg:cleanup-2", "cipher-cleanup-2");
   assert.equal(append1.seq, 1);
   assert.equal(append2.seq, 2);
 
-  const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/ack`, {
+  const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/ack`, {
     method: "POST",
     headers: {
       ...authHeaders(token),
@@ -769,14 +1001,14 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
   await waitForCleanup(mf, token, deviceId, 1, `inbox-payload/${deviceId}/2.json`);
 
   for (const fromSeq of [1, 2]) {
-    const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
+    const headResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/head`, {
       headers: authHeaders(token)
     });
     assert.equal(headResponse.status, 200);
     const head = (await headResponse.json()) as { headSeq: number };
     assert.equal(head.headSeq, 2);
 
-    const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=${fromSeq}&limit=10`, {
+    const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=${fromSeq}&limit=10`, {
       headers: authHeaders(token)
     });
     assert.equal(fetchResponse.status, 200);
@@ -793,10 +1025,11 @@ test("runtime integration: message request changes push over realtime and inbox 
   });
 
   const deviceId = "device:bob:phone";
-  const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
+  const bundle = await issueDeviceBundle(mf, OWNER_USER_ID, deviceId);
   const token = bundle.runtimeCredential.token;
+  const relationship = await prepareIncomingRelationship(mf, bundle, deviceId, 71);
 
-  const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
+  const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
     headers: {
       ...authHeaders(token),
       Upgrade: "websocket",
@@ -809,7 +1042,13 @@ test("runtime integration: message request changes push over realtime and inbox 
   await waitForSubscribeReady(socket);
   const queuedMessage = waitForWebSocketMessage(socket);
 
-  const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
+  const queued = await appendEnvelopeV2(
+    mf,
+    relationship,
+    "msg:req-1",
+    "cipher-req",
+    "mls_welcome"
+  );
   assert.equal(queued.deliveredTo, "message_request");
   assert.equal(queued.queuedAsRequest, true);
   const queuedEvent = (await queuedMessage) as {
@@ -821,29 +1060,27 @@ test("runtime integration: message request changes push over realtime and inbox 
   };
   assert.equal(queuedEvent.event, "message_request_changed");
   assert.equal(queuedEvent.deviceId, deviceId);
-  assert.equal(queuedEvent.senderUserId, "user:mallory");
+  assert.equal(queuedEvent.senderUserId, relationship.sender.bundle.userId);
   assert.equal(queuedEvent.change, "queued");
 
-  const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
+  const headResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/head`, {
     headers: authHeaders(token)
   });
   const head = (await headResponse.json()) as { headSeq: number };
   assert.equal(head.headSeq, 0);
 
-  const requestsResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests`, {
+  const requestsResponse = await mf.dispatchFetch(`${BASE_URL}/v2/relationships/requests`, {
     headers: authHeaders(token)
   });
   assert.equal(requestsResponse.status, 200);
-  const requests = (await requestsResponse.json()) as MessageRequestListResult;
+  const requests = (await requestsResponse.json()) as {
+    requests: Array<{ ticketId: string; peerBundle: IdentityBundle }>;
+  };
   assert.equal(requests.requests.length, 1);
+  assert.equal(requests.requests[0].ticketId, relationship.claim.ticket!.ticketId);
+  assert.equal(requests.requests[0].peerBundle.userId, relationship.sender.bundle.userId);
 
-  const acceptResponse = await mf.dispatchFetch(
-    `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`,
-    {
-      method: "POST",
-      headers: authHeaders(token)
-    }
-  );
+  const acceptResponse = await decideIncomingRelationship(mf, relationship);
   assert.equal(acceptResponse.status, 200);
   const acceptedEvent = await waitForMatchingWebSocketMessage(socket, (value): value is {
     event: string;
@@ -858,27 +1095,26 @@ test("runtime integration: message request changes push over realtime and inbox 
     return (
       candidate.event === "message_request_changed" &&
       candidate.change === "accepted" &&
-      candidate.senderUserId === "user:mallory" &&
-      candidate.requestId === requests.requests[0].requestId
+      candidate.senderUserId === relationship.sender.bundle.userId &&
+      candidate.requestId === queued.requestId
     );
   });
   assert.equal(acceptedEvent.event, "message_request_changed");
-  assert.equal(acceptedEvent.senderUserId, "user:mallory");
-  assert.equal(acceptedEvent.requestId, requests.requests[0].requestId);
+  assert.equal(acceptedEvent.senderUserId, relationship.sender.bundle.userId);
+  assert.equal(acceptedEvent.requestId, queued.requestId);
   assert.equal(acceptedEvent.change, "accepted");
 
-  const deliveredAfterAccept = await appendEnvelope(
+  const deliveredAfterAccept = await appendEnvelopeV2(
     mf,
-    deviceId,
+    relationship,
     "msg:req-2",
-    "cipher-after-accept",
-    "user:mallory"
+    "cipher-after-accept"
   );
   assert.equal(deliveredAfterAccept.status, 200);
   assert.equal(deliveredAfterAccept.deliveredTo, "inbox");
   assert.notEqual(deliveredAfterAccept.queuedAsRequest, true);
 
-  const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
+  const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v2/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
     headers: authHeaders(token)
   });
   const fetched = (await fetchResponse.json()) as { records: Array<{ messageId: string }> };
@@ -893,7 +1129,7 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
     await mf.dispose();
   });
 
-  const bundle = await issueDeviceBundle(mf, "user:bob", "device:bob:laptop");
+  const bundle = await issueDeviceBundle(mf, OWNER_USER_ID, "device:bob:laptop");
   const token = bundle.runtimeCredential.token;
   const request: PrepareBlobUploadRequest = {
     taskId: "task-1",

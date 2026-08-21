@@ -19,12 +19,28 @@ const TAPCHAT_LIFECYCLE_RULE_IDS: &[&str] = &[
     "tapchat-group-transition-spill-retention-v1",
 ];
 
-fn reject_unauthorized(status: StatusCode) -> Result<(), String> {
+fn reject_auth_failure(status: StatusCode) -> Result<(), String> {
     if status == StatusCode::UNAUTHORIZED {
         Err("cloudflare_api_unauthorized".into())
+    } else if status == StatusCode::FORBIDDEN {
+        Err("cloudflare_permission_denied:http_status=403".into())
     } else {
         Ok(())
     }
+}
+
+fn cloudflare_api_failure(app_code: &str, status: StatusCode, body: &str) -> String {
+    let cloudflare_code = serde_json::from_str::<CloudflareError>(body)
+        .ok()
+        .and_then(|error| error.errors.first().and_then(|detail| detail.code));
+    match cloudflare_code {
+        Some(code) => format!("{app_code}:http_status={} cf_code={code}", status.as_u16()),
+        None => format!("{app_code}:http_status={}", status.as_u16()),
+    }
+}
+
+fn request_failure(app_code: &str) -> String {
+    format!("{app_code}:network_request_failed")
 }
 
 /// OAuth token result used by the native Rust login flow.
@@ -137,12 +153,9 @@ struct CloudflareError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 struct CloudflareErrorDetail {
     #[serde(default)]
     code: Option<i64>,
-    #[serde(default)]
-    message: Option<String>,
 }
 
 fn build_worker_metadata(config: &WorkerDeployConfig) -> Value {
@@ -282,55 +295,93 @@ fn build_worker_metadata(config: &WorkerDeployConfig) -> Value {
     })
 }
 
-/// Create R2 bucket via REST API
+/// Ensure the R2 bucket exists via the documented Cloudflare REST API.
 pub async fn create_r2_bucket(
     client: &Client,
     api_token: &str,
     account_id: &str,
     bucket_name: &str,
 ) -> Result<(), String> {
-    let url = format!(
+    create_r2_bucket_at(client, api_token, CF_API_BASE, account_id, bucket_name).await
+}
+
+async fn create_r2_bucket_at(
+    client: &Client,
+    api_token: &str,
+    api_base: &str,
+    account_id: &str,
+    bucket_name: &str,
+) -> Result<(), String> {
+    let bucket_url = format!(
         "{}/accounts/{}/r2/buckets/{}",
-        CF_API_BASE, account_id, bucket_name
+        api_base, account_id, bucket_name
     );
+    let lookup = client
+        .get(&bucket_url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|_| request_failure("cloudflare_storage_setup_failed"))?;
+    let lookup_status = lookup.status();
+    reject_auth_failure(lookup_status)?;
+    if lookup_status.is_success() {
+        return Ok(());
+    }
+    if lookup_status != StatusCode::NOT_FOUND {
+        let body = lookup.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_storage_setup_failed",
+            lookup_status,
+            &body,
+        ));
+    }
+
+    let url = format!("{}/accounts/{}/r2/buckets", api_base, account_id);
 
     let response = client
-        .put(&url)
+        .post(&url)
         .header("Authorization", format!("Bearer {}", api_token))
         .json(&serde_json::json!({
             "name": bucket_name,
         }))
         .send()
         .await
-        .map_err(|e| format!("R2 bucket create request failed: {}", e))?;
+        .map_err(|_| request_failure("cloudflare_storage_setup_failed"))?;
 
     let status = response.status();
-    reject_unauthorized(status)?;
+    reject_auth_failure(status)?;
 
-    // 200 OK = bucket created
-    // 409 Conflict = bucket already exists (acceptable)
-    if status.is_success() || status.as_u16() == 409 {
+    if status.is_success() {
         return Ok(());
     }
 
-    // Parse error
-    let error_body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read error response: {}", e))?;
+    // A concurrent retry may have created the bucket after our lookup. Only
+    // accept a conflict after verifying that the exact bucket now exists.
+    if status == StatusCode::CONFLICT {
+        let verify = client
+            .get(&bucket_url)
+            .header("Authorization", format!("Bearer {}", api_token))
+            .send()
+            .await
+            .map_err(|_| request_failure("cloudflare_storage_setup_failed"))?;
+        let verify_status = verify.status();
+        reject_auth_failure(verify_status)?;
+        if verify_status.is_success() {
+            return Ok(());
+        }
+        let body = verify.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_storage_setup_failed",
+            verify_status,
+            &body,
+        ));
+    }
 
-    let cf_error: CloudflareError = serde_json::from_str(&error_body)
-        .map_err(|e| format!("Failed to parse error response: {}", e))?;
-
-    let error_msg = cf_error
-        .errors
-        .first()
-        .and_then(|e| e.message.clone())
-        .unwrap_or_else(|| format!("HTTP {}", status));
-
-    Err(format!(
-        "Failed to create bucket {}: {}",
-        bucket_name, error_msg
+    let body = response.text().await.unwrap_or_default();
+    Err(cloudflare_api_failure(
+        "cloudflare_storage_setup_failed",
+        status,
+        &body,
     ))
 }
 
@@ -382,18 +433,21 @@ pub async fn configure_r2_lifecycle(
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
-        .map_err(|error| format!("R2 lifecycle read request failed: {error}"))?;
-    reject_unauthorized(response.status())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Failed to read lifecycle rules for bucket {bucket_name}: HTTP {}",
-            response.status()
+        .map_err(|_| request_failure("cloudflare_storage_setup_failed"))?;
+    let status = response.status();
+    reject_auth_failure(status)?;
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_storage_setup_failed",
+            status,
+            &body,
         ));
     }
     let body: Value = response
         .json()
         .await
-        .map_err(|error| format!("Failed to decode R2 lifecycle rules: {error}"))?;
+        .map_err(|_| "cloudflare_storage_setup_failed:invalid_response".to_string())?;
     let existing = body
         .get("result")
         .and_then(|result| result.get("rules"))
@@ -408,12 +462,15 @@ pub async fn configure_r2_lifecycle(
         .json(&serde_json::json!({ "rules": rules }))
         .send()
         .await
-        .map_err(|error| format!("R2 lifecycle update request failed: {error}"))?;
-    reject_unauthorized(response.status())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Failed to configure lifecycle rules for bucket {bucket_name}: HTTP {}",
-            response.status()
+        .map_err(|_| request_failure("cloudflare_storage_setup_failed"))?;
+    let status = response.status();
+    reject_auth_failure(status)?;
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_storage_setup_failed",
+            status,
+            &body,
         ));
     }
     Ok(())
@@ -439,14 +496,14 @@ pub async fn upload_worker_script(
             "metadata",
             reqwest::multipart::Part::text(metadata.to_string())
                 .mime_str("application/json")
-                .map_err(|e| format!("MIME type error: {}", e))?,
+                .map_err(|_| "cloudflare_worker_deploy_failed:invalid_metadata".to_string())?,
         )
         .part(
             "worker.js",
             reqwest::multipart::Part::text(worker_script.to_string())
                 .file_name("worker.js")
                 .mime_str("application/javascript+module")
-                .map_err(|e| format!("MIME type error: {}", e))?,
+                .map_err(|_| "cloudflare_worker_deploy_failed:invalid_script".to_string())?,
         );
 
     let url = format!(
@@ -460,27 +517,18 @@ pub async fn upload_worker_script(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("Worker upload request failed: {}", e))?;
+        .map_err(|_| request_failure("cloudflare_worker_deploy_failed"))?;
 
     let status = response.status();
-    reject_unauthorized(status)?;
+    reject_auth_failure(status)?;
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read error response: {}", e))?;
-
-        let cf_error: CloudflareError = serde_json::from_str(&error_body)
-            .map_err(|e| format!("Failed to parse error response: {}", e))?;
-
-        let error_msg = cf_error
-            .errors
-            .first()
-            .and_then(|e| e.message.clone())
-            .unwrap_or_else(|| format!("HTTP {}", status));
-
-        return Err(format!("Failed to upload worker: {error_msg}"));
+        let body = response.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_worker_deploy_failed",
+            status,
+            &body,
+        ));
     }
 
     Ok(())
@@ -502,14 +550,17 @@ pub async fn delete_worker_secret(
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
-        .map_err(|error| format!("Secret delete request failed: {error}"))?;
-    reject_unauthorized(response.status())?;
+        .map_err(|_| request_failure("cloudflare_worker_deploy_failed"))?;
+    reject_auth_failure(response.status())?;
     if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
         return Ok(());
     }
-    Err(format!(
-        "Failed to delete secret {secret_name}: HTTP {}",
-        response.status()
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(cloudflare_api_failure(
+        "cloudflare_worker_deploy_failed",
+        status,
+        &body,
     ))
 }
 
@@ -540,20 +591,17 @@ pub async fn enable_workers_dev_routing(
         }))
         .send()
         .await
-        .map_err(|e| format!("Workers.dev routing request failed: {}", e))?;
+        .map_err(|_| request_failure("cloudflare_worker_deploy_failed"))?;
 
     let status = response.status();
-    reject_unauthorized(status)?;
-    let response_body = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+    reject_auth_failure(status)?;
+    let response_body = response.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        eprintln!("Error enabling workers.dev routing: HTTP {}", status);
-        return Err(format!(
-            "Failed to enable workers.dev routing: HTTP {}",
-            status
+        return Err(cloudflare_api_failure(
+            "cloudflare_worker_deploy_failed",
+            status,
+            &response_body,
         ));
     }
 
@@ -579,26 +627,31 @@ pub async fn get_worker_subdomain(
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
-        .map_err(|e| format!("Worker subdomain request failed: {}", e))?;
+        .map_err(|_| request_failure("cloudflare_worker_deploy_failed"))?;
 
     let status = response.status();
-    reject_unauthorized(status)?;
+    reject_auth_failure(status)?;
 
     if !status.is_success() {
-        return Err(format!("Failed to get worker subdomain: HTTP {}", status));
+        let body = response.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_worker_deploy_failed",
+            status,
+            &body,
+        ));
     }
 
     let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|_| "cloudflare_worker_deploy_failed:invalid_response".to_string())?;
 
     // Extract subdomain from response
     body.get("result")
         .and_then(|r| r.get("subdomain"))
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "No subdomain found in response".to_string())
+        .ok_or_else(|| "cloudflare_worker_deploy_failed:missing_subdomain".to_string())
 }
 
 /// Ensure account has a workers.dev subdomain set (required for workers.dev routing)
@@ -616,8 +669,13 @@ pub async fn ensure_account_workers_dev_subdomain(
             eprintln!("Account workers.dev subdomain exists: {}", subdomain);
             return Ok(subdomain);
         }
-        Err(err) => {
-            eprintln!("Could not get existing subdomain: {}", err);
+        Err(error)
+            if error.starts_with("cloudflare_api_unauthorized")
+                || error.starts_with("cloudflare_permission_denied") =>
+        {
+            return Err(error);
+        }
+        Err(_) => {
             // Account might not have a subdomain set yet
             // Try to create one using the account ID as a fallback identifier
             // (Cloudflare requires a subdomain name for PUT)
@@ -645,23 +703,24 @@ pub async fn ensure_account_workers_dev_subdomain(
         }))
         .send()
         .await
-        .map_err(|e| format!("Create subdomain request failed: {}", e))?;
+        .map_err(|_| request_failure("cloudflare_worker_deploy_failed"))?;
 
     let status = response.status();
-    reject_unauthorized(status)?;
+    reject_auth_failure(status)?;
 
     if !status.is_success() {
-        eprintln!("Failed to set workers.dev subdomain: HTTP {}", status);
-        return Err(format!(
-            "Failed to set workers.dev subdomain: HTTP {}",
-            status
+        let body = response.text().await.unwrap_or_default();
+        return Err(cloudflare_api_failure(
+            "cloudflare_worker_deploy_failed",
+            status,
+            &body,
         ));
     }
 
     let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+        .map_err(|_| "cloudflare_worker_deploy_failed:invalid_response".to_string())?;
 
     eprintln!("Workers.dev subdomain configured");
 
@@ -670,7 +729,7 @@ pub async fn ensure_account_workers_dev_subdomain(
         .and_then(|r| r.get("subdomain"))
         .and_then(|s| s.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "No subdomain in response".to_string())
+        .ok_or_else(|| "cloudflare_worker_deploy_failed:missing_subdomain".to_string())
 }
 
 /// Full deployment flow via REST API
@@ -683,7 +742,7 @@ pub async fn deploy_via_rest_api(
 ) -> Result<DeployResult, String> {
     let client = Client::builder()
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|_| "cloudflare_worker_deploy_failed:http_client_unavailable".to_string())?;
 
     // Phase 1: Create R2 buckets
     progress_callback(DeployProgress {
@@ -736,32 +795,24 @@ pub async fn deploy_via_rest_api(
         progress_percent: 80,
     });
 
-    // Get workers.dev subdomain or custom URL
-    let worker_url = if let Some(public_url) = &config.public_base_url {
-        if !public_url.is_empty() {
-            public_url.clone()
-        } else {
-            // Get the account's workers.dev subdomain and construct URL
-            match get_worker_subdomain(&client, api_token, account_id).await {
-                Ok(subdomain) => {
-                    format!("https://{}.{}.workers.dev", config.worker_name, subdomain)
-                }
-                Err(_) => format!("https://{}.workers.dev", config.worker_name),
-            }
-        }
+    // Get the workers.dev subdomain or use an explicitly configured URL.
+    let worker_url = if let Some(public_url) = config
+        .public_base_url
+        .as_ref()
+        .filter(|url| !url.is_empty())
+    {
+        public_url.clone()
     } else {
-        // Get the account's workers.dev subdomain and construct URL
-        match get_worker_subdomain(&client, api_token, account_id).await {
-            Ok(subdomain) => format!("https://{}.{}.workers.dev", config.worker_name, subdomain),
-            Err(_) => format!("https://{}.workers.dev", config.worker_name),
-        }
+        let subdomain = get_worker_subdomain(&client, api_token, account_id).await?;
+        format!("https://{}.{}.workers.dev", config.worker_name, subdomain)
     };
 
-    // Phase 5: Complete
+    // The Worker upload is complete, but device enrollment and local
+    // writeback are finalized by the caller.
     progress_callback(DeployProgress {
-        phase: DeployPhase::Complete,
-        message: "Deployment complete!".into(),
-        progress_percent: 100,
+        phase: DeployPhase::VerifyingDeployment,
+        message: "Worker uploaded. Finishing device setup...".into(),
+        progress_percent: 80,
     });
 
     Ok(DeployResult {
@@ -830,9 +881,83 @@ pub async fn get_accounts(api_token: &str) -> Result<Vec<AccountInfo>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_worker_metadata, merge_tapchat_lifecycle_rules, WorkerDeployConfig,
-        WORKER_COMPATIBILITY_DATE,
+        build_worker_metadata, create_r2_bucket_at, merge_tapchat_lifecycle_rules,
+        WorkerDeployConfig, WORKER_COMPATIBILITY_DATE,
     };
+    use reqwest::Client;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct ExpectedRequest {
+        request_line: &'static str,
+        body_contains: Option<&'static str>,
+        status: u16,
+        response_body: &'static str,
+    }
+
+    async fn test_server(
+        expectations: Vec<ExpectedRequest>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("local address");
+        let handle = tokio::spawn(async move {
+            for expected in expectations {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) =
+                        request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    if request.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.starts_with(expected.request_line), "{request}");
+                if let Some(fragment) = expected.body_contains {
+                    assert!(request.contains(fragment), "{request}");
+                }
+                let reason = match expected.status {
+                    200 => "OK",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    409 => "Conflict",
+                    500 => "Internal Server Error",
+                    _ => "Test",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    expected.status,
+                    reason,
+                    expected.response_body.len(),
+                    expected.response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
 
     fn deploy_config() -> WorkerDeployConfig {
         WorkerDeployConfig {
@@ -950,5 +1075,95 @@ mod tests {
             blob_rule["deleteObjectsTransition"]["condition"]["maxAge"],
             30 * 24 * 60 * 60
         );
+    }
+
+    #[tokio::test]
+    async fn r2_bucket_creation_uses_get_then_documented_post() {
+        let (api_base, server) = test_server(vec![
+            ExpectedRequest {
+                request_line: "GET /accounts/account/r2/buckets/tapchat-storage HTTP/1.1",
+                body_contains: None,
+                status: 404,
+                response_body: r#"{"success":false,"errors":[]}"#,
+            },
+            ExpectedRequest {
+                request_line: "POST /accounts/account/r2/buckets HTTP/1.1",
+                body_contains: Some(r#""name":"tapchat-storage""#),
+                status: 200,
+                response_body: r#"{"success":true,"result":{"name":"tapchat-storage"}}"#,
+            },
+        ])
+        .await;
+
+        create_r2_bucket_at(
+            &Client::new(),
+            "token",
+            &api_base,
+            "account",
+            "tapchat-storage",
+        )
+        .await
+        .expect("create bucket");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn r2_bucket_conflict_is_accepted_only_after_exact_lookup() {
+        let (api_base, server) = test_server(vec![
+            ExpectedRequest {
+                request_line: "GET /accounts/account/r2/buckets/tapchat-storage HTTP/1.1",
+                body_contains: None,
+                status: 404,
+                response_body: r#"{"success":false,"errors":[]}"#,
+            },
+            ExpectedRequest {
+                request_line: "POST /accounts/account/r2/buckets HTTP/1.1",
+                body_contains: Some(r#""name":"tapchat-storage""#),
+                status: 409,
+                response_body: r#"{"success":false,"errors":[]}"#,
+            },
+            ExpectedRequest {
+                request_line: "GET /accounts/account/r2/buckets/tapchat-storage HTTP/1.1",
+                body_contains: None,
+                status: 200,
+                response_body: r#"{"success":true,"result":{"name":"tapchat-storage"}}"#,
+            },
+        ])
+        .await;
+
+        create_r2_bucket_at(
+            &Client::new(),
+            "token",
+            &api_base,
+            "account",
+            "tapchat-storage",
+        )
+        .await
+        .expect("verify concurrent create");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn r2_permission_failure_is_structured_and_redacted() {
+        let (api_base, server) = test_server(vec![ExpectedRequest {
+            request_line: "GET /accounts/account/r2/buckets/tapchat-storage HTTP/1.1",
+            body_contains: None,
+            status: 403,
+            response_body: r#"{"success":false,"errors":[{"code":10000,"message":"token=secret"}]}"#,
+        }])
+        .await;
+
+        let error = create_r2_bucket_at(
+            &Client::new(),
+            "token",
+            &api_base,
+            "account",
+            "tapchat-storage",
+        )
+        .await
+        .expect_err("permission must fail");
+        assert_eq!(error, "cloudflare_permission_denied:http_status=403");
+        assert!(!error.contains("secret"));
+        server.await.expect("server");
     }
 }

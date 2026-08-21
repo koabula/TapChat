@@ -312,63 +312,76 @@ impl TransportPort for DesktopPlatformPorts {
         if request.method == HttpMethod::Post && request.url.contains("/messages") {
             log::info!("[TransportPort] Intercepting /messages POST request");
             if let Some(body) = &request.body {
-                // Try to parse as AppendEnvelopeRequest
-                if let Ok(mut append_request) = serde_json::from_str::<AppendEnvelopeRequest>(body)
-                {
-                    log::info!("[TransportPort] Parsed AppendEnvelopeRequest successfully");
-                    log::info!(
-                        "[TransportPort] sender_bundle_share_url={}",
-                        summarize_share_url(append_request.sender_bundle_share_url.as_deref())
-                    );
-
-                    // Check if sender_bundle_share_url needs to be replaced
-                    // It should be a contact-share URL, not identity_bundle_ref
-                    let needs_contact_share_url = append_request.sender_bundle_share_url.is_none()
-                        || append_request
-                            .sender_bundle_share_url
-                            .as_ref()
-                            .map(|url| !url.contains("/v1/contact-share/"))
-                            .unwrap_or(true);
-
-                    log::info!(
-                        "[TransportPort] needs_contact_share_url: {}",
-                        needs_contact_share_url
-                    );
-
-                    if needs_contact_share_url {
-                        // Generate correct contact share URL from runtime metadata
-                        let contact_share_url = match self.build_contact_share_url().await {
-                            Ok(url) => url,
-                            Err(_) => {
-                                return Ok(vec![CoreEvent::HttpRequestFailed {
-                                    request_id: request.request_id.clone(),
-                                    failure: tapchat_core::AppErrorV1::from_registered_code(
-                                        "contact_share_offline",
-                                    ),
-                                }]);
-                            }
-                        };
+                let is_envelope_v2 = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|value| value.get("version")?.as_str().map(str::to_owned))
+                    .as_deref()
+                    == Some("2");
+                if is_envelope_v2 {
+                    // V2 carries the exact signed IdentityBundle inline. Any
+                    // platform injection would invalidate its protocol binding.
+                    log::info!("[TransportPort] Envelope V2 bypasses legacy share-link injection");
+                } else {
+                    // Try to parse as AppendEnvelopeRequest
+                    if let Ok(mut append_request) =
+                        serde_json::from_str::<AppendEnvelopeRequest>(body)
+                    {
+                        log::info!("[TransportPort] Parsed AppendEnvelopeRequest successfully");
                         log::info!(
-                            "[TransportPort] generated_contact_share_url={}",
-                            summarize_share_url(contact_share_url.as_deref())
+                            "[TransportPort] sender_bundle_share_url={}",
+                            summarize_share_url(append_request.sender_bundle_share_url.as_deref())
                         );
 
-                        if let Some(url) = contact_share_url {
+                        // Check if sender_bundle_share_url needs to be replaced
+                        // It should be a contact-share URL, not identity_bundle_ref
+                        let needs_contact_share_url =
+                            append_request.sender_bundle_share_url.is_none()
+                                || append_request
+                                    .sender_bundle_share_url
+                                    .as_ref()
+                                    .map(|url| !url.contains("/v1/contact-share/"))
+                                    .unwrap_or(true);
+
+                        log::info!(
+                            "[TransportPort] needs_contact_share_url: {}",
+                            needs_contact_share_url
+                        );
+
+                        if needs_contact_share_url {
+                            // Generate correct contact share URL from runtime metadata
+                            let contact_share_url = match self.build_contact_share_url().await {
+                                Ok(url) => url,
+                                Err(_) => {
+                                    return Ok(vec![CoreEvent::HttpRequestFailed {
+                                        request_id: request.request_id.clone(),
+                                        failure: tapchat_core::AppErrorV1::from_registered_code(
+                                            "contact_share_offline",
+                                        ),
+                                    }]);
+                                }
+                            };
                             log::info!(
+                                "[TransportPort] generated_contact_share_url={}",
+                                summarize_share_url(contact_share_url.as_deref())
+                            );
+
+                            if let Some(url) = contact_share_url {
+                                log::info!(
                                 "[TransportPort] Injecting contact-share URL for outbound request"
                             );
-                            append_request.sender_bundle_share_url = Some(url);
-                            // Rebuild the request with modified body
-                            let modified_body = serde_json::to_string(&append_request)?;
-                            request.body = Some(modified_body);
-                        } else {
-                            log::warn!(
+                                append_request.sender_bundle_share_url = Some(url);
+                                // Rebuild the request with modified body
+                                let modified_body = serde_json::to_string(&append_request)?;
+                                request.body = Some(modified_body);
+                            } else {
+                                log::warn!(
                                 "[TransportPort] Failed to generate contact_share_url, sending original request"
                             );
+                            }
                         }
+                    } else {
+                        log::warn!("[TransportPort] Failed to parse body as AppendEnvelopeRequest");
                     }
-                } else {
-                    log::warn!("[TransportPort] Failed to parse body as AppendEnvelopeRequest");
                 }
             }
         }

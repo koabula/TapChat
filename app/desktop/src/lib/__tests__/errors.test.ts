@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeAppError, presentError } from "../errors";
+import { AppInvokeError, normalizeAppError, presentError } from "../errors";
 
 describe("structured application errors", () => {
   it("presents every security-sensitive key package error with fixed English copy", () => {
@@ -28,6 +28,51 @@ describe("structured application errors", () => {
     expect(error.action).toBe("upgrade_runtime");
     expect(error.correlationId).toBe("safe-id");
     expect(presentError(error).message).toBe("Update TapChat and your Cloudflare runtime to continue.");
+  });
+
+  it("presents Cloudflare deployment failures without exposing provider details", () => {
+    const permission = presentError({
+      version: 1,
+      code: "cloudflare_permission_denied",
+      domain: "runtime",
+      retryable: false,
+    });
+    expect(permission.message).toBe(
+      "Reconnect Cloudflare and allow TapChat to manage Workers and R2 storage.",
+    );
+
+    const storage = presentError({
+      version: 1,
+      code: "cloudflare_storage_setup_failed",
+      domain: "runtime",
+      retryable: true,
+    });
+    expect(storage.message).toBe(
+      "TapChat could not prepare its Cloudflare R2 storage. Try again.",
+    );
+    expect(JSON.stringify(storage)).not.toContain("token");
+
+    const incomplete = presentError({
+      version: 1,
+      code: "cloudflare_setup_incomplete",
+      domain: "runtime",
+      retryable: true,
+    });
+    expect(incomplete.message).toBe(
+      "The Worker may already be deployed, but this device did not finish setup. Retry to resume.",
+    );
+  });
+
+  it("preserves structured errors after the invoke boundary wraps them", () => {
+    const wrapped = new AppInvokeError({
+      version: 1,
+      code: "cloudflare_storage_setup_failed",
+      domain: "runtime",
+      retryable: true,
+    });
+    expect(presentError(wrapped).message).toBe(
+      "TapChat could not prepare its Cloudflare R2 storage. Try again.",
+    );
   });
 
   it("normalizes domain and recovery action from the registry", () => {

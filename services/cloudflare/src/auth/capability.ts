@@ -1,6 +1,7 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import type {
   AppendEnvelopeRequest,
+  EnvelopeV2,
   AppendGroupEnvelopeRequest,
   DeviceBinding,
   DeviceContactProfile,
@@ -13,8 +14,13 @@ import type {
   GroupMessageType,
   IdentityBundle,
   InboxAppendCapability,
+  KeyPackageClaimCapability,
   KeyPackageWriteToken,
   SharedStateWriteToken,
+  MlsDeviceKeyBinding,
+  PublishKeyPackageBatchRequest,
+  RelationshipDecisionProofV2,
+  RelationshipProposalV2,
   WelcomePickupDescriptor
 } from "../types/contracts";
 import { CURRENT_MODEL_VERSION } from "../types/contracts";
@@ -50,7 +56,7 @@ export function getBearerToken(request: Request): string {
 }
 
 export interface AppendAuthContext {
-  mode: "verified" | "legacy_unverified";
+  mode: "verified" | "relationship_accepted" | "legacy_unverified";
   reason?: string;
 }
 
@@ -187,6 +193,9 @@ function bindingPayload(binding: DeviceBinding): string {
 }
 
 function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boolean): string {
+  if ((bundle.publicationVersion ?? 0) >= 2) {
+    return identityBundleV2SigningPayload(bundle);
+  }
   const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
   if ((bundle.publicationVersion ?? 0) > 0) {
     parts.push(String(bundle.publicationVersion));
@@ -222,6 +231,110 @@ function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boole
   return parts.join("|");
 }
 
+export function mlsDeviceKeyBindingSigningPayload(binding: MlsDeviceKeyBinding): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-mls-device-key-binding-v2",
+    binding.version,
+    binding.userId,
+    binding.deviceId,
+    binding.devicePublicKey,
+    binding.mlsSignaturePublicKey,
+    binding.ciphersuite,
+    binding.createdAt
+  ]));
+}
+
+export function keyPackageClaimCapabilitySigningPayload(
+  capability: KeyPackageClaimCapability
+): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-key-package-claim-capability-v2",
+    capability.version,
+    capability.service,
+    capability.userId,
+    capability.targetDeviceId,
+    capability.endpoint,
+    capability.expiresAt,
+    capability.nonce
+  ]));
+}
+
+export function identityBundleV2SigningPayload(bundle: IdentityBundle): string {
+  const devices = bundle.devices.map((device) => [
+    device.version,
+    device.deviceId,
+    device.devicePublicKey,
+    [
+      device.binding.version,
+      device.binding.userId,
+      device.binding.deviceId,
+      device.binding.devicePublicKey,
+      device.binding.createdAt,
+      device.binding.signature
+    ],
+    device.status,
+    device.inboxAppendCapability
+      ? [
+          device.inboxAppendCapability.version,
+          device.inboxAppendCapability.service,
+          device.inboxAppendCapability.userId,
+          device.inboxAppendCapability.targetDeviceId,
+          device.inboxAppendCapability.endpoint,
+          device.inboxAppendCapability.operations,
+          device.inboxAppendCapability.conversationScope ?? [],
+          device.inboxAppendCapability.expiresAt,
+          device.inboxAppendCapability.constraints
+            ? [
+                device.inboxAppendCapability.constraints.maxBytes ?? null,
+                device.inboxAppendCapability.constraints.maxOpsPerMinute ?? null
+              ]
+            : null,
+          device.inboxAppendCapability.signature
+        ]
+      : null,
+    device.keyPackageClaimCapability
+      ? [
+          device.keyPackageClaimCapability.version,
+          device.keyPackageClaimCapability.service,
+          device.keyPackageClaimCapability.userId,
+          device.keyPackageClaimCapability.targetDeviceId,
+          device.keyPackageClaimCapability.endpoint,
+          device.keyPackageClaimCapability.expiresAt,
+          device.keyPackageClaimCapability.nonce,
+          device.keyPackageClaimCapability.signature
+        ]
+      : null,
+    device.mlsDeviceKeyBinding
+      ? [
+          device.mlsDeviceKeyBinding.version,
+          device.mlsDeviceKeyBinding.userId,
+          device.mlsDeviceKeyBinding.deviceId,
+          device.mlsDeviceKeyBinding.devicePublicKey,
+          device.mlsDeviceKeyBinding.mlsSignaturePublicKey,
+          device.mlsDeviceKeyBinding.ciphersuite,
+          device.mlsDeviceKeyBinding.createdAt,
+          device.mlsDeviceKeyBinding.signature
+        ]
+      : null
+  ]);
+  return JSON.stringify([
+    "tapchat-identity-bundle-v2",
+    bundle.version,
+    bundle.publicationVersion ?? 0,
+    bundle.publicationRevision ?? 0,
+    bundle.userId,
+    bundle.userPublicKey,
+    devices,
+    bundle.bundleShareId ?? null,
+    bundle.identityBundleRef ?? null,
+    bundle.deviceStatusRef ?? null,
+    bundle.storageProfile?.baseUrl ?? null,
+    bundle.storageProfile?.profileRef ?? null,
+    bundle.displayName ?? null,
+    bundle.updatedAt
+  ]);
+}
+
 function keyPackageRefValue(device: DeviceContactProfile): string {
   if (!device.keypackageRef) return "";
   const keypackage = device.keypackageRef as DeviceContactProfile["keypackageRef"] & { objectRef?: string };
@@ -232,11 +345,221 @@ export function verifyIdentityBundle(bundle: IdentityBundle): boolean {
   if (bundle.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
+  if (`user:${bundle.userPublicKey.toLowerCase().slice(0, 16)}` !== bundle.userId) {
+    return false;
+  }
+  if ((bundle.publicationVersion ?? 0) >= 2) {
+    if ((bundle.publicationVersion ?? 0) !== 2) return false;
+    for (const device of bundle.devices) {
+      if (device.status !== "active") continue;
+      const binding = device.mlsDeviceKeyBinding;
+      const capability = device.keyPackageClaimCapability;
+      if (!binding || !capability) return false;
+      if (
+        binding.userId !== bundle.userId ||
+        binding.deviceId !== device.deviceId ||
+        binding.devicePublicKey !== device.devicePublicKey ||
+        !verifyMlsDeviceKeyBinding(binding) ||
+        capability.userId !== bundle.userId ||
+        capability.targetDeviceId !== device.deviceId ||
+        !verifyKeyPackageClaimCapability(capability, device.devicePublicKey)
+      ) return false;
+    }
+  }
   return (
     verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) ||
     ((bundle.publicationVersion ?? 0) === 0 &&
       verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false)))
   );
+}
+
+export function verifyMlsDeviceKeyBinding(binding: MlsDeviceKeyBinding): boolean {
+  return (
+    binding.version === CURRENT_MODEL_VERSION &&
+    binding.ciphersuite === "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519" &&
+    verifyEd25519(binding.devicePublicKey, binding.signature, mlsDeviceKeyBindingSigningPayload(binding))
+  );
+}
+
+export function verifyKeyPackageClaimCapability(
+  capability: KeyPackageClaimCapability,
+  devicePublicKey: string
+): boolean {
+  return (
+    capability.version === CURRENT_MODEL_VERSION &&
+    capability.service === "key_package_claim" &&
+    verifyEd25519(
+      devicePublicKey,
+      capability.signature,
+      keyPackageClaimCapabilitySigningPayload(capability)
+    )
+  );
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Tagged(bytes: Uint8Array): Promise<string> {
+  const source = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  ) as ArrayBuffer;
+  return `sha256:${bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", source)))}`;
+}
+
+export async function identityBundleDigest(bundle: IdentityBundle): Promise<string> {
+  if (!verifyIdentityBundle(bundle)) {
+    throw new HttpError(403, "sender_identity_invalid", "sender IdentityBundle V2 is invalid");
+  }
+  return sha256Tagged(new TextEncoder().encode(JSON.stringify([
+    "tapchat-identity-bundle-digest-v2",
+    identityBundlePayload(bundle, true),
+    bundle.signature
+  ])));
+}
+
+export async function envelopeV2SigningPayload(envelope: EnvelopeV2): Promise<Uint8Array> {
+  const storageRefs = (envelope.storageRefs ?? []).map((reference) => [
+    reference.kind,
+    reference.ref,
+    reference.sizeBytes,
+    reference.mimeType,
+    reference.fileName ?? null,
+    reference.expiresAt ?? null
+  ]);
+  const [inlineDigest, storageRefsDigest] = await Promise.all([
+    sha256Tagged(new TextEncoder().encode(envelope.inlineCiphertext ?? "")),
+    sha256Tagged(new TextEncoder().encode(JSON.stringify(storageRefs)))
+  ]);
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-envelope-v2",
+    envelope.version,
+    envelope.messageId,
+    envelope.conversationId,
+    envelope.relationshipId,
+    envelope.generation,
+    envelope.attempt,
+    envelope.proposalId,
+    envelope.claimId ?? null,
+    envelope.senderUserId,
+    envelope.senderDeviceId,
+    envelope.recipientUserId,
+    envelope.recipientDeviceId,
+    envelope.createdAt,
+    envelope.messageType,
+    envelope.deliveryClass,
+    envelope.wakeHint?.latestSeqHint ?? null,
+    inlineDigest,
+    storageRefsDigest,
+    envelope.senderBundleDigest
+  ]));
+}
+
+export async function verifyEnvelopeV2(envelope: EnvelopeV2, bundle: IdentityBundle): Promise<boolean> {
+  if (
+    envelope.version !== "2" ||
+    envelope.senderProof.type !== "ed25519_device_v2" ||
+    envelope.attempt < 1 ||
+    !Number.isSafeInteger(envelope.generation) ||
+    !Number.isSafeInteger(envelope.attempt) ||
+    envelope.conversationId !== `conv:direct:v2:${envelope.relationshipId}:g${envelope.generation}` ||
+    envelope.senderUserId !== bundle.userId ||
+    envelope.senderBundleDigest !== await identityBundleDigest(bundle)
+  ) return false;
+  const device = bundle.devices.find((candidate) => candidate.deviceId === envelope.senderDeviceId);
+  if (!device || device.status !== "active") return false;
+  return verifyEd25519(
+    device.devicePublicKey,
+    envelope.senderProof.value,
+    await envelopeV2SigningPayload(envelope)
+  );
+}
+
+export function relationshipProposalSigningPayload(proposal: RelationshipProposalV2): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-proposal-v2",
+    proposal.proposalId,
+    proposal.initiatorUserId,
+    proposal.initiatorDeviceId,
+    proposal.relationshipIdCandidate,
+    proposal.generation,
+    proposal.attempt,
+    proposal.peerUserId,
+    proposal.senderBundleDigest,
+    proposal.createdAt,
+    proposal.expiresAt
+  ]));
+}
+
+export function relationshipDecisionProofSigningPayload(
+  proof: RelationshipDecisionProofV2
+): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-decision-v2",
+    proof.version,
+    proof.ticketId,
+    proof.relationshipId,
+    proof.generation,
+    proof.proposalId,
+    proof.decision,
+    proof.actorUserId,
+    proof.actorDeviceId,
+    proof.peerUserId,
+    proof.peerBundleDigest,
+    proof.decidedAt
+  ]));
+}
+
+export function relationshipTicketStatusSigningPayload(
+  ticketId: string,
+  deviceId: string,
+  issuedAt: number,
+  ticketSecretProof: string
+): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-ticket-status-v2",
+    ticketId,
+    deviceId,
+    issuedAt,
+    ticketSecretProof
+  ]));
+}
+
+export async function relationshipTicketSecretProof(
+  ticketId: string,
+  deviceId: string,
+  issuedAt: number,
+  ticketSecretHash: string
+): Promise<string> {
+  const payload = new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-ticket-secret-proof-v2",
+    ticketId,
+    deviceId,
+    issuedAt,
+    ticketSecretHash
+  ]));
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", payload)));
+}
+
+export function publishKeyPackageBatchSigningPayload(
+  request: PublishKeyPackageBatchRequest
+): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-key-package-publish-v2",
+    request.version,
+    request.deviceId,
+    request.idempotencyKey,
+    request.packages.map((item) => [
+      item.keyPackageId,
+      item.keyPackageB64,
+      item.lifecycleVersion,
+      item.notBefore,
+      item.createdAt,
+      item.expiresAt,
+      item.mlsSignaturePublicKey
+    ])
+  ]));
 }
 
 export function verifyDeviceBinding(userPublicKey: string, binding: DeviceBinding): boolean {

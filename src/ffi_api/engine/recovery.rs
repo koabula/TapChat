@@ -9,8 +9,10 @@ impl CoreEngine {
             .state
             .local_identity
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
         let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
+        let relationship_id = self.direct_relationship_id_for_conversation(&conversation_id)?;
         let peer_active_device_ids = self.peer_active_device_ids(&peer_user_id)?;
         let reconcile = {
             let conversation_state = self
@@ -28,19 +30,6 @@ impl CoreEngine {
                 },
             )?
         };
-        {
-            let conversation_state = self
-                .state
-                .conversations
-                .get_mut(&conversation_id)
-                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-            ConversationManager::apply_reconciled_membership(
-                conversation_state,
-                &reconcile,
-                &peer_active_device_ids,
-                current_timestamp_hint(self.state.outbox.len()),
-            );
-        }
         let needs_rebootstrap = {
             let conversation_state = self
                 .state
@@ -56,6 +45,46 @@ impl CoreEngine {
                     .map(|summary| summary.status == MlsStateStatus::NeedsRebuild)
                     .unwrap_or(false)
         };
+
+        let claim_device_ids = if needs_rebootstrap {
+            peer_active_device_ids.clone()
+        } else {
+            reconcile.added_devices.clone()
+        };
+        let claimed_key_packages = if claim_device_ids.is_empty() {
+            key_packages::ClaimedKeyPackages {
+                packages: Vec::new(),
+                claim_ids_by_device: BTreeMap::new(),
+            }
+        } else {
+            match self.claim_key_packages_for_operation(
+                if needs_rebootstrap {
+                    crate::transport_contract::KeyPackageClaimPurpose::Recovery
+                } else {
+                    crate::transport_contract::KeyPackageClaimPurpose::DeviceReconcile
+                },
+                PersistedKeyPackageClaimContinuation::ReconcileConversation {
+                    conversation_id: conversation_id.clone(),
+                },
+                vec![(peer_user_id.clone(), claim_device_ids)],
+            )? {
+                key_packages::KeyPackageClaimReadiness::Deferred(output) => return Ok(output),
+                key_packages::KeyPackageClaimReadiness::Ready(claimed) => claimed,
+            }
+        };
+        {
+            let conversation_state = self
+                .state
+                .conversations
+                .get_mut(&conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+            ConversationManager::apply_reconciled_membership(
+                conversation_state,
+                &reconcile,
+                &peer_active_device_ids,
+                current_timestamp_hint(self.state.outbox.len()),
+            );
+        }
 
         if !reconcile.changed && !needs_rebootstrap {
             let device_id = self
@@ -147,13 +176,12 @@ impl CoreEngine {
         }
 
         if needs_rebootstrap {
-            let key_packages = self.peer_key_packages(&peer_user_id, &peer_active_device_ids)?;
             let artifacts = self
                 .state
                 .mls_adapter
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .create_conversation(&conversation_id, &key_packages)?;
+                .create_conversation(&conversation_id, &claimed_key_packages.packages)?;
             let summary = self
                 .state
                 .mls_adapter
@@ -171,13 +199,19 @@ impl CoreEngine {
                     peer_active_device_ids.iter().cloned().collect();
             }
 
-            let mut generated = self.commit_envelopes_for_artifacts(
-                &conversation_id,
+            let mut generated = self.commit_envelopes_v2_for_artifacts(
+                &relationship_id,
+                &peer_user_id,
                 &peer_active_device_ids,
                 &artifacts,
             )?;
-            generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
-            self.enqueue_envelopes(peer_user_id, generated.clone());
+            generated.extend(self.welcome_envelopes_v2_for_artifacts(
+                &relationship_id,
+                &peer_user_id,
+                &artifacts,
+                &claimed_key_packages.claim_ids_by_device,
+            )?);
+            self.enqueue_envelopes_v2(peer_user_id, generated.clone());
             self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
             return self.merge_with_transport_flush(CoreOutput {
                 state_update: CoreStateUpdate {
@@ -213,25 +247,30 @@ impl CoreEngine {
             });
         }
 
-        let mut generated = self.build_control_membership_changed_messages(
-            &conversation_id,
+        let mut generated = self.build_control_membership_changed_messages_v2(
+            &relationship_id,
             &peer_user_id,
             &peer_active_device_ids,
         )?;
         if !reconcile.added_devices.is_empty() {
-            let key_packages = self.peer_key_packages(&peer_user_id, &reconcile.added_devices)?;
             let artifacts = self
                 .state
                 .mls_adapter
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .add_members(&conversation_id, &key_packages)?;
-            generated.extend(self.commit_envelopes_for_artifacts(
-                &conversation_id,
+                .add_members(&conversation_id, &claimed_key_packages.packages)?;
+            generated.extend(self.commit_envelopes_v2_for_artifacts(
+                &relationship_id,
+                &peer_user_id,
                 &peer_active_device_ids,
                 &artifacts,
             )?);
-            generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
+            generated.extend(self.welcome_envelopes_v2_for_artifacts(
+                &relationship_id,
+                &peer_user_id,
+                &artifacts,
+                &claimed_key_packages.claim_ids_by_device,
+            )?);
         }
         if !reconcile.revoked_devices.is_empty() {
             let artifacts = self
@@ -240,13 +279,14 @@ impl CoreEngine {
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
                 .remove_members(&conversation_id, &reconcile.revoked_devices)?;
-            generated.extend(self.commit_envelopes_for_remove(
-                &conversation_id,
+            generated.extend(self.commit_envelopes_v2_for_remove(
+                &relationship_id,
+                &peer_user_id,
                 &peer_active_device_ids,
                 &artifacts,
             )?);
         }
-        self.enqueue_envelopes(peer_user_id, generated.clone());
+        self.enqueue_envelopes_v2(peer_user_id, generated.clone());
         self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
@@ -392,6 +432,7 @@ impl CoreEngine {
                     last_message_type,
                     message_count: None,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
+                    relationship: self.relationship_view_state(&conversation_id),
                 }],
                 ..CoreViewModel::default()
             }),
@@ -412,12 +453,35 @@ impl CoreEngine {
             merge_outputs(
                 self.migrate_legacy_removed_relationships()?,
                 merge_outputs(
-                    self.sync_inbox(device_id, Some(reason.to_string()))?,
-                    self.retry_pending_welcome_pickups()?,
+                    self.migrate_legacy_accepted_relationships()?,
+                    merge_outputs(
+                        self.sync_inbox(device_id, Some(reason.to_string()))?,
+                        self.retry_pending_welcome_pickups()?,
+                    ),
                 ),
             ),
         );
         let output = merge_outputs(output, self.restore_degraded_output());
+        let output = merge_outputs(output, self.resume_key_package_claim_operations()?);
+        let output = merge_outputs(output, self.sync_account_relationships()?);
+        let output = merge_outputs(output, self.list_message_requests()?);
+        let pending_relationship_ids = self
+            .state
+            .relationships
+            .values()
+            .filter(|relationship| {
+                relationship.account_state == RelationshipAccountState::Pending
+                    && relationship
+                        .attempts
+                        .last()
+                        .is_some_and(|attempt| attempt.ticket_status_endpoint.is_some())
+            })
+            .map(|relationship| relationship.relationship_id.clone())
+            .collect::<Vec<_>>();
+        let mut output = output;
+        for relationship_id in pending_relationship_ids {
+            output = merge_outputs(output, self.poll_relationship_ticket(&relationship_id)?);
+        }
         let output = merge_outputs(
             output,
             self.initialize_locally_hosted_group_authorizations(),
@@ -628,6 +692,34 @@ impl CoreEngine {
         local_user_id: &str,
         record: &InboxRecord,
     ) {
+        let peer_user_id = record
+            .envelope_v2
+            .as_ref()
+            .and_then(|envelope| self.state.relationships.get(&envelope.relationship_id))
+            .map(|relationship| relationship.peer_user_id.clone())
+            .unwrap_or_else(|| record.envelope.sender_user_id.clone());
+        let peer_device_ids = self
+            .state
+            .contacts
+            .get(&peer_user_id)
+            .map(|contact| {
+                contact
+                    .bundle
+                    .devices
+                    .iter()
+                    .filter(|device| device.status == crate::model::DeviceStatusKind::Active)
+                    .map(|device| device.device_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![record.envelope.sender_device_id.clone()]);
+        let peer_members = peer_device_ids
+            .iter()
+            .map(|peer_device_id| crate::model::ConversationMember {
+                user_id: peer_user_id.clone(),
+                device_id: peer_device_id.clone(),
+                status: crate::model::DeviceStatusKind::Active,
+            })
+            .collect::<Vec<_>>();
         self.state
             .conversations
             .entry(record.envelope.conversation_id.clone())
@@ -635,32 +727,22 @@ impl CoreEngine {
                 conversation: crate::model::Conversation {
                     conversation_id: record.envelope.conversation_id.clone(),
                     kind: ConversationKind::Direct,
-                    member_users: vec![
-                        record.envelope.sender_user_id.clone(),
-                        local_user_id.to_string(),
-                    ],
-                    member_devices: vec![
-                        crate::model::ConversationMember {
-                            user_id: record.envelope.sender_user_id.clone(),
-                            device_id: record.envelope.sender_device_id.clone(),
-                            status: crate::model::DeviceStatusKind::Active,
-                        },
-                        crate::model::ConversationMember {
+                    member_users: vec![peer_user_id.clone(), local_user_id.to_string()],
+                    member_devices: peer_members
+                        .into_iter()
+                        .chain(std::iter::once(crate::model::ConversationMember {
                             user_id: local_user_id.to_string(),
                             device_id: device_id.to_string(),
                             status: crate::model::DeviceStatusKind::Active,
-                        },
-                    ],
+                        }))
+                        .collect(),
                     state: ConversationState::Active,
                     updated_at: record.envelope.created_at,
                 },
                 messages: Vec::new(),
                 last_message_type: None,
-                peer_user_id: record.envelope.sender_user_id.clone(),
-                last_known_peer_active_devices: BTreeSet::from([record
-                    .envelope
-                    .sender_device_id
-                    .clone()]),
+                peer_user_id,
+                last_known_peer_active_devices: peer_device_ids.into_iter().collect(),
                 recovery_status: RecoveryStatus::Healthy,
                 archive_metadata: None,
             });

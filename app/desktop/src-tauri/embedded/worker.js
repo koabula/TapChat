@@ -45,11 +45,11 @@ function bytesToHex(bytes) {
   abytes(bytes);
   if (hasHexBuiltin)
     return bytes.toHex();
-  let hex = "";
+  let hex2 = "";
   for (let i = 0; i < bytes.length; i++) {
-    hex += hexes[bytes[i]];
+    hex2 += hexes[bytes[i]];
   }
-  return hex;
+  return hex2;
 }
 var asciis = { _0: 48, _9: 57, A: 65, F: 70, a: 97, f: 102 };
 function asciiToBase16(ch) {
@@ -61,21 +61,21 @@ function asciiToBase16(ch) {
     return ch - (asciis.a - 10);
   return;
 }
-function hexToBytes(hex) {
-  if (typeof hex !== "string")
-    throw new Error("hex string expected, got " + typeof hex);
+function hexToBytes(hex2) {
+  if (typeof hex2 !== "string")
+    throw new Error("hex string expected, got " + typeof hex2);
   if (hasHexBuiltin)
-    return Uint8Array.fromHex(hex);
-  const hl = hex.length;
+    return Uint8Array.fromHex(hex2);
+  const hl = hex2.length;
   const al = hl / 2;
   if (hl % 2)
     throw new Error("hex string expected, got unpadded hex of length " + hl);
   const array = new Uint8Array(al);
   for (let ai = 0, hi = 0; ai < al; ai++, hi += 2) {
-    const n1 = asciiToBase16(hex.charCodeAt(hi));
-    const n2 = asciiToBase16(hex.charCodeAt(hi + 1));
+    const n1 = asciiToBase16(hex2.charCodeAt(hi));
+    const n2 = asciiToBase16(hex2.charCodeAt(hi + 1));
     if (n1 === void 0 || n2 === void 0) {
-      const char = hex[hi] + hex[hi + 1];
+      const char = hex2[hi] + hex2[hi + 1];
       throw new Error('hex string expected, got non-hex character "' + char + '" at index ' + hi);
     }
     array[ai] = n1 * 16 + n2;
@@ -507,10 +507,10 @@ function _abytes2(value, length, title = "") {
   }
   return value;
 }
-function hexToNumber(hex) {
-  if (typeof hex !== "string")
-    throw new Error("hex string expected, got " + typeof hex);
-  return hex === "" ? _0n : BigInt("0x" + hex);
+function hexToNumber(hex2) {
+  if (typeof hex2 !== "string")
+    throw new Error("hex string expected, got " + typeof hex2);
+  return hex2 === "" ? _0n : BigInt("0x" + hex2);
 }
 function bytesToNumberBE(bytes) {
   return hexToNumber(bytesToHex(bytes));
@@ -525,16 +525,16 @@ function numberToBytesBE(n, len) {
 function numberToBytesLE(n, len) {
   return numberToBytesBE(n, len).reverse();
 }
-function ensureBytes(title, hex, expectedLength) {
+function ensureBytes(title, hex2, expectedLength) {
   let res;
-  if (typeof hex === "string") {
+  if (typeof hex2 === "string") {
     try {
-      res = hexToBytes(hex);
+      res = hexToBytes(hex2);
     } catch (e) {
       throw new Error(title + " must be hex string or Uint8Array, cause: " + e);
     }
-  } else if (isBytes(hex)) {
-    res = Uint8Array.from(hex);
+  } else if (isBytes(hex2)) {
+    res = Uint8Array.from(hex2);
   } else {
     throw new Error(title + " must be hex string or Uint8Array");
   }
@@ -1867,8 +1867,8 @@ var _RistrettoPoint = class __RistrettoPoint extends PrimeEdwardsPoint {
     return new __RistrettoPoint(ep);
   }
   /** @deprecated use `import { ristretto255_hasher } from '@noble/curves/ed25519.js';` */
-  static hashToCurve(hex) {
-    return ristretto255_map(ensureBytes("ristrettoHash", hex, 64));
+  static hashToCurve(hex2) {
+    return ristretto255_map(ensureBytes("ristrettoHash", hex2, 64));
   }
   static fromBytes(bytes) {
     abytes(bytes, 32);
@@ -1901,8 +1901,8 @@ var _RistrettoPoint = class __RistrettoPoint extends PrimeEdwardsPoint {
    * Described in [RFC9496](https://www.rfc-editor.org/rfc/rfc9496#name-decode).
    * @param hex Ristretto-encoded 32 bytes. Not every 32-byte string is valid ristretto encoding
    */
-  static fromHex(hex) {
-    return __RistrettoPoint.fromBytes(ensureBytes("ristrettoHex", hex, 32));
+  static fromHex(hex2) {
+    return __RistrettoPoint.fromBytes(ensureBytes("ristrettoHex", hex2, 32));
   }
   static msm(points, scalars) {
     return pippenger(__RistrettoPoint, ed25519.Point.Fn, points, scalars);
@@ -1992,8 +1992,8 @@ async function importSecret(secret) {
     ["sign", "verify"]
   );
 }
-async function signSharingPayload(secret, payload) {
-  const encodedPayload = encoder.encode(JSON.stringify(payload));
+async function signSharingPayload(secret, payload2) {
+  const encodedPayload = encoder.encode(JSON.stringify(payload2));
   const key = await importSecret(secret);
   const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, encodedPayload));
   return `${toBase64Url(encodedPayload)}.${toBase64Url(signature)}`;
@@ -2018,11 +2018,11 @@ async function verifySharingPayload(secret, token, now) {
   if (!valid) {
     throw new Error("invalid sharing token");
   }
-  const payload = JSON.parse(new TextDecoder().decode(payloadBytes));
-  if (payload.expiresAt !== void 0 && payload.expiresAt <= now) {
+  const payload2 = JSON.parse(new TextDecoder().decode(payloadBytes));
+  if (payload2.expiresAt !== void 0 && payload2.expiresAt <= now) {
     throw new Error("sharing token expired");
   }
-  return payload;
+  return payload2;
 }
 
 // src/auth/capability.ts
@@ -2162,6 +2162,9 @@ function bindingPayload(binding) {
   return `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`;
 }
 function identityBundlePayload(bundle, includeDisplayName) {
+  if ((bundle.publicationVersion ?? 0) >= 2) {
+    return identityBundleV2SigningPayload(bundle);
+  }
   const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
   if ((bundle.publicationVersion ?? 0) > 0) {
     parts.push(String(bundle.publicationVersion));
@@ -2196,6 +2199,97 @@ function identityBundlePayload(bundle, includeDisplayName) {
   }
   return parts.join("|");
 }
+function mlsDeviceKeyBindingSigningPayload(binding) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-mls-device-key-binding-v2",
+    binding.version,
+    binding.userId,
+    binding.deviceId,
+    binding.devicePublicKey,
+    binding.mlsSignaturePublicKey,
+    binding.ciphersuite,
+    binding.createdAt
+  ]));
+}
+function keyPackageClaimCapabilitySigningPayload(capability) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-key-package-claim-capability-v2",
+    capability.version,
+    capability.service,
+    capability.userId,
+    capability.targetDeviceId,
+    capability.endpoint,
+    capability.expiresAt,
+    capability.nonce
+  ]));
+}
+function identityBundleV2SigningPayload(bundle) {
+  const devices = bundle.devices.map((device) => [
+    device.version,
+    device.deviceId,
+    device.devicePublicKey,
+    [
+      device.binding.version,
+      device.binding.userId,
+      device.binding.deviceId,
+      device.binding.devicePublicKey,
+      device.binding.createdAt,
+      device.binding.signature
+    ],
+    device.status,
+    device.inboxAppendCapability ? [
+      device.inboxAppendCapability.version,
+      device.inboxAppendCapability.service,
+      device.inboxAppendCapability.userId,
+      device.inboxAppendCapability.targetDeviceId,
+      device.inboxAppendCapability.endpoint,
+      device.inboxAppendCapability.operations,
+      device.inboxAppendCapability.conversationScope ?? [],
+      device.inboxAppendCapability.expiresAt,
+      device.inboxAppendCapability.constraints ? [
+        device.inboxAppendCapability.constraints.maxBytes ?? null,
+        device.inboxAppendCapability.constraints.maxOpsPerMinute ?? null
+      ] : null,
+      device.inboxAppendCapability.signature
+    ] : null,
+    device.keyPackageClaimCapability ? [
+      device.keyPackageClaimCapability.version,
+      device.keyPackageClaimCapability.service,
+      device.keyPackageClaimCapability.userId,
+      device.keyPackageClaimCapability.targetDeviceId,
+      device.keyPackageClaimCapability.endpoint,
+      device.keyPackageClaimCapability.expiresAt,
+      device.keyPackageClaimCapability.nonce,
+      device.keyPackageClaimCapability.signature
+    ] : null,
+    device.mlsDeviceKeyBinding ? [
+      device.mlsDeviceKeyBinding.version,
+      device.mlsDeviceKeyBinding.userId,
+      device.mlsDeviceKeyBinding.deviceId,
+      device.mlsDeviceKeyBinding.devicePublicKey,
+      device.mlsDeviceKeyBinding.mlsSignaturePublicKey,
+      device.mlsDeviceKeyBinding.ciphersuite,
+      device.mlsDeviceKeyBinding.createdAt,
+      device.mlsDeviceKeyBinding.signature
+    ] : null
+  ]);
+  return JSON.stringify([
+    "tapchat-identity-bundle-v2",
+    bundle.version,
+    bundle.publicationVersion ?? 0,
+    bundle.publicationRevision ?? 0,
+    bundle.userId,
+    bundle.userPublicKey,
+    devices,
+    bundle.bundleShareId ?? null,
+    bundle.identityBundleRef ?? null,
+    bundle.deviceStatusRef ?? null,
+    bundle.storageProfile?.baseUrl ?? null,
+    bundle.storageProfile?.profileRef ?? null,
+    bundle.displayName ?? null,
+    bundle.updatedAt
+  ]);
+}
 function keyPackageRefValue(device) {
   if (!device.keypackageRef) return "";
   const keypackage = device.keypackageRef;
@@ -2205,7 +2299,163 @@ function verifyIdentityBundle(bundle) {
   if (bundle.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
+  if (`user:${bundle.userPublicKey.toLowerCase().slice(0, 16)}` !== bundle.userId) {
+    return false;
+  }
+  if ((bundle.publicationVersion ?? 0) >= 2) {
+    if ((bundle.publicationVersion ?? 0) !== 2) return false;
+    for (const device of bundle.devices) {
+      if (device.status !== "active") continue;
+      const binding = device.mlsDeviceKeyBinding;
+      const capability = device.keyPackageClaimCapability;
+      if (!binding || !capability) return false;
+      if (binding.userId !== bundle.userId || binding.deviceId !== device.deviceId || binding.devicePublicKey !== device.devicePublicKey || !verifyMlsDeviceKeyBinding(binding) || capability.userId !== bundle.userId || capability.targetDeviceId !== device.deviceId || !verifyKeyPackageClaimCapability(capability, device.devicePublicKey)) return false;
+    }
+  }
   return verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) || (bundle.publicationVersion ?? 0) === 0 && verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false));
+}
+function verifyMlsDeviceKeyBinding(binding) {
+  return binding.version === CURRENT_MODEL_VERSION && binding.ciphersuite === "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519" && verifyEd25519(binding.devicePublicKey, binding.signature, mlsDeviceKeyBindingSigningPayload(binding));
+}
+function verifyKeyPackageClaimCapability(capability, devicePublicKey) {
+  return capability.version === CURRENT_MODEL_VERSION && capability.service === "key_package_claim" && verifyEd25519(
+    devicePublicKey,
+    capability.signature,
+    keyPackageClaimCapabilitySigningPayload(capability)
+  );
+}
+function bytesToHex2(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Tagged(bytes) {
+  const source = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  );
+  return `sha256:${bytesToHex2(new Uint8Array(await crypto.subtle.digest("SHA-256", source)))}`;
+}
+async function identityBundleDigest(bundle) {
+  if (!verifyIdentityBundle(bundle)) {
+    throw new HttpError(403, "sender_identity_invalid", "sender IdentityBundle V2 is invalid");
+  }
+  return sha256Tagged(new TextEncoder().encode(JSON.stringify([
+    "tapchat-identity-bundle-digest-v2",
+    identityBundlePayload(bundle, true),
+    bundle.signature
+  ])));
+}
+async function envelopeV2SigningPayload(envelope) {
+  const storageRefs = (envelope.storageRefs ?? []).map((reference) => [
+    reference.kind,
+    reference.ref,
+    reference.sizeBytes,
+    reference.mimeType,
+    reference.fileName ?? null,
+    reference.expiresAt ?? null
+  ]);
+  const [inlineDigest, storageRefsDigest] = await Promise.all([
+    sha256Tagged(new TextEncoder().encode(envelope.inlineCiphertext ?? "")),
+    sha256Tagged(new TextEncoder().encode(JSON.stringify(storageRefs)))
+  ]);
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-envelope-v2",
+    envelope.version,
+    envelope.messageId,
+    envelope.conversationId,
+    envelope.relationshipId,
+    envelope.generation,
+    envelope.attempt,
+    envelope.proposalId,
+    envelope.claimId ?? null,
+    envelope.senderUserId,
+    envelope.senderDeviceId,
+    envelope.recipientUserId,
+    envelope.recipientDeviceId,
+    envelope.createdAt,
+    envelope.messageType,
+    envelope.deliveryClass,
+    envelope.wakeHint?.latestSeqHint ?? null,
+    inlineDigest,
+    storageRefsDigest,
+    envelope.senderBundleDigest
+  ]));
+}
+async function verifyEnvelopeV2(envelope, bundle) {
+  if (envelope.version !== "2" || envelope.senderProof.type !== "ed25519_device_v2" || envelope.attempt < 1 || !Number.isSafeInteger(envelope.generation) || !Number.isSafeInteger(envelope.attempt) || envelope.conversationId !== `conv:direct:v2:${envelope.relationshipId}:g${envelope.generation}` || envelope.senderUserId !== bundle.userId || envelope.senderBundleDigest !== await identityBundleDigest(bundle)) return false;
+  const device = bundle.devices.find((candidate) => candidate.deviceId === envelope.senderDeviceId);
+  if (!device || device.status !== "active") return false;
+  return verifyEd25519(
+    device.devicePublicKey,
+    envelope.senderProof.value,
+    await envelopeV2SigningPayload(envelope)
+  );
+}
+function relationshipProposalSigningPayload(proposal) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-proposal-v2",
+    proposal.proposalId,
+    proposal.initiatorUserId,
+    proposal.initiatorDeviceId,
+    proposal.relationshipIdCandidate,
+    proposal.generation,
+    proposal.attempt,
+    proposal.peerUserId,
+    proposal.senderBundleDigest,
+    proposal.createdAt,
+    proposal.expiresAt
+  ]));
+}
+function relationshipDecisionProofSigningPayload(proof) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-decision-v2",
+    proof.version,
+    proof.ticketId,
+    proof.relationshipId,
+    proof.generation,
+    proof.proposalId,
+    proof.decision,
+    proof.actorUserId,
+    proof.actorDeviceId,
+    proof.peerUserId,
+    proof.peerBundleDigest,
+    proof.decidedAt
+  ]));
+}
+function relationshipTicketStatusSigningPayload(ticketId, deviceId, issuedAt, ticketSecretProof) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-ticket-status-v2",
+    ticketId,
+    deviceId,
+    issuedAt,
+    ticketSecretProof
+  ]));
+}
+async function relationshipTicketSecretProof(ticketId, deviceId, issuedAt, ticketSecretHash) {
+  const payload2 = new TextEncoder().encode(JSON.stringify([
+    "tapchat-relationship-ticket-secret-proof-v2",
+    ticketId,
+    deviceId,
+    issuedAt,
+    ticketSecretHash
+  ]));
+  return bytesToHex2(new Uint8Array(await crypto.subtle.digest("SHA-256", payload2)));
+}
+function publishKeyPackageBatchSigningPayload(request) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-key-package-publish-v2",
+    request.version,
+    request.deviceId,
+    request.idempotencyKey,
+    request.packages.map((item) => [
+      item.keyPackageId,
+      item.keyPackageB64,
+      item.lifecycleVersion,
+      item.notBefore,
+      item.createdAt,
+      item.expiresAt,
+      item.mlsSignaturePublicKey
+    ])
+  ]));
 }
 function verifyDeviceBinding(userPublicKey, binding) {
   if (binding.version !== CURRENT_MODEL_VERSION) {
@@ -2216,9 +2466,9 @@ function verifyDeviceBinding(userPublicKey, binding) {
 function verifyInboxAppendCapability(capability, devicePublicKey) {
   return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
 }
-function verifyEd25519(publicKeyHex, signatureHex, payload) {
+function verifyEd25519(publicKeyHex, signatureHex, payload2) {
   try {
-    const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+    const encoded = typeof payload2 === "string" ? new TextEncoder().encode(payload2) : payload2;
     return ed25519.verify(hexToBytes2(signatureHex), encoded, hexToBytes2(publicKeyHex));
   } catch {
     return false;
@@ -2276,10 +2526,10 @@ function unsignedGroupManifest(manifest) {
 function groupManifestSigningPayload(manifest) {
   const prefix = new TextEncoder().encode("tapchat.group_manifest.v1\n");
   const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
-  const payload = new Uint8Array(prefix.length + body.length);
-  payload.set(prefix);
-  payload.set(body, prefix.length);
-  return payload;
+  const payload2 = new Uint8Array(prefix.length + body.length);
+  payload2.set(prefix);
+  payload2.set(body, prefix.length);
+  return payload2;
 }
 function groupMembershipProofSigningPayload(proof) {
   const fields = [
@@ -2390,8 +2640,8 @@ function tokenKeyId(token) {
     if (!payloadPart) return void 0;
     const normalized = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
     const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-    const payload = JSON.parse(atob(padded));
-    return typeof payload.keyId === "string" && payload.keyId.trim() ? payload.keyId : void 0;
+    const payload2 = JSON.parse(atob(padded));
+    return typeof payload2.keyId === "string" && payload2.keyId.trim() ? payload2.keyId : void 0;
   } catch {
     return void 0;
   }
@@ -2482,29 +2732,6 @@ async function validateSharedStateWriteAuthorization(request, secret, userId, de
   }
   if (!token.objectKinds.includes(objectKind)) {
     throw new HttpError(403, "invalid_capability", "token does not grant this shared-state object kind");
-  }
-  return token;
-}
-async function validateKeyPackageWriteAuthorization(request, secret, userId, deviceId, keyPackageId, now, legacySecret) {
-  try {
-    return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
-  } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
-      throw error;
-    }
-  }
-  const token = await verifySignedToken(legacySecret ?? secret, request, now);
-  if (token.version !== CURRENT_MODEL_VERSION) {
-    throw new HttpError(400, "unsupported_version", "keypackage token version is not supported");
-  }
-  if (token.service !== "keypackages") {
-    throw new HttpError(403, "invalid_capability", "token service must be keypackages");
-  }
-  if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "token scope does not match request path");
-  }
-  if (token.keyPackageId && token.keyPackageId !== keyPackageId) {
-    throw new HttpError(403, "invalid_capability", "token keyPackageId does not match request path");
   }
   return token;
 }
@@ -2649,6 +2876,11 @@ var ERROR_DEFAULTS = {
   runtime_auth_expired: ["runtime", true, "reconnect_runtime"],
   runtime_auth_invalid: ["runtime", false, "reconnect_runtime"],
   runtime_misconfigured: ["runtime", false, "upgrade_runtime"],
+  cloudflare_permission_denied: ["runtime", false, "retry"],
+  cloudflare_storage_setup_failed: ["runtime", true, "retry"],
+  cloudflare_worker_deploy_failed: ["runtime", true, "retry"],
+  cloudflare_runtime_not_ready: ["runtime", true, "retry"],
+  cloudflare_setup_incomplete: ["runtime", true, "retry"],
   runtime_mismatch: ["runtime", false, "reconnect_runtime"],
   runtime_missing_group_outbox: ["runtime", false, "upgrade_runtime"],
   enrollment_required: ["runtime", false, "reconnect_runtime"],
@@ -2658,9 +2890,16 @@ var ERROR_DEFAULTS = {
   keypackage_lifetime_invalid: ["mls", false, "refresh_identity"],
   keypackage_refresh_pending: ["mls", true, "reconnect"],
   keypackage_publish_failed: ["mls", true, "retry"],
+  keypackage_pool_exhausted: ["mls", true, "retry_later"],
   device_clock_invalid: ["security", false, null],
   identity_bundle_conflict: ["identity", true, "sync_now"],
   identity_refresh_required: ["identity", true, "refresh_identity"],
+  identity_binding_invalid: ["identity", false, "refresh_identity"],
+  sender_identity_invalid: ["identity", false, "refresh_identity"],
+  relationship_proposal_invalid: ["identity", false, "refresh_identity"],
+  relationship_conflict: ["identity", true, "sync_now"],
+  relationship_superseded: ["identity", false, "sync_now"],
+  idempotency_conflict: ["validation", false, null],
   contact_share_offline: ["identity", true, "reconnect"],
   contact_share_publish_failed: ["identity", true, "retry"],
   contact_share_rotation_unverified: ["identity", true, "reconnect"],
@@ -2726,6 +2965,19 @@ var KEY_PACKAGE_NOT_BEFORE_SKEW_MS = 60 * 60 * 1e3;
 var KEY_PACKAGE_MIN_REMAINING_MS = 7 * 24 * 60 * 60 * 1e3;
 var CLOCK_TOLERANCE_MS = 5 * 60 * 1e3;
 var INBOX_CAPABILITY_MAX_LIFETIME_MS = 365 * 24 * 60 * 60 * 1e3;
+var KEY_PACKAGE_PREFIX = "key-package:v2:";
+var KEY_PACKAGE_PUBLISH_IDEMPOTENCY_PREFIX = "key-package-publish-idempotency:v2:";
+var KEY_PACKAGE_CLAIM_IDEMPOTENCY_PREFIX = "key-package-claim-idempotency:v2:";
+var RELATIONSHIP_PREFIX = "relationship:v2:";
+var RELATIONSHIP_TICKET_PREFIX = "relationship-ticket:v2:";
+var RELATIONSHIP_PROJECTION_PREFIX = "relationship-projection:v2:";
+var KEY_PACKAGE_POOL_TARGET = 16;
+var KEY_PACKAGE_POOL_REFILL_THRESHOLD = 8;
+var MAX_KEY_PACKAGE_BATCH = 16;
+var KEY_PACKAGE_BATCH_MAX_BYTES = 512 * 1024;
+var RELATIONSHIP_ATTEMPT_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
+var OPAQUE_ID_PATTERN = /^[0-9a-f]{64}$/i;
+var MLS_CIPHERSUITE_V2 = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
 var DurableObjectBase = globalThis.DurableObject ?? class {
   constructor(_state, _env) {
   }
@@ -2755,6 +3007,103 @@ function randomNonce() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+function requireTicketDerivationSecret(env) {
+  const secret = env.SHARING_INTERNAL_SECRET?.trim() || env.DEVICE_RUNTIME_SECRET?.trim();
+  if (!secret) {
+    throw new HttpError(503, "runtime_misconfigured", "ticket derivation secret is not configured");
+  }
+  return secret;
+}
+function bytesToHex3(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+async function sha256Hex(value) {
+  const bytes = new TextEncoder().encode(value);
+  const source = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  return bytesToHex3(new Uint8Array(await crypto.subtle.digest("SHA-256", source)));
+}
+async function deriveTicketSecret(env, idempotencyKey, ticketId) {
+  const encoder2 = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder2.encode(requireTicketDerivationSecret(env)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const input = encoder2.encode(`tapchat-relationship-ticket-v2|${idempotencyKey}|${ticketId}`);
+  return bytesToHex3(new Uint8Array(await crypto.subtle.sign("HMAC", key, input)));
+}
+async function publishRequestDigest(body) {
+  return sha256Hex(JSON.stringify([
+    "tapchat-key-package-publish-v2",
+    body.deviceId,
+    body.idempotencyKey,
+    [...body.packages].sort((left, right) => left.keyPackageId.localeCompare(right.keyPackageId)).map((item) => [
+      item.keyPackageId,
+      item.keyPackageB64,
+      item.lifecycleVersion,
+      item.notBefore,
+      item.createdAt,
+      item.expiresAt,
+      item.mlsSignaturePublicKey
+    ]),
+    body.signature
+  ]));
+}
+async function claimRequestDigest(body) {
+  const requesterBundleDigest = await identityBundleDigest(body.requesterBundle);
+  return sha256Hex(JSON.stringify([
+    "tapchat-key-package-claim-v2",
+    body.version,
+    body.purpose,
+    body.idempotencyKey,
+    body.requesterBundle.userId,
+    requesterBundleDigest,
+    body.proposal.proposalId,
+    body.proposal.initiatorUserId,
+    body.proposal.initiatorDeviceId,
+    body.proposal.relationshipIdCandidate,
+    body.proposal.generation,
+    body.proposal.attempt,
+    body.proposal.peerUserId,
+    body.proposal.senderBundleDigest,
+    body.proposal.createdAt,
+    body.proposal.expiresAt,
+    body.proposal.signature,
+    [...body.targets].sort((left, right) => left.deviceId.localeCompare(right.deviceId)).map((target) => [
+      target.deviceId,
+      target.capability.version,
+      target.capability.service,
+      target.capability.userId,
+      target.capability.targetDeviceId,
+      target.capability.endpoint,
+      target.capability.expiresAt,
+      target.capability.nonce,
+      target.capability.signature
+    ])
+  ]));
+}
+function packageKey(deviceId, keyPackageId) {
+  return `${KEY_PACKAGE_PREFIX}${deviceId}:${keyPackageId}`;
+}
+function relationshipRank(proposal) {
+  return [proposal.initiatorUserId, proposal.relationshipIdCandidate, proposal.proposalId];
+}
+function compareRank(left, right) {
+  const a = relationshipRank(left);
+  const b = relationshipRank(right);
+  for (let index = 0; index < a.length; index += 1) {
+    const compared = a[index].localeCompare(b[index]);
+    if (compared !== 0) return compared;
+  }
+  return 0;
+}
+function validateOpaqueId(name, value) {
+  if (!OPAQUE_ID_PATTERN.test(value)) {
+    throw new HttpError(400, "invalid_input", `${name} must be an opaque 256-bit hex identifier`);
+  }
+}
 async function bindingHash(device) {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -2771,7 +3120,7 @@ async function identityBundleEtag(bundle) {
   return `"${value}"`;
 }
 function validateIdentityBundleLifecycle(bundle, writerDeviceId, now) {
-  if (bundle.publicationVersion !== 1 || !Number.isSafeInteger(bundle.publicationRevision) || bundle.publicationRevision < 1) {
+  if (bundle.publicationVersion !== 2 || !Number.isSafeInteger(bundle.publicationRevision) || bundle.publicationRevision < 1) {
     throw new HttpError(426, "upgrade_required", "identity bundle publication protocol is not supported");
   }
   const writer = bundle.devices.find((device) => device.deviceId === writerDeviceId);
@@ -2779,18 +3128,8 @@ function validateIdentityBundleLifecycle(bundle, writerDeviceId, now) {
     throw new HttpError(403, "device_revoked", "publishing device is not active in the identity bundle");
   }
   for (const device of bundle.devices) {
-    const keyPackage = device.keypackageRef;
-    if (keyPackage) {
-      if (keyPackage.createdAt > now + CLOCK_TOLERANCE_MS || keyPackage.notBefore > now + CLOCK_TOLERANCE_MS) {
-        throw new HttpError(422, "device_clock_invalid", "key package timestamps are too far in the future");
-      }
-      const validMetadata = keyPackage.lifecycleVersion === 1 && Number.isSafeInteger(keyPackage.notBefore) && Number.isSafeInteger(keyPackage.createdAt) && Number.isSafeInteger(keyPackage.expiresAt) && keyPackage.userId === bundle.userId && keyPackage.deviceId === device.deviceId && keyPackage.expiresAt - keyPackage.createdAt === KEY_PACKAGE_LIFETIME_MS && keyPackage.notBefore === Math.max(0, keyPackage.createdAt - KEY_PACKAGE_NOT_BEFORE_SKEW_MS);
-      if (!validMetadata) {
-        throw new HttpError(422, "keypackage_lifetime_invalid", "key package lifecycle metadata is invalid");
-      }
-      if (keyPackage.expiresAt <= now - CLOCK_TOLERANCE_MS) {
-        throw new HttpError(422, "keypackage_expired", "key package is expired");
-      }
+    if (device.keypackageRef) {
+      throw new HttpError(426, "upgrade_required", "IdentityBundle V2 must not publish public KeyPackage references");
     }
     const capability = device.inboxAppendCapability;
     if (capability) {
@@ -2798,11 +3137,15 @@ function validateIdentityBundleLifecycle(bundle, writerDeviceId, now) {
         throw new HttpError(422, "capability_expired", "inbox append capability lifecycle is invalid");
       }
     }
+    if (device.status === "active") {
+      const claimCapability = device.keyPackageClaimCapability;
+      const mlsBinding = device.mlsDeviceKeyBinding;
+      if (!claimCapability || !mlsBinding || claimCapability.userId !== bundle.userId || claimCapability.targetDeviceId !== device.deviceId || claimCapability.expiresAt <= now || claimCapability.expiresAt > now + INBOX_CAPABILITY_MAX_LIFETIME_MS + CLOCK_TOLERANCE_MS || mlsBinding.userId !== bundle.userId || mlsBinding.deviceId !== device.deviceId || mlsBinding.devicePublicKey !== device.devicePublicKey || mlsBinding.ciphersuite !== MLS_CIPHERSUITE_V2) {
+        throw new HttpError(422, "identity_binding_invalid", "active device V2 bindings are invalid");
+      }
+    }
   }
-  if (!writer.keypackageRef || writer.keypackageRef.expiresAt < now + KEY_PACKAGE_MIN_REMAINING_MS) {
-    throw new HttpError(422, "keypackage_expired", "publishing device key package has insufficient remaining lifetime");
-  }
-  if (!writer.inboxAppendCapability || writer.inboxAppendCapability.expiresAt <= now) {
+  if (!writer.inboxAppendCapability || writer.inboxAppendCapability.expiresAt <= now || !writer.keyPackageClaimCapability || writer.keyPackageClaimCapability.expiresAt <= now || !writer.mlsDeviceKeyBinding) {
     throw new HttpError(422, "capability_expired", "publishing device inbox append capability is expired");
   }
 }
@@ -2841,6 +3184,73 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
       if (request.method === "POST" && url.pathname.endsWith("/authorize")) {
         return await this.authorize(request);
       }
+      if (request.method === "POST" && url.pathname.endsWith("/device-registry/key-packages")) {
+        return await this.publishKeyPackages(request, now);
+      }
+      if (request.method === "GET" && url.pathname.endsWith("/device-registry/key-packages/status")) {
+        return await this.keyPackageStatus(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/key-packages/claims")) {
+        return await this.claimKeyPackages(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/relationships/authorize-append")) {
+        return await this.authorizeRelationshipAppend(request);
+      }
+      if (request.method === "GET" && url.pathname.endsWith("/device-registry/relationships")) {
+        return await this.listRelationships(request);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/device-registry/relationships/outbound")) {
+        return await this.upsertOutboundRelationship(request, now);
+      }
+      const removeRelationship = url.pathname.match(
+        /\/device-registry\/relationships\/([^/]+)\/remove$/
+      );
+      if (request.method === "POST" && removeRelationship) {
+        return await this.removeRelationship(
+          request,
+          decodeURIComponent(removeRelationship[1]),
+          now
+        );
+      }
+      const peerDecision = url.pathname.match(
+        /\/device-registry\/relationships\/([^/]+)\/peer-decision$/
+      );
+      if (request.method === "POST" && peerDecision) {
+        return await this.confirmRelationshipPeerDecision(
+          request,
+          decodeURIComponent(peerDecision[1]),
+          now
+        );
+      }
+      const joinState = url.pathname.match(
+        /\/device-registry\/relationships\/([^/]+)\/devices\/([^/]+)\/join-state$/
+      );
+      if (request.method === "POST" && joinState) {
+        return await this.updateRelationshipDeviceJoinState(
+          request,
+          decodeURIComponent(joinState[1]),
+          decodeURIComponent(joinState[2]),
+          now
+        );
+      }
+      if (request.method === "GET" && url.pathname.endsWith("/relationships/requests")) {
+        return await this.listRelationshipRequests(request);
+      }
+      const relationshipDecision = url.pathname.match(/\/relationships\/([^/]+)\/decision$/);
+      if (request.method === "POST" && relationshipDecision) {
+        return await this.decideRelationship(
+          request,
+          decodeURIComponent(relationshipDecision[1]),
+          now
+        );
+      }
+      const relationshipStatus = url.pathname.match(/\/relationships\/([^/]+)\/status$/);
+      if (request.method === "GET" && relationshipStatus) {
+        return await this.relationshipStatus(
+          request,
+          decodeURIComponent(relationshipStatus[1])
+        );
+      }
       if (request.method === "POST" && url.pathname.endsWith("/sync")) {
         return await this.syncIdentityBundle(request, now);
       }
@@ -2858,15 +3268,18 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
       return errorResponse(500, "temporary_unavailable");
     }
   }
+  async alarm() {
+    await this.runRelationshipProjections(Date.now());
+  }
   async ready() {
     const config = runtimeConfig(this.envRef);
     await this.stateRef.storage.get("__runtime_registry_ready__");
     return jsonResponse({
       ready: true,
       runtimeId: config.runtimeId,
-      protocolVersion: 5,
-      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
-      registrySchemaVersion: 2
+      protocolVersion: 6,
+      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v6-unknown",
+      registrySchemaVersion: 3
     });
   }
   async issueChallenge(request, now) {
@@ -2971,6 +3384,775 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
       throw new HttpError(403, "runtime_auth_invalid", "runtime token registration is stale");
     }
     return jsonResponse({ active: true });
+  }
+  async requireLocalActiveDevice(request) {
+    const deviceId = request.headers.get("X-Tapchat-Device-Id")?.trim();
+    if (!deviceId) {
+      throw new HttpError(401, "runtime_auth_invalid", "authenticated device context is missing");
+    }
+    const record = await this.stateRef.storage.get(deviceKey(deviceId));
+    if (!record) throw new HttpError(403, "enrollment_required", "device is not registered");
+    if (record.status !== "active") throw new HttpError(403, "device_revoked", "device is revoked");
+    return record;
+  }
+  async publishKeyPackages(request, now) {
+    const writer = await this.requireLocalActiveDevice(request);
+    const body = await readJsonLimited(
+      request,
+      KEY_PACKAGE_BATCH_MAX_BYTES
+    );
+    if (body.version !== "2" || body.deviceId !== writer.deviceId || !OPAQUE_ID_PATTERN.test(body.idempotencyKey) || body.packages.length < 1 || body.packages.length > MAX_KEY_PACKAGE_BATCH) {
+      throw new HttpError(400, "invalid_input", "invalid KeyPackage V2 publish batch");
+    }
+    const storedIdentity = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    const device = storedIdentity?.bundle.devices.find((candidate) => candidate.deviceId === body.deviceId);
+    if (!storedIdentity || !verifyIdentityBundle(storedIdentity.bundle) || !device || device.status !== "active" || !device.mlsDeviceKeyBinding || !verifyEd25519(
+      device.devicePublicKey,
+      body.signature,
+      publishKeyPackageBatchSigningPayload(body)
+    )) {
+      throw new HttpError(403, "runtime_auth_invalid", "KeyPackage publish proof is invalid");
+    }
+    const packageIds = /* @__PURE__ */ new Set();
+    for (const item of body.packages) {
+      validateOpaqueId("keyPackageId", item.keyPackageId);
+      if (packageIds.has(item.keyPackageId)) {
+        throw new HttpError(400, "invalid_input", "KeyPackage publish batch contains duplicate IDs");
+      }
+      packageIds.add(item.keyPackageId);
+      if (!item.keyPackageB64 || item.keyPackageB64.length > 64 * 1024 || item.lifecycleVersion !== 1 || !Number.isSafeInteger(item.notBefore) || !Number.isSafeInteger(item.createdAt) || !Number.isSafeInteger(item.expiresAt) || item.createdAt > now + CLOCK_TOLERANCE_MS || item.notBefore > now + CLOCK_TOLERANCE_MS || item.expiresAt - item.createdAt !== KEY_PACKAGE_LIFETIME_MS || item.notBefore !== Math.max(0, item.createdAt - KEY_PACKAGE_NOT_BEFORE_SKEW_MS) || item.expiresAt < now + KEY_PACKAGE_MIN_REMAINING_MS || item.mlsSignaturePublicKey !== device.mlsDeviceKeyBinding.mlsSignaturePublicKey) {
+        throw new HttpError(422, "keypackage_lifetime_invalid", "KeyPackage V2 metadata is invalid");
+      }
+    }
+    const requestDigest = await publishRequestDigest(body);
+    const result = await this.stateRef.storage.transaction(async (transaction) => {
+      const idempotencyKey = `${KEY_PACKAGE_PUBLISH_IDEMPOTENCY_PREFIX}${body.deviceId}:${body.idempotencyKey}`;
+      const existing = await transaction.get(idempotencyKey);
+      if (existing) {
+        if (existing.requestDigest !== requestDigest) {
+          throw new HttpError(409, "idempotency_conflict", "publish idempotency key was reused");
+        }
+        return existing;
+      }
+      for (const item of body.packages) {
+        const key = packageKey(body.deviceId, item.keyPackageId);
+        if (await transaction.get(key)) {
+          throw new HttpError(409, "idempotency_conflict", "KeyPackage ID was already published");
+        }
+        await transaction.put(key, {
+          ...item,
+          userId: runtimeConfig(this.envRef).userId,
+          deviceId: body.deviceId,
+          state: "available",
+          publishedAt: now
+        });
+      }
+      const published = {
+        deviceId: body.deviceId,
+        packageIds: body.packages.map((item) => item.keyPackageId),
+        requestDigest
+      };
+      await transaction.put(idempotencyKey, published);
+      return published;
+    });
+    return jsonResponse({
+      accepted: true,
+      idempotencyKey: body.idempotencyKey,
+      published: result.packageIds.length
+    });
+  }
+  async keyPackageStatus(request, now) {
+    const device = await this.requireLocalActiveDevice(request);
+    const status = await this.stateRef.storage.transaction(async (transaction) => {
+      const packages = await transaction.list({
+        prefix: `${KEY_PACKAGE_PREFIX}${device.deviceId}:`
+      });
+      let available = 0;
+      let claimed = 0;
+      let expired = 0;
+      for (const [key, item] of packages) {
+        if (item.state === "available" && item.expiresAt <= now) {
+          item.state = "expired";
+          await transaction.put(key, item);
+        }
+        if (item.state === "available") available += 1;
+        else if (item.state === "claimed") claimed += 1;
+        else expired += 1;
+      }
+      return {
+        deviceId: device.deviceId,
+        available,
+        claimed,
+        expired,
+        target: KEY_PACKAGE_POOL_TARGET,
+        refillThreshold: KEY_PACKAGE_POOL_REFILL_THRESHOLD
+      };
+    });
+    return jsonResponse(status);
+  }
+  async validateClaimRequest(body, ownerBundle, now) {
+    if (body.version !== "2" || !["direct", "group_invite", "device_reconcile", "recovery", "self_join"].includes(body.purpose) || body.targets.length < 1 || body.targets.length > MAX_KEY_PACKAGE_BATCH) {
+      throw new HttpError(400, "invalid_input", "invalid KeyPackage claim request");
+    }
+    validateOpaqueId("idempotencyKey", body.idempotencyKey);
+    validateOpaqueId("proposalId", body.proposal.proposalId);
+    validateOpaqueId("relationshipIdCandidate", body.proposal.relationshipIdCandidate);
+    if (body.requesterBundle.publicationVersion !== 2 || !verifyIdentityBundle(body.requesterBundle) || body.proposal.initiatorUserId !== body.requesterBundle.userId || (body.purpose === "self_join" ? body.requesterBundle.userId !== ownerBundle.userId : body.proposal.peerUserId !== ownerBundle.userId) || body.proposal.attempt < 1 || body.proposal.generation < 1 || !Number.isSafeInteger(body.proposal.attempt) || !Number.isSafeInteger(body.proposal.generation) || body.proposal.createdAt > now + CLOCK_TOLERANCE_MS || body.proposal.expiresAt <= now || body.proposal.expiresAt - body.proposal.createdAt > RELATIONSHIP_ATTEMPT_TTL_MS || body.proposal.senderBundleDigest !== await identityBundleDigest(body.requesterBundle)) {
+      throw new HttpError(403, "relationship_proposal_invalid", "relationship proposal context is invalid");
+    }
+    const initiator = body.requesterBundle.devices.find(
+      (candidate) => candidate.deviceId === body.proposal.initiatorDeviceId
+    );
+    if (!initiator || initiator.status !== "active" || !verifyEd25519(
+      initiator.devicePublicKey,
+      body.proposal.signature,
+      relationshipProposalSigningPayload(body.proposal)
+    )) {
+      throw new HttpError(403, "relationship_proposal_invalid", "relationship proposal signature is invalid");
+    }
+    const targetIds = /* @__PURE__ */ new Set();
+    for (const target of body.targets) {
+      if (targetIds.has(target.deviceId)) {
+        throw new HttpError(400, "invalid_input", "claim target devices must be unique");
+      }
+      targetIds.add(target.deviceId);
+      const targetDevice = ownerBundle.devices.find((candidate) => candidate.deviceId === target.deviceId);
+      if (!targetDevice || targetDevice.status !== "active" || !targetDevice.mlsDeviceKeyBinding || !targetDevice.keyPackageClaimCapability || target.capability.signature !== targetDevice.keyPackageClaimCapability.signature || target.capability.userId !== ownerBundle.userId || target.capability.targetDeviceId !== target.deviceId || target.capability.expiresAt <= now || !verifyKeyPackageClaimCapability(target.capability, targetDevice.devicePublicKey)) {
+        throw new HttpError(403, "invalid_capability", "KeyPackage claim target is not authorized");
+      }
+    }
+    if (body.purpose === "direct") {
+      const activeIds = ownerBundle.devices.filter((device) => device.status === "active").map((device) => device.deviceId).sort();
+      if (JSON.stringify([...targetIds].sort()) !== JSON.stringify(activeIds)) {
+        throw new HttpError(409, "identity_refresh_required", "direct claim must cover every active target device");
+      }
+    } else if (body.purpose === "self_join") {
+      const expectedSiblingIds = ownerBundle.devices.filter(
+        (device) => device.status === "active" && device.deviceId !== body.proposal.initiatorDeviceId
+      ).map((device) => device.deviceId).sort();
+      if (JSON.stringify([...targetIds].sort()) !== JSON.stringify(expectedSiblingIds)) {
+        throw new HttpError(
+          409,
+          "identity_refresh_required",
+          "authenticated self claim must cover every active sibling device"
+        );
+      }
+    }
+  }
+  async claimKeyPackages(request, now) {
+    const body = await readJsonLimited(request, KEY_PACKAGE_BATCH_MAX_BYTES);
+    const storedIdentity = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    if (!storedIdentity || !verifyIdentityBundle(storedIdentity.bundle)) {
+      throw new HttpError(409, "identity_refresh_required", "target IdentityBundle V2 is unavailable");
+    }
+    await this.validateClaimRequest(body, storedIdentity.bundle, now);
+    const requestDigest = await claimRequestDigest(body);
+    const relationshipKey = `${RELATIONSHIP_PREFIX}${await sha256Hex(body.requesterBundle.userPublicKey)}`;
+    const generatedTicketId = randomNonce();
+    const generatedTicketSecret = await deriveTicketSecret(
+      this.envRef,
+      body.idempotencyKey,
+      generatedTicketId
+    );
+    const generatedTicketSecretHash = await sha256Hex(generatedTicketSecret);
+    const claimIds = new Map(body.targets.map((target) => [target.deviceId, randomNonce()]));
+    const storedResult = await this.stateRef.storage.transaction(async (transaction) => {
+      const claimIdempotencyKey = `${KEY_PACKAGE_CLAIM_IDEMPOTENCY_PREFIX}${body.idempotencyKey}`;
+      const previousResult = await transaction.get(claimIdempotencyKey);
+      if (previousResult) {
+        if (previousResult.requestDigest !== requestDigest) {
+          throw new HttpError(409, "idempotency_conflict", "claim idempotency key was reused");
+        }
+        return previousResult;
+      }
+      let relationship;
+      let ticket;
+      let retainedAttempts = [];
+      if (body.purpose === "direct") {
+        const existing = await transaction.get(relationshipKey);
+        if (existing) {
+          if (existing.generation > body.proposal.generation) {
+            throw new HttpError(409, "relationship_conflict", "a newer relationship generation exists");
+          }
+          if (existing.generation === body.proposal.generation) {
+            if (existing.accountState === "accepted") {
+              throw new HttpError(409, "relationship_conflict", "accepted canonical relationship is immutable");
+            }
+            const isExpiredNextAttempt = existing.relationshipId === body.proposal.relationshipIdCandidate && body.proposal.attempt === existing.canonicalProposal.attempt + 1 && existing.canonicalProposal.expiresAt <= now;
+            if (isExpiredNextAttempt) {
+              retainedAttempts = existing.attempts ?? [];
+            }
+            if (!isExpiredNextAttempt && compareRank(existing.canonicalProposal, body.proposal) <= 0) {
+              throw new HttpError(409, "relationship_superseded", "relationship proposal lost canonical ordering");
+            }
+            if (existing.direction === "incoming" && existing.ticketSecretHash) {
+              await transaction.put(`${RELATIONSHIP_TICKET_PREFIX}${existing.ticketId}`, {
+                relationshipKey,
+                ticketSecretHash: existing.ticketSecretHash,
+                status: "superseded"
+              });
+            }
+          } else if (existing.accountState !== "removed" || body.proposal.generation !== existing.generation + 1) {
+            throw new HttpError(409, "relationship_conflict", "relationship generation cannot advance");
+          }
+        } else if (body.proposal.generation !== 1) {
+          throw new HttpError(409, "relationship_conflict", "initial relationship generation must be 1");
+        }
+        const localJoinStates = Object.fromEntries(
+          storedIdentity.bundle.devices.filter((device) => device.status === "active").map((device) => [device.deviceId, "waiting_welcome"])
+        );
+        relationship = {
+          relationshipId: body.proposal.relationshipIdCandidate,
+          peerUserId: body.requesterBundle.userId,
+          peerRootPublicKey: body.requesterBundle.userPublicKey,
+          peerBundleDigest: body.proposal.senderBundleDigest,
+          peerBundleRevision: body.requesterBundle.publicationRevision ?? 0,
+          generation: body.proposal.generation,
+          canonicalProposal: body.proposal,
+          accountState: "pending",
+          setupState: "delivering",
+          localDeviceJoinStates: localJoinStates,
+          version: (existing?.version ?? 0) + 1,
+          updatedAt: now,
+          direction: "incoming",
+          peerBundle: body.requesterBundle,
+          ticketId: generatedTicketId,
+          ticketSecretHash: generatedTicketSecretHash
+        };
+        ticket = {
+          ticketId: generatedTicketId,
+          relationshipId: relationship.relationshipId,
+          generation: relationship.generation,
+          attempt: body.proposal.attempt
+        };
+      }
+      const selected = [];
+      for (const target of body.targets) {
+        const entries = await transaction.list({
+          prefix: `${KEY_PACKAGE_PREFIX}${target.deviceId}:`
+        });
+        let available;
+        for (const [key, value] of entries) {
+          if (value.state === "available" && value.expiresAt <= now) {
+            value.state = "expired";
+            await transaction.put(key, value);
+            continue;
+          }
+          if (value.state === "available" && (!available || value.createdAt < available.value.createdAt || value.createdAt === available.value.createdAt && key < available.key)) {
+            available = { key, value };
+          }
+        }
+        if (!available) {
+          throw new HttpError(409, "keypackage_pool_exhausted", "a target device has no available KeyPackage");
+        }
+        selected.push({ key: available.key, value: available.value, claimId: claimIds.get(target.deviceId) });
+      }
+      const claims = [];
+      for (const selectedPackage of selected) {
+        selectedPackage.value.state = "claimed";
+        selectedPackage.value.claimId = selectedPackage.claimId;
+        selectedPackage.value.claimedAt = now;
+        await transaction.put(selectedPackage.key, selectedPackage.value);
+        claims.push({
+          claimId: selectedPackage.claimId,
+          userId: selectedPackage.value.userId,
+          deviceId: selectedPackage.value.deviceId,
+          keyPackageId: selectedPackage.value.keyPackageId,
+          keyPackageB64: selectedPackage.value.keyPackageB64,
+          createdAt: selectedPackage.value.createdAt,
+          expiresAt: selectedPackage.value.expiresAt
+        });
+      }
+      if (relationship && ticket) {
+        relationship.attempts = [...retainedAttempts, {
+          attempt: body.proposal.attempt,
+          proposalId: body.proposal.proposalId,
+          ticketId: ticket.ticketId,
+          ticketSecret: "",
+          claimIds: claims.map((claim) => claim.claimId),
+          welcomeDigests: [],
+          claimSets: [{
+            purpose: body.purpose,
+            idempotencyKey: body.idempotencyKey,
+            claims,
+            ticket: { ...ticket }
+          }],
+          createdAt: body.proposal.createdAt,
+          expiresAt: body.proposal.expiresAt
+        }];
+        await transaction.put(relationshipKey, relationship);
+        await transaction.put(`${RELATIONSHIP_TICKET_PREFIX}${ticket.ticketId}`, {
+          relationshipKey,
+          ticketSecretHash: relationship.ticketSecretHash,
+          status: "active"
+        });
+      }
+      const result2 = {
+        idempotencyKey: body.idempotencyKey,
+        requestDigest,
+        claims,
+        ...ticket ? { ticket } : {}
+      };
+      await transaction.put(claimIdempotencyKey, result2);
+      return result2;
+    });
+    const result = {
+      idempotencyKey: storedResult.idempotencyKey,
+      claims: storedResult.claims,
+      ...storedResult.ticket ? {
+        ticket: {
+          ...storedResult.ticket,
+          ticketSecret: await deriveTicketSecret(
+            this.envRef,
+            storedResult.idempotencyKey,
+            storedResult.ticket.ticketId
+          )
+        }
+      } : {}
+    };
+    return jsonResponse(result);
+  }
+  async listRelationships(request) {
+    await this.requireLocalActiveDevice(request);
+    const stored = await this.stateRef.storage.list({ prefix: RELATIONSHIP_PREFIX });
+    const relationships = Array.from(stored.values()).map((storedRelationship) => {
+      const {
+        peerBundle,
+        ticketId: _ticketId,
+        ticketSecretHash: _ticketSecretHash,
+        ticketStatusEndpoint: _ticketStatusEndpoint,
+        direction: _direction,
+        ...relationship
+      } = storedRelationship;
+      return { relationship, peerBundle };
+    });
+    return jsonResponse({ relationships });
+  }
+  async upsertOutboundRelationship(request, now) {
+    const writer = await this.requireLocalActiveDevice(request);
+    const body = await readJsonLimited(
+      request,
+      KEY_PACKAGE_BATCH_MAX_BYTES
+    );
+    const owner = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    const relationship = body.relationship;
+    const proposal = relationship.canonicalProposal;
+    if (body.version !== "2" || !owner || !verifyIdentityBundle(owner.bundle) || !verifyIdentityBundle(body.peerBundle) || relationship.peerUserId !== body.peerBundle.userId || relationship.peerRootPublicKey !== body.peerBundle.userPublicKey || relationship.peerBundleDigest !== await identityBundleDigest(body.peerBundle) || relationship.peerBundleRevision !== (body.peerBundle.publicationRevision ?? 0) || relationship.relationshipId !== proposal.relationshipIdCandidate || relationship.generation !== proposal.generation || relationship.accountState !== "pending" || proposal.initiatorUserId !== owner.bundle.userId || proposal.initiatorDeviceId !== writer.deviceId || proposal.peerUserId !== body.peerBundle.userId || proposal.senderBundleDigest !== await identityBundleDigest(owner.bundle) || body.ticket.relationshipId !== relationship.relationshipId || body.ticket.generation !== relationship.generation || body.ticket.attempt !== proposal.attempt) {
+      throw new HttpError(403, "relationship_proposal_invalid", "outbound relationship context is invalid");
+    }
+    const initiator = owner.bundle.devices.find((device) => device.deviceId === proposal.initiatorDeviceId);
+    if (!initiator || initiator.status !== "active" || !verifyEd25519(
+      initiator.devicePublicKey,
+      proposal.signature,
+      relationshipProposalSigningPayload(proposal)
+    )) {
+      throw new HttpError(403, "relationship_proposal_invalid", "outbound proposal signature is invalid");
+    }
+    const expectedStatusEndpoints = new Set(
+      body.peerBundle.devices.filter((device) => device.status === "active" && device.keyPackageClaimCapability).map((device) => {
+        const claimEndpoint = device.keyPackageClaimCapability.endpoint;
+        const base = claimEndpoint.endsWith("/v2/key-packages/claims") ? claimEndpoint.slice(0, -"/v2/key-packages/claims".length) : claimEndpoint.replace(/\/+$/, "");
+        return `${base}/v2/relationships/${encodeURIComponent(body.ticket.ticketId)}/status`;
+      })
+    );
+    let parsedStatus;
+    try {
+      parsedStatus = new URL(body.ticketStatusEndpoint);
+    } catch {
+      throw new HttpError(400, "invalid_input", "relationship status endpoint is invalid");
+    }
+    if (parsedStatus.protocol !== "https:" || parsedStatus.username || parsedStatus.password || parsedStatus.search || parsedStatus.hash || !expectedStatusEndpoints.has(body.ticketStatusEndpoint)) {
+      throw new HttpError(403, "relationship_proposal_invalid", "relationship status endpoint is not peer-authorized");
+    }
+    const activeLocalIds = owner.bundle.devices.filter((device) => device.status === "active").map((device) => device.deviceId).sort();
+    if (JSON.stringify(Object.keys(relationship.localDeviceJoinStates).sort()) !== JSON.stringify(activeLocalIds)) {
+      throw new HttpError(409, "identity_refresh_required", "outbound relationship must cover every active local device");
+    }
+    const sanitized = {
+      ...relationship,
+      attempts: relationship.attempts?.map((attempt) => ({
+        ...attempt,
+        ticketSecret: "",
+        ticketStatusEndpoint: body.ticketStatusEndpoint
+      })),
+      direction: "outbound",
+      peerBundle: body.peerBundle,
+      ticketId: body.ticket.ticketId,
+      ticketStatusEndpoint: body.ticketStatusEndpoint,
+      updatedAt: now
+    };
+    const relationshipKey = `${RELATIONSHIP_PREFIX}${await sha256Hex(body.peerBundle.userPublicKey)}`;
+    const stored = await this.stateRef.storage.transaction(async (transaction) => {
+      const existing = await transaction.get(relationshipKey);
+      if (existing) {
+        if (existing.generation > relationship.generation) {
+          throw new HttpError(409, "relationship_superseded", "a newer canonical relationship exists");
+        }
+        if (existing.generation === relationship.generation) {
+          if (existing.accountState === "accepted" && existing.relationshipId !== relationship.relationshipId) {
+            throw new HttpError(409, "relationship_conflict", "accepted canonical relationship is immutable");
+          }
+          if (existing.canonicalProposal.proposalId !== proposal.proposalId && !(existing.relationshipId === relationship.relationshipId && proposal.attempt === existing.canonicalProposal.attempt + 1 && existing.canonicalProposal.expiresAt <= now) && compareRank(existing.canonicalProposal, proposal) <= 0) {
+            return existing;
+          }
+          if (existing.direction === "incoming" && existing.ticketSecretHash) {
+            await transaction.put(`${RELATIONSHIP_TICKET_PREFIX}${existing.ticketId}`, {
+              relationshipKey,
+              ticketSecretHash: existing.ticketSecretHash,
+              status: "superseded"
+            });
+          }
+        }
+      }
+      await transaction.put(relationshipKey, sanitized);
+      return sanitized;
+    });
+    return jsonResponse({
+      canonical: stored.relationshipId === relationship.relationshipId,
+      relationship: (({
+        peerBundle: _peerBundle,
+        direction: _direction,
+        ticketId: _ticketId,
+        ticketSecretHash: _ticketSecretHash,
+        ticketStatusEndpoint: _ticketStatusEndpoint,
+        ...value
+      }) => value)(stored),
+      peerBundle: stored.peerBundle
+    });
+  }
+  async removeRelationship(request, relationshipId, now) {
+    await this.requireLocalActiveDevice(request);
+    validateOpaqueId("relationship", relationshipId);
+    const body = await readJsonLimited(
+      request,
+      CONTROL_JSON_MAX_BYTES
+    );
+    if (body.version !== "2" || body.relationshipId !== relationshipId || !Number.isSafeInteger(body.generation) || body.generation < 1) {
+      throw new HttpError(400, "invalid_input", "relationship removal context is invalid");
+    }
+    const relationships = await this.stateRef.storage.list({
+      prefix: RELATIONSHIP_PREFIX
+    });
+    const entry = Array.from(relationships.entries()).find(
+      ([, relationship]) => relationship.relationshipId === relationshipId
+    );
+    if (!entry) {
+      throw new HttpError(404, "not_found", "relationship is unavailable");
+    }
+    const [relationshipKey] = entry;
+    const updated = await this.stateRef.storage.transaction(async (transaction) => {
+      const current = await transaction.get(relationshipKey);
+      if (!current || current.relationshipId !== relationshipId || current.generation !== body.generation) {
+        throw new HttpError(409, "relationship_conflict", "canonical relationship changed");
+      }
+      if (current.accountState !== "removed") {
+        current.accountState = "removed";
+        current.setupState = "ready";
+        current.version += 1;
+        current.updatedAt = now;
+        await transaction.put(relationshipKey, current);
+      }
+      return current;
+    });
+    return jsonResponse({
+      removed: true,
+      relationshipId: updated.relationshipId,
+      generation: updated.generation
+    });
+  }
+  async updateRelationshipDeviceJoinState(request, relationshipId, deviceId, now) {
+    const writer = await this.requireLocalActiveDevice(request);
+    if (writer.deviceId !== deviceId) {
+      throw new HttpError(403, "runtime_auth_invalid", "device join state writer mismatch");
+    }
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    if (body.version !== "2" || !body.state || !["waiting_welcome", "joining", "ready", "failed"].includes(body.state)) {
+      throw new HttpError(400, "invalid_input", "relationship device join state is invalid");
+    }
+    const nextState = body.state;
+    await this.stateRef.storage.transaction(async (transaction) => {
+      const relationships = await transaction.list({
+        prefix: RELATIONSHIP_PREFIX
+      });
+      const entry = Array.from(relationships.entries()).find(
+        ([, relationship2]) => relationship2.relationshipId === relationshipId
+      );
+      if (!entry || entry[1].localDeviceJoinStates[deviceId] === void 0) {
+        throw new HttpError(404, "not_found", "relationship device is unavailable");
+      }
+      const [key, relationship] = entry;
+      relationship.localDeviceJoinStates[deviceId] = nextState;
+      if (relationship.accountState === "accepted") {
+        relationship.setupState = Object.values(relationship.localDeviceJoinStates).every((state) => state === "ready") ? "ready" : "delivering";
+      }
+      relationship.version += 1;
+      relationship.updatedAt = now;
+      await transaction.put(key, relationship);
+    });
+    return jsonResponse({ accepted: true, relationshipId, deviceId, state: nextState });
+  }
+  async confirmRelationshipPeerDecision(request, relationshipId, now) {
+    await this.requireLocalActiveDevice(request);
+    validateOpaqueId("relationship", relationshipId);
+    const body = await readJsonLimited(
+      request,
+      CONTROL_JSON_MAX_BYTES
+    );
+    const owner = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    if (body.version !== "2" || !owner || !verifyIdentityBundle(owner.bundle)) {
+      throw new HttpError(400, "invalid_input", "peer relationship decision is invalid");
+    }
+    const proof = body.proof;
+    const relationships = await this.stateRef.storage.list({
+      prefix: RELATIONSHIP_PREFIX
+    });
+    const entry = Array.from(relationships.entries()).find(
+      ([, relationship2]) => relationship2.relationshipId === relationshipId && relationship2.direction === "outbound"
+    );
+    if (!entry) throw new HttpError(404, "not_found", "outbound relationship is unavailable");
+    const [relationshipKey, relationship] = entry;
+    const actorDevice = relationship.peerBundle.devices.find(
+      (device) => device.deviceId === proof.actorDeviceId
+    );
+    if (proof.version !== "2" || proof.ticketId !== relationship.ticketId || proof.relationshipId !== relationship.relationshipId || proof.generation !== relationship.generation || proof.proposalId !== relationship.canonicalProposal.proposalId || proof.decision !== "accept" && proof.decision !== "reject" || proof.actorUserId !== relationship.peerBundle.userId || proof.peerUserId !== owner.bundle.userId || proof.peerBundleDigest !== relationship.canonicalProposal.senderBundleDigest || !Number.isSafeInteger(proof.decidedAt) || proof.decidedAt < relationship.canonicalProposal.createdAt || proof.decidedAt > now + CLOCK_TOLERANCE_MS || !actorDevice || actorDevice.status !== "active" || !verifyEd25519(
+      actorDevice.devicePublicKey,
+      proof.signature,
+      relationshipDecisionProofSigningPayload(proof)
+    )) {
+      throw new HttpError(403, "relationship_proposal_invalid", "peer decision proof is invalid");
+    }
+    const desired = proof.decision === "accept" ? "accepted" : "rejected";
+    const updated = await this.stateRef.storage.transaction(async (transaction) => {
+      const current = await transaction.get(relationshipKey);
+      if (!current || current.relationshipId !== relationshipId) {
+        throw new HttpError(409, "relationship_conflict", "canonical relationship changed");
+      }
+      if (current.accountState !== "pending" && current.accountState !== desired) {
+        throw new HttpError(409, "relationship_conflict", "relationship already has a final decision");
+      }
+      if (current.accountState === "pending") {
+        current.accountState = desired;
+        current.setupState = desired === "accepted" && Object.values(current.localDeviceJoinStates).every((state) => state === "ready") ? "ready" : desired === "accepted" ? "delivering" : "ready";
+        current.decisionProof = proof;
+        current.version += 1;
+        current.updatedAt = now;
+        await transaction.put(relationshipKey, current);
+      }
+      return current;
+    });
+    return jsonResponse({
+      accepted: true,
+      relationshipId: updated.relationshipId,
+      accountState: updated.accountState
+    });
+  }
+  async authorizeRelationshipAppend(request) {
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.senderRootPublicKey || !body.recipientDeviceId) {
+      throw new HttpError(400, "invalid_input", "relationship append context is incomplete");
+    }
+    const owner = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    const isAuthenticatedSelfDelivery = Boolean(
+      owner && verifyIdentityBundle(owner.bundle) && body.senderUserId === owner.bundle.userId && body.senderRootPublicKey === owner.bundle.userPublicKey && body.senderBundleDigest === await identityBundleDigest(owner.bundle)
+    );
+    let relationship;
+    if (isAuthenticatedSelfDelivery) {
+      const relationships = await this.stateRef.storage.list({
+        prefix: RELATIONSHIP_PREFIX
+      });
+      relationship = Array.from(relationships.values()).find(
+        (candidate) => candidate.direction === "outbound" && candidate.relationshipId === body.relationshipId
+      );
+    } else {
+      const key = `${RELATIONSHIP_PREFIX}${await sha256Hex(body.senderRootPublicKey)}`;
+      relationship = await this.stateRef.storage.get(key);
+    }
+    if (!relationship || relationship.accountState === "rejected" || relationship.accountState === "removed" || !isAuthenticatedSelfDelivery && relationship.peerUserId !== body.senderUserId || !isAuthenticatedSelfDelivery && relationship.peerRootPublicKey !== body.senderRootPublicKey || !isAuthenticatedSelfDelivery && relationship.peerBundleDigest !== body.senderBundleDigest || relationship.relationshipId !== body.relationshipId || relationship.generation !== body.generation || relationship.canonicalProposal.proposalId !== body.proposalId || relationship.canonicalProposal.attempt !== body.attempt || relationship.localDeviceJoinStates[body.recipientDeviceId] === void 0) {
+      throw new HttpError(403, "relationship_closed", "envelope is outside the canonical relationship");
+    }
+    if (relationship.accountState === "pending") {
+      if (body.messageType !== "mls_welcome" || !body.claimId) {
+        throw new HttpError(403, "relationship_closed", "pending relationships only accept claimed setup Welcomes");
+      }
+      const packages = await this.stateRef.storage.list({
+        prefix: `${KEY_PACKAGE_PREFIX}${body.recipientDeviceId}:`
+      });
+      if (!Array.from(packages.values()).some((item) => item.state === "claimed" && item.claimId === body.claimId)) {
+        throw new HttpError(403, "relationship_proposal_invalid", "setup Welcome claim is not valid");
+      }
+    }
+    return jsonResponse({
+      accountState: relationship.accountState,
+      selfDelivery: isAuthenticatedSelfDelivery
+    });
+  }
+  async listRelationshipRequests(request) {
+    await this.requireLocalActiveDevice(request);
+    const stored = await this.stateRef.storage.list({ prefix: RELATIONSHIP_PREFIX });
+    const requests = Array.from(stored.values()).filter(
+      (relationship) => relationship.direction === "incoming" && relationship.accountState === "pending" && relationship.canonicalProposal.expiresAt > Date.now()
+    ).map((relationship) => ({
+      ticketId: relationship.ticketId,
+      relationshipId: relationship.relationshipId,
+      generation: relationship.generation,
+      attempt: relationship.canonicalProposal.attempt,
+      peerBundle: relationship.peerBundle,
+      peerBundleDigest: relationship.peerBundleDigest,
+      proposal: relationship.canonicalProposal,
+      createdAt: relationship.canonicalProposal.createdAt,
+      expiresAt: relationship.canonicalProposal.expiresAt
+    }));
+    return jsonResponse({ requests });
+  }
+  async decideRelationship(request, ticketId, now) {
+    const writer = await this.requireLocalActiveDevice(request);
+    validateOpaqueId("ticket", ticketId);
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    const owner = await this.stateRef.storage.get(IDENTITY_BUNDLE_KEY);
+    if (body.version !== "2" || !owner || !verifyIdentityBundle(owner.bundle) || body.decision !== "accept" && body.decision !== "reject") {
+      throw new HttpError(400, "invalid_input", "relationship decision is invalid");
+    }
+    const relationship = await this.stateRef.storage.transaction(async (transaction) => {
+      const index = await transaction.get(`${RELATIONSHIP_TICKET_PREFIX}${ticketId}`);
+      if (!index || index.status === "superseded") {
+        throw new HttpError(409, "relationship_superseded", "relationship request was superseded");
+      }
+      const stored = await transaction.get(index.relationshipKey);
+      if (!stored || stored.ticketId !== ticketId) {
+        throw new HttpError(404, "not_found", "relationship request was not found");
+      }
+      if (stored.accountState === "pending" && stored.canonicalProposal.expiresAt <= now) {
+        throw new HttpError(409, "relationship_superseded", "relationship request has expired");
+      }
+      const proof = body.proof;
+      const actorDevice = owner.bundle.devices.find((device) => device.deviceId === proof?.actorDeviceId);
+      if (!proof || proof.version !== "2" || proof.ticketId !== ticketId || proof.relationshipId !== stored.relationshipId || proof.generation !== stored.generation || proof.proposalId !== stored.canonicalProposal.proposalId || proof.decision !== body.decision || proof.actorUserId !== owner.bundle.userId || proof.actorDeviceId !== writer.deviceId || proof.peerUserId !== stored.peerUserId || proof.peerBundleDigest !== stored.peerBundleDigest || !Number.isSafeInteger(proof.decidedAt) || Math.abs(now - proof.decidedAt) > CLOCK_TOLERANCE_MS || !actorDevice || actorDevice.status !== "active" || !verifyEd25519(
+        actorDevice.devicePublicKey,
+        proof.signature,
+        relationshipDecisionProofSigningPayload(proof)
+      )) {
+        throw new HttpError(403, "relationship_proposal_invalid", "relationship decision proof is invalid");
+      }
+      const desired = body.decision === "accept" ? "accepted" : "rejected";
+      if (stored.accountState !== "pending" && stored.accountState !== desired) {
+        throw new HttpError(409, "relationship_conflict", "relationship already has a final decision");
+      }
+      if (stored.accountState === "pending") {
+        stored.accountState = desired;
+        stored.setupState = desired === "accepted" && Object.values(stored.localDeviceJoinStates).every((state) => state === "ready") ? "ready" : desired === "accepted" ? "delivering" : "ready";
+        stored.version += 1;
+        stored.updatedAt = now;
+        stored.decisionProof = proof;
+        await transaction.put(index.relationshipKey, stored);
+      }
+      return stored;
+    });
+    const activeDevices = Object.keys(relationship.localDeviceJoinStates);
+    await this.stateRef.storage.transaction(async (transaction) => {
+      for (const deviceId of activeDevices) {
+        const projection = {
+          ticketId,
+          deviceId,
+          senderUserId: relationship.peerUserId,
+          proposalId: relationship.canonicalProposal.proposalId,
+          decision: body.decision,
+          attemptCount: 0,
+          nextRetryAt: now
+        };
+        await transaction.put(
+          `${RELATIONSHIP_PROJECTION_PREFIX}${ticketId}:${deviceId}`,
+          projection
+        );
+      }
+    });
+    await this.runRelationshipProjections(now);
+    return jsonResponse({
+      accepted: true,
+      ticketId,
+      relationshipId: relationship.relationshipId,
+      generation: relationship.generation,
+      accountState: relationship.accountState,
+      localDeviceJoinStates: relationship.localDeviceJoinStates,
+      proof: relationship.decisionProof
+    });
+  }
+  async runRelationshipProjections(now) {
+    const pending = await this.stateRef.storage.list({
+      prefix: RELATIONSHIP_PROJECTION_PREFIX
+    });
+    let nextAlarm;
+    const secret = this.envRef.SHARING_INTERNAL_SECRET?.trim();
+    if (!secret) {
+      if (pending.size > 0) await this.stateRef.storage.setAlarm(now + 5 * 60 * 1e3);
+      return;
+    }
+    for (const [key, projection] of pending) {
+      if (projection.nextRetryAt > now) {
+        nextAlarm = Math.min(nextAlarm ?? projection.nextRetryAt, projection.nextRetryAt);
+        continue;
+      }
+      const response = await this.envRef.INBOX.get(this.envRef.INBOX.idFromName(projection.deviceId)).fetch(new Request(
+        `https://inbox.internal/v2/inbox/${encodeURIComponent(projection.deviceId)}/internal/relationships/promote`,
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "X-Tapchat-Internal-Secret": secret
+          },
+          body: JSON.stringify({
+            senderUserId: projection.senderUserId,
+            proposalId: projection.proposalId,
+            decision: projection.decision
+          })
+        }
+      ));
+      if (response.ok) {
+        await this.stateRef.storage.delete(key);
+        continue;
+      }
+      projection.attemptCount += 1;
+      const delay = Math.min(
+        24 * 60 * 60 * 1e3,
+        5 * 60 * 1e3 * 2 ** Math.min(Math.max(projection.attemptCount - 1, 0), 8)
+      );
+      projection.nextRetryAt = now + delay;
+      await this.stateRef.storage.put(key, projection);
+      nextAlarm = Math.min(nextAlarm ?? projection.nextRetryAt, projection.nextRetryAt);
+    }
+    if (nextAlarm !== void 0) await this.stateRef.storage.setAlarm(nextAlarm);
+  }
+  async relationshipStatus(request, ticketId) {
+    validateOpaqueId("ticket", ticketId);
+    const index = await this.stateRef.storage.get(`${RELATIONSHIP_TICKET_PREFIX}${ticketId}`);
+    if (!index) throw new HttpError(403, "invalid_capability", "relationship ticket is invalid");
+    const relationship = await this.stateRef.storage.get(index.relationshipKey);
+    if (!relationship) throw new HttpError(404, "not_found", "relationship is unavailable");
+    const deviceId = request.headers.get("X-Tapchat-Ticket-Device")?.trim();
+    const issuedAt = Number(request.headers.get("X-Tapchat-Ticket-Issued-At"));
+    const secretProof = request.headers.get("X-Tapchat-Ticket-Secret-Proof")?.trim();
+    const proof = request.headers.get("X-Tapchat-Ticket-Proof")?.trim();
+    const device = relationship.peerBundle.devices.find((candidate) => candidate.deviceId === deviceId);
+    if (!deviceId || !secretProof || !proof || !Number.isSafeInteger(issuedAt) || Math.abs(Date.now() - issuedAt) > CLOCK_TOLERANCE_MS || !device || device.status !== "active" || secretProof !== await relationshipTicketSecretProof(
+      ticketId,
+      deviceId,
+      issuedAt,
+      index.ticketSecretHash
+    ) || !verifyEd25519(
+      device.devicePublicKey,
+      proof,
+      relationshipTicketStatusSigningPayload(ticketId, deviceId, issuedAt, secretProof)
+    )) {
+      throw new HttpError(403, "invalid_capability", "relationship ticket proof is invalid");
+    }
+    return jsonResponse({
+      ticketId,
+      status: index.status === "superseded" ? "superseded" : relationship.accountState,
+      relationshipId: relationship.relationshipId,
+      generation: relationship.generation,
+      canonicalProposal: relationship.canonicalProposal,
+      updatedAt: relationship.updatedAt,
+      ...relationship.decisionProof ? { decisionProof: relationship.decisionProof } : {}
+    });
   }
   async syncIdentityBundle(request, now) {
     const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
@@ -4151,11 +5333,11 @@ var GroupOutboxService = class {
     })).sort((left, right) => right.invite.createdAt - left.invite.createdAt);
     return { revision: await this.state.get(INVITE_REVISION_KEY) ?? 0, invites };
   }
-  async fetchInvite(payload, now) {
-    if (payload.groupId !== this.groupId) {
+  async fetchInvite(payload2, now) {
+    if (payload2.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "invite token group does not match route");
     }
-    const stored = await this.loadUsableInvite(payload.inviteId, now);
+    const stored = await this.loadUsableInvite(payload2.inviteId, now);
     if (stored.token !== stored.document.signature) {
       throw new HttpError(403, "invalid_capability", "invite signature is invalid");
     }
@@ -4190,20 +5372,20 @@ var GroupOutboxService = class {
     await this.scheduleNextAlarm(now);
     return { accepted: true, inviteId: input.inviteId };
   }
-  async submitJoinRequest(input, payload, now) {
-    if (payload.groupId !== this.groupId || input.request.groupId !== this.groupId) {
+  async submitJoinRequest(input, payload2, now) {
+    if (payload2.groupId !== this.groupId || input.request.groupId !== this.groupId) {
       throw new HttpError(400, "invalid_input", "join request group does not match route");
     }
     await this.rejectIfSealed();
-    if (payload.inviteId !== input.request.inviteId) {
+    if (payload2.inviteId !== input.request.inviteId) {
       throw new HttpError(403, "invalid_capability", "join request invite does not match bearer token");
     }
-    const invite = await this.loadUsableInvite(payload.inviteId, now);
+    const invite = await this.loadUsableInvite(payload2.inviteId, now);
     if (invite.document.joinPolicy === "closed") {
       throw new HttpError(403, "invalid_invite", "invite does not allow link join requests");
     }
     this.validateJoinRequest(input.request, now);
-    const idempotencyKey = `${JOIN_REQUEST_IDEMPOTENCY_PREFIX}${encodeURIComponent(payload.inviteId)}:${encodeURIComponent(input.request.joinerUserId)}:${encodeURIComponent(input.request.joinerDeviceId)}`;
+    const idempotencyKey = `${JOIN_REQUEST_IDEMPOTENCY_PREFIX}${encodeURIComponent(payload2.inviteId)}:${encodeURIComponent(input.request.joinerUserId)}:${encodeURIComponent(input.request.joinerDeviceId)}`;
     const existingRequestId = await this.state.get(idempotencyKey);
     if (existingRequestId) {
       const existingByIdentity = await this.state.get(`${JOIN_REQUEST_PREFIX}${existingRequestId}`);
@@ -4238,7 +5420,7 @@ var GroupOutboxService = class {
     await this.state.putEntries({
       [key]: { request },
       [idempotencyKey]: request.requestId,
-      [`${INVITE_PREFIX}${payload.inviteId}`]: {
+      [`${INVITE_PREFIX}${payload2.inviteId}`]: {
         ...invite,
         uses: nextUses,
         exhaustedAt
@@ -4644,9 +5826,9 @@ var GroupOutboxService = class {
     }
   }
   publish(event) {
-    const payload = JSON.stringify(event);
+    const payload2 = JSON.stringify(event);
     for (const session of this.sessions) {
-      session.send(payload);
+      session.send(payload2);
     }
   }
 };
@@ -4950,8 +6132,8 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     }
     const inviteFetchMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
     if (inviteFetchMatch && request.method === "GET") {
-      const payload = await verifyInviteToken(deps.sharingSecret, decodeURIComponent(inviteFetchMatch[1]), now);
-      return jsonResponse2(await service.fetchInvite(payload, now));
+      const payload2 = await verifyInviteToken(deps.sharingSecret, decodeURIComponent(inviteFetchMatch[1]), now);
+      return jsonResponse2(await service.fetchInvite(payload2, now));
     }
     const revokeMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/invites\/([^/]+)\/revoke$/);
     if (revokeMatch && request.method === "POST") {
@@ -4972,9 +6154,9 @@ async function handleGroupOutboxDurableRequest(request, deps) {
     const joinCollectionMatch = url.pathname.match(/\/v1\/groups\/[^/]+\/join-requests$/);
     if (joinCollectionMatch && request.method === "POST") {
       const token = getBearerToken(request);
-      const payload = await verifyInviteToken(deps.sharingSecret, token, now);
+      const payload2 = await verifyInviteToken(deps.sharingSecret, token, now);
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-      return jsonResponse2(await service.submitJoinRequest({ ...body, inviteToken: token }, payload, now));
+      return jsonResponse2(await service.submitJoinRequest({ ...body, inviteToken: token }, payload2, now));
     }
     if (joinCollectionMatch && request.method === "GET") {
       await authorization.authorize(
@@ -5070,11 +6252,11 @@ async function handleGroupOutboxDurableRequest(request, deps) {
 }
 async function verifyInviteToken(secret, token, now) {
   try {
-    const payload = await verifySharingPayload(secret, token, now);
-    if (payload.version !== "0.1" || payload.service !== "group_invite" || !payload.groupId || !payload.inviteId) {
+    const payload2 = await verifySharingPayload(secret, token, now);
+    if (payload2.version !== "0.1" || payload2.service !== "group_invite" || !payload2.groupId || !payload2.inviteId) {
       throw new Error("malformed group invite token");
     }
-    return payload;
+    return payload2;
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid group invite token";
     if (message.includes("expired")) {
@@ -5095,12 +6277,12 @@ async function groupIdFromGroupOutboxRequestUrl(url, sharingSecret, now) {
   if (!groupId) {
     const inviteMatch = url.pathname.match(/\/v1\/group-invite\/([^/]+)$/);
     if (inviteMatch) {
-      const payload = await verifyInviteToken(
+      const payload2 = await verifyInviteToken(
         sharingSecret,
         decodeURIComponent(inviteMatch[1]),
         now
       );
-      groupId = payload.groupId;
+      groupId = payload2.groupId;
     }
   }
   return groupId;
@@ -5137,8 +6319,8 @@ var GroupOutboxDurableObject = class extends DurableObjectBase2 {
       spillStore: new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
       sessions: Array.from(this.sessions.values()).map(
         (session) => ({
-          send(payload) {
-            return session.send(payload);
+          send(payload2) {
+            return session.send(payload2);
           }
         })
       ),
@@ -5180,7 +6362,7 @@ var GroupOutboxDurableObject = class extends DurableObjectBase2 {
       new DurableObjectStorageAdapter(this.stateRef.storage),
       new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
       { headSeq: 0, retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"), maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096") },
-      Array.from(this.sessions.values()).map((session) => ({ send: (payload) => session.send(payload) }))
+      Array.from(this.sessions.values()).map((session) => ({ send: (payload2) => session.send(payload2) }))
     );
     await service.processAlarm(Date.now());
   }
@@ -5193,7 +6375,7 @@ var ManagedSession = class {
     this.socket = socket;
     this.onClosed = onClosed;
   }
-  send(payload) {
+  send(payload2) {
     if (this.closed) {
       return false;
     }
@@ -5202,7 +6384,7 @@ var ManagedSession = class {
       return false;
     }
     try {
-      this.socket.send(payload);
+      this.socket.send(payload2);
       return true;
     } catch {
       this.close();
@@ -5229,6 +6411,56 @@ var ManagedSession = class {
     this.onClosed();
   }
 };
+
+// src/auth/internal-relationship.ts
+var HEADER_PREFIX = "v2.";
+function payload(deviceId, messageId, accountState) {
+  return new TextEncoder().encode(JSON.stringify([
+    "tapchat-inbox-relationship-authorization-v2",
+    deviceId,
+    messageId,
+    accountState
+  ]));
+}
+function hex(bytes) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+function bufferSource(bytes) {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+function fromHex(value) {
+  if (!/^[0-9a-f]{64}$/i.test(value)) return null;
+  return Uint8Array.from(value.match(/.{2}/g), (part) => Number.parseInt(part, 16));
+}
+async function hmacKey(secret, usages) {
+  return crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    usages
+  );
+}
+async function signRelationshipAuthorization(secret, deviceId, messageId) {
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await hmacKey(secret, ["sign"]),
+    bufferSource(payload(deviceId, messageId, "accepted"))
+  );
+  return `${HEADER_PREFIX}${hex(new Uint8Array(signature))}`;
+}
+async function verifyRelationshipAuthorization(secret, value, deviceId, messageId) {
+  if (!value?.startsWith(HEADER_PREFIX)) return false;
+  const signature = fromHex(value.slice(HEADER_PREFIX.length));
+  if (!signature) return false;
+  return crypto.subtle.verify(
+    "HMAC",
+    await hmacKey(secret, ["verify"]),
+    bufferSource(signature),
+    bufferSource(payload(deviceId, messageId, "accepted"))
+  );
+}
+var RELATIONSHIP_AUTHORIZATION_HEADER = "X-Tapchat-Internal-Relationship-Authorization";
 
 // src/inbox/service.ts
 var META_KEY2 = "meta";
@@ -5272,10 +6504,10 @@ var InboxService = class {
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, rejected);
       return rejected;
     }
-    if (authContext.mode !== "verified") {
+    if (authContext.mode !== "verified" && authContext.mode !== "relationship_accepted") {
       throw new HttpError(426, "upgrade_required", "verified append authorization is required");
     }
-    if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
+    if (authContext.mode === "relationship_accepted" || allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
       const delivered = await this.deliverEnvelope(input, now);
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, delivered);
       return delivered;
@@ -5445,6 +6677,42 @@ var InboxService = class {
       promotedConversationIds: [...promotedConversationIds].sort()
     };
   }
+  async promoteRelationshipRequest(senderUserId, proposalId, now) {
+    const entry = await this.state.get(this.messageRequestKey(senderUserId));
+    if (!entry) return { promotedCount: 0 };
+    const selected = entry.pendingRequests.filter(
+      (request) => "proposalId" in request.envelope && request.envelope.proposalId === proposalId
+    );
+    let promotedCount = 0;
+    for (const request of selected) {
+      const delivered = await this.deliverEnvelope(request, now);
+      await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
+      if (delivered.deliveredTo === "inbox") promotedCount += 1;
+    }
+    for (const request of entry.pendingRequests) {
+      if (!selected.some((candidate) => candidate.envelope.messageId === request.envelope.messageId)) {
+        await this.state.put(
+          `${APPEND_RESULT_PREFIX}${request.envelope.messageId}`,
+          this.supersededMessageRequestResult()
+        );
+      }
+    }
+    await this.deleteMessageRequest(senderUserId, "accepted");
+    await this.scheduleNextAlarm(now);
+    return { promotedCount };
+  }
+  async discardRelationshipRequest(senderUserId, now) {
+    const entry = await this.state.get(this.messageRequestKey(senderUserId));
+    if (!entry) return;
+    for (const request of entry.pendingRequests) {
+      await this.state.put(
+        `${APPEND_RESULT_PREFIX}${request.envelope.messageId}`,
+        this.supersededMessageRequestResult()
+      );
+    }
+    await this.deleteMessageRequest(senderUserId, "rejected");
+    await this.scheduleNextAlarm(now);
+  }
   async rejectMessageRequest(requestId, now) {
     const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
@@ -5530,7 +6798,9 @@ var InboxService = class {
       receivedAt: now,
       expiresAt,
       state: "available",
-      envelope: input.envelope
+      envelope: input.envelope,
+      ...input.senderIdentityBundle ? { senderIdentityBundle: input.senderIdentityBundle } : {},
+      ...input.relationshipProposal ? { relationshipProposal: input.relationshipProposal } : {}
     };
     const serialized = JSON.stringify(record);
     const storageKey = `${RECORD_PREFIX2}${seq}`;
@@ -5749,9 +7019,9 @@ var InboxService = class {
     await this.state.put(MESSAGE_REQUEST_RATE_LIMIT_KEY, state);
   }
   publish(event) {
-    const payload = JSON.stringify(event);
+    const payload2 = JSON.stringify(event);
     for (const session of this.sessions) {
-      session.send(payload);
+      session.send(payload2);
     }
   }
   validateAppendRequest(input) {
@@ -5915,9 +7185,9 @@ var InboxService = class {
         return null;
       }
       try {
-        const payload = JSON.parse(atob(encoded));
-        if (payload.groupId && payload.title) {
-          return payload;
+        const payload2 = JSON.parse(atob(encoded));
+        if (payload2.groupId && payload2.title) {
+          return payload2;
         }
       } catch {
         return null;
@@ -6043,6 +7313,23 @@ async function handleInboxDurableRequest(request, deps) {
     messageRequestRateLimitHour: deps.messageRequestRateLimitHour ?? 300
   });
   try {
+    if (url.pathname.endsWith("/internal/relationships/promote") && request.method === "POST") {
+      if (!deps.internalRelationshipSecret || request.headers.get("X-Tapchat-Internal-Secret") !== deps.internalRelationshipSecret) {
+        throw new HttpError(403, "invalid_capability", "internal relationship authorization failed");
+      }
+      const body = await readJsonLimited(
+        request,
+        CONTROL_JSON_MAX_BYTES
+      );
+      if (!body.senderUserId || !body.proposalId || !body.decision) {
+        throw new HttpError(400, "invalid_input", "relationship promotion context is incomplete");
+      }
+      if (body.decision === "reject") {
+        await service.discardRelationshipRequest(body.senderUserId, now);
+        return jsonResponse3({ promotedCount: 0 });
+      }
+      return jsonResponse3(await service.promoteRelationshipRequest(body.senderUserId, body.proposalId, now));
+    }
     if (url.pathname.endsWith("/subscribe")) {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         throw new HttpError(400, "invalid_input", "subscribe requires websocket upgrade");
@@ -6079,7 +7366,13 @@ async function handleInboxDurableRequest(request, deps) {
         request,
         deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
       );
-      const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified" ? "legacy_unverified" : "verified";
+      const relationshipAuthorized = deps.internalRelationshipSecret ? await verifyRelationshipAuthorization(
+        deps.internalRelationshipSecret,
+        request.headers.get(RELATIONSHIP_AUTHORIZATION_HEADER),
+        deps.deviceId,
+        body.envelope.messageId
+      ) : false;
+      const mode = relationshipAuthorized ? "relationship_accepted" : request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified" ? "legacy_unverified" : "verified";
       const result = await service.appendEnvelope(body, now, {
         mode,
         reason: request.headers.get(APPEND_AUTH_REASON_HEADER) ?? void 0
@@ -6136,7 +7429,7 @@ var InboxDurableObject = class extends DurableObjectBase3 {
   }
   async fetch(request) {
     const url = new URL(request.url);
-    const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
+    const match = url.pathname.match(/\/v[12]\/inbox\/([^/]+)\//);
     const deviceId = decodeURIComponent(match?.[1] ?? "");
     return handleInboxDurableRequest(request, {
       deviceId,
@@ -6144,8 +7437,8 @@ var InboxDurableObject = class extends DurableObjectBase3 {
       spillStore: new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
       sessions: Array.from(this.sessions.values()).map(
         (session) => ({
-          send(payload) {
-            return session.send(payload);
+          send(payload2) {
+            return session.send(payload2);
           }
         })
       ),
@@ -6160,6 +7453,7 @@ var InboxDurableObject = class extends DurableObjectBase3 {
       messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
       messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
       messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300"),
+      internalRelationshipSecret: this.envRef.SHARING_INTERNAL_SECRET?.trim(),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];
@@ -6217,7 +7511,7 @@ var ManagedSession2 = class {
     this.socket = socket;
     this.onClosed = onClosed;
   }
-  send(payload) {
+  send(payload2) {
     if (this.closed) {
       return false;
     }
@@ -6226,7 +7520,7 @@ var ManagedSession2 = class {
       return false;
     }
     try {
-      this.socket.send(payload);
+      this.socket.send(payload2);
       return true;
     } catch {
       this.close();
@@ -6469,23 +7763,23 @@ var StorageService = class {
     };
   }
   async uploadBlob(blobKey, token, body, contentLength, now) {
-    const payload = await this.verifyToken(token, now);
-    if (payload.action !== "upload" || payload.blobKey !== blobKey) {
+    const payload2 = await this.verifyToken(token, now);
+    if (payload2.action !== "upload" || payload2.blobKey !== blobKey) {
       throw new HttpError(403, "invalid_capability", "upload token is not valid for this blob");
     }
-    if (!Number.isSafeInteger(payload.sizeBytes) || contentLength !== payload.sizeBytes) {
+    if (!Number.isSafeInteger(payload2.sizeBytes) || contentLength !== payload2.sizeBytes) {
       throw new HttpError(400, "invalid_input", "upload body size does not match prepared size");
     }
-    if (!payload.readCapabilityHash || !payload.deleteCapabilityHash || !Number.isSafeInteger(payload.blobExpiresAt)) {
+    if (!payload2.readCapabilityHash || !payload2.deleteCapabilityHash || !Number.isSafeInteger(payload2.blobExpiresAt)) {
       throw new HttpError(403, "invalid_capability", "upload token is missing blob capability binding");
     }
     const stored = await this.store.putStream(blobKey, body, {
-      [CAPABILITY_METADATA_KEY]: payload.readCapabilityHash,
-      [DELETE_CAPABILITY_METADATA_KEY]: payload.deleteCapabilityHash,
-      [BLOB_EXPIRY_METADATA_KEY]: String(payload.blobExpiresAt),
+      [CAPABILITY_METADATA_KEY]: payload2.readCapabilityHash,
+      [DELETE_CAPABILITY_METADATA_KEY]: payload2.deleteCapabilityHash,
+      [BLOB_EXPIRY_METADATA_KEY]: String(payload2.blobExpiresAt),
       "content-type": "application/octet-stream"
     });
-    if (stored.size !== payload.sizeBytes) {
+    if (stored.size !== payload2.sizeBytes) {
       await this.store.delete(blobKey);
       throw new HttpError(400, "invalid_input", "stored upload size does not match prepared size");
     }
@@ -6600,6 +7894,18 @@ var WelcomePickupService = class {
     if (!request.welcomeB64?.trim()) {
       throw new HttpError(400, "invalid_input", "welcome_b64 must not be empty");
     }
+    const digestBytes = new Uint8Array(await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(request.welcomeB64)
+    ));
+    const actualDigest = btoa(String.fromCharCode(...digestBytes));
+    if (request.descriptor.welcomeDigest !== actualDigest) {
+      throw new HttpError(
+        403,
+        "relationship_proposal_invalid",
+        "welcome digest does not match descriptor"
+      );
+    }
     await this.store.putJson(pickupKey(request.descriptor.groupId, request.descriptor.deviceId, request.descriptor.requestId), {
       descriptor: request.descriptor,
       welcomeB64: request.welcomeB64,
@@ -6614,7 +7920,7 @@ var WelcomePickupService = class {
     if (!stored) {
       throw new HttpError(404, "not_found", "welcome pickup not found");
     }
-    if (stored.descriptor.capability !== descriptor.capability) {
+    if (stored.descriptor.capability !== descriptor.capability || stored.descriptor.claimId !== descriptor.claimId || stored.descriptor.welcomeDigest !== descriptor.welcomeDigest) {
       throw new HttpError(403, "invalid_capability", "welcome pickup capability does not match stored descriptor");
     }
     if (stored.descriptor.expiresAt <= now) {
@@ -6624,7 +7930,7 @@ var WelcomePickupService = class {
     return { welcomeB64: stored.welcomeB64, manifest: stored.manifest };
   }
   validateDescriptor(descriptor, now) {
-    if (!descriptor.groupId || !descriptor.deviceId || !descriptor.endpoint || !descriptor.capability) {
+    if (!descriptor.groupId || !descriptor.deviceId || !descriptor.endpoint || !descriptor.capability || !descriptor.claimId || !descriptor.welcomeDigest) {
       throw new HttpError(400, "invalid_input", "welcome pickup descriptor is missing required fields");
     }
     if (descriptor.expiresAt <= now) {
@@ -6835,12 +8141,12 @@ function publicDeploymentBundle(request, env) {
   return {
     version: CURRENT_MODEL_VERSION,
     runtimeId,
-    protocolVersion: 5,
-    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
-    registrySchemaVersion: 2,
+    protocolVersion: 6,
+    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v6-unknown",
+    registrySchemaVersion: 3,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
-    inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
+    inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v2/inbox/{deviceId}/subscribe`,
     storageBaseInfo: {
       baseUrl: baseUrl(request, env),
       bucketHint: "tapchat-storage"
@@ -6849,7 +8155,6 @@ function publicDeploymentBundle(request, env) {
       supportedRealtimeKinds: ["websocket"],
       identityBundleRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/identity-bundle`,
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
-      keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
       features: [
         "generic_sync",
@@ -6866,7 +8171,9 @@ function publicDeploymentBundle(request, env) {
         "runtime_secret_rotation_v1",
         "device_runtime_refresh_v2",
         "device_registry_v1",
-        "keypackage_lifecycle_v1",
+        "keypackage_pool_v2",
+        "relationship_registry_v2",
+        "envelope_v2",
         "identity_bundle_cas_v1",
         "structured_errors_v1"
       ]
@@ -6942,12 +8249,12 @@ async function handleRequest(request, env) {
     const contactShareMatch = url.pathname.match(/^\/v1\/contact-share\/([^/]+)$/);
     if (contactShareMatch && request.method === "GET") {
       const token = decodeURIComponent(contactShareMatch[1]);
-      const payload = await verifySharingPayload(sharedStateSecret(env), token, now);
-      if (payload.service !== "contact_share" || !payload.userId || !payload.shareId) {
+      const payload2 = await verifySharingPayload(sharedStateSecret(env), token, now);
+      if (payload2.service !== "contact_share" || !payload2.userId || !payload2.shareId) {
         throw new HttpError(403, "invalid_capability", "invalid contact share token");
       }
       const bundle = await authoritativeIdentityBundle(env, sharedState);
-      if (!bundle || bundle.userId !== payload.userId || bundle.bundleShareId !== payload.shareId) {
+      if (!bundle || bundle.userId !== payload2.userId || bundle.bundleShareId !== payload2.shareId) {
         throw new HttpError(404, "contact_share_revoked", "contact share not found");
       }
       return jsonResponse4(bundle);
@@ -7002,6 +8309,224 @@ async function handleRequest(request, env) {
       const result = await verified.json();
       return jsonResponse4({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
+    if (request.method === "POST" && url.pathname === "/v2/device-registry/key-packages") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "keypackage_write", now);
+      const bodyText = await readRequestTextLimited(request, 512 * 1024);
+      return registryStub(env).fetch(new Request(
+        "https://device-registry.internal/v2/device-registry/key-packages",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
+          body: bodyText
+        }
+      ));
+    }
+    if (request.method === "GET" && url.pathname === "/v2/device-registry/key-packages/status") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "keypackage_write", now);
+      return registryStub(env).fetch(new Request(
+        "https://device-registry.internal/v2/device-registry/key-packages/status",
+        { headers: { "X-Tapchat-Device-Id": token.deviceId } }
+      ));
+    }
+    if (request.method === "POST" && url.pathname === "/v2/key-packages/claims") {
+      const bodyText = await readRequestTextLimited(request, 512 * 1024);
+      return registryStub(env).fetch(new Request(
+        "https://device-registry.internal/v2/key-packages/claims",
+        { method: "POST", headers: { "content-type": "application/json" }, body: bodyText }
+      ));
+    }
+    if (request.method === "GET" && url.pathname === "/v2/device-registry/relationships") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      return registryStub(env).fetch(new Request(
+        "https://device-registry.internal/v2/device-registry/relationships",
+        { headers: { "X-Tapchat-Device-Id": token.deviceId } }
+      ));
+    }
+    if (request.method === "POST" && url.pathname === "/v2/device-registry/relationships/outbound") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      const bodyText = await readRequestTextLimited(request, 512 * 1024);
+      return registryStub(env).fetch(new Request(
+        "https://device-registry.internal/v2/device-registry/relationships/outbound",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
+          body: bodyText
+        }
+      ));
+    }
+    const relationshipRemoveV2 = url.pathname.match(
+      /^\/v2\/device-registry\/relationships\/([^/]+)\/remove$/
+    );
+    if (relationshipRemoveV2 && request.method === "POST") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+      return registryStub(env).fetch(new Request(
+        `https://device-registry.internal/v2/device-registry/relationships/${relationshipRemoveV2[1]}/remove`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
+          body: bodyText
+        }
+      ));
+    }
+    const relationshipPeerDecisionV2 = url.pathname.match(
+      /^\/v2\/device-registry\/relationships\/([^/]+)\/peer-decision$/
+    );
+    if (relationshipPeerDecisionV2 && request.method === "POST") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+      return registryStub(env).fetch(new Request(
+        `https://device-registry.internal/v2/device-registry/relationships/${relationshipPeerDecisionV2[1]}/peer-decision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
+          body: bodyText
+        }
+      ));
+    }
+    const relationshipJoinStateV2 = url.pathname.match(
+      /^\/v2\/device-registry\/relationships\/([^/]+)\/devices\/([^/]+)\/join-state$/
+    );
+    if (relationshipJoinStateV2 && request.method === "POST") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      const deviceId = decodeURIComponent(relationshipJoinStateV2[2]);
+      if (token.deviceId !== deviceId) {
+        throw new HttpError(403, "runtime_auth_invalid", "device join state writer mismatch");
+      }
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+      return registryStub(env).fetch(new Request(
+        `https://device-registry.internal/v2/device-registry/relationships/${relationshipJoinStateV2[1]}/devices/${relationshipJoinStateV2[2]}/join-state`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
+          body: bodyText
+        }
+      ));
+    }
+    if (request.method === "GET" && url.pathname === "/v2/relationships/requests") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      return registryStub(env).fetch(new Request(
+        "https://device-registry.internal/v2/relationships/requests",
+        { headers: { "X-Tapchat-Device-Id": token.deviceId } }
+      ));
+    }
+    const relationshipDecisionV2 = url.pathname.match(/^\/v2\/relationships\/([^/]+)\/decision$/);
+    if (relationshipDecisionV2 && request.method === "POST") {
+      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
+      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+      return registryStub(env).fetch(new Request(
+        `https://device-registry.internal/v2/relationships/${relationshipDecisionV2[1]}/decision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
+          body: bodyText
+        }
+      ));
+    }
+    const relationshipStatusV2 = url.pathname.match(/^\/v2\/relationships\/([^/]+)\/status$/);
+    if (relationshipStatusV2 && request.method === "GET") {
+      return registryStub(env).fetch(new Request(
+        `https://device-registry.internal/v2/relationships/${relationshipStatusV2[1]}/status`,
+        {
+          headers: {
+            "X-Tapchat-Ticket-Secret-Proof": request.headers.get("X-Tapchat-Ticket-Secret-Proof") ?? "",
+            "X-Tapchat-Ticket-Device": request.headers.get("X-Tapchat-Ticket-Device") ?? "",
+            "X-Tapchat-Ticket-Issued-At": request.headers.get("X-Tapchat-Ticket-Issued-At") ?? "",
+            "X-Tapchat-Ticket-Proof": request.headers.get("X-Tapchat-Ticket-Proof") ?? ""
+          }
+        }
+      ));
+    }
+    const inboxV2 = url.pathname.match(/^\/v2\/inbox\/([^/]+)\/(messages|ack|head|subscribe)$/);
+    if (inboxV2) {
+      const deviceId = decodeURIComponent(inboxV2[1]);
+      const operation = inboxV2[2];
+      const stub = env.INBOX.get(env.INBOX.idFromName(deviceId));
+      if (request.method === "POST" && operation === "messages") {
+        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
+        const body = JSON.parse(bodyText);
+        if (body.version !== "2" || body.recipientDeviceId !== deviceId || body.envelope.recipientDeviceId !== deviceId || body.senderIdentityBundle.publicationVersion !== 2 || body.recipientCapability.signature !== request.headers.get("Authorization")?.replace(/^Bearer\s+/, "") || !await verifyEnvelopeV2(body.envelope, body.senderIdentityBundle) || !body.relationshipProposal || body.relationshipProposal.proposalId !== body.envelope.proposalId || body.relationshipProposal.relationshipIdCandidate !== body.envelope.relationshipId || body.relationshipProposal.generation !== body.envelope.generation || body.relationshipProposal.attempt !== body.envelope.attempt || body.relationshipProposal.initiatorUserId !== body.envelope.senderUserId || body.relationshipProposal.initiatorDeviceId !== body.envelope.senderDeviceId || !verifyEd25519(
+          body.senderIdentityBundle.devices.find((device) => device.deviceId === body.envelope.senderDeviceId)?.devicePublicKey ?? "",
+          body.relationshipProposal.signature,
+          relationshipProposalSigningPayload(body.relationshipProposal)
+        )) {
+          throw new HttpError(403, "sender_identity_invalid", "Envelope V2 identity binding is invalid");
+        }
+        await validateAppendAuthorization(
+          request,
+          deviceId,
+          {
+            version: CURRENT_MODEL_VERSION,
+            recipientDeviceId: body.recipientDeviceId,
+            envelope: body.envelope
+          },
+          now,
+          () => authoritativeIdentityBundle(env, sharedState)
+        );
+        const relationshipAuthorization = await registryStub(env).fetch(new Request(
+          "https://device-registry.internal/v2/relationships/authorize-append",
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              senderUserId: body.envelope.senderUserId,
+              senderRootPublicKey: body.senderIdentityBundle.userPublicKey,
+              senderBundleDigest: body.envelope.senderBundleDigest,
+              senderDeviceId: body.envelope.senderDeviceId,
+              recipientDeviceId: body.envelope.recipientDeviceId,
+              relationshipId: body.envelope.relationshipId,
+              generation: body.envelope.generation,
+              attempt: body.envelope.attempt,
+              proposalId: body.envelope.proposalId,
+              claimId: body.envelope.claimId,
+              messageType: body.envelope.messageType
+            })
+          }
+        ));
+        if (!relationshipAuthorization.ok) return relationshipAuthorization;
+        const relationship = await relationshipAuthorization.json();
+        const forwardedBody = {
+          version: CURRENT_MODEL_VERSION,
+          recipientDeviceId: body.recipientDeviceId,
+          envelope: body.envelope,
+          ...body.envelope.messageType === "mls_welcome" ? { senderIdentityBundle: body.senderIdentityBundle } : {},
+          ...body.envelope.messageType === "mls_welcome" ? { relationshipProposal: body.relationshipProposal } : {},
+          senderBundleHash: await identityBundleDigest(body.senderIdentityBundle),
+          senderDisplayName: body.senderIdentityBundle.displayName
+        };
+        const forwarded = new Request(request.url, {
+          method: "POST",
+          headers: request.headers,
+          body: JSON.stringify(forwardedBody)
+        });
+        forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, "verified");
+        if (relationship.accountState === "accepted" || relationship.selfDelivery) {
+          forwarded.headers.set(
+            RELATIONSHIP_AUTHORIZATION_HEADER,
+            await signRelationshipAuthorization(
+              sharedStateSecret(env),
+              deviceId,
+              body.envelope.messageId
+            )
+          );
+        } else {
+          forwarded.headers.delete(RELATIONSHIP_AUTHORIZATION_HEADER);
+        }
+        return stub.fetch(forwarded);
+      }
+      if (request.method === "GET" && (operation === "messages" || operation === "head")) {
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
+        return stub.fetch(request);
+      }
+      if (request.method === "POST" && operation === "ack") {
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_ack", now);
+        return stub.fetch(request);
+      }
+      if (operation === "subscribe") {
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
+        return stub.fetch(request);
+      }
+    }
     const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
@@ -7009,18 +8534,7 @@ async function handleRequest(request, env) {
       const objectId = env.INBOX.idFromName(deviceId);
       const stub = env.INBOX.get(objectId);
       if (request.method === "POST" && operation === "messages") {
-        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
-        const body = JSON.parse(bodyText);
-        const appendAuth = await validateAppendAuthorization(
-          request,
-          deviceId,
-          body,
-          now,
-          () => authoritativeIdentityBundle(env, sharedState)
-        );
-        const forwarded = forwardRequestWithBody(request, bodyText);
-        forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, appendAuth.mode);
-        return await stub.fetch(forwarded);
+        return structuredErrorResponse(request, 426, "upgrade_required", false);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
       } else if (request.method === "POST" && operation === "ack") {
@@ -7028,6 +8542,9 @@ async function handleRequest(request, env) {
       } else if (operation === "subscribe") {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
       } else if (operation === "allowlist" || operation === "message-requests" || operation.startsWith("message-requests/")) {
+        if (operation.endsWith("/accept") || operation.endsWith("/reject")) {
+          return structuredErrorResponse(request, 426, "upgrade_required", false);
+        }
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
       }
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -7073,9 +8590,9 @@ async function handleRequest(request, env) {
     }
     const publicInviteMatch = url.pathname.match(/^\/v1\/group-invite\/([^/]+)$/);
     if (publicInviteMatch && request.method === "GET") {
-      let payload;
+      let payload2;
       try {
-        payload = await verifySharingPayload(
+        payload2 = await verifySharingPayload(
           sharedStateSecret(env),
           decodeURIComponent(publicInviteMatch[1]),
           now
@@ -7084,10 +8601,10 @@ async function handleRequest(request, env) {
         const message = error instanceof Error ? error.message : "invalid group invite token";
         throw new HttpError(message.includes("expired") ? 403 : 403, message.includes("expired") ? "capability_expired" : "invalid_capability", message);
       }
-      if (payload.service !== "group_invite" || !payload.groupId || !payload.inviteId) {
+      if (payload2.service !== "group_invite" || !payload2.groupId || !payload2.inviteId) {
         throw new HttpError(403, "invalid_capability", "group invite token is malformed");
       }
-      const objectId = env.GROUP_OUTBOX.idFromName(payload.groupId);
+      const objectId = env.GROUP_OUTBOX.idFromName(payload2.groupId);
       return env.GROUP_OUTBOX.get(objectId).fetch(request);
     }
     const groupInviteMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/invites(?:\/([^/]+)\/revoke)?$/);
@@ -7108,9 +8625,9 @@ async function handleRequest(request, env) {
         if (!token) {
           throw new HttpError(401, "invalid_capability", "missing group invite bearer token");
         }
-        let payload;
+        let payload2;
         try {
-          payload = await verifySharingPayload(sharedStateSecret(env), token, now);
+          payload2 = await verifySharingPayload(sharedStateSecret(env), token, now);
         } catch (error) {
           const message = error instanceof Error ? error.message : "invalid group invite token";
           throw new HttpError(
@@ -7119,7 +8636,7 @@ async function handleRequest(request, env) {
             message
           );
         }
-        if (payload.service !== "group_invite" || payload.groupId !== groupId) {
+        if (payload2.service !== "group_invite" || payload2.groupId !== groupId) {
           throw new HttpError(403, "invalid_capability", "group invite token scope does not match request");
         }
       }
@@ -7277,63 +8794,11 @@ async function handleRequest(request, env) {
     }
     const keyPackageRefsMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);
     if (keyPackageRefsMatch) {
-      const userId = decodeURIComponent(keyPackageRefsMatch[1]);
-      const deviceId = decodeURIComponent(keyPackageRefsMatch[2]);
-      if (request.method === "GET") {
-        const document = await sharedState.getKeyPackageRefs(userId, deviceId);
-        if (!document) {
-          return structuredErrorResponse(request, 404, "not_found", false);
-        }
-        return jsonResponse4(document);
-      }
-      if (request.method === "PUT") {
-        const authorization = await validateKeyPackageWriteAuthorization(
-          request,
-          deviceRuntimeSecrets(env),
-          userId,
-          deviceId,
-          void 0,
-          now,
-          sharedStateSecret(env)
-        );
-        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
-        const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-        await sharedState.putKeyPackageRefs(userId, deviceId, body);
-        const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
-        return jsonResponse4(saved);
-      }
+      return structuredErrorResponse(request, 410, "upgrade_required", false);
     }
     const keyPackageObjectMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);
     if (keyPackageObjectMatch) {
-      const userId = decodeURIComponent(keyPackageObjectMatch[1]);
-      const deviceId = decodeURIComponent(keyPackageObjectMatch[2]);
-      const keyPackageId = decodeURIComponent(keyPackageObjectMatch[3]);
-      if (request.method === "GET") {
-        const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
-        if (!payload) {
-          return structuredErrorResponse(request, 404, "not_found", false);
-        }
-        return new Response(payload, {
-          status: 200,
-          headers: {
-            "content-type": "application/octet-stream"
-          }
-        });
-      }
-      if (request.method === "PUT") {
-        const authorization = await validateKeyPackageWriteAuthorization(
-          request,
-          deviceRuntimeSecrets(env),
-          userId,
-          deviceId,
-          keyPackageId,
-          now,
-          sharedStateSecret(env)
-        );
-        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
-        await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
-        return new Response(null, { status: 204 });
-      }
+      return structuredErrorResponse(request, 410, "upgrade_required", false);
     }
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
       const auth = await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
@@ -7364,7 +8829,7 @@ async function handleRequest(request, env) {
         throw new HttpError(401, "invalid_capability", "missing blob capability");
       }
       const capability = header.slice("TapChat-Blob ".length).trim();
-      const payload = await store.fetchBlob(
+      const payload2 = await store.fetchBlob(
         blobKey,
         capability,
         request.headers.get("Range") ?? void 0,
@@ -7374,17 +8839,17 @@ async function handleRequest(request, env) {
       const headers = new Headers({
         "content-type": "application/octet-stream",
         "accept-ranges": "bytes",
-        "content-length": String(payload.contentLength)
+        "content-length": String(payload2.contentLength)
       });
-      if (payload.httpEtag) headers.set("etag", payload.httpEtag);
-      if (payload.range) {
+      if (payload2.httpEtag) headers.set("etag", payload2.httpEtag);
+      if (payload2.range) {
         headers.set(
           "content-range",
-          `bytes ${payload.range.offset}-${payload.range.offset + payload.range.length - 1}/${payload.size}`
+          `bytes ${payload2.range.offset}-${payload2.range.offset + payload2.range.length - 1}/${payload2.size}`
         );
       }
-      return new Response(payload.body, {
-        status: payload.range ? 206 : 200,
+      return new Response(payload2.body, {
+        status: payload2.range ? 206 : 200,
         headers
       });
     }

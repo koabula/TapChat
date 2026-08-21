@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use tapchat_core::CoreEngine;
 
@@ -54,6 +54,7 @@ pub async fn create_profile(
 pub async fn start_new_profile_onboarding(
     app: AppHandle,
     state: State<'_, AppState>,
+    mode: Option<String>,
 ) -> crate::errors::DesktopResult<()> {
     {
         let realtime = {
@@ -65,12 +66,16 @@ pub async fn start_new_profile_onboarding(
         }
     }
 
-    // Set session state to Onboarding Welcome
+    let step = match mode.as_deref() {
+        None | Some("welcome") => crate::state::OnboardingStep::Welcome,
+        Some("create") => crate::state::OnboardingStep::CreateIdentity,
+        Some("recover") => crate::state::OnboardingStep::RecoverIdentity,
+        Some(_) => return Err("invalid_input".into()),
+    };
+
     {
         let mut inner = state.inner.write().await;
-        inner.session = SessionState::Onboarding {
-            step: crate::state::OnboardingStep::Welcome,
-        };
+        inner.session = SessionState::Onboarding { step: step.clone() };
         inner.profile_path = None; // Clear profile path - will be set during onboarding
 
         // Reset engine to fresh state
@@ -83,7 +88,7 @@ pub async fn start_new_profile_onboarding(
     let _ = app.emit(
         "session-status",
         SessionStatus {
-            state: "onboarding:welcome".to_string(),
+            state: format!("onboarding:{step:?}").to_lowercase(),
             device_id: None,
             ws_connected: false,
             profile_path: None,
@@ -119,8 +124,26 @@ pub async fn activate_profile(
             .map_err(|_| profile_access_error(passphrase_supplied))?;
     }
 
-    // Reload the engine from the new profile
-    reload_engine_from_profile(&app, &state).await?;
+    let onboarding_window = app.get_webview_window("onboarding");
+    if let Some(window) = onboarding_window.as_ref() {
+        window.hide().map_err(|error| error.to_string())?;
+    }
+
+    // Reload the engine from the new profile.
+    if let Err(error) = reload_engine_from_profile(&app, &state).await {
+        if let Some(window) = onboarding_window.as_ref() {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        return Err(error.into());
+    }
+    if let Some(window) = onboarding_window {
+        if let Some(main_window) = app.get_webview_window("main") {
+            main_window.show().map_err(|error| error.to_string())?;
+            let _ = main_window.set_focus();
+        }
+        window.close().map_err(|error| error.to_string())?;
+    }
     if let Err(error) = crate::commands::message::run_attachment_maintenance(&app).await {
         log::warn!("post-switch attachment maintenance failed: {error}");
     }
