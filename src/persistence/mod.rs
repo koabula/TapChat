@@ -8,15 +8,14 @@ use crate::ffi_api::{AttachmentDescriptor, AttachmentVariantSource};
 use crate::identity::LocalIdentityState;
 use crate::mls_adapter::{MlsConversationPatch, PublishedKeyPackage};
 use crate::model::{
-    Ack, DeploymentBundle, Envelope, EnvelopeV2, GroupCapability, GroupCursor, GroupEnvelope,
+    Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
     GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupManifest, GroupMembershipProof,
     GroupRole, GroupTransitionOperation, GroupTransitionRequestBinding, IdentityBundle,
-    MlsStateSummary, PersistedRelationship, WelcomePickupDescriptor,
+    MlsStateSummary, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    GroupInviteStatus, KeyPackageClaimPurpose, PrepareBlobUploadResult, PutWelcomePickupRequest,
-    SealGroupOutboxRequest,
+    GroupInviteStatus, PrepareBlobUploadResult, PutWelcomePickupRequest, SealGroupOutboxRequest,
 };
 
 fn pending_welcome_pickup_key(group_id: &str, device_id: &str) -> String {
@@ -36,93 +35,9 @@ pub struct PersistedDeployment {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_package_inventory: Vec<PublishedKeyPackage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending_key_package_publish: Option<PendingKeyPackagePublish>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relationships: Vec<PersistedRelationship>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub key_package_claim_operations: Vec<PersistedKeyPackageClaimOperation>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub quarantine: Vec<PersistedQuarantineRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_identity_publication: Option<PendingIdentityPublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serialized_mls_bootstrap_state: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
-pub enum PersistedKeyPackageClaimContinuation {
-    CreateGroup {
-        title: String,
-        member_user_ids: Vec<String>,
-    },
-    InviteToGroup {
-        group_id: String,
-        invitee_user_ids: Vec<String>,
-    },
-    ApproveGroupJoin {
-        group_id: String,
-        request_id: String,
-    },
-    AddGroupMemberDevice {
-        group_id: String,
-        user_id: String,
-        device_id: String,
-    },
-    ReconcileConversation {
-        conversation_id: String,
-    },
-    RebuildConversation {
-        conversation_id: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistedAccountKeyPackageClaim {
-    pub user_id: String,
-    pub target_device_ids: Vec<String>,
-    #[serde(default)]
-    pub target_bundle_digest: String,
-    #[serde(default)]
-    pub target_bundle_revision: u64,
-    pub endpoint: String,
-    pub idempotency_key: String,
-    pub proposal: crate::model::RelationshipProposalV2,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<crate::model::KeyPackageClaimSet>,
-    #[serde(default)]
-    pub retry_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistedKeyPackageClaimOperation {
-    pub operation_id: String,
-    pub purpose: KeyPackageClaimPurpose,
-    pub continuation: PersistedKeyPackageClaimContinuation,
-    pub accounts: Vec<PersistedAccountKeyPackageClaim>,
-    pub created_at: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingKeyPackagePublish {
-    pub idempotency_key: String,
-    pub device_id: String,
-    pub package_ids: Vec<String>,
-    pub created_at: u64,
-    #[serde(default)]
-    pub attempt_count: u8,
-    #[serde(default)]
-    pub next_retry_at: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistedQuarantineRecord {
-    pub device_id: String,
-    pub seq: u64,
-    pub message_id: String,
-    pub envelope_digest: String,
-    pub reason: String,
-    pub quarantined_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,8 +115,6 @@ pub struct PersistedMlsState {
 pub struct PersistedOutgoingEnvelope {
     pub message_id: String,
     pub envelope: Envelope,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub envelope_v2: Option<EnvelopeV2>,
     pub peer_user_id: String,
     pub retries: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -584,7 +497,7 @@ pub struct CorePersistenceSnapshot {
     pub mls_state_persistence_blocked: bool,
 }
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotFileEnvelope {
@@ -1036,7 +949,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> crate::CoreResult<CorePersistenceSnapsho
         crate::CoreError::invalid_input(format!("failed to decode persistence snapshot: {error}"))
     })?;
 
-    if !matches!(envelope.format_version, 1 | 2 | SNAPSHOT_FORMAT_VERSION) {
+    if !matches!(envelope.format_version, 1 | SNAPSHOT_FORMAT_VERSION) {
         return Err(crate::CoreError::unsupported(format!(
             "unsupported persistence snapshot format version {}",
             envelope.format_version
@@ -1141,7 +1054,6 @@ mod tests {
                         value: "proof".into(),
                     },
                 },
-                envelope_v2: None,
                 peer_user_id: "user:bob".into(),
                 retries: 0,
                 app_message_id: Some("app:conv:one:1:device:alice:phone".into()),
@@ -1163,8 +1075,6 @@ mod tests {
                     device_id: identity.device_identity.device_id.clone(),
                     endpoint: "https://example.com/welcome".into(),
                     capability: "capability".into(),
-                    claim_id: None,
-                    welcome_digest: None,
                     expires_at: 999,
                     start_seq: None,
                     roster_version: None,
@@ -1303,9 +1213,9 @@ mod tests {
                 deployment_bundle: DeploymentBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     runtime_id: "runtime:test".into(),
-                    protocol_version: 6,
+                    protocol_version: 5,
                     worker_build_id: "test-worker-v4".into(),
-                    registry_schema_version: 3,
+                    registry_schema_version: 2,
                     region: "local".into(),
                     inbox_http_endpoint: "https://example.com".into(),
                     inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -1344,10 +1254,6 @@ mod tests {
                 }),
                 published_key_package: None,
                 key_package_inventory: vec![],
-                pending_key_package_publish: None,
-                relationships: vec![],
-                key_package_claim_operations: vec![],
-                quarantine: vec![],
                 pending_identity_publication: None,
                 serialized_mls_bootstrap_state: None,
             }),
@@ -1560,8 +1466,6 @@ mod tests {
                 constraints: None,
                 signature: "cap-sig".into(),
             }),
-            key_package_claim_capability: None,
-            mls_device_key_binding: None,
             keypackage_ref: Some(crate::model::KeyPackageRef {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 user_id: user_id.into(),

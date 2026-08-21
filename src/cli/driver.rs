@@ -27,15 +27,15 @@ use crate::platform_ports::{
     SecureStoragePort, TimerPort, TransportPort,
 };
 use crate::transport_contract::{
-    AppendEnvelopeRequest, AppendEnvelopeRequestV2, AppendGroupEnvelopeRequest,
-    AppendGroupEnvelopeResult, AppendGroupTransitionRequest, AppendGroupTransitionResult,
-    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult,
-    ClaimGroupLeaveRequest, ClaimGroupLeaveResult, CompleteGroupJoinRequest,
-    CompleteGroupJoinResult, CreateGroupInviteRequest, CreateGroupInviteResult,
-    DecideGroupJoinRequest, DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupInviteResult, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
-    FetchWelcomePickupResult, GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
+    AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
+    AppendGroupTransitionRequest, AppendGroupTransitionResult, BlobDownloadRequest,
+    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
+    ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
+    CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
+    DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupInviteResult,
+    FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
     GetGroupJoinRequestStatusRequest, GetGroupJoinRequestStatusResult, GetGroupOutboxHeadRequest,
     GetGroupOutboxHeadResult, InitializeGroupAuthorizationRequest,
     InitializeGroupAuthorizationResult, ListGroupInvitesRequest, ListGroupInvitesResult,
@@ -561,18 +561,7 @@ impl CoreDriver {
             builder = builder.header(key, header_value);
         }
         if let Some(body) = request.body.as_deref() {
-            let is_envelope_v2 = serde_json::from_str::<serde_json::Value>(body)
-                .ok()
-                .and_then(|value| value.get("version")?.as_str().map(str::to_owned))
-                .as_deref()
-                == Some("2");
-            if request.url.contains("/messages") && is_envelope_v2 {
-                let append_request: AppendEnvelopeRequestV2 = serde_json::from_str(body)?;
-                self.runtime
-                    .recent_appends
-                    .push(append_request.envelope.legacy_shadow());
-            }
-            if request.url.contains("/messages") && !is_envelope_v2 {
+            if request.url.contains("/messages") {
                 let mut append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
                 if append_request.sender_bundle_share_url.is_none() {
                     append_request.sender_bundle_share_url = self.runtime.contact_share_url.clone();

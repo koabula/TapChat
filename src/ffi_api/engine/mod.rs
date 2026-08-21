@@ -2,14 +2,15 @@ mod direct;
 mod group_commands;
 mod group_fsm;
 mod group_sync;
-mod key_packages;
 mod recovery;
 mod transport;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::attachments::{attachment_download_task_id, validate_attachment_descriptor};
-use super::groups::{group_capability_operations, group_message_type_to_direct};
+use super::groups::{
+    active_peer_key_packages, group_capability_operations, group_message_type_to_direct,
+};
 use super::recovery::{
     is_degraded_restore_diagnostic, recovery_recoverable, suggested_recovery_action,
 };
@@ -36,25 +37,21 @@ use crate::mls_adapter::{
 };
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
-    DeliveryClass, DeviceJoinState, DeviceStatusKind, Envelope, GroupCapability, GroupCursor,
-    GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy, GroupJoinRequest,
+    DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
+    GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy, GroupJoinRequest,
     GroupJoinRequestStatus, GroupLeaveRequest, GroupLeaveRequestStatus, GroupManifest, GroupMember,
     GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
     GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
     GroupStateEvent, GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
-    IdentityBundle, InboxRecord, KeyPackageClaim, KeyPackageClaimSet, MessageType, MlsStateStatus,
-    MlsStateSummary, PersistedRelationship, ProtectedAppMessage, ProtectedPayloadKind,
-    RecordApplyOutcome, RelationshipAccountState, RelationshipAttempt, RelationshipProposalV2,
-    RelationshipSetupState, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, ProtectedAppMessage,
+    ProtectedPayloadKind, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, GroupConsistencyState,
-    GroupTransitionIntent, PendingGroupTransitionStage, PendingKeyPackagePublish, PersistOp,
-    PersistedAccountKeyPackageClaim, PersistedContact, PersistedConversation, PersistedDeployment,
-    PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
-    PersistedGroupLeaveRequest, PersistedGroupRealtimeSession, PersistedGroupState,
-    PersistedKeyPackageClaimContinuation, PersistedKeyPackageClaimOperation,
-    PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
+    GroupTransitionIntent, PendingGroupTransitionStage, PersistOp, PersistedContact,
+    PersistedConversation, PersistedDeployment, PersistedGroupCursor, PersistedGroupInvite,
+    PersistedGroupJoinRequest, PersistedGroupLeaveRequest, PersistedGroupRealtimeSession,
+    PersistedGroupState, PersistedLocalIdentity, PersistedMlsState, PersistedOutgoingEnvelope,
     PersistedOutgoingGroupEnvelope, PersistedPendingAck, PersistedPendingBlobTransfer,
     PersistedPendingGroupMembershipTransition, PersistedPendingGroupTransition,
     PersistedPendingWelcomePickup, PersistedRealtimeSession, PersistedRecoveryContext,
@@ -63,46 +60,33 @@ use crate::persistence::{
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
-    AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequestV2,
+    AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
     AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
     AppendGroupTransitionRequest, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
-    ClaimGroupLeaveRequest, ClaimKeyPackagesRequest, ClaimKeyPackagesResult,
-    CompleteGroupJoinRequest, ConfirmRelationshipPeerDecisionRequest, CreateGroupInviteRequest,
+    ClaimGroupLeaveRequest, CompleteGroupJoinRequest, CreateGroupInviteRequest,
     DecideGroupJoinRequest, DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest,
     FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessagesRequest, FetchMessagesResult,
-    FetchWelcomePickupRequest, FetchWelcomePickupResult, GetGroupAuthorizationStateRequest,
-    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GetHeadResult,
-    GroupAuthorizationUpdate, GroupJoinDecision, InitializeGroupAuthorizationRequest,
-    KeyPackagePoolStatus, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
-    ListGroupLeaveRequestsRequest, ListRelationshipRequestsResult, ListRelationshipsResult,
-    MessageRequestAction, MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
-    PrepareBlobUploadResult, PublishKeyPackageBatchRequest, PublishKeyPackageBatchResult,
-    PublishSharedStateRequest, PublishedKeyPackageV2, PutWelcomePickupRequest,
-    PutWelcomePickupResult, RealtimeSubscriptionRequest, RelationshipDecisionRequest,
-    RelationshipDecisionResult, RelationshipTicketStatusResult, RemoveRelationshipRequest,
-    ReplaceAllowlistRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
-    SharedStateDocumentKind, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
-    TransportAuthRequirement, UpdateRelationshipDeviceJoinStateRequest,
-    UpsertOutboundRelationshipRequest, UpsertOutboundRelationshipResult,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
+    FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GetHeadResult, GroupAuthorizationUpdate, GroupJoinDecision,
+    InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
+    ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
+    MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
+    PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
+    SubmitGroupJoinRequest, SubmitGroupLeaveRequest, TransportAuthRequirement,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Verifier;
 use log;
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Default)]
 pub struct CoreEngine {
     pub(crate) state: CoreState,
-    pending_inbound_commits: BTreeMap<String, PendingInboundCommit>,
-}
-
-#[derive(Debug)]
-struct PendingInboundCommit {
-    state: CoreState,
-    post_commit_output: CoreOutput,
 }
 
 #[derive(Debug, Default)]
@@ -259,50 +243,6 @@ impl CoreEngine {
         self.state.conversations.get(conversation_id)
     }
 
-    pub fn relationship_view_state(&self, conversation_id: &str) -> Option<RelationshipViewState> {
-        let relationship = self.state.relationships.values().find(|relationship| {
-            format!(
-                "conv:direct:v2:{}:g{}",
-                relationship.relationship_id, relationship.generation
-            ) == conversation_id
-        })?;
-        let canonical = if relationship.setup_state == RelationshipSetupState::Superseded {
-            self.state
-                .relationships
-                .values()
-                .filter(|candidate| {
-                    candidate.peer_user_id == relationship.peer_user_id
-                        && candidate.generation == relationship.generation
-                        && candidate.setup_state != RelationshipSetupState::Superseded
-                })
-                .min_by(|left, right| {
-                    left.canonical_proposal
-                        .canonical_rank()
-                        .cmp(&right.canonical_proposal.canonical_rank())
-                })
-                .unwrap_or(relationship)
-        } else {
-            relationship
-        };
-        let local_device_join_state = self.local_device_id().and_then(|device_id| {
-            relationship
-                .local_device_join_states
-                .get(device_id)
-                .copied()
-        });
-        Some(RelationshipViewState {
-            relationship_id: relationship.relationship_id.clone(),
-            generation: relationship.generation,
-            account_state: relationship.account_state,
-            setup_state: relationship.setup_state,
-            local_device_join_state,
-            canonical_conversation_id: format!(
-                "conv:direct:v2:{}:g{}",
-                canonical.relationship_id, canonical.generation
-            ),
-        })
-    }
-
     pub fn mls_summary(&self, conversation_id: &str) -> Option<&MlsStateSummary> {
         self.state.mls_summaries.get(conversation_id)
     }
@@ -431,7 +371,6 @@ impl CoreEngine {
             .into_iter()
             .map(|item| PendingOutboxItem {
                 envelope: item.envelope,
-                envelope_v2: item.envelope_v2,
                 peer_user_id: item.peer_user_id,
                 retries: item.retries,
                 in_flight: false,
@@ -731,44 +670,22 @@ impl CoreEngine {
                 group_realtime_sessions,
                 mls_adapter: restored_mls.adapter,
                 mls_summaries,
-                // Protocol V2 never restores the legacy singleton public
-                // KeyPackage. Those objects are not claimable and must not be
-                // reintroduced into the one-shot pool after a hard-cut upgrade.
-                published_key_package: None,
+                published_key_package: persisted_deployment
+                    .as_ref()
+                    .and_then(|deployment| deployment.published_key_package.clone()),
                 key_package_inventory: persisted_deployment
                     .as_ref()
-                    .map(|deployment| deployment.key_package_inventory.clone())
-                    .unwrap_or_default(),
-                pending_key_package_publish: persisted_deployment
-                    .as_ref()
-                    .and_then(|deployment| deployment.pending_key_package_publish.clone()),
-                relationships: persisted_deployment
-                    .as_ref()
                     .map(|deployment| {
-                        deployment
-                            .relationships
-                            .iter()
-                            .cloned()
-                            .map(|relationship| {
-                                (relationship.relationship_id.clone(), relationship)
-                            })
-                            .collect()
+                        if deployment.key_package_inventory.is_empty() {
+                            deployment
+                                .published_key_package
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        } else {
+                            deployment.key_package_inventory.clone()
+                        }
                     })
-                    .unwrap_or_default(),
-                key_package_claim_operations: persisted_deployment
-                    .as_ref()
-                    .map(|deployment| {
-                        deployment
-                            .key_package_claim_operations
-                            .iter()
-                            .cloned()
-                            .map(|operation| (operation.operation_id.clone(), operation))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                quarantine: persisted_deployment
-                    .as_ref()
-                    .map(|deployment| deployment.quarantine.clone())
                     .unwrap_or_default(),
                 pending_identity_publication: persisted_deployment
                     .as_ref()
@@ -782,7 +699,6 @@ impl CoreEngine {
                 pending_sync_group_head: BTreeSet::new(),
                 group_sync_target_head: BTreeMap::new(),
             },
-            pending_inbound_commits: BTreeMap::new(),
         };
 
         if engine.state.mls_adapter.is_none() {
@@ -1326,13 +1242,6 @@ impl CoreEngine {
                 records,
                 to_seq,
             } => self.handle_inbox_records(device_id, records, to_seq),
-            CoreEvent::PersistenceCommitted { commit_id } => {
-                self.handle_persistence_committed(&commit_id)
-            }
-            CoreEvent::PersistenceFailed {
-                commit_id,
-                failure: _,
-            } => self.handle_persistence_failed(&commit_id),
             CoreEvent::InboxHistoryFloorAdvanced {
                 device_id,
                 history_floor_seq,
@@ -2498,23 +2407,6 @@ impl CoreEngine {
             ),
         }
     }
-
-    fn handle_persistence_committed(&mut self, commit_id: &str) -> CoreResult<CoreOutput> {
-        let Some(commit) = self.pending_inbound_commits.remove(commit_id) else {
-            // A duplicate completion after restart is harmless: the committed
-            // snapshot already contains any pending ACK.
-            return Ok(CoreOutput::default());
-        };
-        self.state = commit.state;
-        Ok(commit.post_commit_output)
-    }
-
-    fn handle_persistence_failed(&mut self, commit_id: &str) -> CoreResult<CoreOutput> {
-        // The live state was never replaced, so dropping the fork is the full
-        // rollback. In particular no ACK or view-model effect is released.
-        self.pending_inbound_commits.remove(commit_id);
-        Ok(CoreOutput::default())
-    }
 }
 
 fn current_timestamp_hint(outbox_len: usize) -> u64 {
@@ -2552,12 +2444,6 @@ fn current_unix_millis(fallback: u64) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(fallback)
-}
-
-fn random_opaque_id(_purpose: &str) -> String {
-    let mut bytes = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    crate::identity::encode_hex(&bytes)
 }
 
 fn hex_prefix(bytes: &[u8], len: usize) -> String {
@@ -2624,54 +2510,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn fork_core_state(state: &CoreState) -> CoreResult<CoreState> {
-    Ok(CoreState {
-        local_identity: state.local_identity.clone(),
-        local_bundle: state.local_bundle.clone(),
-        deployment_bundle: state.deployment_bundle.clone(),
-        contacts: state.contacts.clone(),
-        conversations: state.conversations.clone(),
-        sync_states: state.sync_states.clone(),
-        outbox: state.outbox.clone(),
-        pending_outbox: state.pending_outbox.clone(),
-        group_states: state.group_states.clone(),
-        group_cursors: state.group_cursors.clone(),
-        pending_group_outbox: state.pending_group_outbox.clone(),
-        group_invites: state.group_invites.clone(),
-        group_join_requests: state.group_join_requests.clone(),
-        pending_group_join_approvals: state.pending_group_join_approvals.clone(),
-        pending_welcome_pickups: state.pending_welcome_pickups.clone(),
-        pending_group_seal: state.pending_group_seal.clone(),
-        pending_acks: state.pending_acks.clone(),
-        pending_blob_uploads: state.pending_blob_uploads.clone(),
-        pending_blob_downloads: state.pending_blob_downloads.clone(),
-        pending_blob_deletions: state.pending_blob_deletions.clone(),
-        realtime_sessions: state.realtime_sessions.clone(),
-        group_realtime_sessions: state.group_realtime_sessions.clone(),
-        mls_adapter: state
-            .mls_adapter
-            .as_ref()
-            .map(MlsAdapter::fork)
-            .transpose()?,
-        mls_summaries: state.mls_summaries.clone(),
-        published_key_package: state.published_key_package.clone(),
-        key_package_inventory: state.key_package_inventory.clone(),
-        pending_key_package_publish: state.pending_key_package_publish.clone(),
-        relationships: state.relationships.clone(),
-        key_package_claim_operations: state.key_package_claim_operations.clone(),
-        quarantine: state.quarantine.clone(),
-        pending_identity_publication: state.pending_identity_publication.clone(),
-        pending_requests: state.pending_requests.clone(),
-        request_nonce: state.request_nonce,
-        message_nonce: state.message_nonce,
-        recovery_contexts: state.recovery_contexts.clone(),
-        pending_allowlist_mutation: state.pending_allowlist_mutation.clone(),
-        local_display_name: state.local_display_name.clone(),
-        pending_sync_group_head: state.pending_sync_group_head.clone(),
-        group_sync_target_head: state.group_sync_target_head.clone(),
-    })
-}
-
 fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
     let mut unique = BTreeSet::new();
     unique.extend(ops);
@@ -2679,7 +2517,6 @@ fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
     let snapshot = build_persistence_snapshot(state);
     CoreEffect::PersistState {
         persist: PersistenceBatch {
-            commit_id: None,
             mutations: persistence_mutations(&snapshot, &ops),
             ops,
             snapshot: None,
@@ -3161,14 +2998,6 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 local_bundle: state.local_bundle.clone(),
                 published_key_package: state.published_key_package.clone(),
                 key_package_inventory: state.key_package_inventory.clone(),
-                pending_key_package_publish: state.pending_key_package_publish.clone(),
-                relationships: state.relationships.values().cloned().collect(),
-                key_package_claim_operations: state
-                    .key_package_claim_operations
-                    .values()
-                    .cloned()
-                    .collect(),
-                quarantine: state.quarantine.clone(),
                 pending_identity_publication: state.pending_identity_publication.clone(),
                 serialized_mls_bootstrap_state: if state.mls_summaries.is_empty() {
                     state
@@ -3207,7 +3036,6 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .map(|item| PersistedOutgoingEnvelope {
                 message_id: item.envelope.message_id.clone(),
                 envelope: item.envelope.clone(),
-                envelope_v2: item.envelope_v2.clone(),
                 peer_user_id: item.peer_user_id.clone(),
                 retries: item.retries,
                 app_message_id: item.app_message_id.clone(),
@@ -3438,9 +3266,6 @@ mod protected_application_message_tests {
             received_at: 1,
             expires_at: None,
             state: InboxRecordState::Available,
-            envelope_v2: None,
-            sender_identity_bundle: None,
-            relationship_proposal: None,
             envelope: Envelope {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 message_id: "msg:conv:alice:bob:1:device:bob:phone".into(),
@@ -3704,9 +3529,9 @@ mod group_membership_security_tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 3,
+            registry_schema_version: 2,
             region: "test".into(),
             inbox_http_endpoint: "https://example.test".into(),
             inbox_websocket_endpoint: "wss://example.test/ws".into(),
@@ -4055,8 +3880,6 @@ mod group_membership_security_tests {
             device_id,
             endpoint: "https://example.test/welcome".into(),
             capability: "capability".into(),
-            claim_id: None,
-            welcome_digest: None,
             expires_at: 999,
             start_seq: None,
             roster_version: None,

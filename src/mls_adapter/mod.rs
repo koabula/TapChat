@@ -4,16 +4,13 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
-use rand::RngCore;
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CoreError, CoreResult};
-use crate::identity::{encode_hex, LocalIdentityState};
+use crate::identity::LocalIdentityState;
 use crate::log_sanitize::redact_id;
-use crate::model::{
-    MessageType, MlsDeviceKeyBinding, MlsStateStatus, MlsStateSummary, MLS_CIPHERSUITE_V2,
-};
+use crate::model::{MessageType, MlsStateStatus, MlsStateSummary};
 
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -23,18 +20,12 @@ pub const KEY_PACKAGE_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
 pub const KEY_PACKAGE_CLOCK_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 pub const KEY_PACKAGE_ROTATION_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 pub const KEY_PACKAGE_ROTATION_JITTER_MAX_MS: u64 = 24 * 60 * 60 * 1000;
-pub const KEY_PACKAGE_POOL_TARGET: usize = 16;
-pub const KEY_PACKAGE_POOL_REFILL_THRESHOLD: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SerdeDeserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishedKeyPackageState {
     #[default]
-    PendingPublish,
     Advertised,
-    Claimed,
-    Expired,
-    // Legacy snapshot states retained only for format migration.
     Consumed,
     Retired,
 }
@@ -50,8 +41,6 @@ impl MlsAdapterModule {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize)]
 pub struct PublishedKeyPackage {
-    #[serde(default)]
-    pub key_package_id: String,
     pub key_package_ref: String,
     pub key_package_b64: String,
     #[serde(default)]
@@ -421,7 +410,6 @@ impl MlsAdapter {
         Ok((adapter, package))
     }
 
-    #[cfg(test)]
     pub fn generate_key_package(
         local_identity: &LocalIdentityState,
         now: u64,
@@ -456,27 +444,6 @@ impl MlsAdapter {
             self.credential_identity.clone(),
             now,
         )
-    }
-
-    pub fn generate_key_package_pool(
-        &mut self,
-        now: u64,
-        count: usize,
-    ) -> CoreResult<Vec<PublishedKeyPackage>> {
-        if count == 0 || count > KEY_PACKAGE_POOL_TARGET {
-            return Err(CoreError::invalid_input(
-                "key package pool batch size must be between 1 and 16",
-            ));
-        }
-        (0..count).map(|_| self.rotate_key_package(now)).collect()
-    }
-
-    pub fn signature_public_key(&self) -> String {
-        encode_hex(&self.signer.to_public_vec())
-    }
-
-    pub fn ciphersuite_name(&self) -> &'static str {
-        MLS_CIPHERSUITE_V2
     }
 
     pub fn create_conversation(
@@ -561,22 +528,6 @@ impl MlsAdapter {
             member_device_ids: member_device_ids.into_iter().collect(),
             epoch: self.export_group_summary(conversation_id)?.epoch,
         })
-    }
-
-    /// Replaces an unaccepted setup group on a fully isolated provider fork.
-    /// The live group and its key material remain untouched unless deletion,
-    /// recreation, member addition and Welcome generation all succeed.
-    pub fn rebuild_unaccepted_conversation(
-        &mut self,
-        conversation_id: &str,
-        peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
-    ) -> CoreResult<CreateConversationArtifacts> {
-        let mut staged = self.fork()?;
-        staged.delete_group(conversation_id)?;
-        let artifacts =
-            staged.create_conversation(conversation_id, peer_devices_with_keypackages)?;
-        *self = staged;
-        Ok(artifacts)
     }
 
     /// Create the canonical provisional MLS group containing only the local
@@ -766,55 +717,6 @@ impl MlsAdapter {
         }
     }
 
-    pub fn ingest_welcome_with_device_bindings(
-        &mut self,
-        conversation_id: &str,
-        payload_b64: &str,
-        bundles: &[crate::model::IdentityBundle],
-    ) -> CoreResult<IngestResult> {
-        let mut staged = self.fork()?;
-        let result = staged.ingest_welcome_in_place(conversation_id, payload_b64)?;
-        staged.validate_group_member_device_bindings(conversation_id, bundles)?;
-        *self = staged;
-        Ok(result)
-    }
-
-    pub fn ingest_protocol_message_with_device_bindings(
-        &mut self,
-        conversation_id: &str,
-        sender_device_id: &str,
-        message_type: MessageType,
-        payload_b64: &str,
-        bundles: &[crate::model::IdentityBundle],
-    ) -> CoreResult<IngestResult> {
-        if !matches!(
-            message_type,
-            MessageType::MlsCommit | MessageType::MlsApplication
-        ) {
-            return Err(CoreError::invalid_input(
-                "bound MLS protocol ingestion only accepts commits or applications",
-            ));
-        }
-        if !self.groups.contains_key(conversation_id) {
-            return Ok(IngestResult::PendingRetry);
-        }
-        let mut staged = self.fork()?;
-        let result = staged.ingest_protocol_message(
-            conversation_id,
-            sender_device_id,
-            message_type,
-            payload_b64,
-        )?;
-        if matches!(
-            &result,
-            IngestResult::AppliedCommit { .. } | IngestResult::AppliedApplication(_)
-        ) {
-            staged.validate_group_member_device_bindings(conversation_id, bundles)?;
-            *self = staged;
-        }
-        Ok(result)
-    }
-
     pub fn export_group_summary(&self, conversation_id: &str) -> CoreResult<MlsStateSummary> {
         let state = self
             .groups
@@ -899,54 +801,6 @@ impl MlsAdapter {
             }
         }
         Ok(result)
-    }
-
-    pub fn validate_group_member_device_bindings(
-        &self,
-        conversation_id: &str,
-        bundles: &[crate::model::IdentityBundle],
-    ) -> CoreResult<()> {
-        for bundle in bundles {
-            crate::identity::IdentityManager::verify_identity_bundle(bundle)?;
-        }
-        let state = self
-            .groups
-            .get(conversation_id)
-            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
-        for member in state.group.members() {
-            let identity = extract_sender_identity(&member.credential)?;
-            let fields = identity.split('|').collect::<Vec<_>>();
-            if fields.len() != 4 {
-                return Err(CoreError::invalid_input(
-                    "MLS leaf credential identity is malformed",
-                ));
-            }
-            let device = bundles
-                .iter()
-                .find(|bundle| bundle.user_id == fields[0])
-                .and_then(|bundle| {
-                    bundle.devices.iter().find(|device| {
-                        device.device_id == fields[1]
-                            && device.device_public_key == fields[2]
-                            && device.binding.signature == fields[3]
-                    })
-                })
-                .filter(|device| device.status == crate::model::DeviceStatusKind::Active)
-                .ok_or_else(|| {
-                    CoreError::invalid_input(
-                        "MLS leaf credential is not bound to an active IdentityBundle device",
-                    )
-                })?;
-            let binding = device.mls_device_key_binding.as_ref().ok_or_else(|| {
-                CoreError::invalid_input("MLS leaf device is missing its MLS key binding")
-            })?;
-            if encode_hex(&member.signature_key) != binding.mls_signature_public_key {
-                return Err(CoreError::invalid_input(
-                    "MLS leaf signature key does not match the device binding",
-                ));
-            }
-        }
-        Ok(())
     }
 
     pub fn export_persisted_group_state(&self, conversation_id: &str) -> CoreResult<String> {
@@ -1311,20 +1165,9 @@ impl MlsAdapter {
         conversation_id: &str,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
-        let mut staged = self.fork()?;
-        let result = staged.ingest_welcome_in_place(conversation_id, payload_b64)?;
-        *self = staged;
-        Ok(result)
-    }
-
-    fn ingest_welcome_in_place(
-        &mut self,
-        conversation_id: &str,
-        payload_b64: &str,
-    ) -> CoreResult<IngestResult> {
         // Rebuild/rejoin semantics treat a fresh welcome as authoritative for this
-        // conversation. This method only runs on a fork; failures cannot clear
-        // the live group or consume its KeyPackage private material.
+        // conversation. If stale local state still exists, replace it before
+        // attempting to join the new group.
         if self.groups.contains_key(conversation_id) {
             self.clear_conversation(conversation_id);
         }
@@ -1347,30 +1190,12 @@ impl MlsAdapter {
             }
         };
         let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
-            .map_err(|error| match error {
-                WelcomeError::NoMatchingKeyPackage => CoreError::new(
-                    "mls_no_matching_keypackage",
-                    "Welcome references a KeyPackage that is unavailable or already consumed",
-                ),
-                WelcomeError::LibraryError(_) | WelcomeError::StorageError(_) => {
-                    CoreError::invalid_state("failed to stage Welcome using local MLS state")
-                }
-                _ => CoreError::new(
-                    "mls_message_invalid",
-                    "Welcome failed MLS cryptographic validation",
-                ),
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to stage welcome: {error}"))
             })?;
-        let group = staged
-            .into_group(&self.provider)
-            .map_err(|error| match error {
-                WelcomeError::LibraryError(_) | WelcomeError::StorageError(_) => {
-                    CoreError::invalid_state("failed to persist the joined MLS group")
-                }
-                _ => CoreError::new(
-                    "mls_message_invalid",
-                    "Welcome produced an invalid MLS group",
-                ),
-            })?;
+        let group = staged.into_group(&self.provider).map_err(|error| {
+            CoreError::invalid_state(format!("failed to join group from welcome: {error}"))
+        })?;
         let member_device_ids = extract_member_device_ids(&group)?;
         self.groups.insert(
             conversation_id.to_string(),
@@ -1410,32 +1235,13 @@ impl MlsAdapter {
                 );
                 return Ok(IngestResult::IgnoredReplay);
             }
-            Err(ProcessMessageError::ValidationError(ValidationError::WrongEpoch)) => {
+            Err(_error) => {
                 log::warn!(
-                    "ingest_protocol_message: MLS message has a missing epoch predecessor for conversation {}",
+                    "ingest_protocol_message: MLS process_message failed for conversation {}",
                     redact_id("conversation", conversation_id)
                 );
                 state.status = MlsStateStatus::NeedsRecovery;
                 return Ok(IngestResult::PendingRetry);
-            }
-            Err(
-                ProcessMessageError::StorageError(_)
-                | ProcessMessageError::LibraryError(_)
-                | ProcessMessageError::GroupStateError(_)
-                | ProcessMessageError::ValidationError(ValidationError::LibraryError(_)),
-            ) => {
-                log::warn!(
-                    "ingest_protocol_message: local MLS processing state failed for conversation {}",
-                    redact_id("conversation", conversation_id)
-                );
-                state.status = MlsStateStatus::NeedsRecovery;
-                return Ok(IngestResult::PendingRetry);
-            }
-            Err(_) => {
-                return Err(CoreError::new(
-                    "mls_message_invalid",
-                    "MLS message failed cryptographic or structural validation",
-                ));
             }
         };
         let sender_identity = extract_sender_identity(processed.credential())?;
@@ -1498,60 +1304,17 @@ impl MlsAdapter {
                 CoreError::invalid_state(format!("failed to encode key package: {error}"))
             })?;
         let key_package_b64 = BASE64.encode(key_package_bytes);
-        let mut package_id = [0_u8; 32];
-        rand::thread_rng().fill_bytes(&mut package_id);
         Ok(PublishedKeyPackage {
-            key_package_id: encode_hex(&package_id),
             key_package_ref: key_package_b64.clone(),
             key_package_b64,
             lifecycle_version: KEY_PACKAGE_LIFECYCLE_VERSION,
             not_before: not_before_seconds.saturating_mul(1000),
             created_at: now_seconds.saturating_mul(1000),
             expires_at: not_after_seconds.saturating_mul(1000),
-            state: PublishedKeyPackageState::PendingPublish,
+            state: PublishedKeyPackageState::Advertised,
             credential_identity,
         })
     }
-}
-
-pub fn validate_key_package_device_binding(
-    payload_b64: &str,
-    binding: &MlsDeviceKeyBinding,
-) -> CoreResult<()> {
-    if binding.ciphersuite != MLS_CIPHERSUITE_V2 {
-        return Err(CoreError::invalid_input(
-            "MLS binding ciphersuite is not supported",
-        ));
-    }
-    let key_package = decode_key_package(payload_b64)?;
-    if key_package.ciphersuite() != DEFAULT_CIPHERSUITE {
-        return Err(CoreError::invalid_input(
-            "KeyPackage ciphersuite does not match device binding",
-        ));
-    }
-    let signature_key = encode_hex(key_package.leaf_node().signature_key().as_slice());
-    if signature_key != binding.mls_signature_public_key {
-        return Err(CoreError::invalid_input(
-            "KeyPackage leaf signature key does not match device binding",
-        ));
-    }
-    let identity = extract_sender_identity(key_package.leaf_node().credential())?;
-    let mut fields = identity.split('|');
-    let user_id = fields.next().unwrap_or_default();
-    let device_id = fields.next().unwrap_or_default();
-    let device_public_key = fields.next().unwrap_or_default();
-    let root_binding_signature = fields.next().unwrap_or_default();
-    if fields.next().is_some()
-        || user_id != binding.user_id
-        || device_id != binding.device_id
-        || device_public_key != binding.device_public_key
-        || root_binding_signature.is_empty()
-    {
-        return Err(CoreError::invalid_input(
-            "KeyPackage credential identity does not match device binding",
-        ));
-    }
-    Ok(())
 }
 
 fn current_unix_time_ms() -> CoreResult<u64> {
@@ -1751,7 +1514,6 @@ mod tests {
         let jitter = key_package_rotation_jitter_ms(device_id);
         assert_eq!(jitter, key_package_rotation_jitter_ms(device_id));
         let package = PublishedKeyPackage {
-            key_package_id: "00".repeat(32),
             key_package_ref: "ref".into(),
             key_package_b64: "payload".into(),
             lifecycle_version: KEY_PACKAGE_LIFECYCLE_VERSION,

@@ -3,10 +3,6 @@ import {
   APPEND_AUTH_REASON_HEADER,
   HttpError
 } from "../auth/capability";
-import {
-  RELATIONSHIP_AUTHORIZATION_HEADER,
-  verifyRelationshipAuthorization
-} from "../auth/internal-relationship";
 import type { DurableObject as CloudflareDurableObject } from "cloudflare:workers";
 import { CONTROL_JSON_MAX_BYTES, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES, readJsonLimited } from "../auth/runtime-security";
 import { InboxService } from "./service";
@@ -156,7 +152,6 @@ export async function handleInboxDurableRequest(
     messageRequestTtlSeconds?: number;
     messageRequestRateLimitMinute?: number;
     messageRequestRateLimitHour?: number;
-    internalRelationshipSecret?: string;
     onUpgrade?: () => Response;
     now?: number;
   }
@@ -179,30 +174,6 @@ export async function handleInboxDurableRequest(
   });
 
   try {
-    if (url.pathname.endsWith("/internal/relationships/promote") && request.method === "POST") {
-      if (
-        !deps.internalRelationshipSecret ||
-        request.headers.get("X-Tapchat-Internal-Secret") !== deps.internalRelationshipSecret
-      ) {
-        throw new HttpError(403, "invalid_capability", "internal relationship authorization failed");
-      }
-      const body = await readJsonLimited<{
-        senderUserId?: string;
-        proposalId?: string;
-        decision?: "accept" | "reject";
-      }>(
-        request,
-        CONTROL_JSON_MAX_BYTES
-      );
-      if (!body.senderUserId || !body.proposalId || !body.decision) {
-        throw new HttpError(400, "invalid_input", "relationship promotion context is incomplete");
-      }
-      if (body.decision === "reject") {
-        await service.discardRelationshipRequest(body.senderUserId, now);
-        return jsonResponse({ promotedCount: 0 });
-      }
-      return jsonResponse(await service.promoteRelationshipRequest(body.senderUserId, body.proposalId, now));
-    }
     if (url.pathname.endsWith("/subscribe")) {
       if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
         throw new HttpError(400, "invalid_input", "subscribe requires websocket upgrade");
@@ -246,19 +217,9 @@ export async function handleInboxDurableRequest(
         request,
         deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
       );
-      const relationshipAuthorized = deps.internalRelationshipSecret
-        ? await verifyRelationshipAuthorization(
-            deps.internalRelationshipSecret,
-            request.headers.get(RELATIONSHIP_AUTHORIZATION_HEADER),
-            deps.deviceId,
-            body.envelope.messageId
-          )
-        : false;
-      const mode = relationshipAuthorized
-        ? "relationship_accepted"
-        : request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified"
-          ? "legacy_unverified"
-          : "verified";
+      const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified"
+        ? "legacy_unverified"
+        : "verified";
       const result = await service.appendEnvelope(body, now, {
         mode,
         reason: request.headers.get(APPEND_AUTH_REASON_HEADER) ?? undefined
@@ -322,7 +283,7 @@ export class InboxDurableObject extends DurableObjectBase {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const match = url.pathname.match(/\/v[12]\/inbox\/([^/]+)\//);
+    const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
     const deviceId = decodeURIComponent(match?.[1] ?? "");
 
     return handleInboxDurableRequest(request, {
@@ -348,7 +309,6 @@ export class InboxDurableObject extends DurableObjectBase {
       messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
       messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
       messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300"),
-      internalRelationshipSecret: this.envRef.SHARING_INTERNAL_SECRET?.trim(),
       onUpgrade: () => {
         const pair = new WebSocketPair();
         const client = pair[0];

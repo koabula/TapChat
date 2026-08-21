@@ -118,7 +118,6 @@ pub enum SessionState {
 #[serde(rename_all = "snake_case")]
 pub enum LockReason {
     ProfileLocked,
-    ProfileSelectionRequired,
     SnapshotLoadFailed,
     RestoreFailed,
 }
@@ -127,7 +126,6 @@ impl LockReason {
     pub fn as_str(self) -> &'static str {
         match self {
             LockReason::ProfileLocked => "profile_locked",
-            LockReason::ProfileSelectionRequired => "profile_selection_required",
             LockReason::SnapshotLoadFailed => "snapshot_load_failed",
             LockReason::RestoreFailed => "restore_failed",
         }
@@ -189,18 +187,13 @@ impl AppState {
         Self::with_profile_manager(ProfileManager::with_layout(layout))
     }
 
-    /// Create AppState with a specific profile selector (for multi-instance mode).
-    pub fn with_profile_selector(selector: &str) -> Self {
-        Self::with_profile_manager(ProfileManager::with_profile_selector(selector))
+    /// Create AppState with a specific profile name (for multi-instance mode).
+    pub fn with_profile_name(name: &str) -> Self {
+        Self::with_profile_manager(ProfileManager::with_profile_name(name))
     }
 
-    pub fn with_profile_selector_and_storage_layout(
-        selector: &str,
-        layout: DesktopStorageLayout,
-    ) -> Self {
-        Self::with_profile_manager(ProfileManager::with_profile_selector_and_layout(
-            selector, layout,
-        ))
+    pub fn with_profile_name_and_storage_layout(name: &str, layout: DesktopStorageLayout) -> Self {
+        Self::with_profile_manager(ProfileManager::with_profile_name_and_layout(name, layout))
     }
 
     fn with_profile_manager(profile_manager: ProfileManager) -> Self {

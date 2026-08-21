@@ -3,15 +3,13 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::Sha512;
 
 use crate::capability::CapabilityManager;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
-    DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind, EnvelopeV2,
-    IdentityBundle, MlsDeviceKeyBinding, RelationshipDecisionProofV2, RelationshipProposalV2,
-    StorageProfile, UserIdentity, Validate, CURRENT_MODEL_VERSION, ENVELOPE_SENDER_PROOF_V2,
-    IDENTITY_PUBLICATION_VERSION_V2, MLS_CIPHERSUITE_V2,
+    DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind,
+    IdentityBundle, StorageProfile, UserIdentity, Validate, CURRENT_MODEL_VERSION,
 };
 
 type HmacSha512 = Hmac<Sha512>;
@@ -57,45 +55,6 @@ impl LocalIdentityState {
     pub fn sign_sender_proof(&self, payload: &[u8]) -> String {
         let signature = self.device_signing_key().sign(payload);
         encode_hex(&signature.to_bytes())
-    }
-
-    /// Signs a protocol payload with the persisted device key.  Callers must
-    /// construct a domain-separated canonical payload before invoking this
-    /// method; the raw private key never crosses the identity boundary.
-    pub fn sign_device_payload(&self, payload: &[u8]) -> String {
-        self.sign_sender_proof(payload)
-    }
-
-    pub fn build_mls_device_key_binding(
-        &self,
-        mls_signature_public_key: String,
-        created_at: u64,
-    ) -> MlsDeviceKeyBinding {
-        let unsigned = MlsDeviceKeyBinding {
-            version: CURRENT_MODEL_VERSION.to_string(),
-            user_id: self.user_identity.user_id.clone(),
-            device_id: self.device_identity.device_id.clone(),
-            device_public_key: self.device_identity.device_public_key.clone(),
-            mls_signature_public_key,
-            ciphersuite: MLS_CIPHERSUITE_V2.to_string(),
-            created_at,
-            signature: String::new(),
-        };
-        let signature = self
-            .device_signing_key()
-            .sign(&mls_device_key_binding_payload(&unsigned));
-        MlsDeviceKeyBinding {
-            signature: encode_hex(&signature.to_bytes()),
-            ..unsigned
-        }
-    }
-
-    pub fn sign_envelope_v2(&self, envelope: &mut EnvelopeV2) -> CoreResult<()> {
-        envelope.sender_proof.proof_type = ENVELOPE_SENDER_PROOF_V2.to_string();
-        envelope.sender_proof.value.clear();
-        envelope.sender_proof.value =
-            self.sign_sender_proof(&envelope_v2_signing_payload(envelope)?);
-        Ok(())
     }
 }
 
@@ -252,11 +211,6 @@ impl IdentityManager {
 
     pub fn verify_identity_bundle(bundle: &IdentityBundle) -> CoreResult<()> {
         bundle.validate()?;
-        if derive_user_id_from_public_key(&bundle.user_public_key)? != bundle.user_id {
-            return Err(CoreError::invalid_input(
-                "identity bundle user_id is not derived from its root public key",
-            ));
-        }
         let verifying_key = parse_verifying_key(&bundle.user_public_key)?;
         let signature = parse_signature(&bundle.signature)?;
         let verified = verifying_key
@@ -292,35 +246,8 @@ impl IdentityManager {
                     "device binding device_public_key does not match device profile device_public_key",
                 ));
             }
-            if bundle.publication_version >= IDENTITY_PUBLICATION_VERSION_V2 {
-                let mls_binding = device.mls_device_key_binding.as_ref().ok_or_else(|| {
-                    CoreError::invalid_input("IdentityBundle V2 device is missing MLS binding")
-                })?;
-                Self::verify_mls_device_key_binding(mls_binding)?;
-                if mls_binding.user_id != bundle.user_id
-                    || mls_binding.device_id != device.device_id
-                    || mls_binding.device_public_key != device.device_public_key
-                {
-                    return Err(CoreError::invalid_input(
-                        "MLS device key binding does not match IdentityBundle device",
-                    ));
-                }
-            }
         }
         Ok(())
-    }
-
-    pub fn verify_mls_device_key_binding(binding: &MlsDeviceKeyBinding) -> CoreResult<()> {
-        binding.validate()?;
-        if binding.ciphersuite != MLS_CIPHERSUITE_V2 {
-            return Err(CoreError::invalid_input(
-                "unsupported MLS device key binding ciphersuite",
-            ));
-        }
-        let signature = parse_signature(&binding.signature)?;
-        parse_verifying_key(&binding.device_public_key)?
-            .verify(&mls_device_key_binding_payload(binding), &signature)
-            .map_err(|_| CoreError::invalid_input("MLS device key binding signature mismatch"))
     }
 
     pub fn export_identity_bundle(
@@ -355,15 +282,7 @@ impl IdentityManager {
             urlencoding::encode(&local_identity.user_identity.user_id).into_owned();
         let unsigned = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
-            publication_version: if devices.iter().all(|device| {
-                device.status != DeviceStatusKind::Active
-                    || (device.mls_device_key_binding.is_some()
-                        && device.key_package_claim_capability.is_some())
-            }) {
-                IDENTITY_PUBLICATION_VERSION_V2
-            } else {
-                1
-            },
+            publication_version: 1,
             publication_revision: local_identity.device_status.updated_at.max(1),
             user_id: local_identity.user_identity.user_id.clone(),
             user_public_key: local_identity.user_identity.user_public_key.clone(),
@@ -481,9 +400,6 @@ fn derive_slip10_ed25519_key(seed: &[u8], path: &[u32]) -> CoreResult<[u8; 32]> 
 }
 
 pub fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
-    if bundle.publication_version >= IDENTITY_PUBLICATION_VERSION_V2 {
-        return identity_bundle_v2_payload(bundle);
-    }
     identity_bundle_payload_with_display_name(bundle, true)
 }
 
@@ -560,354 +476,6 @@ fn identity_bundle_payload_with_display_name(
     parts.join("|")
 }
 
-fn identity_bundle_v2_payload(bundle: &IdentityBundle) -> String {
-    let devices = bundle
-        .devices
-        .iter()
-        .map(|device| {
-            serde_json::json!([
-                device.version,
-                device.device_id,
-                device.device_public_key,
-                [
-                    device.binding.version,
-                    device.binding.user_id,
-                    device.binding.device_id,
-                    device.binding.device_public_key,
-                    device.binding.created_at,
-                    device.binding.signature
-                ],
-                device.status,
-                device
-                    .inbox_append_capability
-                    .as_ref()
-                    .map(|capability| serde_json::json!([
-                        capability.version,
-                        capability.service,
-                        capability.user_id,
-                        capability.target_device_id,
-                        capability.endpoint,
-                        capability.operations,
-                        capability.conversation_scope,
-                        capability.expires_at,
-                        capability
-                            .constraints
-                            .as_ref()
-                            .map(|constraints| serde_json::json!([
-                                constraints.max_bytes,
-                                constraints.max_ops_per_minute
-                            ])),
-                        capability.signature
-                    ])),
-                device
-                    .key_package_claim_capability
-                    .as_ref()
-                    .map(|capability| serde_json::json!([
-                        capability.version,
-                        capability.service,
-                        capability.user_id,
-                        capability.target_device_id,
-                        capability.endpoint,
-                        capability.expires_at,
-                        capability.nonce,
-                        capability.signature
-                    ])),
-                device
-                    .mls_device_key_binding
-                    .as_ref()
-                    .map(|binding| serde_json::json!([
-                        binding.version,
-                        binding.user_id,
-                        binding.device_id,
-                        binding.device_public_key,
-                        binding.mls_signature_public_key,
-                        binding.ciphersuite,
-                        binding.created_at,
-                        binding.signature
-                    ]))
-            ])
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!([
-        "tapchat-identity-bundle-v2",
-        bundle.version,
-        bundle.publication_version,
-        bundle.publication_revision,
-        bundle.user_id,
-        bundle.user_public_key,
-        devices,
-        bundle.bundle_share_id,
-        bundle.identity_bundle_ref,
-        bundle.device_status_ref,
-        bundle
-            .storage_profile
-            .as_ref()
-            .and_then(|profile| profile.base_url.as_ref()),
-        bundle
-            .storage_profile
-            .as_ref()
-            .and_then(|profile| profile.profile_ref.as_ref()),
-        bundle.display_name,
-        bundle.updated_at
-    ])
-    .to_string()
-}
-
-pub fn mls_device_key_binding_payload(binding: &MlsDeviceKeyBinding) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!([
-        "tapchat-mls-device-key-binding-v2",
-        binding.version,
-        binding.user_id,
-        binding.device_id,
-        binding.device_public_key,
-        binding.mls_signature_public_key,
-        binding.ciphersuite,
-        binding.created_at
-    ]))
-    .expect("MLS device binding canonical JSON is serializable")
-}
-
-pub fn derive_user_id_from_public_key(user_public_key: &str) -> CoreResult<String> {
-    let key = parse_verifying_key(user_public_key)?;
-    Ok(format!("user:{}", short_fingerprint(key.as_bytes(), 16)))
-}
-
-pub fn identity_bundle_digest(bundle: &IdentityBundle) -> CoreResult<String> {
-    IdentityManager::verify_identity_bundle(bundle)?;
-    let canonical = serde_json::to_vec(&serde_json::json!([
-        "tapchat-identity-bundle-digest-v2",
-        identity_bundle_payload(bundle),
-        bundle.signature
-    ]))
-    .map_err(|error| {
-        CoreError::invalid_state(format!("failed to encode identity bundle digest: {error}"))
-    })?;
-    Ok(format!("sha256:{}", encode_hex(&Sha256::digest(canonical))))
-}
-
-pub fn relationship_proposal_signing_payload(proposal: &RelationshipProposalV2) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!([
-        "tapchat-relationship-proposal-v2",
-        proposal.proposal_id,
-        proposal.initiator_user_id,
-        proposal.initiator_device_id,
-        proposal.relationship_id_candidate,
-        proposal.generation,
-        proposal.attempt,
-        proposal.peer_user_id,
-        proposal.sender_bundle_digest,
-        proposal.created_at,
-        proposal.expires_at,
-    ]))
-    .expect("fixed relationship proposal payload is serializable")
-}
-
-pub fn relationship_ticket_secret_proof(
-    ticket_id: &str,
-    device_id: &str,
-    issued_at: u64,
-    ticket_secret: &str,
-) -> String {
-    let secret_hash = encode_hex(&Sha256::digest(ticket_secret.as_bytes()));
-    let canonical = serde_json::to_vec(&serde_json::json!([
-        "tapchat-relationship-ticket-secret-proof-v2",
-        ticket_id,
-        device_id,
-        issued_at,
-        secret_hash,
-    ]))
-    .expect("fixed relationship ticket secret proof is serializable");
-    encode_hex(&Sha256::digest(canonical))
-}
-
-pub fn relationship_ticket_status_signing_payload(
-    ticket_id: &str,
-    device_id: &str,
-    issued_at: u64,
-    ticket_secret_proof: &str,
-) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!([
-        "tapchat-relationship-ticket-status-v2",
-        ticket_id,
-        device_id,
-        issued_at,
-        ticket_secret_proof,
-    ]))
-    .expect("fixed relationship ticket status payload is serializable")
-}
-
-pub fn relationship_decision_proof_signing_payload(proof: &RelationshipDecisionProofV2) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!([
-        "tapchat-relationship-decision-v2",
-        proof.version,
-        proof.ticket_id,
-        proof.relationship_id,
-        proof.generation,
-        proof.proposal_id,
-        proof.decision,
-        proof.actor_user_id,
-        proof.actor_device_id,
-        proof.peer_user_id,
-        proof.peer_bundle_digest,
-        proof.decided_at,
-    ]))
-    .expect("fixed relationship decision proof payload is serializable")
-}
-
-pub fn verify_relationship_decision_proof(
-    proof: &RelationshipDecisionProofV2,
-    actor_bundle: &IdentityBundle,
-) -> CoreResult<()> {
-    IdentityManager::verify_identity_bundle(actor_bundle)?;
-    if proof.version != crate::model::ENVELOPE_VERSION_V2
-        || proof.actor_user_id != actor_bundle.user_id
-        || !matches!(proof.decision.as_str(), "accept" | "reject")
-    {
-        return Err(CoreError::invalid_input(
-            "relationship decision proof context is invalid",
-        ));
-    }
-    let device = actor_bundle
-        .devices
-        .iter()
-        .find(|device| device.device_id == proof.actor_device_id)
-        .filter(|device| device.status == crate::model::DeviceStatusKind::Active)
-        .ok_or_else(|| CoreError::invalid_input("relationship decision actor is not active"))?;
-    parse_verifying_key(&device.device_public_key)?
-        .verify(
-            &relationship_decision_proof_signing_payload(proof),
-            &parse_signature(&proof.signature)?,
-        )
-        .map_err(|_| CoreError::invalid_input("relationship decision proof signature mismatch"))
-}
-
-pub fn verify_relationship_proposal(
-    proposal: &RelationshipProposalV2,
-    bundle: &IdentityBundle,
-) -> CoreResult<()> {
-    if proposal.initiator_user_id != bundle.user_id
-        || proposal.sender_bundle_digest != identity_bundle_digest(bundle)?
-    {
-        return Err(CoreError::invalid_input(
-            "relationship proposal is not bound to the supplied IdentityBundle",
-        ));
-    }
-    let device = bundle
-        .devices
-        .iter()
-        .find(|device| device.device_id == proposal.initiator_device_id)
-        .filter(|device| device.status == crate::model::DeviceStatusKind::Active)
-        .ok_or_else(|| CoreError::invalid_input("relationship initiator device is not active"))?;
-    parse_verifying_key(&device.device_public_key)?
-        .verify(
-            &relationship_proposal_signing_payload(proposal),
-            &parse_signature(&proposal.signature)?,
-        )
-        .map_err(|_| CoreError::invalid_input("relationship proposal signature mismatch"))
-}
-
-fn sha256_tagged_bytes(bytes: &[u8]) -> String {
-    format!("sha256:{}", encode_hex(&Sha256::digest(bytes)))
-}
-
-pub fn envelope_v2_signing_payload(envelope: &EnvelopeV2) -> CoreResult<Vec<u8>> {
-    let storage_refs = envelope
-        .storage_refs
-        .iter()
-        .map(|reference| {
-            serde_json::json!([
-                reference.kind,
-                reference.object_ref,
-                reference.size_bytes,
-                reference.mime_type,
-                reference.file_name,
-                reference.expires_at
-            ])
-        })
-        .collect::<Vec<_>>();
-    let storage_refs_json = serde_json::to_vec(&storage_refs).map_err(|error| {
-        CoreError::invalid_state(format!(
-            "failed to encode Envelope V2 storage refs: {error}"
-        ))
-    })?;
-    let message_type = serde_json::to_value(envelope.message_type).map_err(|error| {
-        CoreError::invalid_state(format!("message type encode failed: {error}"))
-    })?;
-    let delivery_class = serde_json::to_value(envelope.delivery_class).map_err(|error| {
-        CoreError::invalid_state(format!("delivery class encode failed: {error}"))
-    })?;
-    serde_json::to_vec(&serde_json::json!([
-        "tapchat-envelope-v2",
-        envelope.version,
-        envelope.message_id,
-        envelope.conversation_id,
-        envelope.relationship_id,
-        envelope.generation,
-        envelope.attempt,
-        envelope.proposal_id,
-        envelope.claim_id,
-        envelope.sender_user_id,
-        envelope.sender_device_id,
-        envelope.recipient_user_id,
-        envelope.recipient_device_id,
-        envelope.created_at,
-        message_type,
-        delivery_class,
-        envelope
-            .wake_hint
-            .as_ref()
-            .and_then(|hint| hint.latest_seq_hint),
-        sha256_tagged_bytes(
-            envelope
-                .inline_ciphertext
-                .as_deref()
-                .unwrap_or_default()
-                .as_bytes()
-        ),
-        sha256_tagged_bytes(&storage_refs_json),
-        envelope.sender_bundle_digest
-    ]))
-    .map_err(|error| {
-        CoreError::invalid_state(format!(
-            "failed to encode Envelope V2 signing payload: {error}"
-        ))
-    })
-}
-
-pub fn verify_envelope_v2(envelope: &EnvelopeV2, bundle: &IdentityBundle) -> CoreResult<()> {
-    envelope.validate()?;
-    IdentityManager::verify_identity_bundle(bundle)?;
-    if bundle.publication_version != IDENTITY_PUBLICATION_VERSION_V2 {
-        return Err(CoreError::invalid_input(
-            "Envelope V2 requires IdentityBundle publication version 2",
-        ));
-    }
-    if bundle.user_id != envelope.sender_user_id {
-        return Err(CoreError::invalid_input(
-            "Envelope V2 sender user does not match IdentityBundle",
-        ));
-    }
-    if identity_bundle_digest(bundle)? != envelope.sender_bundle_digest {
-        return Err(CoreError::invalid_input(
-            "Envelope V2 sender bundle digest mismatch",
-        ));
-    }
-    let sender = bundle
-        .devices
-        .iter()
-        .find(|device| device.device_id == envelope.sender_device_id)
-        .ok_or_else(|| CoreError::invalid_input("Envelope V2 sender device is not in bundle"))?;
-    if sender.status != DeviceStatusKind::Active {
-        return Err(CoreError::invalid_input(
-            "Envelope V2 sender device is not active",
-        ));
-    }
-    let signature = parse_signature(&envelope.sender_proof.value)?;
-    parse_verifying_key(&sender.device_public_key)?
-        .verify(&envelope_v2_signing_payload(envelope)?, &signature)
-        .map_err(|_| CoreError::invalid_input("Envelope V2 sender proof mismatch"))
-}
-
 pub fn generate_bundle_share_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -956,17 +524,11 @@ pub fn parse_signature(input: &str) -> CoreResult<Signature> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        envelope_v2_signing_payload, identity_bundle_digest, identity_bundle_payload,
-        mls_device_key_binding_payload, relationship_decision_proof_signing_payload,
-        relationship_ticket_secret_proof, verify_relationship_decision_proof, IdentityManager,
-        IdentityModule, DEFAULT_MNEMONIC_WORDS,
-    };
+    use super::{IdentityManager, IdentityModule, DEFAULT_MNEMONIC_WORDS};
     use crate::model::{
         CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
-        DeviceContactProfile, DeviceStatusKind, EnvelopeV2, IdentityBundle, InboxAppendCapability,
-        KeyPackageRef, MlsDeviceKeyBinding, RelationshipDecisionProofV2, StorageBaseInfo,
-        CURRENT_MODEL_VERSION, ENVELOPE_VERSION_V2,
+        DeviceContactProfile, DeviceStatusKind, IdentityBundle, InboxAppendCapability,
+        KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
     };
     use bip39::Language;
 
@@ -1088,8 +650,6 @@ mod tests {
                     }),
                     signature: "cap-sig".into(),
                 }),
-                key_package_claim_capability: None,
-                mls_device_key_binding: None,
                 keypackage_ref: Some(KeyPackageRef {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     user_id: identity.user_identity.user_id.clone(),
@@ -1230,133 +790,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn protocol_v2_signing_payloads_match_shared_golden_vector() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../test-vectors/protocol-v2.json"))
-                .expect("protocol V2 fixture");
-        let binding: MlsDeviceKeyBinding =
-            serde_json::from_value(fixture["mlsDeviceKeyBinding"].clone())
-                .expect("MLS binding fixture");
-        let envelope: EnvelopeV2 =
-            serde_json::from_value(fixture["envelope"].clone()).expect("Envelope V2 fixture");
-        let bundle: IdentityBundle = serde_json::from_value(fixture["identityBundle"].clone())
-            .expect("IdentityBundle fixture");
-
-        assert_eq!(
-            String::from_utf8(mls_device_key_binding_payload(&binding)).expect("utf8"),
-            fixture["mlsDeviceKeyBindingSigningPayload"]
-                .as_str()
-                .expect("binding payload")
-        );
-        assert_eq!(
-            String::from_utf8(envelope_v2_signing_payload(&envelope).expect("payload"))
-                .expect("utf8"),
-            fixture["envelopeSigningPayload"]
-                .as_str()
-                .expect("envelope payload")
-        );
-        assert_eq!(
-            identity_bundle_payload(&bundle),
-            fixture["identityBundleSigningPayload"]
-                .as_str()
-                .expect("IdentityBundle payload")
-        );
-        assert_eq!(
-            identity_bundle_digest(&bundle).expect("IdentityBundle digest"),
-            fixture["identityBundleDigest"]
-                .as_str()
-                .expect("IdentityBundle digest fixture")
-        );
-    }
-
-    #[test]
-    fn relationship_ticket_secret_proof_is_context_bound_and_does_not_expose_secret() {
-        let first = relationship_ticket_secret_proof(
-            "ticket:opaque",
-            "device:alice:phone",
-            42,
-            "private-ticket-secret",
-        );
-        assert_eq!(first.len(), 64);
-        assert!(!first.contains("private-ticket-secret"));
-        assert_eq!(
-            first,
-            relationship_ticket_secret_proof(
-                "ticket:opaque",
-                "device:alice:phone",
-                42,
-                "private-ticket-secret",
-            )
-        );
-        assert_ne!(
-            first,
-            relationship_ticket_secret_proof(
-                "ticket:opaque",
-                "device:alice:laptop",
-                42,
-                "private-ticket-secret",
-            )
-        );
-        assert_ne!(
-            first,
-            relationship_ticket_secret_proof(
-                "ticket:opaque",
-                "device:alice:phone",
-                43,
-                "private-ticket-secret",
-            )
-        );
-    }
-
-    #[test]
-    fn relationship_decision_proof_rejects_tampered_security_context() {
-        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-            .expect("identity");
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("test clock")
-            .as_millis() as u64;
-        let package = crate::mls_adapter::MlsAdapter::generate_key_package(&identity, now_ms)
-            .expect("key package");
-        let bundle = IdentityManager::export_identity_bundle(
-            &identity,
-            &sample_deployment(),
-            package.key_package_b64,
-            package.expires_at,
-        )
-        .expect("bundle");
-        let mut proof = RelationshipDecisionProofV2 {
-            version: ENVELOPE_VERSION_V2.into(),
-            ticket_id: "ticket:opaque".into(),
-            relationship_id: "relationship:opaque".into(),
-            generation: 0,
-            proposal_id: "proposal:opaque".into(),
-            decision: "accept".into(),
-            actor_user_id: bundle.user_id.clone(),
-            actor_device_id: bundle.devices[0].device_id.clone(),
-            peer_user_id: "user:peer".into(),
-            peer_bundle_digest: "sha256:peer-bundle".into(),
-            decided_at: now_ms,
-            signature: String::new(),
-        };
-        proof.signature =
-            identity.sign_device_payload(&relationship_decision_proof_signing_payload(&proof));
-        verify_relationship_decision_proof(&proof, &bundle).expect("valid decision proof");
-
-        proof.generation = 1;
-        let error = verify_relationship_decision_proof(&proof, &bundle)
-            .expect_err("tampered generation must invalidate the proof");
-        assert_eq!(error.code(), "invalid_input");
-    }
-
     fn sample_deployment() -> DeploymentBundle {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 3,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),

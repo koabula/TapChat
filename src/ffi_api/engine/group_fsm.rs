@@ -1,49 +1,6 @@
 use super::*;
 
 impl CoreEngine {
-    pub(super) fn identity_bundles_for_group_manifest(
-        &self,
-        manifest: &GroupManifest,
-    ) -> CoreResult<Vec<IdentityBundle>> {
-        let local_bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local IdentityBundle is unavailable"))?;
-        let mut user_ids = manifest
-            .members
-            .iter()
-            .filter(|member| member.status == GroupMemberStatus::Active)
-            .map(|member| member.user_id.clone())
-            .collect::<BTreeSet<_>>();
-        user_ids.extend(
-            manifest
-                .member_devices
-                .iter()
-                .filter(|device| device.status == GroupMemberStatus::Active)
-                .map(|device| device.user_id.clone()),
-        );
-        user_ids
-            .into_iter()
-            .map(|user_id| {
-                if user_id == local_bundle.user_id {
-                    Ok(local_bundle.clone())
-                } else {
-                    self.state
-                        .contacts
-                        .get(&user_id)
-                        .map(|contact| contact.bundle.clone())
-                        .ok_or_else(|| {
-                            CoreError::new(
-                                "identity_refresh_required",
-                                format!("group member {user_id} has no verified IdentityBundle V2"),
-                            )
-                        })
-                }
-            })
-            .collect()
-    }
-
     pub(super) fn build_envelope(
         &mut self,
         conversation_id: &str,
@@ -1195,8 +1152,6 @@ impl CoreEngine {
         &self,
         group_id: &str,
         device_id: &str,
-        claim_id: &str,
-        welcome_digest: &str,
     ) -> CoreResult<WelcomePickupDescriptor> {
         let deployment = self
             .state
@@ -1216,18 +1171,13 @@ impl CoreEngine {
             device_id
         );
         let capability = identity.sign_sender_proof(
-            format!(
-                "welcome_pickup_v2:{group_id}:{device_id}:{claim_id}:{welcome_digest}:{expires_at}"
-            )
-            .as_bytes(),
+            format!("welcome_pickup:{group_id}:{device_id}:{expires_at}").as_bytes(),
         );
         Ok(WelcomePickupDescriptor {
             group_id: group_id.to_string(),
             device_id: device_id.to_string(),
             endpoint,
             capability,
-            claim_id: Some(claim_id.to_string()),
-            welcome_digest: Some(welcome_digest.to_string()),
             expires_at,
             start_seq: None,
             roster_version: None,

@@ -22,10 +22,6 @@ Cloudflare 参考 Transport 及其账户拥有者可能观察到：
 
 Group Outbox 为了执行 `group_authorization_v2`，持有完整签名 `GroupManifest` 和经过验证的设备公钥。Manifest 包含 group/conversation 标识、owner、admins、成员 user、成员 device、role、status、roster version 和 outbox endpoint。因此当前实现不向 Group Outbox provider 或 Cloudflare 隐藏单群 roster、设备关系或角色变化。
 
-Direct / Identity V2 由每个账户自己的 DeviceRegistry Durable Object 协调。该 owner runtime 可以看到本账户设备集合、KeyPackage 库存变化、随机 relationship/ticket/proposal/claim 标识、对端根身份和精确 IdentityBundle revision，以及账户关系和本地设备 join 状态。随机不透明标识避免在 URL 和日志中直接编码双方 user ID，但不能向承载该账户 runtime 的 provider 隐藏“某个经过验证的对端正在与本账户建联”这一事实。
-
-KeyPackage claim、relationship decision 和 Inbox promotion 都在单个 owner Registry 内形成权威事务或可重试投影。实现不假设多个 Inbox Durable Object 之间存在事务，也不会为实现账户关系而建立一个跨所有用户的全局社交图服务。
-
 服务端不能由这些状态解密 MLS application message、附件明文或本地 MLS group secret，但可以观察成员关系和状态变化的时间。
 
 ### 2.1 附件预览预取的边界
@@ -50,7 +46,6 @@ KeyPackage claim、relationship decision 和 Inbox promotion 都在单个 owner 
 - 全局匿名、发送者不可链接性或对强大全局观察者的关系隐藏；
 - 向承载某群的 Group Outbox 隐藏该群 roster、设备和角色；
 - 隐藏消息长度、访问时序、在线状态或 Cloudflare 账户关系；
-- 向某账户自己的 DeviceRegistry provider 隐藏其对端根身份、设备数量、关系状态或 KeyPackage 库存时序；
 - 在 endpoint、capability 或客户端已被攻陷时继续保密；
 - 对 provider、网络审查者或群管理员的可用性攻击提供绝对防护。
 

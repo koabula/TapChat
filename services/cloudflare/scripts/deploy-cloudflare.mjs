@@ -468,9 +468,9 @@ async function verifyRuntimeConfiguration(baseUrl, config) {
       if (response.ok) {
         const ready = await response.json();
         if (ready.runtimeId !== config.runtimeId) throw new Error("runtime_mismatch");
-        if (ready.protocolVersion !== 6) throw new Error("protocol_mismatch");
+        if (ready.protocolVersion !== 4) throw new Error("protocol_mismatch");
         if (ready.workerBuildId !== config.workerBuildId) throw new Error("worker_build_mismatch");
-        if (ready.registrySchemaVersion !== 3) throw new Error("registry_schema_mismatch");
+        if (ready.registrySchemaVersion !== 1) throw new Error("registry_schema_mismatch");
         return ready;
       }
       if (![404, 409, 429].includes(response.status) && response.status < 500) {

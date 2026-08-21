@@ -245,14 +245,9 @@ impl CoreEngine {
                     let direct_conversation_id = self
                         .active_direct_conversation_for_peer(&recipient_user_id)
                         .map(|(conversation_id, _)| conversation_id)
-                        .ok_or_else(|| {
-                            CoreError::new(
-                                "protocol_upgrade_required",
-                                "group Welcome delivery requires an accepted V2 Direct relationship",
-                            )
-                        })?;
-                    let relationship_id =
-                        self.direct_relationship_id_for_conversation(&direct_conversation_id)?;
+                        .unwrap_or_else(|| {
+                            direct_conversation_id(&local_user_id, &recipient_user_id)
+                        });
                     let invite = GroupWelcomePickupControl {
                         version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                         group_id: group_state.group_id.clone(),
@@ -266,18 +261,16 @@ impl CoreEngine {
                             "failed to encode group welcome pickup control: {error}"
                         ))
                     })?;
-                    let envelope = self.build_envelope_v2(
-                        &relationship_id,
-                        &recipient_user_id,
+                    let envelope = self.build_envelope(
+                        &direct_conversation_id,
                         &descriptor.device_id,
                         MessageType::ControlGroupWelcomePickup,
                         STANDARD.encode(payload),
-                        None,
                     )?;
                     persist_ops.push(PersistOp::SaveOutgoingEnvelope {
                         message_id: envelope.message_id.clone(),
                     });
-                    self.enqueue_envelopes_v2(recipient_user_id, vec![envelope]);
+                    self.enqueue_envelopes(recipient_user_id, vec![envelope]);
                 }
             }
         }
@@ -1675,14 +1668,12 @@ impl CoreEngine {
                     stopped_on_retryable_gap = true;
                     break;
                 }
-                let binding_bundles =
-                    self.identity_bundles_for_group_manifest(&group_state.manifest)?;
                 let result = match self
                     .state
                     .mls_adapter
                     .as_mut()
                     .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                    .ingest_protocol_message_with_device_bindings(
+                    .ingest_message(
                         &conversation_id,
                         &record.envelope.sender_device_id,
                         message_type,
@@ -1691,7 +1682,6 @@ impl CoreEngine {
                             .inline_ciphertext
                             .as_deref()
                             .unwrap_or_default(),
-                        &binding_bundles,
                     ) {
                     Ok(result) => result,
                     Err(error)
@@ -2129,10 +2119,6 @@ impl CoreEngine {
                 "transition state event does not match the verified manifest diff",
             ));
         }
-
-        let updated_bundles = self.identity_bundles_for_group_manifest(&updated)?;
-        staged_mls
-            .validate_group_member_device_bindings(&current.conversation_id, &updated_bundles)?;
 
         let summary = staged_mls.export_group_summary(&current.conversation_id)?;
         if summary.epoch != updated.mls_epoch_hint {
@@ -3264,54 +3250,6 @@ impl CoreEngine {
         welcome_b64: String,
         manifest: Option<GroupManifest>,
     ) -> CoreResult<CoreOutput> {
-        let claim_id = descriptor.claim_id.as_ref().ok_or_else(|| {
-            CoreError::new(
-                "protocol_upgrade_required",
-                "group Welcome pickup is missing its V2 KeyPackage claim ID",
-            )
-        })?;
-        let declared_digest = descriptor.welcome_digest.as_ref().ok_or_else(|| {
-            CoreError::new(
-                "protocol_upgrade_required",
-                "group Welcome pickup is missing its signed Welcome digest",
-            )
-        })?;
-        let actual_digest = STANDARD.encode(Sha256::digest(welcome_b64.as_bytes()));
-        if &actual_digest != declared_digest {
-            return Err(CoreError::invalid_input(
-                "group Welcome ciphertext does not match its signed pickup descriptor",
-            ));
-        }
-        if let Some(existing) = self
-            .state
-            .group_states
-            .get(&descriptor.group_id)
-            .and_then(|state| state.welcome_pickup.as_ref())
-        {
-            if existing.claim_id.as_ref() == Some(claim_id) {
-                if existing.welcome_digest.as_ref() == Some(declared_digest) {
-                    self.state
-                        .pending_welcome_pickups
-                        .remove(&pending_welcome_pickup_key(
-                            &descriptor.group_id,
-                            &descriptor.device_id,
-                        ));
-                    return Ok(CoreOutput {
-                        effects: vec![persist_effect(
-                            &self.state,
-                            vec![PersistOp::DeletePendingWelcomePickup {
-                                group_id: descriptor.group_id.clone(),
-                                device_id: descriptor.device_id.clone(),
-                            }],
-                        )],
-                        ..CoreOutput::default()
-                    });
-                }
-                return Err(CoreError::invalid_input(
-                    "a consumed group KeyPackage claim was reused with a different Welcome",
-                ));
-            }
-        }
         log::info!(
             "handle_welcome_pickup_fetched: applying welcome pickup group_id={} device_id={}",
             descriptor.group_id,
@@ -3450,11 +3388,11 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .fork()?;
-        let binding_bundles = self.identity_bundles_for_group_manifest(&group_state.manifest)?;
-        let result = staged_mls.ingest_welcome_with_device_bindings(
+        let result = staged_mls.ingest_message(
             &group_state.conversation_id,
+            &group_state.manifest.signer_device_id,
+            MessageType::MlsWelcome,
             &welcome_b64,
-            &binding_bundles,
         );
         let result = match result {
             Ok(result) => result,

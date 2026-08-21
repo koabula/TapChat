@@ -13,7 +13,7 @@ use tapchat_core::{CoreCommand, CoreOperationStatus, CoreOutput, ErrorDomain, Re
 use crate::errors::{DesktopError, DesktopResult};
 use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
 use crate::platform::log_sanitize::redact_id;
-use crate::platform::profile::{ProfileManager, ProfileProtectionMode, ProfileSummary};
+use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::state::{
     AppState, RecoveryPhraseAuthMode, RecoveryPhraseChallenge, RecoveryPhraseGate, SessionState,
 };
@@ -66,19 +66,9 @@ pub async fn init_onboarding_profile(
     let profile_ref = redact_id("profile", &profile_name);
     log::info!("Creating profile {}", profile_ref);
 
-    let (profile_manager, onboarding_profile_path) = {
-        let inner = state.inner.read().await;
-        (inner.profile_manager.clone(), inner.profile_path.clone())
-    };
-    if let Some(summary) =
-        reusable_onboarding_profile(&profile_manager, onboarding_profile_path.as_ref()).await?
-    {
-        log::info!("Reusing incomplete onboarding profile");
-        return Ok(summary);
-    }
-
     // Create profile
     let summary = {
+        let pm = &state.inner.read().await.profile_manager;
         let protection_mode = protection_mode.unwrap_or_else(|| {
             if passphrase.as_deref().is_some_and(|value| !value.is_empty()) {
                 ProfileProtectionMode::KeychainAndPassphrase
@@ -86,8 +76,7 @@ pub async fn init_onboarding_profile(
                 ProfileProtectionMode::KeychainOnly
             }
         });
-        profile_manager
-            .create_profile(&profile_name, passphrase, protection_mode)
+        pm.create_profile(&profile_name, passphrase, protection_mode)
             .await
             .map_err(|e| {
                 log::error!("Failed to create profile {}", profile_ref);
@@ -106,29 +95,6 @@ pub async fn init_onboarding_profile(
     Ok(summary)
 }
 
-async fn reusable_onboarding_profile(
-    profile_manager: &ProfileManager,
-    onboarding_path: Option<&std::path::PathBuf>,
-) -> crate::errors::DesktopResult<Option<ProfileSummary>> {
-    let Some(path) = onboarding_path else {
-        return Ok(None);
-    };
-    let Some(metadata) = profile_manager.get_active_metadata().await else {
-        return Ok(None);
-    };
-    if &metadata.root_dir != path {
-        return Ok(None);
-    }
-    if metadata.user_id.is_some() || metadata.device_id.is_some() {
-        return Err("invalid_state".into());
-    }
-    Ok(profile_manager
-        .list_profiles()
-        .await
-        .into_iter()
-        .find(|profile| &profile.path == path))
-}
-
 /// Create or load identity with profile persistence
 #[tauri::command]
 pub async fn create_or_load_identity(
@@ -138,22 +104,8 @@ pub async fn create_or_load_identity(
     device_name: Option<String>,
     display_name: Option<String>,
 ) -> crate::errors::DesktopResult<CreateIdentityResult> {
-    let mnemonic = mnemonic
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
     let supplied_mnemonic = mnemonic.is_some();
-    let (had_identity, onboarding_step) = {
-        let inner = state.inner.read().await;
-        (
-            inner.engine.local_identity().is_some(),
-            match &inner.session {
-                SessionState::Onboarding { step } => Some(step.clone()),
-                _ => None,
-            },
-        )
-    };
-    validate_identity_onboarding_mode(onboarding_step.as_ref(), supplied_mnemonic)
-        .map_err(crate::errors::DesktopError::from)?;
+    let had_identity = state.inner.read().await.engine.local_identity().is_some();
     // First ensure profile exists
     {
         let inner = state.inner.read().await;
@@ -220,19 +172,6 @@ pub async fn create_or_load_identity(
     };
 
     Ok(result)
-}
-
-fn validate_identity_onboarding_mode(
-    step: Option<&crate::state::OnboardingStep>,
-    supplied_mnemonic: bool,
-) -> Result<(), &'static str> {
-    match (step, supplied_mnemonic) {
-        (Some(crate::state::OnboardingStep::CreateIdentity), false)
-        | (Some(crate::state::OnboardingStep::RecoverIdentity), true) => Ok(()),
-        (Some(crate::state::OnboardingStep::CreateIdentity), true)
-        | (Some(crate::state::OnboardingStep::RecoverIdentity), false) => Err("invalid_input"),
-        _ => Err("invalid_state"),
-    }
 }
 
 #[tauri::command]
@@ -696,62 +635,5 @@ mod tests {
         .expect("serialize identity info");
 
         assert!(value.get("mnemonic").is_none());
-    }
-
-    #[tokio::test]
-    async fn incomplete_onboarding_profile_is_reused_instead_of_duplicated() {
-        let root = std::env::temp_dir().join(format!(
-            "tapchat-onboarding-profile-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let layout = crate::storage_layout::DesktopStorageLayout::from_roots(
-            root.join("data"),
-            root.join("cache"),
-            root.join("logs"),
-        );
-        let manager = ProfileManager::with_layout(layout);
-        let created = manager
-            .create_profile(
-                "default",
-                Some("profile-passphrase".into()),
-                ProfileProtectionMode::PassphraseOnly,
-            )
-            .await
-            .expect("create profile");
-
-        let reused = reusable_onboarding_profile(&manager, Some(&created.path))
-            .await
-            .expect("reuse profile")
-            .expect("incomplete profile");
-
-        assert_eq!(reused.path, created.path);
-        assert_eq!(manager.list_profiles().await.len(), 1);
-        drop(manager);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn identity_creation_and_recovery_require_matching_backend_modes() {
-        assert!(validate_identity_onboarding_mode(
-            Some(&crate::state::OnboardingStep::CreateIdentity),
-            false
-        )
-        .is_ok());
-        assert!(validate_identity_onboarding_mode(
-            Some(&crate::state::OnboardingStep::RecoverIdentity),
-            true
-        )
-        .is_ok());
-        assert_eq!(
-            validate_identity_onboarding_mode(
-                Some(&crate::state::OnboardingStep::RecoverIdentity),
-                false
-            ),
-            Err("invalid_input")
-        );
-        assert_eq!(
-            validate_identity_onboarding_mode(None, true),
-            Err("invalid_state")
-        );
     }
 }

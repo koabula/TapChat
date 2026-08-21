@@ -1,5 +1,6 @@
 /target
 /doc/*
+!/doc/THREAT_MODEL.md
 /draft
 node_modules/
 /app/desktop/node_modules/

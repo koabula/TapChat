@@ -134,14 +134,11 @@ export class InboxService {
       return rejected;
     }
 
-    if (authContext.mode !== "verified" && authContext.mode !== "relationship_accepted") {
+    if (authContext.mode !== "verified") {
       throw new HttpError(426, "upgrade_required", "verified append authorization is required");
     }
 
-    if (
-      authContext.mode === "relationship_accepted" ||
-      allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)
-    ) {
+    if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
       const delivered = await this.deliverEnvelope(input, now);
       await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, delivered);
       return delivered;
@@ -328,48 +325,6 @@ export class InboxService {
     };
   }
 
-  async promoteRelationshipRequest(
-    senderUserId: string,
-    proposalId: string,
-    now: number
-  ): Promise<{ promotedCount: number }> {
-    const entry = await this.state.get<MessageRequestEntry>(this.messageRequestKey(senderUserId));
-    if (!entry) return { promotedCount: 0 };
-    const selected = entry.pendingRequests.filter((request) =>
-      "proposalId" in request.envelope && request.envelope.proposalId === proposalId
-    );
-    let promotedCount = 0;
-    for (const request of selected) {
-      const delivered = await this.deliverEnvelope(request, now);
-      await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
-      if (delivered.deliveredTo === "inbox") promotedCount += 1;
-    }
-    for (const request of entry.pendingRequests) {
-      if (!selected.some((candidate) => candidate.envelope.messageId === request.envelope.messageId)) {
-        await this.state.put(
-          `${APPEND_RESULT_PREFIX}${request.envelope.messageId}`,
-          this.supersededMessageRequestResult()
-        );
-      }
-    }
-    await this.deleteMessageRequest(senderUserId, "accepted");
-    await this.scheduleNextAlarm(now);
-    return { promotedCount };
-  }
-
-  async discardRelationshipRequest(senderUserId: string, now: number): Promise<void> {
-    const entry = await this.state.get<MessageRequestEntry>(this.messageRequestKey(senderUserId));
-    if (!entry) return;
-    for (const request of entry.pendingRequests) {
-      await this.state.put(
-        `${APPEND_RESULT_PREFIX}${request.envelope.messageId}`,
-        this.supersededMessageRequestResult()
-      );
-    }
-    await this.deleteMessageRequest(senderUserId, "rejected");
-    await this.scheduleNextAlarm(now);
-  }
-
   async rejectMessageRequest(requestId: string, now: number): Promise<MessageRequestActionResult> {
     const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
@@ -471,9 +426,7 @@ export class InboxService {
       receivedAt: now,
       expiresAt,
       state: "available",
-      envelope: input.envelope,
-      ...(input.senderIdentityBundle ? { senderIdentityBundle: input.senderIdentityBundle } : {}),
-      ...(input.relationshipProposal ? { relationshipProposal: input.relationshipProposal } : {})
+      envelope: input.envelope
     };
     const serialized = JSON.stringify(record);
     const storageKey = `${RECORD_PREFIX}${seq}`;

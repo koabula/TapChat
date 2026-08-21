@@ -9,42 +9,28 @@ mod tests {
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput,
-        CoreStateUpdate, FfiApiModule, PersistenceMutation, RealtimeEvent,
+        FfiApiModule, PersistenceMutation, RealtimeEvent,
     };
     use crate::identity::IdentityManager;
-    use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage, PublishedKeyPackageState};
+    use crate::mls_adapter::MlsAdapter;
     use crate::model::{
         CapabilityService, ConversationKind, ConversationState, DeliveryClass, DeploymentBundle,
-        DeviceJoinState, Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
         GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
         GroupManifest, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
         GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord,
-        InboxRecordState, MessageType, RelationshipAccountState, RelationshipSetupState,
-        RelationshipTicket, SenderProof, StorageBaseInfo, WakeHint, WelcomePickupDescriptor,
-        CURRENT_MODEL_VERSION,
+        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
+        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{ContactRelationshipStatus, PersistOp, PersistedPendingWelcomePickup};
     use crate::transport_contract::{
-        ClaimKeyPackagesRequest, ClaimKeyPackagesResult, ClaimedKeyPackage, GroupJoinDecision,
-        KeyPackageClaimPurpose, MessageRequestAction, MessageRequestActionResult,
-        RelationshipTicketStatusResult, SealGroupOutboxRequest, SealGroupOutboxResult,
-        SharedStateDocumentKind, TransportAuthRequirement, UpsertOutboundRelationshipRequest,
-        UpsertOutboundRelationshipResult,
+        GroupJoinDecision, MessageRequestAction, MessageRequestActionResult,
+        SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
+        TransportAuthRequirement,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use ed25519_dalek::Signer;
-    use sha2::{Digest, Sha256};
-    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
-
-    thread_local! {
-        /// Test-only model of the authoritative per-owner DeviceRegistry pool.
-        /// Each Rust test runs on its own harness thread, so this stays isolated
-        /// while still allowing the initiator-only helpers to drive the real V2
-        /// asynchronous claim state machine.
-        static TEST_KEY_PACKAGE_POOLS: RefCell<BTreeMap<(String, String), Vec<PublishedKeyPackage>>> =
-            RefCell::new(BTreeMap::new());
-    }
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
@@ -329,25 +315,16 @@ mod tests {
 
         let append_body = output.effects.iter().find_map(|effect| match effect {
             CoreEffect::ExecuteHttpRequest { request }
-                if request.method == crate::ffi_api::HttpMethod::Post
-                    && request.url.contains("/messages") =>
+                if request.method == crate::ffi_api::HttpMethod::Post =>
             {
                 request.body.as_deref()
             }
             _ => None,
         });
         let body = append_body.expect("append request body");
-        let request: crate::transport_contract::AppendEnvelopeRequestV2 =
+        let request: crate::transport_contract::AppendEnvelopeRequest =
             serde_json::from_str(body).expect("append request json");
-        assert_eq!(
-            request.sender_identity_bundle.display_name.as_deref(),
-            Some("Alice")
-        );
-        assert_eq!(
-            request.envelope.sender_bundle_digest,
-            crate::identity::identity_bundle_digest(&request.sender_identity_bundle)
-                .expect("sender bundle digest")
-        );
+        assert_eq!(request.sender_display_name.as_deref(), Some("Alice"));
     }
 
     #[test]
@@ -558,8 +535,6 @@ mod tests {
             device_id: "device:alice:phone".into(),
             endpoint: "https://example.test/welcome".into(),
             capability: "cap".into(),
-            claim_id: None,
-            welcome_digest: None,
             expires_at: 999,
             start_seq: None,
             roster_version: None,
@@ -597,8 +572,6 @@ mod tests {
             device_id: "device:alice:phone".into(),
             endpoint: "https://example.test/welcome".into(),
             capability: "cap".into(),
-            claim_id: None,
-            welcome_digest: None,
             expires_at: 999,
             start_seq: None,
             roster_version: None,
@@ -838,11 +811,12 @@ mod tests {
             })
             .expect("import carol");
 
-        let output = create_test_group_conversation(
-            &mut alice,
-            "Project",
-            vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
-        );
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
+            })
+            .expect("create group");
 
         let summary = output
             .view_model
@@ -966,8 +940,12 @@ mod tests {
     fn transition_conflict_preserves_intent_for_reconciliation() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Conflict", vec![bob_bundle.user_id]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Conflict".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -1017,8 +995,12 @@ mod tests {
     fn leave_request_does_not_mutate_canonical_membership() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Leave", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Leave".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -1065,8 +1047,12 @@ mod tests {
     fn removed_local_role_cannot_restore_or_send_group_outbox() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let summary = output
             .view_model
             .as_ref()
@@ -1108,8 +1094,12 @@ mod tests {
     fn capability_expired_resigns_and_retries_group_append() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
         let summary = created
             .view_model
             .as_ref()
@@ -1166,8 +1156,12 @@ mod tests {
     fn membership_revoked_clears_every_pending_group_send() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
         let summary = created
             .view_model
             .as_ref()
@@ -1230,8 +1224,12 @@ mod tests {
         // authoritative role check and produce no side-effects.
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let summary = output
             .view_model
             .as_ref()
@@ -1294,11 +1292,12 @@ mod tests {
                 bundle: carol_bundle.clone(),
             })
             .expect("import carol");
-        let created = create_test_group_conversation(
-            &mut alice,
-            "Project",
-            vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
-        );
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = created
             .view_model
             .as_ref()
@@ -1386,8 +1385,12 @@ mod tests {
         // append from being stranded behind an irreversible seal.
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = created
             .view_model
             .as_ref()
@@ -1478,8 +1481,12 @@ mod tests {
     fn group_append_ack_persists_local_state_before_seal_effect() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = created
             .view_model
             .as_ref()
@@ -1549,8 +1556,12 @@ mod tests {
     fn app_started_reissues_persisted_group_seal_after_outbox_drained() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = created
             .view_model
             .as_ref()
@@ -1601,8 +1612,12 @@ mod tests {
         // engine (strict step-(d) contract).
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = created
             .view_model
             .as_ref()
@@ -1696,8 +1711,12 @@ mod tests {
         // again, NOT setting `dissolved_at`.
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let created =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = created
             .view_model
             .as_ref()
@@ -2944,11 +2963,7 @@ mod tests {
             })
             .expect("second create");
 
-        assert!(!second.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.ends_with("/v2/key-packages/claims")
-        )));
+        assert!(second.effects.is_empty());
         assert_eq!(alice.state.conversations.len(), 1);
         assert_eq!(
             alice
@@ -3038,12 +3053,10 @@ mod tests {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("delete contact");
-        assert!(delete_output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.contains("/v2/device-registry/relationships/")
-                    && request.url.ends_with("/remove")
-        )));
+        assert!(delete_output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
         assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
         let archived = alice
             .state
@@ -3083,6 +3096,25 @@ mod tests {
             .expect_err("closed relationship blocks send");
         assert_eq!(send_err.code(), "relationship_closed");
         assert_eq!(alice.state.pending_outbox.len(), pending_after_delete);
+
+        let allowlist_output = alice
+            .handle_event(CoreEvent::AllowlistFetched {
+                document: crate::transport_contract::AllowlistDocument {
+                    allowed_sender_user_ids: vec![bob_bundle.user_id.clone()],
+                    rejected_sender_user_ids: vec![],
+                },
+            })
+            .expect("allowlist fetched");
+        let replace = allowlist_output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReplaceAllowlist { update } => Some(update),
+                _ => None,
+            })
+            .expect("replace allowlist effect");
+        assert!(replace.document.allowed_sender_user_ids.is_empty());
+        assert!(replace.document.rejected_sender_user_ids.is_empty());
 
         let snapshot = alice.refresh_snapshot();
         assert!(snapshot
@@ -3256,20 +3288,17 @@ mod tests {
             .expect("alice contact")
             .display_name = Some("Alice".into());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-        assert!(bob.state.conversations.contains_key(&conversation_id));
-        bob.state
-            .contacts
-            .get_mut(&alice_bundle.user_id)
-            .expect("verified alice contact")
-            .display_name = Some("Alice".into());
+        assert_eq!(
+            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
+            conversation_id
+        );
 
         alice
             .handle_command(CoreCommand::DeleteContact {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("alice deletes bob");
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
 
         assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
@@ -3322,22 +3351,25 @@ mod tests {
         })
         .expect("bob imports alice");
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-        assert!(bob.state.conversations.contains_key(&conversation_id));
+        assert_eq!(
+            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
+            conversation_id
+        );
 
         alice
             .handle_command(CoreCommand::DeleteContact {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("alice deletes bob");
-        let control_item = alice
+        let mut control_envelope = alice
             .state
             .pending_outbox
             .iter()
             .find(|item| item.envelope.message_type == MessageType::ControlContactRemoved)
             .expect("control envelope")
+            .envelope
             .clone();
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
         assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
         let message_count_before = bob
@@ -3347,32 +3379,22 @@ mod tests {
             .expect("archived conversation")
             .messages
             .len();
+        control_envelope.message_id = format!("{}:duplicate", control_envelope.message_id);
 
-        let replay = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                to_seq: 2,
-                records: vec![InboxRecord {
-                    seq: 2,
-                    recipient_device_id: bob_device_id.clone(),
-                    message_id: control_item.envelope.message_id.clone(),
-                    received_at: 2,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: control_item.envelope,
-                    envelope_v2: control_item.envelope_v2,
-                    sender_identity_bundle: None,
-                    relationship_proposal: None,
-                }],
-            })
-            .expect("duplicate control ignored");
-        for commit_id in replay.effects.iter().filter_map(|effect| match effect {
-            CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-            _ => None,
-        }) {
-            bob.handle_event(CoreEvent::PersistenceCommitted { commit_id })
-                .expect("commit duplicate classification");
-        }
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 2,
+            records: vec![InboxRecord {
+                seq: 2,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: control_envelope.message_id.clone(),
+                received_at: 2,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: control_envelope,
+            }],
+        })
+        .expect("duplicate control ignored");
 
         assert_eq!(
             bob.state
@@ -3402,185 +3424,21 @@ mod tests {
                 relationship_status: ContactRelationshipStatus::PendingOutbound,
             })
             .expect("import pending outbound");
-        let conversation_id =
-            create_pending_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         assert!(alice.state.pending_outbox.iter().any(|item| matches!(
             item.envelope.message_type,
             MessageType::MlsCommit | MessageType::MlsWelcome
         )));
 
         let pending_count = alice.state.pending_outbox.len();
-        let mls_before = alice
-            .mls_summary(&conversation_id)
-            .expect("pending relationship MLS state")
-            .clone();
         let send_err = alice
             .handle_command(CoreCommand::SendTextMessage {
-                conversation_id: conversation_id.clone(),
+                conversation_id,
                 plaintext: "too early".into(),
             })
             .expect_err("pending outbound blocks normal messages");
         assert_eq!(send_err.code(), "relationship_closed");
         assert_eq!(alice.state.pending_outbox.len(), pending_count);
-        assert_eq!(
-            alice
-                .mls_summary(&conversation_id)
-                .expect("pending relationship MLS state remains unchanged"),
-            &mls_before,
-            "a rejected send must not advance the MLS sender ratchet"
-        );
-    }
-
-    #[test]
-    fn relationship_ticket_secret_survives_restore_and_only_emits_derived_proof() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
-        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        create_pending_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let relationship_id = alice
-            .state
-            .relationships
-            .values()
-            .find(|relationship| relationship.peer_user_id == bob_bundle.user_id)
-            .expect("outbound relationship")
-            .relationship_id
-            .clone();
-        let secret = alice
-            .state
-            .relationships
-            .get(&relationship_id)
-            .and_then(|relationship| relationship.attempts.last())
-            .expect("relationship attempt")
-            .ticket_secret
-            .clone();
-        assert_eq!(secret.len(), 64);
-        assert!(secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
-
-        let mut restored = CoreEngine::try_from_restored_state(alice.refresh_snapshot())
-            .expect("restore relationship ticket");
-        assert_eq!(
-            restored
-                .state
-                .relationships
-                .get(&relationship_id)
-                .and_then(|relationship| relationship.attempts.last())
-                .expect("restored relationship attempt")
-                .ticket_secret,
-            secret
-        );
-        let poll = restored
-            .handle_event(CoreEvent::TimerTriggered {
-                timer_id: format!("relationship_status:{relationship_id}"),
-            })
-            .expect("poll relationship ticket");
-        let request = poll
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.contains("/v2/relationships/")
-                        && request.url.ends_with("/status") =>
-                {
-                    Some(request)
-                }
-                _ => None,
-            })
-            .expect("ticket status request");
-        assert!(request.body.is_none());
-        assert!(request
-            .headers
-            .contains_key("X-Tapchat-Ticket-Secret-Proof"));
-        assert!(request.headers.values().all(|value| value != &secret));
-        assert!(!request.url.contains(&secret));
-    }
-
-    #[test]
-    fn expired_relationship_status_reclaims_with_a_new_attempt_and_key_package() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
-        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        create_pending_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let relationship_id = alice
-            .state
-            .relationships
-            .values()
-            .find(|relationship| relationship.peer_user_id == bob_bundle.user_id)
-            .expect("outbound relationship")
-            .relationship_id
-            .clone();
-        let (ticket_id, old_proposal_id, old_claim_idempotency) = {
-            let relationship = alice
-                .state
-                .relationships
-                .get_mut(&relationship_id)
-                .expect("relationship");
-            relationship.canonical_proposal.expires_at = 0;
-            let attempt = relationship.attempts.last_mut().expect("attempt one");
-            attempt.expires_at = 0;
-            (
-                attempt.ticket_id.clone(),
-                relationship.canonical_proposal.proposal_id.clone(),
-                attempt.remote_claim_idempotency_key.clone(),
-            )
-        };
-        let poll = alice
-            .handle_event(CoreEvent::TimerTriggered {
-                timer_id: format!("relationship_status:{relationship_id}"),
-            })
-            .expect("poll expired relationship");
-        let poll_request_id = first_http_request_id_containing(&poll, "/status");
-        let expired = alice
-            .state
-            .relationships
-            .get(&relationship_id)
-            .expect("expired relationship")
-            .clone();
-        let retry = alice
-            .handle_event(CoreEvent::HttpResponseReceived {
-                request_id: poll_request_id,
-                status: 200,
-                body: Some(
-                    serde_json::to_string(&RelationshipTicketStatusResult {
-                        ticket_id,
-                        status: "pending".into(),
-                        relationship_id: relationship_id.clone(),
-                        generation: expired.generation,
-                        canonical_proposal: expired.canonical_proposal,
-                        updated_at: test_now_ms(),
-                        decision_proof: None,
-                    })
-                    .expect("pending ticket status"),
-                ),
-            })
-            .expect("restart expired attempt after authoritative status");
-        let claim_request = retry
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/key-packages/claims") =>
-                {
-                    serde_json::from_str::<ClaimKeyPackagesRequest>(
-                        request.body.as_deref().expect("retry claim body"),
-                    )
-                    .ok()
-                }
-                _ => None,
-            })
-            .expect("new KeyPackage claim");
-        assert_eq!(
-            claim_request.proposal.relationship_id_candidate,
-            relationship_id
-        );
-        assert_eq!(claim_request.proposal.generation, expired.generation);
-        assert_eq!(claim_request.proposal.attempt, 2);
-        assert_ne!(claim_request.proposal.proposal_id, old_proposal_id);
-        assert_ne!(claim_request.idempotency_key, old_claim_idempotency);
-        let retried = alice
-            .state
-            .relationships
-            .get(&relationship_id)
-            .expect("retried relationship");
-        assert_eq!(retried.attempts.len(), 2);
-        assert_eq!(retried.setup_state, RelationshipSetupState::RetryingExpired);
     }
 
     #[test]
@@ -3629,15 +3487,42 @@ mod tests {
             "conv:user:alice:user:bob:rel:1".into(),
             "conv:user:alice:user:bob:rel:2".into(),
         ];
-        let error = alice
+        alice
             .handle_event(CoreEvent::MessageRequestActionCompleted { result })
-            .expect_err("legacy accept must be hard-cut");
-        assert_eq!(error.code(), "protocol_upgrade_required");
-        assert!(alice
+            .expect("accept with multiple promoted ids");
+
+        let accepted_envelopes = alice
             .state
             .pending_outbox
             .iter()
-            .all(|item| item.envelope.message_type != MessageType::ControlContactAccepted));
+            .filter(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
+            .collect::<Vec<_>>();
+        assert_eq!(accepted_envelopes.len(), 2);
+        let mut conversation_ids = accepted_envelopes
+            .iter()
+            .map(|item| {
+                let payload_b64 = item
+                    .envelope
+                    .inline_ciphertext
+                    .as_deref()
+                    .expect("accepted payload");
+                let payload = STANDARD.decode(payload_b64).expect("payload base64");
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&payload).expect("accepted payload json");
+                payload["conversation_id"]
+                    .as_str()
+                    .expect("conversation id")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        conversation_ids.sort();
+        assert_eq!(
+            conversation_ids,
+            vec![
+                "conv:user:alice:user:bob:rel:1".to_string(),
+                "conv:user:alice:user:bob:rel:2".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3682,27 +3567,65 @@ mod tests {
                 .state,
             "active"
         );
-        assert!(!output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.ends_with("/v2/key-packages/claims")
-        )));
+        assert!(output.effects.is_empty());
     }
 
     #[test]
     fn direct_shell_without_mls_state_is_recovery_only_and_blocks_send() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
-        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        alice.state.mls_summaries.remove(&conversation_id);
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
+        let commit = bob
             .state
-            .mls_adapter
-            .as_mut()
-            .expect("MLS adapter")
-            .delete_group(&conversation_id)
-            .expect("remove MLS state");
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == alice_device_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            })
+            .expect("setup commit")
+            .envelope
+            .clone();
+
+        alice
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: alice_device_id.clone(),
+                to_seq: 1,
+                records: vec![InboxRecord {
+                    seq: 1,
+                    recipient_device_id: alice_device_id,
+                    message_id: commit.message_id.clone(),
+                    received_at: 1,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: commit,
+                }],
+            })
+            .expect("commit pending retry");
+
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("direct shell")
+                .recovery_status,
+            RecoveryStatus::NeedsRecovery
+        );
         let create_again = alice
             .handle_command(CoreCommand::CreateConversation {
                 peer_user_id: bob_bundle.user_id.clone(),
@@ -3734,7 +3657,19 @@ mod tests {
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let welcome_item = alice
+
+        let commit = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            })
+            .expect("setup commit")
+            .envelope
+            .clone();
+        let welcome = alice
             .state
             .pending_outbox
             .iter()
@@ -3743,33 +3678,48 @@ mod tests {
                     && item.envelope.message_type == MessageType::MlsWelcome
             })
             .expect("setup welcome")
+            .envelope
             .clone();
-        let proposal = alice
-            .state
-            .relationships
-            .values()
-            .find(|relationship| relationship.peer_user_id == bob_bundle.user_id)
-            .expect("relationship")
-            .canonical_proposal
-            .clone();
-        let pending_record = InboxRecord {
-            seq: 1,
-            recipient_device_id: bob_device_id.clone(),
-            message_id: welcome_item.envelope.message_id.clone(),
-            received_at: 1,
-            expires_at: None,
-            state: InboxRecordState::Available,
-            envelope: welcome_item.envelope.clone(),
-            envelope_v2: welcome_item.envelope_v2.clone(),
-            sender_identity_bundle: alice.local_bundle().cloned(),
-            relationship_proposal: Some(proposal.clone()),
-        };
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 1,
+            records: vec![InboxRecord {
+                seq: 1,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: commit.message_id.clone(),
+                received_at: 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: commit.clone(),
+            }],
+        })
+        .expect("commit pending retry");
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("direct shell")
+                .recovery_status,
+            RecoveryStatus::NeedsRecovery
+        );
         bob.state
             .sync_states
             .get_mut(&bob_device_id)
             .expect("sync state")
             .pending_records
-            .insert(1, pending_record);
+            .insert(
+                1,
+                InboxRecord {
+                    seq: 1,
+                    recipient_device_id: bob_device_id.clone(),
+                    message_id: commit.message_id.clone(),
+                    received_at: 1,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: commit,
+                },
+            );
         {
             let sync_state = bob
                 .state
@@ -3787,34 +3737,20 @@ mod tests {
             .pending_records
             .contains_key(&1));
 
-        let staged = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                to_seq: 2,
-                records: vec![InboxRecord {
-                    seq: 2,
-                    recipient_device_id: bob_device_id.clone(),
-                    message_id: welcome_item.envelope.message_id.clone(),
-                    received_at: 2,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: welcome_item.envelope,
-                    envelope_v2: welcome_item.envelope_v2,
-                    sender_identity_bundle: alice.local_bundle().cloned(),
-                    relationship_proposal: Some(proposal),
-                }],
-            })
-            .expect("welcome applies");
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("welcome commit");
-        bob.handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit Welcome");
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 2,
+            records: vec![InboxRecord {
+                seq: 2,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: welcome.message_id.clone(),
+                received_at: 2,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: welcome,
+            }],
+        })
+        .expect("welcome applies");
 
         assert_eq!(
             bob.state
@@ -3876,12 +3812,68 @@ mod tests {
                 message_request_id: Some("request:pending".into()),
             });
 
-        let error = alice
+        let output = alice
             .handle_event(CoreEvent::MessageRequestActionCompleted {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
-            .expect_err("legacy accept must be hard-cut");
-        assert_eq!(error.code(), "protocol_upgrade_required");
+            .expect("alice accepts bob request");
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { .. })));
+
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let accepted_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::ControlContactAccepted
+            })
+            .expect("accepted control envelope")
+            .envelope
+            .clone();
+        let payload_b64 = accepted_envelope
+            .inline_ciphertext
+            .as_deref()
+            .expect("accepted payload");
+        let payload = STANDARD.decode(payload_b64).expect("payload base64");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&payload).expect("accepted payload json");
+        assert_eq!(payload["conversation_id"], conversation_id);
+        assert_eq!(payload["actor_user_id"], alice_bundle.user_id);
+        assert_eq!(payload["accepted_user_id"], bob_bundle.user_id);
+
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+
+        assert_eq!(
+            bob.state
+                .contacts
+                .get(&alice_bundle.user_id)
+                .expect("alice contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages[0]
+                .delivery_state,
+            Some(crate::conversation::StoredMessageDeliveryState::Sent)
+        );
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .len(),
+            1,
+            "accepted control must stay protocol-only"
+        );
     }
 
     #[test]
@@ -3901,12 +3893,39 @@ mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        let error = alice
+        alice
             .handle_event(CoreEvent::MessageRequestActionCompleted {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
-            .expect_err("legacy accept must be hard-cut");
-        assert_eq!(error.code(), "protocol_upgrade_required");
+            .expect("alice accepts bob request");
+
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let mut accepted_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
+            .expect("accepted control envelope")
+            .envelope
+            .clone();
+        accepted_envelope.sender_proof.value = "00".repeat(64);
+
+        let err = bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device_id.clone(),
+                to_seq: 1,
+                records: vec![InboxRecord {
+                    seq: 1,
+                    recipient_device_id: bob_device_id,
+                    message_id: accepted_envelope.message_id.clone(),
+                    received_at: 1,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: accepted_envelope,
+                }],
+            })
+            .expect_err("invalid accepted control is rejected");
+        assert_eq!(err.code(), "invalid_input");
         assert_eq!(
             bob.state
                 .contacts
@@ -3934,12 +3953,61 @@ mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        let error = alice
+        alice
             .handle_event(CoreEvent::MessageRequestActionCompleted {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
-            .expect_err("legacy accept must be hard-cut");
-        assert_eq!(error.code(), "protocol_upgrade_required");
+            .expect("alice accepts bob request");
+        let accepted_envelope = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
+            .expect("accepted control envelope")
+            .envelope
+            .clone();
+
+        bob.handle_command(CoreCommand::DeleteContact {
+            user_id: alice_bundle.user_id.clone(),
+        })
+        .expect("bob deletes alice");
+        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
+
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 1,
+            records: vec![InboxRecord {
+                seq: 1,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: accepted_envelope.message_id.clone(),
+                received_at: 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: accepted_envelope,
+            }],
+        })
+        .expect("late accepted control ignored");
+
+        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
+        assert_eq!(
+            bob.state
+                .conversations
+                .get(&conversation_id)
+                .expect("archived conversation")
+                .conversation
+                .state,
+            ConversationState::Archived
+        );
+        assert_eq!(
+            bob.state
+                .sync_states
+                .get(&bob_device_id)
+                .expect("sync state")
+                .checkpoint
+                .last_acked_seq,
+            1
+        );
     }
 
     #[test]
@@ -3997,16 +4065,18 @@ mod tests {
         })
         .expect("bob imports alice");
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-        assert!(bob.state.conversations.contains_key(&conversation_id));
+        assert_eq!(
+            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
+            conversation_id
+        );
         alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "late".into(),
             })
             .expect("queue late message");
-        let stale_item = alice
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let stale_envelope = alice
             .state
             .pending_outbox
             .iter()
@@ -4015,11 +4085,8 @@ mod tests {
                     && item.envelope.message_type == MessageType::MlsApplication
             })
             .expect("stale app envelope")
+            .envelope
             .clone();
-        alice
-            .state
-            .pending_outbox
-            .retain(|item| item.envelope.message_id != stale_item.envelope.message_id);
 
         alice
             .handle_command(CoreCommand::DeleteContact {
@@ -4035,31 +4102,20 @@ mod tests {
             .messages
             .len();
 
-        let staged = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                to_seq: 2,
-                records: vec![InboxRecord {
-                    seq: 2,
-                    recipient_device_id: bob_device_id.clone(),
-                    message_id: stale_item.envelope.message_id.clone(),
-                    received_at: 2,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: stale_item.envelope.clone(),
-                    envelope_v2: stale_item.envelope_v2,
-                    sender_identity_bundle: None,
-                    relationship_proposal: None,
-                }],
-            })
-            .expect("late message ignored");
-        for commit_id in staged.effects.iter().filter_map(|effect| match effect {
-            CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-            _ => None,
-        }) {
-            bob.handle_event(CoreEvent::PersistenceCommitted { commit_id })
-                .expect("commit late-message classification");
-        }
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 2,
+            records: vec![InboxRecord {
+                seq: 2,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: stale_envelope.message_id.clone(),
+                received_at: 2,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: stale_envelope.clone(),
+            }],
+        })
+        .expect("late message ignored");
 
         let bob_conversation = bob
             .state
@@ -4070,7 +4126,7 @@ mod tests {
         assert!(!bob_conversation
             .messages
             .iter()
-            .any(|message| message.message_id == stale_item.envelope.message_id));
+            .any(|message| message.message_id == stale_envelope.message_id));
         assert!(!bob.state.recovery_contexts.contains_key(&conversation_id));
         let sync_state = bob
             .state
@@ -4921,24 +4977,12 @@ mod tests {
             })
             .expect("fetch response");
 
-        let commit_id = output
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("legacy quarantine commit");
-        let committed = engine
-            .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit legacy quarantine");
-        assert!(!engine
+        assert!(output.state_update.conversations_changed);
+        assert!(engine
             .state
             .conversations
             .contains_key(&expected_conversation_id));
-        assert_eq!(engine.state.quarantine.len(), 1);
-        assert_eq!(engine.state.quarantine[0].reason, "legacy_protocol");
-        assert!(committed.effects.iter().any(|effect| matches!(
+        assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
                 && request.headers.get("Authorization").is_none()
@@ -4966,10 +5010,13 @@ mod tests {
         let response = alice
             .handle_event(CoreEvent::IdentityBundleFetched {
                 user_id: bob_bundle.user_id.clone(),
-                bundle: updated_bundle,
+                bundle: serde_json::from_str(&updated_bundle_json_for_user(
+                    &bob_bundle.user_id,
+                    updated_bundle,
+                ))
+                .expect("bundle"),
             })
             .expect("identity bundle response");
-        let response = drive_all_test_claim_requests(&mut alice, response);
 
         assert!(response.state_update.conversations_changed);
         assert!(response.effects.iter().any(|effect| matches!(
@@ -5636,13 +5683,18 @@ mod tests {
     fn append_inbox_result_exposes_structured_append_result() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .relationship_status = ContactRelationshipStatus::PendingOutbound;
         let output = alice
-            .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
-                plaintext: "deliver me".into(),
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
             })
-            .expect("send V2 application");
+            .expect("conversation setup");
         let request_id = find_http_request_id(&output, "/messages");
 
         let output = alice
@@ -5664,10 +5716,7 @@ mod tests {
             append_result.delivered_to,
             crate::transport_contract::AppendDeliveryDisposition::Inbox
         );
-        assert!(
-            !output.state_update.contacts_changed,
-            "an ordinary V2 inbox delivery must not mutate account relationship state"
-        );
+        assert!(output.state_update.contacts_changed);
         assert_eq!(
             alice
                 .state
@@ -5890,18 +5939,7 @@ mod tests {
                 ),
             })
             .expect("fetch response");
-        let commit_id = fetched
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("inbound commit id");
-        let committed = engine
-            .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit inbound record");
-        let ack_request_id = find_http_request_id(&committed, "/ack");
+        let ack_request_id = find_http_request_id(&fetched, "/ack");
 
         let error = engine
             .handle_event(CoreEvent::HttpResponseReceived {
@@ -6123,7 +6161,7 @@ mod tests {
         );
         let conversation_id = record.envelope.conversation_id.clone();
 
-        let staged = engine
+        engine
             .handle_event(CoreEvent::RealtimeEventReceived {
                 device_id: device_id.clone(),
                 event: RealtimeEvent::InboxRecordAvailable {
@@ -6132,60 +6170,24 @@ mod tests {
                 },
             })
             .expect("inline record");
-        let overlapping_fetch = engine
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: device_id.clone(),
-                records: vec![record.clone()],
-                to_seq: 1,
-            })
-            .expect("fetch records");
-        assert!(overlapping_fetch.effects.is_empty());
-        assert!(!engine.state.conversations.contains_key(&conversation_id));
-
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("staged commit id");
-        let committed = engine
-            .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit inline record");
-
-        assert!(!engine.state.conversations.contains_key(&conversation_id));
-        assert_eq!(engine.state.quarantine.len(), 1);
-        assert_eq!(
-            committed
-                .effects
-                .iter()
-                .filter(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")))
-                .count(),
-            1
-        );
-
-        let replay = engine
+        engine
             .handle_event(CoreEvent::InboxRecordsFetched {
                 device_id,
                 records: vec![record],
                 to_seq: 1,
             })
-            .expect("replayed fetch");
-        let replay_commit_id = replay
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("duplicate checkpoint commit id");
-        engine
-            .handle_event(CoreEvent::PersistenceCommitted {
-                commit_id: replay_commit_id,
-            })
-            .expect("commit duplicate checkpoint");
-        assert_eq!(engine.state.quarantine.len(), 1);
+            .expect("fetch records");
+
+        assert_eq!(
+            engine
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -6235,24 +6237,13 @@ mod tests {
         );
         let conversation_id = record.envelope.conversation_id.clone();
 
-        let staged = engine
+        engine
             .handle_event(CoreEvent::InboxRecordsFetched {
                 device_id: device_id.clone(),
                 records: vec![record],
                 to_seq: 1,
             })
             .expect("fetch records");
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("inbound commit id");
-        engine
-            .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit fetched record");
 
         let stale = engine
             .handle_event(CoreEvent::RealtimeEventReceived {
@@ -6261,12 +6252,17 @@ mod tests {
             })
             .expect("stale realtime");
 
-        assert!(!stale.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages?")
-        )));
-        assert!(!engine.state.conversations.contains_key(&conversation_id));
-        assert_eq!(engine.state.quarantine.len(), 1);
+        assert!(stale.effects.is_empty());
+        assert_eq!(
+            engine
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .len(),
+            1
+        );
         assert_eq!(
             engine
                 .sync_checkpoint_snapshot(&device_id)
@@ -6352,219 +6348,6 @@ mod tests {
     }
 
     #[test]
-    fn signed_invalid_mls_record_is_quarantined_without_blocking_the_next_seq() {
-        let mut bob = local_engine(BOB_MNEMONIC, "phone");
-        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
-        let bob_device_id = bob_bundle.devices[0].device_id.clone();
-        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-
-        alice
-            .handle_command(CoreCommand::SendTextMessage {
-                conversation_id: conversation_id.clone(),
-                plaintext: "this ciphertext will be corrupted".into(),
-            })
-            .expect("send application");
-        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
-        let alice_identity = alice
-            .state
-            .local_identity
-            .as_ref()
-            .expect("alice identity")
-            .clone();
-        let relationship = alice
-            .state
-            .relationships
-            .values()
-            .find(|relationship| relationship.peer_user_id == bob_bundle.user_id)
-            .expect("Direct V2 relationship")
-            .clone();
-        let first_seq = bob
-            .state
-            .sync_states
-            .get(&bob_device_id)
-            .expect("bob sync state")
-            .checkpoint
-            .last_fetched_seq
-            + 1;
-
-        let mut invalid = pending_application_record(&alice, &bob_device_id);
-        invalid.seq = first_seq;
-        invalid.received_at = first_seq;
-        invalid.sender_identity_bundle = Some(alice_bundle.clone());
-        let invalid_v2 = invalid.envelope_v2.as_mut().expect("V2 application");
-        invalid_v2.inline_ciphertext = Some("not-a-valid-mls-message".into());
-        alice_identity
-            .sign_envelope_v2(invalid_v2)
-            .expect("sign corrupted MLS test envelope");
-        invalid.envelope = invalid_v2.legacy_shadow();
-
-        let mut control_v2 = crate::model::EnvelopeV2 {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            message_id: "msg:v2-after-invalid-mls".into(),
-            conversation_id: conversation_id.clone(),
-            relationship_id: relationship.relationship_id,
-            generation: relationship.generation,
-            attempt: relationship.canonical_proposal.attempt,
-            proposal_id: relationship.canonical_proposal.proposal_id,
-            claim_id: None,
-            sender_user_id: alice_bundle.user_id.clone(),
-            sender_device_id: alice_bundle.devices[0].device_id.clone(),
-            recipient_user_id: bob_bundle.user_id.clone(),
-            recipient_device_id: bob_device_id.clone(),
-            created_at: test_now_ms(),
-            message_type: MessageType::ControlConversationNeedsRebuild,
-            inline_ciphertext: Some(STANDARD.encode("recover after invalid MLS")),
-            storage_refs: Vec::new(),
-            delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
-            sender_bundle_digest: crate::identity::identity_bundle_digest(&alice_bundle)
-                .expect("alice bundle digest"),
-            sender_proof: SenderProof {
-                proof_type: crate::model::ENVELOPE_SENDER_PROOF_V2.into(),
-                value: String::new(),
-            },
-        };
-        alice_identity
-            .sign_envelope_v2(&mut control_v2)
-            .expect("sign following control");
-        let second_seq = first_seq + 1;
-        let control = InboxRecord {
-            seq: second_seq,
-            recipient_device_id: bob_device_id.clone(),
-            message_id: control_v2.message_id.clone(),
-            received_at: second_seq,
-            expires_at: None,
-            state: InboxRecordState::Available,
-            envelope: control_v2.legacy_shadow(),
-            envelope_v2: Some(control_v2),
-            sender_identity_bundle: Some(alice_bundle),
-            relationship_proposal: None,
-        };
-
-        let staged = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                records: vec![invalid, control],
-                to_seq: second_seq,
-            })
-            .expect("stage invalid MLS and following record");
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("inbound commit");
-        bob.handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit classified records");
-
-        assert_eq!(
-            bob.state
-                .quarantine
-                .last()
-                .expect("quarantine record")
-                .reason,
-            "invalid_mls_message"
-        );
-        assert_eq!(
-            bob.state
-                .sync_states
-                .get(&bob_device_id)
-                .expect("bob sync state")
-                .checkpoint
-                .last_acked_seq,
-            second_seq,
-            "the quarantined record must not block the following sequence"
-        );
-    }
-
-    #[test]
-    fn inbound_state_and_ack_are_released_only_after_persistence_commit() {
-        let mut engine = local_engine(BOB_MNEMONIC, "phone");
-        let local_user_id = engine
-            .state
-            .local_identity
-            .as_ref()
-            .expect("local identity")
-            .user_identity
-            .user_id
-            .clone();
-        let device_id = engine.local_device_id().expect("local device").to_string();
-        let record = sample_control_record(
-            &device_id,
-            1,
-            &local_user_id,
-            "user:legacy-peer",
-            "device:legacy-peer:phone",
-        );
-
-        let staged = engine
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: device_id.clone(),
-                records: vec![record.clone()],
-                to_seq: 1,
-            })
-            .expect("stage inbound batch");
-        assert_eq!(engine.state.quarantine.len(), 0);
-        assert!(!engine.state.pending_acks.contains_key(&device_id));
-        assert_eq!(staged.state_update, CoreStateUpdate::default());
-        assert!(staged.view_model.is_none());
-        assert!(!staged.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
-        )));
-        let first_commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("staged commit id");
-
-        let failed = engine
-            .handle_event(CoreEvent::PersistenceFailed {
-                commit_id: first_commit_id,
-                failure: test_failure("temporary_failure", true, None),
-            })
-            .expect("rollback failed persistence");
-        assert!(failed.effects.is_empty());
-        assert_eq!(engine.state.quarantine.len(), 0);
-        assert!(!engine.state.pending_acks.contains_key(&device_id));
-
-        let retried = engine
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: device_id.clone(),
-                records: vec![record],
-                to_seq: 1,
-            })
-            .expect("restage inbound batch");
-        let second_commit_id = retried
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("restaged commit id");
-        let committed = engine
-            .handle_event(CoreEvent::PersistenceCommitted {
-                commit_id: second_commit_id,
-            })
-            .expect("commit inbound batch");
-        assert_eq!(engine.state.quarantine.len(), 1);
-        assert_eq!(engine.state.quarantine[0].reason, "legacy_protocol");
-        assert!(engine.state.pending_acks.contains_key(&device_id));
-        assert!(committed.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
-        )));
-    }
-
-    #[test]
     fn proven_mls_ciphertext_replay_is_acknowledged_without_duplicate_message() {
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
@@ -6607,23 +6390,12 @@ mod tests {
         let replay_seq = sync.checkpoint.last_fetched_seq + 1;
         application_record.seq = replay_seq;
 
-        let staged = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                records: vec![application_record],
-                to_seq: replay_seq,
-            })
-            .expect("proven replay");
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("proven replay commit");
-        bob.handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit proven replay");
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            records: vec![application_record],
+            to_seq: replay_seq,
+        })
+        .expect("proven replay");
 
         let sync = bob
             .state
@@ -6677,31 +6449,12 @@ mod tests {
         let replay_seq = sync.checkpoint.last_fetched_seq + 1;
         application_record.seq = replay_seq;
 
-        let staged = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                records: vec![application_record],
-                to_seq: replay_seq,
-            })
-            .expect("unproven replay is recoverable");
-        assert!(
-            !bob.state
-                .sync_states
-                .get(&bob_device_id)
-                .expect("live sync state")
-                .pending_retry,
-            "staged retry state must not leak before persistence commits"
-        );
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("unproven replay commit");
-        bob.handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit unproven replay recovery state");
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            records: vec![application_record],
+            to_seq: replay_seq,
+        })
+        .expect("unproven replay is recoverable");
 
         let sync = bob
             .state
@@ -6840,83 +6593,52 @@ mod tests {
 
     #[test]
     fn control_needs_rebuild_record_sets_explicit_rebuild_escalation_reason() {
-        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
-        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
-        let alice_device_id = alice_bundle.devices[0].device_id.clone();
-        let mut bob = seeded_engine(BOB_MNEMONIC, "phone", alice_bundle.clone());
-        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        deliver_pending_outbox_to_device(&mut alice, &bob, &alice_device_id);
-        let relationship = bob
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let device_id = alice
             .state
-            .relationships
-            .values()
-            .find(|relationship| relationship.peer_user_id == alice_bundle.user_id)
-            .expect("relationship")
-            .clone();
-        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
-        let mut envelope_v2 = crate::model::EnvelopeV2 {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            message_id: "msg:v2-needs-rebuild".into(),
-            conversation_id: conversation_id.clone(),
-            relationship_id: relationship.relationship_id,
-            generation: relationship.generation,
-            attempt: relationship.canonical_proposal.attempt,
-            proposal_id: relationship.canonical_proposal.proposal_id,
-            claim_id: None,
-            sender_user_id: bob_bundle.user_id.clone(),
-            sender_device_id: bob_bundle.devices[0].device_id.clone(),
-            recipient_user_id: alice_bundle.user_id.clone(),
-            recipient_device_id: alice_device_id.clone(),
-            created_at: test_now_ms(),
-            message_type: MessageType::ControlConversationNeedsRebuild,
-            inline_ciphertext: Some(STANDARD.encode("needs-rebuild")),
-            storage_refs: Vec::new(),
-            delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
-            sender_bundle_digest: crate::identity::identity_bundle_digest(&bob_bundle)
-                .expect("bundle digest"),
-            sender_proof: SenderProof {
-                proof_type: crate::model::ENVELOPE_SENDER_PROOF_V2.into(),
-                value: String::new(),
-            },
-        };
-        bob.state
             .local_identity
             .as_ref()
-            .expect("bob identity")
-            .sign_envelope_v2(&mut envelope_v2)
-            .expect("signed V2 control");
-        let record = InboxRecord {
-            seq: 2,
-            recipient_device_id: alice_device_id.clone(),
-            message_id: envelope_v2.message_id.clone(),
-            received_at: 2,
-            expires_at: None,
-            state: InboxRecordState::Available,
-            envelope: envelope_v2.legacy_shadow(),
-            envelope_v2: Some(envelope_v2),
-            sender_identity_bundle: Some(bob_bundle),
-            relationship_proposal: None,
-        };
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+        let local_user_id = alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+        let peer_user_id = alice.state.contacts.keys().next().expect("contact").clone();
+        let peer_device_id = alice
+            .state
+            .contacts
+            .values()
+            .next()
+            .expect("contact")
+            .bundle
+            .devices[0]
+            .device_id
+            .clone();
+        let record = sample_control_record_with_type(
+            &device_id,
+            1,
+            &local_user_id,
+            &peer_user_id,
+            &peer_device_id,
+            MessageType::ControlConversationNeedsRebuild,
+        );
+        let conversation_id = record.envelope.conversation_id.clone();
 
-        let staged = alice
+        alice
             .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: alice_device_id,
+                device_id,
                 records: vec![record],
-                to_seq: 2,
+                to_seq: 1,
             })
             .expect("ingest control rebuild");
-        let commit_id = staged
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .expect("control commit");
-        alice
-            .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-            .expect("commit control");
 
         assert_eq!(
             alice
@@ -7316,6 +7038,11 @@ mod tests {
 
     #[test]
     fn additional_device_snapshot_round_trip_restores_bootstrap_for_welcome_staging() {
+        let bob_phone_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_phone_bundle.clone());
+        let conversation_id =
+            create_direct_conversation(&mut alice, bob_phone_bundle.user_id.clone());
+
         let mut laptop = CoreEngine::new();
         laptop
             .handle_command(CoreCommand::ImportDeploymentBundle {
@@ -7349,39 +7076,100 @@ mod tests {
                 .device_identity
                 .device_id
         );
-        assert!(deployment.published_key_package.is_none());
-        assert!(deployment
-            .local_bundle
-            .as_ref()
-            .expect("local bundle")
-            .devices[0]
-            .keypackage_ref
-            .is_none());
         assert_eq!(
-            deployment.key_package_inventory.len(),
-            crate::mls_adapter::KEY_PACKAGE_POOL_TARGET
+            deployment
+                .published_key_package
+                .as_ref()
+                .expect("published key package")
+                .key_package_ref,
+            deployment
+                .local_bundle
+                .as_ref()
+                .expect("local bundle")
+                .devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("key package reference")
+                .object_ref
         );
         assert!(
             deployment.serialized_mls_bootstrap_state.is_some(),
             "additional device snapshot should persist MLS bootstrap state before welcome"
         );
 
+        let laptop_profile = deployment
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .clone();
+        let laptop_identity = snapshot
+            .local_identity
+            .as_ref()
+            .expect("local identity")
+            .state
+            .clone();
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &laptop_identity,
+            &sample_deployment(),
+            vec![bob_phone_bundle.devices[0].clone(), laptop_profile.clone()],
+            None,
+            None,
+        )
+        .expect("merged bundle");
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
+            .expect("apply merged bundle");
+        let welcome = alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsWelcome
+                    && item.envelope.recipient_device_id == laptop_profile.device_id
+            })
+            .map(|item| item.envelope.clone())
+            .expect("welcome for laptop");
+
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
-        let generated = restored
+        let result = restored
             .state
             .mls_adapter
             .as_mut()
             .expect("restored laptop adapter")
-            .generate_key_package_pool(test_now_ms(), 1)
-            .expect("generate from restored provider");
-        assert_eq!(generated.len(), 1);
-        assert!(generated[0].expires_at > generated[0].created_at);
+            .ingest_message(
+                &conversation_id,
+                &welcome.sender_device_id,
+                MessageType::MlsWelcome,
+                welcome
+                    .inline_ciphertext
+                    .as_deref()
+                    .expect("welcome payload"),
+            )
+            .expect("stage welcome after snapshot restore");
+        assert!(matches!(
+            result,
+            crate::mls_adapter::IngestResult::AppliedWelcome { .. }
+        ));
     }
 
     #[test]
     fn manual_key_package_rotation_commits_only_after_publication_confirmation() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let before = engine
+            .state
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("key package reference")
+            .object_ref
+            .clone();
+
         let output = engine
             .handle_command(CoreCommand::RotateLocalKeyPackage)
             .expect("rotate key package");
@@ -7389,195 +7177,159 @@ mod tests {
             .effects
             .iter()
             .find_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/device-registry/key-packages") =>
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
                 {
-                    Some(request.clone())
+                    Some(publish.clone())
                 }
                 _ => None,
             })
-            .expect("V2 KeyPackage pool publication");
-        let batch: crate::transport_contract::PublishKeyPackageBatchRequest =
-            serde_json::from_str(publish.body.as_deref().expect("batch body"))
-                .expect("publish batch");
-        assert!(!batch.packages.is_empty());
-        assert!(batch.packages.iter().all(|package| engine
-            .state
-            .key_package_inventory
-            .iter()
-            .any(|item| item.key_package_id == package.key_package_id
-                && item.state == PublishedKeyPackageState::PendingPublish)));
-        assert!(engine.local_bundle().expect("IdentityBundle V2").devices[0]
+            .expect("identity publication");
+        let candidate: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("candidate bundle");
+        let candidate_ref = candidate.devices[0]
             .keypackage_ref
-            .is_none());
+            .as_ref()
+            .expect("candidate key package")
+            .object_ref
+            .clone();
+        assert_ne!(before, candidate_ref);
+        assert_eq!(local_key_package_ref(&engine), before);
 
         engine
-            .handle_event(CoreEvent::HttpResponseReceived {
-                request_id: publish.request_id,
-                status: 200,
-                body: Some(
-                    serde_json::json!({
-                        "accepted": true,
-                        "idempotency_key": batch.idempotency_key,
-                        "published": batch.packages.len(),
-                    })
-                    .to_string(),
-                ),
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference,
+                etag: Some("\"rotated\"".into()),
+                saved_bundle: Some(candidate),
             })
-            .expect("confirm KeyPackage batch publication");
-        assert!(engine.state.pending_key_package_publish.is_none());
-        assert!(batch.packages.iter().all(|package| engine
+            .expect("confirm key package publication");
+        let after = engine
             .state
-            .key_package_inventory
-            .iter()
-            .any(|item| item.key_package_id == package.key_package_id
-                && item.state == PublishedKeyPackageState::Advertised)));
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("key package reference")
+            .object_ref
+            .clone();
+        assert_ne!(before, after);
     }
 
     #[test]
     fn expired_key_package_recovers_after_offline_publication_failure_and_restore() {
         let mut engine = local_engine(ALICE_MNEMONIC, "phone");
-        let now_ms = test_now_ms();
-        for package in &mut engine.state.key_package_inventory {
-            package.expires_at = now_ms.saturating_sub(1);
-            package.state = PublishedKeyPackageState::Advertised;
-        }
-        engine.state.pending_key_package_publish = None;
+        let previous_ref = local_key_package_ref(&engine);
+        let expired_at = engine
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("published key package")
+            .expires_at;
         let output = engine
-            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms })
-            .expect("stage expired pool recovery");
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms: expired_at })
+            .expect("stage expired key package recovery");
         let publish = output
             .effects
             .iter()
             .find_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/device-registry/key-packages") =>
+                CoreEffect::PublishSharedState { publish }
+                    if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
                 {
-                    Some(request.clone())
+                    Some(publish.clone())
                 }
                 _ => None,
             })
-            .expect("pool publication");
-        let batch: crate::transport_contract::PublishKeyPackageBatchRequest =
-            serde_json::from_str(publish.body.as_deref().expect("batch body"))
-                .expect("publish batch");
-        assert_eq!(
-            batch.packages.len(),
-            crate::mls_adapter::KEY_PACKAGE_POOL_TARGET
-        );
+            .expect("identity publication");
+        let candidate: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("candidate bundle");
+        assert_eq!(local_key_package_ref(&engine), previous_ref);
 
         engine
-            .handle_event(CoreEvent::HttpRequestFailed {
-                request_id: publish.request_id.clone(),
-                failure: test_failure("network_unavailable", true, None),
+            .handle_event(CoreEvent::SharedStatePublishFailed {
+                operation_id: publish.operation_id.clone(),
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference.clone(),
+                failure: crate::error::AppErrorV1::new(
+                    "network_unavailable",
+                    crate::error::ErrorDomain::Transport,
+                    true,
+                ),
+                current_bundle: None,
+                etag: None,
             })
-            .expect("record offline pool publication failure");
+            .expect("record offline publication failure");
         let mut restored = CoreEngine::try_from_restored_state(engine.refresh_snapshot())
-            .expect("restore pending pool publication");
-        assert_eq!(
-            restored
-                .state
-                .pending_key_package_publish
-                .as_ref()
-                .expect("pending batch")
-                .idempotency_key,
-            batch.idempotency_key
-        );
+            .expect("restore pending credential publication");
+        assert_eq!(local_key_package_ref(&restored), previous_ref);
 
-        let retry_at = restored
-            .state
-            .pending_key_package_publish
-            .as_ref()
-            .expect("pending batch")
-            .next_retry_at;
         let retry = restored
-            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms: retry_at })
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms: u64::MAX })
             .expect("retry after reconnect");
-        let retried = retry
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/device-registry/key-packages") =>
-                {
-                    Some(request.clone())
-                }
-                _ => None,
-            })
-            .expect("retried pool publication");
-        let retried_batch: crate::transport_contract::PublishKeyPackageBatchRequest =
-            serde_json::from_str(retried.body.as_deref().expect("retry body"))
-                .expect("retry batch");
-        assert_eq!(retried_batch, batch);
+        let retried = retry.effects.iter().find_map(|effect| match effect {
+            CoreEffect::PublishSharedState { publish } => Some(publish),
+            _ => None,
+        });
+        assert_eq!(
+            retried.and_then(|publish| publish.operation_id.as_ref()),
+            publish.operation_id.as_ref()
+        );
 
         restored
-            .handle_event(CoreEvent::HttpResponseReceived {
-                request_id: retried.request_id,
-                status: 200,
-                body: Some(
-                    serde_json::json!({
-                        "accepted": true,
-                        "idempotency_key": batch.idempotency_key,
-                        "published": batch.packages.len(),
-                    })
-                    .to_string(),
-                ),
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: SharedStateDocumentKind::IdentityBundle,
+                reference: publish.reference,
+                etag: Some("\"recovered\"".into()),
+                saved_bundle: Some(candidate),
             })
-            .expect("confirm recovered pool publication");
-        assert!(restored.state.pending_key_package_publish.is_none());
-        assert_eq!(
-            restored
-                .state
-                .key_package_inventory
-                .iter()
-                .filter(|package| package.state == PublishedKeyPackageState::Advertised)
-                .count(),
-            crate::mls_adapter::KEY_PACKAGE_POOL_TARGET
-        );
+            .expect("confirm recovered publication");
+        assert_ne!(local_key_package_ref(&restored), previous_ref);
+        assert!(restored.state.pending_identity_publication.is_none());
     }
 
     #[test]
     fn restored_legacy_2100_key_package_rotates_on_first_online_maintenance() {
         let engine = local_engine(ALICE_MNEMONIC, "phone");
+        let previous_ref = local_key_package_ref(&engine);
         let mut snapshot = engine.refresh_snapshot();
         let deployment = snapshot.deployment.as_mut().expect("deployment snapshot");
-        let mut legacy = deployment
-            .key_package_inventory
-            .first()
-            .expect("generated package")
-            .clone();
-        legacy.lifecycle_version = 0;
-        legacy.not_before = 0;
-        legacy.created_at = 0;
-        legacy.expires_at = 4_102_444_800_000;
-        legacy.state = PublishedKeyPackageState::Advertised;
-        deployment.published_key_package = Some(legacy);
+        let package = deployment
+            .published_key_package
+            .as_mut()
+            .expect("published key package");
+        package.lifecycle_version = 0;
+        package.not_before = 0;
+        package.created_at = 0;
+        package.expires_at = 4_102_444_800_000;
         deployment.key_package_inventory.clear();
-        deployment.pending_key_package_publish = None;
 
         let mut restored = CoreEngine::try_from_restored_state(snapshot)
             .expect("restore legacy key package snapshot");
         let output = restored
             .handle_event(CoreEvent::AppStarted)
             .expect("startup maintenance");
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.ends_with("/v2/device-registry/key-packages")
-        )));
-        assert!(!output.effects.iter().any(|effect| matches!(
-            effect,
+        let candidate = output.effects.iter().find_map(|effect| match effect {
             CoreEffect::PublishSharedState { publish }
-                if publish.document_kind == SharedStateDocumentKind::IdentityBundle
-        )));
-        assert!(restored.state.published_key_package.is_none());
-        assert!(restored
-            .state
-            .pending_key_package_publish
-            .as_ref()
-            .is_some_and(
-                |pending| pending.package_ids.len() == crate::mls_adapter::KEY_PACKAGE_POOL_TARGET
-            ));
+                if publish.document_kind == SharedStateDocumentKind::IdentityBundle =>
+            {
+                serde_json::from_str::<IdentityBundle>(&publish.body).ok()
+            }
+            _ => None,
+        });
+        let candidate = candidate.expect("legacy package rotation publication");
+        assert_ne!(
+            candidate.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("candidate key package")
+                .object_ref,
+            previous_ref
+        );
+        assert!(restored.state.pending_identity_publication.is_some());
     }
 
     #[test]
@@ -7585,18 +7337,11 @@ mod tests {
         let mut engine = local_engine(ALICE_MNEMONIC, "phone");
         let now_ms = engine
             .state
-            .key_package_inventory
-            .first()
-            .expect("V2 key package inventory")
-            .created_at;
-        let previous_mls_binding = engine
-            .state
-            .local_bundle
+            .published_key_package
             .as_ref()
-            .expect("local bundle")
-            .devices[0]
-            .mls_device_key_binding
-            .clone();
+            .expect("published key package")
+            .created_at;
+        let previous_key_package = local_key_package_ref(&engine);
         let previous_expiry =
             now_ms.saturating_add(crate::capability::INBOX_APPEND_CAPABILITY_RENEWAL_WINDOW_MS);
         engine
@@ -7628,15 +7373,12 @@ mod tests {
         let candidate_device = &candidate.devices[0];
         assert_eq!(
             candidate_device
-                .mls_device_key_binding
+                .keypackage_ref
                 .as_ref()
-                .map(|binding| binding.mls_signature_public_key.as_str()),
-            previous_mls_binding
-                .as_ref()
-                .map(|binding| binding.mls_signature_public_key.as_str()),
-            "capability renewal must not rotate the MLS signer"
+                .expect("candidate key package")
+                .object_ref,
+            previous_key_package
         );
-        assert!(candidate_device.keypackage_ref.is_none());
         assert_eq!(
             candidate_device
                 .inbox_append_capability
@@ -7662,64 +7404,67 @@ mod tests {
     }
 
     #[test]
-    fn direct_welcome_replenishes_and_persists_key_package_pool() {
+    fn direct_welcome_rotates_and_persists_new_key_package() {
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
-        for package in &mut bob.state.key_package_inventory {
-            package.state = PublishedKeyPackageState::Advertised;
-        }
-        bob.state.pending_key_package_publish = None;
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob_bundle.devices[0].device_id.clone();
         let bob_user_id = bob_bundle.user_id.clone();
-        let before_binding = bob_bundle.devices[0]
-            .mls_device_key_binding
-            .as_ref()
-            .expect("MLS binding")
-            .mls_signature_public_key
-            .clone();
-        let before_count = bob.state.key_package_inventory.len();
+        let before = local_key_package_ref(&bob);
 
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         create_direct_conversation(&mut alice, bob_user_id);
         let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
 
-        assert_eq!(
-            bob.state.key_package_inventory.len(),
-            before_count + 1,
-            "a successful Welcome must replenish one consumed pool slot"
+        let after = bob
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("replacement published key package")
+            .key_package_ref
+            .clone();
+        assert_ne!(
+            before, after,
+            "welcome import must publish a fresh KeyPackage"
         );
-        assert_eq!(
-            bob.local_bundle().expect("bundle").devices[0]
-                .mls_device_key_binding
-                .as_ref()
-                .expect("MLS binding")
-                .mls_signature_public_key,
-            before_binding
-        );
-        assert!(bob.local_bundle().expect("bundle").devices[0]
-            .keypackage_ref
-            .is_none());
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.ends_with("/v2/device-registry/key-packages")
-        )));
-        assert!(!publish_shared_state_effects(&output)
-            .iter()
-            .any(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle));
 
         let snapshot = bob.refresh_snapshot();
         let deployment = snapshot.deployment.expect("persisted deployment");
-        assert_eq!(deployment.key_package_inventory.len(), before_count + 1);
         assert_eq!(
             deployment
-                .pending_key_package_publish
-                .expect("persisted pool refill")
-                .package_ids
-                .len(),
-            1
+                .published_key_package
+                .expect("persisted published key package")
+                .key_package_ref,
+            after
         );
-        assert!(deployment.pending_identity_publication.is_none());
+        let pending = deployment
+            .pending_identity_publication
+            .expect("welcome rotation publication remains pending");
+        assert_eq!(
+            pending.candidate_bundle.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("key package reference")
+                .object_ref,
+            after
+        );
+        assert_eq!(
+            deployment
+                .local_bundle
+                .expect("persisted confirmed local bundle")
+                .devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("confirmed key package reference")
+                .object_ref,
+            before,
+            "the advertised package must not switch before server confirmation"
+        );
+        assert!(
+            publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle),
+            "rotated identity bundle should be republished after welcome"
+        );
     }
 
     #[test]
@@ -7751,26 +7496,31 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         create_direct_conversation(&mut alice, bob_user_id);
         let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-        let still_pending = bob
-            .state
-            .pending_identity_publication
-            .as_ref()
-            .expect("share publication remains pending");
+        let rebased_publish = publish_shared_state_effects(&output)
+            .into_iter()
+            .find(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle)
+            .expect("rebased identity publication");
+        let rebased_candidate: IdentityBundle =
+            serde_json::from_str(&rebased_publish.body).expect("rebased bundle");
+
+        assert_eq!(rebased_publish.operation_id, staged_publish.operation_id);
         assert_eq!(
-            Some(still_pending.operation_id.as_str()),
-            staged_publish.operation_id.as_deref()
-        );
-        assert_eq!(
-            still_pending.candidate_bundle.bundle_share_id.as_deref(),
+            rebased_candidate.bundle_share_id.as_deref(),
             Some(staged_share_id.as_str()),
             "the delayed Welcome must preserve the pending share-id change"
         );
-        assert_eq!(still_pending.candidate_bundle, staged_candidate);
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.ends_with("/v2/device-registry/key-packages")
-        )));
+        assert_ne!(
+            rebased_candidate.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("replacement key package")
+                .object_ref,
+            staged_candidate.devices[0]
+                .keypackage_ref
+                .as_ref()
+                .expect("staged key package")
+                .object_ref
+        );
         assert_eq!(
             bob.local_bundle()
                 .and_then(|bundle| bundle.bundle_share_id.as_deref()),
@@ -7780,14 +7530,42 @@ mod tests {
     }
 
     #[test]
-    fn group_invite_after_direct_welcome_uses_a_new_claimed_key_package() {
+    fn group_invite_after_direct_welcome_uses_rotated_key_package() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
         import_peer_bundles(&mut [&mut alice, &mut bob]);
 
         create_direct_conversation(&mut alice.engine, bob.bundle.user_id.clone());
         let bob_device_id = bob.bundle.devices[0].device_id.clone();
-        deliver_pending_outbox_to_device(&mut bob.engine, &alice.engine, &bob_device_id);
+        let welcome_output =
+            deliver_pending_outbox_to_device(&mut bob.engine, &alice.engine, &bob_device_id);
+        let publish = publish_shared_state_effects(&welcome_output)
+            .into_iter()
+            .find(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle)
+            .expect("rotated identity publication")
+            .clone();
+        let saved_bundle: IdentityBundle =
+            serde_json::from_str(&publish.body).expect("rotated identity bundle");
+        bob.engine
+            .handle_event(CoreEvent::SharedStatePublished {
+                operation_id: publish.operation_id,
+                document_kind: publish.document_kind,
+                reference: publish.reference,
+                etag: Some("\"direct-welcome\"".into()),
+                saved_bundle: Some(saved_bundle),
+            })
+            .expect("confirm rotated identity publication");
+        bob.bundle = bob
+            .engine
+            .local_bundle()
+            .expect("rotated bob bundle")
+            .clone();
+        alice
+            .engine
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob.bundle.clone(),
+            })
+            .expect("alice refreshes bob identity");
 
         let mut harness = GroupHarness::with_bundles(&[HarnessUser {
             name: bob.name,
@@ -7805,7 +7583,7 @@ mod tests {
     }
 
     #[test]
-    fn group_welcome_allows_a_new_claim_for_subsequent_group_invite() {
+    fn group_welcome_rotates_key_package_for_subsequent_group_invite() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
         import_peer_bundles(&mut [&mut alice, &mut bob]);
@@ -7815,9 +7593,19 @@ mod tests {
             engine: CoreEngine::new(),
         }]);
 
+        let before = local_key_package_ref(&bob.engine);
         let (first_group_id, _) =
             harness.create_group(&mut alice, "First", vec![bob.bundle.user_id.clone()]);
         harness.import_welcome(&mut bob, &first_group_id);
+        let after_first = local_key_package_ref(&bob.engine);
+        assert_ne!(before, after_first);
+
+        alice
+            .engine
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob.bundle.clone(),
+            })
+            .expect("alice refreshes bob identity after first group welcome");
         let (second_group_id, _) =
             harness.create_group(&mut alice, "Second", vec![bob.bundle.user_id.clone()]);
         harness.import_welcome(&mut bob, &second_group_id);
@@ -7855,8 +7643,28 @@ mod tests {
     fn identity_bundle_update_with_new_device_refreshes_contact_devices() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let (merged, bob_laptop_profile, _) =
-            identity_bundle_with_additional_test_device(&bob_bundle, BOB_MNEMONIC, "laptop");
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile.clone()],
+            None,
+            None,
+        )
+        .expect("merged bundle");
 
         alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
@@ -7883,20 +7691,34 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let (merged, bob_laptop_profile, _) =
-            identity_bundle_with_additional_test_device(&bob_bundle, BOB_MNEMONIC, "laptop");
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile.clone()],
+            None,
+            None,
+        )
+        .expect("merged bundle");
 
-        let output = alice
+        alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
                 bundle: merged.clone(),
             })
             .expect("apply bundle update");
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.ends_with("/v2/key-packages/claims")
-        )));
-        drive_all_test_claim_requests(&mut alice, output);
 
         assert!(alice.state.pending_outbox.iter().any(|item| {
             item.envelope.conversation_id == conversation_id
@@ -7911,22 +7733,34 @@ mod tests {
 
     #[test]
     fn revoked_device_update_queues_remove_commit_without_welcome() {
-        let mut bob_phone = local_engine(BOB_MNEMONIC, "phone");
-        let bob_laptop = local_engine(BOB_MNEMONIC, "laptop");
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_phone = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob phone identity");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_package =
+            MlsAdapter::generate_key_package(&bob_phone, test_now_ms()).expect("phone package");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
         let deployment = sample_deployment();
         let mut bob_phone_profile =
-            bob_phone.local_bundle().expect("phone bundle").devices[0].clone();
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_phone,
+                &deployment,
+                bob_phone_package.key_package_b64,
+                bob_phone_package.expires_at,
+            )
+            .expect("phone profile");
         let bob_laptop_profile =
-            bob_laptop.local_bundle().expect("laptop bundle").devices[0].clone();
-        let mut bob_laptop_signer = bob_laptop
-            .state
-            .local_identity
-            .as_ref()
-            .expect("laptop identity")
-            .clone();
-        bob_laptop_signer.device_status.updated_at = test_now_ms();
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &deployment,
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
         let active_bundle = IdentityManager::export_identity_bundle_with_devices(
-            &bob_laptop_signer,
+            &bob_laptop,
             &deployment,
             vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
             None,
@@ -7937,23 +7771,12 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", active_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, active_bundle.user_id.clone());
 
-        bob_phone
-            .handle_command(CoreCommand::ApplyLocalDeviceStatusUpdate {
-                status: crate::model::DeviceStatusKind::Revoked,
-            })
-            .expect("revoke phone");
-        bob_phone_profile = bob_phone
-            .local_bundle()
-            .expect("revoked phone bundle")
-            .devices[0]
-            .clone();
-        bob_laptop_signer.device_status.updated_at =
-            active_bundle.publication_revision.saturating_add(1);
+        bob_phone_profile.status = crate::model::DeviceStatusKind::Revoked;
         let revoked_bundle = IdentityManager::export_identity_bundle_with_devices(
-            &bob_laptop_signer,
+            &bob_laptop,
             &deployment,
             vec![bob_phone_profile.clone(), bob_laptop_profile.clone()],
-            active_bundle.bundle_share_id.clone(),
+            None,
             None,
         )
         .expect("revoked bundle");
@@ -7992,13 +7815,32 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let (merged, _, _) =
-            identity_bundle_with_additional_test_device(&bob_bundle, BOB_MNEMONIC, "laptop");
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile],
+            None,
+            None,
+        )
+        .expect("merged bundle");
 
-        let output = alice
+        alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
             .expect("apply bundle update");
-        drive_all_test_claim_requests(&mut alice, output);
         let pending_after_refresh = alice.state.pending_outbox.len();
 
         alice
@@ -8016,13 +7858,32 @@ mod tests {
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let (merged, _, _) =
-            identity_bundle_with_additional_test_device(&bob_bundle, BOB_MNEMONIC, "laptop");
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_phone_profile = bob_bundle.devices[0].clone();
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
+        let bob_laptop_profile =
+            crate::capability::CapabilityManager::build_device_contact_profile(
+                &bob_laptop,
+                &sample_deployment(),
+                bob_laptop_package.key_package_b64,
+                bob_laptop_package.expires_at,
+            )
+            .expect("laptop profile");
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &bob_laptop,
+            &sample_deployment(),
+            vec![bob_phone_profile, bob_laptop_profile],
+            None,
+            None,
+        )
+        .expect("merged bundle");
 
-        let refresh_output = alice
+        let _refresh_output = alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
             .expect("apply bundle update");
-        drive_all_test_claim_requests(&mut alice, refresh_output);
         let pending_after_refresh = alice.state.pending_outbox.len();
 
         let snapshot = alice.refresh_snapshot();
@@ -8072,7 +7933,6 @@ mod tests {
                 conversation_id: conversation_id.clone(),
             })
             .expect("reconcile after rebuild");
-        let output = drive_all_test_claim_requests(&mut restored, output);
 
         assert!(output.view_model.as_ref().is_some_and(|view| {
             view.messages
@@ -8205,10 +8065,8 @@ mod tests {
 
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.method == crate::ffi_api::HttpMethod::Get
-                    && request.url.ends_with("/v2/relationships/requests")
-                    && request.auth.is_some()
+            CoreEffect::FetchMessageRequests { fetch }
+                if fetch.endpoint.ends_with("/message-requests")
         )));
     }
 
@@ -8504,21 +8362,6 @@ mod tests {
                         }
                     }
                     CoreEffect::PutWelcomePickup { put } => {
-                        let recipient_user_id = self
-                            .bundles
-                            .values()
-                            .find(|bundle| {
-                                bundle
-                                    .devices
-                                    .iter()
-                                    .any(|device| device.device_id == put.descriptor.device_id)
-                            })
-                            .map(|bundle| bundle.user_id.clone());
-                        if let Some(recipient_user_id) = recipient_user_id {
-                            if recipient_user_id != user.bundle.user_id {
-                                create_direct_conversation(&mut user.engine, recipient_user_id);
-                            }
-                        }
                         self.welcome_pickups.insert(
                             (
                                 put.descriptor.group_id.clone(),
@@ -8865,34 +8708,8 @@ mod tests {
                             })
                             .expect("group authorization initialized")
                     }
-                    CoreEffect::ExecuteHttpRequest { request }
-                        if request.url.ends_with("/v2/key-packages/claims") =>
-                    {
-                        let claim_request: ClaimKeyPackagesRequest = serde_json::from_str(
-                            request.body.as_deref().expect("claim request body"),
-                        )
-                        .expect("V2 group KeyPackage claim request");
-                        let result = claim_test_key_packages(&claim_request);
-                        user.engine
-                            .handle_event(CoreEvent::HttpResponseReceived {
-                                request_id: request.request_id,
-                                status: 200,
-                                body: Some(
-                                    serde_json::to_string(&result).expect("group claim response"),
-                                ),
-                            })
-                            .expect("V2 group KeyPackage claim response")
-                    }
-                    CoreEffect::PersistState { persist } => {
-                        if let Some(commit_id) = persist.commit_id {
-                            user.engine
-                                .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-                                .expect("group harness persistence commit")
-                        } else {
-                            CoreOutput::default()
-                        }
-                    }
-                    CoreEffect::EmitUserNotification { .. }
+                    CoreEffect::PersistState { .. }
+                    | CoreEffect::EmitUserNotification { .. }
                     | CoreEffect::ExecuteHttpRequest { .. }
                     | CoreEffect::ScheduleTimer { .. }
                     | CoreEffect::CloseGroupRealtimeConnection { .. } => CoreOutput::default(),
@@ -8919,7 +8736,6 @@ mod tests {
                     member_user_ids,
                 })
                 .expect("create group");
-            let output = self.drain(owner, output);
             let summary = output
                 .view_model
                 .as_ref()
@@ -8928,6 +8744,7 @@ mod tests {
                 .clone();
             let group_id = summary.group_id.clone().expect("group id");
             let conversation_id = summary.conversation_id;
+            self.drain(owner, output);
             (group_id, conversation_id)
         }
 
@@ -9136,7 +8953,6 @@ mod tests {
                 display_name: Some(name.into()),
             })
             .expect("identity");
-        register_test_key_package_pool(&engine);
         let bundle = engine.local_bundle().expect("local bundle").clone();
         HarnessUser {
             name,
@@ -9313,161 +9129,7 @@ mod tests {
                 display_name: None,
             })
             .expect("identity");
-        register_test_key_package_pool(&engine);
         engine
-    }
-
-    fn register_test_key_package_pool(engine: &CoreEngine) {
-        let Some(bundle) = engine.state.local_bundle.as_ref() else {
-            return;
-        };
-        let Some(device_id) = engine
-            .state
-            .local_identity
-            .as_ref()
-            .map(|identity| identity.device_identity.device_id.clone())
-        else {
-            return;
-        };
-        let mut packages = engine
-            .state
-            .key_package_inventory
-            .iter()
-            .filter(|package| {
-                matches!(
-                    package.state,
-                    PublishedKeyPackageState::PendingPublish | PublishedKeyPackageState::Advertised
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(package) = engine.state.published_key_package.as_ref() {
-            if !packages
-                .iter()
-                .any(|candidate| candidate.key_package_id == package.key_package_id)
-            {
-                packages.push(package.clone());
-            }
-        }
-        TEST_KEY_PACKAGE_POOLS.with(|pools| {
-            pools
-                .borrow_mut()
-                .insert((bundle.user_id.clone(), device_id), packages);
-        });
-    }
-
-    fn claim_test_key_packages(request: &ClaimKeyPackagesRequest) -> ClaimKeyPackagesResult {
-        let claims = TEST_KEY_PACKAGE_POOLS.with(|pools| {
-            let mut pools = pools.borrow_mut();
-            request
-                .targets
-                .iter()
-                .map(|target| {
-                    let key = (target.capability.user_id.clone(), target.device_id.clone());
-                    let pool = pools
-                        .get_mut(&key)
-                        .unwrap_or_else(|| panic!("missing V2 test KeyPackage pool for {key:?}"));
-                    assert!(
-                        !pool.is_empty(),
-                        "V2 test KeyPackage pool exhausted for {key:?}"
-                    );
-                    let package = pool.remove(0);
-                    ClaimedKeyPackage {
-                        claim_id: format!(
-                            "claim:test:{}:{}",
-                            request.idempotency_key, target.device_id
-                        ),
-                        user_id: target.capability.user_id.clone(),
-                        device_id: target.device_id.clone(),
-                        key_package_id: package.key_package_id,
-                        key_package_b64: package.key_package_b64,
-                        created_at: package.created_at,
-                        expires_at: package.expires_at,
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
-        let ticket =
-            (request.purpose == KeyPackageClaimPurpose::Direct).then(|| RelationshipTicket {
-                ticket_id: format!("ticket:test:{}", request.idempotency_key),
-                ticket_secret: Some(format!(
-                    "{:x}",
-                    Sha256::digest(format!("ticket-secret:test:{}", request.idempotency_key))
-                )),
-                relationship_id: request.proposal.relationship_id_candidate.clone(),
-                generation: request.proposal.generation,
-                attempt: request.proposal.attempt,
-            });
-        ClaimKeyPackagesResult {
-            idempotency_key: request.idempotency_key.clone(),
-            claims,
-            ticket,
-        }
-    }
-
-    fn create_test_group_conversation(
-        engine: &mut CoreEngine,
-        title: &str,
-        member_user_ids: Vec<String>,
-    ) -> CoreOutput {
-        for peer_user_id in &member_user_ids {
-            let has_accepted_relationship =
-                engine.state.relationships.values().any(|relationship| {
-                    relationship.peer_user_id == *peer_user_id
-                        && relationship.account_state == RelationshipAccountState::Accepted
-                });
-            if !has_accepted_relationship {
-                create_direct_conversation(engine, peer_user_id.clone());
-            }
-        }
-        let mut output = engine
-            .handle_command(CoreCommand::CreateGroupConversation {
-                title: title.into(),
-                member_user_ids,
-            })
-            .expect("begin V2 group creation");
-        let mut requests = std::collections::VecDeque::from(
-            output
-                .effects
-                .iter()
-                .filter_map(|effect| match effect {
-                    CoreEffect::ExecuteHttpRequest { request }
-                        if request.url.ends_with("/v2/key-packages/claims") =>
-                    {
-                        Some(request.clone())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-        );
-        let mut handled = BTreeSet::new();
-        while let Some(request) = requests.pop_front() {
-            assert!(
-                handled.insert(request.request_id.clone()),
-                "group claim request must be idempotently unique"
-            );
-            let claim_request: ClaimKeyPackagesRequest =
-                serde_json::from_str(request.body.as_deref().expect("group claim request body"))
-                    .expect("V2 group claim request");
-            let result = claim_test_key_packages(&claim_request);
-            output = engine
-                .handle_event(CoreEvent::HttpResponseReceived {
-                    request_id: request.request_id,
-                    status: 200,
-                    body: Some(serde_json::to_string(&result).expect("group claim response")),
-                })
-                .expect("V2 group KeyPackage claim response");
-            requests.extend(output.effects.iter().filter_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/key-packages/claims")
-                        && !handled.contains(&request.request_id) =>
-                {
-                    Some(request.clone())
-                }
-                _ => None,
-            }));
-        }
-        output
     }
 
     fn scheduled_timer_delay(output: &CoreOutput, timer_id: &str) -> Option<u64> {
@@ -9493,119 +9155,31 @@ mod tests {
     }
 
     fn create_direct_conversation(engine: &mut CoreEngine, peer_user_id: String) -> String {
-        create_direct_conversation_with_state(engine, peer_user_id, true)
-    }
-
-    fn create_pending_direct_conversation(engine: &mut CoreEngine, peer_user_id: String) -> String {
-        create_direct_conversation_with_state(engine, peer_user_id, false)
-    }
-
-    fn create_direct_conversation_with_state(
-        engine: &mut CoreEngine,
-        peer_user_id: String,
-        accepted: bool,
-    ) -> String {
-        let output = engine
+        engine
             .handle_command(CoreCommand::CreateConversation {
-                peer_user_id: peer_user_id.clone(),
+                peer_user_id,
                 conversation_kind: ConversationKind::Direct,
             })
-            .expect("conversation");
-        let mut effects = std::collections::VecDeque::from(output.effects);
-        let mut steps = 0usize;
-        while let Some(effect) = effects.pop_front() {
-            steps += 1;
-            assert!(steps <= 100, "Direct V2 test setup exceeded 100 effects");
-            let next = match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/key-packages/claims") =>
-                {
-                    let claim_request: ClaimKeyPackagesRequest =
-                        serde_json::from_str(request.body.as_deref().expect("claim request body"))
-                            .expect("V2 claim request");
-                    let result = claim_test_key_packages(&claim_request);
-                    engine
-                        .handle_event(CoreEvent::HttpResponseReceived {
-                            request_id: request.request_id,
-                            status: 200,
-                            body: Some(serde_json::to_string(&result).expect("claim response")),
-                        })
-                        .expect("V2 KeyPackage claim response")
-                }
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request
-                        .url
-                        .ends_with("/v2/device-registry/relationships/outbound") =>
-                {
-                    let upsert: UpsertOutboundRelationshipRequest = serde_json::from_str(
-                        request.body.as_deref().expect("relationship upsert body"),
-                    )
-                    .expect("relationship upsert request");
-                    let result = UpsertOutboundRelationshipResult {
-                        canonical: true,
-                        relationship: upsert.relationship,
-                        peer_bundle: upsert.peer_bundle,
-                    };
-                    engine
-                        .handle_event(CoreEvent::HttpResponseReceived {
-                            request_id: request.request_id,
-                            status: 200,
-                            body: Some(
-                                serde_json::to_string(&result)
-                                    .expect("relationship upsert response"),
-                            ),
-                        })
-                        .expect("V2 relationship upsert response")
-                }
-                CoreEffect::PersistState { persist } => {
-                    if let Some(commit_id) = persist.commit_id {
-                        engine
-                            .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-                            .expect("test persistence commit")
-                    } else {
-                        CoreOutput::default()
-                    }
-                }
-                CoreEffect::ExecuteHttpRequest { .. }
-                | CoreEffect::ScheduleTimer { .. }
-                | CoreEffect::EmitUserNotification { .. } => CoreOutput::default(),
-                other => panic!("unexpected Direct V2 setup effect: {other:?}"),
-            };
-            effects.extend(next.effects);
-        }
+            .expect("conversation")
+            .view_model
+            .unwrap()
+            .conversations[0]
+            .conversation_id
+            .clone()
+    }
 
-        let (relationship_id, generation) = engine
+    fn local_key_package_ref(engine: &CoreEngine) -> String {
+        engine
             .state
-            .relationships
-            .values()
-            .filter(|relationship| relationship.peer_user_id == peer_user_id)
-            .max_by_key(|relationship| relationship.generation)
-            .map(|relationship| {
-                (
-                    relationship.relationship_id.clone(),
-                    relationship.generation,
-                )
-            })
-            .expect("canonical Direct V2 relationship");
-        let conversation_id = format!("conv:direct:v2:{}:g{}", relationship_id, generation);
-        assert!(
-            engine.state.conversations.contains_key(&conversation_id),
-            "canonical Direct V2 conversation was not materialized"
-        );
-        if accepted {
-            let relationship = engine
-                .state
-                .relationships
-                .get_mut(&relationship_id)
-                .expect("canonical Direct V2 relationship remains available");
-            relationship.account_state = RelationshipAccountState::Accepted;
-            relationship.setup_state = RelationshipSetupState::Ready;
-            relationship
-                .local_device_join_states
-                .values_mut()
-                .for_each(|state| *state = DeviceJoinState::Ready);
-        }
-        conversation_id
+            .local_bundle
+            .as_ref()
+            .expect("local bundle")
+            .devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("key package reference")
+            .object_ref
+            .clone()
     }
 
     fn deliver_pending_outbox_to_device(
@@ -9613,121 +9187,33 @@ mod tests {
         sender: &CoreEngine,
         device_id: &str,
     ) -> CoreOutput {
-        let sender_bundle = sender.state.local_bundle.clone();
-        if let Some(bundle) = sender_bundle.as_ref() {
-            let accepted_relationships = sender
-                .state
-                .pending_outbox
-                .iter()
-                .filter(|item| item.envelope.recipient_device_id == device_id)
-                .filter_map(|item| item.envelope_v2.as_ref())
-                .filter_map(|envelope| sender.state.relationships.get(&envelope.relationship_id))
-                .filter(|relationship| {
-                    relationship.account_state == RelationshipAccountState::Accepted
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            for mut relationship in accepted_relationships {
-                if recipient
-                    .state
-                    .relationships
-                    .contains_key(&relationship.relationship_id)
-                {
-                    continue;
-                }
-                relationship.peer_user_id = bundle.user_id.clone();
-                relationship.peer_root_public_key = bundle.user_public_key.clone();
-                relationship.peer_bundle_digest =
-                    crate::identity::identity_bundle_digest(bundle).expect("sender bundle digest");
-                relationship.peer_bundle_revision = bundle.publication_revision;
-                relationship.account_state = RelationshipAccountState::Accepted;
-                relationship.setup_state = RelationshipSetupState::WaitingAcceptance;
-                relationship.local_device_join_states =
-                    BTreeMap::from([(device_id.to_string(), DeviceJoinState::WaitingWelcome)]);
-                recipient
-                    .state
-                    .relationships
-                    .insert(relationship.relationship_id.clone(), relationship);
-                recipient
-                    .state
-                    .contacts
-                    .entry(bundle.user_id.clone())
-                    .or_insert_with(|| crate::persistence::PersistedContact {
-                        user_id: bundle.user_id.clone(),
-                        display_name: None,
-                        original_name: bundle.display_name.clone(),
-                        bundle: bundle.clone(),
-                        relationship_status: ContactRelationshipStatus::Available,
-                        added_at: test_now_ms(),
-                    });
-            }
-        }
         let records = sender
             .state
             .pending_outbox
             .iter()
             .filter(|item| item.envelope.recipient_device_id == device_id)
             .enumerate()
-            .map(|(index, item)| {
-                let relationship_proposal = item.envelope_v2.as_ref().and_then(|envelope| {
-                    sender
-                        .state
-                        .relationships
-                        .get(&envelope.relationship_id)
-                        .map(|relationship| relationship.canonical_proposal.clone())
-                });
-                InboxRecord {
-                    seq: index as u64 + 1,
-                    recipient_device_id: item.envelope.recipient_device_id.clone(),
-                    message_id: item.envelope.message_id.clone(),
-                    received_at: index as u64 + 1,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: item.envelope.clone(),
-                    envelope_v2: item.envelope_v2.clone(),
-                    sender_identity_bundle: item.envelope_v2.as_ref().and(sender_bundle.clone()),
-                    relationship_proposal,
-                }
+            .map(|(index, item)| InboxRecord {
+                seq: index as u64 + 1,
+                recipient_device_id: item.envelope.recipient_device_id.clone(),
+                message_id: item.envelope.message_id.clone(),
+                received_at: index as u64 + 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: item.envelope.clone(),
             })
             .collect::<Vec<_>>();
         assert!(
             !records.is_empty(),
             "sender has no pending records for {device_id}"
         );
-        let mut output = recipient
+        recipient
             .handle_event(CoreEvent::InboxRecordsFetched {
                 device_id: device_id.to_string(),
                 to_seq: records.len() as u64,
                 records,
             })
-            .expect("recipient inbox records fetched");
-        let commit_ids = output
-            .effects
-            .iter()
-            .filter_map(|effect| match effect {
-                CoreEffect::PersistState { persist } => persist.commit_id.clone(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for commit_id in commit_ids {
-            let committed = recipient
-                .handle_event(CoreEvent::PersistenceCommitted { commit_id })
-                .expect("recipient persistence committed");
-            output.state_update.contacts_changed |= committed.state_update.contacts_changed;
-            output.state_update.conversations_changed |=
-                committed.state_update.conversations_changed;
-            output.state_update.messages_changed |= committed.state_update.messages_changed;
-            output.state_update.checkpoints_changed |= committed.state_update.checkpoints_changed;
-            output
-                .state_update
-                .system_statuses_changed
-                .extend(committed.state_update.system_statuses_changed);
-            if output.view_model.is_none() {
-                output.view_model = committed.view_model;
-            }
-            output.effects.extend(committed.effects);
-        }
-        output
+            .expect("recipient inbox records fetched")
     }
 
     fn pending_application_record(sender: &CoreEngine, device_id: &str) -> InboxRecord {
@@ -9748,105 +9234,20 @@ mod tests {
             expires_at: None,
             state: InboxRecordState::Available,
             envelope: item.envelope.clone(),
-            envelope_v2: item.envelope_v2.clone(),
-            sender_identity_bundle: None,
-            relationship_proposal: None,
         }
     }
 
     fn sample_identity_bundle(mnemonic: &str, device_name: &str) -> IdentityBundle {
-        local_engine(mnemonic, device_name)
-            .local_bundle()
-            .expect("IdentityBundle V2")
-            .clone()
-    }
-
-    fn identity_bundle_with_additional_test_device(
-        existing: &IdentityBundle,
-        mnemonic: &str,
-        device_name: &str,
-    ) -> (
-        IdentityBundle,
-        crate::model::DeviceContactProfile,
-        crate::identity::LocalIdentityState,
-    ) {
-        let device = local_engine(mnemonic, device_name);
-        let device_profile = device.local_bundle().expect("device bundle").devices[0].clone();
-        let mut signer = device
-            .state
-            .local_identity
-            .as_ref()
-            .expect("device identity")
-            .clone();
-        signer.device_status.updated_at = existing.publication_revision.saturating_add(1);
-        let merged = IdentityManager::export_identity_bundle_with_devices(
-            &signer,
+        let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
+            .expect("identity");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
+        IdentityManager::export_identity_bundle(
+            &identity,
             &sample_deployment(),
-            vec![existing.devices[0].clone(), device_profile.clone()],
-            existing.bundle_share_id.clone(),
-            existing.display_name.clone(),
+            package.key_package_b64,
+            package.expires_at,
         )
-        .expect("root-signed V2 multi-device bundle");
-        (merged, device_profile, signer)
-    }
-
-    fn drive_all_test_claim_requests(
-        engine: &mut CoreEngine,
-        mut output: CoreOutput,
-    ) -> CoreOutput {
-        let mut requests = output
-            .effects
-            .iter()
-            .filter_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/key-packages/claims") =>
-                {
-                    Some(request.clone())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut handled = BTreeSet::new();
-        while let Some(request) = requests.pop() {
-            if !handled.insert(request.request_id.clone()) {
-                continue;
-            }
-            let claim_request: ClaimKeyPackagesRequest =
-                serde_json::from_str(request.body.as_deref().expect("claim request body"))
-                    .expect("V2 claim request");
-            let result = claim_test_key_packages(&claim_request);
-            let next = engine
-                .handle_event(CoreEvent::HttpResponseReceived {
-                    request_id: request.request_id,
-                    status: 200,
-                    body: Some(serde_json::to_string(&result).expect("claim response")),
-                })
-                .expect("apply claim response");
-            requests.extend(next.effects.iter().filter_map(|effect| match effect {
-                CoreEffect::ExecuteHttpRequest { request }
-                    if request.url.ends_with("/v2/key-packages/claims") =>
-                {
-                    Some(request.clone())
-                }
-                _ => None,
-            }));
-            output.state_update.contacts_changed |= next.state_update.contacts_changed;
-            output.state_update.conversations_changed |= next.state_update.conversations_changed;
-            output.state_update.messages_changed |= next.state_update.messages_changed;
-            output.state_update.checkpoints_changed |= next.state_update.checkpoints_changed;
-            output
-                .state_update
-                .system_statuses_changed
-                .extend(next.state_update.system_statuses_changed);
-            if let Some(next_view) = next.view_model {
-                let view = output.view_model.get_or_insert_with(Default::default);
-                view.conversations.extend(next_view.conversations);
-                view.messages.extend(next_view.messages);
-                view.banners.extend(next_view.banners);
-            }
-            output.effects.extend(next.effects);
-        }
-        output
+        .expect("bundle")
     }
 
     fn sample_identity_bundle_without_identity_ref(
@@ -9866,6 +9267,11 @@ mod tests {
             package.expires_at,
         )
         .expect("bundle")
+    }
+
+    fn updated_bundle_json_for_user(user_id: &str, mut bundle: IdentityBundle) -> String {
+        bundle.user_id = user_id.to_string();
+        serde_json::to_string(&bundle).expect("bundle json")
     }
 
     fn sample_attachment_descriptor() -> AttachmentDescriptor {
@@ -9946,9 +9352,6 @@ mod tests {
             received_at: seq,
             expires_at: None,
             state: InboxRecordState::Available,
-            envelope_v2: None,
-            sender_identity_bundle: None,
-            relationship_proposal: None,
             envelope: Envelope {
                 version: CURRENT_MODEL_VERSION.to_string(),
                 message_id: format!("msg:{seq}"),
@@ -10020,9 +9423,9 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
-            registry_schema_version: 3,
+            registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
@@ -10088,8 +9491,12 @@ mod tests {
     fn add_group_member_device_rejects_current_device() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let summary = output
             .view_model
             .as_ref()
@@ -10121,8 +9528,12 @@ mod tests {
     fn add_group_member_device_rejects_wrong_user() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -10175,8 +9586,12 @@ mod tests {
     fn add_group_member_device_rejects_duplicate() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -10212,8 +9627,12 @@ mod tests {
     fn remove_group_member_device_rejects_current_device() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -10248,8 +9667,12 @@ mod tests {
     fn remove_group_member_device_rejects_wrong_user() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let output =
-            create_test_group_conversation(&mut alice, "Project", vec![bob_bundle.user_id.clone()]);
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -10385,11 +9808,13 @@ mod tests {
                 bundle: alice_bundle.clone(),
             })
             .expect("import alice");
-        let output = create_test_group_conversation(
-            &mut bob.engine,
-            "Project",
-            vec![alice_bundle.user_id.clone()],
-        );
+        let output = bob
+            .engine
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![alice_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -10480,11 +9905,13 @@ mod tests {
                 bundle: alice_bundle.clone(),
             })
             .expect("import alice");
-        let output = create_test_group_conversation(
-            &mut bob.engine,
-            "Project",
-            vec![alice_bundle.user_id.clone()],
-        );
+        let output = bob
+            .engine
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![alice_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()
@@ -10566,11 +9993,13 @@ mod tests {
                 bundle: alice_bundle.clone(),
             })
             .expect("import alice");
-        let output = create_test_group_conversation(
-            &mut bob.engine,
-            "Project",
-            vec![alice_bundle.user_id.clone()],
-        );
+        let output = bob
+            .engine
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![alice_bundle.user_id.clone()],
+            })
+            .expect("create group");
         let group_id = output
             .view_model
             .as_ref()

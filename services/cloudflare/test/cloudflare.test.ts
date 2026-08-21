@@ -22,8 +22,6 @@ import {
   type InboxAppendCapability,
   type MessageRequestActionResult,
   type MessageRequestListResult,
-  type MlsDeviceKeyBinding,
-  type KeyPackageClaimCapability,
   type SubmitGroupJoinRequest
 } from "../src/types/contracts";
 import type {
@@ -46,10 +44,7 @@ import { signSharingPayload } from "../src/storage/sharing";
 import {
   groupCapabilitySigningPayload,
   groupManifestSigningPayload,
-  groupMembershipProofSigningPayload,
-  identityBundleV2SigningPayload,
-  keyPackageClaimCapabilitySigningPayload,
-  mlsDeviceKeyBindingSigningPayload
+  groupMembershipProofSigningPayload
 } from "../src/auth/capability";
 import { GroupAuthorizationService } from "../src/group-outbox/authorization";
 
@@ -890,7 +885,6 @@ function groupIdentity(userId: string, deviceId: string, userByte: number, devic
   const userSecret = new Uint8Array(32).fill(userByte);
   const deviceSecret = new Uint8Array(32).fill(deviceByte);
   const userPublicKey = bytesToHex(ed25519.getPublicKey(userSecret));
-  userId = `user:${userPublicKey.slice(0, 16)}`;
   const devicePublicKey = bytesToHex(ed25519.getPublicKey(deviceSecret));
   const inboxCapability: InboxAppendCapability = {
     version: CURRENT_MODEL_VERSION,
@@ -912,35 +906,8 @@ function groupIdentity(userId: string, deviceId: string, userByte: number, devic
     signature: ""
   };
   binding.signature = signHex(userSecret, bindingPayload(binding));
-  const mlsBinding: MlsDeviceKeyBinding = {
-    version: CURRENT_MODEL_VERSION,
-    userId,
-    deviceId,
-    devicePublicKey,
-    mlsSignaturePublicKey: devicePublicKey,
-    ciphersuite: "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
-    createdAt: 1_000,
-    signature: ""
-  };
-  mlsBinding.signature = signHex(deviceSecret, mlsDeviceKeyBindingSigningPayload(mlsBinding));
-  const claimCapability: KeyPackageClaimCapability = {
-    version: CURRENT_MODEL_VERSION,
-    service: "key_package_claim",
-    userId,
-    targetDeviceId: deviceId,
-    endpoint: "https://example.com/v2/key-packages/claims",
-    expiresAt: Number.MAX_SAFE_INTEGER,
-    nonce: `claim-capability:${deviceId}`,
-    signature: ""
-  };
-  claimCapability.signature = signHex(
-    deviceSecret,
-    keyPackageClaimCapabilitySigningPayload(claimCapability)
-  );
   const bundle: IdentityBundle = {
     version: CURRENT_MODEL_VERSION,
-    publicationVersion: 2,
-    publicationRevision: 1,
     userId,
     userPublicKey,
     updatedAt: 1_000,
@@ -951,12 +918,17 @@ function groupIdentity(userId: string, deviceId: string, userByte: number, devic
       binding,
       status: "active",
       inboxAppendCapability: inboxCapability,
-      keyPackageClaimCapability: claimCapability,
-      mlsDeviceKeyBinding: mlsBinding
+      keypackageRef: {
+        version: CURRENT_MODEL_VERSION,
+        userId,
+        deviceId,
+        ref: `https://example.com/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/kp1`,
+        expiresAt: 61_000
+      }
     }],
     signature: ""
   };
-  bundle.signature = signHex(userSecret, identityBundleV2SigningPayload(bundle));
+  bundle.signature = signHex(userSecret, identityBundlePayload(bundle, true));
   return { userId, deviceId, userSecret, deviceSecret, bundle };
 }
 
@@ -1445,14 +1417,21 @@ test("v2 device-signed runtime refresh issues 24h audience-bound credentials and
 
 });
 
-test("v1 append is hard-cut even with an explicit legacy capability", async () => {
+test("accepts append requests only with explicit capability header", async () => {
   const { env } = createEnv();
   const response = await appendWithCapability(env);
-  assert.equal(response.status, 426);
-  assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 0,
+    deliveredTo: "message_request",
+    queuedAsRequest: true,
+    requestId: "request:user:alice"
+  });
 });
 
-test("v1 append cannot pollute an allowlisted inbox", async () => {
+test("verified append capability delivers allowlisted sender to inbox", async () => {
   const { env, bucket } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
@@ -1474,7 +1453,13 @@ test("v1 append cannot pollute an allowlisted inbox", async () => {
     env
   );
 
-  assert.equal(response.status, 426);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 1,
+    deliveredTo: "inbox"
+  });
 
   const head = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/head`, {
@@ -1482,10 +1467,10 @@ test("v1 append cannot pollute an allowlisted inbox", async () => {
     }),
     env
   );
-  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 1 });
 });
 
-test("v1 append is rejected before legacy grant details are considered", async () => {
+test("tampered append grant is rejected even when sender is allowlisted", async () => {
   const { env, bucket } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
@@ -1507,11 +1492,11 @@ test("v1 append is rejected before legacy grant details are considered", async (
     env
   );
 
-  assert.equal(response.status, 426);
-  assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
+  assert.equal(response.status, 403);
+  assert.equal(((await response.json()) as { code: string }).code, "invalid_capability");
 });
 
-test("v1 append does not regain access through an expired signed grant", async () => {
+test("expired signed append grant requests a capability refresh", async () => {
   const { env, bucket } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
@@ -1532,8 +1517,8 @@ test("v1 append does not regain access through an expired signed grant", async (
     env
   );
 
-  assert.equal(response.status, 426);
-  assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
+  assert.equal(response.status, 422);
+  assert.equal(((await response.json()) as { code: string }).code, "capability_expired");
 
   const head = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/head`, {
@@ -1544,7 +1529,7 @@ test("v1 append does not regain access through an expired signed grant", async (
   assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
 });
 
-test("all v1 append targets and endpoints are hard-cut", async () => {
+test("signed append grant with mismatched target or endpoint is rejected", async () => {
   {
     const { env, bucket } = createEnv();
     const fixture = signedIdentityFixture();
@@ -1561,7 +1546,7 @@ test("all v1 append targets and endpoints are hard-cut", async () => {
       }),
       env
     );
-    assert.equal(response.status, 426);
+    assert.equal(response.status, 403);
   }
 
   {
@@ -1582,7 +1567,7 @@ test("all v1 append targets and endpoints are hard-cut", async () => {
       }),
       env
     );
-    assert.equal(response.status, 426);
+    assert.equal(response.status, 403);
   }
 });
 
@@ -1604,7 +1589,7 @@ test("append requests without capability header require an upgraded client", asy
   assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
 });
 
-test("v1 append cannot bypass the hard cut through scope or size fields", async () => {
+test("enforces append conversation scope and payload size", async () => {
   const { env } = createEnv();
   const wrongScope = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
@@ -1618,7 +1603,7 @@ test("v1 append cannot bypass the hard cut through scope or size fields", async 
     }),
     env
   );
-  assert.equal(wrongScope.status, 426);
+  assert.equal(wrongScope.status, 403);
 
   const tooLarge = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
@@ -1632,32 +1617,16 @@ test("v1 append cannot bypass the hard cut through scope or size fields", async 
     }),
     env
   );
-  assert.equal(tooLarge.status, 426);
+  assert.equal(tooLarge.status, 413);
 });
 
-test("v1 append and request decisions cannot populate V2 relationship state", async () => {
+test("message requests stay out of inbox until accepted and reject blocks future appends", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
 
   const queued = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-1"));
-  assert.equal(queued.status, 426);
-  const legacyDecision = await handleRequest(
-    new Request(
-      "https://example.com/v1/inbox/device:bob:phone/message-requests/legacy-request/accept",
-      { method: "POST", headers: authHeaders(token) }
-    ),
-    env
-  );
-  assert.equal(legacyDecision.status, 426);
-  const emptyHead = await handleRequest(
-    new Request("https://example.com/v1/inbox/device:bob:phone/head", {
-      headers: authHeaders(token)
-    }),
-    env
-  );
-  assert.deepEqual(await emptyHead.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
-  return;
+  assert.equal(queued.status, 200);
   const queuedWelcome = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-1b"));
   assert.equal(queuedWelcome.status, 200);
 
@@ -1734,22 +1703,12 @@ test("v1 append and request decisions cannot populate V2 relationship state", as
   });
 });
 
-test("legacy last-arrival request promotion is disabled", async () => {
+test("direct message request accept promotes only the latest conversation group", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
 
-  const legacyAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-commit", "conv:alice:bob:rel:1"));
-  assert.equal(legacyAppend.status, 426);
-  const legacyDecision = await handleRequest(
-    new Request(
-      "https://example.com/v1/inbox/device:bob:phone/message-requests/legacy-request/accept",
-      { method: "POST", headers: authHeaders(token) }
-    ),
-    env
-  );
-  assert.equal(legacyDecision.status, 426);
-  return;
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-commit", "conv:alice:bob:rel:1"));
   await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-welcome", "conv:alice:bob:rel:1"));
   await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:new-commit", "conv:alice:bob:rel:2"));
   await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:new-welcome", "conv:alice:bob:rel:2"));
@@ -1810,7 +1769,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
     new Request("https://example.com/v1/inbox/device:bob:phone/head", { headers: authHeaders(token) }),
     env
   );
-  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 0 });
+  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 1 });
 
   const fetch = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", {
@@ -1820,7 +1779,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
   );
   const fetched = (await fetch.json()) as { version: string; records: Array<{ seq: number }> };
   assert.equal(fetched.version, CURRENT_MODEL_VERSION);
-  assert.deepEqual(fetched.records.map((record) => record.seq), []);
+  assert.deepEqual(fetched.records.map((record) => record.seq), [1]);
 
   const ack = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/ack", {
@@ -1860,15 +1819,14 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
   assert.equal(listRequests.status, 200);
 });
 
-test("v1 append never reaches the rate limiter", async () => {
+test("rate limit is per recipient sender pair and idempotent retries do not consume extra quota", async () => {
   const { env } = createEnv({ rateLimitPerMinute: "1", rateLimitPerHour: "10" });
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
   await setAllowlist(env, token, "device:bob:phone", ["user:alice", "user:mallory"]);
 
   const first = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-1", "conv:alice:bob", "user:alice"));
-  assert.equal(first.status, 426);
-  return;
+  assert.equal(first.status, 200);
 
   const duplicate = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-1", "conv:alice:bob", "user:alice"));
   assert.equal(duplicate.status, 200);
@@ -2726,18 +2684,11 @@ test("group outbox spills large records to R2 and fetches them back", async () =
 
 test("welcome pickup stores and fetches a device-scoped welcome", async () => {
   const { env } = createEnv();
-  const welcomeB64 = "d2VsY29tZQ==";
-  const welcomeDigest = btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(welcomeB64)
-  ))));
   const descriptor = {
     groupId: "group:project",
     deviceId: "device:bob:phone",
     endpoint: "https://example.com/v1/groups/group:project/welcome-pickup/device:bob:phone",
     capability: "welcome-cap-1",
-    claimId: "claim:welcome-cap-1",
-    welcomeDigest,
     expiresAt: Date.now() + 60_000
   };
 
@@ -2750,7 +2701,7 @@ test("welcome pickup stores and fetches a device-scoped welcome", async () => {
       },
       body: JSON.stringify({
         descriptor,
-        welcomeB64
+        welcomeB64: "d2VsY29tZQ=="
       })
     }),
     env
@@ -3297,7 +3248,7 @@ test("runtime secrets fail closed when missing, short, or placeholders", async (
   assert.equal(((await response.json()) as { code: string }).code, "runtime_misconfigured");
 });
 
-test("v1 append hard cut precedes legacy body-size processing", async () => {
+test("append request body limit checks actual streamed bytes", async () => {
   const { env } = createEnv();
   env.MESSAGE_REQUEST_MAX_BODY_BYTES = "128";
   const oversized = JSON.stringify({ ...sampleAppend(), padding: "x".repeat(512) });
@@ -3309,8 +3260,8 @@ test("v1 append hard cut precedes legacy body-size processing", async () => {
     }),
     env
   );
-  assert.equal(response.status, 426);
-  assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
+  assert.equal(response.status, 413);
+  assert.equal(((await response.json()) as { code: string }).code, "request_too_large");
 });
 
 test("message request quotas, global rate limit, expiry, and capacity recovery work", async () => {

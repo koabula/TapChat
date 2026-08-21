@@ -23,9 +23,6 @@ impl CoreEngine {
         output
             .effects
             .extend(self.local_shared_state_publish_effects()?);
-        if self.state.pending_key_package_publish.is_some() {
-            output.effects.push(self.key_package_publish_effect()?);
-        }
         Ok(output)
     }
 
@@ -204,18 +201,16 @@ impl CoreEngine {
         } else {
             IdentityManager::create_or_recover(mnemonic.as_deref(), device_name.as_deref())?
         };
-        let (mut adapter, package) = crate::mls_adapter::MlsAdapter::bootstrap(&identity)?;
-        let now_ms = current_unix_millis(self.state.message_nonce);
-        let mut packages = vec![package];
-        packages.extend(adapter.generate_key_package_pool(
-            now_ms,
-            crate::mls_adapter::KEY_PACKAGE_POOL_TARGET.saturating_sub(1),
-        )?);
+        let (adapter, package) = crate::mls_adapter::MlsAdapter::bootstrap(&identity)?;
         let user_id = identity.user_identity.user_id.clone();
         let device_id = identity.device_identity.device_id.clone();
         self.state.local_identity = Some(identity);
         self.state.mls_adapter = Some(adapter);
-        self.stage_initial_key_package_pool(packages, now_ms);
+        self.state.key_package_inventory.clear();
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Retired,
+        );
         self.state.local_display_name = effective_display_name.clone();
         self.state
             .sync_states
@@ -273,18 +268,16 @@ impl CoreEngine {
         }
         let _ = device_name;
         let identity = IdentityManager::create_new_device_for_user(&recovered, None)?;
-        let (mut adapter, package) = crate::mls_adapter::MlsAdapter::bootstrap(&identity)?;
-        let now_ms = current_unix_millis(self.state.message_nonce);
-        let mut packages = vec![package];
-        packages.extend(adapter.generate_key_package_pool(
-            now_ms,
-            crate::mls_adapter::KEY_PACKAGE_POOL_TARGET.saturating_sub(1),
-        )?);
+        let (adapter, package) = crate::mls_adapter::MlsAdapter::bootstrap(&identity)?;
         let user_id = identity.user_identity.user_id.clone();
         let device_id = identity.device_identity.device_id.clone();
         self.state.local_identity = Some(identity);
         self.state.mls_adapter = Some(adapter);
-        self.stage_initial_key_package_pool(packages, now_ms);
+        self.state.key_package_inventory.clear();
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Retired,
+        );
         self.state.local_display_name = effective_display_name.clone();
         self.state
             .sync_states
@@ -316,8 +309,14 @@ impl CoreEngine {
     }
 
     pub(super) fn rotate_local_key_package(&mut self) -> CoreResult<CoreOutput> {
+        if self.state.pending_identity_publication.is_some() {
+            return Err(CoreError::new(
+                "keypackage_refresh_pending",
+                "an identity publication is already awaiting confirmation",
+            ));
+        }
         let now_ms = current_unix_millis(self.state.message_nonce);
-        self.stage_key_package_pool_refill(now_ms, false, true)
+        self.stage_local_key_package_rotation(now_ms, false)
     }
 
     pub(super) fn local_credential_maintenance_due(&self, now_ms: u64) -> bool {
@@ -335,13 +334,13 @@ impl CoreEngine {
         else {
             return false;
         };
-        self.state
-            .pending_key_package_publish
+        let key_package_due = self
+            .state
+            .published_key_package
             .as_ref()
-            .is_some_and(|pending| now_ms >= pending.next_retry_at)
-            || self.usable_key_package_count(now_ms)
-                < crate::mls_adapter::KEY_PACKAGE_POOL_REFILL_THRESHOLD
-            || self.local_inbox_capability_due(now_ms, device_id)
+            .map(|package| package.should_rotate_at(now_ms, device_id))
+            .unwrap_or(true);
+        key_package_due || self.local_inbox_capability_due(now_ms, device_id)
     }
 
     pub(super) fn maintain_local_credentials(&mut self, now_ms: u64) -> CoreResult<CoreOutput> {
@@ -382,15 +381,14 @@ impl CoreEngine {
             .device_identity
             .device_id
             .clone();
-        if self
+        let key_package_due = self
             .state
-            .pending_key_package_publish
+            .published_key_package
             .as_ref()
-            .is_some_and(|pending| now_ms >= pending.next_retry_at)
-            || self.usable_key_package_count(now_ms)
-                < crate::mls_adapter::KEY_PACKAGE_POOL_REFILL_THRESHOLD
-        {
-            return self.stage_key_package_pool_refill(now_ms, true, false);
+            .map(|package| package.should_rotate_at(now_ms, &device_id))
+            .unwrap_or(true);
+        if key_package_due {
+            return self.stage_local_key_package_rotation(now_ms, true);
         }
         if self.local_inbox_capability_due(now_ms, &device_id) {
             return self.stage_local_inbox_capability_renewal(now_ms, true);
@@ -420,236 +418,6 @@ impl CoreEngine {
                         crate::capability::INBOX_APPEND_CAPABILITY_RENEWAL_WINDOW_MS,
                     )
             })
-    }
-
-    fn stage_initial_key_package_pool(
-        &mut self,
-        mut packages: Vec<crate::mls_adapter::PublishedKeyPackage>,
-        now_ms: u64,
-    ) {
-        for package in &mut packages {
-            package.state = crate::mls_adapter::PublishedKeyPackageState::PendingPublish;
-        }
-        let package_ids = packages
-            .iter()
-            .map(|package| package.key_package_id.clone())
-            .collect();
-        let device_id = self
-            .state
-            .local_identity
-            .as_ref()
-            .map(|identity| identity.device_identity.device_id.clone())
-            .unwrap_or_default();
-        self.state.published_key_package = None;
-        self.state.key_package_inventory = packages;
-        self.state.pending_key_package_publish = Some(PendingKeyPackagePublish {
-            idempotency_key: random_opaque_id("kppub"),
-            device_id,
-            package_ids,
-            created_at: now_ms,
-            attempt_count: 0,
-            next_retry_at: now_ms,
-        });
-    }
-
-    fn usable_key_package_count(&self, now_ms: u64) -> usize {
-        self.state
-            .key_package_inventory
-            .iter()
-            .filter(|package| {
-                !package.is_expired_at(now_ms)
-                    && matches!(
-                        package.state,
-                        crate::mls_adapter::PublishedKeyPackageState::PendingPublish
-                            | crate::mls_adapter::PublishedKeyPackageState::Advertised
-                    )
-            })
-            .count()
-    }
-
-    pub(super) fn stage_key_package_pool_refill(
-        &mut self,
-        now_ms: u64,
-        schedule_next_check: bool,
-        force: bool,
-    ) -> CoreResult<CoreOutput> {
-        if self.state.deployment_bundle.is_none() || self.state.local_bundle.is_none() {
-            return Err(CoreError::invalid_state(
-                "deployment and IdentityBundle V2 are required to publish KeyPackages",
-            ));
-        }
-        if self.state.local_bundle.as_ref().is_none_or(|bundle| {
-            bundle.publication_version < crate::model::IDENTITY_PUBLICATION_VERSION_V2
-        }) {
-            return Err(CoreError::new(
-                "protocol_upgrade_required",
-                "KeyPackage pools require IdentityBundle V2",
-            ));
-        }
-
-        self.state
-            .key_package_inventory
-            .iter_mut()
-            .for_each(|package| {
-                if package.is_expired_at(now_ms)
-                    && !matches!(
-                        package.state,
-                        crate::mls_adapter::PublishedKeyPackageState::Claimed
-                    )
-                {
-                    package.state = crate::mls_adapter::PublishedKeyPackageState::Expired;
-                }
-            });
-
-        if self.state.pending_key_package_publish.is_none() {
-            let current = self.usable_key_package_count(now_ms);
-            let desired = crate::mls_adapter::KEY_PACKAGE_POOL_TARGET.saturating_sub(current);
-            let count = if force {
-                desired
-                    .max(1)
-                    .min(crate::mls_adapter::KEY_PACKAGE_POOL_TARGET)
-            } else {
-                desired
-            };
-            if count > 0 {
-                let mut generated = self
-                    .state
-                    .mls_adapter
-                    .as_mut()
-                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                    .generate_key_package_pool(now_ms, count)?;
-                for package in &mut generated {
-                    package.state = crate::mls_adapter::PublishedKeyPackageState::PendingPublish;
-                }
-                let package_ids = generated
-                    .iter()
-                    .map(|package| package.key_package_id.clone())
-                    .collect::<Vec<_>>();
-                let device_id = self.local_identity_device_id()?;
-                self.state.key_package_inventory.extend(generated);
-                self.state.pending_key_package_publish = Some(PendingKeyPackagePublish {
-                    idempotency_key: random_opaque_id("kppub"),
-                    device_id,
-                    package_ids,
-                    created_at: now_ms,
-                    attempt_count: 0,
-                    next_retry_at: now_ms,
-                });
-            }
-        }
-
-        let mut effects = vec![persist_effect(
-            &self.state,
-            vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
-        )];
-        if self.state.pending_key_package_publish.is_some() {
-            effects.push(self.key_package_publish_effect()?);
-        }
-        if schedule_next_check {
-            effects.push(CoreEffect::ScheduleTimer {
-                timer: TimerEffect {
-                    timer_id: "credential_maintenance".into(),
-                    delay_ms: 24 * 60 * 60 * 1000,
-                },
-            });
-        }
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                system_statuses_changed: vec![SystemStatus::SyncInProgress],
-                ..CoreStateUpdate::default()
-            },
-            effects,
-            view_model: None,
-        })
-    }
-
-    pub(super) fn key_package_publish_effect(&mut self) -> CoreResult<CoreEffect> {
-        let pending = self
-            .state
-            .pending_key_package_publish
-            .clone()
-            .ok_or_else(|| CoreError::invalid_state("no KeyPackage publication is pending"))?;
-        let identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local IdentityBundle is unavailable"))?;
-        if bundle.publication_version < crate::model::IDENTITY_PUBLICATION_VERSION_V2 {
-            return Err(CoreError::new(
-                "protocol_upgrade_required",
-                "KeyPackage publication requires IdentityBundle V2",
-            ));
-        }
-        let mls_signature_public_key = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .signature_public_key();
-        let packages = pending
-            .package_ids
-            .iter()
-            .map(|package_id| {
-                let package = self
-                    .state
-                    .key_package_inventory
-                    .iter()
-                    .find(|package| package.key_package_id == *package_id)
-                    .ok_or_else(|| {
-                        CoreError::invalid_state("pending KeyPackage inventory entry is missing")
-                    })?;
-                Ok(PublishedKeyPackageV2 {
-                    key_package_id: package.key_package_id.clone(),
-                    key_package_b64: package.key_package_b64.clone(),
-                    lifecycle_version: package.lifecycle_version,
-                    not_before: package.not_before,
-                    created_at: package.created_at,
-                    expires_at: package.expires_at,
-                    mls_signature_public_key: mls_signature_public_key.clone(),
-                })
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-        let mut request_body = PublishKeyPackageBatchRequest {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            device_id: pending.device_id.clone(),
-            packages,
-            idempotency_key: pending.idempotency_key.clone(),
-            signature: String::new(),
-        };
-        request_body.signature = identity.sign_device_payload(&request_body.signing_payload());
-        let request_id = format!("keypackage-publish:{}", pending.idempotency_key);
-        self.state.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::PublishKeyPackages {
-                idempotency_key: pending.idempotency_key,
-                package_ids: pending.package_ids,
-            },
-        );
-        let endpoint = self
-            .state
-            .deployment_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("deployment is unavailable"))?
-            .inbox_http_endpoint
-            .trim_end_matches('/')
-            .to_string();
-        Ok(CoreEffect::ExecuteHttpRequest {
-            request: HttpRequestEffect {
-                request_id,
-                method: HttpMethod::Post,
-                url: format!("{endpoint}/v2/device-registry/key-packages"),
-                headers: BTreeMap::new(),
-                auth: Some(self.device_runtime_auth_requirement()?),
-                body: Some(serde_json::to_string(&request_body).map_err(|error| {
-                    CoreError::invalid_input(format!("failed to encode KeyPackage batch: {error}"))
-                })?),
-            },
-        })
     }
 
     fn stage_local_key_package_rotation(
@@ -813,14 +581,93 @@ impl CoreEngine {
 
     pub(super) fn rotate_local_key_package_after_welcome(&mut self) -> CoreResult<Vec<CoreEffect>> {
         let now_ms = current_unix_millis(self.state.message_nonce);
-        // A claimed KeyPackage is one-shot and is burned by OpenMLS while the
-        // corresponding Welcome is staged. Replenishment is therefore a pool
-        // publication, never an IdentityBundle mutation. `force` guarantees
-        // that a successful Welcome replaces one server-side consumed slot;
-        // an already pending batch remains idempotent and is simply retried.
-        Ok(self
-            .stage_key_package_pool_refill(now_ms, false, true)?
-            .effects)
+        let pending = self.state.pending_identity_publication.clone();
+        let confirmed_bundle = self.state.local_bundle.clone();
+        if let Some(pending) = pending.as_ref() {
+            // A delayed Welcome may arrive while another identity publication is
+            // awaiting confirmation. Build on that candidate so the consumed
+            // KeyPackage replacement cannot overwrite a pending share-id or
+            // capability change, while keeping the confirmed bundle visible
+            // locally until the server acknowledges the combined candidate.
+            self.state.local_bundle = Some(pending.candidate_bundle.clone());
+        }
+        let package = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .rotate_key_package(now_ms)?;
+        self.install_published_key_package(
+            package,
+            crate::mls_adapter::PublishedKeyPackageState::Consumed,
+        );
+        let updated_at = {
+            let identity = self
+                .state
+                .local_identity
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            let candidate_revision = pending
+                .as_ref()
+                .map(|publication| publication.candidate_bundle.publication_revision)
+                .unwrap_or_default();
+            identity.device_status.updated_at = identity
+                .device_status
+                .updated_at
+                .max(candidate_revision)
+                .saturating_add(1);
+            identity.device_status.updated_at
+        };
+        self.refresh_local_bundle_with_updated_at_at(updated_at, now_ms)?;
+        let candidate_bundle =
+            self.state.local_bundle.clone().ok_or_else(|| {
+                CoreError::invalid_state("candidate identity bundle is unavailable")
+            })?;
+
+        let (operation_id, expected_etag) = if let Some(mut pending) = pending {
+            let operation_id = pending.operation_id.clone();
+            let expected_etag = pending.expected_etag.clone();
+            pending.candidate_bundle = candidate_bundle.clone();
+            pending.stage = crate::persistence::PendingIdentityPublicationStage::AwaitingPublish;
+            pending.next_retry_at = now_ms;
+            self.state.pending_identity_publication = Some(pending);
+            self.state.local_bundle = confirmed_bundle;
+            (operation_id, expected_etag)
+        } else if candidate_bundle.identity_bundle_ref.is_some() {
+            let operation_id = format!(
+                "credential_maintenance:{}",
+                candidate_bundle.publication_revision
+            );
+            if let Some(previous_bundle) = confirmed_bundle {
+                self.state.local_bundle = Some(previous_bundle.clone());
+                self.state.pending_identity_publication =
+                    Some(crate::persistence::PendingIdentityPublication {
+                        operation_id: operation_id.clone(),
+                        reason: "keypackage_rotation_after_welcome".into(),
+                        previous_bundle,
+                        candidate_bundle: candidate_bundle.clone(),
+                        expected_etag: None,
+                        stage: crate::persistence::PendingIdentityPublicationStage::AwaitingPublish,
+                        attempt_count: 0,
+                        next_retry_at: now_ms,
+                    });
+            }
+            (operation_id, None)
+        } else {
+            (String::new(), None)
+        };
+        let mut effects = vec![persist_effect(
+            &self.state,
+            vec![PersistOp::SaveLocalIdentity, PersistOp::SaveDeployment],
+        )];
+        if candidate_bundle.identity_bundle_ref.is_some() {
+            effects.push(self.identity_bundle_publish_effect(
+                &candidate_bundle,
+                operation_id,
+                expected_etag.as_deref(),
+            )?);
+        }
+        Ok(effects)
     }
 
     fn install_published_key_package(
@@ -950,13 +797,6 @@ impl CoreEngine {
             return Err(Self::relationship_closed_error(&peer_user_id));
         }
         let contact_bundle = self.direct_peer_contact_bundle(&peer_user_id)?.clone();
-        if contact_bundle.publication_version < crate::model::IDENTITY_PUBLICATION_VERSION_V2 {
-            return Err(CoreError::new(
-                "protocol_upgrade_required",
-                "the contact must publish IdentityBundle V2 before a Direct relationship can be created",
-            ));
-        }
-        IdentityManager::verify_identity_bundle(&contact_bundle)?;
         let now_ms = current_unix_millis(self.state.message_nonce);
         let peer_device_ids: Vec<String> = contact_bundle
             .devices
@@ -964,22 +804,33 @@ impl CoreEngine {
             .filter(|device| {
                 matches!(device.status, crate::model::DeviceStatusKind::Active)
                     && device
-                        .key_package_claim_capability
+                        .keypackage_ref
                         .as_ref()
-                        .is_some_and(|capability| capability.expires_at > now_ms)
-                    && device.mls_device_key_binding.is_some()
+                        .is_some_and(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
             })
             .map(|d| d.device_id.clone())
             .collect();
-        let active_device_count = contact_bundle
-            .devices
-            .iter()
-            .filter(|device| device.status == crate::model::DeviceStatusKind::Active)
-            .count();
-        if peer_device_ids.is_empty() || peer_device_ids.len() != active_device_count {
+        if peer_device_ids.is_empty()
+            && self
+                .active_direct_conversation_for_peer(&peer_user_id)
+                .is_none()
+        {
+            if contact_bundle.devices.iter().any(|device| {
+                matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && device.keypackage_ref.as_ref().is_some_and(|keypackage| {
+                        keypackage.created_at
+                            > now_ms
+                                .saturating_add(crate::mls_adapter::KEY_PACKAGE_CLOCK_TOLERANCE_MS)
+                    })
+            }) {
+                return Err(CoreError::new(
+                    "device_clock_invalid",
+                    "contact key package was created too far in the future",
+                ));
+            }
             return Err(CoreError::new(
-                "identity_refresh_required",
-                "every active peer device must expose a valid MLS binding and KeyPackage claim capability",
+                "keypackage_expired",
+                "peer identity bundle does not contain a usable key package",
             ));
         }
         if let Some((conversation_id, existing)) =
@@ -1020,7 +871,7 @@ impl CoreEngine {
                 effects,
                 view_model: Some(CoreViewModel {
                     conversations: vec![ConversationSummary {
-                        conversation_id: conversation_id.clone(),
+                        conversation_id,
                         peer_user_id: peer_user_id.clone(),
                         state,
                         kind: Some(ConversationKind::Direct),
@@ -1034,286 +885,95 @@ impl CoreEngine {
                         last_message_type: existing_last_message_type,
                         message_count: None,
                         recovery,
-                        relationship: self.relationship_view_state(&conversation_id),
                     }],
                     ..CoreViewModel::default()
                 }),
             });
         }
 
-        if let Some(pending) = self.state.relationships.values().find(|relationship| {
-            relationship.peer_user_id == peer_user_id
-                && relationship.account_state == RelationshipAccountState::Pending
-                && relationship.setup_state != RelationshipSetupState::Superseded
-        }) {
-            let conversation_id = format!(
-                "conv:direct:v2:{}:g{}",
-                pending.relationship_id, pending.generation
-            );
-            return Ok(CoreOutput {
-                state_update: CoreStateUpdate::default(),
-                effects: Vec::new(),
-                view_model: Some(CoreViewModel {
-                    conversations: vec![ConversationSummary {
-                        conversation_id: conversation_id.clone(),
-                        peer_user_id: peer_user_id.clone(),
-                        state: "claiming".into(),
-                        kind: Some(ConversationKind::Direct),
-                        title: None,
-                        display_name: self.contact_archive_display_name(&peer_user_id),
-                        group_id: None,
-                        member_count: None,
-                        group_role: None,
-                        group_cursor: None,
-                        last_message_preview: None,
-                        last_message_type: None,
-                        message_count: None,
-                        recovery: None,
-                        relationship: self.relationship_view_state(&conversation_id),
-                    }],
-                    ..CoreViewModel::default()
-                }),
-            });
-        }
-
-        let relationship_id = random_opaque_id("relationship");
-        let proposal_id = random_opaque_id("proposal");
-        let idempotency_key = random_opaque_id("claim");
-        let sender_bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .filter(|bundle| {
-                bundle.publication_version >= crate::model::IDENTITY_PUBLICATION_VERSION_V2
-            })
-            .cloned()
-            .ok_or_else(|| {
-                CoreError::new(
-                    "protocol_upgrade_required",
-                    "local IdentityBundle V2 is required to create a Direct relationship",
-                )
-            })?;
-        let sender_bundle_digest = crate::identity::identity_bundle_digest(&sender_bundle)?;
-        let generation = self
-            .state
-            .relationships
-            .values()
-            .filter(|relationship| relationship.peer_user_id == peer_user_id)
-            .map(|relationship| relationship.generation)
-            .max()
-            .map_or(1, |generation| generation.saturating_add(1));
-        let mut proposal = RelationshipProposalV2 {
-            proposal_id: proposal_id.clone(),
-            initiator_user_id: local_identity.user_identity.user_id.clone(),
-            initiator_device_id: local_identity.device_identity.device_id.clone(),
-            relationship_id_candidate: relationship_id.clone(),
-            generation,
-            attempt: 1,
-            peer_user_id: peer_user_id.clone(),
-            sender_bundle_digest,
-            created_at: now_ms,
-            expires_at: now_ms.saturating_add(7 * 24 * 60 * 60 * 1000),
-            signature: String::new(),
-        };
-        proposal.signature = local_identity.sign_device_payload(
-            &crate::identity::relationship_proposal_signing_payload(&proposal),
+        let conversation_id = self.new_direct_relationship_conversation_id(
+            &local_identity.user_identity.user_id,
+            &peer_user_id,
         );
-        crate::identity::verify_relationship_proposal(&proposal, &sender_bundle)?;
-        let targets = contact_bundle
+        let local_conversation = ConversationManager::create_direct_conversation_with_id(
+            conversation_id.clone(),
+            &local_identity.user_identity.user_id,
+            &local_identity.device_identity.device_id,
+            &peer_user_id,
+            &peer_device_ids,
+        )?;
+        let peer_keypackages: Vec<PeerDeviceKeyPackage> = contact_bundle
             .devices
             .iter()
-            .filter(|device| device.status == crate::model::DeviceStatusKind::Active)
-            .map(|device| {
-                Ok(crate::transport_contract::KeyPackageClaimTarget {
+            .filter_map(|device| {
+                let keypackage_ref = device.keypackage_ref.as_ref()?;
+                (matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && keypackage_ref.is_usable_at(now_ms))
+                .then(|| PeerDeviceKeyPackage {
+                    user_id: peer_user_id.clone(),
                     device_id: device.device_id.clone(),
-                    capability: device.key_package_claim_capability.clone().ok_or_else(|| {
-                        CoreError::invalid_input("active peer device is missing a claim capability")
-                    })?,
+                    device_public_key: device.device_public_key.clone(),
+                    key_package_b64: keypackage_ref.object_ref.clone(),
                 })
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-        let endpoint = targets
-            .first()
-            .map(|target| target.capability.endpoint.clone())
-            .ok_or_else(|| CoreError::invalid_input("claim target set is empty"))?;
-        if targets
-            .iter()
-            .any(|target| target.capability.endpoint != endpoint)
-        {
-            return Err(CoreError::invalid_input(
-                "all devices in an account must use one authoritative claim endpoint",
-            ));
-        }
-        let request_body = ClaimKeyPackagesRequest {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            purpose: crate::transport_contract::KeyPackageClaimPurpose::Direct,
-            idempotency_key: idempotency_key.clone(),
-            requester_bundle: sender_bundle.clone(),
-            proposal: proposal.clone(),
-            targets,
-        };
-        let self_targets = sender_bundle
-            .devices
-            .iter()
-            .filter(|device| {
-                device.status == DeviceStatusKind::Active
-                    && device.device_id != local_identity.device_identity.device_id
-            })
-            .map(|device| {
-                Ok(crate::transport_contract::KeyPackageClaimTarget {
-                    device_id: device.device_id.clone(),
-                    capability: device.key_package_claim_capability.clone().ok_or_else(|| {
-                        CoreError::invalid_input(
-                            "active sibling device is missing a claim capability",
-                        )
-                    })?,
-                })
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-        let self_claim = if self_targets.is_empty() {
-            None
-        } else {
-            let self_endpoint = self_targets[0].capability.endpoint.clone();
-            if self_targets
-                .iter()
-                .any(|target| target.capability.endpoint != self_endpoint)
-            {
-                return Err(CoreError::invalid_input(
-                    "all sibling devices must use one authoritative claim endpoint",
-                ));
-            }
-            let self_idempotency_key = random_opaque_id("self-claim");
-            Some((
-                self_endpoint,
-                self_idempotency_key.clone(),
-                ClaimKeyPackagesRequest {
-                    version: crate::model::ENVELOPE_VERSION_V2.into(),
-                    purpose: crate::transport_contract::KeyPackageClaimPurpose::SelfJoin,
-                    idempotency_key: self_idempotency_key,
-                    requester_bundle: sender_bundle.clone(),
-                    proposal: proposal.clone(),
-                    targets: self_targets,
-                },
-            ))
-        };
-        let local_join_states = sender_bundle
-            .devices
-            .iter()
-            .filter(|device| device.status == DeviceStatusKind::Active)
-            .map(|device| {
-                (
-                    device.device_id.clone(),
-                    if device.device_id == local_identity.device_identity.device_id {
-                        DeviceJoinState::Ready
-                    } else {
-                        DeviceJoinState::WaitingWelcome
-                    },
-                )
             })
             .collect();
-        self.state.relationships.insert(
-            relationship_id.clone(),
-            PersistedRelationship {
-                relationship_id: relationship_id.clone(),
-                peer_user_id: peer_user_id.clone(),
-                peer_root_public_key: contact_bundle.user_public_key.clone(),
-                peer_bundle_digest: crate::identity::identity_bundle_digest(&contact_bundle)?,
-                peer_bundle_revision: contact_bundle.publication_revision,
-                generation,
-                canonical_proposal: proposal.clone(),
-                account_state: RelationshipAccountState::Pending,
-                setup_state: RelationshipSetupState::Claiming,
-                local_device_join_states: local_join_states,
-                attempts: vec![RelationshipAttempt {
-                    attempt: 1,
-                    proposal_id: proposal_id.clone(),
-                    ticket_id: String::new(),
-                    ticket_secret: String::new(),
-                    ticket_status_endpoint: None,
-                    remote_claim_idempotency_key: idempotency_key.clone(),
-                    self_claim_idempotency_key: self_claim
-                        .as_ref()
-                        .map(|(_, idempotency_key, _)| idempotency_key.clone()),
-                    claim_retry_count: 0,
-                    claim_ids: Vec::new(),
-                    welcome_digests: Vec::new(),
-                    claim_sets: Vec::new(),
-                    created_at: now_ms,
-                    expires_at: now_ms.saturating_add(7 * 24 * 60 * 60 * 1000),
-                }],
-                version: 1,
-                updated_at: now_ms,
+        let artifacts = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .create_conversation(&conversation_id, &peer_keypackages)?;
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter missing after create"))?
+            .export_group_summary(&conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(conversation_id.clone(), summary);
+        self.state
+            .conversations
+            .insert(conversation_id.clone(), local_conversation);
+
+        let mut generated = Vec::new();
+        for device_id in &peer_device_ids {
+            generated.push(self.build_envelope(
+                &conversation_id,
+                device_id,
+                MessageType::MlsCommit,
+                artifacts.commit_b64.clone(),
+            )?);
+        }
+        for welcome in &artifacts.welcomes {
+            generated.push(self.build_envelope(
+                &conversation_id,
+                &welcome.recipient_device_id,
+                MessageType::MlsWelcome,
+                welcome.payload_b64.clone(),
+            )?);
+        }
+        self.enqueue_envelopes(peer_user_id.clone(), generated.clone());
+        let persist_ops = vec![
+            PersistOp::SaveConversation {
+                conversation_id: conversation_id.clone(),
             },
-        );
-        let conversation_id = format!("conv:direct:v2:{relationship_id}:g{generation}");
-        let request_id = self.next_request_id(&format!("claim:{proposal_id}"));
-        self.state.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::ClaimKeyPackages {
-                purpose: crate::transport_contract::KeyPackageClaimPurpose::Direct,
-                peer_user_id: peer_user_id.clone(),
-                relationship_id: relationship_id.clone(),
-                proposal_id: proposal_id.clone(),
-                idempotency_key,
-                claim_endpoint: endpoint.clone(),
-            },
-        );
-        let mut effects = vec![
-            persist_effect(&self.state, vec![PersistOp::SaveDeployment]),
-            CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id,
-                    method: HttpMethod::Post,
-                    url: endpoint,
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: None,
-                    body: Some(serde_json::to_string(&request_body).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode KeyPackage claim: {error}"
-                        ))
-                    })?),
-                },
+            PersistOp::SaveMlsState {
+                conversation_id: conversation_id.clone(),
             },
         ];
-        if let Some((self_endpoint, self_idempotency_key, self_request)) = self_claim {
-            let self_request_id = self.next_request_id(&format!("self-claim:{proposal_id}"));
-            self.state.pending_requests.insert(
-                self_request_id.clone(),
-                PendingRequest::ClaimKeyPackages {
-                    purpose: crate::transport_contract::KeyPackageClaimPurpose::SelfJoin,
-                    peer_user_id: peer_user_id.clone(),
-                    relationship_id: relationship_id.clone(),
-                    proposal_id: proposal_id.clone(),
-                    idempotency_key: self_idempotency_key,
-                    claim_endpoint: self_endpoint.clone(),
-                },
-            );
-            effects.push(CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id: self_request_id,
-                    method: HttpMethod::Post,
-                    url: self_endpoint,
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: None,
-                    body: Some(serde_json::to_string(&self_request).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode authenticated self claim: {error}"
-                        ))
-                    })?),
-                },
-            });
-        }
-        Ok(CoreOutput {
+        self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
-                contacts_changed: true,
+                conversations_changed: true,
+                messages_changed: true,
                 ..CoreStateUpdate::default()
             },
-            effects,
+            effects: vec![persist_effect(&self.state, persist_ops)],
             view_model: Some(CoreViewModel {
                 conversations: vec![ConversationSummary {
-                    conversation_id: conversation_id.clone(),
+                    conversation_id,
                     peer_user_id: peer_user_id.clone(),
-                    state: "claiming".into(),
+                    state: "active".into(),
                     kind: Some(ConversationKind::Direct),
                     title: None,
                     display_name: self.contact_archive_display_name(&peer_user_id),
@@ -1322,11 +982,18 @@ impl CoreEngine {
                     group_role: None,
                     group_cursor: None,
                     last_message_preview: None,
-                    last_message_type: None,
+                    last_message_type: Some(MessageType::MlsCommit),
                     message_count: None,
                     recovery: None,
-                    relationship: self.relationship_view_state(&conversation_id),
                 }],
+                messages: generated
+                    .iter()
+                    .map(|envelope| MessageSummary {
+                        conversation_id: envelope.conversation_id.clone(),
+                        message_id: envelope.message_id.clone(),
+                        message_type: envelope.message_type,
+                    })
+                    .collect(),
                 ..CoreViewModel::default()
             }),
         })
@@ -1350,28 +1017,6 @@ impl CoreEngine {
         let sender_device_id = local_identity.device_identity.device_id.clone();
         let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
         let recipient_device_ids = self.recipient_device_ids(&conversation_id)?;
-        // Authorization must be checked before encrypting. OpenMLS advances the
-        // sender ratchet when `encrypt_application` succeeds, so discovering a
-        // pending/rejected relationship afterwards would corrupt the local MLS
-        // state even though the command is returned as an error.
-        let relationship_id = self
-            .state
-            .relationships
-            .values()
-            .find(|relationship| {
-                format!(
-                    "conv:direct:v2:{}:g{}",
-                    relationship.relationship_id, relationship.generation
-                ) == conversation_id
-                    && relationship.account_state == RelationshipAccountState::Accepted
-            })
-            .map(|relationship| relationship.relationship_id.clone())
-            .ok_or_else(|| {
-                CoreError::new(
-                    "relationship_not_ready",
-                    "Direct V2 relationship is not accepted",
-                )
-            })?;
         let app_message_nonce = self.next_message_nonce();
         let app_message_id =
             self.next_app_message_id(&conversation_id, &sender_device_id, app_message_nonce);
@@ -1394,18 +1039,16 @@ impl CoreEngine {
         let envelopes = recipient_device_ids
             .iter()
             .map(|device_id| {
-                self.build_envelope_v2(
-                    &relationship_id,
-                    &peer_user_id,
+                self.build_envelope(
+                    &conversation_id,
                     device_id,
                     MessageType::MlsApplication,
                     payload.payload_b64.clone(),
-                    None,
                 )
             })
             .collect::<CoreResult<Vec<_>>>()?;
         // Cache plaintext for display until message is synced
-        self.enqueue_envelopes_v2_with_plaintext(
+        self.enqueue_envelopes_with_plaintext(
             peer_user_id,
             envelopes.clone(),
             plaintext.clone(),
@@ -1434,7 +1077,7 @@ impl CoreEngine {
                 // The protected application id is the only user-visible
                 // identity. Envelope ids are per-recipient transport details.
                 messages: vec![MessageSummary {
-                    conversation_id: conversation_id.clone(),
+                    conversation_id,
                     message_id: app_message_id,
                     message_type: MessageType::MlsApplication,
                 }],
@@ -1481,12 +1124,11 @@ impl CoreEngine {
             self.state.local_bundle = None;
             return Ok(());
         };
-        let mls_signature_public_key = self
+        let package = self
             .state
-            .mls_adapter
+            .published_key_package
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("MLS adapter missing"))?
-            .signature_public_key();
+            .ok_or_else(|| CoreError::invalid_state("published key package missing"))?;
         let mut signing_identity = local_identity.clone();
         signing_identity.device_status.updated_at = updated_at;
         let mut devices = self
@@ -1524,10 +1166,14 @@ impl CoreEngine {
             .as_ref()
             .and_then(|bundle| bundle.bundle_share_id.clone());
         devices.push(
-            crate::capability::CapabilityManager::build_device_contact_profile_v2(
+            crate::capability::CapabilityManager::build_device_contact_profile_with_lifetime(
                 &signing_identity,
                 deployment,
-                mls_signature_public_key,
+                package.key_package_ref.clone(),
+                package.lifecycle_version,
+                package.not_before,
+                package.created_at,
+                package.expires_at,
                 now_ms,
             )?,
         );
@@ -1609,12 +1255,11 @@ impl CoreEngine {
             self.state.local_bundle = None;
             return Ok(());
         };
-        let mls_signature_public_key = self
+        let package = self
             .state
-            .mls_adapter
+            .published_key_package
             .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("MLS adapter missing"))?
-            .signature_public_key();
+            .ok_or_else(|| CoreError::invalid_state("published key package missing"))?;
         let mut signing_identity = local_identity.clone();
         signing_identity.device_status.updated_at = updated_at;
         let mut devices = self
@@ -1632,7 +1277,13 @@ impl CoreEngine {
             .unwrap_or_default();
         let now_ms = current_unix_millis(self.state.message_nonce);
         for device in &mut devices {
-            device.keypackage_ref = None;
+            if device
+                .keypackage_ref
+                .as_ref()
+                .is_some_and(|keypackage| !keypackage.is_usable_at(now_ms))
+            {
+                device.keypackage_ref = None;
+            }
             if device
                 .inbox_append_capability
                 .as_ref()
@@ -1640,19 +1291,16 @@ impl CoreEngine {
             {
                 device.inbox_append_capability = None;
             }
-            if device
-                .key_package_claim_capability
-                .as_ref()
-                .is_some_and(|capability| capability.expires_at <= now_ms)
-            {
-                device.key_package_claim_capability = None;
-            }
         }
         devices.push(
-            crate::capability::CapabilityManager::build_device_contact_profile_v2(
+            crate::capability::CapabilityManager::build_device_contact_profile_with_lifetime(
                 &signing_identity,
                 deployment,
-                mls_signature_public_key,
+                package.key_package_ref.clone(),
+                package.lifecycle_version,
+                package.not_before,
+                package.created_at,
+                package.expires_at,
                 now_ms,
             )?,
         );
@@ -1695,11 +1343,7 @@ impl CoreEngine {
             .conversations
             .iter()
             .filter(|(_, state)| {
-                if state
-                    .conversation
-                    .conversation_id
-                    .starts_with("conv:direct:v2:")
-                    && state.peer_user_id == peer_user_id
+                if state.peer_user_id == peer_user_id
                     && state.conversation.kind == ConversationKind::Direct
                     && matches!(
                         state.conversation.state,
@@ -1876,96 +1520,53 @@ impl CoreEngine {
         Ok(output)
     }
 
-    /// Converts a locally trusted V1 Direct relationship into a V2 setup attempt.
-    ///
-    /// Local history is sufficient to auto-accept an incoming proposal from the
-    /// same root identity, but it is deliberately not sufficient to set the
-    /// outbound DeviceRegistry row to Accepted.  The outbound side still waits
-    /// for the peer device's signed RelationshipDecisionProofV2.
-    pub(super) fn migrate_legacy_accepted_relationships(&mut self) -> CoreResult<CoreOutput> {
-        let peer_user_ids = self
-            .state
-            .contacts
-            .iter()
-            .filter_map(|(peer_user_id, contact)| {
-                let has_v2_relationship = self
-                    .state
-                    .relationships
-                    .values()
-                    .any(|relationship| relationship.peer_user_id == *peer_user_id);
-                let has_legacy_direct =
-                    self.state
-                        .conversations
-                        .iter()
-                        .any(|(conversation_id, conversation)| {
-                            !conversation_id.starts_with("conv:direct:v2:")
-                                && conversation.peer_user_id == *peer_user_id
-                                && conversation.conversation.kind == ConversationKind::Direct
-                                && conversation.conversation.state != ConversationState::Archived
-                        });
-                (contact.relationship_status == ContactRelationshipStatus::Available
-                    && !has_v2_relationship
-                    && has_legacy_direct)
-                    .then_some(peer_user_id.clone())
-            })
-            .collect::<Vec<_>>();
-        if peer_user_ids.is_empty() {
-            return Ok(CoreOutput::default());
-        }
-
-        let mut output = CoreOutput::default();
-        for peer_user_id in peer_user_ids {
-            let legacy_conversation_ids = self
-                .state
-                .conversations
-                .iter()
-                .filter_map(|(conversation_id, conversation)| {
-                    (!conversation_id.starts_with("conv:direct:v2:")
-                        && conversation.peer_user_id == peer_user_id
-                        && conversation.conversation.kind == ConversationKind::Direct
-                        && conversation.conversation.state != ConversationState::Archived)
-                        .then_some(conversation_id.clone())
-                })
-                .collect::<Vec<_>>();
-            for conversation_id in legacy_conversation_ids {
-                output = merge_outputs(output, self.rebuild_conversation(conversation_id)?);
-            }
-
-            let supports_v2 = self
-                .state
-                .contacts
-                .get(&peer_user_id)
-                .is_some_and(|contact| {
-                    contact.bundle.publication_version
-                        >= crate::model::IDENTITY_PUBLICATION_VERSION_V2
-                });
-            output = if supports_v2 {
-                merge_outputs(
-                    output,
-                    self.create_conversation(peer_user_id, ConversationKind::Direct)?,
-                )
-            } else {
-                merge_outputs(output, self.refresh_identity_state(peer_user_id)?)
-            };
-        }
-        Ok(output)
-    }
-
     pub(super) fn peer_active_device_ids(&self, peer_user_id: &str) -> CoreResult<Vec<String>> {
         let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
+        let now_ms = current_unix_millis(self.state.message_nonce);
         let devices: Vec<String> = bundle
             .devices
             .iter()
-            .filter(|device| matches!(device.status, crate::model::DeviceStatusKind::Active))
+            .filter(|device| {
+                matches!(device.status, crate::model::DeviceStatusKind::Active)
+                    && device
+                        .keypackage_ref
+                        .as_ref()
+                        .is_some_and(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
+            })
             .map(|device| device.device_id.clone())
             .collect();
         if devices.is_empty() {
             return Err(CoreError::new(
-                "identity_refresh_required",
-                "peer IdentityBundle does not contain an active device",
+                "keypackage_expired",
+                "peer identity bundle does not contain a usable key package",
             ));
         }
         Ok(devices)
+    }
+
+    pub(super) fn peer_key_packages(
+        &self,
+        peer_user_id: &str,
+        device_ids: &[String],
+    ) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
+        let wanted: BTreeSet<String> = device_ids.iter().cloned().collect();
+        let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        Ok(bundle
+            .devices
+            .iter()
+            .filter_map(|device| {
+                let keypackage_ref = device.keypackage_ref.as_ref()?;
+                (wanted.contains(&device.device_id) && keypackage_ref.is_usable_at(now_ms)).then(
+                    || PeerDeviceKeyPackage {
+                        user_id: peer_user_id.to_string(),
+                        device_id: device.device_id.clone(),
+                        device_public_key: device.device_public_key.clone(),
+                        key_package_b64: keypackage_ref.object_ref.clone(),
+                    },
+                )
+            })
+            .collect())
     }
 
     pub(super) fn peer_user_for_conversation(&self, conversation_id: &str) -> CoreResult<String> {
@@ -2033,7 +1634,6 @@ impl CoreEngine {
             self.state.outbox.push(envelope.clone());
             self.state.pending_outbox.push(PendingOutboxItem {
                 envelope,
-                envelope_v2: None,
                 peer_user_id: peer_user_id.clone(),
                 retries: 0,
                 in_flight: false,
@@ -2041,1137 +1641,6 @@ impl CoreEngine {
                 plaintext_cache: None,
                 identity_refresh_attempted: false,
             });
-        }
-    }
-
-    pub(super) fn build_envelope_v2(
-        &mut self,
-        relationship_id: &str,
-        recipient_user_id: &str,
-        recipient_device_id: &str,
-        message_type: MessageType,
-        payload_b64: String,
-        claim_id: Option<String>,
-    ) -> CoreResult<crate::model::EnvelopeV2> {
-        let relationship = self
-            .state
-            .relationships
-            .get(relationship_id)
-            .ok_or_else(|| CoreError::invalid_state("relationship state is missing"))?
-            .clone();
-        let identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-            .clone();
-        let sender_bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local IdentityBundle is unavailable"))?;
-        let sender_bundle_digest = crate::identity::identity_bundle_digest(sender_bundle)?;
-        let conversation_id = format!(
-            "conv:direct:v2:{}:g{}",
-            relationship.relationship_id, relationship.generation
-        );
-        let nonce = self.next_message_nonce();
-        let mut envelope = crate::model::EnvelopeV2 {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            message_id: self.next_message_id(&conversation_id, recipient_device_id, nonce),
-            conversation_id,
-            relationship_id: relationship.relationship_id,
-            generation: relationship.generation,
-            attempt: relationship.canonical_proposal.attempt,
-            proposal_id: relationship.canonical_proposal.proposal_id,
-            claim_id,
-            sender_user_id: identity.user_identity.user_id.clone(),
-            sender_device_id: identity.device_identity.device_id.clone(),
-            recipient_user_id: recipient_user_id.to_string(),
-            recipient_device_id: recipient_device_id.to_string(),
-            created_at: current_unix_millis(nonce),
-            message_type,
-            inline_ciphertext: Some(payload_b64),
-            storage_refs: Vec::new(),
-            delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
-            sender_bundle_digest,
-            sender_proof: SenderProof {
-                proof_type: crate::model::ENVELOPE_SENDER_PROOF_V2.into(),
-                value: String::new(),
-            },
-        };
-        identity.sign_envelope_v2(&mut envelope)?;
-        envelope.validate()?;
-        Ok(envelope)
-    }
-
-    pub(super) fn handle_key_package_claimed(
-        &mut self,
-        purpose: crate::transport_contract::KeyPackageClaimPurpose,
-        peer_user_id: String,
-        relationship_id: String,
-        proposal_id: String,
-        idempotency_key: String,
-        claim_endpoint: String,
-        result: ClaimKeyPackagesResult,
-    ) -> CoreResult<CoreOutput> {
-        if result.idempotency_key != idempotency_key {
-            return Err(CoreError::invalid_input(
-                "KeyPackage claim response idempotency key mismatch",
-            ));
-        }
-        let contact_bundle = self.direct_peer_contact_bundle(&peer_user_id)?.clone();
-        let local_bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("local IdentityBundle is unavailable"))?;
-        let relationship = self
-            .state
-            .relationships
-            .get(&relationship_id)
-            .filter(|relationship| relationship.canonical_proposal.proposal_id == proposal_id)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("pending relationship claim is unavailable"))?;
-        let local_device_id = self.local_device_id_required()?;
-        let (claim_user_id, active_devices) = match purpose {
-            crate::transport_contract::KeyPackageClaimPurpose::Direct => (
-                peer_user_id.as_str(),
-                contact_bundle
-                    .devices
-                    .iter()
-                    .filter(|device| device.status == DeviceStatusKind::Active)
-                    .collect::<Vec<_>>(),
-            ),
-            crate::transport_contract::KeyPackageClaimPurpose::SelfJoin => (
-                local_bundle.user_id.as_str(),
-                local_bundle
-                    .devices
-                    .iter()
-                    .filter(|device| {
-                        device.status == DeviceStatusKind::Active
-                            && device.device_id != local_device_id
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            _ => {
-                return Err(CoreError::invalid_input(
-                    "Direct relationship received an unrelated KeyPackage claim purpose",
-                ));
-            }
-        };
-        if result.claims.len() != active_devices.len() {
-            return Err(CoreError::invalid_input(
-                "KeyPackage claim response did not cover every required device",
-            ));
-        }
-        for device in active_devices {
-            let claim = result
-                .claims
-                .iter()
-                .find(|claim| claim.user_id == claim_user_id && claim.device_id == device.device_id)
-                .ok_or_else(|| CoreError::invalid_input("KeyPackage claim target mismatch"))?;
-            let binding = device.mls_device_key_binding.as_ref().ok_or_else(|| {
-                CoreError::invalid_input("claimed device is missing an MLS key binding")
-            })?;
-            crate::mls_adapter::validate_key_package_device_binding(
-                &claim.key_package_b64,
-                binding,
-            )?;
-        }
-        let ticket = match purpose {
-            crate::transport_contract::KeyPackageClaimPurpose::Direct => {
-                let ticket = result.ticket.clone().ok_or_else(|| {
-                    CoreError::invalid_input(
-                        "Direct KeyPackage claim did not return a relationship ticket",
-                    )
-                })?;
-                if ticket.relationship_id != relationship_id
-                    || ticket.generation != relationship.generation
-                    || ticket.attempt != relationship.canonical_proposal.attempt
-                {
-                    return Err(CoreError::invalid_input(
-                        "relationship ticket does not match the pending proposal",
-                    ));
-                }
-                Some(ticket)
-            }
-            crate::transport_contract::KeyPackageClaimPurpose::SelfJoin => {
-                if result.ticket.is_some() {
-                    return Err(CoreError::invalid_input(
-                        "authenticated self claim unexpectedly returned a relationship ticket",
-                    ));
-                }
-                None
-            }
-            _ => unreachable!(),
-        };
-        let claim_ids = result
-            .claims
-            .iter()
-            .map(|claim| claim.claim_id.clone())
-            .collect::<Vec<_>>();
-        if let Some(stored) = self.state.relationships.get_mut(&relationship_id) {
-            stored.setup_state = RelationshipSetupState::Delivering;
-            stored.updated_at = current_unix_millis(self.state.message_nonce);
-            stored.version = stored.version.saturating_add(1);
-            if let Some(attempt) = stored.attempts.last_mut() {
-                if let Some(ticket) = ticket.as_ref() {
-                    let ticket_secret = ticket
-                        .ticket_secret
-                        .as_deref()
-                        .filter(|secret| {
-                            secret.len() == 64
-                                && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
-                        })
-                        .ok_or_else(|| {
-                            CoreError::invalid_input(
-                                "relationship claim response is missing its opaque ticket secret",
-                            )
-                        })?;
-                    attempt.ticket_id = ticket.ticket_id.clone();
-                    // The secret is retained only in the local encrypted
-                    // relationship state. Registry/upsert wire copies below
-                    // are explicitly sanitized before serialization.
-                    attempt.ticket_secret = ticket_secret.to_string();
-                    attempt.ticket_status_endpoint = Some(format!(
-                        "{}/v2/relationships/{}/status",
-                        claim_endpoint
-                            .strip_suffix("/v2/key-packages/claims")
-                            .unwrap_or(claim_endpoint.trim_end_matches('/')),
-                        ticket.ticket_id
-                    ));
-                }
-                for claim_id in &claim_ids {
-                    if !attempt.claim_ids.contains(claim_id) {
-                        attempt.claim_ids.push(claim_id.clone());
-                    }
-                }
-                let purpose_name = match purpose {
-                    crate::transport_contract::KeyPackageClaimPurpose::Direct => "direct",
-                    crate::transport_contract::KeyPackageClaimPurpose::SelfJoin => "self_join",
-                    _ => unreachable!(),
-                };
-                attempt.claim_sets.retain(|set| set.purpose != purpose_name);
-                attempt.claim_sets.push(KeyPackageClaimSet {
-                    purpose: purpose_name.into(),
-                    idempotency_key: result.idempotency_key.clone(),
-                    claims: result
-                        .claims
-                        .iter()
-                        .map(|claim| KeyPackageClaim {
-                            claim_id: claim.claim_id.clone(),
-                            user_id: claim.user_id.clone(),
-                            device_id: claim.device_id.clone(),
-                            key_package_id: claim.key_package_id.clone(),
-                            key_package_b64: claim.key_package_b64.clone(),
-                            created_at: claim.created_at,
-                            expires_at: claim.expires_at,
-                        })
-                        .collect(),
-                    ticket: ticket.clone().map(|mut ticket| {
-                        ticket.ticket_secret = None;
-                        ticket
-                    }),
-                });
-            }
-        }
-        let stored_relationship = self
-            .state
-            .relationships
-            .get(&relationship_id)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("relationship disappeared after claim"))?;
-        let attempt = stored_relationship
-            .attempts
-            .last()
-            .ok_or_else(|| CoreError::invalid_state("relationship attempt is unavailable"))?;
-        let needs_self_claim = local_bundle.devices.iter().any(|device| {
-            device.status == DeviceStatusKind::Active && device.device_id != local_device_id
-        });
-        let has_remote_claim = attempt.claim_sets.iter().any(|set| set.purpose == "direct");
-        let has_self_claim = attempt
-            .claim_sets
-            .iter()
-            .any(|set| set.purpose == "self_join");
-        if !has_remote_claim || (needs_self_claim && !has_self_claim) {
-            return Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    contacts_changed: true,
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
-                view_model: None,
-            });
-        }
-        let mut registry_relationship = self
-            .state
-            .relationships
-            .get(&relationship_id)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("relationship disappeared after claim"))?;
-        for attempt in &mut registry_relationship.attempts {
-            attempt.ticket_secret.clear();
-            for claim_set in &mut attempt.claim_sets {
-                if let Some(ticket) = claim_set.ticket.as_mut() {
-                    ticket.ticket_secret = None;
-                }
-            }
-        }
-        let ticket_status_endpoint = attempt.ticket_status_endpoint.clone().ok_or_else(|| {
-            CoreError::invalid_state("relationship ticket status endpoint is missing")
-        })?;
-        let mut public_ticket = attempt
-            .claim_sets
-            .iter()
-            .find(|set| set.purpose == "direct")
-            .and_then(|set| set.ticket.clone())
-            .ok_or_else(|| CoreError::invalid_state("relationship ticket is missing"))?;
-        public_ticket.ticket_secret = None;
-        let upsert = UpsertOutboundRelationshipRequest {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            relationship: registry_relationship,
-            peer_bundle: contact_bundle,
-            ticket: public_ticket,
-            ticket_status_endpoint,
-        };
-        let endpoint = self
-            .state
-            .deployment_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?
-            .inbox_http_endpoint
-            .trim_end_matches('/')
-            .to_string();
-        let request_id = self.next_request_id("relationship-upsert");
-        self.state.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::UpsertOutboundRelationship {
-                relationship_id: relationship_id.clone(),
-            },
-        );
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                contacts_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![
-                persist_effect(&self.state, vec![PersistOp::SaveDeployment]),
-                CoreEffect::ExecuteHttpRequest {
-                    request: HttpRequestEffect {
-                        request_id,
-                        method: HttpMethod::Post,
-                        url: format!("{endpoint}/v2/device-registry/relationships/outbound"),
-                        headers: BTreeMap::from([(
-                            "Content-Type".into(),
-                            "application/json".into(),
-                        )]),
-                        auth: Some(self.device_runtime_auth_requirement()?),
-                        body: Some(serde_json::to_string(&upsert).map_err(|error| {
-                            CoreError::invalid_input(format!(
-                                "failed to encode outbound relationship: {error}"
-                            ))
-                        })?),
-                    },
-                },
-            ],
-            view_model: None,
-        })
-    }
-
-    pub(super) fn handle_relationship_claim_failure(
-        &mut self,
-        relationship_id: String,
-        response_body: Option<&str>,
-    ) -> CoreResult<CoreOutput> {
-        let error_code = response_body
-            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-            .and_then(|value| value.get("code")?.as_str().map(str::to_owned));
-        let retry_count = {
-            let relationship = self
-                .state
-                .relationships
-                .get_mut(&relationship_id)
-                .ok_or_else(|| {
-                    CoreError::invalid_state("relationship claim state is unavailable")
-                })?;
-            relationship.setup_state = if error_code.as_deref() == Some("keypackage_pool_exhausted")
-            {
-                RelationshipSetupState::PoolExhausted
-            } else {
-                RelationshipSetupState::Claiming
-            };
-            relationship.version = relationship.version.saturating_add(1);
-            relationship.updated_at = current_unix_millis(self.state.message_nonce);
-            let attempt = relationship
-                .attempts
-                .last_mut()
-                .ok_or_else(|| CoreError::invalid_state("relationship attempt is unavailable"))?;
-            attempt.claim_retry_count = attempt.claim_retry_count.saturating_add(1);
-            attempt.claim_retry_count
-        };
-        let exponent = retry_count.saturating_sub(1).min(8);
-        let base_delay = (5 * 60 * 1000_u64)
-            .saturating_mul(1_u64 << exponent)
-            .min(24 * 60 * 60 * 1000);
-        let jitter_window = (base_delay / 5).max(1);
-        let delay_ms = base_delay.saturating_add(self.state.message_nonce % jitter_window);
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                contacts_changed: true,
-                conversations_changed: true,
-                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![
-                persist_effect(&self.state, vec![PersistOp::SaveDeployment]),
-                CoreEffect::ScheduleTimer {
-                    timer: TimerEffect {
-                        timer_id: format!("relationship_claim:{relationship_id}"),
-                        delay_ms,
-                    },
-                },
-            ],
-            view_model: None,
-        })
-    }
-
-    pub(super) fn retry_relationship_claim_requests(
-        &mut self,
-        relationship_id: &str,
-    ) -> CoreResult<CoreOutput> {
-        let relationship = self
-            .state
-            .relationships
-            .get(relationship_id)
-            .filter(|relationship| relationship.account_state == RelationshipAccountState::Pending)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("pending relationship is unavailable"))?;
-        let attempt = relationship
-            .attempts
-            .last()
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("relationship attempt is unavailable"))?;
-        if attempt.expires_at <= current_unix_millis(self.state.message_nonce) {
-            return self.restart_expired_relationship(relationship_id);
-        }
-        let local_bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("local IdentityBundle is unavailable"))?;
-        let peer_bundle = self
-            .direct_peer_contact_bundle(&relationship.peer_user_id)?
-            .clone();
-        let mut effects = vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])];
-        let has_remote = attempt.claim_sets.iter().any(|set| set.purpose == "direct");
-        if !has_remote {
-            if attempt.remote_claim_idempotency_key.is_empty() {
-                return Err(CoreError::invalid_state(
-                    "remote claim idempotency key is unavailable",
-                ));
-            }
-            let targets = peer_bundle
-                .devices
-                .iter()
-                .filter(|device| device.status == DeviceStatusKind::Active)
-                .map(|device| {
-                    Ok(crate::transport_contract::KeyPackageClaimTarget {
-                        device_id: device.device_id.clone(),
-                        capability: device.key_package_claim_capability.clone().ok_or_else(
-                            || {
-                                CoreError::invalid_input(
-                                    "active peer device is missing claim capability",
-                                )
-                            },
-                        )?,
-                    })
-                })
-                .collect::<CoreResult<Vec<_>>>()?;
-            let endpoint = targets
-                .first()
-                .map(|target| target.capability.endpoint.clone())
-                .ok_or_else(|| CoreError::invalid_input("peer has no active claim targets"))?;
-            if targets
-                .iter()
-                .any(|target| target.capability.endpoint != endpoint)
-            {
-                return Err(CoreError::invalid_input(
-                    "peer claim authority is inconsistent",
-                ));
-            }
-            let request = ClaimKeyPackagesRequest {
-                version: crate::model::ENVELOPE_VERSION_V2.into(),
-                purpose: crate::transport_contract::KeyPackageClaimPurpose::Direct,
-                idempotency_key: attempt.remote_claim_idempotency_key.clone(),
-                requester_bundle: local_bundle.clone(),
-                proposal: relationship.canonical_proposal.clone(),
-                targets,
-            };
-            let request_id = self.next_request_id(&format!(
-                "claim:{}",
-                relationship.canonical_proposal.proposal_id
-            ));
-            self.state.pending_requests.insert(
-                request_id.clone(),
-                PendingRequest::ClaimKeyPackages {
-                    purpose: crate::transport_contract::KeyPackageClaimPurpose::Direct,
-                    peer_user_id: relationship.peer_user_id.clone(),
-                    relationship_id: relationship_id.to_string(),
-                    proposal_id: relationship.canonical_proposal.proposal_id.clone(),
-                    idempotency_key: attempt.remote_claim_idempotency_key.clone(),
-                    claim_endpoint: endpoint.clone(),
-                },
-            );
-            effects.push(CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id,
-                    method: HttpMethod::Post,
-                    url: endpoint,
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: None,
-                    body: Some(serde_json::to_string(&request).map_err(|error| {
-                        CoreError::invalid_input(format!("failed to encode claim retry: {error}"))
-                    })?),
-                },
-            });
-        }
-        let local_device_id = self.local_device_id_required()?;
-        let sibling_targets = local_bundle
-            .devices
-            .iter()
-            .filter(|device| {
-                device.status == DeviceStatusKind::Active && device.device_id != local_device_id
-            })
-            .map(|device| {
-                Ok(crate::transport_contract::KeyPackageClaimTarget {
-                    device_id: device.device_id.clone(),
-                    capability: device.key_package_claim_capability.clone().ok_or_else(|| {
-                        CoreError::invalid_input("active sibling is missing claim capability")
-                    })?,
-                })
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-        let has_self = attempt
-            .claim_sets
-            .iter()
-            .any(|set| set.purpose == "self_join");
-        if !sibling_targets.is_empty() && !has_self {
-            let idempotency_key = attempt.self_claim_idempotency_key.clone().ok_or_else(|| {
-                CoreError::invalid_state("self claim idempotency key is unavailable")
-            })?;
-            let endpoint = sibling_targets[0].capability.endpoint.clone();
-            if sibling_targets
-                .iter()
-                .any(|target| target.capability.endpoint != endpoint)
-            {
-                return Err(CoreError::invalid_input(
-                    "sibling claim authority is inconsistent",
-                ));
-            }
-            let request = ClaimKeyPackagesRequest {
-                version: crate::model::ENVELOPE_VERSION_V2.into(),
-                purpose: crate::transport_contract::KeyPackageClaimPurpose::SelfJoin,
-                idempotency_key: idempotency_key.clone(),
-                requester_bundle: local_bundle,
-                proposal: relationship.canonical_proposal.clone(),
-                targets: sibling_targets,
-            };
-            let request_id = self.next_request_id(&format!(
-                "self-claim:{}",
-                relationship.canonical_proposal.proposal_id
-            ));
-            self.state.pending_requests.insert(
-                request_id.clone(),
-                PendingRequest::ClaimKeyPackages {
-                    purpose: crate::transport_contract::KeyPackageClaimPurpose::SelfJoin,
-                    peer_user_id: relationship.peer_user_id.clone(),
-                    relationship_id: relationship_id.to_string(),
-                    proposal_id: relationship.canonical_proposal.proposal_id.clone(),
-                    idempotency_key,
-                    claim_endpoint: endpoint.clone(),
-                },
-            );
-            effects.push(CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id,
-                    method: HttpMethod::Post,
-                    url: endpoint,
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: None,
-                    body: Some(serde_json::to_string(&request).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode self claim retry: {error}"
-                        ))
-                    })?),
-                },
-            });
-        }
-        if let Some(stored) = self.state.relationships.get_mut(relationship_id) {
-            stored.setup_state = RelationshipSetupState::Claiming;
-            stored.version = stored.version.saturating_add(1);
-        }
-        effects[0] = persist_effect(&self.state, vec![PersistOp::SaveDeployment]);
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                contacts_changed: true,
-                conversations_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects,
-            view_model: None,
-        })
-    }
-
-    pub(super) fn restart_expired_relationship(
-        &mut self,
-        relationship_id: &str,
-    ) -> CoreResult<CoreOutput> {
-        let now_ms = current_unix_millis(self.state.message_nonce);
-        let existing = self
-            .state
-            .relationships
-            .get(relationship_id)
-            .filter(|relationship| relationship.account_state == RelationshipAccountState::Pending)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("pending relationship is unavailable"))?;
-        let local_identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("local identity is unavailable"))?;
-        let local_bundle = self
-            .state
-            .local_bundle
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("local IdentityBundle is unavailable"))?;
-        let peer_bundle = self
-            .direct_peer_contact_bundle(&existing.peer_user_id)?
-            .clone();
-        let next_attempt = existing.canonical_proposal.attempt.saturating_add(1);
-        let proposal_id = random_opaque_id("proposal");
-        let mut proposal = RelationshipProposalV2 {
-            proposal_id: proposal_id.clone(),
-            initiator_user_id: local_bundle.user_id.clone(),
-            initiator_device_id: local_identity.device_identity.device_id.clone(),
-            relationship_id_candidate: existing.relationship_id.clone(),
-            generation: existing.generation,
-            attempt: next_attempt,
-            peer_user_id: existing.peer_user_id.clone(),
-            sender_bundle_digest: crate::identity::identity_bundle_digest(&local_bundle)?,
-            created_at: now_ms,
-            expires_at: now_ms.saturating_add(7 * 24 * 60 * 60 * 1000),
-            signature: String::new(),
-        };
-        proposal.signature = local_identity.sign_device_payload(
-            &crate::identity::relationship_proposal_signing_payload(&proposal),
-        );
-        crate::identity::verify_relationship_proposal(&proposal, &local_bundle)?;
-
-        let remote_targets = peer_bundle
-            .devices
-            .iter()
-            .filter(|device| device.status == DeviceStatusKind::Active)
-            .map(|device| {
-                Ok(crate::transport_contract::KeyPackageClaimTarget {
-                    device_id: device.device_id.clone(),
-                    capability: device.key_package_claim_capability.clone().ok_or_else(|| {
-                        CoreError::invalid_input("active peer device is missing claim capability")
-                    })?,
-                })
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-        let remote_endpoint = remote_targets
-            .first()
-            .map(|target| target.capability.endpoint.clone())
-            .ok_or_else(|| CoreError::invalid_input("peer has no active claim targets"))?;
-        if remote_targets
-            .iter()
-            .any(|target| target.capability.endpoint != remote_endpoint)
-        {
-            return Err(CoreError::invalid_input(
-                "peer claim targets do not share one authority",
-            ));
-        }
-        let remote_idempotency = random_opaque_id("claim");
-        let remote_request = ClaimKeyPackagesRequest {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            purpose: crate::transport_contract::KeyPackageClaimPurpose::Direct,
-            idempotency_key: remote_idempotency.clone(),
-            requester_bundle: local_bundle.clone(),
-            proposal: proposal.clone(),
-            targets: remote_targets,
-        };
-        let sibling_targets = local_bundle
-            .devices
-            .iter()
-            .filter(|device| {
-                device.status == DeviceStatusKind::Active
-                    && device.device_id != local_identity.device_identity.device_id
-            })
-            .map(|device| {
-                Ok(crate::transport_contract::KeyPackageClaimTarget {
-                    device_id: device.device_id.clone(),
-                    capability: device.key_package_claim_capability.clone().ok_or_else(|| {
-                        CoreError::invalid_input("active sibling is missing claim capability")
-                    })?,
-                })
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-
-        if let Some(relationship) = self.state.relationships.get_mut(relationship_id) {
-            relationship.canonical_proposal = proposal.clone();
-            relationship.setup_state = RelationshipSetupState::RetryingExpired;
-            relationship.version = relationship.version.saturating_add(1);
-            relationship.updated_at = now_ms;
-            relationship.attempts.push(RelationshipAttempt {
-                attempt: next_attempt,
-                proposal_id: proposal_id.clone(),
-                ticket_id: String::new(),
-                ticket_secret: String::new(),
-                ticket_status_endpoint: None,
-                remote_claim_idempotency_key: remote_idempotency.clone(),
-                self_claim_idempotency_key: None,
-                claim_retry_count: 0,
-                claim_ids: Vec::new(),
-                welcome_digests: Vec::new(),
-                claim_sets: Vec::new(),
-                created_at: now_ms,
-                expires_at: proposal.expires_at,
-            });
-        }
-        let mut stale_message_ids = Vec::new();
-        for item in &mut self.state.pending_outbox {
-            if item.envelope_v2.as_ref().is_some_and(|envelope| {
-                envelope.relationship_id == relationship_id && envelope.attempt < next_attempt
-            }) {
-                item.retries = MAX_TRANSPORT_RETRIES;
-                item.in_flight = false;
-                stale_message_ids.push(item.envelope.message_id.clone());
-            }
-        }
-        let remote_request_id = self.next_request_id(&format!("claim:{proposal_id}"));
-        self.state.pending_requests.insert(
-            remote_request_id.clone(),
-            PendingRequest::ClaimKeyPackages {
-                purpose: crate::transport_contract::KeyPackageClaimPurpose::Direct,
-                peer_user_id: existing.peer_user_id.clone(),
-                relationship_id: relationship_id.to_string(),
-                proposal_id: proposal_id.clone(),
-                idempotency_key: remote_idempotency,
-                claim_endpoint: remote_endpoint.clone(),
-            },
-        );
-        let mut retry_persist_ops = vec![PersistOp::SaveDeployment];
-        retry_persist_ops.extend(
-            stale_message_ids
-                .into_iter()
-                .map(|message_id| PersistOp::SaveOutgoingEnvelope { message_id }),
-        );
-        let mut effects = vec![
-            persist_effect(&self.state, retry_persist_ops.clone()),
-            CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id: remote_request_id,
-                    method: HttpMethod::Post,
-                    url: remote_endpoint,
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: None,
-                    body: Some(serde_json::to_string(&remote_request).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode relationship retry claim: {error}"
-                        ))
-                    })?),
-                },
-            },
-        ];
-        if !sibling_targets.is_empty() {
-            let sibling_endpoint = sibling_targets[0].capability.endpoint.clone();
-            if sibling_targets
-                .iter()
-                .any(|target| target.capability.endpoint != sibling_endpoint)
-            {
-                return Err(CoreError::invalid_input(
-                    "sibling claim targets do not share one authority",
-                ));
-            }
-            let self_idempotency = random_opaque_id("self-claim");
-            if let Some(attempt) = self
-                .state
-                .relationships
-                .get_mut(relationship_id)
-                .and_then(|relationship| relationship.attempts.last_mut())
-            {
-                attempt.self_claim_idempotency_key = Some(self_idempotency.clone());
-            }
-            let self_request = ClaimKeyPackagesRequest {
-                version: crate::model::ENVELOPE_VERSION_V2.into(),
-                purpose: crate::transport_contract::KeyPackageClaimPurpose::SelfJoin,
-                idempotency_key: self_idempotency.clone(),
-                requester_bundle: local_bundle,
-                proposal,
-                targets: sibling_targets,
-            };
-            let self_request_id = self.next_request_id(&format!("self-claim:{proposal_id}"));
-            self.state.pending_requests.insert(
-                self_request_id.clone(),
-                PendingRequest::ClaimKeyPackages {
-                    purpose: crate::transport_contract::KeyPackageClaimPurpose::SelfJoin,
-                    peer_user_id: existing.peer_user_id.clone(),
-                    relationship_id: relationship_id.to_string(),
-                    proposal_id,
-                    idempotency_key: self_idempotency,
-                    claim_endpoint: sibling_endpoint.clone(),
-                },
-            );
-            effects.push(CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id: self_request_id,
-                    method: HttpMethod::Post,
-                    url: sibling_endpoint,
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: None,
-                    body: Some(serde_json::to_string(&self_request).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode relationship self-retry claim: {error}"
-                        ))
-                    })?),
-                },
-            });
-        }
-        effects[0] = persist_effect(&self.state, retry_persist_ops);
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                contacts_changed: true,
-                conversations_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects,
-            view_model: None,
-        })
-    }
-
-    pub(super) fn handle_outbound_relationship_upserted(
-        &mut self,
-        relationship_id: String,
-        result: UpsertOutboundRelationshipResult,
-    ) -> CoreResult<CoreOutput> {
-        crate::identity::IdentityManager::verify_identity_bundle(&result.peer_bundle)?;
-        if !result.canonical || result.relationship.relationship_id != relationship_id {
-            if let Some(losing) = self.state.relationships.get_mut(&relationship_id) {
-                losing.setup_state = RelationshipSetupState::Superseded;
-                losing.version = losing.version.saturating_add(1);
-            }
-            let losing_conversation_id =
-                self.state
-                    .relationships
-                    .get(&relationship_id)
-                    .map(|relationship| {
-                        format!(
-                            "conv:direct:v2:{}:g{}",
-                            relationship.relationship_id, relationship.generation
-                        )
-                    });
-            if let Some(conversation_id) = losing_conversation_id {
-                if let Some(conversation) = self.state.conversations.get_mut(&conversation_id) {
-                    conversation.conversation.state = ConversationState::Archived;
-                }
-            }
-            self.state.relationships.insert(
-                result.relationship.relationship_id.clone(),
-                result.relationship.clone(),
-            );
-            return Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    conversations_changed: true,
-                    contacts_changed: true,
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![persist_effect(&self.state, vec![PersistOp::SaveDeployment])],
-                view_model: None,
-            });
-        }
-
-        let relationship = self
-            .state
-            .relationships
-            .get(&relationship_id)
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("canonical relationship is unavailable"))?;
-        let direct_claim_set = relationship
-            .attempts
-            .last()
-            .and_then(|attempt| {
-                attempt
-                    .claim_sets
-                    .iter()
-                    .find(|set| set.purpose == "direct")
-            })
-            .cloned()
-            .ok_or_else(|| CoreError::invalid_state("persisted Direct claim set is unavailable"))?;
-        let self_claim_set = relationship
-            .attempts
-            .last()
-            .and_then(|attempt| {
-                attempt
-                    .claim_sets
-                    .iter()
-                    .find(|set| set.purpose == "self_join")
-            })
-            .cloned();
-        let all_claims = direct_claim_set
-            .claims
-            .iter()
-            .chain(
-                self_claim_set
-                    .iter()
-                    .flat_map(|claim_set| claim_set.claims.iter()),
-            )
-            .cloned()
-            .collect::<Vec<_>>();
-        let peer_user_id = relationship.peer_user_id.clone();
-        let peer_devices = result
-            .peer_bundle
-            .devices
-            .iter()
-            .filter(|device| device.status == DeviceStatusKind::Active)
-            .collect::<Vec<_>>();
-        let mut peer_packages = Vec::with_capacity(peer_devices.len());
-        for device in peer_devices {
-            let claim = direct_claim_set
-                .claims
-                .iter()
-                .find(|claim| claim.user_id == peer_user_id && claim.device_id == device.device_id)
-                .ok_or_else(|| CoreError::invalid_input("persisted claim target mismatch"))?;
-            crate::mls_adapter::validate_key_package_device_binding(
-                &claim.key_package_b64,
-                device.mls_device_key_binding.as_ref().ok_or_else(|| {
-                    CoreError::invalid_input("peer device is missing MLS binding")
-                })?,
-            )?;
-            peer_packages.push(PeerDeviceKeyPackage {
-                user_id: peer_user_id.clone(),
-                device_id: device.device_id.clone(),
-                device_public_key: device.device_public_key.clone(),
-                key_package_b64: claim.key_package_b64.clone(),
-            });
-        }
-        if let Some(self_claim_set) = self_claim_set.as_ref() {
-            let local_bundle =
-                self.state.local_bundle.as_ref().ok_or_else(|| {
-                    CoreError::invalid_state("local IdentityBundle is unavailable")
-                })?;
-            let local_device_id = self.local_device_id_required()?;
-            for device in local_bundle.devices.iter().filter(|device| {
-                device.status == DeviceStatusKind::Active && device.device_id != local_device_id
-            }) {
-                let claim = self_claim_set
-                    .claims
-                    .iter()
-                    .find(|claim| {
-                        claim.user_id == local_bundle.user_id && claim.device_id == device.device_id
-                    })
-                    .ok_or_else(|| {
-                        CoreError::invalid_input("persisted self claim target mismatch")
-                    })?;
-                crate::mls_adapter::validate_key_package_device_binding(
-                    &claim.key_package_b64,
-                    device.mls_device_key_binding.as_ref().ok_or_else(|| {
-                        CoreError::invalid_input("sibling device is missing MLS binding")
-                    })?,
-                )?;
-                peer_packages.push(PeerDeviceKeyPackage {
-                    user_id: local_bundle.user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    device_public_key: device.device_public_key.clone(),
-                    key_package_b64: claim.key_package_b64.clone(),
-                });
-            }
-        }
-        let conversation_id = format!(
-            "conv:direct:v2:{}:g{}",
-            relationship.relationship_id, relationship.generation
-        );
-        let local_identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-            .clone();
-        let peer_device_ids = direct_claim_set
-            .claims
-            .iter()
-            .map(|claim| claim.device_id.clone())
-            .collect::<Vec<_>>();
-        let local_conversation = ConversationManager::create_direct_conversation_with_id(
-            conversation_id.clone(),
-            &local_identity.user_identity.user_id,
-            &local_identity.device_identity.device_id,
-            &peer_user_id,
-            &peer_device_ids,
-        )?;
-        let replacing_expired_attempt = relationship.canonical_proposal.attempt > 1
-            && self.state.mls_summaries.contains_key(&conversation_id);
-        let adapter = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
-        let artifacts = if replacing_expired_attempt {
-            adapter.rebuild_unaccepted_conversation(&conversation_id, &peer_packages)?
-        } else {
-            adapter.create_conversation(&conversation_id, &peer_packages)?
-        };
-        let summary = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter missing after Direct V2 setup"))?
-            .export_group_summary(&conversation_id)?;
-        self.state
-            .mls_summaries
-            .insert(conversation_id.clone(), summary);
-        self.state
-            .conversations
-            .insert(conversation_id.clone(), local_conversation);
-
-        let mut envelopes = Vec::new();
-        for welcome in artifacts.welcomes {
-            let claim = all_claims
-                .iter()
-                .find(|claim| claim.device_id == welcome.recipient_device_id)
-                .ok_or_else(|| CoreError::invalid_input("Welcome recipient has no claim"))?;
-            envelopes.push(self.build_envelope_v2(
-                &relationship_id,
-                &claim.user_id,
-                &welcome.recipient_device_id,
-                MessageType::MlsWelcome,
-                welcome.payload_b64,
-                Some(claim.claim_id.clone()),
-            )?);
-        }
-        let message_summaries = envelopes
-            .iter()
-            .map(|envelope| MessageSummary {
-                conversation_id: envelope.conversation_id.clone(),
-                message_id: envelope.message_id.clone(),
-                message_type: envelope.message_type,
-            })
-            .collect::<Vec<_>>();
-        self.enqueue_envelopes_v2(peer_user_id.clone(), envelopes);
-        if let Some(stored) = self.state.relationships.get_mut(&relationship_id) {
-            stored.setup_state = RelationshipSetupState::WaitingAcceptance;
-        }
-        let mut persist_ops = vec![
-            PersistOp::SaveDeployment,
-            PersistOp::SaveConversation {
-                conversation_id: conversation_id.clone(),
-            },
-            PersistOp::SaveMlsState {
-                conversation_id: conversation_id.clone(),
-            },
-        ];
-        persist_ops.extend(self.state.pending_outbox.iter().filter_map(|item| {
-            item.envelope_v2
-                .as_ref()
-                .filter(|envelope| envelope.relationship_id == relationship_id)
-                .map(|envelope| PersistOp::SaveOutgoingEnvelope {
-                    message_id: envelope.message_id.clone(),
-                })
-        }));
-        self.merge_with_transport_flush(CoreOutput {
-            state_update: CoreStateUpdate {
-                conversations_changed: true,
-                messages_changed: true,
-                contacts_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![
-                persist_effect(&self.state, persist_ops),
-                CoreEffect::ScheduleTimer {
-                    timer: TimerEffect {
-                        timer_id: format!("relationship_status:{relationship_id}"),
-                        delay_ms: 6 * 60 * 60 * 1000,
-                    },
-                },
-            ],
-            view_model: Some(CoreViewModel {
-                conversations: vec![ConversationSummary {
-                    conversation_id: conversation_id.clone(),
-                    peer_user_id: peer_user_id.clone(),
-                    state: "waiting_acceptance".into(),
-                    kind: Some(ConversationKind::Direct),
-                    title: None,
-                    display_name: self.contact_archive_display_name(&peer_user_id),
-                    group_id: None,
-                    member_count: None,
-                    group_role: None,
-                    group_cursor: None,
-                    last_message_preview: None,
-                    last_message_type: Some(MessageType::MlsWelcome),
-                    message_count: None,
-                    recovery: None,
-                    relationship: self.relationship_view_state(&conversation_id),
-                }],
-                messages: message_summaries,
-                ..CoreViewModel::default()
-            }),
-        })
-    }
-
-    pub(super) fn enqueue_envelopes_v2(
-        &mut self,
-        _peer_user_id: String,
-        envelopes: Vec<crate::model::EnvelopeV2>,
-    ) {
-        for envelope_v2 in envelopes {
-            let peer_user_id = envelope_v2.recipient_user_id.clone();
-            let shadow = Envelope {
-                version: crate::model::CURRENT_MODEL_VERSION.into(),
-                message_id: envelope_v2.message_id.clone(),
-                conversation_id: envelope_v2.conversation_id.clone(),
-                sender_user_id: envelope_v2.sender_user_id.clone(),
-                sender_device_id: envelope_v2.sender_device_id.clone(),
-                recipient_device_id: envelope_v2.recipient_device_id.clone(),
-                created_at: envelope_v2.created_at,
-                message_type: envelope_v2.message_type,
-                inline_ciphertext: envelope_v2.inline_ciphertext.clone(),
-                storage_refs: envelope_v2.storage_refs.clone(),
-                delivery_class: envelope_v2.delivery_class,
-                wake_hint: envelope_v2.wake_hint.clone(),
-                sender_proof: envelope_v2.sender_proof.clone(),
-            };
-            self.state.outbox.push(shadow.clone());
-            self.state.pending_outbox.push(PendingOutboxItem {
-                envelope: shadow,
-                envelope_v2: Some(envelope_v2),
-                peer_user_id,
-                retries: 0,
-                in_flight: false,
-                app_message_id: None,
-                plaintext_cache: None,
-                identity_refresh_attempted: false,
-            });
-        }
-    }
-
-    pub(super) fn enqueue_envelopes_v2_with_plaintext(
-        &mut self,
-        peer_user_id: String,
-        envelopes: Vec<crate::model::EnvelopeV2>,
-        plaintext: String,
-        app_message_id: Option<String>,
-    ) {
-        let start = self.state.pending_outbox.len();
-        self.enqueue_envelopes_v2(peer_user_id, envelopes);
-        for item in &mut self.state.pending_outbox[start..] {
-            item.plaintext_cache = Some(plaintext.clone());
-            item.app_message_id = app_message_id.clone();
         }
     }
 
@@ -3188,7 +1657,6 @@ impl CoreEngine {
             self.state.outbox.push(envelope.clone());
             self.state.pending_outbox.push(PendingOutboxItem {
                 envelope,
-                envelope_v2: None,
                 peer_user_id: peer_user_id.clone(),
                 retries: 0,
                 in_flight: false,
@@ -3530,7 +1998,6 @@ impl CoreEngine {
                 last_message_type: conversation.last_message_type,
                 message_count: Some(conversation.messages.len()),
                 recovery: self.recovery_snapshot_for_conversation(conversation_id),
-                relationship: None,
             });
         }
         Ok(ConversationSummary {
@@ -3562,7 +2029,6 @@ impl CoreEngine {
             last_message_type: conversation.last_message_type,
             message_count: None,
             recovery: self.recovery_snapshot_for_conversation(conversation_id),
-            relationship: self.relationship_view_state(conversation_id),
         })
     }
 
@@ -4028,105 +2494,6 @@ impl CoreEngine {
             .collect()
     }
 
-    pub(super) fn build_contact_removed_envelopes_v2(
-        &mut self,
-        peer_user_id: &str,
-        relationship_id: &str,
-        created_at: u64,
-    ) -> CoreResult<Vec<crate::model::EnvelopeV2>> {
-        let contact = self
-            .state
-            .contacts
-            .get(peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer contact is missing"))?
-            .clone();
-        let conversation_id = self
-            .state
-            .relationships
-            .get(relationship_id)
-            .map(|relationship| {
-                format!(
-                    "conv:direct:v2:{}:g{}",
-                    relationship.relationship_id, relationship.generation
-                )
-            })
-            .ok_or_else(|| CoreError::invalid_state("relationship state is missing"))?;
-        let local_user_id = self.local_identity_user_id()?;
-        let payload = ContactRemovedControl {
-            version: crate::model::ENVELOPE_VERSION_V2.to_string(),
-            conversation_id,
-            actor_user_id: local_user_id,
-            removed_user_id: peer_user_id.to_string(),
-            created_at,
-        };
-        let payload_b64 = STANDARD.encode(serde_json::to_vec(&payload).map_err(|error| {
-            CoreError::invalid_input(format!("failed to encode contact removed control: {error}"))
-        })?);
-        contact
-            .bundle
-            .devices
-            .iter()
-            .filter(|device| device.status == DeviceStatusKind::Active)
-            .map(|device| {
-                self.build_envelope_v2(
-                    relationship_id,
-                    peer_user_id,
-                    &device.device_id,
-                    MessageType::ControlContactRemoved,
-                    payload_b64.clone(),
-                    None,
-                )
-            })
-            .collect()
-    }
-
-    fn remove_relationship_from_registry(
-        &mut self,
-        relationship_id: &str,
-        generation: u64,
-    ) -> CoreResult<CoreOutput> {
-        let endpoint = self
-            .state
-            .deployment_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?
-            .inbox_http_endpoint
-            .trim_end_matches('/')
-            .to_string();
-        let request_id = self.next_request_id("relationship-remove");
-        self.state.pending_requests.insert(
-            request_id.clone(),
-            PendingRequest::RemoveRelationship {
-                relationship_id: relationship_id.to_string(),
-            },
-        );
-        let body = RemoveRelationshipRequest {
-            version: crate::model::ENVELOPE_VERSION_V2.into(),
-            relationship_id: relationship_id.to_string(),
-            generation,
-        };
-        Ok(CoreOutput {
-            effects: vec![CoreEffect::ExecuteHttpRequest {
-                request: HttpRequestEffect {
-                    request_id,
-                    method: HttpMethod::Post,
-                    url: format!(
-                        "{endpoint}/v2/device-registry/relationships/{}/remove",
-                        urlencoding::encode(relationship_id)
-                    ),
-                    headers: BTreeMap::from([("Content-Type".into(), "application/json".into())]),
-                    auth: Some(self.device_runtime_auth_requirement()?),
-                    body: Some(serde_json::to_string(&body).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode relationship removal: {error}"
-                        ))
-                    })?),
-                },
-            }],
-            ..CoreOutput::default()
-        })
-    }
-
     pub(super) fn contact_accepted_conversation_ids(
         &self,
         peer_user_id: &str,
@@ -4390,14 +2757,12 @@ impl CoreEngine {
         let payload_b64 = envelope.inline_ciphertext.as_deref().ok_or_else(|| {
             CoreError::invalid_input("contact removed control is missing payload")
         })?;
-        if record.envelope_v2.is_none() {
-            self.verify_device_signature(
-                &envelope.sender_user_id,
-                &envelope.sender_device_id,
-                payload_b64.as_bytes(),
-                &envelope.sender_proof.value,
-            )?;
-        }
+        self.verify_device_signature(
+            &envelope.sender_user_id,
+            &envelope.sender_device_id,
+            payload_b64.as_bytes(),
+            &envelope.sender_proof.value,
+        )?;
         let payload = STANDARD.decode(payload_b64).map_err(|error| {
             CoreError::invalid_input(format!("failed to decode contact removed control: {error}"))
         })?;
@@ -4452,29 +2817,9 @@ impl CoreEngine {
             "removed_by_peer",
         );
         self.state.contacts.remove(&peer_user_id);
-        let relationship = record.envelope_v2.as_ref().and_then(|envelope_v2| {
-            self.state
-                .relationships
-                .get(&envelope_v2.relationship_id)
-                .cloned()
-        });
-        if let Some(relationship) = &relationship {
-            if let Some(stored) = self
-                .state
-                .relationships
-                .get_mut(&relationship.relationship_id)
-            {
-                stored.account_state = RelationshipAccountState::Removed;
-                stored.version = stored.version.saturating_add(1);
-                stored.updated_at = envelope.created_at;
-            }
-        }
         let mut persist_ops = vec![PersistOp::DeleteContact {
             user_id: peer_user_id.clone(),
         }];
-        if relationship.is_some() {
-            persist_ops.push(PersistOp::SaveDeployment);
-        }
         persist_ops.extend(self.clear_direct_runtime_state(&envelope.conversation_id)?);
         persist_ops.push(PersistOp::SaveConversation {
             conversation_id: envelope.conversation_id.clone(),
@@ -4494,14 +2839,8 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         };
-        if let Some(relationship) = relationship {
-            output = merge_outputs(
-                output,
-                self.remove_relationship_from_registry(
-                    &relationship.relationship_id,
-                    relationship.generation,
-                )?,
-            );
+        if self.state.deployment_bundle.is_some() {
+            output = merge_outputs(output, self.remove_allowlist_user(peer_user_id)?);
         }
         if created_conversation {
             log::info!(
@@ -4656,36 +2995,16 @@ impl CoreEngine {
         );
         conversation_ids.sort();
         conversation_ids.dedup();
-        let relationship = self
-            .state
-            .relationships
-            .values()
-            .filter(|relationship| {
-                relationship.peer_user_id == user_id
-                    && relationship.setup_state != RelationshipSetupState::Superseded
-            })
-            .max_by_key(|relationship| relationship.generation)
-            .cloned();
-        let control_conversation_id = relationship
-            .as_ref()
-            .map(|relationship| {
-                format!(
-                    "conv:direct:v2:{}:g{}",
-                    relationship.relationship_id, relationship.generation
-                )
-            })
-            .or_else(|| conversation_ids.first().cloned())
+        let control_conversation_id = conversation_ids
+            .first()
+            .cloned()
             .unwrap_or_else(|| direct_conversation_id(&local_user_id, &user_id));
         let control_created_at = current_unix_millis(self.next_message_nonce());
-        let control_envelopes = if let Some(relationship) = &relationship {
-            self.build_contact_removed_envelopes_v2(
-                &user_id,
-                &relationship.relationship_id,
-                control_created_at,
-            )?
-        } else {
-            Vec::new()
-        };
+        let control_envelopes = self.build_contact_removed_envelopes(
+            &user_id,
+            &control_conversation_id,
+            control_created_at,
+        )?;
         let control_message_ids = control_envelopes
             .iter()
             .map(|envelope| envelope.message_id.clone())
@@ -4721,25 +3040,12 @@ impl CoreEngine {
             persist_ops.extend(self.clear_direct_runtime_state(&control_conversation_id)?);
         }
 
-        self.enqueue_envelopes_v2(user_id.clone(), control_envelopes.clone());
+        self.enqueue_envelopes(user_id.clone(), control_envelopes.clone());
         persist_ops.extend(
             control_message_ids
                 .into_iter()
                 .map(|message_id| PersistOp::SaveOutgoingEnvelope { message_id }),
         );
-
-        if let Some(relationship) = relationship.as_ref() {
-            if let Some(stored) = self
-                .state
-                .relationships
-                .get_mut(&relationship.relationship_id)
-            {
-                stored.account_state = RelationshipAccountState::Removed;
-                stored.version = stored.version.saturating_add(1);
-                stored.updated_at = control_created_at;
-                persist_ops.push(PersistOp::SaveDeployment);
-            }
-        }
 
         let transport_output = if control_envelopes.is_empty() {
             CoreOutput::default()
@@ -4766,14 +3072,8 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         };
-        if let Some(relationship) = relationship {
-            output = merge_outputs(
-                output,
-                self.remove_relationship_from_registry(
-                    &relationship.relationship_id,
-                    relationship.generation,
-                )?,
-            );
+        if self.state.deployment_bundle.is_some() {
+            output = merge_outputs(output, self.remove_allowlist_user(user_id)?);
         }
         Ok(merge_outputs(output, transport_output))
     }
@@ -4798,131 +3098,6 @@ impl CoreEngine {
                     device_id,
                     MessageType::ControlDeviceMembershipChanged,
                     payload.clone(),
-                )
-            })
-            .collect()
-    }
-
-    pub(super) fn direct_relationship_id_for_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> CoreResult<String> {
-        self.state
-            .relationships
-            .values()
-            .find(|relationship| {
-                format!(
-                    "conv:direct:v2:{}:g{}",
-                    relationship.relationship_id, relationship.generation
-                ) == conversation_id
-                    && relationship.setup_state != RelationshipSetupState::Superseded
-            })
-            .map(|relationship| relationship.relationship_id.clone())
-            .ok_or_else(|| {
-                CoreError::new(
-                    "protocol_upgrade_required",
-                    "Direct MLS recovery requires an account-level V2 relationship",
-                )
-            })
-    }
-
-    pub(super) fn commit_envelopes_v2_for_artifacts(
-        &mut self,
-        relationship_id: &str,
-        peer_user_id: &str,
-        peer_active_device_ids: &[String],
-        artifacts: &CreateConversationArtifacts,
-    ) -> CoreResult<Vec<crate::model::EnvelopeV2>> {
-        peer_active_device_ids
-            .iter()
-            .map(|device_id| {
-                self.build_envelope_v2(
-                    relationship_id,
-                    peer_user_id,
-                    device_id,
-                    MessageType::MlsCommit,
-                    artifacts.commit_b64.clone(),
-                    None,
-                )
-            })
-            .collect()
-    }
-
-    pub(super) fn welcome_envelopes_v2_for_artifacts(
-        &mut self,
-        relationship_id: &str,
-        peer_user_id: &str,
-        artifacts: &CreateConversationArtifacts,
-        claim_ids_by_device: &BTreeMap<String, String>,
-    ) -> CoreResult<Vec<crate::model::EnvelopeV2>> {
-        artifacts
-            .welcomes
-            .iter()
-            .map(|welcome| {
-                let claim_id = claim_ids_by_device
-                    .get(&welcome.recipient_device_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        CoreError::invalid_state(
-                            "MLS Welcome is missing its one-time KeyPackage claim ID",
-                        )
-                    })?;
-                self.build_envelope_v2(
-                    relationship_id,
-                    peer_user_id,
-                    &welcome.recipient_device_id,
-                    MessageType::MlsWelcome,
-                    welcome.payload_b64.clone(),
-                    Some(claim_id),
-                )
-            })
-            .collect()
-    }
-
-    pub(super) fn commit_envelopes_v2_for_remove(
-        &mut self,
-        relationship_id: &str,
-        peer_user_id: &str,
-        peer_active_device_ids: &[String],
-        artifacts: &RemoveMembersArtifacts,
-    ) -> CoreResult<Vec<crate::model::EnvelopeV2>> {
-        peer_active_device_ids
-            .iter()
-            .map(|device_id| {
-                self.build_envelope_v2(
-                    relationship_id,
-                    peer_user_id,
-                    device_id,
-                    MessageType::MlsCommit,
-                    artifacts.commit_b64.clone(),
-                    None,
-                )
-            })
-            .collect()
-    }
-
-    pub(super) fn build_control_membership_changed_messages_v2(
-        &mut self,
-        relationship_id: &str,
-        peer_user_id: &str,
-        peer_active_device_ids: &[String],
-    ) -> CoreResult<Vec<crate::model::EnvelopeV2>> {
-        let payload = STANDARD.encode(format!(
-            "membership_changed:{}:{}:{}",
-            relationship_id,
-            peer_user_id,
-            peer_active_device_ids.len()
-        ));
-        peer_active_device_ids
-            .iter()
-            .map(|device_id| {
-                self.build_envelope_v2(
-                    relationship_id,
-                    peer_user_id,
-                    device_id,
-                    MessageType::ControlDeviceMembershipChanged,
-                    payload.clone(),
-                    None,
                 )
             })
             .collect()

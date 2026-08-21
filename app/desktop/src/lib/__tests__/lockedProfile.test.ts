@@ -7,14 +7,6 @@ import {
 } from "../lockedProfile";
 
 describe("locked profile retry view model", () => {
-  it("requires an explicit profile choice for ambiguous startup selectors", () => {
-    const view = lockedProfileView("profile_selection_required");
-
-    expect(view.reasonLabel).toBe("Choose a profile");
-    expect(view.needsPassphrase).toBe(false);
-    expect(view.canRetry).toBe(false);
-  });
-
   it("treats restore_failed as a repair retry without passphrase", () => {
     const view = lockedProfileView("restore_failed");
 

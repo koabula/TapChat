@@ -23,7 +23,7 @@ use crate::commands::cloudflare_rest::{
     self, DeployPhase, DeployProgress, DeployResult, WorkerDeployConfig,
 };
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
-use crate::lifecycle::{drive_core_with_handle, drive_prepared_core_output, CoreInput};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::sanitize_url_for_log;
 use crate::runtime_auth::wait_for_runtime_ready;
 use crate::state::AppState;
@@ -33,7 +33,7 @@ use crate::timetest;
 static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const AUTH_ROTATION_GRACE_MS: u64 = 48 * 60 * 60 * 1000;
 const AUTH_ROTATION_INTERVAL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v6-", env!("CARGO_PKG_VERSION"));
+const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v5-", env!("CARGO_PKG_VERSION"));
 
 fn generate_runtime_key_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 8];
@@ -59,65 +59,6 @@ fn repair_worker_secret(candidate: Option<String>) -> (String, bool) {
     OsRng.fill_bytes(&mut bytes);
     let generated = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     (generated, true)
-}
-
-fn cloudflare_deploy_error_code(error: &str) -> &'static str {
-    match error.split_once(':').map_or(error, |(code, _)| code) {
-        "cloudflare_permission_denied" | "cloudflare_api_unauthorized" => {
-            "cloudflare_permission_denied"
-        }
-        "cloudflare_storage_setup_failed" => "cloudflare_storage_setup_failed",
-        "cloudflare_runtime_not_ready" => "cloudflare_runtime_not_ready",
-        _ => "cloudflare_worker_deploy_failed",
-    }
-}
-
-fn safe_deploy_diagnostic(error: &str) -> Option<&str> {
-    let detail = error.split_once(':')?.1;
-    (detail.len() <= 128
-        && detail.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-' | '=' | '.')
-        }))
-    .then_some(detail)
-}
-
-fn report_cloudflare_deploy_failure(app: &AppHandle, error: &str) -> crate::errors::DesktopError {
-    let code = cloudflare_deploy_error_code(error);
-    if let Some(detail) = safe_deploy_diagnostic(error) {
-        log::warn!("cloudflare_deploy failed: code={code} detail={detail}");
-    } else {
-        log::warn!("cloudflare_deploy failed: code={code}");
-    }
-    let _ = app.emit(
-        "cloudflare-progress",
-        DeployProgress {
-            phase: DeployPhase::Failed,
-            message: "Deployment failed.".into(),
-            progress_percent: 100,
-        },
-    );
-    crate::errors::DesktopError::from(code)
-}
-
-fn report_cloudflare_setup_failure(
-    app: &AppHandle,
-    stage: &'static str,
-    error: &str,
-) -> crate::errors::DesktopError {
-    let candidate = error.split_once(':').map_or(error, |(code, _)| code).trim();
-    let cause = tapchat_core::error_codes_generated::is_registered_app_error(candidate)
-        .then_some(candidate)
-        .unwrap_or("unexpected_error");
-    log::warn!("cloudflare_setup failed: stage={stage} cause={cause}");
-    let _ = app.emit(
-        "cloudflare-progress",
-        DeployProgress {
-            phase: DeployPhase::Failed,
-            message: format!("Device setup failed during {stage}."),
-            progress_percent: 95,
-        },
-    );
-    crate::errors::DesktopError::from("cloudflare_setup_incomplete")
 }
 
 /// Preflight check result
@@ -264,17 +205,6 @@ fn runtime_status(
     status
 }
 
-fn runtime_writeback_matches(
-    has_bundle_path: bool,
-    runtime_endpoint: Option<&str>,
-    bundle_endpoint: Option<&str>,
-    snapshot_endpoint: &str,
-) -> bool {
-    has_bundle_path
-        && runtime_endpoint == Some(snapshot_endpoint)
-        && bundle_endpoint == Some(snapshot_endpoint)
-}
-
 pub async fn runtime_status_for_deployment(
     deployment: Option<PersistedDeployment>,
 ) -> CloudflareRuntimeStatus {
@@ -283,8 +213,8 @@ pub async fn runtime_status_for_deployment(
     };
     let endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
     let local_features = deployment.deployment_bundle.runtime_config.features.clone();
-    if deployment.deployment_bundle.protocol_version != 6
-        || deployment.deployment_bundle.registry_schema_version != 3
+    if deployment.deployment_bundle.protocol_version != 5
+        || deployment.deployment_bundle.registry_schema_version != 2
         || deployment
             .deployment_bundle
             .worker_build_id
@@ -349,8 +279,8 @@ pub async fn runtime_status_for_deployment(
                 Ok(manifest)
                     if manifest.ready
                         && manifest.runtime_id == deployment.deployment_bundle.runtime_id
-                        && manifest.protocol_version == 6
-                        && manifest.registry_schema_version == 3
+                        && manifest.protocol_version == 5
+                        && manifest.registry_schema_version == 2
                         && manifest.worker_build_id
                             == deployment.deployment_bundle.worker_build_id =>
                 {
@@ -417,8 +347,7 @@ pub fn runtime_missing_group_outbox_message(status: &CloudflareRuntimeStatus) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        cloudflare_deploy_error_code, repair_worker_secret, runtime_missing_group_outbox_message,
-        runtime_writeback_matches, safe_deploy_diagnostic, status_from_features,
+        repair_worker_secret, runtime_missing_group_outbox_message, status_from_features,
         valid_worker_secret,
     };
 
@@ -463,46 +392,6 @@ mod tests {
         );
         assert!(!current.needs_upgrade);
         assert!(runtime_missing_group_outbox_message(&current).is_none());
-    }
-
-    #[test]
-    fn cloudflare_deploy_errors_are_classified_without_exposing_raw_details() {
-        assert_eq!(
-            cloudflare_deploy_error_code(
-                "cloudflare_storage_setup_failed:http_status=403 cf_code=10000"
-            ),
-            "cloudflare_storage_setup_failed"
-        );
-        assert_eq!(
-            cloudflare_deploy_error_code("cloudflare_api_unauthorized"),
-            "cloudflare_permission_denied"
-        );
-        assert_eq!(
-            cloudflare_deploy_error_code("raw failure token=secret"),
-            "cloudflare_worker_deploy_failed"
-        );
-        assert_eq!(
-            safe_deploy_diagnostic("cloudflare_storage_setup_failed:http_status=403 cf_code=10000"),
-            Some("http_status=403 cf_code=10000")
-        );
-        assert!(safe_deploy_diagnostic("failure:https://example.invalid/account-id").is_none());
-    }
-
-    #[test]
-    fn runtime_writeback_requires_the_runtime_metadata_endpoint() {
-        let endpoint = "https://example.worker.dev";
-        assert!(!runtime_writeback_matches(
-            true,
-            None,
-            Some(endpoint),
-            endpoint
-        ));
-        assert!(runtime_writeback_matches(
-            true,
-            Some(endpoint),
-            Some(endpoint),
-            endpoint
-        ));
     }
 }
 
@@ -960,30 +849,25 @@ pub async fn cloudflare_deploy(
         },
     )
     .await;
-    let deploy_result = match first_deploy {
-        Ok(result) => Ok(result),
-        Err(error) if error.contains("cloudflare_api_unauthorized") => {
-            match crate::commands::cloudflare_oauth::force_refresh_access_token(&api_token).await {
-                Ok(refreshed) => {
-                    cloudflare_rest::deploy_via_rest_api(
-                        &refreshed,
-                        &account_id,
-                        &worker_script,
-                        &config,
-                        |progress| {
-                            let _ = app.emit("cloudflare-progress", progress);
-                        },
-                    )
-                    .await
-                }
-                Err(_) => Err("cloudflare_permission_denied:token_refresh_failed".into()),
-            }
-        }
-        Err(error) => Err(error),
-    };
-    let result = match deploy_result {
+    let result = match first_deploy {
         Ok(result) => result,
-        Err(error) => return Err(report_cloudflare_deploy_failure(&app, &error)),
+        Err(error) if error.contains("cloudflare_api_unauthorized") => {
+            let refreshed =
+                crate::commands::cloudflare_oauth::force_refresh_access_token(&api_token)
+                    .await
+                    .map_err(|refresh_error| refresh_error.to_string())?;
+            cloudflare_rest::deploy_via_rest_api(
+                &refreshed,
+                &account_id,
+                &worker_script,
+                &config,
+                |progress| {
+                    let _ = app.emit("cloudflare-progress", progress);
+                },
+            )
+            .await?
+        }
+        Err(error) => return Err(error.into()),
     };
 
     if !result.success {
@@ -995,11 +879,7 @@ pub async fn cloudflare_deploy(
         );
         return Ok(result);
     }
-    advance_provisioning_journal(&state, RuntimeProvisioningPhase::CloudDeployed)
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(&app, "saving deployment progress", &error)
-        })?;
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::CloudDeployed).await?;
 
     // Wait for deployment to be ready
     let _ = app.emit(
@@ -1011,24 +891,14 @@ pub async fn cloudflare_deploy(
         },
     );
 
-    if wait_for_runtime_ready(
+    wait_for_runtime_ready(
         &result.worker_url,
         &config.runtime_id,
         &config.worker_build_id,
     )
     .await
-    .is_err()
-    {
-        return Err(report_cloudflare_deploy_failure(
-            &app,
-            "cloudflare_runtime_not_ready",
-        ));
-    }
-    advance_provisioning_journal(&state, RuntimeProvisioningPhase::RuntimeReady)
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(&app, "saving deployment progress", &error)
-        })?;
+    .map_err(|error| format!("Runtime not ready: {error}"))?;
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::RuntimeReady).await?;
 
     // Fetch the public deployment descriptor, build the root-signed local
     // IdentityBundle, then enroll the current device with its long-lived key.
@@ -1048,87 +918,52 @@ pub async fn cloudflare_deploy(
         ))
         .send()
         .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "fetching the deployment descriptor",
-                &error.to_string(),
-            )
-        })?
+        .map_err(|error| format!("Fetch deployment descriptor failed: {error}"))?
         .error_for_status()
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "fetching the deployment descriptor",
-                &error.to_string(),
-            )
-        })?
+        .map_err(|error| format!("Fetch deployment descriptor rejected: {error}"))?
         .json::<DeploymentBundle>()
         .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "reading the deployment descriptor",
-                &error.to_string(),
-            )
-        })?;
+        .map_err(|error| format!("Decode deployment descriptor failed: {error}"))?;
 
     let profile_manager = {
         let inner = state.inner.read().await;
         inner.profile_manager.clone()
     };
-    let (local_bundle, local_identity, prepared_snapshot, prepared_output) = {
+    let (local_bundle, local_identity, prepared_snapshot) = {
         let mut inner = state.inner.write().await;
-        let prepared_output = inner
+        inner
             .engine
             .handle_command(CoreCommand::ImportDeploymentBundle {
                 bundle: deployment_bundle.clone(),
             })
-            .map_err(|error| {
-                report_cloudflare_setup_failure(
-                    &app,
-                    "preparing device enrollment",
-                    &error.to_string(),
-                )
-            })?;
+            .map_err(|error| format!("Prepare deployment import failed: {error}"))?;
         let snapshot = inner.engine.refresh_snapshot();
         let local_bundle = snapshot
             .deployment
             .as_ref()
             .and_then(|deployment| deployment.local_bundle.clone())
             .ok_or_else(|| {
-                report_cloudflare_setup_failure(
-                    &app,
-                    "preparing device enrollment",
-                    "identity_binding_invalid",
-                )
+                "Local IdentityBundle is unavailable for device enrollment".to_string()
             })?;
         let local_identity = snapshot
             .local_identity
             .as_ref()
             .map(|identity| identity.state.clone())
-            .ok_or_else(|| {
-                report_cloudflare_setup_failure(
-                    &app,
-                    "preparing device enrollment",
-                    "invalid_state",
-                )
-            })?;
-        (local_bundle, local_identity, snapshot, prepared_output)
+            .ok_or_else(|| "Local identity is unavailable for device enrollment".to_string())?;
+        (local_bundle, local_identity, snapshot)
     };
     {
         let mut pm_inner = profile_manager.inner.write().await;
-        let profile = pm_inner.active_profile.as_mut().ok_or_else(|| {
-            report_cloudflare_setup_failure(&app, "saving enrollment state", "profile_required")
-        })?;
-        profile.save_snapshot(&prepared_snapshot).map_err(|error| {
-            report_cloudflare_setup_failure(&app, "saving enrollment state", &error.to_string())
-        })?;
+        let profile = pm_inner
+            .active_profile
+            .as_mut()
+            .ok_or_else(|| "active profile disappeared during enrollment".to_string())?;
+        profile
+            .save_snapshot(&prepared_snapshot)
+            .map_err(|error| format!("Persist prepared enrollment snapshot failed: {error}"))?;
         profile
             .save_deployment_bundle(&deployment_bundle)
-            .map_err(|error| {
-                report_cloudflare_setup_failure(&app, "saving enrollment state", &error.to_string())
-            })?;
+            .map_err(|error| format!("Persist deployment descriptor failed: {error}"))?;
     }
     state
         .runtime_auth
@@ -1139,26 +974,18 @@ pub async fn cloudflare_deploy(
             &local_identity,
         )
         .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(&app, "device enrollment", &error.to_string())
-        })?;
-    advance_provisioning_journal(&state, RuntimeProvisioningPhase::DeviceEnrolled)
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(&app, "saving enrollment state", &error)
-        })?;
+        .map_err(|error| format!("Device enrollment failed: {error}"))?;
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::DeviceEnrolled).await?;
 
-    // The import command was prepared before enrollment so its exact effects
-    // can now run with the newly issued runtime credential.
-    drive_prepared_core_output(&app, prepared_output)
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "publishing secure device state",
-                &error.to_string(),
-            )
-        })?;
+    // Import deployment bundle
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ImportDeploymentBundle {
+            bundle: deployment_bundle,
+        }),
+    )
+    .await
+    .map_err(|e| format!("Import deployment failed: {}", e))?;
 
     let deployment_bundle = {
         let inner = state.inner.read().await;
@@ -1168,13 +995,7 @@ pub async fn cloudflare_deploy(
             .deployment
             .as_ref()
             .map(|deployment| deployment.deployment_bundle.clone())
-            .ok_or_else(|| {
-                report_cloudflare_setup_failure(
-                    &app,
-                    "publishing secure device state",
-                    "invalid_state",
-                )
-            })?
+            .ok_or_else(|| "Import deployment did not update engine snapshot".to_string())?
     };
 
     let pending_group_ids = {
@@ -1198,13 +1019,7 @@ pub async fn cloudflare_deploy(
             }),
         )
         .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "resuming pending group delivery",
-                &error.to_string(),
-            )
-        })?;
+        .map_err(|e| format!("Retry pending group outbox failed: {}", e))?;
     }
 
     // Save runtime metadata and deployment bundle, then verify all runtime
@@ -1249,28 +1064,19 @@ pub async fn cloudflare_deploy(
             },
         };
 
-        persist_runtime_writeback(&state, &deployment_bundle, &runtime, &result.worker_url)
-            .await
-            .map_err(|error| {
-                report_cloudflare_setup_failure(&app, "saving local runtime state", &error)
-            })?;
+        persist_runtime_writeback(&state, &deployment_bundle, &runtime, &result.worker_url).await?;
     }
-    advance_provisioning_journal(&state, RuntimeProvisioningPhase::Complete)
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(&app, "saving local runtime state", &error)
-        })?;
+    advance_provisioning_journal(&state, RuntimeProvisioningPhase::Complete).await?;
     {
         let inner = state.inner.read().await;
         let pm = inner.profile_manager.inner.read().await;
-        let profile = pm.active_profile.as_ref().ok_or_else(|| {
-            report_cloudflare_setup_failure(&app, "finishing local setup", "profile_required")
-        })?;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "active profile is missing".to_string())?;
         profile
             .save_pending_runtime_provisioning(None)
-            .map_err(|error| {
-                report_cloudflare_setup_failure(&app, "finishing local setup", &error.to_string())
-            })?;
+            .map_err(|error| format!("failed to clear provisioning journal: {error}"))?;
     }
 
     let _ = app.emit(
@@ -1679,8 +1485,8 @@ async fn cloudflare_status_impl(
         )
     };
 
-    let runtime_endpoint = runtime.public_base_url.clone().or(runtime.base_url.clone());
-    if runtime_endpoint.is_none() && snapshot_deployment.is_none() && bundle_file.is_none() {
+    let endpoint = runtime.public_base_url.clone().or(runtime.base_url.clone());
+    if endpoint.is_none() && snapshot_deployment.is_none() && bundle_file.is_none() {
         return Ok(runtime_status(
             "missing",
             Some("deploy"),
@@ -1696,8 +1502,8 @@ async fn cloudflare_status_impl(
         return Ok(runtime_status(
             "writeback_incomplete",
             Some("retry_writeback"),
-            runtime_endpoint.is_some(),
-            runtime_endpoint,
+            endpoint.is_some(),
+            endpoint,
             bundle_file
                 .map(|bundle| bundle.runtime_config.features)
                 .unwrap_or_default(),
@@ -1707,20 +1513,19 @@ async fn cloudflare_status_impl(
     };
 
     let snapshot_endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
+    let endpoint = endpoint.unwrap_or_else(|| snapshot_endpoint.clone());
     let bundle_endpoint = bundle_file
         .as_ref()
         .map(|bundle| bundle.inbox_http_endpoint.clone());
-    if !runtime_writeback_matches(
-        metadata_bundle_path.is_some(),
-        runtime_endpoint.as_deref(),
-        bundle_endpoint.as_deref(),
-        &snapshot_endpoint,
-    ) {
+    if metadata_bundle_path.is_none()
+        || bundle_endpoint.as_deref() != Some(snapshot_endpoint.as_str())
+        || endpoint != snapshot_endpoint
+    {
         return Ok(runtime_status(
             "writeback_incomplete",
             Some("retry_writeback"),
-            runtime_endpoint.is_some(),
-            runtime_endpoint.or(Some(snapshot_endpoint)),
+            true,
+            Some(endpoint),
             deployment.deployment_bundle.runtime_config.features.clone(),
             None,
             Some(

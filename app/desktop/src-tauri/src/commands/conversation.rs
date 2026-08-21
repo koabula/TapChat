@@ -5,10 +5,8 @@ use tauri::State;
 
 use tapchat_core::attachment_crypto::{AttachmentKind, AttachmentManifestV2};
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::ffi_api::{ConversationSummary, RelationshipViewState};
-use tapchat_core::model::{
-    ConversationKind, ConversationState, RelationshipSetupState, StorageRef,
-};
+use tapchat_core::ffi_api::ConversationSummary;
+use tapchat_core::model::{ConversationKind, ConversationState, StorageRef};
 use tapchat_core::{CoreCommand, ErrorDomain};
 
 use super::conversation_view::{generate_last_message_preview, summarize_plaintext};
@@ -112,15 +110,6 @@ pub async fn list_conversations(
             .collect()
     };
 
-    let local_device_id = snapshot
-        .local_identity
-        .as_ref()
-        .map(|identity| identity.state.device_identity.device_id.as_str());
-    let relationships = snapshot
-        .deployment
-        .as_ref()
-        .map(|deployment| deployment.relationships.as_slice())
-        .unwrap_or_default();
     // Build conversation summaries from snapshot
     let summaries: Vec<ConversationSummary> = snapshot
         .conversations
@@ -161,51 +150,6 @@ pub async fn list_conversations(
             recovery: recovery_by_conversation
                 .get(&persisted.conversation_id)
                 .cloned(),
-            relationship: relationships
-                .iter()
-                .find(|relationship| {
-                    format!(
-                        "conv:direct:v2:{}:g{}",
-                        relationship.relationship_id, relationship.generation
-                    ) == persisted.conversation_id
-                })
-                .map(|relationship| {
-                    let canonical = if relationship.setup_state
-                        == RelationshipSetupState::Superseded
-                    {
-                        relationships
-                            .iter()
-                            .filter(|candidate| {
-                                candidate.peer_user_id == relationship.peer_user_id
-                                    && candidate.generation == relationship.generation
-                                    && candidate.setup_state != RelationshipSetupState::Superseded
-                            })
-                            .min_by(|left, right| {
-                                left.canonical_proposal
-                                    .canonical_rank()
-                                    .cmp(&right.canonical_proposal.canonical_rank())
-                            })
-                            .unwrap_or(relationship)
-                    } else {
-                        relationship
-                    };
-                    RelationshipViewState {
-                        relationship_id: relationship.relationship_id.clone(),
-                        generation: relationship.generation,
-                        account_state: relationship.account_state,
-                        setup_state: relationship.setup_state,
-                        local_device_join_state: local_device_id.and_then(|device_id| {
-                            relationship
-                                .local_device_join_states
-                                .get(device_id)
-                                .copied()
-                        }),
-                        canonical_conversation_id: format!(
-                            "conv:direct:v2:{}:g{}",
-                            canonical.relationship_id, canonical.generation
-                        ),
-                    }
-                }),
         })
         .collect();
 

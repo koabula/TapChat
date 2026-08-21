@@ -127,8 +127,6 @@ prop_compose! {
             device_id,
             endpoint,
             capability,
-            claim_id: None,
-            welcome_digest: None,
             expires_at,
             start_seq: None,
             roster_version: None,

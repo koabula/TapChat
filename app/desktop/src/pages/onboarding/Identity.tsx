@@ -3,7 +3,6 @@ import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { invokeApp as invoke } from "@/lib/tauri";
 import { evaluatePassphraseStrength } from "@/lib/passphraseStrength";
-import { useSessionStore } from "@/store/session";
 
 interface ProfileSummary {
   name: string;
@@ -27,10 +26,7 @@ type ProfileProtectionMode =
 export default function Identity() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const sessionState = useSessionStore((state) => state.sessionState);
-  const isRecover =
-    sessionState === "onboarding:recoveridentity" ||
-    (sessionState !== "onboarding:createidentity" && searchParams.get("mode") === "recover");
+  const isRecover = searchParams.get("mode") === "recover";
 
   const [profileName, setProfileName] = useState("default");
   const [protectionMode, setProtectionMode] =
@@ -93,7 +89,11 @@ export default function Identity() {
       setStep("identity");
     } catch (err) {
       console.error(`[OnboardingIdentity] Failed to create profile: ${presentError(err).message}`);
-      setError(presentError(err).message);
+      // Handle different error formats
+      const errorMsg = typeof err === 'string' ? err :
+        (err instanceof Error ? err.message :
+          JSON.stringify(err));
+      setError(errorMsg);
     } finally {
       setLoading(false);
     }
@@ -125,23 +125,13 @@ export default function Identity() {
     }
   };
 
-  const handleBack = async () => {
-    setError(null);
-    try {
-      await invoke("set_onboarding_step", { step: "welcome" });
-      navigate("/onboarding");
-    } catch (reason) {
-      setError(presentError(reason).message);
-    }
-  };
-
   return (
     <div className="flex h-screen min-h-0 flex-col overflow-hidden bg-base p-8">
       {/* Header */}
       <div className="mb-4 flex shrink-0 items-center">
         <button
           className="btn btn-ghost px-2"
-          onClick={() => void handleBack()}
+          onClick={() => step === "identity" ? setStep("profile") : navigate("/onboarding")}
         >
           ← Back
         </button>
@@ -158,12 +148,11 @@ export default function Identity() {
         {step === "profile" && (
           <>
             <h2 className="text-xl font-semibold text-primary-color mb-2">
-              {isRecover ? "Create a Local Profile for Recovery" : "Create Your Profile"}
+              {isRecover ? "Create a Profile for Recovery" : "Create Your Profile"}
             </h2>
             <p className="text-secondary-color text-center mb-6 max-w-md">
-              {isRecover
-                ? "Recovery creates a new local profile and device for your existing identity. Your recovery phrase does not restore local message history."
-                : "Your profile stores encrypted messages and contacts locally. Choose how its local encryption key is protected."}
+              Your profile stores encrypted messages and contacts locally. Choose how its local
+              encryption key is protected.
             </p>
 
             <div className="w-full max-w-sm space-y-3 pb-4">

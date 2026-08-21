@@ -43,9 +43,6 @@ function safeCorrelationId(value: unknown): string | undefined {
 
 export function normalizeAppError(value: unknown): AppErrorV1 {
   let candidate: unknown = value;
-  if (isRecord(candidate) && isRecord(candidate.appError)) {
-    candidate = candidate.appError;
-  }
   if (typeof candidate === "string") {
     try {
       candidate = JSON.parse(candidate);

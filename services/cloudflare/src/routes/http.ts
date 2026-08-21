@@ -1,21 +1,13 @@
 import {
   HttpError,
   APPEND_AUTH_CONTEXT_HEADER,
-  identityBundleDigest,
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization,
-  validateWelcomePickupAuthorization,
-  verifyEnvelopeV2,
-  verifyEd25519,
-  relationshipProposalSigningPayload
+  validateWelcomePickupAuthorization
 } from "../auth/capability";
-import {
-  RELATIONSHIP_AUTHORIZATION_HEADER,
-  signRelationshipAuthorization
-} from "../auth/internal-relationship";
 import {
   CONTROL_JSON_MAX_BYTES,
   DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES,
@@ -33,7 +25,6 @@ import {
   type AllowlistDocument,
   type AppendGroupEnvelopeRequest,
   type AppendEnvelopeRequest,
-  type AppendEnvelopeRequestV2,
   type DeploymentBundle,
   type DeviceRuntimeAuth,
   type DeviceRuntimeEnrollmentProof,
@@ -313,12 +304,12 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
   return {
     version: CURRENT_MODEL_VERSION,
     runtimeId,
-    protocolVersion: 6,
-    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v6-unknown",
-    registrySchemaVersion: 3,
+    protocolVersion: 5,
+    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+    registrySchemaVersion: 2,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
-    inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v2/inbox/{deviceId}/subscribe`,
+    inboxWebsocketEndpoint: `${baseUrl(request, env).replace(/^http/i, "ws")}/v1/inbox/{deviceId}/subscribe`,
     storageBaseInfo: {
       baseUrl: baseUrl(request, env),
       bucketHint: "tapchat-storage"
@@ -327,6 +318,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       supportedRealtimeKinds: ["websocket"],
       identityBundleRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/identity-bundle`,
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
+      keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
       features: [
         "generic_sync",
@@ -343,9 +335,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "runtime_secret_rotation_v1",
         "device_runtime_refresh_v2",
         "device_registry_v1",
-        "keypackage_pool_v2",
-        "relationship_registry_v2",
-        "envelope_v2",
+        "keypackage_lifecycle_v1",
         "identity_bundle_cas_v1",
         "structured_errors_v1"
       ]
@@ -526,258 +516,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
 
-    if (request.method === "POST" && url.pathname === "/v2/device-registry/key-packages") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "keypackage_write", now);
-      const bodyText = await readRequestTextLimited(request, 512 * 1024);
-      return registryStub(env).fetch(new Request(
-        "https://device-registry.internal/v2/device-registry/key-packages",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
-          body: bodyText
-        }
-      ));
-    }
-
-    if (request.method === "GET" && url.pathname === "/v2/device-registry/key-packages/status") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "keypackage_write", now);
-      return registryStub(env).fetch(new Request(
-        "https://device-registry.internal/v2/device-registry/key-packages/status",
-        { headers: { "X-Tapchat-Device-Id": token.deviceId } }
-      ));
-    }
-
-    if (request.method === "POST" && url.pathname === "/v2/key-packages/claims") {
-      const bodyText = await readRequestTextLimited(request, 512 * 1024);
-      return registryStub(env).fetch(new Request(
-        "https://device-registry.internal/v2/key-packages/claims",
-        { method: "POST", headers: { "content-type": "application/json" }, body: bodyText }
-      ));
-    }
-
-    if (request.method === "GET" && url.pathname === "/v2/device-registry/relationships") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      return registryStub(env).fetch(new Request(
-        "https://device-registry.internal/v2/device-registry/relationships",
-        { headers: { "X-Tapchat-Device-Id": token.deviceId } }
-      ));
-    }
-
-    if (request.method === "POST" && url.pathname === "/v2/device-registry/relationships/outbound") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      const bodyText = await readRequestTextLimited(request, 512 * 1024);
-      return registryStub(env).fetch(new Request(
-        "https://device-registry.internal/v2/device-registry/relationships/outbound",
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
-          body: bodyText
-        }
-      ));
-    }
-
-    const relationshipRemoveV2 = url.pathname.match(
-      /^\/v2\/device-registry\/relationships\/([^/]+)\/remove$/
-    );
-    if (relationshipRemoveV2 && request.method === "POST") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
-      return registryStub(env).fetch(new Request(
-        `https://device-registry.internal/v2/device-registry/relationships/${relationshipRemoveV2[1]!}/remove`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
-          body: bodyText
-        }
-      ));
-    }
-
-    const relationshipPeerDecisionV2 = url.pathname.match(
-      /^\/v2\/device-registry\/relationships\/([^/]+)\/peer-decision$/
-    );
-    if (relationshipPeerDecisionV2 && request.method === "POST") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
-      return registryStub(env).fetch(new Request(
-        `https://device-registry.internal/v2/device-registry/relationships/${relationshipPeerDecisionV2[1]!}/peer-decision`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
-          body: bodyText
-        }
-      ));
-    }
-
-    const relationshipJoinStateV2 = url.pathname.match(
-      /^\/v2\/device-registry\/relationships\/([^/]+)\/devices\/([^/]+)\/join-state$/
-    );
-    if (relationshipJoinStateV2 && request.method === "POST") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      const deviceId = decodeURIComponent(relationshipJoinStateV2[2]!);
-      if (token.deviceId !== deviceId) {
-        throw new HttpError(403, "runtime_auth_invalid", "device join state writer mismatch");
-      }
-      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
-      return registryStub(env).fetch(new Request(
-        `https://device-registry.internal/v2/device-registry/relationships/${relationshipJoinStateV2[1]!}/devices/${relationshipJoinStateV2[2]!}/join-state`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
-          body: bodyText
-        }
-      ));
-    }
-
-    if (request.method === "GET" && url.pathname === "/v2/relationships/requests") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      return registryStub(env).fetch(new Request(
-        "https://device-registry.internal/v2/relationships/requests",
-        { headers: { "X-Tapchat-Device-Id": token.deviceId } }
-      ));
-    }
-
-    const relationshipDecisionV2 = url.pathname.match(/^\/v2\/relationships\/([^/]+)\/decision$/);
-    if (relationshipDecisionV2 && request.method === "POST") {
-      const token = await validateRegisteredRuntimeAuthorization(request, env, "inbox_manage", now);
-      const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
-      return registryStub(env).fetch(new Request(
-        `https://device-registry.internal/v2/relationships/${relationshipDecisionV2[1]!}/decision`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json", "X-Tapchat-Device-Id": token.deviceId },
-          body: bodyText
-        }
-      ));
-    }
-
-    const relationshipStatusV2 = url.pathname.match(/^\/v2\/relationships\/([^/]+)\/status$/);
-    if (relationshipStatusV2 && request.method === "GET") {
-      return registryStub(env).fetch(new Request(
-        `https://device-registry.internal/v2/relationships/${relationshipStatusV2[1]!}/status`,
-        {
-          headers: {
-            "X-Tapchat-Ticket-Secret-Proof": request.headers.get("X-Tapchat-Ticket-Secret-Proof") ?? "",
-            "X-Tapchat-Ticket-Device": request.headers.get("X-Tapchat-Ticket-Device") ?? "",
-            "X-Tapchat-Ticket-Issued-At": request.headers.get("X-Tapchat-Ticket-Issued-At") ?? "",
-            "X-Tapchat-Ticket-Proof": request.headers.get("X-Tapchat-Ticket-Proof") ?? ""
-          }
-        }
-      ));
-    }
-
-    const inboxV2 = url.pathname.match(/^\/v2\/inbox\/([^/]+)\/(messages|ack|head|subscribe)$/);
-    if (inboxV2) {
-      const deviceId = decodeURIComponent(inboxV2[1]!);
-      const operation = inboxV2[2]!;
-      const stub = env.INBOX.get(env.INBOX.idFromName(deviceId));
-      if (request.method === "POST" && operation === "messages") {
-        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
-        const body = JSON.parse(bodyText) as AppendEnvelopeRequestV2;
-        if (
-          body.version !== "2" ||
-          body.recipientDeviceId !== deviceId ||
-          body.envelope.recipientDeviceId !== deviceId ||
-          body.senderIdentityBundle.publicationVersion !== 2 ||
-          body.recipientCapability.signature !== request.headers.get("Authorization")?.replace(/^Bearer\s+/, "") ||
-          !(await verifyEnvelopeV2(body.envelope, body.senderIdentityBundle)) ||
-          !body.relationshipProposal ||
-          body.relationshipProposal.proposalId !== body.envelope.proposalId
-          || body.relationshipProposal.relationshipIdCandidate !== body.envelope.relationshipId
-          || body.relationshipProposal.generation !== body.envelope.generation
-          || body.relationshipProposal.attempt !== body.envelope.attempt
-          || body.relationshipProposal.initiatorUserId !== body.envelope.senderUserId
-          || body.relationshipProposal.initiatorDeviceId !== body.envelope.senderDeviceId
-          || !verifyEd25519(
-            body.senderIdentityBundle.devices.find((device) => device.deviceId === body.envelope.senderDeviceId)?.devicePublicKey ?? "",
-            body.relationshipProposal.signature,
-            relationshipProposalSigningPayload(body.relationshipProposal)
-          )
-        ) {
-          throw new HttpError(403, "sender_identity_invalid", "Envelope V2 identity binding is invalid");
-        }
-        await validateAppendAuthorization(
-          request,
-          deviceId,
-          {
-            version: CURRENT_MODEL_VERSION,
-            recipientDeviceId: body.recipientDeviceId,
-            envelope: body.envelope as unknown as AppendEnvelopeRequest["envelope"]
-          },
-          now,
-          () => authoritativeIdentityBundle(env, sharedState)
-        );
-        const relationshipAuthorization = await registryStub(env).fetch(new Request(
-          "https://device-registry.internal/v2/relationships/authorize-append",
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              senderUserId: body.envelope.senderUserId,
-              senderRootPublicKey: body.senderIdentityBundle.userPublicKey,
-              senderBundleDigest: body.envelope.senderBundleDigest,
-              senderDeviceId: body.envelope.senderDeviceId,
-              recipientDeviceId: body.envelope.recipientDeviceId,
-              relationshipId: body.envelope.relationshipId,
-              generation: body.envelope.generation,
-              attempt: body.envelope.attempt,
-              proposalId: body.envelope.proposalId,
-              claimId: body.envelope.claimId,
-              messageType: body.envelope.messageType
-            })
-          }
-        ));
-        if (!relationshipAuthorization.ok) return relationshipAuthorization;
-        const relationship = await relationshipAuthorization.json<{
-          accountState: "pending" | "accepted";
-          selfDelivery?: boolean;
-        }>();
-        const forwardedBody: AppendEnvelopeRequest = {
-          version: CURRENT_MODEL_VERSION,
-          recipientDeviceId: body.recipientDeviceId,
-          envelope: body.envelope as unknown as AppendEnvelopeRequest["envelope"],
-          ...(body.envelope.messageType === "mls_welcome"
-            ? { senderIdentityBundle: body.senderIdentityBundle }
-            : {}),
-          ...(body.envelope.messageType === "mls_welcome"
-            ? { relationshipProposal: body.relationshipProposal }
-            : {}),
-          senderBundleHash: await identityBundleDigest(body.senderIdentityBundle),
-          senderDisplayName: body.senderIdentityBundle.displayName
-        };
-        const forwarded = new Request(request.url, {
-          method: "POST",
-          headers: request.headers,
-          body: JSON.stringify(forwardedBody)
-        });
-        forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, "verified");
-        if (relationship.accountState === "accepted" || relationship.selfDelivery) {
-          forwarded.headers.set(
-            RELATIONSHIP_AUTHORIZATION_HEADER,
-            await signRelationshipAuthorization(
-              sharedStateSecret(env),
-              deviceId,
-              body.envelope.messageId
-            )
-          );
-        } else {
-          forwarded.headers.delete(RELATIONSHIP_AUTHORIZATION_HEADER);
-        }
-        return stub.fetch(forwarded);
-      }
-      if (request.method === "GET" && (operation === "messages" || operation === "head")) {
-        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
-        return stub.fetch(request);
-      }
-      if (request.method === "POST" && operation === "ack") {
-        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_ack", now);
-        return stub.fetch(request);
-      }
-      if (operation === "subscribe") {
-        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
-        return stub.fetch(request);
-      }
-    }
-
     const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
@@ -786,7 +524,18 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       const stub = env.INBOX.get(objectId);
 
       if (request.method === "POST" && operation === "messages") {
-        return structuredErrorResponse(request, 426, "upgrade_required", false);
+        const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
+        const body = JSON.parse(bodyText) as AppendEnvelopeRequest;
+        const appendAuth = await validateAppendAuthorization(
+          request,
+          deviceId,
+          body,
+          now,
+          () => authoritativeIdentityBundle(env, sharedState)
+        );
+        const forwarded = forwardRequestWithBody(request, bodyText);
+        forwarded.headers.set(APPEND_AUTH_CONTEXT_HEADER, appendAuth.mode);
+        return await stub.fetch(forwarded);
       } else if (request.method === "GET" && (operation === "messages" || operation === "head")) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_read", now);
       } else if (request.method === "POST" && operation === "ack") {
@@ -798,9 +547,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         operation === "message-requests" ||
         operation.startsWith("message-requests/")
       ) {
-        if (operation.endsWith("/accept") || operation.endsWith("/reject")) {
-          return structuredErrorResponse(request, 426, "upgrade_required", false);
-        }
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
       }
 
@@ -1069,12 +815,64 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     const keyPackageRefsMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);
     if (keyPackageRefsMatch) {
-      return structuredErrorResponse(request, 410, "upgrade_required", false);
+      const userId = decodeURIComponent(keyPackageRefsMatch[1]);
+      const deviceId = decodeURIComponent(keyPackageRefsMatch[2]);
+      if (request.method === "GET") {
+        const document = await sharedState.getKeyPackageRefs(userId, deviceId);
+        if (!document) {
+          return structuredErrorResponse(request, 404, "not_found", false);
+        }
+        return jsonResponse(document);
+      }
+      if (request.method === "PUT") {
+        const authorization = await validateKeyPackageWriteAuthorization(
+          request,
+          deviceRuntimeSecrets(env),
+          userId,
+          deviceId,
+          undefined,
+          now,
+          sharedStateSecret(env)
+        );
+        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
+        const body = await readJsonLimited<KeyPackageRefsDocument>(request, CONTROL_JSON_MAX_BYTES);
+        await sharedState.putKeyPackageRefs(userId, deviceId, body);
+        const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
+        return jsonResponse(saved);
+      }
     }
 
     const keyPackageObjectMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);
     if (keyPackageObjectMatch) {
-      return structuredErrorResponse(request, 410, "upgrade_required", false);
+      const userId = decodeURIComponent(keyPackageObjectMatch[1]);
+      const deviceId = decodeURIComponent(keyPackageObjectMatch[2]);
+      const keyPackageId = decodeURIComponent(keyPackageObjectMatch[3]);
+      if (request.method === "GET") {
+        const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
+        if (!payload) {
+          return structuredErrorResponse(request, 404, "not_found", false);
+        }
+        return new Response(payload, {
+          status: 200,
+          headers: {
+            "content-type": "application/octet-stream"
+          }
+        });
+      }
+      if (request.method === "PUT") {
+        const authorization = await validateKeyPackageWriteAuthorization(
+          request,
+          deviceRuntimeSecrets(env),
+          userId,
+          deviceId,
+          keyPackageId,
+          now,
+          sharedStateSecret(env)
+        );
+        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
+        await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
+        return new Response(null, { status: 204 });
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {

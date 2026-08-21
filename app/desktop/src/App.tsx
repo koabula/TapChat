@@ -68,12 +68,6 @@ function summarizeRealtimeEvent(event: RealtimeEventPayload): string {
   return `type=${event.event_type} device_id=${event.device_id}`;
 }
 
-function shortProfileReference(profile: ProfileSummary): string {
-  const component = profile.path.split(/[\\/]/).at(-1) ?? profile.path;
-  const device = profile.device_id ? `device …${profile.device_id.slice(-8)}` : "unknown device";
-  return `${device} · profile …${component.slice(-8)}`;
-}
-
 /**
  * Inner app component that has Router context.
  * Hooks that use useNavigate() must be called here, inside BrowserRouter.
@@ -120,9 +114,6 @@ function AppInner({ startupError }: { startupError: string | null }) {
 
   if (sessionState === "locked") {
     const lockedView = lockedProfileView(lockReason);
-    const switchableProfiles = profiles.filter(
-      (profile) => profile.user_id && profile.device_id && profile.runtime_bound !== false,
-    );
 
     const handleRetry = async () => {
       setUnlocking(true);
@@ -172,10 +163,10 @@ function AppInner({ startupError }: { startupError: string | null }) {
         setUnlocking(false);
       }
     };
-    const handleOnboarding = async (mode: "create" | "recover") => {
+    const handleOnboarding = async () => {
       setUnlockSubmitError(null);
       try {
-        await invoke("start_new_profile_onboarding", { mode });
+        await invoke("start_new_profile_onboarding");
       } catch (err) {
         setUnlockSubmitError(presentError(err).message);
       }
@@ -190,7 +181,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
               {unlockError ?? "TapChat could not unlock the active profile."}
             </p>
           </div>
-          {(lockedView.needsPassphrase || switchableProfiles.length > 0) && (
+          {lockedView.needsPassphrase && (
             <input
               className="input"
               type="password"
@@ -208,36 +199,29 @@ function AppInner({ startupError }: { startupError: string | null }) {
             <div className="status-error text-sm">{unlockSubmitError}</div>
           )}
           <div className="grid grid-cols-2 gap-2">
-            {lockedView.canRetry && (
-              <button
-                className="btn btn-primary"
-                disabled={lockedProfileRetryDisabled(lockReason, unlockPassphrase, unlocking)}
-                onClick={handleRetry}
-              >
-                {unlocking ? "Retrying..." : lockedView.primaryActionLabel}
-              </button>
-            )}
+            <button
+              className="btn btn-primary"
+              disabled={lockedProfileRetryDisabled(lockReason, unlockPassphrase, unlocking)}
+              onClick={handleRetry}
+            >
+              {unlocking ? "Retrying..." : lockedView.primaryActionLabel}
+            </button>
             <button className="btn" disabled={loadingProfiles} onClick={handleShowProfiles}>
               {loadingProfiles ? "Loading..." : "Switch Profile"}
             </button>
-            <button className="btn" onClick={() => void handleOnboarding("create")}>New Profile</button>
-            <button className="btn" onClick={() => void handleOnboarding("recover")}>Recover</button>
+            <button className="btn" onClick={handleOnboarding}>New Profile</button>
+            <button className="btn" onClick={handleOnboarding}>Recover</button>
           </div>
-          {switchableProfiles.length > 0 && (
+          {profiles.length > 0 && (
             <div className="space-y-2 border-t border-default pt-3">
-              {switchableProfiles.map((profile) => (
+              {profiles.map((profile) => (
                 <button
                   key={profile.path}
                   className="btn w-full justify-start"
                   disabled={unlocking}
                   onClick={() => void handleActivateProfile(profile)}
                 >
-                  <span>
-                    <span className="block">{profile.name}</span>
-                    <span className="block text-xs text-muted-color">
-                      {shortProfileReference(profile)}
-                    </span>
-                  </span>
+                  {profile.name}
                 </button>
               ))}
             </div>
@@ -253,9 +237,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
       ? "/onboarding/cloudflare"
       : sessionState === "onboarding:backupmnemonic"
         ? "/onboarding/backup"
-        : sessionState === "onboarding:recoveridentity"
-          ? "/onboarding/identity?mode=recover"
-          : sessionState === "onboarding:createidentity"
+        : sessionState === "onboarding:createidentity" || sessionState === "onboarding:recoveridentity"
           ? "/onboarding/identity"
           : "/onboarding";
 
