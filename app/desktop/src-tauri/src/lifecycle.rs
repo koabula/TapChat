@@ -10,7 +10,9 @@ use tapchat_core::ffi_api::CoreViewModel;
 use tapchat_core::platform_ports::execute_platform_effect;
 use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput};
 
-use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
+use crate::commands::session::{
+    read_session_status_snapshot, set_ws_connection_snapshot, SessionStatus,
+};
 use crate::state::{AppState, DeferredTransportBatch, LockReason, SessionState, StartupPhase};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
@@ -385,8 +387,9 @@ fn determine_onboarding_step(
         // No profile at all - start fresh
         crate::state::OnboardingStep::Welcome
     } else if !check.has_identity {
-        // Profile exists but no identity - need to create/recover
-        crate::state::OnboardingStep::CreateIdentity
+        // Recovery intent is not persisted. Ask again instead of silently
+        // turning an interrupted recovery into identity creation.
+        crate::state::OnboardingStep::Welcome
     } else if !check.has_runtime_binding {
         // Has identity but no Cloudflare binding - need setup
         crate::state::OnboardingStep::CloudflareSetup
@@ -398,9 +401,40 @@ fn determine_onboarding_step(
 
 fn lock_reason_from_startup(reason: Option<&str>) -> LockReason {
     match reason {
+        Some("profile_selection_required") => LockReason::ProfileSelectionRequired,
         Some("snapshot_load_failed") => LockReason::SnapshotLoadFailed,
         Some("restore_failed") => LockReason::RestoreFailed,
         _ => LockReason::ProfileLocked,
+    }
+}
+
+#[cfg(test)]
+mod onboarding_state_tests {
+    use super::{determine_onboarding_step, lock_reason_from_startup};
+    use crate::platform::profile::SessionStartupCheck;
+    use crate::state::{LockReason, OnboardingStep};
+
+    #[test]
+    fn interrupted_identity_setup_returns_to_safe_mode_choice() {
+        let check = SessionStartupCheck {
+            has_active_profile: true,
+            has_identity: false,
+            has_runtime_binding: false,
+            needs_onboarding: true,
+            profile_path: None,
+            unlock_error: None,
+            lock_reason: None,
+        };
+
+        assert_eq!(determine_onboarding_step(&check), OnboardingStep::Welcome);
+    }
+
+    #[test]
+    fn unresolved_profile_selector_uses_profile_choice_view() {
+        assert_eq!(
+            lock_reason_from_startup(Some("profile_selection_required")),
+            LockReason::ProfileSelectionRequired
+        );
     }
 }
 
@@ -1044,13 +1078,16 @@ pub async fn set_onboarding_step(app: AppHandle, step: String) -> crate::errors:
         _ => return Err(format!("Invalid onboarding step: {}", step).into()),
     };
 
-    let mut inner = state.inner.write().await;
-
-    if let SessionState::Onboarding { .. } = &inner.session {
-        inner.session = SessionState::Onboarding {
-            step: onboarding_step,
-        };
+    {
+        let mut inner = state.inner.write().await;
+        if let SessionState::Onboarding { .. } = &inner.session {
+            inner.session = SessionState::Onboarding {
+                step: onboarding_step,
+            };
+        }
     }
+
+    let _ = app.emit("session-status", read_session_status_snapshot(&state).await);
 
     Ok(())
 }

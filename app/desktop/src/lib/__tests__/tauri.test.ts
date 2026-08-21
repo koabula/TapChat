@@ -20,6 +20,7 @@ import {
   initOnboardingProfile,
   selectProfileForRestart,
   setLocalDisplayName,
+  startNewProfileOnboarding,
 } from "../tauri";
 
 describe("tauri identity wrappers", () => {
@@ -100,5 +101,15 @@ describe("tauri identity wrappers", () => {
       "activate_profile",
       expect.anything(),
     );
+  });
+
+  it("starts recovery onboarding with an explicit backend mode", async () => {
+    tauriMocks.invoke.mockResolvedValueOnce({});
+
+    await startNewProfileOnboarding("recover");
+
+    expect(tauriMocks.invoke).toHaveBeenCalledWith("start_new_profile_onboarding", {
+      mode: "recover",
+    });
   });
 });

@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use tapchat_core::CoreEngine;
 
-use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
+use crate::commands::session::{
+    read_session_status_snapshot, set_ws_connection_snapshot, SessionStatus,
+};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
@@ -27,13 +29,7 @@ pub async fn create_profile(
     passphrase: Option<String>,
     protection_mode: Option<ProfileProtectionMode>,
 ) -> crate::errors::DesktopResult<ProfileSummary> {
-    // Check if profile with this name already exists
     let pm = &state.inner.read().await.profile_manager;
-    let existing = pm.list_profiles().await;
-    if existing.iter().any(|p| p.name == name) {
-        return Err(format!("Profile '{}' already exists", name).into());
-    }
-
     let protection_mode = protection_mode.unwrap_or_else(|| {
         if passphrase.as_deref().is_some_and(|value| !value.is_empty()) {
             ProfileProtectionMode::KeychainAndPassphrase
@@ -54,6 +50,7 @@ pub async fn create_profile(
 pub async fn start_new_profile_onboarding(
     app: AppHandle,
     state: State<'_, AppState>,
+    mode: Option<String>,
 ) -> crate::errors::DesktopResult<()> {
     {
         let realtime = {
@@ -65,12 +62,16 @@ pub async fn start_new_profile_onboarding(
         }
     }
 
-    // Set session state to Onboarding Welcome
+    let step = match mode.as_deref() {
+        None | Some("welcome") => crate::state::OnboardingStep::Welcome,
+        Some("create") => crate::state::OnboardingStep::CreateIdentity,
+        Some("recover") => crate::state::OnboardingStep::RecoverIdentity,
+        Some(_) => return Err("invalid_input".into()),
+    };
+
     {
         let mut inner = state.inner.write().await;
-        inner.session = SessionState::Onboarding {
-            step: crate::state::OnboardingStep::Welcome,
-        };
+        inner.session = SessionState::Onboarding { step };
         inner.profile_path = None; // Clear profile path - will be set during onboarding
 
         // Reset engine to fresh state
@@ -79,18 +80,7 @@ pub async fn start_new_profile_onboarding(
 
     set_ws_connection_snapshot(&state, None, false).await;
 
-    // Emit session-status event to notify frontend - this triggers route change
-    let _ = app.emit(
-        "session-status",
-        SessionStatus {
-            state: "onboarding:welcome".to_string(),
-            device_id: None,
-            ws_connected: false,
-            profile_path: None,
-            error: None,
-            lock_reason: None,
-        },
-    );
+    let _ = app.emit("session-status", read_session_status_snapshot(&state).await);
 
     Ok(())
 }
@@ -119,8 +109,25 @@ pub async fn activate_profile(
             .map_err(|_| profile_access_error(passphrase_supplied))?;
     }
 
-    // Reload the engine from the new profile
-    reload_engine_from_profile(&app, &state).await?;
+    let onboarding_window = app.get_webview_window("onboarding");
+    if let Some(window) = onboarding_window.as_ref() {
+        window.hide().map_err(|error| error.to_string())?;
+    }
+
+    if let Err(error) = reload_engine_from_profile(&app, &state).await {
+        if let Some(window) = onboarding_window.as_ref() {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        return Err(error.into());
+    }
+    if let Some(window) = onboarding_window {
+        if let Some(main_window) = app.get_webview_window("main") {
+            main_window.show().map_err(|error| error.to_string())?;
+            let _ = main_window.set_focus();
+        }
+        window.close().map_err(|error| error.to_string())?;
+    }
     if let Err(error) = crate::commands::message::run_attachment_maintenance(&app).await {
         log::warn!("post-switch attachment maintenance failed: {error}");
     }
