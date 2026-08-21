@@ -265,55 +265,164 @@ async fn request_runtime_credential_with_retry(
     Err(last_error.unwrap_or_else(|| runtime_error("temporary_unavailable")))
 }
 
-pub async fn wait_for_runtime_ready(
+enum RuntimePoll<T> {
+    Ready(T),
+    Retry(String),
+    Fatal(String),
+}
+
+fn retryable_deployment_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 404 | 409 | 429)
+}
+
+async fn poll_runtime_ready(
+    client: &reqwest::Client,
+    endpoint: &str,
+    runtime_id: &str,
+    worker_build_id: &str,
+) -> RuntimePoll<()> {
+    let response = match client.get(endpoint).send().await {
+        Ok(response) => response,
+        Err(_) => return RuntimePoll::Retry("network".into()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let code = format!("http_{}", status.as_u16());
+        return if retryable_deployment_status(status) {
+            RuntimePoll::Retry(code)
+        } else {
+            RuntimePoll::Fatal(code)
+        };
+    }
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => return RuntimePoll::Retry("invalid_response".into()),
+    };
+    let ready = match parse_runtime_ready_manifest(&body) {
+        Ok(ready) => ready,
+        Err(_) => return RuntimePoll::Retry("invalid_response".into()),
+    };
+    if ready.ready
+        && ready.runtime_id == runtime_id
+        && ready.protocol_version == 5
+        && ready.worker_build_id == worker_build_id
+        && ready.registry_schema_version == 2
+    {
+        RuntimePoll::Ready(())
+    } else {
+        RuntimePoll::Retry("manifest_mismatch".into())
+    }
+}
+
+async fn poll_deployment_bundle(
+    client: &reqwest::Client,
+    endpoint: &str,
     base_url: &str,
     runtime_id: &str,
     worker_build_id: &str,
-) -> Result<()> {
+) -> RuntimePoll<DeploymentBundle> {
+    let response = match client.get(endpoint).send().await {
+        Ok(response) => response,
+        Err(_) => return RuntimePoll::Retry("network".into()),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let code = format!("http_{}", status.as_u16());
+        return if retryable_deployment_status(status) {
+            RuntimePoll::Retry(code)
+        } else {
+            RuntimePoll::Fatal(code)
+        };
+    }
+    let bundle = match response.json::<DeploymentBundle>().await {
+        Ok(bundle) => bundle,
+        Err(_) => return RuntimePoll::Retry("invalid_response".into()),
+    };
+    let endpoint_matches =
+        bundle.inbox_http_endpoint.trim_end_matches('/') == base_url.trim_end_matches('/');
+    if bundle.validate().is_ok()
+        && bundle.runtime_id == runtime_id
+        && bundle.worker_build_id == worker_build_id
+        && endpoint_matches
+    {
+        RuntimePoll::Ready(bundle)
+    } else {
+        RuntimePoll::Retry("manifest_mismatch".into())
+    }
+}
+
+async fn wait_for_runtime_bundle_with_client(
+    client: &reqwest::Client,
+    base_url: &str,
+    runtime_id: &str,
+    worker_build_id: &str,
+    timeout: std::time::Duration,
+    retry_delay: std::time::Duration,
+) -> Result<DeploymentBundle> {
+    let root = base_url.trim_end_matches('/');
+    let ready_endpoint = format!("{root}/v2/runtime/ready");
+    let bundle_endpoint = format!("{root}/v1/deployment-bundle");
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut ready_seen = false;
+    let mut last_code: String;
+    let mut current_delay = retry_delay;
+    loop {
+        match poll_runtime_ready(client, &ready_endpoint, runtime_id, worker_build_id).await {
+            RuntimePoll::Ready(()) => {
+                ready_seen = true;
+                match poll_deployment_bundle(
+                    client,
+                    &bundle_endpoint,
+                    root,
+                    runtime_id,
+                    worker_build_id,
+                )
+                .await
+                {
+                    RuntimePoll::Ready(bundle) => return Ok(bundle),
+                    RuntimePoll::Retry(code) => last_code = code,
+                    RuntimePoll::Fatal(code) => {
+                        return Err(anyhow!("deployment_descriptor_failed:{code}"));
+                    }
+                }
+            }
+            RuntimePoll::Retry(code) => last_code = code,
+            RuntimePoll::Fatal(code) => {
+                return Err(anyhow!("runtime_registry_failed:{code}"));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if ready_seen {
+                return Err(anyhow!("deployment_descriptor_not_ready:{last_code}"));
+            } else {
+                return Err(anyhow!("runtime_registry_not_ready:{last_code}"));
+            }
+        }
+        tokio::time::sleep(current_delay).await;
+        current_delay = current_delay
+            .saturating_mul(2)
+            .min(std::time::Duration::from_secs(5));
+    }
+}
+
+pub async fn wait_for_runtime_bundle(
+    base_url: &str,
+    runtime_id: &str,
+    worker_build_id: &str,
+) -> Result<DeploymentBundle> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .context("build runtime registry readiness client")?;
-    let endpoint = format!("{}/v2/runtime/ready", base_url.trim_end_matches('/'));
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
-    loop {
-        let last_code = match client.get(&endpoint).send().await {
-            Ok(response) if response.status().is_success() => {
-                let body = response
-                    .text()
-                    .await
-                    .context("read runtime registry readiness response")?;
-                let ready = parse_runtime_ready_manifest(&body)?;
-                if ready.ready
-                    && ready.runtime_id == runtime_id
-                    && ready.protocol_version == 5
-                    && ready.worker_build_id == worker_build_id
-                    && ready.registry_schema_version == 2
-                {
-                    return Ok(());
-                }
-                return Err(runtime_error("runtime_manifest_mismatch"));
-            }
-            Ok(response) => {
-                let status = response.status();
-                let code = response
-                    .json::<ErrorResponse>()
-                    .await
-                    .ok()
-                    .and_then(|body| body.error)
-                    .unwrap_or_else(|| format!("http_{}", status.as_u16()));
-                if !status.is_server_error() && !matches!(status.as_u16(), 404 | 409 | 429) {
-                    return Err(runtime_error(&code));
-                }
-                code
-            }
-            Err(_) => "temporary_unavailable".to_string(),
-        };
-        if tokio::time::Instant::now() >= deadline {
-            return Err(anyhow!("runtime_registry_not_ready:{last_code}"));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
+        .context("build runtime deployment readiness client")?;
+    wait_for_runtime_bundle_with_client(
+        &client,
+        base_url,
+        runtime_id,
+        worker_build_id,
+        std::time::Duration::from_secs(90),
+        std::time::Duration::from_millis(500),
+    )
+    .await
 }
 
 impl RuntimeAuthManager {
@@ -581,6 +690,76 @@ pub async fn ensure_fresh_device_runtime_auth_for_state(state: &AppState) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct ExpectedResponse {
+        path: &'static str,
+        status: u16,
+        body: String,
+    }
+
+    async fn bootstrap_server(
+        build_responses: impl FnOnce(&str) -> Vec<ExpectedResponse>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let responses = build_responses(&base_url);
+        let handle = tokio::spawn(async move {
+            for expected in responses {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).await.expect("read");
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request.starts_with(&format!("GET {} HTTP/1.1", expected.path)),
+                    "{request}"
+                );
+                let reason = match expected.status {
+                    200 => "OK",
+                    403 => "Forbidden",
+                    503 => "Service Unavailable",
+                    _ => "Test",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    expected.status,
+                    reason,
+                    expected.body.len(),
+                    expected.body
+                );
+                stream.write_all(response.as_bytes()).await.expect("write");
+            }
+        });
+        (base_url, handle)
+    }
+
+    fn ready_json() -> String {
+        serde_json::json!({
+            "ready": true,
+            "runtimeId": "runtime-1",
+            "protocolVersion": 5,
+            "workerBuildId": "worker-1",
+            "registrySchemaVersion": 2
+        })
+        .to_string()
+    }
+
+    fn deployment_bundle_json(base_url: &str, runtime_id: &str) -> String {
+        serde_json::json!({
+            "version": "0.1",
+            "runtimeId": runtime_id,
+            "protocolVersion": 5,
+            "workerBuildId": "worker-1",
+            "registrySchemaVersion": 2,
+            "region": "test",
+            "inboxHttpEndpoint": base_url,
+            "inboxWebsocketEndpoint": base_url.replace("http://", "ws://"),
+            "storageBaseInfo": { "baseUrl": base_url },
+            "runtimeConfig": {}
+        })
+        .to_string()
+    }
 
     #[test]
     fn readiness_manifest_parses_worker_camel_case_contract() {
@@ -591,6 +770,20 @@ mod tests {
         assert_eq!(manifest.protocol_version, 5);
         assert_eq!(manifest.worker_build_id, "tapchat-worker-v5-0.1.15");
         assert_eq!(manifest.registry_schema_version, 2);
+    }
+
+    #[test]
+    fn deployment_poll_retries_only_transient_statuses() {
+        for status in [404, 409, 429, 500, 503] {
+            assert!(retryable_deployment_status(
+                reqwest::StatusCode::from_u16(status).expect("status")
+            ));
+        }
+        for status in [400, 401, 403, 426] {
+            assert!(!retryable_deployment_status(
+                reqwest::StatusCode::from_u16(status).expect("status")
+            ));
+        }
     }
 
     #[test]
@@ -633,5 +826,91 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_bundle_retries_transient_descriptor_failure() {
+        let (base_url, server) = bootstrap_server(|base_url| {
+            vec![
+                ExpectedResponse {
+                    path: "/v2/runtime/ready",
+                    status: 200,
+                    body: ready_json(),
+                },
+                ExpectedResponse {
+                    path: "/v1/deployment-bundle",
+                    status: 503,
+                    body: "{}".into(),
+                },
+                ExpectedResponse {
+                    path: "/v2/runtime/ready",
+                    status: 200,
+                    body: ready_json(),
+                },
+                ExpectedResponse {
+                    path: "/v1/deployment-bundle",
+                    status: 200,
+                    body: deployment_bundle_json(base_url, "runtime-1"),
+                },
+            ]
+        })
+        .await;
+
+        let bundle = wait_for_runtime_bundle_with_client(
+            &reqwest::Client::new(),
+            &base_url,
+            "runtime-1",
+            "worker-1",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("descriptor retry succeeds");
+
+        assert_eq!(bundle.runtime_id, "runtime-1");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn runtime_bundle_never_accepts_a_mismatched_descriptor() {
+        let (base_url, server) = bootstrap_server(|base_url| {
+            vec![
+                ExpectedResponse {
+                    path: "/v2/runtime/ready",
+                    status: 200,
+                    body: ready_json(),
+                },
+                ExpectedResponse {
+                    path: "/v1/deployment-bundle",
+                    status: 200,
+                    body: deployment_bundle_json(base_url, "stale-runtime"),
+                },
+                ExpectedResponse {
+                    path: "/v2/runtime/ready",
+                    status: 200,
+                    body: ready_json(),
+                },
+                ExpectedResponse {
+                    path: "/v1/deployment-bundle",
+                    status: 200,
+                    body: deployment_bundle_json(base_url, "runtime-1"),
+                },
+            ]
+        })
+        .await;
+
+        let bundle = wait_for_runtime_bundle_with_client(
+            &reqwest::Client::new(),
+            &base_url,
+            "runtime-1",
+            "worker-1",
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("matching descriptor eventually succeeds");
+
+        assert_eq!(bundle.runtime_id, "runtime-1");
+        server.await.expect("server");
     }
 }

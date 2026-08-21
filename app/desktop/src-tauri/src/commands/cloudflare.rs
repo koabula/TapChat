@@ -25,7 +25,7 @@ use crate::commands::cloudflare_rest::{
 use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
 use crate::lifecycle::{drive_core_with_handle, drive_prepared_core_output, CoreInput};
 use crate::platform::log_sanitize::sanitize_url_for_log;
-use crate::runtime_auth::wait_for_runtime_ready;
+use crate::runtime_auth::wait_for_runtime_bundle;
 use crate::state::AppState;
 use crate::state::SessionState;
 use crate::timetest;
@@ -108,7 +108,11 @@ fn report_cloudflare_setup_failure(
     let cause = tapchat_core::error_codes_generated::is_registered_app_error(candidate)
         .then_some(candidate)
         .unwrap_or("unexpected_error");
-    log::warn!("cloudflare_setup failed: stage={stage} cause={cause}");
+    if let Some(detail) = safe_deploy_diagnostic(error) {
+        log::warn!("cloudflare_setup failed: stage={stage} cause={cause} detail={detail}");
+    } else {
+        log::warn!("cloudflare_setup failed: stage={stage} cause={cause}");
+    }
     let _ = app.emit(
         "cloudflare-progress",
         DeployProgress {
@@ -1006,32 +1010,41 @@ pub async fn cloudflare_deploy(
         "cloudflare-progress",
         DeployProgress {
             phase: DeployPhase::VerifyingDeployment,
-            message: "Waiting for deployment to be ready...".into(),
+            message: "Waiting for the deployed runtime and metadata...".into(),
             progress_percent: 85,
         },
     );
 
-    if wait_for_runtime_ready(
+    let deployment_bundle = match wait_for_runtime_bundle(
         &result.worker_url,
         &config.runtime_id,
         &config.worker_build_id,
     )
     .await
-    .is_err()
     {
-        return Err(report_cloudflare_deploy_failure(
-            &app,
-            "cloudflare_runtime_not_ready",
-        ));
-    }
+        Ok(bundle) => bundle,
+        Err(error) if error.to_string().starts_with("deployment_descriptor_") => {
+            return Err(report_cloudflare_setup_failure(
+                &app,
+                "fetching the deployment descriptor",
+                &error.to_string(),
+            ));
+        }
+        Err(_) => {
+            return Err(report_cloudflare_deploy_failure(
+                &app,
+                "cloudflare_runtime_not_ready",
+            ));
+        }
+    };
     advance_provisioning_journal(&state, RuntimeProvisioningPhase::RuntimeReady)
         .await
         .map_err(|error| {
             report_cloudflare_setup_failure(&app, "saving deployment progress", &error)
         })?;
 
-    // Fetch the public deployment descriptor, build the root-signed local
-    // IdentityBundle, then enroll the current device with its long-lived key.
+    // Build the root-signed local IdentityBundle, then enroll the current
+    // device with its long-lived key.
     let _ = app.emit(
         "cloudflare-progress",
         DeployProgress {
@@ -1040,38 +1053,6 @@ pub async fn cloudflare_deploy(
             progress_percent: 90,
         },
     );
-
-    let deployment_bundle = reqwest::Client::new()
-        .get(format!(
-            "{}/v1/deployment-bundle",
-            result.worker_url.trim_end_matches('/')
-        ))
-        .send()
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "fetching the deployment descriptor",
-                &error.to_string(),
-            )
-        })?
-        .error_for_status()
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "fetching the deployment descriptor",
-                &error.to_string(),
-            )
-        })?
-        .json::<DeploymentBundle>()
-        .await
-        .map_err(|error| {
-            report_cloudflare_setup_failure(
-                &app,
-                "reading the deployment descriptor",
-                &error.to_string(),
-            )
-        })?;
 
     let profile_manager = {
         let inner = state.inner.read().await;
