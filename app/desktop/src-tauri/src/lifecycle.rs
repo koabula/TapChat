@@ -564,6 +564,26 @@ pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result
     drive_core_work_queue(app, vec![DriverWork::Input(input)]).await
 }
 
+/// Execute effects from a core output that was already applied and persisted.
+/// This avoids applying the originating command a second time after a staged
+/// onboarding write.
+pub async fn drive_prepared_core_output(
+    app: &AppHandle,
+    mut output: CoreOutput,
+) -> Result<CoreOutput> {
+    emit_core_update(app, &output);
+    let pending = output
+        .effects
+        .iter()
+        .cloned()
+        .rev()
+        .map(DriverWork::Effect)
+        .collect();
+    let completed = drive_core_work_queue(app, pending).await?;
+    merge_core_outputs(&mut output, completed);
+    Ok(output)
+}
+
 /// Drain core inputs, platform effects and the events they produce without
 /// recursively re-entering the driver. Attachment upload and inbox recovery
 /// can each produce long effect/event chains; a heap-backed work stack keeps

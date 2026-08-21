@@ -40,6 +40,23 @@ interface DeployResult {
   error: string | null;
 }
 
+interface SetupError {
+  title?: string;
+  message: string;
+  code?: string;
+  correlationId?: string;
+}
+
+function setupErrorFromUnknown(value: unknown): SetupError {
+  const presented = presentError(value);
+  return {
+    title: presented.title,
+    message: presented.message,
+    code: presented.error.code,
+    correlationId: presented.error.correlationId,
+  };
+}
+
 type StepState = "idle" | "current" | "complete" | "error";
 
 const PHASE_LABELS: Record<string, string> = {
@@ -60,7 +77,7 @@ export default function CloudflareSetup() {
   const [deploying, setDeploying] = useState(false);
   const [progress, setProgress] = useState<DeployProgress | null>(null);
   const [deployResult, setDeployResult] = useState<DeployResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<SetupError | null>(null);
 
   useEffect(() => {
     void checkPreflight();
@@ -140,10 +157,10 @@ export default function CloudflareSetup() {
       const result = await invoke<PreflightResult>("cloudflare_preflight");
       setPreflight(result);
       if (result.error) {
-        setError(result.error);
+        setError({ message: result.error });
       }
     } catch (err) {
-      setError(presentError(err).message);
+      setError(setupErrorFromUnknown(err));
     }
   };
 
@@ -155,10 +172,10 @@ export default function CloudflareSetup() {
       if (result.success) {
         await checkPreflight();
       } else {
-        setError(result.error || "Login failed. Please try again.");
+        setError({ message: result.error || "Login failed. Please try again." });
       }
     } catch (err) {
-      setError(presentError(err).message);
+      setError(setupErrorFromUnknown(err));
     } finally {
       setLoginInProgress(false);
     }
@@ -173,10 +190,10 @@ export default function CloudflareSetup() {
       const result = await invoke<DeployResult>("cloudflare_deploy");
       setDeployResult(result);
       if (!result.success) {
-        setError(result.error || "Deployment failed.");
+        setError({ message: result.error || "Deployment failed." });
       }
     } catch (err) {
-      setError(presentError(err).message);
+      setError(setupErrorFromUnknown(err));
     } finally {
       setDeploying(false);
     }
@@ -226,7 +243,14 @@ export default function CloudflareSetup() {
 
             {error && (
               <div className="mt-4 rounded-md border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-                {error}
+                {error.title && <p className="font-medium">{error.title}</p>}
+                <p>{error.message}</p>
+                {error.code && (
+                  <p className="mt-1 text-xs opacity-80">
+                    Error code: {error.code}
+                    {error.correlationId ? ` · Reference: ${error.correlationId}` : ""}
+                  </p>
+                )}
               </div>
             )}
           </section>
