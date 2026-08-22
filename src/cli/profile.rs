@@ -20,11 +20,11 @@ use zeroize::Zeroizing;
 use crate::ffi_api::PersistStateEffect;
 use crate::fs_util::write_atomic_unique;
 use crate::local_store::{
-    inspect_storage, LocalStoreDiagnostics, ProfileStorageSession, PRIVATE_STATE_DOCUMENT_KIND,
-    STATE_DB_FILE_NAME,
+    inspect_storage, LocalStoreDiagnostics, MessageReadCursor, ProfileStorageSession,
+    PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
 };
 use crate::log_sanitize::redact_id;
-use crate::model::{DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
+use crate::model::{ConversationKind, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::profile_crypto::{
     build_os_keychain_wrapper, build_passphrase_wrapper,
@@ -976,6 +976,40 @@ impl Profile {
         query: &crate::local_store::MessageQuery,
     ) -> Result<crate::local_store::MessagePage> {
         self.storage_session.query_messages(query)
+    }
+
+    pub fn count_received_visible_messages(
+        &self,
+        conversation_id: &str,
+        local_device_id: &str,
+        kind: ConversationKind,
+        after: Option<&MessageReadCursor>,
+    ) -> Result<u64> {
+        self.storage_session.count_received_visible_messages(
+            conversation_id,
+            local_device_id,
+            kind,
+            after,
+        )
+    }
+
+    pub fn latest_visible_message_cursor(
+        &self,
+        conversation_id: &str,
+        kind: ConversationKind,
+    ) -> Result<Option<MessageReadCursor>> {
+        self.storage_session
+            .latest_visible_message_cursor(conversation_id, kind)
+    }
+
+    pub fn visible_message_cursor(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> Result<Option<MessageReadCursor>> {
+        self.storage_session
+            .visible_message_cursor(conversation_id, message_id, kind)
     }
 
     pub fn checkpoint_local_store(&self) -> Result<()> {

@@ -35,6 +35,7 @@ import {
   getGroupSnapshot,
   listContacts,
   listConversations,
+  markConversationRead,
   refreshContact,
   syncGroupOutbox,
   type GroupMessageView,
@@ -78,6 +79,7 @@ export default function ChatView() {
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
   const messageRefs = useRef(new Map<string, HTMLDivElement>());
+  const messageRequestIdRef = useRef(0);
 
   const { contacts, setContacts } = useContactsStore();
   const { conversations, mergeConversationSnapshot, setActiveConversation } =
@@ -103,6 +105,10 @@ export default function ChatView() {
   const markGroupSyncFailed = useGroupSyncStore((s) => s.markSyncFailed);
 
   const isGroup = activeConversation?.kind === "group";
+  const currentConversationIdRef = useRef(conversationId);
+  const currentIsGroupRef = useRef(isGroup);
+  currentConversationIdRef.current = conversationId;
+  currentIsGroupRef.current = isGroup;
   const dissolved = isGroup && activeConversation?.dissolved_at != null;
   const activeDirectContact = useMemo(() => {
     if (!activeConversation || activeConversation.kind === "group") return null;
@@ -464,7 +470,10 @@ export default function ChatView() {
   useEffect(() => {
     setActiveConversation(conversationId ?? null);
     setRecoveryError(null);
-    return () => { setActiveConversation(null); };
+    return () => {
+      messageRequestIdRef.current += 1;
+      setActiveConversation(null);
+    };
   }, [conversationId, setActiveConversation]);
 
   // Track which group (if any) the chat view is displaying so the
@@ -499,40 +508,100 @@ export default function ChatView() {
 
   const loadMessages = async () => {
     if (!conversationId) return;
+    const requestId = ++messageRequestIdRef.current;
+    const requestedConversationId = conversationId;
+    const requestedIsGroup = isGroup;
+    const isCurrentRequest = () =>
+      requestId === messageRequestIdRef.current &&
+      currentConversationIdRef.current === requestedConversationId &&
+      currentIsGroupRef.current === requestedIsGroup;
     setLoading(true);
     try {
-      if (isGroup) {
-        const result = await getGroupMessages(conversationId);
+      if (requestedIsGroup) {
+        const result = await getGroupMessages(requestedConversationId);
+        if (!isCurrentRequest()) {
+          return;
+        }
         setGroupMessages(result);
         setMessages([]);
+        await markLatestMessageRead(requestedConversationId, result.at(-1)?.message_id);
       } else {
-        const page = await invoke<MessagePage>("get_messages", { conversationId, limit: 50 });
+        const page = await invoke<MessagePage>("get_messages", {
+          conversationId: requestedConversationId,
+          limit: 50,
+        });
+        if (!isCurrentRequest()) {
+          return;
+        }
         setMessages(page.items);
         setNextMessageCursor(page.next_cursor ?? null);
         setGroupMessages([]);
+        await markLatestMessageRead(
+          requestedConversationId,
+          page.items.at(-1)?.message_id,
+        );
       }
     } catch (err) {
       console.error(`[ChatView] Failed to load messages: ${presentError(err).message}`);
-      setMessages([]);
-      setGroupMessages([]);
+      if (isCurrentRequest()) {
+        setMessages([]);
+        setGroupMessages([]);
+      }
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) {
+        setLoading(false);
+      }
     }
   };
 
   const refreshMessages = async () => {
     if (!conversationId) return;
+    const requestId = ++messageRequestIdRef.current;
+    const requestedConversationId = conversationId;
+    const requestedIsGroup = isGroup;
+    const isCurrentRequest = () =>
+      requestId === messageRequestIdRef.current &&
+      currentConversationIdRef.current === requestedConversationId &&
+      currentIsGroupRef.current === requestedIsGroup;
     try {
-      if (isGroup) {
-        const result = await getGroupMessages(conversationId);
+      if (requestedIsGroup) {
+        const result = await getGroupMessages(requestedConversationId);
+        if (!isCurrentRequest()) {
+          return;
+        }
         setGroupMessages(result);
+        await markLatestMessageRead(requestedConversationId, result.at(-1)?.message_id);
       } else {
-        const page = await invoke<MessagePage>("get_messages", { conversationId, limit: 50 });
+        const page = await invoke<MessagePage>("get_messages", {
+          conversationId: requestedConversationId,
+          limit: 50,
+        });
+        if (!isCurrentRequest()) {
+          return;
+        }
         setMessages((current) => reconcileLatestMessagePage(current, page.items));
         setNextMessageCursor((current) => current ?? page.next_cursor ?? null);
+        await markLatestMessageRead(
+          requestedConversationId,
+          page.items.at(-1)?.message_id,
+        );
       }
     } catch (err) {
       console.error(`[ChatView] Failed to refresh messages: ${presentError(err).message}`);
+    }
+  };
+
+  const markLatestMessageRead = async (
+    requestedConversationId: string,
+    lastMessageId: string | undefined,
+  ) => {
+    if (!lastMessageId) return;
+    try {
+      await markConversationRead(requestedConversationId, lastMessageId);
+    } catch (err) {
+      console.debug(
+        `[ChatView] failed to persist read state: ${presentError(err).message}`,
+      );
     }
   };
 

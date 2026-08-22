@@ -75,6 +75,7 @@ export interface ConversationSummary {
   last_message_preview?: string | null;
   last_message_type?: string;
   message_count?: number;
+  unread_count?: number;
   recovery?: RecoveryDiagnostics;
 }
 
@@ -499,6 +500,7 @@ export interface CoreUpdateEvent {
   state_update: CoreStateUpdate;
   effects: unknown[];
   view_model?: CoreViewModel;
+  persistence_revision: number;
 }
 
 // Core effects (for debugging, not typically used in frontend)

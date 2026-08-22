@@ -122,4 +122,42 @@ describe("conversation store snapshot merging", () => {
 
     expect(useConversationsStore.getState().conversations[0].recovery).toBeNull();
   });
+
+  test("authoritative conversation snapshot uses the backend unread count", () => {
+    useConversationsStore.getState().mergeConversationSnapshot(
+      [
+        {
+          conversation_id: "bob",
+          peer_user_id: "user:bob",
+          state: "active",
+          kind: "direct",
+          message_count: 4,
+          unread_count: 3,
+        },
+      ],
+      [{ user_id: "user:bob", display_name: "Bob" }],
+      { replace: true },
+    );
+
+    expect(useConversationsStore.getState().conversations[0].unread_count).toBe(3);
+    expect(useConversationsStore.getState().conversations[0].has_unread).toBe(true);
+
+    useConversationsStore.getState().mergeConversationSnapshot(
+      [
+        {
+          conversation_id: "bob",
+          peer_user_id: "user:bob",
+          state: "active",
+          kind: "direct",
+          message_count: 4,
+          unread_count: 0,
+        },
+      ],
+      [{ user_id: "user:bob", display_name: "Bob" }],
+      { replace: true },
+    );
+
+    expect(useConversationsStore.getState().conversations[0].unread_count).toBe(0);
+    expect(useConversationsStore.getState().conversations[0].has_unread).toBe(false);
+  });
 });

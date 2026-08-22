@@ -97,8 +97,8 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
         const displayLabel = isGroup
           ? groupTitle ?? "Group"
           : conv.display_name || conv.peer_user_id;
-        const unreadCount = conv.unread_count ?? (conv.has_unread ? 1 : 0);
-        const hasUnread = unreadCount > 0 || conv.has_unread;
+        const unreadCount = Math.max(0, conv.unread_count ?? 0);
+        const hasUnread = unreadCount > 0;
 
         return (
           <Fragment key={conv.conversation_id}>

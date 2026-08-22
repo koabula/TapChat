@@ -25,7 +25,7 @@ export function mergeMessagePage(current: Message[], incoming: Message[]): Messa
  * that Core no longer reports (for example a legacy envelope-id placeholder).
  */
 export function reconcileLatestMessagePage(current: Message[], incoming: Message[]): Message[] {
-  if (incoming.length === 0) return [];
+  if (incoming.length === 0) return current;
   const incomingIds = new Set(incoming.map((message) => message.message_id));
   const oldestIncoming = Math.min(...incoming.map((message) => message.created_at));
   const olderHistory = current.filter((message) =>

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde::Serialize;
 use std::time::{Duration, Instant};
 use tauri::webview::WebviewWindowBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WindowEvent};
@@ -24,6 +26,19 @@ pub enum CoreInput {
 enum DriverWork {
     Input(CoreInput),
     Effect(CoreEffect),
+}
+
+fn pending_persistence_count(work: &[DriverWork]) -> usize {
+    work.iter()
+        .filter(|item| matches!(item, DriverWork::Effect(CoreEffect::PersistState { .. })))
+        .count()
+}
+
+fn complete_persistence(pending: &mut usize) -> Result<bool> {
+    *pending = pending
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("persistence effect accounting underflow"))?;
+    Ok(*pending == 0)
 }
 
 /// Called once after Tauri setup completes. Determines whether to show
@@ -561,6 +576,11 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
 /// The single entry point for all core state changes. Processes a command or event
 /// through CoreEngine, executes resulting effects, and pushes UI updates to the frontend.
 pub async fn drive_core_with_handle(app: &AppHandle, input: CoreInput) -> Result<CoreOutput> {
+    if matches!(&input, CoreInput::Event(CoreEvent::AppStarted)) {
+        crate::commands::read_state::ensure_baseline(&app.state::<AppState>())
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+    }
     drive_core_work_queue(app, vec![DriverWork::Input(input)]).await
 }
 
@@ -595,6 +615,11 @@ async fn drive_core_work_queue(
     let state = app.state::<AppState>();
     let app_arc = Arc::new(app.clone());
     let mut aggregate = CoreOutput::default();
+    let mut pending_ui_updates = Vec::new();
+    // Some lifecycle paths execute a persistence effect that has already been
+    // split from its originating CoreOutput. Account for those initial effects
+    // before draining the queue, just as we do for effects produced by inputs.
+    let mut pending_persistence_effects = pending_persistence_count(&pending);
 
     while let Some(work) = pending.pop() {
         match work {
@@ -606,24 +631,45 @@ async fn drive_core_work_queue(
                         CoreInput::Event(event) => inner.engine.handle_event(event)?,
                     }
                 };
-                emit_core_update(app, &output);
+                pending_persistence_effects += output
+                    .effects
+                    .iter()
+                    .filter(|effect| matches!(effect, CoreEffect::PersistState { .. }))
+                    .count();
+                if pending_persistence_effects == 0 {
+                    emit_core_update(app, &output);
+                } else {
+                    pending_ui_updates.push(output.clone());
+                }
                 for effect in output.effects.iter().cloned().rev() {
                     pending.push(DriverWork::Effect(effect));
                 }
                 merge_core_outputs(&mut aggregate, output);
             }
             DriverWork::Effect(effect) => {
+                let is_persistence = matches!(effect, CoreEffect::PersistState { .. });
                 let events = {
                     let mut ports = state.ports.lock().await;
                     ports.set_app_handle(app_arc.clone());
                     execute_platform_effect(&mut *ports, effect).await?
                 };
+                if is_persistence {
+                    state.persistence_revision.fetch_add(1, Ordering::SeqCst);
+                    if complete_persistence(&mut pending_persistence_effects)? {
+                        for output in pending_ui_updates.drain(..) {
+                            emit_core_update(app, &output);
+                        }
+                    }
+                }
                 for event in events.into_iter().rev() {
                     pending.push(DriverWork::Input(CoreInput::Event(event)));
                 }
             }
         }
     }
+
+    debug_assert!(pending_ui_updates.is_empty());
+    debug_assert_eq!(pending_persistence_effects, 0);
 
     Ok(aggregate)
 }
@@ -646,8 +692,12 @@ pub async fn drive_core_then_defer_event_effects(
             CoreInput::Event(evt) => inner.engine.handle_event(evt)?,
         }
     };
+    let (persistence_effects, deferred_effects) = split_persistence_prefix(output.effects.clone());
+    for effect in persistence_effects {
+        execute_effect_with_handle(app, &app_arc, &mut output, effect).await?;
+    }
     emit_core_update(app, &output);
-    for effect in output.effects.clone() {
+    for effect in deferred_effects {
         let events = {
             let mut ports = state.ports.lock().await;
             ports.set_app_handle(app_arc.clone());
@@ -719,10 +769,9 @@ pub async fn drive_core_persist_then_defer_transport(
     );
 
     let (persistence_effects, transport_effects) = split_persistence_prefix(output.effects.clone());
-    if persistence_effects.is_empty() || transport_effects.is_empty() {
+    if persistence_effects.is_empty() {
         emit_core_update(app, &output);
-        // Unexpected effect shapes retain the established synchronous behavior.
-        for effect in persistence_effects.into_iter().chain(transport_effects) {
+        for effect in transport_effects {
             execute_effect_with_handle(app, &app_arc, &mut output, effect).await?;
         }
         return Ok(output);
@@ -737,6 +786,10 @@ pub async fn drive_core_persist_then_defer_transport(
         persistence_started_at.elapsed().as_millis()
     );
     emit_core_update(app, &output);
+
+    if transport_effects.is_empty() {
+        return Ok(output);
+    }
 
     ensure_deferred_transport_worker(app).await;
     let profile_path = state.inner.read().await.profile_path.clone();
@@ -765,7 +818,9 @@ fn split_persistence_prefix(effects: Vec<CoreEffect>) -> (Vec<CoreEffect>, Vec<C
 
 #[cfg(test)]
 mod deferred_send_tests {
-    use super::split_persistence_prefix;
+    use super::{
+        complete_persistence, pending_persistence_count, split_persistence_prefix, DriverWork,
+    };
     use std::sync::Arc;
     use std::time::Duration;
     use tapchat_core::ffi_api::{PersistStateEffect, TimerEffect};
@@ -799,6 +854,31 @@ mod deferred_send_tests {
             &transport[1],
             CoreEffect::ScheduleTimer { timer } if timer.timer_id == "second"
         ));
+    }
+
+    #[test]
+    fn standalone_persistence_effect_is_accounted_before_queue_drain() {
+        let work = vec![DriverWork::Effect(CoreEffect::PersistState {
+            persist: PersistStateEffect {
+                mutations: vec![],
+                ops: Vec::new(),
+                snapshot: None,
+            },
+        })];
+        let mut pending = pending_persistence_count(&work);
+
+        assert_eq!(pending, 1);
+        assert!(complete_persistence(&mut pending).expect("complete persistence"));
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn persistence_accounting_error_is_recoverable() {
+        let mut pending = 0;
+        let error = complete_persistence(&mut pending).expect_err("underflow must be rejected");
+
+        assert_eq!(error.to_string(), "persistence effect accounting underflow");
+        assert_eq!(pending, 0);
     }
 
     #[tokio::test]
@@ -845,7 +925,14 @@ mod deferred_send_tests {
     }
 }
 
-fn emit_core_update(app: &AppHandle, output: &CoreOutput) {
+#[derive(Debug, Clone, Serialize)]
+struct DesktopCoreUpdate<'a> {
+    #[serde(flatten)]
+    output: &'a CoreOutput,
+    persistence_revision: u64,
+}
+
+pub(crate) fn emit_core_update(app: &AppHandle, output: &CoreOutput) {
     let has_updates = output.view_model.is_some()
         || output.state_update.conversations_changed
         || output.state_update.messages_changed
@@ -854,7 +941,17 @@ fn emit_core_update(app: &AppHandle, output: &CoreOutput) {
         || output.state_update.checkpoints_changed
         || !output.state_update.system_statuses_changed.is_empty();
     if has_updates {
-        let _ = app.emit("core-update", output);
+        let revision = app
+            .state::<AppState>()
+            .persistence_revision
+            .load(Ordering::SeqCst);
+        let _ = app.emit(
+            "core-update",
+            DesktopCoreUpdate {
+                output,
+                persistence_revision: revision,
+            },
+        );
     }
     if output.state_update.messages_changed {
         crate::commands::message::schedule_preview_prefetch(app);

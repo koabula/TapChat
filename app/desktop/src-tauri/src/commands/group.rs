@@ -44,6 +44,7 @@ use super::group_view::{
 use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
 };
+use crate::commands::read_state;
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::state::AppState;
@@ -71,6 +72,7 @@ pub struct GroupConversationSummary {
     pub dissolved_at: Option<u64>,
     pub last_message_preview: Option<String>,
     pub message_count: usize,
+    pub unread_count: usize,
 }
 
 /// Full projection for a single group (member drawer / settings panel).
@@ -360,6 +362,9 @@ fn notification_message_from_output(output: &CoreOutput) -> Option<String> {
 pub async fn list_group_conversations(
     state: State<'_, AppState>,
 ) -> crate::errors::DesktopResult<Vec<GroupConversationSummary>> {
+    read_state::ensure_baseline(&state)
+        .await
+        .map_err(crate::errors::DesktopError::from)?;
     Ok(list_group_conversations_impl(state.inner()).await?)
 }
 
@@ -372,6 +377,17 @@ pub async fn list_group_conversations_impl(
 ) -> Result<Vec<GroupConversationSummary>, String> {
     let inner = state.inner.read().await;
     let snapshot = inner.engine.refresh_snapshot();
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile".to_string())?;
+    let local_device_id = snapshot
+        .local_identity
+        .as_ref()
+        .map(|identity| identity.state.device_identity.device_id.clone())
+        .ok_or_else(|| "No active device".to_string())?;
+    let read_state = read_state::load(profile);
     // Index conversations by id for O(1) lookup.
     let mut conversations_by_id: BTreeMap<&str, &tapchat_core::persistence::PersistedConversation> =
         BTreeMap::new();
@@ -404,6 +420,13 @@ pub async fn list_group_conversations_impl(
             dissolved_at: group.dissolved_at,
             last_message_preview: last_application_preview(messages),
             message_count: application_message_count(messages),
+            unread_count: read_state::unread_count(
+                profile,
+                &group.conversation_id,
+                &local_device_id,
+                tapchat_core::model::ConversationKind::Group,
+                &read_state,
+            )?,
         });
     }
     Ok(rows)

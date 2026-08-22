@@ -10,6 +10,7 @@ use tapchat_core::model::{ConversationKind, ConversationState, StorageRef};
 use tapchat_core::{CoreCommand, ErrorDomain};
 
 use super::conversation_view::{generate_last_message_preview, summarize_plaintext};
+use crate::commands::read_state;
 use crate::errors::{DesktopError, DesktopResult};
 use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::{AppState, SessionState};
@@ -24,6 +25,16 @@ pub struct CreateConversationResult {
 pub struct MessagePage {
     pub items: Vec<MessageView>,
     pub next_cursor: Option<String>,
+}
+
+/// Desktop-only sidebar projection. The Core/CLI ConversationSummary remains
+/// unchanged; unread state is local to this Profile and never enters the
+/// transport protocol.
+#[derive(Debug, Clone, Serialize)]
+pub struct DesktopConversationSummary {
+    #[serde(flatten)]
+    pub summary: ConversationSummary,
+    pub unread_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -86,7 +97,10 @@ pub struct MessageView {
 #[tauri::command]
 pub async fn list_conversations(
     state: State<'_, AppState>,
-) -> crate::errors::DesktopResult<Vec<ConversationSummary>> {
+) -> crate::errors::DesktopResult<Vec<DesktopConversationSummary>> {
+    read_state::ensure_baseline(&state)
+        .await
+        .map_err(DesktopError::from)?;
     let inner = state.inner.read().await;
 
     // Get snapshot from engine which contains all conversations
@@ -153,7 +167,38 @@ pub async fn list_conversations(
         })
         .collect();
 
-    Ok(summaries)
+    let pm = inner.profile_manager.inner.read().await;
+    let profile = pm
+        .active_profile
+        .as_ref()
+        .ok_or_else(|| "No active profile".to_string())?;
+    let local_device_id = snapshot
+        .local_identity
+        .as_ref()
+        .map(|identity| identity.state.device_identity.device_id.clone())
+        .or_else(|| match &inner.session {
+            SessionState::Active { device_id } => Some(device_id.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| "No active device".to_string())?;
+    let read_state = read_state::load(profile);
+
+    summaries
+        .into_iter()
+        .map(|summary| {
+            let unread_count = read_state::unread_count(
+                profile,
+                &summary.conversation_id,
+                &local_device_id,
+                summary.kind.unwrap_or(ConversationKind::Direct),
+                &read_state,
+            )?;
+            Ok(DesktopConversationSummary {
+                summary,
+                unread_count,
+            })
+        })
+        .collect()
 }
 
 #[tauri::command]

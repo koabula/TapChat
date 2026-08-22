@@ -105,6 +105,7 @@ function mergeConversationState(
   activeConversationId: string | null,
   markUnread: boolean,
   replace: boolean,
+  unreadAuthoritative: boolean,
 ): Conversation[] {
   const previousById = new Map(
     previous.map((conversation) => [conversation.conversation_id, conversation]),
@@ -138,12 +139,16 @@ function mergeConversationState(
       unread_count:
         conversation.conversation_id === activeConversationId
           ? 0
+          : unreadAuthoritative
+            ? Math.max(0, conversation.unread_count)
           : shouldMarkUnread
             ? 1
             : prior?.unread_count ?? conversation.unread_count,
       has_unread:
         conversation.conversation_id === activeConversationId
           ? false
+          : unreadAuthoritative
+            ? conversation.unread_count > 0
           : shouldMarkUnread || prior?.has_unread || conversation.has_unread,
       // Preserve group-specific metadata that arrived earlier through a
       // group-only merge path (`mergeGroupConversationSnapshot`) when
@@ -180,6 +185,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         state.activeConversationId,
         options?.markUnread ?? false,
         options?.replace ?? false,
+        false,
       ),
     })),
   mergeConversationSnapshot: (snapshots, contacts, options) =>
@@ -199,8 +205,8 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         last_message_time: null,
         message_count: conversation.message_count ?? 0,
         last_activity_key: activityKeyForConversationSummary(conversation),
-        unread_count: 0,
-        has_unread: false,
+        unread_count: conversation.unread_count ?? 0,
+        has_unread: (conversation.unread_count ?? 0) > 0,
         kind: conversation.kind ?? "direct",
         title: conversation.title ?? null,
         group_id: conversation.group_id ?? null,
@@ -222,6 +228,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           state.activeConversationId,
           options?.markUnread ?? false,
           options?.replace ?? false,
+          true,
         ),
       };
     }),
@@ -253,6 +260,13 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           group_role: group.local_role,
           recovery: conversation.recovery,
           dissolved_at: group.dissolved_at,
+          unread_count:
+            conversation.conversation_id === state.activeConversationId
+              ? 0
+              : group.unread_count,
+          has_unread:
+            conversation.conversation_id !== state.activeConversationId &&
+            group.unread_count > 0,
           // Surface the group state (active / dissolved / etc) so UI
           // components can branch on it without a separate fetch.
           state: group.conversation_state,
@@ -273,8 +287,8 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
             String(group.message_count ?? 0),
             group.last_message_preview?.trim() ?? group.title,
           ].join("|"),
-          unread_count: 0,
-          has_unread: false,
+          unread_count: group.unread_count,
+          has_unread: group.unread_count > 0,
           kind: "group" as const,
           title: group.title,
           group_id: group.group_id,

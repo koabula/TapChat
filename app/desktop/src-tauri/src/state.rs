@@ -47,6 +47,9 @@ pub struct AppState {
     pub media_decode_limit: Arc<Semaphore>,
     pub preview_prefetch_running: Arc<AtomicBool>,
     pub profile_generation: Arc<AtomicU64>,
+    /// Monotonic, process-local revision for committed Desktop state updates.
+    /// This is deliberately not part of Core or the transport protocol.
+    pub persistence_revision: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -234,6 +237,7 @@ impl AppState {
             media_decode_limit: Arc::new(Semaphore::new(2)),
             preview_prefetch_running: Arc::new(AtomicBool::new(false)),
             profile_generation: Arc::new(AtomicU64::new(0)),
+            persistence_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 

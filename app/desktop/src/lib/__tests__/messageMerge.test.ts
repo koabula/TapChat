@@ -65,4 +65,10 @@ describe("reconcileLatestMessagePage", () => {
 
     expect(result.map((item) => item.message_id)).toEqual(["msg:old", "msg:new"]);
   });
+
+  it("does not clear existing messages when an incremental refresh is empty", () => {
+    const current = [message("msg:existing", 10, "sent")];
+
+    expect(reconcileLatestMessagePage(current, [])).toEqual(current);
+  });
 });

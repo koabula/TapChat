@@ -67,6 +67,9 @@ export function useCoreUpdate() {
   const clearGroups = useGroupsStore((s) => s.clear);
   const latestConversationRequestIdRef = useRef(0);
   const latestAppliedConversationRequestIdRef = useRef(0);
+  const latestGroupRequestIdRef = useRef(0);
+  const latestConversationRevisionRef = useRef(0);
+  const latestGroupRevisionRef = useRef(0);
   /**
    * Debounce group-snapshot refreshes: back-to-back core-update events
    * that touch the same group (e.g. a commit + its ack) should coalesce
@@ -94,10 +97,18 @@ export function useCoreUpdate() {
   const refreshConversationsFromBackend = async (
     contacts: Array<{ user_id: string; display_name: string | null }>,
     markUnread: boolean,
+    persistenceRevision = 0,
   ) => {
     const requestId = ++latestConversationRequestIdRef.current;
+    latestConversationRevisionRef.current = Math.max(
+      latestConversationRevisionRef.current,
+      persistenceRevision,
+    );
     const conversations = await fetchConversationSnapshot();
-    if (requestId < latestConversationRequestIdRef.current) {
+    if (
+      requestId < latestConversationRequestIdRef.current ||
+      persistenceRevision < latestConversationRevisionRef.current
+    ) {
       return;
     }
     applyConversationSnapshot(requestId, conversations, contacts, markUnread, true);
@@ -143,7 +154,12 @@ export function useCoreUpdate() {
    * vanished from the list (e.g. after a profile switch) are evicted
    * from the store.
    */
-  const refreshGroupsFromBackend = async () => {
+  const refreshGroupsFromBackend = async (persistenceRevision = 0) => {
+    const requestId = ++latestGroupRequestIdRef.current;
+    latestGroupRevisionRef.current = Math.max(
+      latestGroupRevisionRef.current,
+      persistenceRevision,
+    );
     let summaries: GroupConversationSummary[];
     try {
       summaries = await listGroupConversations();
@@ -151,6 +167,12 @@ export function useCoreUpdate() {
       console.debug(
         `[useCoreUpdate] listGroupConversations failed: ${presentError(err).message}`,
       );
+      return;
+    }
+    if (
+      requestId < latestGroupRequestIdRef.current ||
+      persistenceRevision < latestGroupRevisionRef.current
+    ) {
       return;
     }
     mergeGroupConversationSnapshot(summaries);
@@ -170,6 +192,7 @@ export function useCoreUpdate() {
   };
 
   const fetchAndSetData = async () => {
+    const requestId = ++latestConversationRequestIdRef.current;
     try {
       console.debug("[useCoreUpdate] fetching initial data");
 
@@ -181,7 +204,12 @@ export function useCoreUpdate() {
 
       const conversations = await fetchConversationSnapshot();
       console.debug(`[useCoreUpdate] loaded conversations=${conversations.length}`);
-      const requestId = ++latestConversationRequestIdRef.current;
+      if (
+        requestId < latestConversationRequestIdRef.current ||
+        latestConversationRevisionRef.current > 0
+      ) {
+        return;
+      }
       applyConversationSnapshot(requestId, conversations, mappedContacts, false, true);
 
       // Fan out group-specific snapshot refreshes. Keeps groups in
@@ -232,6 +260,10 @@ export function useCoreUpdate() {
 
   const clearStores = () => {
     console.debug("[useCoreUpdate] clearing stores");
+    latestConversationRequestIdRef.current += 1;
+    latestGroupRequestIdRef.current += 1;
+    latestConversationRevisionRef.current = 0;
+    latestGroupRevisionRef.current = 0;
     setConversations([], { replace: true });
     setContacts([]);
     setDeviceId(null);
@@ -255,10 +287,10 @@ export function useCoreUpdate() {
 
     const unlistenCoreUpdate = listen<CoreUpdateEvent>("core-update", (event) => {
       void (async () => {
-        const { state_update, view_model } = event.payload;
+        const { state_update, view_model, persistence_revision } = event.payload;
 
         console.debug(
-          `[useCoreUpdate] core-update conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} identity_changed=${state_update.identity_changed ?? false} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
+          `[useCoreUpdate] core-update revision=${persistence_revision} conversations_changed=${state_update.conversations_changed} contacts_changed=${state_update.contacts_changed} identity_changed=${state_update.identity_changed ?? false} messages_changed=${state_update.messages_changed} has_view_model=${Boolean(view_model)}`,
         );
 
         let nextContacts = useContactsStore.getState().contacts;
@@ -283,31 +315,21 @@ export function useCoreUpdate() {
         }
 
         if (state_update.conversations_changed || state_update.messages_changed) {
-          if (view_model?.conversations) {
-            const requestId = ++latestConversationRequestIdRef.current;
-            applyConversationSnapshot(
-              requestId,
-              view_model.conversations,
-              nextContacts,
-              state_update.messages_changed,
-              false,
+          void refreshConversationsFromBackend(
+            nextContacts,
+            state_update.messages_changed,
+            persistence_revision,
+          ).catch((err) => {
+            console.error(
+              `[useCoreUpdate] failed to refresh conversations from backend: ${presentError(err).message}`,
             );
-          } else {
-            void refreshConversationsFromBackend(
-              nextContacts,
-              state_update.messages_changed,
-            ).catch((err) => {
-              console.error(
-                `[useCoreUpdate] failed to refresh conversations from backend: ${presentError(err).message}`,
-              );
-            });
-          }
+          });
           // Keep group snapshots in lock-step with the conversation list.
           // Every conversation change that could touch a group (membership
           // commit, new join, metadata update, dissolve) goes through
           // this branch, so we always re-fetch the flat group list and
           // fan out per-group snapshot refreshes.
-          void refreshGroupsFromBackend().catch((err) => {
+          void refreshGroupsFromBackend(persistence_revision).catch((err) => {
             console.debug(
               `[useCoreUpdate] failed to refresh groups from backend: ${presentError(err).message}`,
             );

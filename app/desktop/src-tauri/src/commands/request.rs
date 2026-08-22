@@ -4,9 +4,11 @@ use tapchat_core::model::{ConversationKind, ConversationState};
 use tapchat_core::persistence::ContactRelationshipStatus;
 use tapchat_core::transport_contract::MessageRequestAction;
 use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
-use crate::lifecycle::{drive_core_then_defer_event_effects, drive_core_with_handle, CoreInput};
+use crate::lifecycle::{
+    drive_core_then_defer_event_effects, drive_core_with_handle, emit_core_update, CoreInput,
+};
 use crate::platform::log_sanitize::redact_id;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::AppState;
@@ -186,9 +188,9 @@ async fn act_on_message_request_impl(
                 );
             }
 
-            let _ = app.emit(
-                "core-update",
-                CoreOutput {
+            emit_core_update(
+                &app,
+                &CoreOutput {
                     state_update: CoreStateUpdate {
                         contacts_changed: true,
                         conversations_changed: conversation_id.is_some(),

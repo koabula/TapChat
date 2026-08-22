@@ -146,6 +146,7 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
         media_decode_limit: Arc::new(tokio::sync::Semaphore::new(2)),
         preview_prefetch_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         profile_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        persistence_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 

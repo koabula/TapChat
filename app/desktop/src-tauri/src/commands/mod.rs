@@ -11,6 +11,7 @@ mod group_view;
 pub mod identity;
 pub mod message;
 pub mod profile;
+pub mod read_state;
 pub mod request;
 pub mod session;
 #[cfg(feature = "gui")]

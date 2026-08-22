@@ -148,6 +148,16 @@ export async function getMessages(
   return invoke("get_messages", { conversationId, beforeCursor, limit });
 }
 
+export async function markConversationRead(
+  conversationId: string,
+  lastMessageId: string,
+): Promise<void> {
+  return invoke("mark_conversation_read", {
+    conversationId,
+    lastMessageId,
+  });
+}
+
 // Messages
 export async function sendText(
   conversationId: string,
@@ -395,6 +405,7 @@ export interface GroupConversationSummary {
   dissolved_at: number | null;
   last_message_preview: string | null;
   message_count: number;
+  unread_count: number;
 }
 
 export interface WelcomePickupShareable extends WelcomePickupDescriptor {

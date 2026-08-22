@@ -17,6 +17,7 @@ use crate::ffi_api::{
     PersistenceValue,
 };
 use crate::fs_util::write_atomic_unique;
+use crate::model::ConversationKind;
 use crate::persistence::{
     decode_snapshot, encode_snapshot, CorePersistenceSnapshot, PersistOp, PersistedContact,
     PersistedConversation, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
@@ -218,6 +219,14 @@ pub struct MessagePage {
     pub next_cursor: Option<String>,
 }
 
+/// Stable local cursor used by the Desktop-only read state. It is intentionally
+/// not part of the transport or Core protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReadCursor {
+    pub created_at: u64,
+    pub message_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationMessageSummary {
     pub conversation_id: String,
@@ -331,6 +340,51 @@ impl ProfileStorageSession {
         self.execute(move |connection| query_messages_from_conn(connection, &query))
     }
 
+    pub fn count_received_visible_messages(
+        &self,
+        conversation_id: &str,
+        local_device_id: &str,
+        kind: ConversationKind,
+        after: Option<&MessageReadCursor>,
+    ) -> Result<u64> {
+        let conversation_id = conversation_id.to_string();
+        let local_device_id = local_device_id.to_string();
+        let after = after.cloned();
+        self.execute(move |connection| {
+            count_received_visible_messages_from_conn(
+                connection,
+                &conversation_id,
+                &local_device_id,
+                kind,
+                after.as_ref(),
+            )
+        })
+    }
+
+    pub fn latest_visible_message_cursor(
+        &self,
+        conversation_id: &str,
+        kind: ConversationKind,
+    ) -> Result<Option<MessageReadCursor>> {
+        let conversation_id = conversation_id.to_string();
+        self.execute(move |connection| {
+            latest_visible_message_cursor_from_conn(connection, &conversation_id, kind)
+        })
+    }
+
+    pub fn visible_message_cursor(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> Result<Option<MessageReadCursor>> {
+        let conversation_id = conversation_id.to_string();
+        let message_id = message_id.to_string();
+        self.execute(move |connection| {
+            visible_message_cursor_from_conn(connection, &conversation_id, &message_id, kind)
+        })
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         self.execute(|connection| {
             connection
@@ -432,6 +486,45 @@ impl<'a> SqlCipherLocalStore<'a> {
         let conn = self.connect()?;
         ensure_schema(&conn)?;
         query_messages_from_conn(&conn, query)
+    }
+
+    pub fn count_received_visible_messages(
+        &self,
+        conversation_id: &str,
+        local_device_id: &str,
+        kind: ConversationKind,
+        after: Option<&MessageReadCursor>,
+    ) -> Result<u64> {
+        let conn = self.connect()?;
+        ensure_schema(&conn)?;
+        count_received_visible_messages_from_conn(
+            &conn,
+            conversation_id,
+            local_device_id,
+            kind,
+            after,
+        )
+    }
+
+    pub fn latest_visible_message_cursor(
+        &self,
+        conversation_id: &str,
+        kind: ConversationKind,
+    ) -> Result<Option<MessageReadCursor>> {
+        let conn = self.connect()?;
+        ensure_schema(&conn)?;
+        latest_visible_message_cursor_from_conn(&conn, conversation_id, kind)
+    }
+
+    pub fn visible_message_cursor(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        kind: ConversationKind,
+    ) -> Result<Option<MessageReadCursor>> {
+        let conn = self.connect()?;
+        ensure_schema(&conn)?;
+        visible_message_cursor_from_conn(&conn, conversation_id, message_id, kind)
     }
 
     pub fn checkpoint(&self) -> Result<()> {
@@ -2181,6 +2274,117 @@ fn query_messages_from_conn(conn: &Connection, query: &MessageQuery) -> Result<M
     })
 }
 
+const DIRECT_VISIBLE_MESSAGE_TYPES_SQL: &str = concat!(
+    "'\"mls_application\"',",
+    "'\"control_contact_removed\"',",
+    "'\"control_identity_state_updated\"'",
+);
+const GROUP_VISIBLE_MESSAGE_TYPES_SQL: &str = concat!(
+    "'\"mls_application\"',",
+    "'\"control_group_state_event\"',",
+    "'\"control_conversation_needs_rebuild\"'",
+);
+
+fn visible_message_types_sql(kind: ConversationKind) -> &'static str {
+    match kind {
+        ConversationKind::Direct => DIRECT_VISIBLE_MESSAGE_TYPES_SQL,
+        ConversationKind::Group => GROUP_VISIBLE_MESSAGE_TYPES_SQL,
+    }
+}
+
+fn count_received_visible_messages_from_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    local_device_id: &str,
+    kind: ConversationKind,
+    after: Option<&MessageReadCursor>,
+) -> Result<u64> {
+    let type_filter = visible_message_types_sql(kind);
+    let count = match after {
+        Some(after) => {
+            let sql = format!(
+                "SELECT COUNT(*) FROM messages
+                 WHERE conversation_id = ?1
+                   AND sender_device_id <> ?2
+                   AND plaintext IS NOT NULL
+                   AND message_type IN ({type_filter})
+                   AND (created_at > ?3 OR (created_at = ?3 AND message_id > ?4))"
+            );
+            conn.query_row(
+                &sql,
+                params![
+                    conversation_id,
+                    local_device_id,
+                    after.created_at as i64,
+                    after.message_id
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+        }
+        None => {
+            let sql = format!(
+                "SELECT COUNT(*) FROM messages
+                 WHERE conversation_id = ?1
+                   AND sender_device_id <> ?2
+                   AND plaintext IS NOT NULL
+                   AND message_type IN ({type_filter})"
+            );
+            conn.query_row(&sql, params![conversation_id, local_device_id], |row| {
+                row.get::<_, i64>(0)
+            })?
+        }
+    };
+    Ok(count.max(0) as u64)
+}
+
+fn latest_visible_message_cursor_from_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    kind: ConversationKind,
+) -> Result<Option<MessageReadCursor>> {
+    let type_filter = visible_message_types_sql(kind);
+    let sql = format!(
+        "SELECT created_at, message_id FROM messages
+         WHERE conversation_id = ?1
+         AND plaintext IS NOT NULL
+         AND message_type IN ({type_filter})
+         ORDER BY created_at DESC, message_id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, params![conversation_id], |row| {
+        Ok(MessageReadCursor {
+            created_at: row.get::<_, i64>(0)?.max(0) as u64,
+            message_id: row.get(1)?,
+        })
+    })
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+fn visible_message_cursor_from_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+    kind: ConversationKind,
+) -> Result<Option<MessageReadCursor>> {
+    let type_filter = visible_message_types_sql(kind);
+    let sql = format!(
+        "SELECT created_at, message_id FROM messages
+         WHERE conversation_id = ?1
+         AND (message_id = ?2 OR app_message_id = ?2)
+         AND plaintext IS NOT NULL
+         AND message_type IN ({type_filter})
+         ORDER BY created_at DESC, message_id DESC LIMIT 1"
+    );
+    conn.query_row(&sql, params![conversation_id, message_id], |row| {
+        Ok(MessageReadCursor {
+            created_at: row.get::<_, i64>(0)?.max(0) as u64,
+            message_id: row.get(1)?,
+        })
+    })
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
 fn decode_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
     let message_type: String = row.get(6)?;
     let storage_refs: Vec<u8> = row.get(9)?;
@@ -2859,5 +3063,169 @@ mod tests {
             .expect("collect query plan")
             .join("\n");
         assert!(plan.contains("messages_page_idx"), "query plan: {plan}");
+    }
+
+    #[test]
+    fn received_visible_message_count_uses_device_and_message_cursor() {
+        let dir = tempdir().expect("tempdir");
+        let pdek = generate_pdek();
+        let store = SqlCipherLocalStore::new(dir.path(), "profile:test", &*pdek);
+        let conversation_id = "conversation:unread".to_string();
+        let local_device_id = "device:alice:phone";
+        let remote_device_id = "device:bob:phone";
+
+        let message = |message_id: &str,
+                       sender_device_id: &str,
+                       message_type: MessageType,
+                       created_at: u64,
+                       plaintext: Option<&str>| StoredMessage {
+            message_id: message_id.into(),
+            app_message_id: Some(format!("app:{message_id}")),
+            mls_ciphertext_sha256: None,
+            sender_user_id: Some("user:bob".into()),
+            sender_device_id: sender_device_id.into(),
+            recipient_device_id: local_device_id.into(),
+            message_type,
+            created_at,
+            plaintext: plaintext.map(str::to_string),
+            storage_refs: Vec::new(),
+            delivery_state: None,
+            message_request_id: None,
+        };
+
+        let conversation = Conversation {
+            conversation_id: conversation_id.clone(),
+            kind: ConversationKind::Direct,
+            member_users: vec!["user:alice".into(), "user:bob".into()],
+            member_devices: vec![
+                ConversationMember {
+                    user_id: "user:alice".into(),
+                    device_id: local_device_id.into(),
+                    status: DeviceStatusKind::Active,
+                },
+                ConversationMember {
+                    user_id: "user:bob".into(),
+                    device_id: remote_device_id.into(),
+                    status: DeviceStatusKind::Active,
+                },
+            ],
+            state: ConversationState::Active,
+            updated_at: 12,
+        };
+        let messages = vec![
+            message(
+                "message:received-1",
+                remote_device_id,
+                MessageType::MlsApplication,
+                10,
+                Some("one"),
+            ),
+            message(
+                "message:received-2",
+                remote_device_id,
+                MessageType::MlsApplication,
+                10,
+                Some("two"),
+            ),
+            message(
+                "message:sent",
+                local_device_id,
+                MessageType::MlsApplication,
+                11,
+                Some("local"),
+            ),
+            message(
+                "message:commit",
+                remote_device_id,
+                MessageType::MlsCommit,
+                12,
+                None,
+            ),
+            message(
+                "message:group-control",
+                remote_device_id,
+                MessageType::ControlConversationNeedsRebuild,
+                13,
+                Some("control_group_dissolved"),
+            ),
+        ];
+        let last_message_type = messages.last().map(|value| value.message_type);
+        let state = crate::conversation::LocalConversationState {
+            conversation: conversation.clone(),
+            messages,
+            last_message_type,
+            peer_user_id: "user:bob".into(),
+            last_known_peer_active_devices: [remote_device_id.to_string()].into_iter().collect(),
+            recovery_status: crate::conversation::RecoveryStatus::Healthy,
+            archive_metadata: None,
+        };
+        store
+            .save_snapshot(&CorePersistenceSnapshot {
+                conversations: vec![PersistedConversation {
+                    conversation_id: conversation_id.clone(),
+                    state,
+                }],
+                ..CorePersistenceSnapshot::default()
+            })
+            .expect("save conversation");
+
+        assert_eq!(
+            store
+                .count_received_visible_messages(
+                    &conversation_id,
+                    local_device_id,
+                    ConversationKind::Direct,
+                    None,
+                )
+                .expect("count all"),
+            2
+        );
+        assert_eq!(
+            store
+                .count_received_visible_messages(
+                    &conversation_id,
+                    local_device_id,
+                    ConversationKind::Direct,
+                    Some(&MessageReadCursor {
+                        created_at: 10,
+                        message_id: "message:received-1".into(),
+                    }),
+                )
+                .expect("count after cursor"),
+            1
+        );
+        assert_eq!(
+            store
+                .count_received_visible_messages(
+                    &conversation_id,
+                    local_device_id,
+                    ConversationKind::Group,
+                    None,
+                )
+                .expect("count group-visible messages"),
+            3
+        );
+        assert_eq!(
+            store
+                .latest_visible_message_cursor(&conversation_id, ConversationKind::Direct)
+                .expect("latest cursor"),
+            Some(MessageReadCursor {
+                created_at: 11,
+                message_id: "message:sent".into(),
+            })
+        );
+        assert_eq!(
+            store
+                .visible_message_cursor(
+                    &conversation_id,
+                    "app:message:received-2",
+                    ConversationKind::Direct,
+                )
+                .expect("logical message cursor"),
+            Some(MessageReadCursor {
+                created_at: 10,
+                message_id: "message:received-2".into(),
+            })
+        );
     }
 }
