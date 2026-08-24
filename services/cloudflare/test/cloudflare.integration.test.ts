@@ -837,15 +837,7 @@ test("runtime integration: message request changes push over realtime and inbox 
   const requests = (await requestsResponse.json()) as MessageRequestListResult;
   assert.equal(requests.requests.length, 1);
 
-  const acceptResponse = await mf.dispatchFetch(
-    `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`,
-    {
-      method: "POST",
-      headers: authHeaders(token)
-    }
-  );
-  assert.equal(acceptResponse.status, 200);
-  const acceptedEvent = await waitForMatchingWebSocketMessage(socket, (value): value is {
+  const acceptedEventPromise = waitForMatchingWebSocketMessage(socket, (value): value is {
     event: string;
     senderUserId: string;
     requestId: string;
@@ -862,6 +854,15 @@ test("runtime integration: message request changes push over realtime and inbox 
       candidate.requestId === requests.requests[0].requestId
     );
   });
+  const acceptResponse = await mf.dispatchFetch(
+    `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`,
+    {
+      method: "POST",
+      headers: authHeaders(token)
+    }
+  );
+  assert.equal(acceptResponse.status, 200);
+  const acceptedEvent = await acceptedEventPromise;
   assert.equal(acceptedEvent.event, "message_request_changed");
   assert.equal(acceptedEvent.senderUserId, "user:mallory");
   assert.equal(acceptedEvent.requestId, requests.requests[0].requestId);
