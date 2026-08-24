@@ -134,10 +134,14 @@ jobs:
             build_args: '--target aarch64-apple-darwin'
 
     runs-on: ${{ matrix.runner }}
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/tapchat-target-${{ matrix.platform }}
 
     steps:
+      - name: Configure Cargo target directory
+        shell: pwsh
+        run: |
+          $cargoTargetDir = Join-Path $env:RUNNER_TEMP "tapchat-target-${{ matrix.platform }}"
+          "CARGO_TARGET_DIR=$cargoTargetDir" >> $env:GITHUB_ENV
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
