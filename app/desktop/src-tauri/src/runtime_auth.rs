@@ -304,7 +304,7 @@ async fn poll_runtime_ready(
     };
     if ready.ready
         && ready.runtime_id == runtime_id
-        && ready.protocol_version == 6
+        && ready.protocol_version == 5
         && ready.worker_build_id == worker_build_id
         && ready.registry_schema_version == 2
     {
@@ -738,7 +738,7 @@ mod tests {
         serde_json::json!({
             "ready": true,
             "runtimeId": "runtime-1",
-            "protocolVersion": 6,
+            "protocolVersion": 5,
             "workerBuildId": "worker-1",
             "registrySchemaVersion": 2
         })
@@ -749,14 +749,14 @@ mod tests {
         serde_json::json!({
             "version": "0.1",
             "runtimeId": runtime_id,
-            "protocolVersion": 6,
+            "protocolVersion": 5,
             "workerBuildId": "worker-1",
             "registrySchemaVersion": 2,
             "region": "test",
             "inboxHttpEndpoint": base_url,
             "inboxWebsocketEndpoint": base_url.replace("http://", "ws://"),
             "storageBaseInfo": { "baseUrl": base_url },
-            "runtimeConfig": { "features": ["group_crypto_epoch_v1"] }
+            "runtimeConfig": {}
         })
         .to_string()
     }

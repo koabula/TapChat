@@ -896,7 +896,6 @@ pub enum GroupCapabilityOperation {
     AppendApplication,
     AppendControl,
     AppendMembership,
-    AppendEpoch,
     ManageInvites,
     ApproveJoin,
     RemoveMember,
@@ -1069,66 +1068,6 @@ pub struct GroupEnvelope {
         skip_serializing_if = "Option::is_none"
     )]
     pub transition_id: Option<String>,
-    #[serde(default, alias = "mls_epoch", skip_serializing_if = "Option::is_none")]
-    pub mls_epoch: Option<u64>,
-    #[serde(
-        default,
-        alias = "epoch_head_hash",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub epoch_head_hash: Option<String>,
-    #[serde(
-        default,
-        alias = "epoch_authenticator_sha256",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub epoch_authenticator_sha256: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProtectedGroupAppMessage {
-    pub version: String,
-    pub group_id: String,
-    pub conversation_id: String,
-    pub app_message_id: String,
-    pub sender_user_id: String,
-    pub sender_device_id: String,
-    pub mls_epoch: u64,
-    pub epoch_head_hash: String,
-    pub body: String,
-}
-
-impl ProtectedGroupAppMessage {
-    pub fn to_json_bytes(&self) -> CoreResult<Vec<u8>> {
-        self.validate()?;
-        serde_json::to_vec(self).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "protected group application serialize failed: {error}"
-            ))
-        })
-    }
-
-    pub fn from_json_slice(bytes: &[u8]) -> CoreResult<Self> {
-        let message: Self = serde_json::from_slice(bytes).map_err(|error| {
-            CoreError::invalid_input(format!("protected group application parse failed: {error}"))
-        })?;
-        message.validate()?;
-        Ok(message)
-    }
-}
-
-impl Validate for ProtectedGroupAppMessage {
-    fn validate(&self) -> CoreResult<()> {
-        validate_version(&self.version)?;
-        validate_required("group_id", &self.group_id)?;
-        validate_required("conversation_id", &self.conversation_id)?;
-        validate_required("app_message_id", &self.app_message_id)?;
-        validate_required("sender_user_id", &self.sender_user_id)?;
-        validate_required("sender_device_id", &self.sender_device_id)?;
-        validate_required("epoch_head_hash", &self.epoch_head_hash)?;
-        validate_required("body", &self.body)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1895,9 +1834,9 @@ impl Validate for DeploymentBundle {
     fn validate(&self) -> CoreResult<()> {
         validate_version(&self.version)?;
         validate_required("runtime_id", &self.runtime_id)?;
-        if self.protocol_version != 6 {
+        if self.protocol_version != 5 {
             return Err(CoreError::invalid_input(format!(
-                "unsupported runtime protocol {}, expected 6",
+                "unsupported runtime protocol {}, expected 5",
                 self.protocol_version
             )));
         }
@@ -1912,17 +1851,6 @@ impl Validate for DeploymentBundle {
         validate_required("inbox_http_endpoint", &self.inbox_http_endpoint)?;
         validate_required("inbox_websocket_endpoint", &self.inbox_websocket_endpoint)?;
         validate_runtime_config(&self.runtime_config)?;
-        if !self
-            .runtime_config
-            .features
-            .iter()
-            .any(|feature| feature == "group_crypto_epoch_v1")
-        {
-            return Err(CoreError::new(
-                "runtime_upgrade_required",
-                "runtime does not declare group_crypto_epoch_v1",
-            ));
-        }
         if let Some(user_id) = &self.expected_user_id {
             validate_required("expected_user_id", user_id)?;
         }
@@ -2502,17 +2430,14 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "local".into(),
             inbox_http_endpoint: "https://example.com".into(),
             inbox_websocket_endpoint: "wss://example.com/ws".into(),
             storage_base_info: StorageBaseInfo::default(),
-            runtime_config: RuntimeConfig {
-                features: vec!["group_crypto_epoch_v1".into()],
-                ..RuntimeConfig::default()
-            },
+            runtime_config: RuntimeConfig::default(),
             expected_user_id: Some(String::new()),
             expected_device_id: None,
         };
@@ -2527,7 +2452,7 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "local".into(),
@@ -2562,11 +2487,7 @@ mod tests {
             device_status_ref: Some("ref:device-status:alice".into()),
             keypackage_ref_base: Some("ref:keypackages:alice".into()),
             max_inline_bytes: Some(4096),
-            features: vec![
-                "generic_sync".into(),
-                "attachment_v1".into(),
-                "group_crypto_epoch_v1".into(),
-            ],
+            features: vec!["generic_sync".into(), "attachment_v1".into()],
         };
 
         let json = serde_json::to_string(&config).expect("serialize runtime config");
@@ -2583,7 +2504,7 @@ mod tests {
         let bundle = DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "local".into(),
@@ -2843,9 +2764,6 @@ mod tests {
                     signature: "member-proof".into(),
                 }),
                 transition_id: None,
-                mls_epoch: None,
-                epoch_head_hash: None,
-                epoch_authenticator_sha256: None,
             },
         }
     }

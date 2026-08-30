@@ -592,7 +592,7 @@ impl Profile {
         )?;
         if !root.join(STATE_DB_FILE_NAME).exists() {
             bail!(
-                "profile state.db is missing; legacy profile layouts are not opened by schema v3"
+                "profile state.db is missing; legacy profile layouts are not opened by schema v2"
             );
         }
         let storage_session = Arc::new(ProfileStorageSession::open(
@@ -2023,7 +2023,7 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_profile_layout_and_schema_v3_database() {
+    fn init_creates_profile_layout_and_schema_v2_database() {
         let _guard = env_lock();
         let dir = tempdir().expect("tempdir");
         unsafe {
@@ -2158,7 +2158,7 @@ mod tests {
         .expect("init profile");
         let diagnostics = profile.storage_diagnostics().expect("storage diagnostics");
         assert!(diagnostics.state_db_exists);
-        assert_eq!(diagnostics.schema_version, Some(3));
+        assert_eq!(diagnostics.schema_version, Some(2));
         assert_eq!(diagnostics.migration_complete, Some(false));
         drop(profile);
 
@@ -2301,7 +2301,7 @@ mod tests {
         let bundle = crate::model::DeploymentBundle {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "test".into(),

@@ -65,7 +65,7 @@ async function createRuntime(options?: { maxInlineBytes?: string; retentionDays?
       RUNTIME_ID,
       OWNER_USER_ID: options?.ownerUserId ?? "user:bob",
       OWNER_USER_PUBLIC_KEY: bytesToHex(ed25519.getPublicKey(new Uint8Array(32).fill(11))),
-      WORKER_BUILD_ID: "integration-worker-v6",
+      WORKER_BUILD_ID: "integration-worker-v5",
       DEPLOYMENT_REGION: "local",
       MAX_INLINE_BYTES: options?.maxInlineBytes ?? "128",
       RETENTION_DAYS: options?.retentionDays ?? "1",
@@ -102,8 +102,8 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
   assert.deepEqual(await readyResponse.json(), {
     ready: true,
     runtimeId: RUNTIME_ID,
-    protocolVersion: 6,
-    workerBuildId: "integration-worker-v6",
+    protocolVersion: 5,
+    workerBuildId: "integration-worker-v5",
     registrySchemaVersion: 2
   });
   const challengeResponse = await mf.dispatchFetch(`${BASE_URL}/v2/runtime-auth/challenge`, {

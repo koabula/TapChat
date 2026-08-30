@@ -140,79 +140,7 @@ impl CoreEngine {
             },
             membership_proof: None,
             transition_id: None,
-            mls_epoch: None,
-            epoch_head_hash: None,
-            epoch_authenticator_sha256: None,
         })
-    }
-
-    pub(super) fn group_crypto_head_hash(
-        previous_head_hash: &str,
-        next_epoch: u64,
-        commit_b64: &str,
-        epoch_authenticator_sha256: &str,
-        committer_user_id: &str,
-        committer_device_id: &str,
-    ) -> CoreResult<String> {
-        let commit = STANDARD.decode(commit_b64).map_err(|error| {
-            CoreError::invalid_input(format!("group MLS commit is not base64: {error}"))
-        })?;
-        Ok(format!(
-            "{:x}",
-            Sha256::digest(
-                format!(
-                    "tapchat.group_crypto_head.v1\n{}\n{}\n{:x}\n{}\n{}\n{}",
-                    previous_head_hash,
-                    next_epoch,
-                    Sha256::digest(commit),
-                    epoch_authenticator_sha256,
-                    committer_user_id,
-                    committer_device_id,
-                )
-                .as_bytes()
-            )
-        ))
-    }
-
-    pub(super) fn bind_group_envelope_epoch(
-        &self,
-        envelope: &mut GroupEnvelope,
-        epoch: u64,
-        head_hash: &str,
-        epoch_authenticator_sha256: Option<&str>,
-    ) -> CoreResult<()> {
-        let identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let payload = envelope.inline_ciphertext.as_deref().unwrap_or_default();
-        let signing_payload = Self::group_envelope_epoch_signature_payload(
-            payload,
-            epoch,
-            head_hash,
-            epoch_authenticator_sha256,
-        );
-        envelope.mls_epoch = Some(epoch);
-        envelope.epoch_head_hash = Some(head_hash.to_string());
-        envelope.epoch_authenticator_sha256 = epoch_authenticator_sha256.map(str::to_string);
-        envelope.sender_proof.value = identity.sign_sender_proof(signing_payload.as_bytes());
-        Ok(())
-    }
-
-    pub(super) fn group_envelope_epoch_signature_payload(
-        payload: &str,
-        epoch: u64,
-        head_hash: &str,
-        epoch_authenticator_sha256: Option<&str>,
-    ) -> String {
-        format!(
-            "tapchat.group_envelope_epoch.v1\npayload={}\nmls_epoch={}\nepoch_head_hash={}\nepoch_authenticator_sha256={}",
-            payload,
-            epoch,
-            head_hash,
-            epoch_authenticator_sha256.unwrap_or_default()
-        )
     }
 
     pub(super) fn enqueue_group_envelope(
@@ -369,37 +297,6 @@ impl CoreEngine {
             &manifest.signer_device_id,
             &Self::manifest_signing_payload(manifest)?,
             &manifest.signature,
-        )
-    }
-
-    pub(super) fn verify_epoch_bound_group_envelope(
-        &self,
-        envelope: &GroupEnvelope,
-    ) -> CoreResult<()> {
-        let epoch = envelope
-            .mls_epoch
-            .ok_or_else(|| CoreError::invalid_input("group envelope is missing MLS epoch"))?;
-        let head_hash = envelope
-            .epoch_head_hash
-            .as_deref()
-            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .ok_or_else(|| CoreError::invalid_input("group envelope has an invalid crypto head"))?;
-        if envelope.sender_proof.proof_type != "device_signature" {
-            return Err(CoreError::invalid_input(
-                "group envelope requires a device signature",
-            ));
-        }
-        self.verify_device_signature(
-            &envelope.sender_user_id,
-            &envelope.sender_device_id,
-            Self::group_envelope_epoch_signature_payload(
-                envelope.inline_ciphertext.as_deref().unwrap_or_default(),
-                epoch,
-                head_hash,
-                envelope.epoch_authenticator_sha256.as_deref(),
-            )
-            .as_bytes(),
-            &envelope.sender_proof.value,
         )
     }
 
@@ -802,11 +699,6 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: current_state.leave_requests.clone(),
-                pcs_state: current_state.pcs_state.clone(),
-                crypto_epoch: current_state.crypto_epoch,
-                crypto_head_hash: current_state.crypto_head_hash.clone(),
-                pending_secure_send: current_state.pending_secure_send.clone(),
-                pending_epoch_transition: current_state.pending_epoch_transition.clone(),
             },
         );
         let _ = self.sync_conversation_members_from_manifest(conversation_id, &updated);
@@ -934,13 +826,11 @@ impl CoreEngine {
                     })
             }
             "update_metadata" => {
-                new.last_commit_message_id == old.last_commit_message_id
-                    && Self::metadata_update_is_well_formed(old, new)
+                Self::metadata_update_is_well_formed(old, new)
                     && Self::manifest_transition_matches(old, new, |expected| {
                         expected.title = new.title.clone();
                         expected.join_policy = new.join_policy;
                         expected.member_invite_policy = new.member_invite_policy;
-                        expected.last_commit_message_id = new.last_commit_message_id.clone();
                     })
             }
             "set_admin" => {
@@ -948,7 +838,6 @@ impl CoreEngine {
                     && Self::manifest_transition_matches(old, new, |expected| {
                         expected.members = new.members.clone();
                         expected.admins = new.admins.clone();
-                        expected.last_commit_message_id = new.last_commit_message_id.clone();
                     })
             }
             "transfer_ownership" => {
@@ -957,7 +846,6 @@ impl CoreEngine {
                         expected.owner_user_id = new.owner_user_id.clone();
                         expected.members = new.members.clone();
                         expected.admins = new.admins.clone();
-                        expected.last_commit_message_id = new.last_commit_message_id.clone();
                     })
             }
             "dissolve" => {

@@ -794,7 +794,7 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 6,
+            protocol_version: 5,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "local".into(),
@@ -814,7 +814,7 @@ mod tests {
                 ),
                 keypackage_ref_base: Some("https://storage.example.com/keypackages".into()),
                 max_inline_bytes: Some(4096),
-                features: vec!["generic_sync".into(), "group_crypto_epoch_v1".into()],
+                features: vec!["generic_sync".into()],
             },
             expected_user_id: None,
             expected_device_id: None,

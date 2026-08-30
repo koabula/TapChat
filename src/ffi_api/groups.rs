@@ -13,7 +13,6 @@ pub(super) fn group_capability_operations(role: GroupRole) -> Vec<GroupCapabilit
             GroupCapabilityOperation::AppendApplication,
             GroupCapabilityOperation::AppendControl,
             GroupCapabilityOperation::AppendMembership,
-            GroupCapabilityOperation::AppendEpoch,
             GroupCapabilityOperation::ManageInvites,
             GroupCapabilityOperation::ApproveJoin,
             GroupCapabilityOperation::RemoveMember,
@@ -27,7 +26,6 @@ pub(super) fn group_capability_operations(role: GroupRole) -> Vec<GroupCapabilit
             GroupCapabilityOperation::AppendApplication,
             GroupCapabilityOperation::AppendControl,
             GroupCapabilityOperation::AppendMembership,
-            GroupCapabilityOperation::AppendEpoch,
             GroupCapabilityOperation::ManageInvites,
             GroupCapabilityOperation::ApproveJoin,
             GroupCapabilityOperation::RemoveMember,
@@ -38,7 +36,6 @@ pub(super) fn group_capability_operations(role: GroupRole) -> Vec<GroupCapabilit
             GroupCapabilityOperation::Subscribe,
             GroupCapabilityOperation::AppendApplication,
             GroupCapabilityOperation::AppendControl,
-            GroupCapabilityOperation::AppendEpoch,
         ],
     }
 }

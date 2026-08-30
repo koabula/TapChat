@@ -223,7 +223,7 @@ impl CoreEngine {
                             request_id,
                             pending.transition_id.clone(),
                             pending.proposed_manifest.clone(),
-                            pending.first_seq.unwrap_or(1).saturating_sub(1),
+                            pending.last_seq.unwrap_or(0),
                         )
                     });
                     state.pending_group_transition = None;
@@ -901,27 +901,7 @@ impl CoreEngine {
         head_seq: u64,
         current_roster_version: Option<u64>,
         last_commit_message_id: Option<String>,
-        crypto_epoch: u64,
-        crypto_head_hash: String,
-        group_app_count: u32,
-        application_index: u64,
-        active_leaf_count: usize,
-        leaf_last_update_index: BTreeMap<String, u64>,
     ) -> CoreResult<CoreOutput> {
-        if active_leaf_count > crate::pcs_policy::GROUP_MAX_ACTIVE_LEAVES {
-            return Err(CoreError::new(
-                "group_leaf_limit_exceeded",
-                "group has more than 16 active MLS leaves; application sending is disabled",
-            ));
-        }
-        self.state
-            .group_sync_target_crypto_head
-            .insert(group_id.clone(), (crypto_epoch, crypto_head_hash.clone()));
-        if let Some(state) = self.state.group_states.get_mut(&group_id) {
-            state.pcs_state.group_app_count_since_update = group_app_count;
-            state.pcs_state.application_index = application_index;
-            state.pcs_state.leaf_last_update_index = leaf_last_update_index;
-        }
         if self.state.group_states.get(&group_id).is_some_and(|state| {
             state.consistency_state == GroupConsistencyState::BlockedNeedsRebuild
         }) {
@@ -997,31 +977,14 @@ impl CoreEngine {
                     head_seq,
                     cursor.last_fetched_seq
                 );
-                let local = self
-                    .state
-                    .group_states
-                    .get(&group_id)
-                    .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
-                if local.crypto_epoch != crypto_epoch || local.crypto_head_hash != crypto_head_hash
-                {
-                    return Err(CoreError::new(
-                        "crypto_log_gap",
-                        "group outbox head advanced without an available canonical Commit",
-                    ));
-                }
-                self.state.group_sync_target_crypto_head.remove(&group_id);
-                let caught_up = CoreOutput {
+                return Ok(CoreOutput {
                     state_update: CoreStateUpdate {
                         checkpoints_changed: true,
                         ..CoreStateUpdate::default()
                     },
                     effects: vec![],
                     view_model: None,
-                };
-                return Ok(merge_outputs(
-                    caught_up,
-                    self.continue_group_secure_send(group_id)?,
-                ));
+                });
             }
             // Store the target head so the fetch loop in
             // handle_group_outbox_records knows when it has caught up.
@@ -1633,82 +1596,6 @@ impl CoreEngine {
                 .get(&group_id)
                 .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
                 .clone();
-            if matches!(
-                record.envelope.message_type,
-                GroupMessageType::MlsApplication | GroupMessageType::MlsCommit
-            ) {
-                self.verify_epoch_bound_group_envelope(&record.envelope)?;
-                let envelope_epoch = record.envelope.mls_epoch.unwrap_or_default();
-                let envelope_head = record
-                    .envelope
-                    .epoch_head_hash
-                    .as_deref()
-                    .unwrap_or_default();
-                if record.envelope.message_type == GroupMessageType::MlsApplication {
-                    if record.envelope.epoch_authenticator_sha256.is_some()
-                        || envelope_epoch != group_state.crypto_epoch
-                        || envelope_head != group_state.crypto_head_hash
-                    {
-                        return Err(CoreError::new(
-                            "crypto_epoch_conflict",
-                            "group application does not bind the canonical local crypto head",
-                        ));
-                    }
-                } else if envelope_epoch == group_state.crypto_epoch
-                    && envelope_head == group_state.crypto_head_hash
-                {
-                    let expected_authenticator = record
-                        .envelope
-                        .epoch_authenticator_sha256
-                        .as_deref()
-                        .ok_or_else(|| {
-                            CoreError::invalid_input(
-                                "group Commit is missing its epoch authenticator",
-                            )
-                        })?;
-                    let local_authenticator = self
-                        .state
-                        .mls_adapter
-                        .as_ref()
-                        .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                        .epoch_authenticator_sha256(&conversation_id)?;
-                    if local_authenticator != expected_authenticator {
-                        return Err(CoreError::new(
-                            "epoch_authenticator_mismatch",
-                            "reflected group Commit does not match canonical MLS state",
-                        ));
-                    }
-                } else {
-                    let authenticator = record
-                        .envelope
-                        .epoch_authenticator_sha256
-                        .as_deref()
-                        .ok_or_else(|| {
-                            CoreError::invalid_input(
-                                "group Commit is missing its epoch authenticator",
-                            )
-                        })?;
-                    if envelope_epoch != group_state.crypto_epoch.saturating_add(1)
-                        || Self::group_crypto_head_hash(
-                            &group_state.crypto_head_hash,
-                            envelope_epoch,
-                            record
-                                .envelope
-                                .inline_ciphertext
-                                .as_deref()
-                                .unwrap_or_default(),
-                            authenticator,
-                            &record.envelope.sender_user_id,
-                            &record.envelope.sender_device_id,
-                        )? != envelope_head
-                    {
-                        return Err(CoreError::new(
-                            "crypto_log_fork",
-                            "group Commit does not extend the canonical crypto head",
-                        ));
-                    }
-                }
-            }
             let is_membership_operation = matches!(
                 record.envelope.message_type,
                 GroupMessageType::MlsCommit
@@ -1814,63 +1701,14 @@ impl CoreEngine {
                     Err(error) => return Err(error),
                 };
                 match result {
-                    IngestResult::AppliedApplication(application) => {
-                        let protected = crate::model::ProtectedGroupAppMessage::from_json_slice(
-                            &application.plaintext,
-                        )?;
-                        if protected.group_id != group_id
-                            || protected.conversation_id != conversation_id
-                            || protected.app_message_id != record.message_id
-                            || protected.sender_user_id != record.envelope.sender_user_id
-                            || protected.sender_device_id != record.envelope.sender_device_id
-                            || Some(protected.mls_epoch) != record.envelope.mls_epoch
-                            || Some(protected.epoch_head_hash.as_str())
-                                != record.envelope.epoch_head_hash.as_deref()
-                        {
-                            return Err(CoreError::new(
-                                "protected_message_binding_invalid",
-                                "group application plaintext does not match its signed epoch envelope",
-                            ));
-                        }
-                        self.store_group_record_message(
+                    IngestResult::AppliedApplication(application) => self
+                        .store_group_record_message(
                             &conversation_id,
                             &record,
                             message_type,
-                            Some(protected.body),
-                        )?
-                    }
+                            String::from_utf8(application.plaintext).ok(),
+                        )?,
                     IngestResult::AppliedCommit { .. } => {
-                        let authenticator = record
-                            .envelope
-                            .epoch_authenticator_sha256
-                            .as_deref()
-                            .ok_or_else(|| {
-                            CoreError::invalid_input(
-                                "group Commit is missing its epoch authenticator",
-                            )
-                        })?;
-                        let merged_authenticator = self
-                            .state
-                            .mls_adapter
-                            .as_ref()
-                            .ok_or_else(|| {
-                                CoreError::invalid_state("mls adapter is not initialized")
-                            })?
-                            .epoch_authenticator_sha256(&conversation_id)?;
-                        if merged_authenticator != authenticator {
-                            return Err(CoreError::new(
-                                "epoch_authenticator_mismatch",
-                                "merged group Commit authenticator does not match the ordered record",
-                            ));
-                        }
-                        if let Some(state) = self.state.group_states.get_mut(&group_id) {
-                            state.crypto_epoch = record.envelope.mls_epoch.unwrap_or_default();
-                            state.crypto_head_hash =
-                                record.envelope.epoch_head_hash.clone().unwrap_or_default();
-                            state
-                                .pcs_state
-                                .update_ordered(&record.envelope.sender_device_id);
-                        }
                         if let Some(proof) = membership_proof.clone() {
                             let mut state = self
                                 .state
@@ -2079,21 +1917,6 @@ impl CoreEngine {
                 output.effects.push(next_fetch);
             } else {
                 self.state.group_sync_target_head.remove(&group_id);
-                if let Some((target_epoch, target_hash)) =
-                    self.state.group_sync_target_crypto_head.remove(&group_id)
-                {
-                    let local = self
-                        .state
-                        .group_states
-                        .get(&group_id)
-                        .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
-                    if local.crypto_epoch != target_epoch || local.crypto_head_hash != target_hash {
-                        return Err(CoreError::new(
-                            "crypto_log_gap",
-                            "ordered group records did not produce the advertised crypto head",
-                        ));
-                    }
-                }
                 if self.state.group_states.get(&group_id).is_some_and(|state| {
                     state
                         .pending_group_transition
@@ -2107,7 +1930,6 @@ impl CoreEngine {
                         self.resume_group_transition_after_reconciliation(group_id.clone())?,
                     );
                 }
-                output = merge_outputs(output, self.continue_group_secure_send(group_id.clone())?);
             }
         }
         self.merge_with_transport_flush(output)
@@ -2167,10 +1989,6 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("transition bundle is missing state event"))?;
         let commit_is_new =
             proof.previous_commit_message_id.as_ref() != Some(&proof.commit_message_id);
-        let welcome_bootstrap = current.crypto_head_hash.is_empty()
-            && current.manifest.roster_version == proof.new_roster_version
-            && current.manifest.last_commit_message_id.as_ref() == Some(&proof.commit_message_id)
-            && Self::manifest_sha256(&current.manifest)? == proof.new_manifest_sha256;
         if commit_is_new != commit.is_some()
             || control.envelope.message_type == GroupMessageType::ControlGroupStateEvent
             || state_event.envelope.message_type != GroupMessageType::ControlGroupStateEvent
@@ -2183,91 +2001,19 @@ impl CoreEngine {
         self.verify_membership_operation_authority(&control.envelope, &current.manifest)?;
         if let Some(commit) = commit {
             self.verify_membership_operation_authority(&commit.envelope, &current.manifest)?;
-            self.verify_epoch_bound_group_envelope(&commit.envelope)?;
-            let next_epoch = commit.envelope.mls_epoch.ok_or_else(|| {
-                CoreError::invalid_input("membership Commit is missing its MLS epoch")
-            })?;
-            let authenticator = commit
-                .envelope
-                .epoch_authenticator_sha256
-                .as_deref()
-                .ok_or_else(|| {
-                    CoreError::invalid_input("membership Commit is missing its epoch authenticator")
-                })?;
-            if current.crypto_head_hash.is_empty() {
-                // A newly joined leaf receives post-Commit MLS state in its
-                // Welcome, but has no prior outbox hash-chain anchor. Anchor
-                // exactly once to the device-signed Commit whose epoch and
-                // authenticator match that imported MLS state.
-                let local_summary = self
-                    .state
-                    .mls_adapter
-                    .as_ref()
-                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                    .export_group_summary(&current.conversation_id)?;
-                let local_authenticator = self
-                    .state
-                    .mls_adapter
-                    .as_ref()
-                    .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                    .epoch_authenticator_sha256(&current.conversation_id)?;
-                let signed_head = commit
-                    .envelope
-                    .epoch_head_hash
-                    .as_deref()
-                    .unwrap_or_default();
-                if local_summary.epoch != next_epoch
-                    || local_authenticator != authenticator
-                    || signed_head.len() != 64
-                    || !signed_head
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(CoreError::new(
-                        "crypto_log_fork",
-                        "welcome Commit does not authenticate the imported MLS state",
-                    ));
-                }
-            } else {
-                let next_head = Self::group_crypto_head_hash(
-                    &current.crypto_head_hash,
-                    next_epoch,
-                    commit
-                        .envelope
-                        .inline_ciphertext
-                        .as_deref()
-                        .unwrap_or_default(),
-                    authenticator,
-                    &commit.envelope.sender_user_id,
-                    &commit.envelope.sender_device_id,
-                )?;
-                if next_epoch != current.crypto_epoch.saturating_add(1)
-                    || commit.envelope.epoch_head_hash.as_deref() != Some(next_head.as_str())
-                {
-                    return Err(CoreError::new(
-                        "crypto_log_fork",
-                        "membership Commit does not extend the canonical crypto head",
-                    ));
-                }
-            }
         }
         for record in bundle {
-            self.verify_epoch_bound_group_envelope(&record.envelope)?;
-            if record.envelope.mls_epoch
-                != commit
-                    .map(|item| item.envelope.mls_epoch)
-                    .unwrap_or(Some(current.crypto_epoch))
-                || record.envelope.epoch_head_hash
-                    != commit
-                        .and_then(|item| item.envelope.epoch_head_hash.clone())
-                        .or_else(|| Some(current.crypto_head_hash.clone()))
-                || (record.envelope.message_type != GroupMessageType::MlsCommit
-                    && record.envelope.epoch_authenticator_sha256.is_some())
-            {
-                return Err(CoreError::invalid_input(
-                    "transition records do not share one authenticated crypto head",
-                ));
-            }
+            let ciphertext = record
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .ok_or_else(|| CoreError::invalid_input("transition record has no ciphertext"))?;
+            self.verify_device_signature(
+                &record.envelope.sender_user_id,
+                &record.envelope.sender_device_id,
+                ciphertext.as_bytes(),
+                &record.envelope.sender_proof.value,
+            )?;
         }
 
         let mut staged_mls = self
@@ -2276,7 +2022,7 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .fork()?;
-        if let Some(commit) = commit.filter(|_| !welcome_bootstrap) {
+        if let Some(commit) = commit {
             match staged_mls.ingest_message(
                 &current.conversation_id,
                 &commit.envelope.sender_device_id,
@@ -2330,15 +2076,11 @@ impl CoreEngine {
             || Self::manifest_sha256(&updated)? != proof.new_manifest_sha256
             || updated.roster_version != proof.new_roster_version
             || updated.last_commit_message_id.as_ref() != Some(&proof.commit_message_id)
-            || if welcome_bootstrap {
-                updated != current.manifest
-            } else {
-                !Self::validate_manifest_transition_for_operation(
-                    &current.manifest,
-                    &updated,
-                    &proof,
-                )
-            }
+            || !Self::validate_manifest_transition_for_operation(
+                &current.manifest,
+                &updated,
+                &proof,
+            )
         {
             return Err(CoreError::invalid_input(
                 "transition manifest does not match its proof and previous state",
@@ -2366,33 +2108,16 @@ impl CoreEngine {
             serde_json::from_slice(&state_event_plaintext).map_err(|error| {
                 CoreError::invalid_input(format!("transition state event is invalid JSON: {error}"))
             })?;
-        if welcome_bootstrap {
-            if event.transition_id != transition_id
-                || event.actor_user_id != proof.signer_user_id
-                || event.roster_version != updated.roster_version
-                || event.manifest_hash != proof.new_manifest_sha256
-            {
-                return Err(CoreError::invalid_input(
-                    "welcome transition state event does not match its authenticated manifest",
-                ));
-            }
-        } else {
-            let expected_json =
-                Self::derive_group_state_event(&current.manifest, &updated, &proof, state_event)
-                    .ok_or_else(|| {
-                        CoreError::invalid_state("failed to derive expected state event")
-                    })?;
-            let expected: GroupStateEvent =
-                serde_json::from_str(&expected_json).map_err(|error| {
-                    CoreError::invalid_state(format!(
-                        "failed to parse expected state event: {error}"
-                    ))
-                })?;
-            if event != expected || event.transition_id != transition_id {
-                return Err(CoreError::invalid_input(
-                    "transition state event does not match the verified manifest diff",
-                ));
-            }
+        let expected_json =
+            Self::derive_group_state_event(&current.manifest, &updated, &proof, state_event)
+                .ok_or_else(|| CoreError::invalid_state("failed to derive expected state event"))?;
+        let expected: GroupStateEvent = serde_json::from_str(&expected_json).map_err(|error| {
+            CoreError::invalid_state(format!("failed to parse expected state event: {error}"))
+        })?;
+        if event != expected || event.transition_id != transition_id {
+            return Err(CoreError::invalid_input(
+                "transition state event does not match the verified manifest diff",
+            ));
         }
 
         let summary = staged_mls.export_group_summary(&current.conversation_id)?;
@@ -2400,23 +2125,6 @@ impl CoreEngine {
             return Err(CoreError::invalid_input(
                 "transition MLS epoch does not match manifest",
             ));
-        }
-        if let Some(commit) = commit.filter(|_| !welcome_bootstrap) {
-            let expected_authenticator = commit
-                .envelope
-                .epoch_authenticator_sha256
-                .as_deref()
-                .ok_or_else(|| {
-                    CoreError::invalid_input("membership Commit has no authenticator")
-                })?;
-            if staged_mls.epoch_authenticator_sha256(&current.conversation_id)?
-                != expected_authenticator
-            {
-                return Err(CoreError::new(
-                    "epoch_authenticator_mismatch",
-                    "membership Commit authenticator does not match merged MLS state",
-                ));
-            }
         }
         self.state.mls_adapter = Some(staged_mls);
         self.state
@@ -2439,14 +2147,6 @@ impl CoreEngine {
             } else {
                 GroupConsistencyState::Ready
             };
-            if let Some(commit) = commit {
-                state.crypto_epoch = commit.envelope.mls_epoch.unwrap_or_default();
-                state.crypto_head_hash =
-                    commit.envelope.epoch_head_hash.clone().unwrap_or_default();
-                state
-                    .pcs_state
-                    .update_ordered(&commit.envelope.sender_device_id);
-            }
         }
         self.sync_conversation_members_from_manifest(&current.conversation_id, &updated)?;
         let mut messages = Vec::new();
@@ -2876,23 +2576,6 @@ impl CoreEngine {
             } else {
                 GroupConsistencyState::Ready
             };
-            state.crypto_epoch = pending.next_crypto_epoch;
-            state.crypto_head_hash = pending.next_crypto_head_hash.clone();
-            let committer_device_id = self
-                .state
-                .local_identity
-                .as_ref()
-                .map(|identity| identity.device_identity.device_id.clone())
-                .unwrap_or_default();
-            for leaf in pending
-                .proposed_manifest
-                .member_devices
-                .iter()
-                .filter(|leaf| leaf.status == GroupMemberStatus::Active)
-            {
-                state.pcs_state.register_leaf(&leaf.device_id);
-            }
-            state.pcs_state.update_ordered(&committer_device_id);
             if let Some(staged) = state.pending_group_transition.as_mut() {
                 staged.stage = PendingGroupTransitionStage::AcceptedPublishingWelcomes;
                 staged.first_seq = Some(first_seq);
@@ -2956,10 +2639,7 @@ impl CoreEngine {
 
         let mut effects = Vec::new();
         for mut welcome in pending.welcomes {
-            // A Welcome contains the post-Commit MLS state but not a trusted
-            // crypto-log anchor. The joining device must replay the complete
-            // atomic transition to derive and verify that anchor itself.
-            welcome.descriptor.start_seq = Some(first_seq.saturating_sub(1));
+            welcome.descriptor.start_seq = Some(last_seq);
             welcome.descriptor.roster_version = Some(roster_version);
             welcome.descriptor.last_commit_message_id = last_commit_message_id.clone();
             effects.push(CoreEffect::PutWelcomePickup { put: welcome });
@@ -3050,9 +2730,7 @@ impl CoreEngine {
         if status == Some(409)
             && matches!(
                 code.as_deref(),
-                Some("roster_version_conflict")
-                    | Some("group_transition_conflict")
-                    | Some("crypto_epoch_conflict")
+                Some("roster_version_conflict") | Some("group_transition_conflict")
             )
         {
             self.state
@@ -3153,8 +2831,6 @@ impl CoreEngine {
                 })
                 .unwrap_or(false);
             if !already_stored {
-                let accepted_application =
-                    item.envelope.message_type == GroupMessageType::MlsApplication;
                 let message_type = group_message_type_to_direct(item.envelope.message_type);
                 let record = GroupOutboxRecord {
                     seq,
@@ -3171,12 +2847,6 @@ impl CoreEngine {
                     message_type,
                     item.plaintext_cache,
                 )?;
-                if accepted_application {
-                    if let Some(state) = self.state.group_states.get_mut(&group_id) {
-                        state.pcs_state.accepted_application();
-                        touched_group_state = true;
-                    }
-                }
                 touched_conversation_id = Some(conversation_id.clone());
                 messages.push(MessageSummary {
                     conversation_id,
@@ -3261,73 +2931,6 @@ impl CoreEngine {
     ) -> CoreResult<CoreOutput> {
         if status == Some(403) && code.as_deref() == Some("group_membership_revoked") {
             return self.handle_group_sync_failed(group_id, false, status, code, detail);
-        }
-        if status == Some(409)
-            && matches!(
-                code.as_deref(),
-                Some("crypto_epoch_conflict" | "epoch_update_required")
-            )
-        {
-            let pending_index = self
-                .state
-                .pending_group_outbox
-                .iter()
-                .position(|item| item.envelope.message_id == message_id);
-            if let Some(index) = pending_index {
-                let item = self.state.pending_group_outbox[index].clone();
-                if item.envelope.message_type == GroupMessageType::MlsApplication {
-                    let state = self
-                        .state
-                        .group_states
-                        .get(&group_id)
-                        .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
-                    if state.pending_secure_send.is_some() {
-                        return Err(CoreError::new(
-                            "crypto_epoch_conflict",
-                            "another secure group send is already being reconciled",
-                        ));
-                    }
-                    let plaintext = item.plaintext_cache.clone().ok_or_else(|| {
-                        CoreError::invalid_state(
-                            "conflicting group application has no persisted plaintext intent",
-                        )
-                    })?;
-                    self.state.pending_group_outbox.remove(index);
-                    self.state
-                        .group_states
-                        .get_mut(&group_id)
-                        .expect("group state checked above")
-                        .pending_secure_send = Some(crate::persistence::PendingGroupSecureSend {
-                        intent_id: format!("group-secure-send:{message_id}"),
-                        app_message_id: message_id.clone(),
-                        plaintext,
-                        storage_refs: item.envelope.storage_refs,
-                        created_at: Some(item.envelope.created_at),
-                    });
-                    let persisted = CoreOutput {
-                        state_update: CoreStateUpdate {
-                            conversations_changed: true,
-                            ..CoreStateUpdate::default()
-                        },
-                        effects: vec![persist_effect(
-                            &self.state,
-                            vec![
-                                PersistOp::DeleteOutgoingGroupEnvelope {
-                                    message_id: message_id.clone(),
-                                },
-                                PersistOp::SaveGroupState {
-                                    group_id: group_id.clone(),
-                                },
-                            ],
-                        )],
-                        view_model: None,
-                    };
-                    return Ok(merge_outputs(
-                        persisted,
-                        self.sync_group_outbox(group_id, Some("crypto_conflict".into()))?,
-                    ));
-                }
-            }
         }
         if let Some(item) = self
             .state
@@ -3659,7 +3262,7 @@ impl CoreEngine {
             })?;
             manifest.validate()?;
             self.verify_manifest_signature(&manifest)?;
-            let _start_seq = descriptor
+            let start_seq = descriptor
                 .start_seq
                 .ok_or_else(|| CoreError::invalid_input("fsm_v2 welcome is missing startSeq"))?;
             let roster_version = descriptor.roster_version.ok_or_else(|| {
@@ -3672,6 +3275,7 @@ impl CoreEngine {
             if manifest.group_id != descriptor.group_id
                 || roster_version != manifest.roster_version
                 || manifest.last_commit_message_id.as_ref() != Some(last_commit_message_id)
+                || start_seq == 0
             {
                 return Err(CoreError::invalid_input(
                     "welcome cursor metadata does not match the imported manifest",
@@ -3758,11 +3362,6 @@ impl CoreEngine {
                     consistency_state: GroupConsistencyState::Ready,
                     pending_group_transition: None,
                     leave_requests: Vec::new(),
-                    pcs_state: Default::default(),
-                    crypto_epoch: 0,
-                    crypto_head_hash: String::new(),
-                    pending_secure_send: None,
-                    pending_epoch_transition: None,
                 },
             );
             imported_shell = Some((imported_group_id, imported_conversation_id));

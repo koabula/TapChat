@@ -54,7 +54,6 @@ const ROLE_OPERATIONS: Record<GroupRole, ReadonlySet<GroupCapabilityOperation>> 
     "append_application",
     "append_control",
     "append_membership",
-    "append_epoch",
     "manage_invites",
     "approve_join",
     "remove_member",
@@ -67,13 +66,12 @@ const ROLE_OPERATIONS: Record<GroupRole, ReadonlySet<GroupCapabilityOperation>> 
     "append_application",
     "append_control",
     "append_membership",
-    "append_epoch",
     "manage_invites",
     "approve_join",
     "remove_member",
     "update_group_metadata"
   ]),
-  member: new Set(["read", "subscribe", "append_application", "append_control", "append_epoch"])
+  member: new Set(["read", "subscribe", "append_application", "append_control"])
 };
 
 function deviceKey(userId: string, deviceId: string): string {

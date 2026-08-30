@@ -394,12 +394,6 @@ pub enum CoreEvent {
         head_seq: u64,
         current_roster_version: Option<u64>,
         last_commit_message_id: Option<String>,
-        crypto_epoch: u64,
-        crypto_head_hash: String,
-        group_app_count: u32,
-        application_index: u64,
-        active_leaf_count: usize,
-        leaf_last_update_index: BTreeMap<String, u64>,
     },
     GroupOutboxHeadFetchFailed {
         group_id: String,
@@ -424,18 +418,6 @@ pub enum CoreEvent {
         last_commit_message_id: Option<String>,
     },
     GroupTransitionAppendFailed {
-        group_id: String,
-        transition_id: String,
-        failure: crate::error::AppErrorV1,
-    },
-    GroupEpochTransitionAppended {
-        group_id: String,
-        transition_id: String,
-        seq: u64,
-        crypto_epoch: u64,
-        crypto_head_hash: String,
-    },
-    GroupEpochTransitionAppendFailed {
         group_id: String,
         transition_id: String,
         failure: crate::error::AppErrorV1,
@@ -887,9 +869,6 @@ pub enum CoreEffect {
     },
     AppendGroupTransition {
         append: AppendGroupTransitionRequest,
-    },
-    AppendGroupEpochTransition {
-        append: crate::transport_contract::AppendGroupEpochTransitionRequest,
     },
     InitializeGroupAuthorization {
         initialize: InitializeGroupAuthorizationRequest,
@@ -1360,9 +1339,6 @@ pub(crate) struct CoreState {
     /// When handle_group_outbox_records finishes a batch with to_seq < target_head_seq,
     /// it continues fetching from to_seq+1 until caught up.
     pub(crate) group_sync_target_head: BTreeMap<String, u64>,
-    /// Advertised crypto head for the current fetch. It is promoted only
-    /// after the corresponding canonical Commit records are merged locally.
-    pub(crate) group_sync_target_crypto_head: BTreeMap<String, (u64, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1528,7 +1504,6 @@ impl Default for CoreState {
             local_display_name: None,
             pending_sync_group_head: BTreeSet::new(),
             group_sync_target_head: BTreeMap::new(),
-            group_sync_target_crypto_head: BTreeMap::new(),
         }
     }
 }

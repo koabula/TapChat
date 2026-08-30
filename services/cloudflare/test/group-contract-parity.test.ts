@@ -46,8 +46,7 @@ test("shared role-operation matrix remains least-privilege ordered", () => {
     "read",
     "subscribe",
     "append_application",
-    "append_control",
-    "append_epoch"
+    "append_control"
   ]);
 });
 

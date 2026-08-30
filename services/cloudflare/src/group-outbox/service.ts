@@ -1,9 +1,7 @@
-import { HttpError, verifyEd25519 } from "../auth/capability";
+import { HttpError } from "../auth/capability";
 import type {
   AppendGroupEnvelopeRequest,
   AppendGroupEnvelopeResult,
-  AppendGroupEpochTransitionRequest,
-  AppendGroupEpochTransitionResult,
   AppendGroupTransitionRequest,
   AppendGroupTransitionResult,
   ClaimGroupJoinRequest,
@@ -76,11 +74,6 @@ interface GroupOutboxMeta {
    * 409 `roster_version_conflict`.
    */
   lastCommitMessageId?: string;
-  cryptoEpoch?: number;
-  cryptoHeadHash?: string;
-  groupAppCount?: number;
-  applicationIndex?: number;
-  leafLastUpdateIndex?: Record<string, number>;
 }
 
 interface StoredGroupRecordIndex {
@@ -109,23 +102,12 @@ const TRANSITION_PREFIX = "transition:";
 const INVITE_REVISION_KEY = "invite-revision";
 const CLEANUP_BATCH_SIZE = 128;
 
-interface StoredMembershipGroupTransition {
-  /** Missing on records written before protocol bundle 6; absence means membership. */
-  kind?: "membership";
+interface StoredGroupTransition {
   fingerprint: string;
   operation: AppendGroupTransitionRequest["operation"];
   requestBinding?: AppendGroupTransitionRequest["requestBinding"];
   result: AppendGroupTransitionResult;
 }
-
-interface StoredEpochGroupTransition {
-  kind: "epoch";
-  fingerprint: string;
-  operation: { type: "self_update" };
-  result: AppendGroupEpochTransitionResult;
-}
-
-type StoredGroupTransition = StoredMembershipGroupTransition | StoredEpochGroupTransition;
 
 interface StoredGroupInvite {
   inviteUrl: string;
@@ -177,57 +159,6 @@ function transitionFingerprint(input: AppendGroupTransitionRequest): string {
   return canonicalJson(stable);
 }
 
-function decodeBase64(value: string): Uint8Array {
-  try {
-    const binary = atob(value);
-    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
-  } catch {
-    throw new HttpError(400, "invalid_crypto_transition", "MLS Commit is not valid base64");
-  }
-}
-
-async function sha256Hex(value: Uint8Array | string): Promise<string> {
-  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
-  const digest = await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer);
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function groupCryptoHeadHash(
-  previousHeadHash: string,
-  nextEpoch: number,
-  commitB64: string,
-  epochAuthenticatorSha256: string,
-  committerUserId: string,
-  committerDeviceId: string
-): Promise<string> {
-  const commitSha256 = await sha256Hex(decodeBase64(commitB64));
-  return sha256Hex(
-    `tapchat.group_crypto_head.v1\n${previousHeadHash}\n${nextEpoch}\n${commitSha256}\n${epochAuthenticatorSha256}\n${committerUserId}\n${committerDeviceId}`
-  );
-}
-
-function groupEnvelopeEpochSigningPayload(envelope: GroupEnvelope): string {
-  return `tapchat.group_envelope_epoch.v1\npayload=${envelope.inlineCiphertext ?? ""}\nmls_epoch=${envelope.mlsEpoch}\nepoch_head_hash=${envelope.epochHeadHash}\nepoch_authenticator_sha256=${envelope.epochAuthenticatorSha256 ?? ""}`;
-}
-
-function verifyEpochBoundEnvelope(envelope: GroupEnvelope, authorization: GroupAuthorizationState): void {
-  if (
-    envelope.senderProof.type !== "device_signature" ||
-    envelope.mlsEpoch === undefined ||
-    !envelope.epochHeadHash ||
-    !/^[0-9a-f]{64}$/.test(envelope.epochHeadHash)
-  ) {
-    throw new HttpError(400, "invalid_epoch_binding", "group envelope is missing its epoch binding");
-  }
-  const device = authorization.devices[`${envelope.senderUserId}\u0000${envelope.senderDeviceId}`];
-  if (
-    !device || device.status !== "active" ||
-    !verifyEd25519(device.publicKey, envelope.senderProof.value, groupEnvelopeEpochSigningPayload(envelope))
-  ) {
-    throw new HttpError(403, "invalid_sender_proof", "group epoch binding signature is invalid");
-  }
-}
-
 export class GroupOutboxService {
   private readonly groupId: string;
   private readonly state: DurableObjectStorageLike;
@@ -259,34 +190,6 @@ export class GroupOutboxService {
     }
 
     const meta = await this.getMeta();
-    const authorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
-    const isApplication = input.envelope.messageType === "mls_application";
-    const activeLeaves = authorization?.manifest.memberDevices?.filter((leaf) => leaf.status === "active") ?? [];
-    if (isApplication) {
-      if (activeLeaves.length === 0 || activeLeaves.length > 16) {
-        throw new HttpError(409, activeLeaves.length > 16 ? "group_leaf_limit_exceeded" : "group_authorization_uninitialized", "group application sending is unavailable for this leaf set");
-      }
-      if (
-        meta.cryptoEpoch === undefined || !meta.cryptoHeadHash ||
-        input.expectedCryptoEpoch !== meta.cryptoEpoch ||
-        input.expectedCryptoHeadHash !== meta.cryptoHeadHash ||
-        input.envelope.mlsEpoch !== meta.cryptoEpoch ||
-        input.envelope.epochHeadHash !== meta.cryptoHeadHash ||
-        input.envelope.epochAuthenticatorSha256 !== undefined
-      ) {
-        throw new HttpError(409, "crypto_epoch_conflict", "group application epoch head is stale");
-      }
-      if (!authorization) {
-        throw new HttpError(409, "group_authorization_uninitialized", "group authorization is unavailable");
-      }
-      verifyEpochBoundEnvelope(input.envelope, authorization);
-      const groupAppCount = meta.groupAppCount ?? 0;
-      const applicationIndex = meta.applicationIndex ?? 0;
-      const leafBaseline = meta.leafLastUpdateIndex?.[input.envelope.senderDeviceId] ?? applicationIndex;
-      if (groupAppCount >= 32 || applicationIndex - leafBaseline >= 32 * activeLeaves.length) {
-        throw new HttpError(409, "epoch_update_required", "group PCS policy requires an update-path Commit before this application");
-      }
-    }
 
     const seq = meta.headSeq + 1;
     const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1000;
@@ -302,9 +205,8 @@ export class GroupOutboxService {
     const serialized = JSON.stringify(record);
     const storageKey = `${RECORD_PREFIX}${seq}`;
 
-    let recordIndex: StoredGroupRecordIndex;
     if (new TextEncoder().encode(serialized).byteLength <= meta.maxInlineBytes && input.envelope.inlineCiphertext) {
-      recordIndex = {
+      await this.state.put<StoredGroupRecordIndex>(storageKey, {
         seq,
         groupId: record.groupId,
         messageId: record.messageId,
@@ -312,11 +214,11 @@ export class GroupOutboxService {
         expiresAt,
         state: record.state,
         inlineRecord: record
-      };
+      });
     } else {
       const payloadRef = `group-outbox-payload/${this.groupId}/${seq}.json`;
       await this.spillStore.putJson(payloadRef, record);
-      recordIndex = {
+      await this.state.put<StoredGroupRecordIndex>(storageKey, {
         seq,
         groupId: record.groupId,
         messageId: record.messageId,
@@ -324,151 +226,17 @@ export class GroupOutboxService {
         expiresAt,
         state: record.state,
         payloadRef
-      };
-      const currentMeta = await this.getMeta();
-      const currentIdempotency = await this.state.get<number>(`${IDEMPOTENCY_PREFIX}${record.messageId}`);
-      if (currentIdempotency !== undefined) {
-        return { accepted: true, seq: currentIdempotency };
-      }
-      if (
-        currentMeta.headSeq !== meta.headSeq ||
-        currentMeta.cryptoEpoch !== meta.cryptoEpoch ||
-        currentMeta.cryptoHeadHash !== meta.cryptoHeadHash ||
-        currentMeta.groupAppCount !== meta.groupAppCount ||
-        currentMeta.applicationIndex !== meta.applicationIndex
-      ) {
-        throw new HttpError(409, "crypto_epoch_conflict", "group head changed while the record was prepared");
-      }
+      });
     }
 
-    await this.state.putEntries({
-      [storageKey]: recordIndex,
-      [`${IDEMPOTENCY_PREFIX}${record.messageId}`]: seq,
-      [META_KEY]: {
-        ...meta,
-        headSeq: seq,
-        ...(isApplication ? {
-          groupAppCount: (meta.groupAppCount ?? 0) + 1,
-          applicationIndex: (meta.applicationIndex ?? 0) + 1
-        } : {})
-      }
-    });
+    await this.state.put(`${IDEMPOTENCY_PREFIX}${record.messageId}`, seq);
+    await this.state.put(META_KEY, { ...meta, headSeq: seq });
     await this.state.setAlarm(expiresAt);
 
     this.publish({ event: "group_head_updated", groupId: this.groupId, seq });
     this.publish({ event: "group_outbox_record_available", groupId: this.groupId, seq, record });
 
     return { accepted: true, seq };
-  }
-
-  async appendEpochTransition(
-    input: AppendGroupEpochTransitionRequest,
-    now: number
-  ): Promise<AppendGroupEpochTransitionResult> {
-    await this.rejectIfSealed();
-    this.validateEnvelope(input.envelope);
-    if (
-      input.groupId !== this.groupId || !input.transitionId ||
-      input.nextCryptoEpoch !== input.expectedCryptoEpoch + 1 ||
-      input.envelope.groupId !== this.groupId ||
-      input.envelope.messageType !== "mls_commit" ||
-      input.envelope.visibility !== "protocol" ||
-      input.envelope.transitionId !== input.transitionId ||
-      input.envelope.mlsEpoch !== input.nextCryptoEpoch ||
-      input.envelope.epochHeadHash !== input.nextCryptoHeadHash ||
-      !input.envelope.inlineCiphertext ||
-      !/^[0-9a-f]{64}$/.test(input.epochAuthenticatorSha256) ||
-      !/^[0-9a-f]{64}$/.test(input.nextCryptoHeadHash)
-    ) {
-      throw new HttpError(400, "invalid_crypto_transition", "group epoch transition is malformed");
-    }
-    const transitionKey = `${TRANSITION_PREFIX}${input.transitionId}`;
-    const { capability: _capability, ...stableInput } = input;
-    const fingerprint = canonicalJson(stableInput);
-    const existing = await this.state.get<StoredGroupTransition>(transitionKey);
-    if (existing) {
-      if (existing.kind !== "epoch" || existing.fingerprint !== fingerprint) {
-        throw new HttpError(409, "group_transition_conflict", "transition id has different content or transition kind");
-      }
-      return existing.result;
-    }
-    const meta = await this.getMeta();
-    if (meta.cryptoEpoch !== input.expectedCryptoEpoch || (meta.cryptoHeadHash ?? "") !== input.expectedCryptoHeadHash) {
-      throw new HttpError(409, "crypto_epoch_conflict", "group crypto head changed");
-    }
-    const authorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
-    const activeLeaves = authorization?.manifest.memberDevices?.filter((leaf) => leaf.status === "active") ?? [];
-    if (activeLeaves.length === 0 || activeLeaves.length > 16) {
-      throw new HttpError(409, "group_leaf_limit_exceeded", "group must contain between 1 and 16 active leaves");
-    }
-    if (!authorization) {
-      throw new HttpError(409, "group_authorization_uninitialized", "group authorization is unavailable");
-    }
-    if (input.envelope.epochAuthenticatorSha256 !== input.epochAuthenticatorSha256) {
-      throw new HttpError(400, "invalid_crypto_transition", "Commit authenticator binding does not match the transition");
-    }
-    verifyEpochBoundEnvelope(input.envelope, authorization);
-    const computedHead = await groupCryptoHeadHash(
-      input.expectedCryptoHeadHash,
-      input.nextCryptoEpoch,
-      input.envelope.inlineCiphertext,
-      input.epochAuthenticatorSha256,
-      input.envelope.senderUserId,
-      input.envelope.senderDeviceId
-    );
-    if (computedHead !== input.nextCryptoHeadHash) {
-      throw new HttpError(400, "invalid_crypto_head", "next group crypto head does not match the Commit");
-    }
-    // WebCrypto yields between the initial reads and this point. Re-read the
-    // authoritative keys so two Commit requests based on one epoch cannot both
-    // append and fork the MLS state.
-    const currentTransition = await this.state.get<StoredGroupTransition>(transitionKey);
-    if (currentTransition) {
-      if (currentTransition.kind === "epoch" && currentTransition.fingerprint === fingerprint) {
-        return currentTransition.result;
-      }
-      throw new HttpError(409, "group_transition_conflict", "transition id has different content or transition kind");
-    }
-    const currentMessageSeq = await this.state.get<number>(`${IDEMPOTENCY_PREFIX}${input.envelope.messageId}`);
-    if (currentMessageSeq !== undefined) {
-      throw new HttpError(409, "group_transition_conflict", "transition message id already belongs to another record");
-    }
-    const currentMeta = await this.getMeta();
-    const currentAuthorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
-    if (
-      currentMeta.headSeq !== meta.headSeq ||
-      currentMeta.cryptoEpoch !== meta.cryptoEpoch ||
-      currentMeta.cryptoHeadHash !== meta.cryptoHeadHash ||
-      !currentAuthorization ||
-      currentAuthorization.manifest.signature !== authorization.manifest.signature
-    ) {
-      throw new HttpError(409, "crypto_epoch_conflict", "group crypto head changed while the Commit was verified");
-    }
-    const seq = meta.headSeq + 1;
-    const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1000;
-    const record: GroupOutboxRecord = { seq, groupId: this.groupId, messageId: input.envelope.messageId, receivedAt: now, expiresAt, state: "available", envelope: input.envelope };
-    const index: StoredGroupRecordIndex = { seq, groupId: this.groupId, messageId: record.messageId, receivedAt: now, expiresAt, state: "available", inlineRecord: record, transitionId: input.transitionId, transitionStartSeq: seq, transitionEndSeq: seq };
-    const result: AppendGroupEpochTransitionResult = { accepted: true, transitionId: input.transitionId, seq, cryptoEpoch: input.nextCryptoEpoch, cryptoHeadHash: input.nextCryptoHeadHash };
-    await this.state.putEntries({
-      [`${RECORD_PREFIX}${seq}`]: index,
-      [`${IDEMPOTENCY_PREFIX}${record.messageId}`]: seq,
-      [transitionKey]: { kind: "epoch", fingerprint, operation: { type: "self_update" }, result } satisfies StoredEpochGroupTransition,
-      [META_KEY]: {
-        ...meta,
-        headSeq: seq,
-        cryptoEpoch: input.nextCryptoEpoch,
-        cryptoHeadHash: input.nextCryptoHeadHash,
-        groupAppCount: 0,
-        leafLastUpdateIndex: {
-          ...(meta.leafLastUpdateIndex ?? {}),
-          [input.envelope.senderDeviceId]: meta.applicationIndex ?? 0
-        }
-      }
-    });
-    await this.state.setAlarm(expiresAt);
-    this.publish({ event: "group_head_updated", groupId: this.groupId, seq });
-    this.publish({ event: "group_outbox_record_available", groupId: this.groupId, seq, record });
-    return result;
   }
 
   /** Fail closed before parsing or authorizing an append body on a sealed log. */
@@ -488,8 +256,8 @@ export class GroupOutboxService {
     const fingerprint = transitionFingerprint(input);
     const existing = await this.state.get<StoredGroupTransition>(transitionKey);
     if (existing) {
-      if (existing.kind === "epoch" || existing.fingerprint !== fingerprint) {
-        throw new HttpError(409, "group_transition_conflict", "transition id already exists with different content or transition kind");
+      if (existing.fingerprint !== fingerprint) {
+        throw new HttpError(409, "group_transition_conflict", "transition id already exists with different content");
       }
       return existing.result;
     }
@@ -498,61 +266,6 @@ export class GroupOutboxService {
     const authorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
     if (!authorization) {
       throw new HttpError(428, "group_authorization_uninitialized", "group authorization has not been initialized");
-    }
-    const activeLeaves = preparedAuthorization.manifest.memberDevices?.filter((leaf) => leaf.status === "active") ?? [];
-    const overLimitRecoveryOperation =
-      input.operation.type === "approve_leave" ||
-      input.operation.type === "remove_member" ||
-      input.operation.type === "remove_device" ||
-      input.operation.type === "dissolve";
-    if (activeLeaves.length > 16 && !overLimitRecoveryOperation) {
-      throw new HttpError(409, "group_leaf_limit_exceeded", "membership transition would exceed 16 active leaves");
-    }
-    const initializingCrypto = meta.cryptoEpoch === undefined && input.operation.type === "create";
-    if (
-      input.expectedCryptoEpoch === undefined ||
-      input.expectedCryptoHeadHash === undefined ||
-      input.nextCryptoEpoch === undefined ||
-      input.nextCryptoHeadHash === undefined ||
-      input.epochAuthenticatorSha256 === undefined ||
-      (!initializingCrypto && (input.expectedCryptoEpoch !== meta.cryptoEpoch || input.expectedCryptoHeadHash !== (meta.cryptoHeadHash ?? ""))) ||
-      (initializingCrypto && (input.expectedCryptoEpoch !== 0 || input.expectedCryptoHeadHash !== "")) ||
-      input.nextCryptoEpoch !== input.expectedCryptoEpoch + 1 ||
-      !/^[0-9a-f]{64}$/.test(input.nextCryptoHeadHash) ||
-      !/^[0-9a-f]{64}$/.test(input.epochAuthenticatorSha256)
-    ) {
-      throw new HttpError(409, "crypto_epoch_conflict", "membership transition crypto base is stale");
-    }
-    const commitEnvelope = input.envelopes.find((envelope) => envelope.messageType === "mls_commit");
-    if (
-      !commitEnvelope || !commitEnvelope.inlineCiphertext ||
-      commitEnvelope.mlsEpoch !== input.nextCryptoEpoch ||
-      commitEnvelope.epochHeadHash !== input.nextCryptoHeadHash ||
-      commitEnvelope.epochAuthenticatorSha256 !== input.epochAuthenticatorSha256
-    ) {
-      throw new HttpError(409, "group_transition_invalid", "membership Commit does not bind the next crypto head");
-    }
-    verifyEpochBoundEnvelope(commitEnvelope, authorization);
-    const computedHead = await groupCryptoHeadHash(
-      input.expectedCryptoHeadHash,
-      input.nextCryptoEpoch,
-      commitEnvelope.inlineCiphertext,
-      input.epochAuthenticatorSha256,
-      commitEnvelope.senderUserId,
-      commitEnvelope.senderDeviceId
-    );
-    if (computedHead !== input.nextCryptoHeadHash) {
-      throw new HttpError(400, "invalid_crypto_head", "membership Commit does not derive the next crypto head");
-    }
-    for (const envelope of input.envelopes) {
-      if (
-        envelope.mlsEpoch !== input.nextCryptoEpoch ||
-        envelope.epochHeadHash !== input.nextCryptoHeadHash ||
-        (envelope.messageType !== "mls_commit" && envelope.epochAuthenticatorSha256 !== undefined)
-      ) {
-        throw new HttpError(409, "group_transition_invalid", "transition records must bind one crypto head");
-      }
-      verifyEpochBoundEnvelope(envelope, authorization);
     }
     const storedRosterVersion = authorization.manifest.rosterVersion;
     const storedCommitMessageId = authorization.manifest.lastCommitMessageId ?? "";
@@ -619,8 +332,6 @@ export class GroupOutboxService {
     const currentAuthorization = await this.state.get<GroupAuthorizationState>(GROUP_AUTHORIZATION_KEY);
     if (
       currentMeta.headSeq !== meta.headSeq ||
-      currentMeta.cryptoEpoch !== meta.cryptoEpoch ||
-      currentMeta.cryptoHeadHash !== meta.cryptoHeadHash ||
       (currentMeta.currentRosterVersion !== undefined && currentMeta.currentRosterVersion !== storedRosterVersion) ||
       (currentMeta.lastCommitMessageId !== undefined && currentMeta.lastCommitMessageId !== storedCommitMessageId) ||
       !currentAuthorization ||
@@ -644,23 +355,13 @@ export class GroupOutboxService {
         ...meta,
         headSeq: lastSeq,
         currentRosterVersion: preparedAuthorization.manifest.rosterVersion,
-        lastCommitMessageId: preparedAuthorization.manifest.lastCommitMessageId,
-        cryptoEpoch: input.nextCryptoEpoch,
-        cryptoHeadHash: input.nextCryptoHeadHash,
-        groupAppCount: 0,
-        applicationIndex: meta.applicationIndex ?? 0,
-        leafLastUpdateIndex: Object.fromEntries(activeLeaves.map((leaf) => [
-          leaf.deviceId,
-          leaf.deviceId === input.capability.deviceId
-            ? (meta.applicationIndex ?? 0)
-            : (meta.leafLastUpdateIndex?.[leaf.deviceId] ?? (meta.applicationIndex ?? 0))
-        ]))
+        lastCommitMessageId: preparedAuthorization.manifest.lastCommitMessageId
       },
       [GROUP_AUTHORIZATION_KEY]: {
         ...preparedAuthorization,
         lastTransitionId: input.transitionId
       },
-      [transitionKey]: { kind: "membership", fingerprint, operation: input.operation, requestBinding: input.requestBinding, result } satisfies StoredMembershipGroupTransition,
+      [transitionKey]: { fingerprint, operation: input.operation, requestBinding: input.requestBinding, result } satisfies StoredGroupTransition,
       ...requestBindingEntries
     };
     for (const [key, index] of indexes) {
@@ -861,13 +562,7 @@ export class GroupOutboxService {
     return {
       headSeq: meta.headSeq,
       currentRosterVersion: meta.currentRosterVersion,
-      lastCommitMessageId: meta.lastCommitMessageId,
-      cryptoEpoch: meta.cryptoEpoch,
-      cryptoHeadHash: meta.cryptoHeadHash,
-      groupAppCount: meta.groupAppCount ?? 0,
-      applicationIndex: meta.applicationIndex ?? 0,
-      activeLeafCount: Object.keys(meta.leafLastUpdateIndex ?? {}).length,
-      leafLastUpdateIndex: meta.leafLastUpdateIndex ?? {}
+      lastCommitMessageId: meta.lastCommitMessageId
     };
   }
 
@@ -1188,7 +883,7 @@ export class GroupOutboxService {
     );
     if (
       !authorization ||
-      !transition || transition.kind === "epoch" || transition.requestBinding?.type !== "join" ||
+      !transition || transition.requestBinding?.type !== "join" ||
       transition.requestBinding.requestId !== input.requestId ||
       transition.requestBinding.leaseToken !== input.leaseToken ||
       transition.operation.type !== "approve_join" ||

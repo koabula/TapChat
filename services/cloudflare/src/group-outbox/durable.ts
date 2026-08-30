@@ -22,7 +22,6 @@ import { GroupAuthorizationService } from "./authorization";
 import { signSharingPayload, verifySharingPayload } from "../storage/sharing";
 import type {
   AppendGroupEnvelopeRequest,
-  AppendGroupEpochTransitionRequest,
   AppendGroupTransitionRequest,
   ClaimGroupJoinRequest,
   ClaimGroupLeaveRequest,
@@ -292,28 +291,6 @@ export async function handleGroupOutboxDurableRequest(
       const result = await service.appendEnvelope(body, now);
       await authorization.commitPreparedUpdate(preparedUpdate);
       return jsonResponse(result);
-    }
-
-    if (url.pathname.endsWith("/epoch-transitions") && request.method === "POST") {
-      const body = await readJsonLimited<AppendGroupEpochTransitionRequest>(request, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES);
-      await service.assertWritable();
-      if (!body?.capability || !body.envelope) {
-        throw new HttpError(400, "invalid_input", "group epoch transition body is required");
-      }
-      await authorization.authorize(
-        request,
-        body.capability,
-        "append_epoch",
-        ["owner", "admin", "member"],
-        now
-      );
-      if (
-        body.envelope.senderUserId !== body.capability.userId ||
-        body.envelope.senderDeviceId !== body.capability.deviceId
-      ) {
-        throw new HttpError(403, "invalid_capability", "epoch transition sender does not match capability");
-      }
-      return jsonResponse(await service.appendEpochTransition(body, now));
     }
 
     if (url.pathname.endsWith("/messages") && request.method === "GET") {

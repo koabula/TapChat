@@ -29,7 +29,7 @@ const worker = await unstable_dev("src/index.ts", {
     RUNTIME_ID: runtimeId,
     OWNER_USER_ID: ownerUserId,
     OWNER_USER_PUBLIC_KEY: ownerUserPublicKey,
-    WORKER_BUILD_ID: "tapchat-worker-v6-dev",
+    WORKER_BUILD_ID: "tapchat-worker-v4-dev",
     DEPLOYMENT_REGION: "local-transport",
     SHARING_INTERNAL_SECRET: sharingSecret,
     DEVICE_RUNTIME_SECRET: runtimeSecret,

@@ -33,7 +33,7 @@ use crate::timetest;
 static CLOUDFLARE_DEPLOY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const AUTH_ROTATION_GRACE_MS: u64 = 48 * 60 * 60 * 1000;
 const AUTH_ROTATION_INTERVAL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
-const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v6-", env!("CARGO_PKG_VERSION"));
+const WORKER_BUILD_ID: &str = concat!("tapchat-worker-v5-", env!("CARGO_PKG_VERSION"));
 
 fn generate_runtime_key_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 8];
@@ -287,7 +287,7 @@ pub async fn runtime_status_for_deployment(
     };
     let endpoint = deployment.deployment_bundle.inbox_http_endpoint.clone();
     let local_features = deployment.deployment_bundle.runtime_config.features.clone();
-    if deployment.deployment_bundle.protocol_version != 6
+    if deployment.deployment_bundle.protocol_version != 5
         || deployment.deployment_bundle.registry_schema_version != 2
         || deployment
             .deployment_bundle
@@ -353,7 +353,7 @@ pub async fn runtime_status_for_deployment(
                 Ok(manifest)
                     if manifest.ready
                         && manifest.runtime_id == deployment.deployment_bundle.runtime_id
-                        && manifest.protocol_version == 6
+                        && manifest.protocol_version == 5
                         && manifest.registry_schema_version == 2
                         && manifest.worker_build_id
                             == deployment.deployment_bundle.worker_build_id =>

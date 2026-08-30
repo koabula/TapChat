@@ -528,7 +528,7 @@ fn escape_ps_double_quoted(value: &str) -> String {
     value.replace('`', "``").replace('"', "`\"")
 }
 
-pub const CLI_WORKER_BUILD_ID: &str = "tapchat-worker-v6-dev";
+pub const CLI_WORKER_BUILD_ID: &str = "tapchat-worker-v5-dev";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -567,7 +567,7 @@ pub async fn wait_until_ready(base_url: &str, expected_runtime_id: &str) -> Resu
                     if !ready.ready || ready.runtime_id != expected_runtime_id {
                         bail!("runtime_mismatch: runtime readiness audience differs from provisioning journal");
                     }
-                    if ready.protocol_version != 6 || ready.registry_schema_version != 2 {
+                    if ready.protocol_version != 5 || ready.registry_schema_version != 2 {
                         bail!("protocol_mismatch: runtime readiness protocol or registry schema is unsupported");
                     }
                     if ready.worker_build_id != CLI_WORKER_BUILD_ID {

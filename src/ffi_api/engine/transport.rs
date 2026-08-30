@@ -1057,13 +1057,6 @@ impl CoreEngine {
                     envelopes,
                     authorization_update: self.group_authorization_update(&group_id)?,
                     capability: self.group_capability(&group_id, role)?,
-                    expected_crypto_epoch: pending_transition.expected_crypto_epoch,
-                    expected_crypto_head_hash: pending_transition.expected_crypto_head_hash.clone(),
-                    next_crypto_epoch: pending_transition.next_crypto_epoch,
-                    next_crypto_head_hash: pending_transition.next_crypto_head_hash.clone(),
-                    epoch_authenticator_sha256: pending_transition
-                        .epoch_authenticator_sha256
-                        .clone(),
                 },
             });
         }
@@ -1119,15 +1112,6 @@ impl CoreEngine {
                         .and_then(|proof| proof.previous_commit_message_id.clone())
                 })
                 .flatten();
-            let crypto_state = self
-                .state
-                .group_states
-                .get(&item.envelope.group_id)
-                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
-            let is_application = item.envelope.message_type == GroupMessageType::MlsApplication;
-            let expected_crypto_epoch = is_application.then_some(crypto_state.crypto_epoch);
-            let expected_crypto_head_hash =
-                is_application.then_some(crypto_state.crypto_head_hash.clone());
             effects.push(CoreEffect::AppendGroupEnvelope {
                 append: AppendGroupEnvelopeRequest {
                     version: crate::model::CURRENT_MODEL_VERSION.to_string(),
@@ -1137,8 +1121,6 @@ impl CoreEngine {
                     authorization_update,
                     expected_previous_roster_version,
                     expected_previous_commit_message_id,
-                    expected_crypto_epoch,
-                    expected_crypto_head_hash,
                 },
             });
         }
@@ -2294,6 +2276,13 @@ impl CoreEngine {
         let manifest_json = serde_json::to_string(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode attachment manifest: {error}"))
         })?;
+        let metadata_ciphertext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&task.conversation_id, manifest_json.as_bytes())?
+            .payload_b64;
         let storage_refs = attachment_tasks
             .iter()
             .map(|task| {
@@ -2362,26 +2351,22 @@ impl CoreEngine {
         if let Some(group_id) = task.group_id {
             let conversation_id = task.conversation_id.clone();
             self.ensure_group_ready_for_send(&conversation_id)?;
-            let state = self
-                .state
-                .group_states
-                .get_mut(&group_id)
-                .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
-            if state.pending_secure_send.is_some() {
-                return Err(CoreError::new(
-                    "secure_send_in_progress",
-                    "a secure group send is already pending",
-                ));
-            }
-            state.pending_secure_send = Some(crate::persistence::PendingGroupSecureSend {
-                intent_id: format!("group-secure-send:{message_id}"),
-                app_message_id: message_id,
-                plaintext: manifest_json,
-                storage_refs,
-                created_at: Some(task.created_at),
-            });
-            persist_ops.push(PersistOp::SaveGroupState {
-                group_id: group_id.clone(),
+            let capability = self.group_capability(&group_id, self.local_group_role(&group_id)?)?;
+            let mut envelope = self.build_group_envelope(
+                &group_id,
+                &conversation_id,
+                GroupMessageType::MlsApplication,
+                GroupEnvelopeVisibility::Visible,
+                metadata_ciphertext,
+            )?;
+            // The upload placeholder and the published group envelope are one
+            // logical message, so retain the identifier allocated at enqueue.
+            envelope.message_id = message_id.clone();
+            envelope.created_at = task.created_at;
+            envelope.storage_refs = storage_refs;
+            self.enqueue_group_envelope(envelope.clone(), capability, Some(manifest_json));
+            persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
+                message_id: envelope.message_id,
             });
             Ok(merge_outputs(
                 CoreOutput {
@@ -2391,23 +2376,15 @@ impl CoreEngine {
                         .collect(),
                     view_model: None,
                 },
-                self.sync_group_outbox(group_id, Some("secure_attachment_send".into()))?,
+                self.flush_pending_transport()?,
             ))
         } else {
-            let metadata_ciphertext = self
-                .state
-                .mls_adapter
-                .as_mut()
-                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .encrypt_application(&task.conversation_id, manifest_json.as_bytes())?
-                .payload_b64;
-            let conversation_id = task.conversation_id.clone();
-            let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
-            let recipients = self.recipient_device_ids(&conversation_id)?;
+            let peer_user_id = self.peer_user_for_conversation(&task.conversation_id)?;
+            let recipients = self.recipient_device_ids(&task.conversation_id)?;
             let mut envelopes = Vec::new();
             for recipient in recipients {
                 let mut envelope = self.build_envelope(
-                    &conversation_id,
+                    &task.conversation_id,
                     &recipient,
                     MessageType::MlsApplication,
                     metadata_ciphertext.clone(),

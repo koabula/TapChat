@@ -110,7 +110,6 @@ export type GroupCapabilityOperation =
   | "append_application"
   | "append_control"
   | "append_membership"
-  | "append_epoch"
   | "manage_invites"
   | "approve_join"
   | "remove_member"
@@ -159,9 +158,6 @@ export interface GroupEnvelope {
   senderProof: SenderProof;
   membershipProof?: GroupMembershipProof;
   transitionId?: string;
-  mlsEpoch?: number;
-  epochHeadHash?: string;
-  epochAuthenticatorSha256?: string;
 }
 
 export interface GroupMembershipProof {
@@ -274,8 +270,6 @@ export interface AppendGroupEnvelopeRequest {
   authorizationUpdate?: GroupAuthorizationUpdate;
   expectedPreviousRosterVersion?: number;
   expectedPreviousCommitMessageId?: string;
-  expectedCryptoEpoch?: number;
-  expectedCryptoHeadHash?: string;
 }
 
 export interface AppendGroupEnvelopeResult {
@@ -294,32 +288,6 @@ export interface AppendGroupTransitionRequest {
   authorizationUpdate: GroupAuthorizationUpdate;
   capability: GroupCapability;
   requestBinding?: GroupTransitionRequestBinding;
-  expectedCryptoEpoch?: number;
-  expectedCryptoHeadHash?: string;
-  nextCryptoEpoch?: number;
-  nextCryptoHeadHash?: string;
-  epochAuthenticatorSha256?: string;
-}
-
-export interface AppendGroupEpochTransitionRequest {
-  version: string;
-  groupId: string;
-  transitionId: string;
-  expectedCryptoEpoch: number;
-  expectedCryptoHeadHash: string;
-  nextCryptoEpoch: number;
-  nextCryptoHeadHash: string;
-  epochAuthenticatorSha256: string;
-  envelope: GroupEnvelope;
-  capability: GroupCapability;
-}
-
-export interface AppendGroupEpochTransitionResult {
-  accepted: boolean;
-  transitionId: string;
-  seq: number;
-  cryptoEpoch: number;
-  cryptoHeadHash: string;
 }
 
 export interface AppendGroupTransitionResult {
@@ -356,12 +324,6 @@ export interface GetGroupOutboxHeadResult {
   headSeq: number;
   currentRosterVersion?: number;
   lastCommitMessageId?: string;
-  cryptoEpoch?: number;
-  cryptoHeadHash?: string;
-  groupAppCount?: number;
-  applicationIndex?: number;
-  activeLeafCount?: number;
-  leafLastUpdateIndex?: Record<string, number>;
 }
 
 export interface GetGroupOutboxHeadRequest {

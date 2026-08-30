@@ -128,10 +128,6 @@ pub struct AppendGroupEnvelopeRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub expected_previous_commit_message_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_crypto_epoch: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_crypto_head_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,34 +177,6 @@ pub struct AppendGroupTransitionRequest {
     pub envelopes: Vec<GroupEnvelope>,
     pub authorization_update: GroupAuthorizationUpdate,
     pub capability: GroupCapability,
-    pub expected_crypto_epoch: u64,
-    pub expected_crypto_head_hash: String,
-    pub next_crypto_epoch: u64,
-    pub next_crypto_head_hash: String,
-    pub epoch_authenticator_sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendGroupEpochTransitionRequest {
-    pub version: String,
-    pub group_id: String,
-    pub transition_id: String,
-    pub expected_crypto_epoch: u64,
-    pub expected_crypto_head_hash: String,
-    pub next_crypto_epoch: u64,
-    pub next_crypto_head_hash: String,
-    pub epoch_authenticator_sha256: String,
-    pub envelope: GroupEnvelope,
-    pub capability: GroupCapability,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendGroupEpochTransitionResult {
-    pub accepted: bool,
-    pub transition_id: String,
-    pub seq: u64,
-    pub crypto_epoch: u64,
-    pub crypto_head_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,18 +252,6 @@ pub struct GetGroupOutboxHeadResult {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_commit_message_id: Option<String>,
-    #[serde(default)]
-    pub crypto_epoch: u64,
-    #[serde(default)]
-    pub crypto_head_hash: String,
-    #[serde(default)]
-    pub group_app_count: u32,
-    #[serde(default)]
-    pub application_index: u64,
-    #[serde(default)]
-    pub active_leaf_count: usize,
-    #[serde(default)]
-    pub leaf_last_update_index: BTreeMap<String, u64>,
 }
 
 /// Owner-signed request to seal a group outbox, rendering all subsequent
@@ -923,8 +879,6 @@ mod tests {
             authorization_update: None,
             expected_previous_roster_version: None,
             expected_previous_commit_message_id: None,
-            expected_crypto_epoch: None,
-            expected_crypto_head_hash: None,
         };
         let json = serde_json::to_string(&append).expect("serialize append");
         let decoded: AppendGroupEnvelopeRequest =
@@ -1020,9 +974,6 @@ mod tests {
                 signature: "member-proof".into(),
             }),
             transition_id: None,
-            mls_epoch: None,
-            epoch_head_hash: None,
-            epoch_authenticator_sha256: None,
         }
     }
 

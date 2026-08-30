@@ -68,17 +68,6 @@ export const ERROR_DEFAULTS = {
   profile_locked: ["security", false, "retry"],
   profile_passphrase_required: ["security", false, "retry"],
   auth_failed: ["security", false, "retry"],
-  crypto_epoch_conflict: ["group", true, "sync_now"],
-  epoch_update_required: ["group", true, "sync_now"],
-  group_leaf_limit_exceeded: ["group", false, null],
-  invalid_crypto_transition: ["security", false, "sync_now"],
-  invalid_crypto_head: ["security", false, "sync_now"],
-  invalid_epoch_binding: ["security", false, "sync_now"],
-  invalid_sender_proof: ["security", false, "sync_now"],
-  crypto_log_gap: ["security", true, "sync_now"],
-  crypto_log_fork: ["security", false, "copy_diagnostics"],
-  epoch_authenticator_mismatch: ["security", false, "copy_diagnostics"],
-  protected_message_binding_invalid: ["security", false, "copy_diagnostics"],
   unexpected_error: ["core", true, "retry"],
 } as const;
 

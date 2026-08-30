@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{
     AttachmentDescriptor, CoreCommand, CoreEvent, MAX_TRANSPORT_RETRIES, RecoveryReason,
@@ -123,10 +124,6 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
                 mime_type: "application/octet-stream".into(),
                 size_bytes: original.len() as u64,
                 file_name: Some("payload.bin".into()),
-                preview: None,
-                width: None,
-                height: None,
-                blur_hash: None,
             },
         })
         .await?;
@@ -170,12 +167,16 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after attachment download")?;
-    assert!(
-        updated
-            .messages
-            .iter()
-            .any(|message| message.message_id == attachment_message_id)
-    );
+    let downloaded_message = updated
+        .messages
+        .iter()
+        .find(|message| message.message_id == attachment_message_id)
+        .context("downloaded attachment message not found")?;
+    let blob_ciphertext = downloaded_message
+        .downloaded_blob_b64
+        .as_ref()
+        .context("downloaded blob bytes missing")?;
+    assert_ne!(STANDARD.decode(blob_ciphertext)?, original);
 
     Ok(())
 }
@@ -792,10 +793,6 @@ async fn attachment_during_recovery_survives_restart_and_downloads_once() -> Res
                 mime_type: "application/octet-stream".into(),
                 size_bytes: original.len() as u64,
                 file_name: Some("recovery-payload.bin".into()),
-                preview: None,
-                width: None,
-                height: None,
-                blur_hash: None,
             },
         })
         .await?;
@@ -878,6 +875,21 @@ async fn attachment_during_recovery_survives_restart_and_downloads_once() -> Res
             .count(),
         1
     );
+    let downloaded_message = updated
+        .messages
+        .iter()
+        .find(|message| message.message_id == attachment_message_id)
+        .context("downloaded recovery attachment message missing")?;
+    assert_ne!(
+        STANDARD.decode(
+            downloaded_message
+                .downloaded_blob_b64
+                .as_ref()
+                .context("downloaded recovery blob bytes missing")?
+        )?,
+        original
+    );
+
     Ok(())
 }
 
@@ -2210,9 +2222,6 @@ fn public_deployment_bundle(
     Ok(DeploymentBundle {
         version: tapchat_core::model::CURRENT_MODEL_VERSION.to_string(),
         runtime_id: format!("legacy-test-runtime:{}", runtime.base_url()),
-        protocol_version: 6,
-        worker_build_id: "legacy-test-worker-v6".into(),
-        registry_schema_version: 2,
         region: "local-transport".into(),
         inbox_http_endpoint: runtime.base_url().to_string(),
         inbox_websocket_endpoint: format!(
@@ -2232,11 +2241,7 @@ fn public_deployment_bundle(
                 runtime.base_url()
             )),
             max_inline_bytes: Some(4096),
-            features: vec![
-                "generic_sync".into(),
-                "attachment_v1".into(),
-                "group_crypto_epoch_v1".into(),
-            ],
+            features: vec!["generic_sync".into(), "attachment_v1".into()],
         },
         expected_user_id: None,
         expected_device_id: None,
