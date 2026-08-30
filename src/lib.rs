@@ -17,6 +17,7 @@ pub mod logging;
 pub mod mls_adapter;
 pub mod model;
 pub mod passphrase_strength;
+pub mod pcs_policy;
 pub mod persistence;
 pub mod platform_ports;
 pub mod profile_crypto;

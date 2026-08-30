@@ -10,17 +10,17 @@ use crate::ffi_api::{
     WriteDownloadedAttachmentEffect,
 };
 use crate::transport_contract::{
-    AppendGroupEnvelopeRequest, AppendGroupTransitionRequest, BlobDownloadRequest,
-    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest, CompleteGroupJoinRequest,
-    CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
-    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest,
-    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
-    InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
-    ListGroupLeaveRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
-    PublishSharedStateRequest, PutWelcomePickupRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
-    SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
+    AppendGroupEnvelopeRequest, AppendGroupEpochTransitionRequest, AppendGroupTransitionRequest,
+    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
+    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupOutboxRequest,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchWelcomePickupRequest,
+    GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
+    GroupRealtimeSubscriptionRequest, InitializeGroupAuthorizationRequest, ListGroupInvitesRequest,
+    ListGroupJoinRequestsRequest, ListGroupLeaveRequestsRequest, MessageRequestActionRequest,
+    PrepareBlobUploadRequest, PublishSharedStateRequest, PutWelcomePickupRequest,
+    RealtimeSubscriptionRequest, ReplaceAllowlistRequest, RevokeGroupInviteRequest,
+    SealGroupOutboxRequest, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
 pub trait TransportPort {
@@ -75,6 +75,13 @@ pub trait TransportPort {
         _append: AppendGroupTransitionRequest,
     ) -> Result<Vec<CoreEvent>> {
         anyhow::bail!("group transition transport is not implemented by this platform")
+    }
+
+    async fn append_group_epoch_transition(
+        &mut self,
+        _append: AppendGroupEpochTransitionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        anyhow::bail!("group epoch transition transport is not implemented by this platform")
     }
 
     async fn get_group_authorization_state(
@@ -325,6 +332,9 @@ where
             CoreEffect::AppendGroupEnvelope { append } => ports.append_group_envelope(append).await,
             CoreEffect::AppendGroupTransition { append } => {
                 ports.append_group_transition(append).await
+            }
+            CoreEffect::AppendGroupEpochTransition { append } => {
+                ports.append_group_epoch_transition(append).await
             }
             CoreEffect::InitializeGroupAuthorization { initialize } => {
                 ports.initialize_group_authorization(initialize).await

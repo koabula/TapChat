@@ -246,7 +246,7 @@ fn cli_profile_short_passphrase_stdin_shows_storage_diagnostics() -> Result<()> 
     )?;
     assert_eq!(shown["profile"]["name"].as_str(), Some("short"));
     assert_eq!(shown["storage"]["state_db_exists"], Value::Bool(true));
-    assert_eq!(shown["storage"]["schema_version"].as_u64(), Some(2));
+    assert_eq!(shown["storage"]["schema_version"].as_u64(), Some(3));
     assert_eq!(shown["storage"]["migration_complete"], Value::Bool(false));
     assert_eq!(
         shown["storage"]["encrypted_snapshot_exists"],

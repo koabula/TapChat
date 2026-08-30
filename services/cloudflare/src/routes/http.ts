@@ -6,7 +6,8 @@ import {
   validateDeviceRuntimeAuthorizationForDevice,
   validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization,
-  validateWelcomePickupAuthorization
+  validateWelcomePickupAuthorization,
+  verifyIdentityBundle
 } from "../auth/capability";
 import {
   CONTROL_JSON_MAX_BYTES,
@@ -304,8 +305,8 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
   return {
     version: CURRENT_MODEL_VERSION,
     runtimeId,
-    protocolVersion: 5,
-    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+    protocolVersion: 6,
+    workerBuildId: env.WORKER_BUILD_ID?.trim() || "tapchat-worker-v6-unknown",
     registrySchemaVersion: 2,
     region: env.DEPLOYMENT_REGION ?? "local",
     inboxHttpEndpoint: baseUrl(request, env),
@@ -337,6 +338,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "device_registry_v1",
         "keypackage_lifecycle_v1",
         "identity_bundle_cas_v1",
+        "group_crypto_epoch_v1",
         "structured_errors_v1"
       ]
     }
@@ -557,14 +559,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return await stub.fetch(request);
     }
 
-    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|transitions|head|seal|subscribe)$/);
+    const groupOutboxMatch = url.pathname.match(/^\/v1\/groups\/([^/]+)\/outbox\/(messages|transitions|epoch-transitions|head|seal|subscribe)$/);
     if (groupOutboxMatch) {
       const groupId = decodeURIComponent(groupOutboxMatch[1]);
       const operation = groupOutboxMatch[2];
       const objectId = env.GROUP_OUTBOX.idFromName(groupId);
       const stub = env.GROUP_OUTBOX.get(objectId);
 
-      if (request.method === "POST" && (operation === "messages" || operation === "transitions")) {
+      if (request.method === "POST" && (operation === "messages" || operation === "transitions" || operation === "epoch-transitions")) {
         const bodyText = await readRequestTextLimited(request, messageRequestBodyLimit(env));
         return await stub.fetch(forwardRequestWithBody(request, bodyText));
       }

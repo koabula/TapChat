@@ -28,6 +28,7 @@ use crate::platform_ports::{
 };
 use crate::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
+    AppendGroupEpochTransitionRequest, AppendGroupEpochTransitionResult,
     AppendGroupTransitionRequest, AppendGroupTransitionResult, BlobDownloadRequest,
     BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
     ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
@@ -1511,6 +1512,68 @@ impl TransportPort for CoreDriver {
         }
     }
 
+    async fn append_group_epoch_transition(
+        &mut self,
+        append: AppendGroupEpochTransitionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let messages_endpoint = self
+            .engine
+            .refresh_snapshot()
+            .group_states
+            .iter()
+            .find(|state| state.group_id == append.group_id)
+            .map(|state| state.manifest.outbox.endpoint.clone())
+            .ok_or_else(|| anyhow!("group outbox endpoint is missing"))?;
+        let base = messages_endpoint
+            .strip_suffix("/outbox/messages")
+            .ok_or_else(|| anyhow!("group outbox endpoint is invalid"))?;
+        let group_id = append.group_id.clone();
+        let transition_id = append.transition_id.clone();
+        let response = self
+            .runtime
+            .client
+            .post(format!("{base}/outbox/epoch-transitions"))
+            .header(
+                "Authorization",
+                format!("Bearer {}", append.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&append.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&append)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupEpochTransitionAppendFailed {
+                        group_id,
+                        transition_id,
+                        failure: crate::AppErrorV1::from_http_response(status, &body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: AppendGroupEpochTransitionResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupEpochTransitionAppended {
+                    group_id,
+                    transition_id: result.transition_id,
+                    seq: result.seq,
+                    crypto_epoch: result.crypto_epoch,
+                    crypto_head_hash: result.crypto_head_hash,
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::GroupEpochTransitionAppendFailed {
+                group_id,
+                transition_id,
+                failure: crate::AppErrorV1::network_unavailable(),
+            }]),
+        }
+    }
+
     async fn get_group_authorization_state(
         &mut self,
         get: GetGroupAuthorizationStateRequest,
@@ -1693,6 +1756,12 @@ impl TransportPort for CoreDriver {
             head_seq: result.head_seq,
             current_roster_version: result.current_roster_version,
             last_commit_message_id: result.last_commit_message_id,
+            crypto_epoch: result.crypto_epoch,
+            crypto_head_hash: result.crypto_head_hash,
+            group_app_count: result.group_app_count,
+            application_index: result.application_index,
+            active_leaf_count: result.active_leaf_count,
+            leaf_last_update_index: result.leaf_last_update_index,
         }])
     }
 

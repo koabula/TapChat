@@ -32,7 +32,7 @@
     "groupId": "group:fixture",
     "userId": "user:alice",
     "deviceId": "device:alice:laptop",
-    "operations": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
+    "operations": ["read", "subscribe", "append_application", "append_control", "append_membership", "append_epoch", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
     "role": "owner",
     "expiresAt": 1775091200000,
     "signature": "fixture-capability-signature"
@@ -56,8 +56,8 @@
     "membershipProofPayload": "tapchat.group.membership.v1\nproof_type=membership_signature\noperation=remove_member\nsigner_user_id=user:alice\nsigner_device_id=device:alice:laptop\nprevious_roster_version=1\nnew_roster_version=2\nprevious_commit_message_id=message:commit:1\ncommit_message_id=message:commit:2\ncontrol_message_id=message:control:2\nnew_manifest_sha256=fixture-next-manifest-hash\nstate_event_message_id=message:event:2"
   },
   "roleOperations": {
-    "owner": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
-    "admin": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata"],
-    "member": ["read", "subscribe", "append_application", "append_control"]
+    "owner": ["read", "subscribe", "append_application", "append_control", "append_membership", "append_epoch", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
+    "admin": ["read", "subscribe", "append_application", "append_control", "append_membership", "append_epoch", "manage_invites", "approve_join", "remove_member", "update_group_metadata"],
+    "member": ["read", "subscribe", "append_application", "append_control", "append_epoch"]
   }
 }

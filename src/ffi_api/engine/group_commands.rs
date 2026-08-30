@@ -107,6 +107,9 @@ impl CoreEngine {
                 "invited contacts have no usable key packages",
             ));
         }
+        crate::pcs_policy::validate_active_leaf_limit(
+            1usize.saturating_add(peer_keypackages.len()),
+        )?;
         let invitee_user_by_device: BTreeMap<String, String> = peer_keypackages
             .iter()
             .map(|package| (package.device_id.clone(), package.user_id.clone()))
@@ -177,6 +180,11 @@ impl CoreEngine {
             consistency_state: GroupConsistencyState::Ready,
             pending_group_transition: None,
             leave_requests: Vec::new(),
+            pcs_state: Default::default(),
+            crypto_epoch: 0,
+            crypto_head_hash: String::new(),
+            pending_secure_send: None,
+            pending_epoch_transition: None,
         };
         self.state
             .group_states
@@ -307,6 +315,11 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Reconciling,
                 pending_group_transition: None,
                 leave_requests: Vec::new(),
+                pcs_state: Default::default(),
+                crypto_epoch: 0,
+                crypto_head_hash: String::new(),
+                pending_secure_send: None,
+                pending_epoch_transition: None,
             },
         );
 
@@ -367,6 +380,48 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .conversation_patch(&staged_mls, &conversation_id)?;
+        let epoch_authenticator_sha256 = staged_mls.epoch_authenticator_sha256(&conversation_id)?;
+        let next_crypto_epoch = manifest.mls_epoch_hint;
+        let next_crypto_head_hash = Self::group_crypto_head_hash(
+            "",
+            next_crypto_epoch,
+            commit.inline_ciphertext.as_deref().unwrap_or_default(),
+            &epoch_authenticator_sha256,
+            &commit.sender_user_id,
+            &commit.sender_device_id,
+        )?;
+        self.bind_group_envelope_epoch(
+            &mut commit,
+            next_crypto_epoch,
+            &next_crypto_head_hash,
+            Some(&epoch_authenticator_sha256),
+        )?;
+        self.bind_group_envelope_epoch(
+            &mut control,
+            next_crypto_epoch,
+            &next_crypto_head_hash,
+            None,
+        )?;
+        self.bind_group_envelope_epoch(
+            &mut state_event,
+            next_crypto_epoch,
+            &next_crypto_head_hash,
+            None,
+        )?;
+        for item in &mut self.state.pending_group_outbox {
+            let canonical = if item.envelope.message_id == commit.message_id {
+                Some(&commit)
+            } else if item.envelope.message_id == control.message_id {
+                Some(&control)
+            } else if item.envelope.message_id == state_event.message_id {
+                Some(&state_event)
+            } else {
+                None
+            };
+            if let Some(canonical) = canonical {
+                item.envelope = canonical.clone();
+            }
+        }
         if let Some(state) = self.state.group_states.get_mut(&group_id) {
             state.pending_group_transition = Some(PersistedPendingGroupTransition {
                 transition_id,
@@ -385,6 +440,11 @@ impl CoreEngine {
                 retries: 0,
                 first_seq: None,
                 last_seq: None,
+                expected_crypto_epoch: 0,
+                expected_crypto_head_hash: String::new(),
+                next_crypto_epoch,
+                next_crypto_head_hash,
+                epoch_authenticator_sha256,
             });
         }
         let mut effects = vec![persist_effect(&self.state, persist_ops)];
@@ -428,34 +488,321 @@ impl CoreEngine {
         if plaintext.trim().is_empty() {
             return Err(CoreError::invalid_input("plaintext must not be empty"));
         }
+        let group_id = self
+            .group_id_for_conversation(&conversation_id)?
+            .to_string();
+        let state = self.state.group_states.get_mut(&group_id).unwrap();
+        if state.pending_secure_send.is_some() {
+            return Err(CoreError::new(
+                "secure_send_in_progress",
+                "a secure group send is already pending",
+            ));
+        }
+        let nonce = self.next_message_nonce();
+        let device_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .unwrap()
+            .device_identity
+            .device_id
+            .clone();
+        let app_message_id = self.next_app_message_id(&conversation_id, &device_id, nonce);
+        self.state
+            .group_states
+            .get_mut(&group_id)
+            .unwrap()
+            .pending_secure_send = Some(crate::persistence::PendingGroupSecureSend {
+            intent_id: format!("group-secure-send:{app_message_id}"),
+            app_message_id: app_message_id.clone(),
+            plaintext,
+            storage_refs: Vec::new(),
+            created_at: None,
+        });
+        let persisted = CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                }],
+            )],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id,
+                    message_id: app_message_id,
+                    message_type: MessageType::MlsApplication,
+                }],
+                ..CoreViewModel::default()
+            }),
+        };
+        Ok(merge_outputs(
+            persisted,
+            self.sync_group_outbox(group_id, Some("secure_send".into()))?,
+        ))
+    }
+
+    pub(super) fn continue_group_secure_send(
+        &mut self,
+        group_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        if state.pending_secure_send.is_none() {
+            return Ok(CoreOutput::default());
+        }
+        let active_leaves = state
+            .manifest
+            .member_devices
+            .iter()
+            .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+            .count();
+        crate::pcs_policy::validate_active_leaf_limit(active_leaves)?;
+        let local_device_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .unwrap()
+            .device_identity
+            .device_id
+            .clone();
+        if state.pcs_state.update_due(&local_device_id, active_leaves) {
+            self.stage_group_epoch_update(group_id)
+        } else {
+            self.finalize_group_secure_send(group_id)
+        }
+    }
+
+    fn stage_group_epoch_update(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let state = self.state.group_states.get(&group_id).unwrap().clone();
+        if state.pending_epoch_transition.is_some() {
+            return self.issue_group_epoch_transition(group_id);
+        }
+        let (artifacts, patch) = {
+            let canonical = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+            let mut staged = canonical.fork()?;
+            let artifacts = staged.self_update(&state.conversation_id)?;
+            let patch = canonical.conversation_patch(&staged, &state.conversation_id)?;
+            (artifacts, patch)
+        };
+        if artifacts.base_epoch != state.crypto_epoch {
+            return Err(CoreError::new(
+                "crypto_epoch_conflict",
+                "local group MLS epoch is not the synchronized crypto head",
+            ));
+        }
+        let commit = STANDARD.decode(&artifacts.commit_b64).map_err(|error| {
+            CoreError::invalid_state(format!("group update commit is not base64: {error}"))
+        })?;
+        let commit_sha256 = format!("{:x}", Sha256::digest(commit));
+        let identity = self.state.local_identity.as_ref().unwrap();
+        let next_head = Self::group_crypto_head_hash(
+            &state.crypto_head_hash,
+            artifacts.next_epoch,
+            &artifacts.commit_b64,
+            &artifacts.epoch_authenticator_sha256,
+            &identity.user_identity.user_id,
+            &identity.device_identity.device_id,
+        )?;
+        self.state
+            .group_states
+            .get_mut(&group_id)
+            .unwrap()
+            .pending_epoch_transition = Some(crate::persistence::PendingGroupSelfUpdate {
+            transition_id: format!("group-epoch:{}:{}", group_id, &commit_sha256[..24]),
+            base_epoch: artifacts.base_epoch,
+            next_epoch: artifacts.next_epoch,
+            expected_head_hash: state.crypto_head_hash,
+            commit_b64: artifacts.commit_b64,
+            commit_sha256,
+            epoch_authenticator_sha256: artifacts.epoch_authenticator_sha256,
+            patch,
+        });
+        // next_head is deterministic; issue_group_epoch_transition recomputes
+        // it from the persisted transition so crash recovery is identical.
+        debug_assert!(!next_head.is_empty());
+        let persisted = CoreOutput {
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveGroupState {
+                    group_id: group_id.clone(),
+                }],
+            )],
+            ..CoreOutput::default()
+        };
+        Ok(merge_outputs(
+            persisted,
+            self.issue_group_epoch_transition(group_id)?,
+        ))
+    }
+
+    pub(super) fn issue_group_epoch_transition(
+        &mut self,
+        group_id: String,
+    ) -> CoreResult<CoreOutput> {
+        let state = self.state.group_states.get(&group_id).unwrap().clone();
+        let pending = state
+            .pending_epoch_transition
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("pending group epoch transition is missing"))?;
+        let identity = self.state.local_identity.as_ref().unwrap();
+        let next_head = Self::group_crypto_head_hash(
+            &pending.expected_head_hash,
+            pending.next_epoch,
+            &pending.commit_b64,
+            &pending.epoch_authenticator_sha256,
+            &identity.user_identity.user_id,
+            &identity.device_identity.device_id,
+        )?;
+        let mut envelope = self.build_group_envelope(
+            &group_id,
+            &state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            pending.commit_b64.clone(),
+        )?;
+        envelope.transition_id = Some(pending.transition_id.clone());
+        self.bind_group_envelope_epoch(
+            &mut envelope,
+            pending.next_epoch,
+            &next_head,
+            Some(&pending.epoch_authenticator_sha256),
+        )?;
+        Ok(CoreOutput {
+            effects: vec![CoreEffect::AppendGroupEpochTransition {
+                append: crate::transport_contract::AppendGroupEpochTransitionRequest {
+                    version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+                    group_id: group_id.clone(),
+                    transition_id: pending.transition_id.clone(),
+                    expected_crypto_epoch: pending.base_epoch,
+                    expected_crypto_head_hash: pending.expected_head_hash.clone(),
+                    next_crypto_epoch: pending.next_epoch,
+                    next_crypto_head_hash: next_head,
+                    epoch_authenticator_sha256: pending.epoch_authenticator_sha256.clone(),
+                    envelope,
+                    capability: self
+                        .group_capability(&group_id, self.local_group_role(&group_id)?)?,
+                },
+            }],
+            ..CoreOutput::default()
+        })
+    }
+
+    pub(super) fn resume_pending_group_secure_sends(&mut self) -> CoreResult<CoreOutput> {
+        let group_ids = self
+            .state
+            .group_states
+            .iter()
+            .filter(|(_, state)| {
+                state.pending_secure_send.is_some() || state.pending_epoch_transition.is_some()
+            })
+            .map(|(group_id, _)| group_id.clone())
+            .collect::<Vec<_>>();
+        let mut output = CoreOutput::default();
+        for group_id in group_ids {
+            let has_staged_transition = self
+                .state
+                .group_states
+                .get(&group_id)
+                .is_some_and(|state| state.pending_epoch_transition.is_some());
+            let resumed = if has_staged_transition {
+                self.issue_group_epoch_transition(group_id)?
+            } else {
+                self.sync_group_outbox(group_id, Some("resume_secure_send".into()))?
+            };
+            output = merge_outputs(output, resumed);
+        }
+        Ok(output)
+    }
+
+    fn finalize_group_secure_send(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let state = self.state.group_states.get(&group_id).unwrap().clone();
+        let pending = state
+            .pending_secure_send
+            .clone()
+            .ok_or_else(|| CoreError::invalid_state("pending group secure send is missing"))?;
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .export_group_summary(&state.conversation_id)?;
+        if summary.epoch != state.crypto_epoch || state.crypto_head_hash.is_empty() {
+            return Err(CoreError::new(
+                "crypto_epoch_conflict",
+                "group application epoch is not canonical",
+            ));
+        }
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let protected = crate::model::ProtectedGroupAppMessage {
+            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
+            group_id: group_id.clone(),
+            conversation_id: state.conversation_id.clone(),
+            app_message_id: pending.app_message_id.clone(),
+            sender_user_id: identity.user_identity.user_id.clone(),
+            sender_device_id: identity.device_identity.device_id.clone(),
+            mls_epoch: state.crypto_epoch,
+            epoch_head_hash: state.crypto_head_hash.clone(),
+            body: pending.plaintext.clone(),
+        };
         let payload = self
             .state
             .mls_adapter
             .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&conversation_id, plaintext.as_bytes())?;
-        let group_id = self
-            .group_id_for_conversation(&conversation_id)?
-            .to_string();
-        let envelope = self.build_group_envelope(
+            .unwrap()
+            .encrypt_application(&state.conversation_id, &protected.to_json_bytes()?)?;
+        let mut envelope = self.build_group_envelope(
             &group_id,
-            &conversation_id,
+            &state.conversation_id,
             GroupMessageType::MlsApplication,
             GroupEnvelopeVisibility::Visible,
             payload.payload_b64,
         )?;
+        // Preserve the stable user-message identity across crash recovery.
+        envelope.message_id = pending.app_message_id.clone();
+        envelope.storage_refs = pending.storage_refs.clone();
+        if let Some(created_at) = pending.created_at {
+            envelope.created_at = created_at;
+        }
+        self.bind_group_envelope_epoch(
+            &mut envelope,
+            state.crypto_epoch,
+            &state.crypto_head_hash,
+            None,
+        )?;
         let capability = self.group_capability(&group_id, self.local_group_role(&group_id)?)?;
-        self.enqueue_group_envelope(envelope.clone(), capability, Some(plaintext));
+        self.enqueue_group_envelope(envelope.clone(), capability, Some(pending.plaintext));
+        self.state
+            .group_states
+            .get_mut(&group_id)
+            .unwrap()
+            .pending_secure_send = None;
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
+                conversations_changed: true,
                 ..CoreStateUpdate::default()
             },
             effects: vec![persist_effect(
                 &self.state,
                 vec![
+                    PersistOp::SaveGroupState { group_id },
                     PersistOp::SaveMlsState {
-                        conversation_id: conversation_id.clone(),
+                        conversation_id: state.conversation_id.clone(),
                     },
                     PersistOp::SaveOutgoingGroupEnvelope {
                         message_id: envelope.message_id.clone(),
@@ -464,12 +811,139 @@ impl CoreEngine {
             )],
             view_model: Some(CoreViewModel {
                 messages: vec![MessageSummary {
-                    conversation_id,
+                    conversation_id: state.conversation_id,
                     message_id: envelope.message_id,
                     message_type: MessageType::MlsApplication,
                 }],
                 ..CoreViewModel::default()
             }),
+        })
+    }
+
+    pub(super) fn handle_group_epoch_transition_appended(
+        &mut self,
+        group_id: String,
+        transition_id: String,
+        seq: u64,
+        crypto_epoch: u64,
+        crypto_head_hash: String,
+    ) -> CoreResult<CoreOutput> {
+        let state = self.state.group_states.get(&group_id).unwrap().clone();
+        let pending = state
+            .pending_epoch_transition
+            .ok_or_else(|| CoreError::invalid_state("group epoch ACK has no pending patch"))?;
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let expected_head = Self::group_crypto_head_hash(
+            &pending.expected_head_hash,
+            pending.next_epoch,
+            &pending.commit_b64,
+            &pending.epoch_authenticator_sha256,
+            &identity.user_identity.user_id,
+            &identity.device_identity.device_id,
+        )?;
+        if pending.transition_id != transition_id
+            || pending.next_epoch != crypto_epoch
+            || crypto_head_hash != expected_head
+            || seq == 0
+        {
+            return Err(CoreError::new(
+                "crypto_epoch_conflict",
+                "group epoch ACK does not match pending transition",
+            ));
+        }
+        let mut summaries = self.state.mls_summaries.clone();
+        let summary = summaries.get_mut(&state.conversation_id).unwrap();
+        summary.epoch = crypto_epoch;
+        summary.updated_at = crypto_epoch;
+        let patched = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .apply_conversation_patch(&pending.patch, &summaries)?;
+        if patched.epoch_authenticator_sha256(&state.conversation_id)?
+            != pending.epoch_authenticator_sha256
+        {
+            return Err(CoreError::new(
+                "epoch_authenticator_mismatch",
+                "group epoch authenticator is invalid",
+            ));
+        }
+        self.state.mls_adapter = Some(patched);
+        self.state.mls_summaries = summaries;
+        let local_device_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .unwrap()
+            .device_identity
+            .device_id
+            .clone();
+        let current = self.state.group_states.get_mut(&group_id).unwrap();
+        current.crypto_epoch = crypto_epoch;
+        current.crypto_head_hash = crypto_head_hash;
+        current.pending_epoch_transition = None;
+        current.pcs_state.update_ordered(&local_device_id);
+        if let Some(cursor) = self.state.group_cursors.get_mut(&group_id) {
+            cursor.last_fetched_seq = cursor.last_fetched_seq.max(seq);
+        }
+        let persisted = CoreOutput {
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: state.conversation_id,
+                    },
+                    PersistOp::SaveGroupCursor {
+                        group_id: group_id.clone(),
+                    },
+                ],
+            )],
+            ..CoreOutput::default()
+        };
+        Ok(merge_outputs(
+            persisted,
+            self.continue_group_secure_send(group_id)?,
+        ))
+    }
+
+    pub(super) fn handle_group_epoch_transition_failed(
+        &mut self,
+        group_id: String,
+        _transition_id: String,
+        failure: crate::error::AppErrorV1,
+    ) -> CoreResult<CoreOutput> {
+        if failure.http_status == Some(409) {
+            if let Some(state) = self.state.group_states.get_mut(&group_id) {
+                state.pending_epoch_transition = None;
+            }
+            let persisted = CoreOutput {
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
+                    }],
+                )],
+                ..CoreOutput::default()
+            };
+            return Ok(merge_outputs(
+                persisted,
+                self.sync_group_outbox(group_id, Some("crypto_conflict".into()))?,
+            ));
+        }
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                ..CoreStateUpdate::default()
+            },
+            ..CoreOutput::default()
         })
     }
 
@@ -904,6 +1378,15 @@ impl CoreEngine {
                 "joiner has no active key packages",
             ));
         }
+        let active_leaf_count = group_state
+            .manifest
+            .member_devices
+            .iter()
+            .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+            .count();
+        crate::pcs_policy::validate_active_leaf_limit(
+            active_leaf_count.saturating_add(peer_devices.len()),
+        )?;
         let adapter = self
             .state
             .mls_adapter
@@ -958,6 +1441,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 
@@ -1012,6 +1500,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 
@@ -1175,6 +1668,15 @@ impl CoreEngine {
                 "no active key packages found for any invitee",
             ));
         }
+        let active_leaf_count = group_state
+            .manifest
+            .member_devices
+            .iter()
+            .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+            .count();
+        crate::pcs_policy::validate_active_leaf_limit(
+            active_leaf_count.saturating_add(peer_keypackages.len()),
+        )?;
         let adapter = self
             .state
             .mls_adapter
@@ -1211,6 +1713,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -1264,6 +1771,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         let mut effects = vec![persist_effect(
@@ -1442,6 +1954,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -1495,6 +2012,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         let effects = vec![persist_effect(
@@ -1804,6 +2326,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -1906,6 +2433,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -2039,6 +2571,11 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -2225,6 +2762,11 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 
@@ -2426,6 +2968,13 @@ impl CoreEngine {
                 "device is already an active member of this group",
             ));
         }
+        let active_leaf_count = group_state
+            .manifest
+            .member_devices
+            .iter()
+            .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+            .count();
+        crate::pcs_policy::validate_active_leaf_limit(active_leaf_count.saturating_add(1))?;
         let bundle =
             self.state.local_bundle.as_ref().ok_or_else(|| {
                 CoreError::invalid_state("local identity bundle is not initialized")
@@ -2493,6 +3042,11 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 
@@ -2547,6 +3101,11 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 
@@ -2746,6 +3305,11 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 
@@ -2800,6 +3364,11 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs_state: group_state.pcs_state.clone(),
+                crypto_epoch: group_state.crypto_epoch,
+                crypto_head_hash: group_state.crypto_head_hash.clone(),
+                pending_secure_send: group_state.pending_secure_send.clone(),
+                pending_epoch_transition: group_state.pending_epoch_transition.clone(),
             },
         );
 

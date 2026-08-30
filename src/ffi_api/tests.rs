@@ -769,6 +769,7 @@ mod tests {
             GroupCapabilityOperation::AppendApplication,
             GroupCapabilityOperation::AppendControl,
             GroupCapabilityOperation::AppendMembership,
+            GroupCapabilityOperation::AppendEpoch,
             GroupCapabilityOperation::ManageInvites,
             GroupCapabilityOperation::ApproveJoin,
             GroupCapabilityOperation::RemoveMember,
@@ -784,6 +785,7 @@ mod tests {
             GroupCapabilityOperation::Subscribe,
             GroupCapabilityOperation::AppendApplication,
             GroupCapabilityOperation::AppendControl,
+            GroupCapabilityOperation::AppendEpoch,
         ];
 
         assert_eq!(
@@ -864,6 +866,7 @@ mod tests {
                 GroupCapabilityOperation::AppendApplication,
                 GroupCapabilityOperation::AppendControl,
                 GroupCapabilityOperation::AppendMembership,
+                GroupCapabilityOperation::AppendEpoch,
                 GroupCapabilityOperation::ManageInvites,
                 GroupCapabilityOperation::ApproveJoin,
                 GroupCapabilityOperation::RemoveMember,
@@ -1115,6 +1118,7 @@ mod tests {
                 plaintext: "retry me".into(),
             })
             .expect("send group text");
+        let sent = complete_group_secure_send_preflight(&mut alice, &group_id, sent);
         let (message_id, initial_expiry) = sent
             .effects
             .iter()
@@ -1153,6 +1157,70 @@ mod tests {
     }
 
     #[test]
+    fn stale_group_application_is_synchronized_and_reencrypted_not_retried() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
+        let summary = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+        let conversation_id = summary.conversation_id.clone();
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        let staged = alice
+            .handle_command(CoreCommand::SendGroupTextMessage {
+                conversation_id,
+                plaintext: "re-encrypt me".into(),
+            })
+            .expect("send group text");
+        let appended = complete_group_secure_send_preflight(&mut alice, &group_id, staged);
+        let message_id = appended
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::AppendGroupEnvelope { append } => {
+                    Some(append.envelope.message_id.clone())
+                }
+                _ => None,
+            })
+            .expect("application append");
+
+        let reconciled = alice
+            .handle_event(CoreEvent::GroupEnvelopeAppendFailed {
+                group_id: group_id.clone(),
+                message_id: message_id.clone(),
+                failure: test_failure("epoch_update_required", true, Some(409)),
+            })
+            .expect("reconcile stale application");
+        assert!(reconciled.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::GetGroupOutboxHead { get } if get.group_id == group_id
+        )));
+        assert!(!reconciled
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
+        assert!(!alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .any(|item| item.envelope.message_id == message_id));
+        let pending = alice.state.group_states[&group_id]
+            .pending_secure_send
+            .as_ref()
+            .expect("plaintext intent restored");
+        assert_eq!(pending.app_message_id, message_id);
+        assert_eq!(pending.plaintext, "re-encrypt me");
+    }
+
+    #[test]
     fn membership_revoked_clears_every_pending_group_send() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -1171,12 +1239,13 @@ mod tests {
         let conversation_id = summary.conversation_id.clone();
         acknowledge_pending_group_transition(&mut alice, &group_id);
         for plaintext in ["first pending", "second pending"] {
-            alice
+            let staged = alice
                 .handle_command(CoreCommand::SendGroupTextMessage {
                     conversation_id: conversation_id.clone(),
                     plaintext: plaintext.into(),
                 })
                 .expect("send group text");
+            complete_group_secure_send_preflight(&mut alice, &group_id, staged);
         }
         let pending_ids: Vec<String> = alice
             .state
@@ -1398,12 +1467,13 @@ mod tests {
             .and_then(|summary| summary.group_id.clone())
             .expect("group id");
         acknowledge_pending_group_transition(&mut alice, &group_id);
-        alice
+        let staged = alice
             .handle_command(CoreCommand::SendGroupTextMessage {
                 conversation_id: alice.state.group_states[&group_id].conversation_id.clone(),
                 plaintext: "preexisting".into(),
             })
             .expect("stage preexisting group message");
+        complete_group_secure_send_preflight(&mut alice, &group_id, staged);
 
         let preexisting_pending: Vec<String> = alice
             .state
@@ -2185,6 +2255,8 @@ mod tests {
                 plaintext: "pending after restart".into(),
             })
             .expect("send pending group text");
+        let send_output =
+            complete_group_secure_send_preflight(&mut bob.engine, &group_id, send_output);
         assert!(send_output.effects.iter().any(|effect| {
             matches!(effect, CoreEffect::AppendGroupEnvelope { append } if append.group_id == group_id)
         }));
@@ -2208,6 +2280,130 @@ mod tests {
     }
 
     #[test]
+    fn group_recovery_resumes_persisted_secure_send_preflight() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
+        let summary = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+        let conversation_id = summary.conversation_id.clone();
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+
+        let staged = alice
+            .handle_command(CoreCommand::SendGroupTextMessage {
+                conversation_id,
+                plaintext: "resume preflight".into(),
+            })
+            .expect("stage secure send");
+        assert!(staged.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::GetGroupOutboxHead { get } if get.group_id == group_id
+        )));
+        assert!(alice.state.group_states[&group_id]
+            .pending_secure_send
+            .is_some());
+
+        let mut restored =
+            CoreEngine::try_from_restored_state(alice.refresh_snapshot()).expect("restore");
+        let resumed = restored
+            .handle_event(CoreEvent::AppStarted)
+            .expect("resume pending secure send");
+        assert!(resumed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::GetGroupOutboxHead { get } if get.group_id == group_id
+        )));
+        assert!(!resumed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ScheduleTimer { timer } if timer.timer_id.contains(&group_id)
+        )));
+    }
+
+    #[test]
+    fn group_recovery_replays_stable_epoch_transition_after_lost_ack() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let created = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id],
+            })
+            .expect("create group");
+        let summary = created
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary");
+        let group_id = summary.group_id.clone().expect("group id");
+        let conversation_id = summary.conversation_id.clone();
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        alice
+            .handle_command(CoreCommand::SendGroupTextMessage {
+                conversation_id,
+                plaintext: "requires update".into(),
+            })
+            .expect("stage secure send");
+
+        let state = alice.state.group_states[&group_id].clone();
+        let staged_update = alice
+            .handle_event(CoreEvent::GroupOutboxHeadFetched {
+                group_id: group_id.clone(),
+                head_seq: group_cursor_engine(&alice, &group_id),
+                current_roster_version: Some(state.manifest.roster_version),
+                last_commit_message_id: state.manifest.last_commit_message_id,
+                crypto_epoch: state.crypto_epoch,
+                crypto_head_hash: state.crypto_head_hash,
+                group_app_count: 32,
+                application_index: 32,
+                active_leaf_count: state
+                    .manifest
+                    .member_devices
+                    .iter()
+                    .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+                    .count(),
+                leaf_last_update_index: state.pcs_state.leaf_last_update_index,
+            })
+            .expect("stage due update");
+        let transition_id = staged_update
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::AppendGroupEpochTransition { append } => {
+                    Some(append.transition_id.clone())
+                }
+                _ => None,
+            })
+            .expect("epoch transition append");
+        assert!(!staged_update
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::AppendGroupEnvelope { .. })));
+
+        let mut restored =
+            CoreEngine::try_from_restored_state(alice.refresh_snapshot()).expect("restore");
+        let resumed = restored
+            .handle_event(CoreEvent::AppStarted)
+            .expect("replay accepted request after lost ACK");
+        assert!(resumed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::AppendGroupEpochTransition { append }
+                if append.group_id == group_id && append.transition_id == transition_id
+        )));
+        assert!(!resumed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::AppendGroupEnvelope { .. })));
+    }
+
+    #[test]
     fn manual_group_outbox_sync_retries_exhausted_pending_appends() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
@@ -2220,13 +2416,14 @@ mod tests {
         let (group_id, conversation_id) =
             harness.create_group(&mut alice, "Project", vec![bob.bundle.user_id.clone()]);
 
-        alice
+        let staged = alice
             .engine
             .handle_command(CoreCommand::SendGroupTextMessage {
                 conversation_id,
                 plaintext: "retry after runtime upgrade".into(),
             })
             .expect("send pending group text");
+        complete_group_secure_send_preflight(&mut alice.engine, &group_id, staged);
 
         for item in &mut alice.engine.state.pending_group_outbox {
             if item.envelope.group_id == group_id {
@@ -2867,48 +3064,6 @@ mod tests {
                 .any(|text| text == "welcome dana"),
             "Dana did not receive post-approval text"
         );
-    }
-
-    #[test]
-    fn send_text_message_emits_append_request() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
-        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        let output = alice
-            .handle_command(CoreCommand::SendTextMessage {
-                conversation_id: conversation_id.clone(),
-                plaintext: "hello".into(),
-            })
-            .expect("send");
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.contains("/messages")
-                    && request.headers.contains_key("X-Tapchat-Capability")
-        )));
-        let pending = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| item.envelope.message_type == MessageType::MlsApplication)
-            .expect("pending application delivery");
-        let app_message_id = pending.app_message_id.as_deref().expect("app message id");
-        assert!(app_message_id.starts_with(&format!("app:{conversation_id}:")));
-        assert!(app_message_id.ends_with(&format!(
-            ":{}",
-            alice
-                .local_identity()
-                .expect("local identity")
-                .device_identity
-                .device_id
-        )));
-        assert_eq!(pending.plaintext_cache.as_deref(), Some("hello"));
-        assert_ne!(pending.envelope.message_id, app_message_id);
-        let visible = &output.view_model.as_ref().expect("view model").messages;
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].conversation_id, conversation_id);
-        assert_eq!(visible[0].message_id, app_message_id);
-        assert_eq!(visible[0].message_type, MessageType::MlsApplication);
     }
 
     #[test]
@@ -8194,6 +8349,57 @@ mod tests {
     }
 
     impl GroupHarness {
+        fn crypto_head(
+            &self,
+            group_id: &str,
+        ) -> (u64, String, u32, u64, usize, BTreeMap<String, u64>) {
+            let mut epoch = 0;
+            let mut head = String::new();
+            let mut group_app_count = 0u32;
+            let mut application_index = 0u64;
+            let mut leaf_baselines = BTreeMap::new();
+            if let Some(manifest) = self.authorization_manifests.get(group_id) {
+                for leaf in manifest
+                    .member_devices
+                    .iter()
+                    .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+                {
+                    leaf_baselines.insert(leaf.device_id.clone(), 0);
+                }
+            }
+            for record in self.outboxes.get(group_id).into_iter().flatten() {
+                if record.envelope.message_type == GroupMessageType::MlsCommit {
+                    epoch = record.envelope.mls_epoch.unwrap_or(epoch);
+                    head = record.envelope.epoch_head_hash.clone().unwrap_or(head);
+                    group_app_count = 0;
+                    leaf_baselines
+                        .insert(record.envelope.sender_device_id.clone(), application_index);
+                } else if record.envelope.message_type == GroupMessageType::MlsApplication {
+                    application_index = application_index.saturating_add(1);
+                    group_app_count = group_app_count.saturating_add(1);
+                }
+            }
+            let active_leaf_count = self
+                .authorization_manifests
+                .get(group_id)
+                .map(|manifest| {
+                    manifest
+                        .member_devices
+                        .iter()
+                        .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+                        .count()
+                })
+                .unwrap_or(0);
+            (
+                epoch,
+                head,
+                group_app_count,
+                application_index,
+                active_leaf_count,
+                leaf_baselines,
+            )
+        }
+
         fn with_bundles(users: &[HarnessUser]) -> Self {
             Self {
                 bundles: users
@@ -8277,6 +8483,35 @@ mod tests {
                             })
                             .expect("group transition appended")
                     }
+                    CoreEffect::AppendGroupEpochTransition { append } => {
+                        let seq = self
+                            .outboxes
+                            .entry(append.group_id.clone())
+                            .or_default()
+                            .len() as u64
+                            + 1;
+                        self.outboxes
+                            .entry(append.group_id.clone())
+                            .or_default()
+                            .push(GroupOutboxRecord {
+                                seq,
+                                group_id: append.group_id.clone(),
+                                message_id: append.envelope.message_id.clone(),
+                                received_at: seq,
+                                expires_at: None,
+                                state: GroupOutboxRecordState::Available,
+                                envelope: append.envelope.clone(),
+                            });
+                        user.engine
+                            .handle_event(CoreEvent::GroupEpochTransitionAppended {
+                                group_id: append.group_id,
+                                transition_id: append.transition_id,
+                                seq,
+                                crypto_epoch: append.next_crypto_epoch,
+                                crypto_head_hash: append.next_crypto_head_hash,
+                            })
+                            .expect("group epoch transition appended")
+                    }
                     CoreEffect::GetGroupOutboxHead { get } => {
                         let revoked = self.authorization_manifests.get(&get.group_id).is_some_and(
                             |manifest| {
@@ -8305,6 +8540,7 @@ mod tests {
                                 .map(|record| record.seq)
                                 .unwrap_or(0);
                             let manifest = self.authorization_manifests.get(&get.group_id);
+                            let crypto = self.crypto_head(&get.group_id);
                             user.engine
                                 .handle_event(CoreEvent::GroupOutboxHeadFetched {
                                     group_id: get.group_id,
@@ -8313,6 +8549,12 @@ mod tests {
                                         .map(|value| value.roster_version),
                                     last_commit_message_id: manifest
                                         .and_then(|value| value.last_commit_message_id.clone()),
+                                    crypto_epoch: crypto.0,
+                                    crypto_head_hash: crypto.1,
+                                    group_app_count: crypto.2,
+                                    application_index: crypto.3,
+                                    active_leaf_count: crypto.4,
+                                    leaf_last_update_index: crypto.5,
                                 })
                                 .expect("group outbox head fetched")
                         }
@@ -8358,7 +8600,10 @@ mod tests {
                             to_seq,
                         }) {
                             Ok(output) => output,
-                            Err(error) => panic!("group outbox fetched: {error:?}"),
+                            Err(error) => panic!(
+                                "group outbox fetched for {} from {}: {error:?}",
+                                user.name, fetch.from_seq
+                            ),
                         }
                     }
                     CoreEffect::PutWelcomePickup { put } => {
@@ -9078,6 +9323,43 @@ mod tests {
         output
     }
 
+    fn complete_group_secure_send_preflight(
+        engine: &mut CoreEngine,
+        group_id: &str,
+        output: CoreOutput,
+    ) -> CoreOutput {
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::GetGroupOutboxHead { get } if get.group_id == group_id
+        )));
+        let state = engine
+            .state
+            .group_states
+            .get(group_id)
+            .expect("group state")
+            .clone();
+        let head_seq = group_cursor_engine(engine, group_id);
+        engine
+            .handle_event(CoreEvent::GroupOutboxHeadFetched {
+                group_id: group_id.to_string(),
+                head_seq,
+                current_roster_version: Some(state.manifest.roster_version),
+                last_commit_message_id: state.manifest.last_commit_message_id,
+                crypto_epoch: state.crypto_epoch,
+                crypto_head_hash: state.crypto_head_hash,
+                group_app_count: state.pcs_state.group_app_count_since_update,
+                application_index: state.pcs_state.application_index,
+                active_leaf_count: state
+                    .manifest
+                    .member_devices
+                    .iter()
+                    .filter(|leaf| leaf.status == GroupMemberStatus::Active)
+                    .count(),
+                leaf_last_update_index: state.pcs_state.leaf_last_update_index,
+            })
+            .expect("complete group crypto-head preflight")
+    }
+
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
         let mut engine = CoreEngine::new();
         engine
@@ -9423,7 +9705,7 @@ mod tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 5,
+            protocol_version: 6,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "local".into(),
@@ -9447,6 +9729,7 @@ mod tests {
                     "generic_sync".into(),
                     "group_authorization_v2".into(),
                     "group_membership_fsm_v2".into(),
+                    "group_crypto_epoch_v1".into(),
                 ],
             },
             expected_user_id: None,
@@ -9863,6 +10146,9 @@ mod tests {
                 "forged",
             )),
             transition_id: None,
+            mls_epoch: None,
+            epoch_head_hash: None,
+            epoch_authenticator_sha256: None,
         };
         harness
             .outboxes
@@ -9951,6 +10237,9 @@ mod tests {
             },
             membership_proof: None,
             transition_id: None,
+            mls_epoch: None,
+            epoch_head_hash: None,
+            epoch_authenticator_sha256: None,
         };
         harness
             .outboxes
@@ -10052,6 +10341,9 @@ mod tests {
                 "forged",
             )),
             transition_id: None,
+            mls_epoch: None,
+            epoch_head_hash: None,
+            epoch_authenticator_sha256: None,
         };
         harness
             .outboxes

@@ -698,6 +698,7 @@ impl CoreEngine {
                 local_display_name,
                 pending_sync_group_head: BTreeSet::new(),
                 group_sync_target_head: BTreeMap::new(),
+                group_sync_target_crypto_head: BTreeMap::new(),
             },
         };
 
@@ -1054,7 +1055,7 @@ impl CoreEngine {
             .find(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
             .map(|item| item.envelope.group_id.clone())
             .ok_or_else(|| CoreError::invalid_state("staged group transition has no group"))?;
-        let proposed = self
+        let mut proposed = self
             .state
             .group_states
             .get(&group_id)
@@ -1065,6 +1066,81 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
             .manifest
             .clone();
+        if !staged_items
+            .iter()
+            .any(|item| item.envelope.message_type == GroupMessageType::MlsCommit)
+        {
+            // Roster metadata and role changes do not alter the MLS tree, but
+            // they still share the roster/crypto CAS domain with membership
+            // changes. Advance the staged adapter with a real update-path
+            // Commit so they cannot race a concurrent PCS self-update.
+            let artifacts = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
+                .self_update(&proposed.conversation_id)?;
+            let mut commit = self.build_group_envelope(
+                &group_id,
+                &proposed.conversation_id,
+                GroupMessageType::MlsCommit,
+                GroupEnvelopeVisibility::Protocol,
+                artifacts.commit_b64,
+            )?;
+            proposed.manifest.mls_epoch_hint = artifacts.next_epoch;
+            proposed.manifest.last_commit_message_id = Some(commit.message_id.clone());
+            proposed.manifest.signature = self.sign_manifest(&proposed.manifest)?;
+            proposed.manifest.validate()?;
+
+            proof.commit_message_id = commit.message_id.clone();
+            proof.new_manifest_sha256 = Self::manifest_sha256(&proposed.manifest)?;
+            commit.membership_proof = Some(proof.clone());
+            let capability = self.group_capability(
+                &group_id,
+                canonical_groups
+                    .get(&group_id)
+                    .and_then(|state| state.local_role)
+                    .ok_or_else(|| CoreError::invalid_state("canonical group role is missing"))?,
+            )?;
+            self.enqueue_group_envelope(commit, capability, None);
+            self.state.pending_group_outbox[pending_start..].rotate_right(1);
+
+            let manifest_payload = serde_json::to_vec(&proposed.manifest).map_err(|error| {
+                CoreError::invalid_input(format!("failed to encode staged manifest: {error}"))
+            })?;
+            let control_payload = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
+                .encrypt_application(&proposed.conversation_id, &manifest_payload)?;
+            let identity = self
+                .state
+                .local_identity
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            let control = self.state.pending_group_outbox[pending_start..]
+                .iter_mut()
+                .find(|item| item.envelope.message_id == proof.control_message_id)
+                .ok_or_else(|| {
+                    CoreError::invalid_state("staged group transition lost its control envelope")
+                })?;
+            control.envelope.inline_ciphertext = Some(control_payload.payload_b64.clone());
+            control.envelope.sender_proof.value =
+                identity.sign_sender_proof(control_payload.payload_b64.as_bytes());
+            control.plaintext_cache = Some(
+                String::from_utf8(manifest_payload)
+                    .map_err(|_| CoreError::invalid_state("staged manifest is not UTF-8"))?,
+            );
+            self.state.mls_summaries.insert(
+                proposed.conversation_id.clone(),
+                self.state
+                    .mls_adapter
+                    .as_ref()
+                    .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
+                    .export_group_summary(&proposed.conversation_id)?,
+            );
+        }
         let transition_id = format!("group-transition:{}", proof.control_message_id);
         let mut event_envelope = self.build_group_envelope(
             &group_id,
@@ -1116,7 +1192,7 @@ impl CoreEngine {
         event_envelope.membership_proof = Some(proof.clone());
         let capability = self.group_capability_for_state(&proposed)?;
         self.enqueue_group_envelope(event_envelope, capability, Some(event_plaintext));
-        let new_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
+        let mut new_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
         let welcomes: Vec<PutWelcomePickupRequest> = output
             .effects
             .iter()
@@ -1149,6 +1225,80 @@ impl CoreEngine {
             })
             .transpose()?
             .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?;
+        let epoch_authenticator_sha256 = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
+            .epoch_authenticator_sha256(&proposed.conversation_id)?;
+        let base_crypto = canonical_groups
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("canonical group crypto state is missing"))?;
+        let commit_envelope = new_items
+            .iter()
+            .map(|item| &item.envelope)
+            .find(|envelope| envelope.message_type == GroupMessageType::MlsCommit)
+            .ok_or_else(|| CoreError::invalid_state("group transition is missing MLS Commit"))?;
+        let next_crypto_epoch = proposed.manifest.mls_epoch_hint;
+        let next_crypto_head_hash = Self::group_crypto_head_hash(
+            &base_crypto.crypto_head_hash,
+            next_crypto_epoch,
+            commit_envelope
+                .inline_ciphertext
+                .as_deref()
+                .unwrap_or_default(),
+            &epoch_authenticator_sha256,
+            &commit_envelope.sender_user_id,
+            &commit_envelope.sender_device_id,
+        )?;
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        for item in &mut self.state.pending_group_outbox[pending_start..] {
+            item.envelope.mls_epoch = Some(next_crypto_epoch);
+            item.envelope.epoch_head_hash = Some(next_crypto_head_hash.clone());
+            item.envelope.epoch_authenticator_sha256 = (item.envelope.message_type
+                == GroupMessageType::MlsCommit)
+                .then(|| epoch_authenticator_sha256.clone());
+            let payload = item
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .unwrap_or_default();
+            item.envelope.sender_proof.value = identity.sign_sender_proof(
+                Self::group_envelope_epoch_signature_payload(
+                    payload,
+                    next_crypto_epoch,
+                    &next_crypto_head_hash,
+                    item.envelope.epoch_authenticator_sha256.as_deref(),
+                )
+                .as_bytes(),
+            );
+        }
+        for item in &mut new_items {
+            item.envelope.mls_epoch = Some(next_crypto_epoch);
+            item.envelope.epoch_head_hash = Some(next_crypto_head_hash.clone());
+            item.envelope.epoch_authenticator_sha256 = (item.envelope.message_type
+                == GroupMessageType::MlsCommit)
+                .then(|| epoch_authenticator_sha256.clone());
+            let payload = item
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .unwrap_or_default();
+            item.envelope.sender_proof.value = identity.sign_sender_proof(
+                Self::group_envelope_epoch_signature_payload(
+                    payload,
+                    next_crypto_epoch,
+                    &next_crypto_head_hash,
+                    item.envelope.epoch_authenticator_sha256.as_deref(),
+                )
+                .as_bytes(),
+            );
+        }
         self.state.mls_adapter = canonical_mls;
         self.state.group_states = canonical_groups;
         self.state.conversations = canonical_conversations;
@@ -1186,6 +1336,11 @@ impl CoreEngine {
                 retries: 0,
                 first_seq: None,
                 last_seq: None,
+                expected_crypto_epoch: base.crypto_epoch,
+                expected_crypto_head_hash: base.crypto_head_hash.clone(),
+                next_crypto_epoch,
+                next_crypto_head_hash,
+                epoch_authenticator_sha256,
             });
         }
         output.effects.retain(|effect| {
@@ -1194,6 +1349,7 @@ impl CoreEngine {
                 CoreEffect::PutWelcomePickup { .. }
                     | CoreEffect::AppendGroupEnvelope { .. }
                     | CoreEffect::AppendGroupTransition { .. }
+                    | CoreEffect::AppendGroupEpochTransition { .. }
                     | CoreEffect::DecideGroupJoinRequest { .. }
             )
         });
@@ -1633,11 +1789,23 @@ impl CoreEngine {
                 head_seq,
                 current_roster_version,
                 last_commit_message_id,
+                crypto_epoch,
+                crypto_head_hash,
+                group_app_count,
+                application_index,
+                active_leaf_count,
+                leaf_last_update_index,
             } => self.handle_group_outbox_head_fetched(
                 group_id,
                 head_seq,
                 current_roster_version,
                 last_commit_message_id,
+                crypto_epoch,
+                crypto_head_hash,
+                group_app_count,
+                application_index,
+                active_leaf_count,
+                leaf_last_update_index,
             ),
             CoreEvent::GroupOutboxHeadFetchFailed {
                 group_id,
@@ -1692,6 +1860,28 @@ impl CoreEngine {
                 failure.http_status,
                 Some(failure.code),
                 None,
+            ),
+            CoreEvent::GroupEpochTransitionAppended {
+                group_id,
+                transition_id,
+                seq,
+                crypto_epoch,
+                crypto_head_hash,
+            } => self.handle_group_epoch_transition_appended(
+                group_id,
+                transition_id,
+                seq,
+                crypto_epoch,
+                crypto_head_hash,
+            ),
+            CoreEvent::GroupEpochTransitionAppendFailed {
+                group_id,
+                transition_id,
+                failure,
+            } => self.handle_group_epoch_transition_failed(
+                group_id,
+                transition_id,
+                failure,
             ),
             CoreEvent::GroupAuthorizationStateFetched {
                 group_id,
@@ -2475,6 +2665,7 @@ fn group_capability_signing_payload(capability: &GroupCapability) -> String {
             crate::model::GroupCapabilityOperation::AppendApplication => "append_application",
             crate::model::GroupCapabilityOperation::AppendControl => "append_control",
             crate::model::GroupCapabilityOperation::AppendMembership => "append_membership",
+            crate::model::GroupCapabilityOperation::AppendEpoch => "append_epoch",
             crate::model::GroupCapabilityOperation::ManageInvites => "manage_invites",
             crate::model::GroupCapabilityOperation::ApproveJoin => "approve_join",
             crate::model::GroupCapabilityOperation::RemoveMember => "remove_member",
@@ -3529,7 +3720,7 @@ mod group_membership_security_tests {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
-            protocol_version: 5,
+            protocol_version: 6,
             worker_build_id: "test-worker-v4".into(),
             registry_schema_version: 2,
             region: "test".into(),
@@ -3545,7 +3736,10 @@ mod group_membership_security_tests {
                 device_status_ref: None,
                 keypackage_ref_base: None,
                 max_inline_bytes: Some(4096),
-                features: vec!["group_membership_fsm_v2".into()],
+                features: vec![
+                    "group_membership_fsm_v2".into(),
+                    "group_crypto_epoch_v1".into(),
+                ],
             },
             expected_user_id: None,
             expected_device_id: None,
@@ -3680,6 +3874,9 @@ mod group_membership_security_tests {
             },
             membership_proof: Some(proof()),
             transition_id: None,
+            mls_epoch: None,
+            epoch_head_hash: None,
+            epoch_authenticator_sha256: None,
         }
     }
 

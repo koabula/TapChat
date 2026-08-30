@@ -39,7 +39,9 @@ pub const SNAPSHOT_DB_BACKUP_FILE_NAME: &str = "snapshot.enc.pre-state-db";
 pub const PRIVATE_STATE_DOCUMENT_KIND: &str = "private-state";
 
 const DB_KEY_DOCUMENT_KIND: &str = "state-db";
-const SCHEMA_VERSION: u32 = 2;
+// Schema 3 requires persisted authenticated group crypto-head state. Schema 2
+// profiles are intentionally not migrated.
+const SCHEMA_VERSION: u32 = 3;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const MIGRATION_COMPLETE_KEY: &str = "migration_complete";
 const JSON_TABLES: &[&str] = &[

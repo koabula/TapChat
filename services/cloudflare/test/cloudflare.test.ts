@@ -6,6 +6,7 @@ import {
   type AllowlistDocument,
   type AppendEnvelopeRequest,
   type AppendGroupEnvelopeRequest,
+  type AppendGroupEpochTransitionRequest,
   type AppendGroupTransitionRequest,
   type CreateGroupInviteRequest,
   type DecideGroupJoinRequest,
@@ -73,6 +74,7 @@ const { GroupOutboxService } = await import("../src/group-outbox/service");
 const { routeFamilyForObservability } = await import("../src/index");
 
 const TEST_SHARING_SECRET = "test-sharing-secret-0123456789abcdef0123456789abcdef";
+const TEST_GROUP_CRYPTO_HEAD = "a".repeat(64);
 const TEST_BOOTSTRAP_SECRET = "test-bootstrap-secret-0123456789abcdef0123456789abcdef";
 const TEST_DEVICE_RUNTIME_SECRET = "test-runtime-secret-0123456789abcdef0123456789abcdef";
 const TEST_DEVICE_RUNTIME_KEY_ID = "test-runtime-current";
@@ -128,14 +130,23 @@ test("group membership proof payload matches the Rust canonical field order", ()
 
 class MemoryState implements DurableObjectStorageLike {
   private readonly map = new Map<string, unknown>();
+  private transactionTail: Promise<unknown> = Promise.resolve();
   alarmAt?: number;
 
   async get<T>(key: string): Promise<T | undefined> {
     return this.map.get(key) as T | undefined;
   }
 
-  async put<T>(key: string, value: T): Promise<void> {
-    this.map.set(key, value);
+  async put<T>(key: string, value: T): Promise<void>;
+  async put(entries: Record<string, unknown>): Promise<void>;
+  async put<T>(keyOrEntries: string | Record<string, unknown>, value?: T): Promise<void> {
+    if (typeof keyOrEntries === "string") {
+      this.map.set(keyOrEntries, value);
+      return;
+    }
+    for (const [key, entry] of Object.entries(keyOrEntries)) {
+      this.map.set(key, entry);
+    }
   }
 
   async putEntries(entries: Record<string, unknown>): Promise<void> {
@@ -181,6 +192,12 @@ class MemoryState implements DurableObjectStorageLike {
     if (JSON.stringify(current) !== JSON.stringify(expected)) return false;
     this.map.delete(key);
     return true;
+  }
+
+  transaction<T>(callback: (transaction: MemoryState) => Promise<T>): Promise<T> {
+    const result = this.transactionTail.then(() => callback(this));
+    this.transactionTail = result.then(() => undefined, () => undefined);
+    return result;
   }
 }
 
@@ -364,6 +381,21 @@ class FakeGroupOutboxStub implements DurableObjectStub {
     if (!isAuthorizationBootstrap && !(await authorization.getState())) {
       await initializeGroupState(this.state, this.groupId);
     }
+    if (!isAuthorizationBootstrap && !(await this.state.get("meta"))) {
+      await this.state.put("meta", {
+        headSeq: 0,
+        retentionDays: this.env.retentionDays,
+        maxInlineBytes: this.env.maxInlineBytes,
+        currentRosterVersion: 1,
+        cryptoEpoch: 1,
+        cryptoHeadHash: TEST_GROUP_CRYPTO_HEAD,
+        groupAppCount: 0,
+        applicationIndex: 0,
+        leafLastUpdateIndex: Object.fromEntries(
+          Object.values(GROUP_IDENTITIES).map((identity) => [identity.deviceId, 0])
+        )
+      });
+    }
     return handleGroupOutboxDurableRequest(request, {
       groupId: this.groupId,
       state: this.state,
@@ -397,7 +429,7 @@ class FakeDeviceRegistryStub {
       return Response.json({
         ready: true,
         runtimeId: config.runtimeId,
-        protocolVersion: 5,
+        protocolVersion: 6,
         workerBuildId: config.workerBuildId,
         registrySchemaVersion: 2
       });
@@ -767,7 +799,7 @@ function bytesToHex(input: Uint8Array): string {
 
 function sampleGroupCapability(
   groupId = "group:project",
-  operations: GroupCapabilityOperation[] = ["read", "append_application", "append_control", "append_membership"],
+  operations: GroupCapabilityOperation[] = ["read", "append_application", "append_control", "append_membership", "append_epoch"],
   role: GroupCapability["role"] = "owner"
 ): GroupCapability {
   const identity = groupIdentityForRole(role);
@@ -792,6 +824,10 @@ function sampleGroupAppend(
   messageType: GroupMessageType = "mls_application",
   capability = sampleGroupCapability(groupId)
 ): AppendGroupEnvelopeRequest {
+  const identity = Object.values(GROUP_IDENTITIES).find((entry) =>
+    entry.userId === capability.userId && entry.deviceId === capability.deviceId
+  )!;
+  const epochBinding = `tapchat.group_envelope_epoch.v1\npayload=cipher\nmls_epoch=1\nepoch_head_hash=${TEST_GROUP_CRYPTO_HEAD}\nepoch_authenticator_sha256=`;
   return {
     version: CURRENT_MODEL_VERSION,
     groupId,
@@ -807,13 +843,36 @@ function sampleGroupAppend(
       visibility: "visible",
       inlineCiphertext: "cipher",
       storageRefs: [],
+      mlsEpoch: 1,
+      epochHeadHash: TEST_GROUP_CRYPTO_HEAD,
       senderProof: {
-        type: "signature",
-        value: "sig"
+        type: "device_signature",
+        value: signHex(identity.deviceSecret, epochBinding)
       }
     },
-    capability
+    capability,
+    expectedCryptoEpoch: 1,
+    expectedCryptoHeadHash: TEST_GROUP_CRYPTO_HEAD
   };
+}
+
+async function testSha256Hex(input: string | Uint8Array): Promise<string> {
+  const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
+  return bytesToHex(new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(bytes).buffer)));
+}
+
+async function testGroupCryptoHead(
+  previousHead: string,
+  nextEpoch: number,
+  commitB64: string,
+  authenticator: string,
+  userId: string,
+  deviceId: string
+): Promise<string> {
+  const commitHash = await testSha256Hex(Uint8Array.from(atob(commitB64), (value) => value.charCodeAt(0)));
+  return testSha256Hex(
+    `tapchat.group_crypto_head.v1\n${previousHead}\n${nextEpoch}\n${commitHash}\n${authenticator}\n${userId}\n${deviceId}`
+  );
 }
 
 test("stale group transitions are classified as roster conflicts before proof validation", async () => {
@@ -1199,7 +1258,7 @@ test("runtime readiness checks the device registry and reports its audience", as
   assert.deepEqual(await response.json(), {
     ready: true,
     runtimeId: "runtime:test",
-    protocolVersion: 5,
+    protocolVersion: 6,
     workerBuildId: "test-worker-v4",
     registrySchemaVersion: 2
   });
@@ -2021,6 +2080,16 @@ test("shared-state writes accept device runtime auth", async () => {
   assert.equal(get.status, 200);
 });
 
+test("retired direct epoch-log route is not exposed", async () => {
+  const { env } = createEnv();
+  const response = await handleRequest(
+    new Request("https://example.com/v1/epoch-log/user%3Aalice/conv%3Aalice%3Abob/head"),
+    env
+  );
+  assert.equal(response.status, 404);
+  assert.equal((await response.json() as { code?: string }).code, "not_found");
+});
+
 test("group outbox appends fetches and returns head with authorized capability", async () => {
   const { env } = createEnv();
   const capability = sampleGroupCapability();
@@ -2062,7 +2131,19 @@ test("group outbox appends fetches and returns head with authorized capability",
     env
   );
   assert.equal(head.status, 200);
-  assert.deepEqual(await head.json(), { version: CURRENT_MODEL_VERSION, headSeq: 2, currentRosterVersion: 1 });
+  assert.deepEqual(await head.json(), {
+    version: CURRENT_MODEL_VERSION,
+    headSeq: 2,
+    currentRosterVersion: 1,
+    cryptoEpoch: 1,
+    cryptoHeadHash: TEST_GROUP_CRYPTO_HEAD,
+    groupAppCount: 2,
+    applicationIndex: 2,
+    activeLeafCount: 3,
+    leafLastUpdateIndex: Object.fromEntries(
+      Object.values(GROUP_IDENTITIES).map((identity) => [identity.deviceId, 0])
+    )
+  });
 
   const empty = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages?fromSeq=99&limit=10", {
@@ -2646,6 +2727,10 @@ test("group outbox spills large records to R2 and fetches them back", async () =
   const capability = sampleGroupCapability();
   const append = sampleGroupAppend("group:project", "msg:large", "mls_application", capability);
   append.envelope.inlineCiphertext = "large cipher payload";
+  append.envelope.senderProof.value = signHex(
+    GROUP_IDENTITIES.owner.deviceSecret,
+    `tapchat.group_envelope_epoch.v1\npayload=${append.envelope.inlineCiphertext}\nmls_epoch=1\nepoch_head_hash=${TEST_GROUP_CRYPTO_HEAD}\nepoch_authenticator_sha256=`
+  );
 
   const response = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
@@ -2841,6 +2926,20 @@ test("inbox fetch fails closed when an R2 spill payload is missing", async () =>
 test("group hard retention keeps one compact history floor and expires idempotency", async () => {
   const state = new MemoryState();
   const spillStore = new MemoryR2Store();
+  await initializeGroupState(state);
+  await state.put("meta", {
+    headSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 1,
+    currentRosterVersion: 1,
+    cryptoEpoch: 1,
+    cryptoHeadHash: TEST_GROUP_CRYPTO_HEAD,
+    groupAppCount: 0,
+    applicationIndex: 0,
+    leafLastUpdateIndex: Object.fromEntries(
+      Object.values(GROUP_IDENTITIES).map((identity) => [identity.deviceId, 0])
+    )
+  });
   const service = new GroupOutboxService(
     "group:project",
     state,
@@ -2866,6 +2965,179 @@ test("group hard retention keeps one compact history floor and expires idempoten
   assert.equal(fetched.records.length, 0);
   assert.equal((await service.appendEnvelope(request, 1_000 + 3 * 24 * 60 * 60 * 1000)).seq, 2);
 });
+
+test("group PCS boundaries reject the 33rd application and exact leaf age", async () => {
+  const state = new MemoryState();
+  await initializeGroupState(state);
+  const initialMeta = {
+    headSeq: 0,
+    retentionDays: 30,
+    maxInlineBytes: 1024,
+    currentRosterVersion: 1,
+    cryptoEpoch: 1,
+    cryptoHeadHash: TEST_GROUP_CRYPTO_HEAD,
+    groupAppCount: 0,
+    applicationIndex: 0,
+    leafLastUpdateIndex: Object.fromEntries(
+      Object.values(GROUP_IDENTITIES).map((identity) => [identity.deviceId, 0])
+    )
+  };
+  await state.put("meta", initialMeta);
+  const service = new GroupOutboxService("group:project", state, new MemoryR2Store(), initialMeta);
+  const capability = sampleGroupCapability();
+  for (let index = 0; index < 32; index += 1) {
+    const request = sampleGroupAppend("group:project", `msg:pcs:${index}`, "mls_application", capability);
+    assert.equal((await service.appendEnvelope(request, 1_000 + index)).seq, index + 1);
+  }
+  await assert.rejects(
+    () => service.appendEnvelope(sampleGroupAppend("group:project", "msg:pcs:33", "mls_application", capability), 2_000),
+    (error: unknown) => (error as { code?: string }).code === "epoch_update_required"
+  );
+
+  await state.put("meta", {
+    ...initialMeta,
+    headSeq: 32,
+    groupAppCount: 0,
+    applicationIndex: 95,
+    leafLastUpdateIndex: {
+      ...initialMeta.leafLastUpdateIndex,
+      [GROUP_IDENTITIES.owner.deviceId]: 0,
+      [GROUP_IDENTITIES.admin.deviceId]: 95,
+      [GROUP_IDENTITIES.member.deviceId]: 95
+    }
+  });
+  assert.equal((await service.appendEnvelope(
+    sampleGroupAppend("group:project", "msg:leaf-age:96", "mls_application", capability),
+    3_000
+  )).seq, 33);
+  await assert.rejects(
+    () => service.appendEnvelope(sampleGroupAppend("group:project", "msg:leaf-age:97", "mls_application", capability), 3_001),
+    (error: unknown) => (error as { code?: string }).code === "epoch_update_required"
+  );
+});
+
+test("group epoch CAS accepts exactly one concurrent Commit and independently derives its head", async () => {
+  const state = new MemoryState();
+  await initializeGroupState(state);
+  const meta = {
+    headSeq: 0,
+    retentionDays: 30,
+    maxInlineBytes: 4096,
+    currentRosterVersion: 1,
+    cryptoEpoch: 1,
+    cryptoHeadHash: TEST_GROUP_CRYPTO_HEAD,
+    groupAppCount: 7,
+    applicationIndex: 19,
+    leafLastUpdateIndex: Object.fromEntries(
+      Object.values(GROUP_IDENTITIES).map((identity) => [identity.deviceId, 0])
+    )
+  };
+  await state.put("meta", meta);
+  const service = new GroupOutboxService("group:project", state, new MemoryR2Store(), meta);
+  const capability = sampleGroupCapability();
+  const commitB64 = btoa("canonical commit");
+  const authenticator = "b".repeat(64);
+  const nextHead = await testGroupCryptoHead(
+    TEST_GROUP_CRYPTO_HEAD,
+    2,
+    commitB64,
+    authenticator,
+    capability.userId,
+    capability.deviceId
+  );
+  const signingPayload = `tapchat.group_envelope_epoch.v1\npayload=${commitB64}\nmls_epoch=2\nepoch_head_hash=${nextHead}\nepoch_authenticator_sha256=${authenticator}`;
+  const request: AppendGroupEpochTransitionRequest = {
+    version: CURRENT_MODEL_VERSION,
+    groupId: "group:project",
+    transitionId: "epoch-transition:one",
+    expectedCryptoEpoch: 1,
+    expectedCryptoHeadHash: TEST_GROUP_CRYPTO_HEAD,
+    nextCryptoEpoch: 2,
+    nextCryptoHeadHash: nextHead,
+    epochAuthenticatorSha256: authenticator,
+    envelope: {
+      ...sampleGroupAppend("group:project", "msg:epoch:one", "mls_commit", capability).envelope,
+      visibility: "protocol",
+      transitionId: "epoch-transition:one",
+      inlineCiphertext: commitB64,
+      mlsEpoch: 2,
+      epochHeadHash: nextHead,
+      epochAuthenticatorSha256: authenticator,
+      senderProof: {
+        type: "device_signature",
+        value: signHex(GROUP_IDENTITIES.owner.deviceSecret, signingPayload)
+      }
+    },
+    capability
+  };
+  await assert.rejects(
+    () => service.appendEpochTransition({
+      ...request,
+      transitionId: "epoch-transition:externalized",
+      envelope: {
+        ...request.envelope,
+        messageId: "msg:epoch:externalized",
+        transitionId: "epoch-transition:externalized",
+        inlineCiphertext: undefined,
+        storageRefs: [{
+          kind: "r2",
+          ref: "blob:commit",
+          sizeBytes: 32,
+          mimeType: "application/octet-stream"
+        }]
+      }
+    }, 3_999),
+    (error: unknown) => (error as { code?: string }).code === "invalid_crypto_transition"
+  );
+
+  const losingCommitB64 = btoa("concurrent losing commit");
+  const losingAuthenticator = "c".repeat(64);
+  const losingHead = await testGroupCryptoHead(
+    TEST_GROUP_CRYPTO_HEAD,
+    2,
+    losingCommitB64,
+    losingAuthenticator,
+    capability.userId,
+    capability.deviceId
+  );
+  const losingSigningPayload = `tapchat.group_envelope_epoch.v1\npayload=${losingCommitB64}\nmls_epoch=2\nepoch_head_hash=${losingHead}\nepoch_authenticator_sha256=${losingAuthenticator}`;
+  const losingRequest: AppendGroupEpochTransitionRequest = {
+    ...request,
+    transitionId: "epoch-transition:loser",
+    nextCryptoHeadHash: losingHead,
+    epochAuthenticatorSha256: losingAuthenticator,
+    envelope: {
+      ...request.envelope,
+      transitionId: "epoch-transition:loser",
+      messageId: "msg:epoch:loser",
+      inlineCiphertext: losingCommitB64,
+      epochHeadHash: losingHead,
+      epochAuthenticatorSha256: losingAuthenticator,
+      senderProof: {
+        type: "device_signature",
+        value: signHex(GROUP_IDENTITIES.owner.deviceSecret, losingSigningPayload)
+      }
+    }
+  };
+  const outcomes = await Promise.allSettled([
+    service.appendEpochTransition(request, 4_000),
+    service.appendEpochTransition(losingRequest, 4_001)
+  ]);
+  assert.equal(outcomes.filter((outcome) => outcome.status === "fulfilled").length, 1);
+  const failure = outcomes.find((outcome) => outcome.status === "rejected") as PromiseRejectedResult;
+  assert.equal((failure.reason as { code?: string }).code, "crypto_epoch_conflict");
+  const winner = outcomes.find((outcome) => outcome.status === "fulfilled") as PromiseFulfilledResult<{ cryptoEpoch: number }>;
+  assert.equal(winner.value.cryptoEpoch, 2);
+  await assert.rejects(
+    () => service.appendEpochTransition({
+      ...request,
+      transitionId: "epoch-transition:stale",
+      envelope: { ...request.envelope, transitionId: "epoch-transition:stale", messageId: "msg:epoch:stale" }
+    }, 4_001),
+    (error: unknown) => (error as { code?: string }).code === "crypto_epoch_conflict"
+  );
+});
+
 
 test("group outbox seal succeeds for owner and records sealed timestamp", async () => {
   // Owner-signed `seal_group` capability must be accepted on the very

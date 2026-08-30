@@ -422,6 +422,7 @@ impl CoreEngine {
             output,
             self.initialize_locally_hosted_group_authorizations(),
         );
+        let output = merge_outputs(output, self.resume_pending_group_secure_sends()?);
         self.merge_with_transport_flush(output)
     }
 

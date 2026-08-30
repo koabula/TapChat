@@ -70,6 +70,17 @@
     { "code": "profile_locked", "domain": "security", "retryable": false, "action": "retry", "title": "Profile locked", "message": "Unlock this profile to continue." },
     { "code": "profile_passphrase_required", "domain": "security", "retryable": false, "action": "retry", "title": "Passphrase required", "message": "Enter the profile passphrase to continue." },
     { "code": "auth_failed", "domain": "security", "retryable": false, "action": "retry", "title": "Authentication failed", "message": "The profile passphrase is incorrect. Try again." },
+    { "code": "crypto_epoch_conflict", "domain": "group", "retryable": true, "action": "sync_now", "title": "Group encryption changed", "message": "Sync the latest group state before sending again." },
+    { "code": "epoch_update_required", "domain": "group", "retryable": true, "action": "sync_now", "title": "Secure group update required", "message": "TapChat must update the group encryption state before sending." },
+    { "code": "group_leaf_limit_exceeded", "domain": "group", "retryable": false, "action": null, "title": "Group device limit reached", "message": "Remove a group device before sending or adding another device." },
+    { "code": "invalid_crypto_transition", "domain": "security", "retryable": false, "action": "sync_now", "title": "Invalid secure group update", "message": "TapChat rejected an invalid group encryption update." },
+    { "code": "invalid_crypto_head", "domain": "security", "retryable": false, "action": "sync_now", "title": "Invalid group encryption state", "message": "TapChat rejected a group update that did not match its authenticated history." },
+    { "code": "invalid_epoch_binding", "domain": "security", "retryable": false, "action": "sync_now", "title": "Invalid group message", "message": "TapChat rejected a group message without a valid encryption-state binding." },
+    { "code": "invalid_sender_proof", "domain": "security", "retryable": false, "action": "sync_now", "title": "Invalid sender proof", "message": "TapChat could not verify the device that sent this group update." },
+    { "code": "crypto_log_gap", "domain": "security", "retryable": true, "action": "sync_now", "title": "Group update missing", "message": "Sync the group to retrieve a missing encryption update." },
+    { "code": "crypto_log_fork", "domain": "security", "retryable": false, "action": "copy_diagnostics", "title": "Conflicting group history", "message": "TapChat detected conflicting authenticated group encryption history." },
+    { "code": "epoch_authenticator_mismatch", "domain": "security", "retryable": false, "action": "copy_diagnostics", "title": "Group encryption verification failed", "message": "TapChat could not verify the resulting group encryption state." },
+    { "code": "protected_message_binding_invalid", "domain": "security", "retryable": false, "action": "copy_diagnostics", "title": "Group message verification failed", "message": "TapChat rejected a group message whose protected contents did not match its envelope." },
     { "code": "unexpected_error", "domain": "core", "retryable": true, "action": "retry", "title": "Something went wrong", "message": "Something went wrong. Try again." }
   ]
 }

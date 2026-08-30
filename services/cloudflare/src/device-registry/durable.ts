@@ -227,8 +227,8 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
     return jsonResponse({
       ready: true,
       runtimeId: config.runtimeId,
-      protocolVersion: 5,
-      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v5-unknown",
+      protocolVersion: 6,
+      workerBuildId: this.envRef.WORKER_BUILD_ID?.trim() || "tapchat-worker-v6-unknown",
       registrySchemaVersion: 2
     });
   }

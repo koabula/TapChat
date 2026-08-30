@@ -119,6 +119,19 @@ pub struct OutboundMlsMessage {
     pub epoch: u64,
 }
 
+/// Artifacts produced by a self-update on an MLS adapter fork.
+///
+/// Callers must not run this operation on the canonical adapter.  The fork is
+/// merged through [`MlsConversationPatch`] only after the delivery service has
+/// selected this Commit as the unique successor of `base_epoch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdateArtifacts {
+    pub commit_b64: String,
+    pub base_epoch: u64,
+    pub next_epoch: u64,
+    pub epoch_authenticator_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecryptedApplicationMessage {
     pub plaintext: Vec<u8>,
@@ -689,6 +702,64 @@ impl MlsAdapter {
             payload_b64: encode_mls_message(message)?,
             epoch: state.group.epoch().as_u64(),
         })
+    }
+
+    /// Stage and locally merge a fresh update-path Commit.
+    ///
+    /// This mutates the receiver, so the receiver must be an adapter returned
+    /// by [`Self::fork`].  Keeping the merge on the fork gives the Core a
+    /// serializable conversation patch while leaving canonical key material
+    /// untouched until ordering succeeds.
+    pub fn self_update(&mut self, conversation_id: &str) -> CoreResult<SelfUpdateArtifacts> {
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let base_epoch = state.group.epoch().as_u64();
+        let bundle = state
+            .group
+            .self_update(&self.provider, &self.signer, LeafNodeParameters::default())
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to stage MLS self update: {error}"))
+            })?;
+        let commit_b64 = encode_mls_message(bundle.commit().clone())?;
+        state
+            .group
+            .merge_pending_commit(&self.provider)
+            .map_err(|error| {
+                CoreError::invalid_state(format!(
+                    "failed to merge staged MLS self update on fork: {error}"
+                ))
+            })?;
+        state.member_device_ids = extract_member_device_ids(&state.group)?;
+        state.status = MlsStateStatus::Active;
+        let next_epoch = state.group.epoch().as_u64();
+        if next_epoch != base_epoch.saturating_add(1) {
+            return Err(CoreError::invalid_state(
+                "MLS self update did not advance exactly one epoch",
+            ));
+        }
+        let epoch_authenticator_sha256 = format!(
+            "{:x}",
+            Sha256::digest(state.group.epoch_authenticator().as_slice())
+        );
+        Ok(SelfUpdateArtifacts {
+            commit_b64,
+            base_epoch,
+            next_epoch,
+            epoch_authenticator_sha256,
+        })
+    }
+
+    pub fn epoch_authenticator_sha256(&self, conversation_id: &str) -> CoreResult<String> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(state.group.epoch_authenticator().as_slice())
+        ))
     }
 
     pub fn ingest_message(
@@ -1451,6 +1522,8 @@ pub fn validate_published_key_package_lifetime(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
         key_package_rotation_jitter_ms, validate_published_key_package_lifetime, IngestResult,
         MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
@@ -1613,6 +1686,96 @@ mod tests {
             }
             other => panic!("unexpected result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn self_update_on_fork_advances_only_after_patch_is_applied() {
+        let alice_identity =
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
+        let (mut alice, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
+        let (mut bob, bob_package) = MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+        let created = alice
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: bob_package.key_package_b64,
+                }],
+            )
+            .expect("create");
+        bob.ingest_message(
+            "conv:alice:bob",
+            &alice_identity.device_identity.device_id,
+            MessageType::MlsWelcome,
+            &created.welcomes[0].payload_b64,
+        )
+        .expect("welcome");
+
+        let base = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("base summary");
+        let mut staged = alice.fork().expect("fork");
+        let update = staged.self_update("conv:alice:bob").expect("self update");
+        assert_eq!(update.base_epoch, base.epoch);
+        assert_eq!(update.next_epoch, base.epoch + 1);
+        assert_eq!(update.epoch_authenticator_sha256.len(), 64);
+        assert!(update
+            .epoch_authenticator_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            alice
+                .export_group_summary("conv:alice:bob")
+                .expect("canonical summary")
+                .epoch,
+            base.epoch,
+            "staging must not mutate canonical MLS state"
+        );
+
+        let patch = alice
+            .conversation_patch(&staged, "conv:alice:bob")
+            .expect("patch");
+        let staged_summary = staged
+            .export_group_summary("conv:alice:bob")
+            .expect("staged summary");
+        let summaries = BTreeMap::from([("conv:alice:bob".to_string(), staged_summary)]);
+        let mut committed = alice
+            .apply_conversation_patch(&patch, &summaries)
+            .expect("apply accepted patch");
+        assert_eq!(
+            committed
+                .export_group_summary("conv:alice:bob")
+                .expect("committed summary")
+                .epoch,
+            update.next_epoch
+        );
+
+        let received = bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &update.commit_b64,
+            )
+            .expect("receive self update");
+        assert!(matches!(received, IngestResult::AppliedCommit { .. }));
+        let application = committed
+            .encrypt_application("conv:alice:bob", b"post update")
+            .expect("application");
+        assert!(matches!(
+            bob.ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &application.payload_b64,
+            )
+            .expect("decrypt"),
+            IngestResult::AppliedApplication(_)
+        ));
     }
 
     #[test]

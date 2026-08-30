@@ -11,7 +11,7 @@ use crate::model::{
     Ack, DeploymentBundle, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
     GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupManifest, GroupMembershipProof,
     GroupRole, GroupTransitionOperation, GroupTransitionRequestBinding, IdentityBundle,
-    MlsStateSummary, WelcomePickupDescriptor,
+    MlsStateSummary, StorageRef, WelcomePickupDescriptor,
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
@@ -126,6 +126,29 @@ pub struct PersistedOutgoingEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGroupSecureSend {
+    pub intent_id: String,
+    pub app_message_id: String,
+    pub plaintext: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_refs: Vec<StorageRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGroupSelfUpdate {
+    pub transition_id: String,
+    pub base_epoch: u64,
+    pub next_epoch: u64,
+    pub expected_head_hash: String,
+    pub commit_b64: String,
+    pub commit_sha256: String,
+    pub epoch_authenticator_sha256: String,
+    pub patch: MlsConversationPatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedGroupState {
     pub group_id: String,
     pub conversation_id: String,
@@ -144,6 +167,16 @@ pub struct PersistedGroupState {
     pub pending_group_transition: Option<PersistedPendingGroupTransition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leave_requests: Vec<PersistedGroupLeaveRequest>,
+    #[serde(default)]
+    pub pcs_state: crate::pcs_policy::GroupPcsState,
+    #[serde(default)]
+    pub crypto_epoch: u64,
+    #[serde(default)]
+    pub crypto_head_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_secure_send: Option<PendingGroupSecureSend>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_epoch_transition: Option<PendingGroupSelfUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +275,16 @@ pub struct PersistedPendingGroupTransition {
     pub first_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seq: Option<u64>,
+    #[serde(default)]
+    pub expected_crypto_epoch: u64,
+    #[serde(default)]
+    pub expected_crypto_head_hash: String,
+    #[serde(default)]
+    pub next_crypto_epoch: u64,
+    #[serde(default)]
+    pub next_crypto_head_hash: String,
+    #[serde(default)]
+    pub epoch_authenticator_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,7 +540,9 @@ pub struct CorePersistenceSnapshot {
     pub mls_state_persistence_blocked: bool,
 }
 
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Format 3 introduces authenticated group crypto heads. Older snapshots are
+/// intentionally rejected instead of inferring an untrusted anchor.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotFileEnvelope {
@@ -949,7 +994,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> crate::CoreResult<CorePersistenceSnapsho
         crate::CoreError::invalid_input(format!("failed to decode persistence snapshot: {error}"))
     })?;
 
-    if !matches!(envelope.format_version, 1 | SNAPSHOT_FORMAT_VERSION) {
+    if envelope.format_version != SNAPSHOT_FORMAT_VERSION {
         return Err(crate::CoreError::unsupported(format!(
             "unsupported persistence snapshot format version {}",
             envelope.format_version
@@ -1213,7 +1258,7 @@ mod tests {
                 deployment_bundle: DeploymentBundle {
                     version: CURRENT_MODEL_VERSION.to_string(),
                     runtime_id: "runtime:test".into(),
-                    protocol_version: 5,
+                    protocol_version: 6,
                     worker_build_id: "test-worker-v4".into(),
                     registry_schema_version: 2,
                     region: "local".into(),
@@ -1229,7 +1274,7 @@ mod tests {
                         device_status_ref: Some("ref:device-status-local".into()),
                         keypackage_ref_base: Some("ref:keypackages-local".into()),
                         max_inline_bytes: Some(4096),
-                        features: vec!["generic_sync".into()],
+                        features: vec!["generic_sync".into(), "group_crypto_epoch_v1".into()],
                     },
                     expected_user_id: Some("user:alice".into()),
                     expected_device_id: Some("device:alice:phone".into()),
@@ -1350,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_snapshot_decodes_with_version_two_defaults() {
+    fn snapshot_without_authenticated_group_crypto_head_is_rejected() {
         let bytes = serde_json::json!({
             "format_version": 1,
             "snapshot": {
@@ -1364,14 +1409,9 @@ mod tests {
         })
         .to_string();
 
-        let snapshot = decode_snapshot(bytes.as_bytes()).expect("decode v1 snapshot");
-        assert_eq!(snapshot.message_nonce, 7);
-        assert!(snapshot
-            .deployment
-            .as_ref()
-            .and_then(|deployment| deployment.pending_identity_publication.as_ref())
-            .is_none());
-        assert!(snapshot.pending_group_outbox.is_empty());
+        let error =
+            decode_snapshot(bytes.as_bytes()).expect_err("legacy snapshot must fail closed");
+        assert_eq!(error.code(), "unsupported");
     }
 
     #[test]

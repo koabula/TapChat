@@ -26,6 +26,7 @@ use tapchat_core::transport_contract::json_case::{
 };
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
+    AppendGroupEpochTransitionRequest, AppendGroupEpochTransitionResult,
     AppendGroupTransitionRequest, AppendGroupTransitionResult, BlobDownloadRequest,
     BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
     ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
@@ -677,6 +678,59 @@ impl TransportPort for DesktopPlatformPorts {
         }
     }
 
+    async fn append_group_epoch_transition(
+        &mut self,
+        append: AppendGroupEpochTransitionRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let url = self
+            .group_outbox_sibling_url(&append.group_id, "epoch-transitions")
+            .await?;
+        let group_id = append.group_id.clone();
+        let transition_id = append.transition_id.clone();
+        let response = self
+            .client
+            .post(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", append.capability.signature),
+            )
+            .header(
+                "X-Tapchat-Group-Capability",
+                to_camel_case_json_string(&serde_json::to_string(&append.capability)?)?,
+            )
+            .header("Content-Type", "application/json")
+            .body(to_camel_case_json_string(&serde_json::to_string(&append)?)?)
+            .send()
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                if !(200..300).contains(&status) {
+                    return Ok(vec![CoreEvent::GroupEpochTransitionAppendFailed {
+                        group_id,
+                        transition_id,
+                        failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
+                    }]);
+                }
+                let body = to_snake_case_json_string(&body).unwrap_or(body);
+                let result: AppendGroupEpochTransitionResult = serde_json::from_str(&body)?;
+                Ok(vec![CoreEvent::GroupEpochTransitionAppended {
+                    group_id,
+                    transition_id: result.transition_id,
+                    seq: result.seq,
+                    crypto_epoch: result.crypto_epoch,
+                    crypto_head_hash: result.crypto_head_hash,
+                }])
+            }
+            Err(_) => Ok(vec![CoreEvent::GroupEpochTransitionAppendFailed {
+                group_id,
+                transition_id,
+                failure: tapchat_core::AppErrorV1::network_unavailable(),
+            }]),
+        }
+    }
+
     async fn get_group_authorization_state(
         &mut self,
         get: GetGroupAuthorizationStateRequest,
@@ -892,6 +946,12 @@ impl TransportPort for DesktopPlatformPorts {
             head_seq: result.head_seq,
             current_roster_version: result.current_roster_version,
             last_commit_message_id: result.last_commit_message_id,
+            crypto_epoch: result.crypto_epoch,
+            crypto_head_hash: result.crypto_head_hash,
+            group_app_count: result.group_app_count,
+            application_index: result.application_index,
+            active_leaf_count: result.active_leaf_count,
+            leaf_last_update_index: result.leaf_last_update_index,
         }])
     }
 
