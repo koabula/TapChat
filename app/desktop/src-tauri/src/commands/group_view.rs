@@ -79,6 +79,7 @@ pub(super) fn group_state_event_text(plaintext: Option<&str>) -> String {
         }
         GroupStateEventKind::GroupMetadataChanged => "Group details were updated.".into(),
         GroupStateEventKind::GroupDissolved => "This group has been dissolved by the owner.".into(),
+        GroupStateEventKind::MlsEpochAdvanced => String::new(),
     }
 }
 

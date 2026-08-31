@@ -27,6 +27,7 @@ export interface CapabilityConstraints {
 export type MessageType =
   | "mls_application"
   | "mls_commit"
+  | "mls_proposal"
   | "mls_welcome"
   | "control_device_membership_changed"
   | "control_identity_state_updated"
@@ -131,6 +132,7 @@ export interface GroupCapability {
 export type GroupMessageType =
   | "mls_application"
   | "mls_commit"
+  | "mls_proposal"
   | "control_group_membership_changed"
   | "control_group_metadata_updated"
   | "control_group_join_requested"
@@ -182,7 +184,8 @@ export type GroupStateEventKind =
   | "role_changed"
   | "ownership_transferred"
   | "group_metadata_changed"
-  | "group_dissolved";
+  | "group_dissolved"
+  | "mls_epoch_advanced";
 
 export interface GroupStateEvent {
   version: string;
@@ -256,7 +259,8 @@ export type GroupTransitionOperation =
   | { type: "update_metadata" }
   | { type: "dissolve" }
   | { type: "add_device"; userId: string; deviceId: string }
-  | { type: "remove_device"; userId: string; deviceId: string };
+  | { type: "remove_device"; userId: string; deviceId: string }
+  | { type: "pcs_update" };
 
 export type GroupTransitionRequestBinding =
   | { type: "join"; requestId: string; leaseToken: string }

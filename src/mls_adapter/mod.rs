@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -131,6 +131,7 @@ pub enum IngestResult {
     AppliedApplication(DecryptedApplicationMessage),
     AppliedCommit { epoch: u64 },
     AppliedWelcome { epoch: u64 },
+    AppliedProposal,
     IgnoredReplay,
     PendingRetry,
     NeedsRebuild,
@@ -161,6 +162,31 @@ struct LocalMlsState {
     group: MlsGroup,
     member_device_ids: BTreeSet<String>,
     status: MlsStateStatus,
+    pcs_updates: Vec<QueuedProposal>,
+    pcs_update_epoch: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, SerdeDeserialize)]
+struct PcsUpdateSidecar {
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    proposals: Vec<QueuedProposal>,
+}
+
+fn local_mls_state(
+    group: MlsGroup,
+    member_device_ids: BTreeSet<String>,
+    status: MlsStateStatus,
+) -> LocalMlsState {
+    let pcs_update_epoch = group.epoch().as_u64();
+    LocalMlsState {
+        group,
+        member_device_ids,
+        status,
+        pcs_updates: Vec::new(),
+        pcs_update_epoch,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize)]
@@ -175,6 +201,8 @@ struct PersistedGroupState {
     signer: SignatureKeyPair,
     credential_with_key: CredentialWithKey,
     storage: SerializableStore,
+    #[serde(default)]
+    pcs_update_sidecar: BTreeMap<String, PcsUpdateSidecar>,
 }
 
 /// A compare-and-swap delta for the OpenMLS provider entries changed while a
@@ -382,7 +410,7 @@ impl MlsAdapter {
                 current.values.remove(key);
             }
         }
-        let serialized = self.serialize_with_store(current)?;
+        let serialized = self.serialize_with_store(current, None)?;
         Self::restore_serialized_state(&serialized, summaries)
     }
 
@@ -543,11 +571,7 @@ impl MlsAdapter {
 
         self.groups.insert(
             conversation_id.to_string(),
-            LocalMlsState {
-                group,
-                member_device_ids: member_device_ids.clone(),
-                status: MlsStateStatus::Active,
-            },
+            local_mls_state(group, member_device_ids.clone(), MlsStateStatus::Active),
         );
 
         Ok(CreateConversationArtifacts {
@@ -599,11 +623,11 @@ impl MlsAdapter {
         })?;
         self.groups.insert(
             conversation_id.to_string(),
-            LocalMlsState {
+            local_mls_state(
                 group,
-                member_device_ids: BTreeSet::from([self.local_device_id.clone()]),
-                status: MlsStateStatus::Active,
-            },
+                BTreeSet::from([self.local_device_id.clone()]),
+                MlsStateStatus::Active,
+            ),
         );
         self.export_group_summary(conversation_id)
     }
@@ -726,6 +750,193 @@ impl MlsAdapter {
         })
     }
 
+    pub fn propose_self_update(&mut self, conversation_id: &str) -> CoreResult<OutboundMlsMessage> {
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let (message, _proposal_ref) = state
+            .group
+            .propose_self_update(provider, signer, LeafNodeParameters::default())
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to propose MLS self-update: {error}"))
+            })?;
+        let pending: Vec<_> = state.group.pending_proposals().cloned().collect();
+        state
+            .group
+            .clear_pending_proposals(provider.storage())
+            .map_err(|error| {
+                CoreError::invalid_state(format!(
+                    "failed to clear live MLS proposal store: {error}"
+                ))
+            })?;
+        for proposal in pending {
+            push_pcs_update(state, proposal);
+        }
+        Ok(OutboundMlsMessage {
+            payload_b64: encode_mls_message(message)?,
+            epoch: state.group.epoch().as_u64(),
+        })
+    }
+
+    pub fn has_pending_proposals(&self, conversation_id: &str) -> CoreResult<bool> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        Ok(state.group.has_pending_proposals())
+    }
+
+    pub fn has_pcs_update_proposals(&self, conversation_id: &str) -> CoreResult<bool> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        Ok(state.pcs_update_epoch == state.group.epoch().as_u64() && !state.pcs_updates.is_empty())
+    }
+
+    #[cfg(test)]
+    pub fn pcs_update_count(&self, conversation_id: &str) -> CoreResult<usize> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        if state.pcs_update_epoch != state.group.epoch().as_u64() {
+            return Ok(0);
+        }
+        Ok(state.pcs_updates.len())
+    }
+
+    pub fn own_leaf_key_b64(&self, conversation_id: &str) -> CoreResult<String> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        leaf_key_b64_for_group(&state.group)
+    }
+
+    pub fn clear_pcs_update_sidecar(&mut self, conversation_id: &str) {
+        if let Some(state) = self.groups.get_mut(conversation_id) {
+            state.pcs_updates.clear();
+            state.pcs_update_epoch = state.group.epoch().as_u64();
+        }
+    }
+
+    pub fn propose_remove_member(
+        &mut self,
+        conversation_id: &str,
+        device_id: &str,
+    ) -> CoreResult<OutboundMlsMessage> {
+        let indices = {
+            let state = self
+                .groups
+                .get(conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+            member_leaf_indices_for_devices(&state.group, &[device_id.to_string()])?
+        };
+        let leaf_index = *indices
+            .first()
+            .ok_or_else(|| CoreError::invalid_input("MLS member for device does not exist"))?;
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let (message, _proposal_ref) = state
+            .group
+            .propose_remove_member(provider, signer, leaf_index)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to propose MLS remove: {error}"))
+            })?;
+        state
+            .group
+            .clear_pending_proposals(provider.storage())
+            .map_err(|error| {
+                CoreError::invalid_state(format!(
+                    "failed to clear live MLS proposal store: {error}"
+                ))
+            })?;
+        Ok(OutboundMlsMessage {
+            payload_b64: encode_mls_message(message)?,
+            epoch: state.group.epoch().as_u64(),
+        })
+    }
+
+    fn inject_pcs_updates(&mut self, conversation_id: &str) -> CoreResult<()> {
+        let provider = &self.provider;
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        align_pcs_sidecar_epoch(state);
+        for proposal in state.pcs_updates.clone() {
+            if !is_member_self_update(&proposal) {
+                continue;
+            }
+            state
+                .group
+                .store_pending_proposal(provider.storage(), proposal)
+                .map_err(|error| {
+                    CoreError::invalid_state(format!(
+                        "failed to restore PCS update proposal: {error:?}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    pub fn stage_group_pcs_commit(
+        &mut self,
+        conversation_id: &str,
+    ) -> CoreResult<OutboundMlsMessage> {
+        self.inject_pcs_updates(conversation_id)?;
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        if state
+            .group
+            .pending_proposals()
+            .any(|proposal| !is_member_self_update(proposal))
+        {
+            return Err(CoreError::invalid_state(
+                "PCS commit store contains a non-update proposal",
+            ));
+        }
+        let members_before = state.member_device_ids.clone();
+        let bundle = state
+            .group
+            .self_update(provider, signer, LeafNodeParameters::default())
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to create group PCS commit: {error}"))
+            })?;
+        let commit = bundle.into_commit();
+        state
+            .group
+            .merge_pending_commit(&self.provider)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to merge group PCS commit: {error}"))
+            })?;
+        state.member_device_ids = extract_member_device_ids(&state.group)?;
+        if state.member_device_ids != members_before {
+            return Err(CoreError::invalid_state(
+                "group PCS commit changed MLS membership",
+            ));
+        }
+        state.pcs_updates.clear();
+        state.pcs_update_epoch = state.group.epoch().as_u64();
+        state.status = MlsStateStatus::Active;
+        Ok(OutboundMlsMessage {
+            payload_b64: encode_mls_message(commit)?,
+            epoch: state.group.epoch().as_u64(),
+        })
+    }
+
     pub fn stage_direct_self_update(
         &mut self,
         conversation_id: &str,
@@ -738,9 +949,10 @@ impl MlsAdapter {
         let base_epoch = self.export_group_summary(conversation_id)?.epoch;
         let provider = &self.provider;
         let signer = &self.signer;
-        let state = self.groups.get_mut(conversation_id).ok_or_else(|| {
-            CoreError::invalid_input("conversation MLS state does not exist")
-        })?;
+        let state = self
+            .groups
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
         let bundle = state
             .group
             .self_update(provider, signer, LeafNodeParameters::default())
@@ -861,9 +1073,10 @@ impl MlsAdapter {
     ) -> CoreResult<MlsStateSummary> {
         {
             let provider = &self.provider;
-            let state = self.groups.get_mut(conversation_id).ok_or_else(|| {
-                CoreError::invalid_input("conversation MLS state does not exist")
-            })?;
+            let state = self
+                .groups
+                .get_mut(conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
             if state.group.pending_commit().is_some() {
                 state
                     .group
@@ -947,7 +1160,7 @@ impl MlsAdapter {
     ) -> CoreResult<IngestResult> {
         match message_type {
             MessageType::MlsWelcome => self.ingest_welcome(conversation_id, payload_b64),
-            MessageType::MlsCommit | MessageType::MlsApplication => {
+            MessageType::MlsCommit | MessageType::MlsApplication | MessageType::MlsProposal => {
                 if !self.groups.contains_key(conversation_id) {
                     return Ok(IngestResult::PendingRetry);
                 }
@@ -1056,7 +1269,7 @@ impl MlsAdapter {
                 "conversation MLS state does not exist",
             ));
         }
-        self.export_serializable_state()
+        self.serialize_with_store(self.serializable_store()?, Some(conversation_id))
     }
 
     pub fn export_bootstrap_state(&self) -> CoreResult<String> {
@@ -1096,6 +1309,7 @@ impl MlsAdapter {
             signer,
             credential_with_key,
             storage,
+            pcs_update_sidecar: _,
         } = parsed;
         {
             let mut values = provider.storage().values.write().map_err(|_| {
@@ -1122,7 +1336,7 @@ impl MlsAdapter {
     }
 
     fn export_serializable_state(&self) -> CoreResult<String> {
-        self.serialize_with_store(self.serializable_store()?)
+        self.serialize_with_store(self.serializable_store()?, None)
     }
 
     fn serializable_store(&self) -> CoreResult<SerializableStore> {
@@ -1137,13 +1351,35 @@ impl MlsAdapter {
         })
     }
 
-    fn serialize_with_store(&self, storage: SerializableStore) -> CoreResult<String> {
+    fn serialize_with_store(
+        &self,
+        storage: SerializableStore,
+        only_conversation_id: Option<&str>,
+    ) -> CoreResult<String> {
+        let pcs_update_sidecar = self
+            .groups
+            .iter()
+            .filter(|(conversation_id, state)| {
+                only_conversation_id.is_none_or(|id| id == conversation_id.as_str())
+                    && (only_conversation_id.is_some() || !state.pcs_updates.is_empty())
+            })
+            .map(|(conversation_id, state)| {
+                (
+                    conversation_id.clone(),
+                    PcsUpdateSidecar {
+                        epoch: state.pcs_update_epoch,
+                        proposals: state.pcs_updates.clone(),
+                    },
+                )
+            })
+            .collect();
         serde_json::to_string(&PersistedGroupState {
             credential_identity: self.credential_identity.clone(),
             local_device_id: self.local_device_id.clone(),
             signer: copy_signer(&self.signer)?,
             credential_with_key: self.credential_with_key.clone(),
             storage,
+            pcs_update_sidecar,
         })
         .map_err(|error| {
             CoreError::invalid_state(format!("failed to serialize MLS group state: {error}"))
@@ -1162,6 +1398,7 @@ impl MlsAdapter {
         let mut failures = Vec::new();
         let provider = OpenMlsRustCrypto::default();
         let mut template: Option<(SignatureKeyPair, CredentialWithKey, String, String)> = None;
+        let mut restored_sidecars: BTreeMap<String, PcsUpdateSidecar> = BTreeMap::new();
 
         for (conversation_id, summary, serialized_state) in persisted_states {
             let Some(serialized_state) = serialized_state.as_ref() else {
@@ -1204,7 +1441,14 @@ impl MlsAdapter {
                 signer,
                 credential_with_key,
                 storage,
+                mut pcs_update_sidecar,
             } = parsed;
+            restored_sidecars.insert(
+                conversation_id.clone(),
+                pcs_update_sidecar
+                    .remove(conversation_id)
+                    .unwrap_or_default(),
+            );
 
             if let Some((_, _, template_identity, template_device_id)) = template.as_ref() {
                 if template_identity != &credential_identity
@@ -1381,12 +1625,21 @@ impl MlsAdapter {
             }
 
             let status = summary.status;
+            let epoch = group.epoch().as_u64();
+            let sidecar = restored_sidecars
+                .remove(&conversation_id)
+                .unwrap_or_default();
+            let (pcs_updates, pcs_update_epoch) = if sidecar.epoch == epoch {
+                (sidecar.proposals, sidecar.epoch)
+            } else {
+                (Vec::new(), epoch)
+            };
             let exported = MlsStateSummary {
                 conversation_id: conversation_id.clone(),
-                epoch: group.epoch().as_u64(),
+                epoch,
                 member_device_ids: member_device_ids.iter().cloned().collect(),
                 status,
-                updated_at: group.epoch().as_u64(),
+                updated_at: epoch,
             };
             adapter.groups.insert(
                 conversation_id.clone(),
@@ -1394,6 +1647,8 @@ impl MlsAdapter {
                     group,
                     member_device_ids,
                     status,
+                    pcs_updates,
+                    pcs_update_epoch,
                 },
             );
             summaries.insert(conversation_id, exported);
@@ -1447,11 +1702,7 @@ impl MlsAdapter {
         let member_device_ids = extract_member_device_ids(&group)?;
         self.groups.insert(
             conversation_id.to_string(),
-            LocalMlsState {
-                group,
-                member_device_ids,
-                status: MlsStateStatus::Active,
-            },
+            local_mls_state(group, member_device_ids, MlsStateStatus::Active),
         );
         Ok(IngestResult::AppliedWelcome {
             epoch: self.export_group_summary(conversation_id)?.epoch,
@@ -1487,6 +1738,25 @@ impl MlsAdapter {
         let from_previous_epoch = message_epoch < live_epoch;
         if message_type == MessageType::MlsCommit && from_previous_epoch {
             return Ok(IngestResult::IgnoredReplay);
+        }
+        if message_type == MessageType::MlsProposal && from_previous_epoch {
+            return Ok(IngestResult::IgnoredReplay);
+        }
+        if message_type == MessageType::MlsCommit && !from_previous_epoch {
+            align_pcs_sidecar_epoch(state);
+            for proposal in state.pcs_updates.clone() {
+                if !is_member_self_update(&proposal) {
+                    continue;
+                }
+                state
+                    .group
+                    .store_pending_proposal(provider.storage(), proposal)
+                    .map_err(|error| {
+                        CoreError::invalid_state(format!(
+                            "failed to restore PCS update proposal: {error:?}"
+                        ))
+                    })?;
+            }
         }
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
@@ -1528,10 +1798,28 @@ impl MlsAdapter {
                     .merge_staged_commit(provider, *staged_commit)
                     .map_err(|_| CoreError::invalid_state("failed to merge staged commit"))?;
                 state.member_device_ids = extract_member_device_ids(&state.group)?;
+                state.pcs_updates.clear();
+                state.pcs_update_epoch = state.group.epoch().as_u64();
                 state.status = MlsStateStatus::Active;
                 Ok(IngestResult::AppliedCommit {
                     epoch: state.group.epoch().as_u64(),
                 })
+            }
+            ProcessedMessageContent::ProposalMessage(proposal) => {
+                if message_type != MessageType::MlsProposal {
+                    state.status = MlsStateStatus::NeedsRebuild;
+                    return Ok(IngestResult::NeedsRebuild);
+                }
+                if is_member_self_update(&proposal) {
+                    push_pcs_update(state, *proposal);
+                } else {
+                    log::warn!(
+                        "ignoring non-self-update MLS proposal for conversation {}",
+                        redact_id("conversation", conversation_id)
+                    );
+                }
+                state.status = MlsStateStatus::Active;
+                Ok(IngestResult::AppliedProposal)
             }
             _ => {
                 state.status = MlsStateStatus::NeedsRecovery;
@@ -1595,6 +1883,44 @@ fn build_credential_identity(local_identity: &LocalIdentityState) -> String {
         local_identity.device_identity.device_public_key,
         local_identity.device_identity.binding.signature,
     )
+}
+
+fn is_member_self_update(proposal: &QueuedProposal) -> bool {
+    matches!(proposal.proposal(), Proposal::Update(_))
+        && matches!(proposal.sender(), Sender::Member(_))
+}
+
+fn align_pcs_sidecar_epoch(state: &mut LocalMlsState) {
+    let epoch = state.group.epoch().as_u64();
+    if state.pcs_update_epoch != epoch {
+        state.pcs_updates.clear();
+        state.pcs_update_epoch = epoch;
+    }
+}
+
+fn push_pcs_update(state: &mut LocalMlsState, proposal: QueuedProposal) {
+    if !is_member_self_update(&proposal) {
+        log::warn!("dropping non-self-update MLS proposal from PCS sidecar");
+        return;
+    }
+    align_pcs_sidecar_epoch(state);
+    if state
+        .pcs_updates
+        .iter()
+        .any(|queued| queued.proposal_reference_ref() == proposal.proposal_reference_ref())
+    {
+        return;
+    }
+    state.pcs_updates.push(proposal);
+}
+
+fn leaf_key_b64_for_group(group: &MlsGroup) -> CoreResult<String> {
+    let own_index = group.own_leaf_index();
+    let member = group
+        .members()
+        .find(|member| member.index == own_index)
+        .ok_or_else(|| CoreError::invalid_state("own MLS leaf is missing"))?;
+    Ok(BASE64.encode(member.encryption_key))
 }
 
 fn extract_sender_identity(credential: &Credential) -> CoreResult<String> {
@@ -1715,10 +2041,10 @@ pub fn validate_published_key_package_lifetime(
 #[cfg(test)]
 mod tests {
     use super::{
-        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
-        IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
-        KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
-        KEY_PACKAGE_ROTATION_WINDOW_MS,
+        DirectCommitClass, IngestResult, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
+        KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, MlsAdapter, MlsAdapterModule,
+        PeerDeviceKeyPackage, PublishedKeyPackage, key_package_rotation_jitter_ms,
+        validate_published_key_package_lifetime,
     };
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
@@ -2185,6 +2511,332 @@ mod tests {
     }
 
     #[test]
+    fn group_pcs_proposal_then_commit_advances_epoch() {
+        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let before = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("summary")
+            .epoch;
+        let proposal = bob.propose_self_update("conv:alice:bob").expect("propose");
+        match alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsProposal,
+                &proposal.payload_b64,
+            )
+            .expect("ingest proposal")
+        {
+            IngestResult::AppliedProposal => {}
+            other => panic!("expected AppliedProposal, got {other:?}"),
+        }
+        assert!(
+            !alice
+                .has_pending_proposals("conv:alice:bob")
+                .expect("live store")
+        );
+        assert!(
+            alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("sidecar")
+        );
+        alice
+            .encrypt_application("conv:alice:bob", b"while waiting")
+            .expect("sender can still encrypt with pending PCS proposal");
+        bob.encrypt_application("conv:alice:bob", b"proposer still sending")
+            .expect("proposer can still encrypt after proposing");
+        let commit = alice
+            .stage_group_pcs_commit("conv:alice:bob")
+            .expect("commit");
+        assert_eq!(
+            alice
+                .export_group_summary("conv:alice:bob")
+                .expect("alice epoch")
+                .epoch,
+            before + 1
+        );
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &commit.payload_b64,
+            )
+            .expect("bob merge")
+        {
+            IngestResult::AppliedCommit { epoch } => assert_eq!(epoch, before + 1),
+            other => panic!("expected AppliedCommit, got {other:?}"),
+        }
+        let plaintext = b"after group pcs";
+        let outbound = alice
+            .encrypt_application("conv:alice:bob", plaintext)
+            .expect("encrypt");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, plaintext);
+            }
+            other => panic!("expected application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_pcs_rejects_remove_proposal_and_keeps_membership() {
+        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let members_before = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("summary")
+            .member_device_ids;
+        let remove = bob
+            .propose_remove_member("conv:alice:bob", &alice_identity.device_identity.device_id)
+            .expect("remove proposal");
+        match alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsProposal,
+                &remove.payload_b64,
+            )
+            .expect("ingest remove")
+        {
+            IngestResult::AppliedProposal => {}
+            other => panic!("expected AppliedProposal, got {other:?}"),
+        }
+        assert!(
+            !alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("sidecar")
+        );
+        let commit = alice
+            .stage_group_pcs_commit("conv:alice:bob")
+            .expect("pcs commit");
+        let members_after = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("after")
+            .member_device_ids;
+        assert_eq!(members_before, members_after);
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &commit.payload_b64,
+            )
+            .expect("bob merge")
+        {
+            IngestResult::AppliedCommit { .. } => {}
+            other => panic!("expected AppliedCommit, got {other:?}"),
+        }
+        let plaintext = b"still in the group";
+        let outbound = alice
+            .encrypt_application("conv:alice:bob", plaintext)
+            .expect("encrypt");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, plaintext);
+            }
+            other => panic!("expected application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_pcs_restore_uses_own_empty_sidecar_not_stale_peer_snapshot() {
+        let (mut alice, mut bob, _, bob_identity, _) = pair_adapters();
+        alice
+            .create_owner_conversation("conv:solo")
+            .expect("solo conversation");
+        let proposal = bob.propose_self_update("conv:alice:bob").expect("propose");
+        match alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsProposal,
+                &proposal.payload_b64,
+            )
+            .expect("ingest")
+        {
+            IngestResult::AppliedProposal => {}
+            other => panic!("expected AppliedProposal, got {other:?}"),
+        }
+        assert!(
+            alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("sidecar")
+        );
+        let stale_full = alice.export_bootstrap_state().expect("stale full dump");
+        alice.clear_pcs_update_sidecar("conv:alice:bob");
+        assert!(
+            !alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("cleared")
+        );
+        let fresh_b = alice
+            .export_persisted_group_state("conv:alice:bob")
+            .expect("fresh b");
+        let summary_solo = alice.export_group_summary("conv:solo").expect("solo");
+        let summary_b = alice.export_group_summary("conv:alice:bob").expect("group");
+        let restored = MlsAdapter::restore_from_persisted_states(&[
+            ("conv:solo".into(), summary_solo, Some(stale_full)),
+            ("conv:alice:bob".into(), summary_b, Some(fresh_b)),
+        ])
+        .expect("restore")
+        .adapter
+        .expect("adapter");
+        assert!(
+            !restored
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("b sidecar after restore"),
+            "latest empty sidecar for this conversation must win over a stale peer dump"
+        );
+    }
+
+    #[test]
+    fn group_pcs_retains_distinct_updates_per_epoch() {
+        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let first = bob
+            .propose_self_update("conv:alice:bob")
+            .expect("first propose");
+        match alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsProposal,
+                &first.payload_b64,
+            )
+            .expect("ingest first")
+        {
+            IngestResult::AppliedProposal => {}
+            other => panic!("expected AppliedProposal, got {other:?}"),
+        }
+        assert_eq!(alice.pcs_update_count("conv:alice:bob").expect("count"), 1);
+        let second = bob
+            .propose_self_update("conv:alice:bob")
+            .expect("second propose");
+        match alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsProposal,
+                &second.payload_b64,
+            )
+            .expect("ingest second")
+        {
+            IngestResult::AppliedProposal => {}
+            other => panic!("expected AppliedProposal, got {other:?}"),
+        }
+        assert_eq!(alice.pcs_update_count("conv:alice:bob").expect("count"), 2);
+        let commit = alice
+            .stage_group_pcs_commit("conv:alice:bob")
+            .expect("commit with both updates");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &commit.payload_b64,
+            )
+            .expect("bob merge")
+        {
+            IngestResult::AppliedCommit { .. } => {}
+            other => panic!("expected AppliedCommit, got {other:?}"),
+        }
+        let plaintext = b"after distinct leaf updates";
+        let outbound = alice
+            .encrypt_application("conv:alice:bob", plaintext)
+            .expect("encrypt");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, plaintext);
+            }
+            other => panic!("expected application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_pcs_commit_resolves_referenced_update_after_newer_proposal() {
+        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let first = bob
+            .propose_self_update("conv:alice:bob")
+            .expect("first propose");
+        match alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsProposal,
+                &first.payload_b64,
+            )
+            .expect("ingest first")
+        {
+            IngestResult::AppliedProposal => {}
+            other => panic!("expected AppliedProposal, got {other:?}"),
+        }
+        let commit = alice
+            .stage_group_pcs_commit("conv:alice:bob")
+            .expect("commit referencing first update");
+        let _second = bob
+            .propose_self_update("conv:alice:bob")
+            .expect("second propose");
+        assert_eq!(
+            bob.pcs_update_count("conv:alice:bob").expect("bob sidecar"),
+            2,
+            "newer update must not drop the proposal already referenced by a pending commit"
+        );
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &commit.payload_b64,
+            )
+            .expect("bob merge referenced first update")
+        {
+            IngestResult::AppliedCommit { .. } => {}
+            other => panic!("expected AppliedCommit, got {other:?}"),
+        }
+        let plaintext = b"after stale-then-newer update";
+        let outbound = alice
+            .encrypt_application("conv:alice:bob", plaintext)
+            .expect("encrypt");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, plaintext);
+            }
+            other => panic!("expected application, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn direct_self_update_keeps_live_epoch_until_certified() {
         let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
         let live_epoch = alice
@@ -2411,9 +3063,7 @@ mod tests {
         let serialized = bob
             .export_persisted_group_state("conv:alice:bob")
             .expect("persist");
-        let summary = bob
-            .export_group_summary("conv:alice:bob")
-            .expect("summary");
+        let summary = bob.export_group_summary("conv:alice:bob").expect("summary");
         let restored = MlsAdapter::restore_from_persisted_states(&[(
             "conv:alice:bob".into(),
             summary,

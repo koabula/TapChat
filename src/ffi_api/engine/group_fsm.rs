@@ -699,8 +699,12 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: current_state.leave_requests.clone(),
+                pcs: current_state.pcs.clone(),
             },
         );
+        if updated.mls_epoch_hint != current_state.manifest.mls_epoch_hint {
+            self.note_group_commit_merged(group_id);
+        }
         let _ = self.sync_conversation_members_from_manifest(conversation_id, &updated);
         true
     }
@@ -852,6 +856,13 @@ impl CoreEngine {
                 Self::dissolve_transition_is_well_formed(old, new)
                     && Self::manifest_transition_matches(old, new, |expected| {
                         expected.members = new.members.clone();
+                        expected.last_commit_message_id = new.last_commit_message_id.clone();
+                    })
+            }
+            "pcs_update" => {
+                old.last_commit_message_id != new.last_commit_message_id
+                    && new.mls_epoch_hint == old.mls_epoch_hint.saturating_add(1)
+                    && Self::manifest_transition_matches(old, new, |expected| {
                         expected.last_commit_message_id = new.last_commit_message_id.clone();
                     })
             }

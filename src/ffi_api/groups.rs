@@ -49,6 +49,7 @@ pub(super) fn group_message_type_to_direct(message_type: GroupMessageType) -> Me
     match message_type {
         GroupMessageType::MlsApplication => MessageType::MlsApplication,
         GroupMessageType::MlsCommit => MessageType::MlsCommit,
+        GroupMessageType::MlsProposal => MessageType::MlsProposal,
         GroupMessageType::ControlConversationNeedsRebuild => {
             MessageType::ControlConversationNeedsRebuild
         }

@@ -43,6 +43,7 @@ import type {
 import { signSharingPayload } from "../src/storage/sharing";
 import {
   groupCapabilitySigningPayload,
+  groupManifestSha256,
   groupManifestSigningPayload,
   groupMembershipProofSigningPayload
 } from "../src/auth/capability";
@@ -871,6 +872,124 @@ test("stale group transitions are classified as roster conflicts before proof va
   const responseBody = await response.text();
   assert.equal(response.status, 409, responseBody);
   assert.equal((JSON.parse(responseBody) as { code?: string }).code, "roster_version_conflict");
+});
+
+async function signedPcsUpdateTransition(
+  groupId: string,
+  epochBump: boolean
+): Promise<AppendGroupTransitionRequest> {
+  const capability = sampleGroupCapability(
+    groupId,
+    ["read", "append_control", "append_membership"],
+    "owner"
+  );
+  const oldManifest = sampleGroupManifest(groupId);
+  const commitId = "msg:pcs-commit";
+  const controlId = "msg:pcs-control";
+  const eventId = "msg:pcs-event";
+  const transitionId = "transition:pcs-update";
+  const nextManifest: GroupManifest = {
+    ...oldManifest,
+    rosterVersion: oldManifest.rosterVersion + 1,
+    mlsEpochHint: epochBump ? oldManifest.mlsEpochHint + 1 : oldManifest.mlsEpochHint,
+    lastCommitMessageId: commitId,
+    updatedAt: oldManifest.updatedAt + 1,
+    signature: ""
+  };
+  nextManifest.signature = signHex(
+    GROUP_IDENTITIES.owner.deviceSecret,
+    groupManifestSigningPayload(nextManifest)
+  );
+  const proof: GroupMembershipProof = {
+    type: "membership_signature",
+    operation: "pcs_update",
+    signerUserId: capability.userId,
+    signerDeviceId: capability.deviceId,
+    previousRosterVersion: oldManifest.rosterVersion,
+    newRosterVersion: nextManifest.rosterVersion,
+    previousCommitMessageId: oldManifest.lastCommitMessageId,
+    commitMessageId: commitId,
+    controlMessageId: controlId,
+    stateEventMessageId: eventId,
+    newManifestSha256: await groupManifestSha256(nextManifest),
+    signature: ""
+  };
+  proof.signature = signHex(
+    GROUP_IDENTITIES.owner.deviceSecret,
+    groupMembershipProofSigningPayload(proof)
+  );
+  const envelope = (
+    messageId: string,
+    messageType: GroupMessageType
+  ): AppendGroupEnvelopeRequest["envelope"] => ({
+    version: CURRENT_MODEL_VERSION,
+    messageId,
+    groupId,
+    conversationId: nextManifest.conversationId,
+    senderUserId: capability.userId,
+    senderDeviceId: capability.deviceId,
+    createdAt: 2,
+    messageType,
+    visibility: "protocol",
+    inlineCiphertext: "cipher",
+    storageRefs: [],
+    senderProof: { type: "signature", value: "sig" },
+    membershipProof: proof,
+    transitionId
+  });
+  return {
+    version: CURRENT_MODEL_VERSION,
+    groupId,
+    transitionId,
+    operation: { type: "pcs_update" },
+    expectedPreviousRosterVersion: oldManifest.rosterVersion,
+    expectedPreviousCommitMessageId: oldManifest.lastCommitMessageId,
+    envelopes: [
+      envelope(commitId, "mls_commit"),
+      envelope(controlId, "control_group_membership_changed"),
+      envelope(eventId, "control_group_state_event")
+    ],
+    authorizationUpdate: {
+      manifest: nextManifest,
+      identityBundles: Object.values(GROUP_IDENTITIES).map((identity) => identity.bundle)
+    },
+    capability
+  };
+}
+
+test("group pcs_update transition is accepted and rejects a missing epoch bump", async () => {
+  const { env } = createEnv();
+  const acceptedRequest = await signedPcsUpdateTransition("group:project", true);
+  const accepted = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/transitions", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(acceptedRequest.capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(acceptedRequest)
+    }),
+    env
+  );
+  const acceptedBody = await accepted.text();
+  assert.equal(accepted.status, 200, acceptedBody);
+
+  const { env: epochEnv } = createEnv();
+  const missingEpochRequest = await signedPcsUpdateTransition("group:project", false);
+  const missingEpoch = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/transitions", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(missingEpochRequest.capability),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(missingEpochRequest)
+    }),
+    epochEnv
+  );
+  const missingEpochBody = await missingEpoch.text();
+  assert.equal(missingEpoch.status, 409, missingEpochBody);
+  assert.equal((JSON.parse(missingEpochBody) as { code?: string }).code, "group_transition_invalid");
 });
 
 interface GroupIdentityFixture {
@@ -2274,6 +2393,25 @@ test("group outbox enforces operation and role permissions", async () => {
     env
   );
   assert.equal(leaveAllowed.status, 200);
+
+  const memberProposal = sampleGroupCapability("group:project", ["read", "append_control"], "member");
+  const proposalAllowed = await handleRequest(
+    new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
+      method: "POST",
+      headers: {
+        ...groupHeaders(memberProposal),
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(sampleGroupAppend(
+        "group:project",
+        "msg:mls-proposal-allowed",
+        "mls_proposal",
+        memberProposal
+      ))
+    }),
+    env
+  );
+  assert.equal(proposalAllowed.status, 200);
 
   for (const messageType of ["mls_commit", "control_group_join_approved", "control_group_metadata_updated"] as GroupMessageType[]) {
     const denied = await handleRequest(

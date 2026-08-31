@@ -1667,10 +1667,8 @@ impl CoreEngine {
                 .map_err(|error| {
                     CoreError::invalid_input(format!("failed to decode fetch response: {error}"))
                 })?;
-                let floor = self.handle_inbox_history_floor(
-                    device_id.clone(),
-                    response.history_floor_seq,
-                )?;
+                let floor =
+                    self.handle_inbox_history_floor(device_id.clone(), response.history_floor_seq)?;
                 Ok(merge_outputs(
                     floor,
                     self.handle_inbox_records(device_id, response.records, response.to_seq)?,
@@ -1820,10 +1818,8 @@ impl CoreEngine {
                         "failed to decode group fetch response: {error}"
                     ))
                 })?;
-                let floor = self.handle_group_history_floor(
-                    &group_id,
-                    response.history_floor_seq,
-                )?;
+                let floor =
+                    self.handle_group_history_floor(&group_id, response.history_floor_seq)?;
                 Ok(merge_outputs(
                     floor,
                     self.handle_group_outbox_records(group_id, response.records, response.to_seq)?,
@@ -2373,15 +2369,23 @@ impl CoreEngine {
             persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
                 message_id: envelope.message_id,
             });
+            persist_ops.push(PersistOp::SaveGroupState {
+                group_id: group_id.clone(),
+            });
+            persist_ops.push(PersistOp::SaveMlsState {
+                conversation_id: conversation_id.clone(),
+            });
+            self.note_group_application_message(&group_id);
+            let published = CoreOutput {
+                state_update: CoreStateUpdate::default(),
+                effects: std::iter::once(persist_effect(&self.state, persist_ops))
+                    .chain(local_cache_effects)
+                    .collect(),
+                view_model: None,
+            };
             Ok(merge_outputs(
-                CoreOutput {
-                    state_update: CoreStateUpdate::default(),
-                    effects: std::iter::once(persist_effect(&self.state, persist_ops))
-                        .chain(local_cache_effects)
-                        .collect(),
-                    view_model: None,
-                },
-                self.flush_pending_transport()?,
+                merge_outputs(published, self.flush_pending_transport()?),
+                self.maybe_advance_group_pcs(&group_id)?,
             ))
         } else {
             let peer_user_id = self.peer_user_for_conversation(&task.conversation_id)?;
@@ -3149,6 +3153,9 @@ impl CoreEngine {
                             touched_recovery_context_ids.insert(conversation_id.clone());
                             ackable = true;
                         }
+                        IngestResult::AppliedProposal => {
+                            ackable = true;
+                        }
                         IngestResult::AppliedWelcome { epoch } => {
                             self.initialize_direct_pcs_from_mls(&conversation_id)?;
                             log::info!(
@@ -3391,10 +3398,10 @@ impl CoreEngine {
                                 )? {
                                 IngestResult::AppliedApplication(application) => {
                                     log::info!(
-                                    "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
-                                    redact_id("msg", &record.message_id),
-                                    application.plaintext.len()
-                                );
+                                        "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
+                                        redact_id("msg", &record.message_id),
+                                        application.plaintext.len()
+                                    );
                                     if let Some(state) =
                                         self.state.conversations.get_mut(&conversation_id)
                                     {
@@ -3406,22 +3413,22 @@ impl CoreEngine {
                                             message.plaintext =
                                                 String::from_utf8(application.plaintext).ok();
                                             log::info!(
-                                            "handle_inbox_records: stored plaintext for message {}",
-                                            redact_id("msg", &record.message_id)
-                                        );
+                                                "handle_inbox_records: stored plaintext for message {}",
+                                                redact_id("msg", &record.message_id)
+                                            );
                                         } else {
                                             log::warn!(
-                                            "handle_inbox_records: Could not find message {} in conversation {} to set plaintext",
-                                            redact_id("msg", &record.message_id),
-                                            redact_id("conversation", &conversation_id)
-                                        );
+                                                "handle_inbox_records: Could not find message {} in conversation {} to set plaintext",
+                                                redact_id("msg", &record.message_id),
+                                                redact_id("conversation", &conversation_id)
+                                            );
                                         }
                                     } else {
                                         log::warn!(
-                                        "handle_inbox_records: Conversation {} not found for message {}",
-                                        redact_id("conversation", &conversation_id),
-                                        redact_id("msg", &record.message_id)
-                                    );
+                                            "handle_inbox_records: Conversation {} not found for message {}",
+                                            redact_id("conversation", &conversation_id),
+                                            redact_id("msg", &record.message_id)
+                                        );
                                     }
                                     if let Ok(summary) = self
                                         .state
@@ -3461,11 +3468,11 @@ impl CoreEngine {
                                 }
                                 IngestResult::AppliedCommit { epoch } => {
                                     log::info!(
-                                    "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
-                                    record.message_id,
-                                    conversation_id,
-                                    epoch
-                                );
+                                        "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
+                                        record.message_id,
+                                        conversation_id,
+                                        epoch
+                                    );
                                     if let Ok(summary) = self
                                         .state
                                         .mls_adapter
@@ -3502,14 +3509,17 @@ impl CoreEngine {
                                     }
                                     ackable = true;
                                 }
+                                IngestResult::AppliedProposal => {
+                                    ackable = true;
+                                }
                                 IngestResult::AppliedWelcome { epoch } => {
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
                                     log::info!(
-                                    "handle_inbox_records: AppliedWelcome for message {} in conversation {}, epoch={}",
-                                    record.message_id,
-                                    conversation_id,
-                                    epoch
-                                );
+                                        "handle_inbox_records: AppliedWelcome for message {} in conversation {}, epoch={}",
+                                        record.message_id,
+                                        conversation_id,
+                                        epoch
+                                    );
                                     if let Ok(summary) = self
                                         .state
                                         .mls_adapter
@@ -3559,18 +3569,18 @@ impl CoreEngine {
                                 }
                                 IngestResult::IgnoredReplay => {
                                     log::warn!(
-                                    "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
-                                    redact_id("msg", &record.message_id),
-                                    redact_id("conversation", &conversation_id)
-                                );
+                                        "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
+                                        redact_id("msg", &record.message_id),
+                                        redact_id("conversation", &conversation_id)
+                                    );
                                     ackable = true;
                                 }
                                 IngestResult::PendingRetry => {
                                     log::warn!(
-                                    "handle_inbox_records: PendingRetry for message {} in conversation {}",
-                                    redact_id("msg", &record.message_id),
-                                    redact_id("conversation", &conversation_id)
-                                );
+                                        "handle_inbox_records: PendingRetry for message {} in conversation {}",
+                                        redact_id("msg", &record.message_id),
+                                        redact_id("conversation", &conversation_id)
+                                    );
                                     let reason = self.recovery_reason_for_record(&conversation_id);
                                     {
                                         let sync_state = self
@@ -3593,10 +3603,10 @@ impl CoreEngine {
                                 }
                                 IngestResult::NeedsRebuild => {
                                     log::warn!(
-                                    "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
-                                    redact_id("msg", &record.message_id),
-                                    redact_id("conversation", &conversation_id)
-                                );
+                                        "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
+                                        redact_id("msg", &record.message_id),
+                                        redact_id("conversation", &conversation_id)
+                                    );
                                     output = merge_outputs(
                                         output,
                                         self.escalate_conversation_to_rebuild(
@@ -4431,7 +4441,7 @@ fn normalize_storage_origin(value: &str) -> CoreResult<String> {
         _ => {
             return Err(CoreError::invalid_input(
                 "attachment storage origin must use HTTPS",
-            ))
+            ));
         }
     }
     let normalized_path = url.path().trim_end_matches('/').to_string();

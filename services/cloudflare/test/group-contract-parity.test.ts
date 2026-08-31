@@ -12,6 +12,8 @@ import type {
   GroupManifest,
   GroupMembershipProof,
   GroupMessageType,
+  GroupStateEventKind,
+  GroupTransitionOperation,
   SealGroupOutboxRequest,
   SealGroupOutboxResult
 } from "../src/types/contracts";
@@ -24,6 +26,9 @@ const fixture = JSON.parse(
   membershipProof: GroupMembershipProof;
   expected: { manifestSha256: string; membershipProofPayload: string };
   roleOperations: Record<"owner" | "admin" | "member", GroupCapabilityOperation[]>;
+  groupMessageTypes: GroupMessageType[];
+  groupTransitionOperations: GroupTransitionOperation["type"][];
+  groupStateEventKinds: GroupStateEventKind[];
 };
 
 test("shared group fixture keeps manifest hash and membership proof payload stable", async () => {
@@ -83,4 +88,76 @@ test("seal group outbox contract keeps Cloudflare HTTP camelCase", () => {
   assert.deepEqual(Object.keys(request), ["groupId", "capability"]);
   assert.equal(request.capability.operations.at(-1), "seal_group");
   assert.equal(result.sealedAt, 1_775_004_800_000);
+});
+
+function groupTransitionProofOperation(operation: GroupTransitionOperation): string {
+  switch (operation.type) {
+    case "create":
+    case "approve_join":
+    case "transfer_ownership":
+    case "set_admin":
+    case "update_metadata":
+    case "dissolve":
+    case "add_device":
+    case "remove_device":
+    case "pcs_update":
+      return operation.type;
+    case "invite_members":
+      return "invite";
+    case "approve_leave":
+      return "leave";
+    case "remove_member":
+      return "remove";
+  }
+}
+
+function groupMessageTypeIsKnown(messageType: GroupMessageType): boolean {
+  switch (messageType) {
+    case "mls_application":
+    case "mls_commit":
+    case "mls_proposal":
+    case "control_group_membership_changed":
+    case "control_group_metadata_updated":
+    case "control_group_join_requested":
+    case "control_group_join_approved":
+    case "control_group_join_rejected":
+    case "control_group_leave_requested":
+    case "control_group_dissolved":
+    case "control_group_state_event":
+    case "control_conversation_needs_rebuild":
+      return true;
+  }
+}
+
+function groupStateEventKindIsKnown(kind: GroupStateEventKind): boolean {
+  switch (kind) {
+    case "member_joined":
+    case "member_left":
+    case "member_removed":
+    case "role_changed":
+    case "ownership_transferred":
+    case "group_metadata_changed":
+    case "group_dissolved":
+    case "mls_epoch_advanced":
+      return true;
+  }
+}
+
+test("group PCS contract variants stay exhaustive with shared fixture lists", () => {
+  assert.equal(groupTransitionProofOperation({ type: "pcs_update" }), "pcs_update");
+  assert.equal(groupMessageTypeIsKnown("mls_proposal"), true);
+  assert.equal(groupStateEventKindIsKnown("mls_epoch_advanced"), true);
+  assert.ok(fixture.groupMessageTypes.includes("mls_proposal"));
+  assert.ok(fixture.groupTransitionOperations.includes("pcs_update"));
+  assert.ok(fixture.groupStateEventKinds.includes("mls_epoch_advanced"));
+  for (const messageType of fixture.groupMessageTypes) {
+    assert.equal(groupMessageTypeIsKnown(messageType), true, messageType);
+  }
+  for (const kind of fixture.groupStateEventKinds) {
+    assert.equal(groupStateEventKindIsKnown(kind), true, kind);
+  }
+  for (const operationType of fixture.groupTransitionOperations) {
+    const operation = { type: operationType } as GroupTransitionOperation;
+    assert.ok(groupTransitionProofOperation(operation).length > 0, operationType);
+  }
 });

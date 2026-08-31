@@ -59,5 +59,43 @@
     "owner": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],
     "admin": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata"],
     "member": ["read", "subscribe", "append_application", "append_control"]
-  }
+  },
+  "groupMessageTypes": [
+    "mls_application",
+    "mls_commit",
+    "mls_proposal",
+    "control_group_membership_changed",
+    "control_group_metadata_updated",
+    "control_group_join_requested",
+    "control_group_join_approved",
+    "control_group_join_rejected",
+    "control_group_leave_requested",
+    "control_group_dissolved",
+    "control_group_state_event",
+    "control_conversation_needs_rebuild"
+  ],
+  "groupTransitionOperations": [
+    "create",
+    "invite_members",
+    "approve_join",
+    "approve_leave",
+    "remove_member",
+    "transfer_ownership",
+    "set_admin",
+    "update_metadata",
+    "dissolve",
+    "add_device",
+    "remove_device",
+    "pcs_update"
+  ],
+  "groupStateEventKinds": [
+    "member_joined",
+    "member_left",
+    "member_removed",
+    "role_changed",
+    "ownership_transferred",
+    "group_metadata_changed",
+    "group_dissolved",
+    "mls_epoch_advanced"
+  ]
 }

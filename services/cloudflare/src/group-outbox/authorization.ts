@@ -684,6 +684,12 @@ function validateTransitionShape(
           expected.lastCommitMessageId = nextManifest.lastCommitMessageId;
         });
       break;
+    case "pcs_update":
+      valid = commitChanged &&
+        manifestTransitionMatches(oldManifest, nextManifest, (expected) => {
+          expected.lastCommitMessageId = nextManifest.lastCommitMessageId;
+        });
+      break;
   }
   if (!valid) {
     throw new HttpError(409, "group_transition_invalid", `manifest changes do not match ${operation.type}`);
@@ -698,6 +704,8 @@ export function groupTransitionProofOperation(operation: GroupTransitionOperatio
       return "leave";
     case "remove_member":
       return "remove";
+    case "pcs_update":
+      return "pcs_update";
     default:
       return operation.type;
   }

@@ -791,6 +791,7 @@ impl CoreEngine {
                 | CoreCommand::RemoveGroupMemberDevice { .. }
                 | CoreCommand::SyncGroupsForNewDevice { .. }
                 | CoreCommand::SyncGroupsForRemovedDevice { .. }
+                | CoreCommand::AdvanceGroupPcs { .. }
         );
         let requires_membership_fsm_v2 = stage_group_transition
             || matches!(
@@ -815,7 +816,8 @@ impl CoreEngine {
             | CoreCommand::UpdateGroupMetadata { group_id, .. }
             | CoreCommand::DissolveGroup { group_id }
             | CoreCommand::AddGroupMemberDevice { group_id, .. }
-            | CoreCommand::RemoveGroupMemberDevice { group_id, .. } => Some(group_id.as_str()),
+            | CoreCommand::RemoveGroupMemberDevice { group_id, .. }
+            | CoreCommand::AdvanceGroupPcs { group_id } => Some(group_id.as_str()),
             _ => None,
         };
         if let Some(group_id) = transition_group_id {
@@ -878,7 +880,11 @@ impl CoreEngine {
                 Ok(merge_outputs(maintenance, created))
             }
             CoreCommand::SyncGroupOutbox { group_id, reason } => {
-                self.sync_group_outbox(group_id, reason)
+                let synced = self.sync_group_outbox(group_id.clone(), reason)?;
+                Ok(merge_outputs(
+                    synced,
+                    self.maybe_advance_group_pcs(&group_id)?,
+                ))
             }
             CoreCommand::ApplyGroupRealtimePlan {
                 websocket_group_ids,
@@ -886,7 +892,17 @@ impl CoreEngine {
             CoreCommand::SendGroupTextMessage {
                 conversation_id,
                 plaintext,
-            } => self.send_group_text_message(conversation_id, plaintext),
+            } => {
+                let group_id = self
+                    .group_id_for_conversation(&conversation_id)?
+                    .to_string();
+                let sent = self.send_group_text_message(conversation_id, plaintext)?;
+                Ok(merge_outputs(
+                    sent,
+                    self.maybe_advance_group_pcs(&group_id)?,
+                ))
+            }
+            CoreCommand::AdvanceGroupPcs { group_id } => self.advance_group_pcs(group_id),
             CoreCommand::CreateGroupInviteLink {
                 group_id,
                 expires_at,
@@ -1074,7 +1090,11 @@ impl CoreEngine {
             &group_id,
             &proposed.conversation_id,
             GroupMessageType::ControlGroupStateEvent,
-            GroupEnvelopeVisibility::Visible,
+            if proof.operation == "pcs_update" {
+                GroupEnvelopeVisibility::Protocol
+            } else {
+                GroupEnvelopeVisibility::Visible
+            },
             "pending-state-event".into(),
         )?;
         event_envelope.transition_id = Some(transition_id.clone());
@@ -1297,7 +1317,9 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: format!("TapChat couldn't complete the {action:?} action for message request {request_id}."),
+                        message: format!(
+                            "TapChat couldn't complete the {action:?} action for message request {request_id}."
+                        ),
                     },
                 }],
                 view_model: None,
@@ -1601,10 +1623,9 @@ impl CoreEngine {
                 task_id,
                 blob_ciphertext,
             } => self.handle_blob_downloaded(task_id, blob_ciphertext),
-            CoreEvent::BlobTransferFailed {
-                task_id,
-                failure,
-            } => self.handle_blob_transfer_failed(task_id, failure.retryable, None),
+            CoreEvent::BlobTransferFailed { task_id, failure } => {
+                self.handle_blob_transfer_failed(task_id, failure.retryable, None)
+            }
             CoreEvent::BlobDeleted { task_id } => self.handle_blob_deleted(task_id),
             CoreEvent::BlobDeleteFailed { task_id, failure } => {
                 self.handle_blob_delete_failed(task_id, failure.retryable)
@@ -1622,16 +1643,14 @@ impl CoreEngine {
                 group_id,
                 history_floor_seq,
             } => self.handle_group_history_floor(&group_id, history_floor_seq),
-            CoreEvent::GroupOutboxFetchFailed {
-                group_id,
-                failure,
-            } => self.handle_group_sync_failed(
-                group_id,
-                failure.retryable,
-                failure.http_status,
-                Some(failure.code),
-                None,
-            ),
+            CoreEvent::GroupOutboxFetchFailed { group_id, failure } => self
+                .handle_group_sync_failed(
+                    group_id,
+                    failure.retryable,
+                    failure.http_status,
+                    Some(failure.code),
+                    None,
+                ),
             CoreEvent::GroupOutboxHeadFetched {
                 group_id,
                 head_seq,
@@ -1643,16 +1662,14 @@ impl CoreEngine {
                 current_roster_version,
                 last_commit_message_id,
             ),
-            CoreEvent::GroupOutboxHeadFetchFailed {
-                group_id,
-                failure,
-            } => self.handle_group_sync_failed(
-                group_id,
-                failure.retryable,
-                failure.http_status,
-                Some(failure.code),
-                None,
-            ),
+            CoreEvent::GroupOutboxHeadFetchFailed { group_id, failure } => self
+                .handle_group_sync_failed(
+                    group_id,
+                    failure.retryable,
+                    failure.http_status,
+                    Some(failure.code),
+                    None,
+                ),
             CoreEvent::GroupEnvelopeAppended {
                 group_id,
                 message_id,
@@ -1712,24 +1729,19 @@ impl CoreEngine {
                 phase,
                 materialized,
             ),
-            CoreEvent::GroupAuthorizationStateFetchFailed {
-                group_id,
-                failure,
-            } => self.handle_group_sync_failed(
-                group_id,
-                failure.retryable,
-                failure.http_status,
-                Some(failure.code),
-                None,
-            ),
+            CoreEvent::GroupAuthorizationStateFetchFailed { group_id, failure } => self
+                .handle_group_sync_failed(
+                    group_id,
+                    failure.retryable,
+                    failure.http_status,
+                    Some(failure.code),
+                    None,
+                ),
             CoreEvent::GroupAuthorizationInitialized {
                 group_id,
                 roster_version,
             } => self.handle_group_authorization_initialized(group_id, roster_version),
-            CoreEvent::GroupAuthorizationInitializeFailed {
-                group_id,
-                failure,
-            } => {
+            CoreEvent::GroupAuthorizationInitializeFailed { group_id, failure } => {
                 log::warn!(
                     "group authorization initialization failed: group_id={} retryable={} status={:?} code={}",
                     redact_id("group", &group_id),
@@ -1745,7 +1757,8 @@ impl CoreEngine {
                     effects: vec![CoreEffect::EmitUserNotification {
                         notification: UserNotificationEffect {
                             status: SystemStatus::TemporaryNetworkFailure,
-                            message: "TapChat couldn't initialize group authorization. Try again.".into(),
+                            message: "TapChat couldn't initialize group authorization. Try again."
+                                .into(),
                         },
                     }],
                     view_model: None,
@@ -2053,7 +2066,9 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: "TapChat couldn't complete the group invite or join request. Try again.".into(),
+                        message:
+                            "TapChat couldn't complete the group invite or join request. Try again."
+                                .into(),
                     },
                 }],
                 view_model: None,
@@ -2205,30 +2220,28 @@ impl CoreEngine {
                 group_id,
                 request_id,
                 failure,
-            } => {
-                Ok(CoreOutput {
-                    state_update: CoreStateUpdate {
-                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: if failure.retryable {
-                        vec![CoreEffect::ScheduleTimer {
-                            timer: TimerEffect {
-                                timer_id: format!("group_join_claim:{group_id}:{request_id}"),
-                                delay_ms: 5_000,
-                            },
-                        }]
-                    } else {
-                        vec![CoreEffect::EmitUserNotification {
-                            notification: UserNotificationEffect {
-                                status: SystemStatus::TemporaryNetworkFailure,
-                                message: "TapChat couldn't claim this group join request.".into(),
-                            },
-                        }]
-                    },
-                    view_model: None,
-                })
-            }
+            } => Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                    ..CoreStateUpdate::default()
+                },
+                effects: if failure.retryable {
+                    vec![CoreEffect::ScheduleTimer {
+                        timer: TimerEffect {
+                            timer_id: format!("group_join_claim:{group_id}:{request_id}"),
+                            delay_ms: 5_000,
+                        },
+                    }]
+                } else {
+                    vec![CoreEffect::EmitUserNotification {
+                        notification: UserNotificationEffect {
+                            status: SystemStatus::TemporaryNetworkFailure,
+                            message: "TapChat couldn't claim this group join request.".into(),
+                        },
+                    }]
+                },
+                view_model: None,
+            }),
             CoreEvent::GroupJoinCompleteFailed {
                 group_id,
                 request_id,
@@ -2399,16 +2412,14 @@ impl CoreEngine {
                 sealed_at,
                 was_already_sealed,
             } => self.handle_group_outbox_sealed(group_id, sealed_at, was_already_sealed),
-            CoreEvent::GroupOutboxSealFailed {
-                group_id,
-                failure,
-            } => self.handle_group_outbox_seal_failed(
-                group_id,
-                failure.retryable,
-                failure.http_status,
-                Some(failure.code),
-                None,
-            ),
+            CoreEvent::GroupOutboxSealFailed { group_id, failure } => self
+                .handle_group_outbox_seal_failed(
+                    group_id,
+                    failure.retryable,
+                    failure.http_status,
+                    Some(failure.code),
+                    None,
+                ),
         }
     }
 }

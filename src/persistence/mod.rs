@@ -144,6 +144,8 @@ pub struct PersistedGroupState {
     pub pending_group_transition: Option<PersistedPendingGroupTransition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub leave_requests: Vec<PersistedGroupLeaveRequest>,
+    #[serde(default)]
+    pub pcs: crate::group_pcs::GroupPcsState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

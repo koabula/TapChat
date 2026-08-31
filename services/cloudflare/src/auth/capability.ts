@@ -491,6 +491,8 @@ export function requiredGroupAppendOperations(messageType: GroupMessageType): Gr
   switch (messageType) {
     case "mls_application":
       return ["append_application"];
+    case "mls_proposal":
+      return ["append_control"];
     case "mls_commit":
     case "control_group_membership_changed":
     case "control_group_state_event":

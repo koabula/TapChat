@@ -637,26 +637,35 @@ pub async fn get_group_messages_impl(
                 let event = message.plaintext.as_deref().and_then(|value| {
                     serde_json::from_str::<tapchat_core::model::GroupStateEvent>(value).ok()
                 });
-                let raw_message_type = event
-                    .as_ref()
-                    .and_then(|event| serde_json::to_value(event.kind).ok())
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "control_group_state_event".into());
-                out.push(GroupMessageView::SystemBanner {
-                    message_id: message.message_id.clone(),
-                    created_at: message.created_at,
-                    text: group_state_event_text(message.plaintext.as_deref()),
-                    raw_message_type,
-                    transition_id: event.as_ref().map(|event| event.transition_id.clone()),
-                    event_kind: event.as_ref().map(|event| event.kind),
-                    actor_user_id: event.as_ref().map(|event| event.actor_user_id.clone()),
-                    subject_user_ids: event
+                if event.as_ref().is_some_and(|event| {
+                    matches!(
+                        event.kind,
+                        tapchat_core::model::GroupStateEventKind::MlsEpochAdvanced
+                    )
+                }) {
+                    // Protocol-only PCS epoch marker; never surface in chat.
+                } else {
+                    let raw_message_type = event
                         .as_ref()
-                        .map(|event| event.subject_user_ids.clone())
-                        .unwrap_or_default(),
-                    old_role: event.as_ref().and_then(|event| event.old_role),
-                    new_role: event.as_ref().and_then(|event| event.new_role),
-                });
+                        .and_then(|event| serde_json::to_value(event.kind).ok())
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "control_group_state_event".into());
+                    out.push(GroupMessageView::SystemBanner {
+                        message_id: message.message_id.clone(),
+                        created_at: message.created_at,
+                        text: group_state_event_text(message.plaintext.as_deref()),
+                        raw_message_type,
+                        transition_id: event.as_ref().map(|event| event.transition_id.clone()),
+                        event_kind: event.as_ref().map(|event| event.kind),
+                        actor_user_id: event.as_ref().map(|event| event.actor_user_id.clone()),
+                        subject_user_ids: event
+                            .as_ref()
+                            .map(|event| event.subject_user_ids.clone())
+                            .unwrap_or_default(),
+                        old_role: event.as_ref().and_then(|event| event.old_role),
+                        new_role: event.as_ref().and_then(|event| event.new_role),
+                    });
+                }
             }
             tapchat_core::model::MessageType::ControlContactRemoved => {
                 // Direct relationship lifecycle message.
@@ -666,6 +675,7 @@ pub async fn get_group_messages_impl(
             }
             tapchat_core::model::MessageType::MlsWelcome
             | tapchat_core::model::MessageType::MlsCommit
+            | tapchat_core::model::MessageType::MlsProposal
             | tapchat_core::model::MessageType::ControlGroupWelcomePickup
             | tapchat_core::model::MessageType::ControlDirectCommitAccept => {
                 // Protocol messages never surface in the chat UI.

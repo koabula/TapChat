@@ -3224,7 +3224,10 @@ impl CoreEngine {
     }
 
     /// Called only after locally creating a group or successfully joining a Welcome.
-    pub(super) fn initialize_direct_pcs_from_mls(&mut self, conversation_id: &str) -> CoreResult<()> {
+    pub(super) fn initialize_direct_pcs_from_mls(
+        &mut self,
+        conversation_id: &str,
+    ) -> CoreResult<()> {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(());
         }

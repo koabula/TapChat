@@ -599,6 +599,7 @@ impl Validate for SenderProof {
 pub enum MessageType {
     MlsApplication,
     MlsCommit,
+    MlsProposal,
     MlsWelcome,
     ControlDeviceMembershipChanged,
     ControlIdentityStateUpdated,
@@ -955,6 +956,7 @@ impl Validate for GroupCapability {
 pub enum GroupMessageType {
     MlsApplication,
     MlsCommit,
+    MlsProposal,
     ControlGroupMembershipChanged,
     ControlGroupMetadataUpdated,
     ControlGroupJoinRequested,
@@ -1088,6 +1090,7 @@ pub enum GroupStateEventKind {
     OwnershipTransferred,
     GroupMetadataChanged,
     GroupDissolved,
+    MlsEpochAdvanced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1159,6 +1162,7 @@ pub enum GroupTransitionOperation {
         user_id: String,
         device_id: String,
     },
+    PcsUpdate,
 }
 
 impl GroupTransitionOperation {
@@ -1175,6 +1179,7 @@ impl GroupTransitionOperation {
             Self::Dissolve => "dissolve",
             Self::AddDevice { .. } => "add_device",
             Self::RemoveDevice { .. } => "remove_device",
+            Self::PcsUpdate => "pcs_update",
         }
     }
 }
@@ -2266,6 +2271,34 @@ mod tests {
         let decoded: GroupMessageType =
             serde_json::from_str(&json).expect("deserialize ControlGroupDissolved");
         assert_eq!(decoded, GroupMessageType::ControlGroupDissolved);
+    }
+
+    #[test]
+    fn group_pcs_contract_variants_roundtrip() {
+        let json = serde_json::to_string(&GroupMessageType::MlsProposal).expect("serialize");
+        assert_eq!(json, "\"mls_proposal\"");
+        let decoded: GroupMessageType = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, GroupMessageType::MlsProposal);
+
+        let json = serde_json::to_string(&MessageType::MlsProposal).expect("serialize");
+        assert_eq!(json, "\"mls_proposal\"");
+        let decoded: MessageType = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, MessageType::MlsProposal);
+
+        let json = serde_json::to_string(&GroupTransitionOperation::PcsUpdate).expect("serialize");
+        assert_eq!(json, "{\"type\":\"pcs_update\"}");
+        let decoded: GroupTransitionOperation = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, GroupTransitionOperation::PcsUpdate);
+        assert_eq!(
+            GroupTransitionOperation::PcsUpdate.proof_operation(),
+            "pcs_update"
+        );
+
+        let json =
+            serde_json::to_string(&GroupStateEventKind::MlsEpochAdvanced).expect("serialize");
+        assert_eq!(json, "\"mls_epoch_advanced\"");
+        let decoded: GroupStateEventKind = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, GroupStateEventKind::MlsEpochAdvanced);
     }
 
     #[test]

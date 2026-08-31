@@ -110,6 +110,9 @@ pub enum CoreCommand {
         conversation_id: String,
         plaintext: String,
     },
+    AdvanceGroupPcs {
+        group_id: String,
+    },
     InviteToGroup {
         group_id: String,
         invitee_user_ids: Vec<String>,

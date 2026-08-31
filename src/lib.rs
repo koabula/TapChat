@@ -11,6 +11,7 @@ pub mod error_codes_generated;
 pub mod external_fetch;
 pub mod ffi_api;
 pub(crate) mod fs_util;
+pub mod group_pcs;
 pub mod identity;
 pub mod local_store;
 pub(crate) mod log_sanitize;

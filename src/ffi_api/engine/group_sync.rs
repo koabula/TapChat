@@ -1179,6 +1179,7 @@ impl CoreEngine {
                         && device.status == GroupMemberStatus::Active
                 })
             }
+            GroupTransitionOperation::PcsUpdate => true,
         }
     }
 
@@ -1245,6 +1246,9 @@ impl CoreEngine {
                     device_id: device_id.clone(),
                 }
             }
+            GroupTransitionOperation::PcsUpdate => CoreCommand::AdvanceGroupPcs {
+                group_id: group_id.to_string(),
+            },
         })
     }
 
@@ -1659,7 +1663,9 @@ impl CoreEngine {
             }
             if matches!(
                 record.envelope.message_type,
-                GroupMessageType::MlsApplication | GroupMessageType::MlsCommit
+                GroupMessageType::MlsApplication
+                    | GroupMessageType::MlsCommit
+                    | GroupMessageType::MlsProposal
             ) {
                 if group_state.local_role.is_none()
                     && record.envelope.message_type == GroupMessageType::MlsApplication
@@ -1701,13 +1707,15 @@ impl CoreEngine {
                     Err(error) => return Err(error),
                 };
                 match result {
-                    IngestResult::AppliedApplication(application) => self
-                        .store_group_record_message(
+                    IngestResult::AppliedApplication(application) => {
+                        self.store_group_record_message(
                             &conversation_id,
                             &record,
                             message_type,
                             String::from_utf8(application.plaintext).ok(),
-                        )?,
+                        )?;
+                        self.note_group_application_message(&group_id);
+                    }
                     IngestResult::AppliedCommit { .. } => {
                         if let Some(proof) = membership_proof.clone() {
                             let mut state = self
@@ -1726,12 +1734,21 @@ impl CoreEngine {
                                 });
                             self.state.group_states.insert(group_id.clone(), state);
                         }
+                        self.note_group_commit_merged(&group_id);
                         self.store_group_record_message(
                             &conversation_id,
                             &record,
                             message_type,
                             None,
                         )?
+                    }
+                    IngestResult::AppliedProposal => {
+                        self.store_group_record_message(
+                            &conversation_id,
+                            &record,
+                            message_type,
+                            None,
+                        )?;
                     }
                     IngestResult::PendingRetry => {
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
@@ -1908,7 +1925,7 @@ impl CoreEngine {
                     .clone();
                 let next_fetch = CoreEffect::FetchGroupOutbox {
                     fetch: FetchGroupOutboxRequest {
-                        group_id,
+                        group_id: group_id.clone(),
                         from_seq: last_terminal_seq.saturating_add(1),
                         limit: GROUP_OUTBOX_FETCH_LIMIT,
                         capability: self.group_capability_for_state(&state)?,
@@ -1932,7 +1949,15 @@ impl CoreEngine {
                 }
             }
         }
-        self.merge_with_transport_flush(output)
+        let mut output = self.merge_with_transport_flush(output)?;
+        let caught_up = !stopped_on_retryable_gap
+            && target_head
+                .map(|head_seq| last_terminal_seq >= head_seq)
+                .unwrap_or(true);
+        if caught_up {
+            output = merge_outputs(output, self.maybe_advance_group_pcs(&group_id)?);
+        }
+        Ok(output)
     }
 
     pub(super) fn apply_inbound_group_transition_bundle(
@@ -2038,12 +2063,12 @@ impl CoreEngine {
                 IngestResult::NeedsRebuild => {
                     return Err(CoreError::invalid_state(
                         "transition commit marked MLS state unrecoverable",
-                    ))
+                    ));
                 }
                 _ => {
                     return Err(CoreError::invalid_input(
                         "transition commit did not produce an MLS commit",
-                    ))
+                    ));
                 }
             }
         }
@@ -2062,7 +2087,7 @@ impl CoreEngine {
             _ => {
                 return Err(CoreError::invalid_input(
                     "transition control did not decrypt as an application message",
-                ))
+                ));
             }
         };
         let updated: GroupManifest =
@@ -2101,7 +2126,7 @@ impl CoreEngine {
             _ => {
                 return Err(CoreError::invalid_input(
                     "transition state event did not decrypt as an application message",
-                ))
+                ));
             }
         };
         let event: GroupStateEvent =
@@ -2147,6 +2172,9 @@ impl CoreEngine {
             } else {
                 GroupConsistencyState::Ready
             };
+        }
+        if commit.is_some() {
+            self.note_group_commit_merged(group_id);
         }
         self.sync_conversation_members_from_manifest(&current.conversation_id, &updated)?;
         let mut messages = Vec::new();
@@ -2221,7 +2249,14 @@ impl CoreEngine {
                 .filter(|new_role| *new_role != old_role)
                 .map(|new_role| (user_id.clone(), *old_role, *new_role))
         });
-        let (kind, subject_user_ids, old_role, new_role) = if proof.operation == "dissolve" {
+        let (kind, subject_user_ids, old_role, new_role) = if proof.operation == "pcs_update" {
+            (
+                GroupStateEventKind::MlsEpochAdvanced,
+                Vec::new(),
+                None,
+                None,
+            )
+        } else if proof.operation == "dissolve" {
             (GroupStateEventKind::GroupDissolved, Vec::new(), None, None)
         } else if previous.owner_user_id != updated.owner_user_id {
             (
@@ -2401,10 +2436,11 @@ impl CoreEngine {
                     device_id: device.device_id.clone(),
                 }
             }
+            "pcs_update" => GroupTransitionOperation::PcsUpdate,
             operation => {
                 return Err(CoreError::invalid_state(format!(
                     "unsupported group transition operation {operation}"
-                )))
+                )));
             }
         };
         let request_binding = match (&operation, join_request_id) {
@@ -2588,6 +2624,9 @@ impl CoreEngine {
             {
                 state.pending_group_transition = None;
             }
+        }
+        if pending.proposed_manifest.mls_epoch_hint != group_state.manifest.mls_epoch_hint {
+            self.note_group_commit_merged(&group_id);
         }
         self.sync_conversation_members_from_manifest(
             &group_state.conversation_id,
@@ -3363,6 +3402,7 @@ impl CoreEngine {
                     consistency_state: GroupConsistencyState::Ready,
                     pending_group_transition: None,
                     leave_requests: Vec::new(),
+                    pcs: crate::group_pcs::GroupPcsState::default(),
                 },
             );
             imported_shell = Some((imported_group_id, imported_conversation_id));
@@ -3468,6 +3508,7 @@ impl CoreEngine {
         self.state
             .mls_summaries
             .insert(group_state.conversation_id.clone(), summary);
+        self.note_group_commit_merged(&group_state.group_id);
         if descriptor
             .roster_version
             .is_some_and(|version| version != group_state.manifest.roster_version)

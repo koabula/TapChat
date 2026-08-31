@@ -178,6 +178,7 @@ export interface GroupCapability {
 export type GroupMessageType =
   | "mls_application"
   | "mls_commit"
+  | "mls_proposal"
   | "control_group_membership_changed"
   | "control_group_metadata_updated"
   | "control_group_join_requested"

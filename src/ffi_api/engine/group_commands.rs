@@ -177,6 +177,7 @@ impl CoreEngine {
             consistency_state: GroupConsistencyState::Ready,
             pending_group_transition: None,
             leave_requests: Vec::new(),
+            pcs: self.group_pcs_state_for_conversation(&conversation_id),
         };
         self.state
             .group_states
@@ -308,6 +309,7 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Reconciling,
                 pending_group_transition: None,
                 leave_requests: Vec::new(),
+                pcs: self.group_pcs_state_for_conversation(&conversation_id),
             },
         );
 
@@ -447,6 +449,7 @@ impl CoreEngine {
         )?;
         let capability = self.group_capability(&group_id, self.local_group_role(&group_id)?)?;
         self.enqueue_group_envelope(envelope.clone(), capability, Some(plaintext));
+        self.note_group_application_message(&group_id);
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -457,6 +460,9 @@ impl CoreEngine {
                 vec![
                     PersistOp::SaveMlsState {
                         conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
                     },
                     PersistOp::SaveOutgoingGroupEnvelope {
                         message_id: envelope.message_id.clone(),
@@ -959,6 +965,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -1013,6 +1020,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -1212,6 +1220,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -1265,6 +1274,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         let mut effects = vec![persist_effect(
@@ -1443,6 +1453,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         let capability = self.group_capability(&group_id, role)?;
@@ -1496,6 +1507,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         let effects = vec![persist_effect(
@@ -1805,6 +1817,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         self.merge_with_transport_flush(CoreOutput {
@@ -1907,6 +1920,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -2040,6 +2054,7 @@ impl CoreEngine {
                 consistency_state: group_state.consistency_state.clone(),
                 pending_group_transition: group_state.pending_group_transition.clone(),
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
         let metadata_payload = serde_json::to_vec(&manifest).map_err(|error| {
@@ -2226,6 +2241,7 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -2494,6 +2510,7 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -2548,6 +2565,7 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -2747,6 +2765,7 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -2801,6 +2820,7 @@ impl CoreEngine {
                 consistency_state: GroupConsistencyState::Ready,
                 pending_group_transition: None,
                 leave_requests: group_state.leave_requests.clone(),
+                pcs: group_state.pcs.clone(),
             },
         );
 
@@ -3099,5 +3119,264 @@ impl CoreEngine {
             ..aggregate.view_model.unwrap_or_default()
         });
         Ok(aggregate)
+    }
+
+    pub(super) fn note_group_application_message(&mut self, group_id: &str) {
+        if let Some(state) = self.state.group_states.get_mut(group_id) {
+            state.pcs.note_application_message();
+        }
+    }
+
+    pub(super) fn note_group_commit_merged(&mut self, group_id: &str) {
+        let Some(conversation_id) = self
+            .state
+            .group_states
+            .get(group_id)
+            .map(|state| state.conversation_id.clone())
+        else {
+            return;
+        };
+        let leaf_key = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.own_leaf_key_b64(&conversation_id).ok());
+        if let Some(adapter) = self.state.mls_adapter.as_mut() {
+            adapter.clear_pcs_update_sidecar(&conversation_id);
+        }
+        if let Some(state) = self.state.group_states.get_mut(group_id) {
+            if let Some(leaf_key) = leaf_key {
+                state.pcs.on_commit_merged(&leaf_key);
+            } else {
+                state.pcs.proposal_in_flight = false;
+            }
+        }
+    }
+
+    fn group_pcs_state_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> crate::group_pcs::GroupPcsState {
+        let mut pcs = crate::group_pcs::GroupPcsState::default();
+        if let Some(leaf_key) = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .and_then(|adapter| adapter.own_leaf_key_b64(conversation_id).ok())
+        {
+            pcs.on_commit_merged(&leaf_key);
+        }
+        pcs
+    }
+
+    pub(super) fn maybe_advance_group_pcs(&mut self, group_id: &str) -> CoreResult<CoreOutput> {
+        let (should_commit, should_propose) = {
+            let Some(state) = self.state.group_states.get(group_id) else {
+                return Ok(CoreOutput::default());
+            };
+            if state.pending_group_transition.is_some()
+                || !matches!(
+                    state.consistency_state,
+                    crate::persistence::GroupConsistencyState::Ready
+                )
+                || state.dissolved_at.is_some()
+            {
+                return Ok(CoreOutput::default());
+            }
+            let is_privileged =
+                matches!(state.local_role, Some(GroupRole::Owner | GroupRole::Admin));
+            let conversation_id = state.conversation_id.clone();
+            let pcs = state.pcs.clone();
+            let has_pending_proposals = self
+                .state
+                .mls_adapter
+                .as_ref()
+                .and_then(|adapter| adapter.has_pcs_update_proposals(&conversation_id).ok())
+                .unwrap_or(false);
+            (
+                pcs.should_commit(is_privileged, has_pending_proposals),
+                pcs.should_propose(),
+            )
+        };
+        if should_commit {
+            return self.handle_command(CoreCommand::AdvanceGroupPcs {
+                group_id: group_id.to_string(),
+            });
+        }
+        if should_propose {
+            return self.emit_group_pcs_proposal(group_id);
+        }
+        Ok(CoreOutput::default())
+    }
+
+    fn emit_group_pcs_proposal(&mut self, group_id: &str) -> CoreResult<CoreOutput> {
+        let group_state = self
+            .state
+            .group_states
+            .get(group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .propose_self_update(&group_state.conversation_id)?;
+        let envelope = self.build_group_envelope(
+            group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsProposal,
+            GroupEnvelopeVisibility::Protocol,
+            payload.payload_b64,
+        )?;
+        let capability = self.group_capability(group_id, self.local_group_role(group_id)?)?;
+        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        if let Some(state) = self.state.group_states.get_mut(group_id) {
+            state.pcs.mark_proposal_in_flight();
+        }
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveMlsState {
+                        conversation_id: group_state.conversation_id.clone(),
+                    },
+                    PersistOp::SaveGroupState {
+                        group_id: group_id.to_string(),
+                    },
+                    PersistOp::SaveOutgoingGroupEnvelope {
+                        message_id: envelope.message_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                messages: vec![MessageSummary {
+                    conversation_id: group_state.conversation_id,
+                    message_id: envelope.message_id,
+                    message_type: MessageType::MlsProposal,
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    pub(super) fn advance_group_pcs(&mut self, group_id: String) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can commit group PCS updates",
+            ));
+        }
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .cloned()
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        let previous_manifest = group_state.manifest.clone();
+        let artifacts = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .stage_group_pcs_commit(&group_state.conversation_id)?;
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .export_group_summary(&group_state.conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(group_state.conversation_id.clone(), summary.clone());
+        let mut manifest = previous_manifest.clone();
+        let now = current_unix_millis(self.state.message_nonce);
+        self.apply_membership_change_to_manifest(&mut manifest, artifacts.epoch, now)?;
+        let capability = self.group_capability(&group_id, role)?;
+        let mut commit = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::MlsCommit,
+            GroupEnvelopeVisibility::Protocol,
+            artifacts.payload_b64,
+        )?;
+        manifest.last_commit_message_id = Some(commit.message_id.clone());
+        manifest.signature = self.sign_manifest(&manifest)?;
+        manifest.validate()?;
+        let manifest_payload = serde_json::to_vec(&manifest).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode manifest: {error}"))
+        })?;
+        let control_plaintext = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(&group_state.conversation_id, &manifest_payload)?;
+        let mut control = self.build_group_envelope(
+            &group_id,
+            &group_state.conversation_id,
+            GroupMessageType::ControlGroupMembershipChanged,
+            GroupEnvelopeVisibility::Protocol,
+            control_plaintext.payload_b64,
+        )?;
+        let membership_proof = self.build_membership_proof(
+            "pcs_update",
+            &previous_manifest,
+            &manifest,
+            &commit.message_id,
+            &control.message_id,
+        )?;
+        commit.membership_proof = Some(membership_proof.clone());
+        control.membership_proof = Some(membership_proof);
+        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(control.clone(), capability, None);
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.manifest = manifest;
+        }
+        self.note_group_commit_merged(&group_id);
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveGroupState {
+                        group_id: group_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: group_state.conversation_id.clone(),
+                    },
+                    PersistOp::SaveOutgoingGroupEnvelope {
+                        message_id: commit.message_id.clone(),
+                    },
+                    PersistOp::SaveOutgoingGroupEnvelope {
+                        message_id: control.message_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                messages: vec![
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id.clone(),
+                        message_id: commit.message_id,
+                        message_type: MessageType::MlsCommit,
+                    },
+                    MessageSummary {
+                        conversation_id: group_state.conversation_id,
+                        message_id: control.message_id,
+                        message_type: MessageType::ControlDeviceMembershipChanged,
+                    },
+                ],
+                ..CoreViewModel::default()
+            }),
+        })
     }
 }
