@@ -123,6 +123,7 @@ pub struct OutboundMlsMessage {
 pub struct DecryptedApplicationMessage {
     pub plaintext: Vec<u8>,
     pub sender_identity: String,
+    pub from_previous_epoch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +131,26 @@ pub enum IngestResult {
     AppliedApplication(DecryptedApplicationMessage),
     AppliedCommit { epoch: u64 },
     AppliedWelcome { epoch: u64 },
+    IgnoredReplay,
+    PendingRetry,
+    NeedsRebuild,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedDirectSelfUpdate {
+    pub commit_b64: String,
+    pub commit_hash: String,
+    pub base_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectCommitClass {
+    PcsSelfUpdate {
+        commit_hash: String,
+        base_epoch: u64,
+        sender_identity: String,
+    },
+    MembershipOrOther,
     IgnoredReplay,
     PendingRetry,
     NeedsRebuild,
@@ -168,7 +189,7 @@ pub struct MlsConversationPatch {
     pub base_state_sha256: String,
     pub staged_state_sha256: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub base_values: BTreeMap<String, Option<String>>,
+    pub base_hashes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub staged_values: BTreeMap<String, Option<String>>,
 }
@@ -230,6 +251,18 @@ fn store_sha256(store: &SerializableStore) -> CoreResult<String> {
         CoreError::invalid_state(format!("failed to encode MLS provider state: {error}"))
     })?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+fn optional_value_sha256(value: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    match value {
+        Some(value) => {
+            hasher.update([1_u8]);
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([0_u8]),
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 pub struct MlsAdapter {
@@ -304,13 +337,13 @@ impl MlsAdapter {
             .chain(target.values.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
-        let mut base_values = BTreeMap::new();
+        let mut base_hashes = BTreeMap::new();
         let mut staged_values = BTreeMap::new();
         for key in keys {
             let before = base.values.get(&key).cloned();
             let after = target.values.get(&key).cloned();
             if before != after {
-                base_values.insert(key.clone(), before);
+                base_hashes.insert(key.clone(), optional_value_sha256(before.as_deref()));
                 staged_values.insert(key, after);
             }
         }
@@ -318,7 +351,7 @@ impl MlsAdapter {
             conversation_id: conversation_id.to_string(),
             base_state_sha256: store_sha256(&base)?,
             staged_state_sha256: store_sha256(&target)?,
-            base_values,
+            base_hashes,
             staged_values,
         })
     }
@@ -333,9 +366,9 @@ impl MlsAdapter {
         summaries: &BTreeMap<String, MlsStateSummary>,
     ) -> CoreResult<Self> {
         let mut current = self.serializable_store()?;
-        for (key, expected) in &patch.base_values {
-            let actual = current.values.get(key).cloned();
-            if &actual != expected {
+        for (key, expected_hash) in &patch.base_hashes {
+            let actual = current.values.get(key).map(String::as_str);
+            if optional_value_sha256(actual) != *expected_hash {
                 return Err(CoreError::invalid_state(format!(
                     "MLS conversation patch CAS failed for {}",
                     patch.conversation_id
@@ -471,6 +504,7 @@ impl MlsAdapter {
         self.delete_stale_persisted_group(&group_id)?;
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
             .build();
         let mut group = MlsGroup::new_with_group_id(
             &self.provider,
@@ -551,6 +585,7 @@ impl MlsAdapter {
         self.delete_stale_persisted_group(&group_id)?;
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
             .build();
         let group = MlsGroup::new_with_group_id(
             &self.provider,
@@ -689,6 +724,218 @@ impl MlsAdapter {
             payload_b64: encode_mls_message(message)?,
             epoch: state.group.epoch().as_u64(),
         })
+    }
+
+    pub fn stage_direct_self_update(
+        &mut self,
+        conversation_id: &str,
+    ) -> CoreResult<StagedDirectSelfUpdate> {
+        if !self.groups.contains_key(conversation_id) {
+            return Err(CoreError::invalid_input(
+                "conversation MLS state does not exist",
+            ));
+        }
+        let base_epoch = self.export_group_summary(conversation_id)?.epoch;
+        let provider = &self.provider;
+        let signer = &self.signer;
+        let state = self.groups.get_mut(conversation_id).ok_or_else(|| {
+            CoreError::invalid_input("conversation MLS state does not exist")
+        })?;
+        let bundle = state
+            .group
+            .self_update(provider, signer, LeafNodeParameters::default())
+            .map_err(|error| {
+                CoreError::invalid_state(format!(
+                    "failed to create direct PCS self-update: {error}"
+                ))
+            })?;
+        let commit = bundle.into_commit();
+        let commit_b64 = encode_mls_message(commit)?;
+        let commit_hash = crate::direct_pcs::commit_hash_from_b64(&commit_b64)?;
+        Ok(StagedDirectSelfUpdate {
+            commit_b64,
+            commit_hash,
+            base_epoch,
+        })
+    }
+
+    pub fn create_forked_direct_self_update(
+        &self,
+        conversation_id: &str,
+    ) -> CoreResult<StagedDirectSelfUpdate> {
+        if !self.groups.contains_key(conversation_id) {
+            return Err(CoreError::invalid_input(
+                "conversation MLS state does not exist",
+            ));
+        }
+        let base_epoch = self.export_group_summary(conversation_id)?.epoch;
+        let mut fork = self.fork()?;
+        let provider = &fork.provider;
+        let signer = &fork.signer;
+        let state = fork.groups.get_mut(conversation_id).ok_or_else(|| {
+            CoreError::invalid_state("forked MLS adapter is missing the conversation")
+        })?;
+        if state.group.pending_commit().is_some() {
+            state
+                .group
+                .clear_pending_commit(provider.storage())
+                .map_err(|error| {
+                    CoreError::invalid_state(format!(
+                        "failed to clear pending commit on fork: {error}"
+                    ))
+                })?;
+        }
+        let bundle = state
+            .group
+            .self_update(provider, signer, LeafNodeParameters::default())
+            .map_err(|error| {
+                CoreError::invalid_state(format!(
+                    "failed to create forked direct PCS self-update: {error}"
+                ))
+            })?;
+        let commit = bundle.into_commit();
+        let commit_b64 = encode_mls_message(commit)?;
+        let commit_hash = crate::direct_pcs::commit_hash_from_b64(&commit_b64)?;
+        Ok(StagedDirectSelfUpdate {
+            commit_b64,
+            commit_hash,
+            base_epoch,
+        })
+    }
+
+    pub fn classify_direct_commit(
+        &self,
+        conversation_id: &str,
+        payload_b64: &str,
+    ) -> CoreResult<DirectCommitClass> {
+        if !self.groups.contains_key(conversation_id) {
+            return Ok(DirectCommitClass::PendingRetry);
+        }
+        let base_epoch = self.export_group_summary(conversation_id)?.epoch;
+        let mut fork = self.fork()?;
+        let provider = &fork.provider;
+        let state = fork.groups.get_mut(conversation_id).ok_or_else(|| {
+            CoreError::invalid_state("forked MLS adapter is missing the conversation")
+        })?;
+        let protocol_message = decode_mls_message(payload_b64)?
+            .try_into_protocol_message()
+            .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
+        // Welcome joiners never process the creating Add Commit; its epoch is
+        // already behind live. Same for any Commit we have already advanced past.
+        if protocol_message.epoch().as_u64() < base_epoch {
+            return Ok(DirectCommitClass::IgnoredReplay);
+        }
+        let processed = match state.group.process_message(provider, protocol_message) {
+            Ok(processed) => processed,
+            Err(error) if is_replay_or_duplicate_process_error(&error) => {
+                return Ok(DirectCommitClass::IgnoredReplay);
+            }
+            Err(_) => return Ok(DirectCommitClass::PendingRetry),
+        };
+        let sender_identity = extract_sender_identity(processed.credential())?;
+        match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                let has_add = staged_commit.add_proposals().next().is_some();
+                let has_remove = staged_commit.remove_proposals().next().is_some();
+                let has_path = staged_commit.update_path_leaf_node().is_some();
+                if has_add || has_remove || !has_path {
+                    return Ok(DirectCommitClass::MembershipOrOther);
+                }
+                Ok(DirectCommitClass::PcsSelfUpdate {
+                    commit_hash: crate::direct_pcs::commit_hash_from_b64(payload_b64)?,
+                    base_epoch,
+                    sender_identity,
+                })
+            }
+            ProcessedMessageContent::ApplicationMessage(_) => {
+                Ok(DirectCommitClass::MembershipOrOther)
+            }
+            _ => Ok(DirectCommitClass::NeedsRebuild),
+        }
+    }
+
+    pub fn apply_certified_direct_commit(
+        &mut self,
+        conversation_id: &str,
+        commit_b64: &str,
+    ) -> CoreResult<MlsStateSummary> {
+        {
+            let provider = &self.provider;
+            let state = self.groups.get_mut(conversation_id).ok_or_else(|| {
+                CoreError::invalid_input("conversation MLS state does not exist")
+            })?;
+            if state.group.pending_commit().is_some() {
+                state
+                    .group
+                    .merge_pending_commit(provider)
+                    .map_err(|error| {
+                        CoreError::invalid_state(format!(
+                            "failed to merge pending certified direct commit: {error}"
+                        ))
+                    })?;
+            } else {
+                let protocol_message = decode_mls_message(commit_b64)?
+                    .try_into_protocol_message()
+                    .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
+                let processed = state
+                    .group
+                    .process_message(provider, protocol_message)
+                    .map_err(|error| {
+                        CoreError::invalid_state(format!(
+                            "failed to process certified direct commit: {error}"
+                        ))
+                    })?;
+                match processed.into_content() {
+                    ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
+                        state
+                            .group
+                            .merge_staged_commit(provider, *staged_commit)
+                            .map_err(|_| {
+                                CoreError::invalid_state("failed to merge certified direct commit")
+                            })?;
+                    }
+                    _ => {
+                        return Err(CoreError::invalid_state(
+                            "certified direct commit did not produce a staged commit",
+                        ));
+                    }
+                }
+            }
+            state.member_device_ids = extract_member_device_ids(&state.group)?;
+            state.status = MlsStateStatus::Active;
+        }
+        self.export_group_summary(conversation_id)
+    }
+
+    pub fn member_device_ids(&self, conversation_id: &str) -> CoreResult<Vec<String>> {
+        Ok(self
+            .export_group_summary(conversation_id)?
+            .member_device_ids)
+    }
+
+    /// Bootstrap the PCS chain from shared, authenticated MLS state, never from
+    /// an unverified creating Commit (Welcome joiners cannot process that Commit).
+    pub fn direct_pcs_initial_hash(&self, conversation_id: &str) -> CoreResult<String> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let exported = zeroize::Zeroizing::new(
+            state
+                .group
+                .export_secret(
+                    self.provider.crypto(),
+                    "tapchat-direct-pcs-initial-v1",
+                    conversation_id.as_bytes(),
+                    32,
+                )
+                .map_err(|error| {
+                    CoreError::invalid_state(format!(
+                        "failed to derive direct PCS initial hash: {error}"
+                    ))
+                })?,
+        );
+        Ok(crate::direct_pcs::commit_hash_from_bytes(&exported))
     }
 
     pub fn ingest_message(
@@ -1173,6 +1420,7 @@ impl MlsAdapter {
         }
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
             .build();
         let welcome_bytes = BASE64
             .decode(payload_b64)
@@ -1210,6 +1458,14 @@ impl MlsAdapter {
         })
     }
 
+    pub fn protocol_message_epoch(payload_b64: &str) -> CoreResult<u64> {
+        Ok(decode_mls_message(payload_b64)?
+            .try_into_protocol_message()
+            .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?
+            .epoch()
+            .as_u64())
+    }
+
     fn ingest_protocol_message(
         &mut self,
         conversation_id: &str,
@@ -1226,6 +1482,12 @@ impl MlsAdapter {
         let protocol_message = message_in
             .try_into_protocol_message()
             .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
+        let message_epoch = protocol_message.epoch().as_u64();
+        let live_epoch = state.group.epoch().as_u64();
+        let from_previous_epoch = message_epoch < live_epoch;
+        if message_type == MessageType::MlsCommit && from_previous_epoch {
+            return Ok(IngestResult::IgnoredReplay);
+        }
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
             Err(error) if is_replay_or_duplicate_process_error(&error) => {
@@ -1252,6 +1514,7 @@ impl MlsAdapter {
                     DecryptedApplicationMessage {
                         plaintext: application.into_bytes(),
                         sender_identity,
+                        from_previous_epoch,
                     },
                 ))
             }
@@ -1452,8 +1715,8 @@ pub fn validate_published_key_package_lifetime(
 #[cfg(test)]
 mod tests {
     use super::{
-        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, IngestResult,
-        MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
+        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
+        IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
         KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
         KEY_PACKAGE_ROTATION_WINDOW_MS,
     };
@@ -1591,10 +1854,7 @@ mod tests {
                 &artifacts.commit_b64,
             )
             .expect("commit");
-        assert!(matches!(
-            commit_result,
-            IngestResult::AppliedCommit { .. } | IngestResult::PendingRetry
-        ));
+        assert_eq!(commit_result, IngestResult::IgnoredReplay);
 
         let outbound = alice_adapter
             .encrypt_application("conv:alice:bob", b"hello bob")
@@ -1872,6 +2132,342 @@ mod tests {
                 .conversation_id,
             "conv:broken"
         );
+    }
+
+    fn pair_adapters() -> (
+        MlsAdapter,
+        MlsAdapter,
+        crate::identity::LocalIdentityState,
+        crate::identity::LocalIdentityState,
+        String,
+    ) {
+        let alice_identity =
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
+        let (mut bob_adapter, bob_package) =
+            MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+        let artifacts = alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: bob_package.key_package_b64,
+                }],
+            )
+            .expect("create conversation");
+        bob_adapter
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &artifacts.welcomes[0].payload_b64,
+            )
+            .expect("welcome");
+        let _ = bob_adapter
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &artifacts.commit_b64,
+            )
+            .expect("genesis commit");
+        (
+            alice_adapter,
+            bob_adapter,
+            alice_identity,
+            bob_identity,
+            artifacts.commit_b64,
+        )
+    }
+
+    #[test]
+    fn direct_self_update_keeps_live_epoch_until_certified() {
+        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let live_epoch = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("summary")
+            .epoch;
+        let staged = alice
+            .stage_direct_self_update("conv:alice:bob")
+            .expect("stage");
+        assert_eq!(
+            alice
+                .export_group_summary("conv:alice:bob")
+                .expect("live")
+                .epoch,
+            live_epoch
+        );
+        assert_eq!(staged.base_epoch, live_epoch);
+        match alice
+            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("alice would not ingest own commit as pcs on unmerged live")
+        {
+            DirectCommitClass::PcsSelfUpdate { .. }
+            | DirectCommitClass::IgnoredReplay
+            | DirectCommitClass::PendingRetry => {}
+            other => panic!("unexpected class on committer live: {other:?}"),
+        }
+        match bob
+            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("bob classify")
+        {
+            DirectCommitClass::PcsSelfUpdate {
+                commit_hash,
+                base_epoch,
+                ..
+            } => {
+                assert_eq!(commit_hash, staged.commit_hash);
+                assert_eq!(base_epoch, live_epoch);
+                let applied = bob
+                    .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+                    .expect("bob apply");
+                assert_eq!(applied.epoch, live_epoch + 1);
+            }
+            other => panic!("expected PCS self-update, got {other:?}"),
+        }
+        let applied = alice
+            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("alice apply");
+        assert_eq!(applied.epoch, live_epoch + 1);
+
+        let outbound = alice
+            .encrypt_application("conv:alice:bob", b"after pcs")
+            .expect("encrypt");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("bob decrypt new epoch")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, b"after pcs");
+            }
+            other => panic!("unexpected ingest: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn previous_epoch_still_decrypts_after_certified_commit() {
+        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let stale = alice
+            .encrypt_application("conv:alice:bob", b"stale epoch")
+            .expect("stale");
+        let staged = alice
+            .stage_direct_self_update("conv:alice:bob")
+            .expect("stage");
+        match bob
+            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("classify")
+        {
+            DirectCommitClass::PcsSelfUpdate { .. } => {
+                bob.apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+                    .expect("apply");
+            }
+            other => panic!("expected PCS, got {other:?}"),
+        }
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &stale.payload_b64,
+            )
+            .expect("previous epoch decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, b"stale epoch");
+                assert!(application.from_previous_epoch);
+            }
+            other => panic!("expected previous-epoch application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn certified_commit_still_applies_after_live_application_messages() {
+        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let live_epoch = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("summary")
+            .epoch;
+        let staged = alice
+            .stage_direct_self_update("conv:alice:bob")
+            .expect("stage");
+        let stale = alice
+            .encrypt_application("conv:alice:bob", b"during handshake")
+            .expect("encrypt during handshake");
+        let applied = alice
+            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("alice apply after live sends");
+        assert_eq!(applied.epoch, live_epoch + 1);
+        match bob
+            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("bob classify")
+        {
+            DirectCommitClass::PcsSelfUpdate { .. } => {
+                bob.apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+                    .expect("bob apply");
+            }
+            other => panic!("expected PCS, got {other:?}"),
+        }
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &stale.payload_b64,
+            )
+            .expect("handshake-period decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, b"during handshake");
+                assert!(application.from_previous_epoch);
+            }
+            other => panic!("expected previous-epoch application, got {other:?}"),
+        }
+        let outbound = alice
+            .encrypt_application("conv:alice:bob", b"new epoch")
+            .expect("encrypt new epoch");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &outbound.payload_b64,
+            )
+            .expect("new epoch decrypt")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, b"new epoch");
+            }
+            other => panic!("unexpected ingest: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_merge_does_not_drop_other_conversations() {
+        let (mut alice, _, _, bob_identity, _) = pair_adapters();
+        let second_package =
+            MlsAdapter::generate_key_package(&bob_identity, test_now_ms()).expect("second package");
+        alice
+            .create_conversation(
+                "conv:alice:bob2",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: second_package.key_package_b64,
+                }],
+            )
+            .expect("second conversation");
+        let staged = alice
+            .stage_direct_self_update("conv:alice:bob")
+            .expect("stage");
+        alice
+            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("apply");
+        assert!(alice.has_conversation("conv:alice:bob"));
+        assert!(alice.has_conversation("conv:alice:bob2"));
+    }
+
+    #[test]
+    fn persisted_live_cannot_rebuild_consumed_next_epoch_keys() {
+        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let late_e = alice
+            .encrypt_application("conv:alice:bob", b"late e")
+            .expect("late e");
+        let staged = alice
+            .stage_direct_self_update("conv:alice:bob")
+            .expect("stage");
+        alice
+            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("alice apply");
+        bob.apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
+            .expect("bob apply");
+        let consumed = alice
+            .encrypt_application("conv:alice:bob", b"e+1")
+            .expect("e+1");
+        match bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &consumed.payload_b64,
+            )
+            .expect("consume e+1")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, b"e+1");
+                assert!(!application.from_previous_epoch);
+            }
+            other => panic!("expected e+1 application, got {other:?}"),
+        }
+        let serialized = bob
+            .export_persisted_group_state("conv:alice:bob")
+            .expect("persist");
+        let summary = bob
+            .export_group_summary("conv:alice:bob")
+            .expect("summary");
+        let restored = MlsAdapter::restore_from_persisted_states(&[(
+            "conv:alice:bob".into(),
+            summary,
+            Some(serialized),
+        )])
+        .expect("restore")
+        .adapter
+        .expect("adapter");
+        let mut restored = restored;
+        match restored
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &staged.commit_b64,
+            )
+            .expect("replay C")
+        {
+            IngestResult::IgnoredReplay | IngestResult::PendingRetry => {}
+            IngestResult::AppliedCommit { .. } => {
+                panic!("persisted live must not re-merge certified commit C")
+            }
+            other => panic!("unexpected C ingest: {other:?}"),
+        }
+        match restored
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &consumed.payload_b64,
+            )
+            .expect("replay consumed e+1")
+        {
+            IngestResult::IgnoredReplay => {}
+            IngestResult::AppliedApplication(_) => {
+                panic!("consumed e+1 generation must not decrypt from persisted live + C")
+            }
+            other => panic!("unexpected consumed ingest: {other:?}"),
+        }
+        match restored
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsApplication,
+                &late_e.payload_b64,
+            )
+            .expect("late e")
+        {
+            IngestResult::AppliedApplication(application) => {
+                assert_eq!(application.plaintext, b"late e");
+                assert!(application.from_previous_epoch);
+            }
+            other => panic!("expected late-e application, got {other:?}"),
+        }
     }
 }
 

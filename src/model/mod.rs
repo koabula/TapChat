@@ -301,6 +301,7 @@ pub struct ProtectedAppMessage {
     pub audience_device_ids: Vec<String>,
     pub payload_kind: ProtectedPayloadKind,
     pub body: String,
+    pub last_certified_commit_hash: String,
 }
 
 impl ProtectedAppMessage {
@@ -312,6 +313,7 @@ impl ProtectedAppMessage {
         recipient_user_id: String,
         mut audience_device_ids: Vec<String>,
         body: String,
+        last_certified_commit_hash: String,
     ) -> CoreResult<Self> {
         audience_device_ids.sort();
         let message = Self {
@@ -324,6 +326,7 @@ impl ProtectedAppMessage {
             audience_device_ids,
             payload_kind: ProtectedPayloadKind::Text,
             body,
+            last_certified_commit_hash,
         };
         message.validate()?;
         Ok(message)
@@ -376,7 +379,11 @@ impl Validate for ProtectedAppMessage {
         match self.payload_kind {
             ProtectedPayloadKind::Text => {}
         }
-        validate_required("body", &self.body)
+        validate_required("body", &self.body)?;
+        validate_required(
+            "last_certified_commit_hash",
+            &self.last_certified_commit_hash,
+        )
     }
 }
 
@@ -598,6 +605,7 @@ pub enum MessageType {
     ControlConversationNeedsRebuild,
     ControlContactRemoved,
     ControlContactAccepted,
+    ControlDirectCommitAccept,
     ControlGroupWelcomePickup,
     ControlGroupStateEvent,
 }
@@ -1985,6 +1993,7 @@ mod tests {
             "user:bob".into(),
             vec!["device:bob:laptop".into(), "device:bob:phone".into()],
             "hello bob".into(),
+            "sha256:genesis".into(),
         )
         .expect("sample protected app message")
     }
@@ -2009,6 +2018,7 @@ mod tests {
             "audience_device_ids": ["device:bob:laptop", "device:bob:phone"],
             "payload_kind": "text",
             "body": "hello bob",
+            "last_certified_commit_hash": "sha256:genesis",
             "extra": true
         });
         assert!(ProtectedAppMessage::from_json_slice(unknown.to_string().as_bytes()).is_err());

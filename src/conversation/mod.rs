@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::direct_pcs::DirectPcsState;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
     Conversation, ConversationKind, ConversationMember, ConversationState, DeviceStatusKind,
@@ -79,6 +80,8 @@ pub struct LocalConversationState {
     pub recovery_status: RecoveryStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_metadata: Option<ConversationArchiveMetadata>,
+    #[serde(default)]
+    pub pcs: DirectPcsState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +175,7 @@ impl ConversationManager {
             last_known_peer_active_devices: peer_device_ids.iter().cloned().collect(),
             recovery_status: RecoveryStatus::Healthy,
             archive_metadata: None,
+            pcs: DirectPcsState::default(),
         })
     }
 

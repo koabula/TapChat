@@ -164,6 +164,7 @@ pub async fn list_conversations(
             recovery: recovery_by_conversation
                 .get(&persisted.conversation_id)
                 .cloned(),
+            pcs_degraded: persisted.state.pcs.degraded.then_some(true),
         })
         .collect();
 

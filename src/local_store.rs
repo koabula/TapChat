@@ -2810,6 +2810,7 @@ mod tests {
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             },
         };
         store
@@ -2940,6 +2941,7 @@ mod tests {
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             },
         };
         let snapshot = CorePersistenceSnapshot {
@@ -3158,6 +3160,7 @@ mod tests {
             last_known_peer_active_devices: [remote_device_id.to_string()].into_iter().collect(),
             recovery_status: crate::conversation::RecoveryStatus::Healthy,
             archive_metadata: None,
+            pcs: Default::default(),
         };
         store
             .save_snapshot(&CorePersistenceSnapshot {

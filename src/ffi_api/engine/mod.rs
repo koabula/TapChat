@@ -27,13 +27,17 @@ use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
     LocalConversationState, ReconcileMembershipInput, RecoveryStatus, StoredMessage,
 };
+use crate::direct_pcs::{
+    commit_hash_from_b64, designated_committer, sign_certificate, DirectCommitCertificate,
+    DirectPcsHandshake, DirectPcsRole,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
 use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
-    CreateConversationArtifacts, DecryptedApplicationMessage, IngestResult, MlsAdapter,
-    PeerDeviceKeyPackage, RemoveMembersArtifacts,
+    CreateConversationArtifacts, DecryptedApplicationMessage, DirectCommitClass, IngestResult,
+    MlsAdapter, PeerDeviceKeyPackage, RemoveMembersArtifacts,
 };
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
@@ -2413,7 +2417,7 @@ fn current_timestamp_hint(outbox_len: usize) -> u64 {
     outbox_len as u64 + 1
 }
 
-fn advance_contiguous_ack(
+pub(super) fn advance_contiguous_ack(
     contiguous_ack: &mut u64,
     deferred_ackable_seqs: &mut BTreeSet<u64>,
     seq: u64,
@@ -3328,6 +3332,7 @@ mod protected_application_message_tests {
             "user:bob".into(),
             audience,
             "hello protected".into(),
+            "sha256:genesis".into(),
         )
         .expect("protected message")
         .to_json_bytes()
@@ -3342,6 +3347,7 @@ mod protected_application_message_tests {
         DecryptedApplicationMessage {
             plaintext,
             sender_identity: sender_identity(user_id, device_id),
+            from_previous_epoch: false,
         }
     }
 
@@ -3454,6 +3460,7 @@ mod protected_application_message_tests {
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             },
         );
 

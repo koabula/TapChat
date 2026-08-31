@@ -443,23 +443,28 @@ impl CoreEngine {
             ],
             view_model: None,
         };
-        if retry_reset_ops.is_empty() {
+        let outbox_grew = self.retransmit_pending_direct_pcs()?;
+        if retry_reset_ops.is_empty() && !outbox_grew {
             return Ok(sync_output);
         }
-        let retry_output = merge_outputs(
-            CoreOutput {
-                state_update: CoreStateUpdate {
-                    checkpoints_changed: true,
-                    messages_changed: true,
-                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
-                    ..CoreStateUpdate::default()
+        let extra = if retry_reset_ops.is_empty() {
+            self.flush_outbox()?
+        } else {
+            merge_outputs(
+                CoreOutput {
+                    state_update: CoreStateUpdate {
+                        checkpoints_changed: true,
+                        messages_changed: true,
+                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist_effect(&self.state, retry_reset_ops)],
+                    view_model: None,
                 },
-                effects: vec![persist_effect(&self.state, retry_reset_ops)],
-                view_model: None,
-            },
-            self.flush_pending_transport()?,
-        );
-        Ok(merge_outputs(retry_output, sync_output))
+                self.flush_pending_transport()?,
+            )
+        };
+        Ok(merge_outputs(extra, sync_output))
     }
 
     pub(super) fn next_request_id(&mut self, prefix: &str) -> String {
@@ -2393,14 +2398,21 @@ impl CoreEngine {
                 envelopes.push(envelope);
             }
             self.enqueue_envelopes_with_plaintext(
-                peer_user_id,
+                peer_user_id.clone(),
                 envelopes,
                 manifest_json,
                 Some(message_id),
             );
+            self.observe_direct_application(&task.conversation_id)?;
+            self.enqueue_direct_pcs_protocol(&task.conversation_id, &peer_user_id)?;
+            persist_ops.extend(self.direct_send_persist_ops(&task.conversation_id));
             Ok(merge_outputs(
                 CoreOutput {
-                    state_update: CoreStateUpdate::default(),
+                    state_update: CoreStateUpdate {
+                        conversations_changed: true,
+                        messages_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
                     effects: std::iter::once(persist_effect(&self.state, persist_ops))
                         .chain(local_cache_effects)
                         .collect(),
@@ -2949,6 +2961,20 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
+            if record.envelope.message_type == MessageType::ControlDirectCommitAccept {
+                output = merge_outputs(output, self.handle_direct_commit_accept(&record)?);
+                {
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.clone())
+                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                }
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+                processed_records.push(record);
+                continue;
+            }
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
                 log::info!(
                     "handle_inbox_records: acking and ignoring {:?} for closed relationship conversation_id={} sender_user_id={} message_id={}",
@@ -3021,7 +3047,7 @@ impl CoreEngine {
                                 } => {
                                     if self.store_accepted_application_message(
                                         &record,
-                                        plaintext,
+                                        plaintext.clone(),
                                         app_message_id,
                                         ciphertext_sha256.clone(),
                                     )? {
@@ -3049,6 +3075,11 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
+                                    self.observe_direct_application(&conversation_id)?;
+                                    self.enqueue_direct_pcs_protocol(
+                                        &conversation_id,
+                                        &record.envelope.sender_user_id,
+                                    )?;
                                 }
                                 ApplicationPlaintextDecision::DuplicateAppMessage {
                                     app_message_id,
@@ -3080,16 +3111,13 @@ impl CoreEngine {
                                     .mls_summaries
                                     .insert(conversation_id.clone(), summary);
                             }
-                            self.ack_pending_records_for_conversation_up_to(
+                            self.finish_mls_apply_pending(
                                 &device_id,
                                 &conversation_id,
-                                record.seq,
-                                &mut contiguous_ack,
-                                &mut deferred_ackable_seqs,
+                                &mut pending_recovery_conversations,
                             );
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
-                            self.clear_recovery_context_as_healthy(&conversation_id);
                             ackable = true;
                         }
                         IngestResult::AppliedCommit { epoch } => {
@@ -3112,19 +3140,17 @@ impl CoreEngine {
                                     .mls_summaries
                                     .insert(conversation_id.clone(), summary);
                             }
-                            self.ack_pending_records_for_conversation_up_to(
+                            self.finish_mls_apply_pending(
                                 &device_id,
                                 &conversation_id,
-                                record.seq,
-                                &mut contiguous_ack,
-                                &mut deferred_ackable_seqs,
+                                &mut pending_recovery_conversations,
                             );
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
-                            self.clear_recovery_context_as_healthy(&conversation_id);
                             ackable = true;
                         }
                         IngestResult::AppliedWelcome { epoch } => {
+                            self.initialize_direct_pcs_from_mls(&conversation_id)?;
                             log::info!(
                                 "handle_inbox_records: unexpected AppliedWelcome for application message {} in conversation {}, epoch={}",
                                 record.message_id,
@@ -3144,16 +3170,20 @@ impl CoreEngine {
                                     .mls_summaries
                                     .insert(conversation_id.clone(), summary);
                             }
-                            self.ack_pending_records_for_conversation_up_to(
+                            self.ack_pending_commits_behind_epoch(
                                 &device_id,
                                 &conversation_id,
-                                record.seq,
+                                epoch,
                                 &mut contiguous_ack,
                                 &mut deferred_ackable_seqs,
                             );
+                            self.finish_mls_apply_pending(
+                                &device_id,
+                                &conversation_id,
+                                &mut pending_recovery_conversations,
+                            );
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
-                            self.clear_recovery_context_as_healthy(&conversation_id);
                             output
                                 .effects
                                 .extend(self.rotate_local_key_package_after_welcome()?);
@@ -3201,6 +3231,7 @@ impl CoreEngine {
                                 );
                                 touched_recovery_context_ids.insert(conversation_id.clone());
                                 pending_recovery_conversations.insert(conversation_id.clone());
+                                ackable = false;
                             }
                         }
                         IngestResult::PendingRetry => {
@@ -3225,6 +3256,7 @@ impl CoreEngine {
                             );
                             touched_recovery_context_ids.insert(conversation_id.clone());
                             pending_recovery_conversations.insert(conversation_id.clone());
+                            ackable = false;
                         }
                         IngestResult::NeedsRebuild => {
                             log::warn!(
@@ -3284,239 +3316,297 @@ impl CoreEngine {
                 });
 
             let mut ackable = apply_effect.duplicate_message;
-            if !apply_effect.duplicate_message {
+            if !apply_effect.duplicate_message
+                || matches!(
+                    record.envelope.message_type,
+                    MessageType::MlsCommit | MessageType::MlsWelcome
+                )
+            {
                 match record.envelope.message_type {
                     MessageType::MlsApplication
                     | MessageType::MlsCommit
                     | MessageType::MlsWelcome => {
-                        match self
-                            .state
-                            .mls_adapter
-                            .as_mut()
-                            .ok_or_else(|| {
-                                CoreError::invalid_state("mls adapter is not initialized")
-                            })?
-                            .ingest_message(
+                        let mut handled_direct_pcs = false;
+                        if record.envelope.message_type == MessageType::MlsCommit {
+                            if let Some(extra) =
+                                self.handle_direct_mls_commit(&conversation_id, &record)?
+                            {
+                                output = merge_outputs(output, extra);
+                                self.finish_mls_apply_pending(
+                                    &device_id,
+                                    &conversation_id,
+                                    &mut pending_recovery_conversations,
+                                );
+                                touched_mls_conversation_ids.insert(conversation_id.clone());
+                                touched_recovery_context_ids.insert(conversation_id.clone());
+                                ackable = true;
+                                handled_direct_pcs = true;
+                            }
+                        }
+                        if handled_direct_pcs {
+                            // Direct PCS handshake consumed this commit.
+                        } else if record.envelope.message_type == MessageType::MlsCommit
+                            && self
+                                .state
+                                .conversations
+                                .get(&conversation_id)
+                                .is_some_and(|state| state.pcs.handshake.is_some())
+                        {
+                            // One epoch-changing commit at a time: keep membership
+                            // commits pending until the staged PCS handshake applies.
+                            let reason = self.recovery_reason_for_record(&conversation_id);
+                            {
+                                let sync_state = self
+                                    .state
+                                    .sync_states
+                                    .entry(device_id.clone())
+                                    .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                                SyncEngine::store_pending_record(sync_state, &record);
+                            }
+                            self.mark_recovery_needed(&conversation_id, reason);
+                            self.transition_recovery_phase(
                                 &conversation_id,
-                                &record.envelope.sender_device_id,
-                                record.envelope.message_type,
-                                record
-                                    .envelope
-                                    .inline_ciphertext
-                                    .as_deref()
-                                    .unwrap_or_default(),
-                            )? {
-                            IngestResult::AppliedApplication(application) => {
-                                log::info!(
+                                RecoveryPhase::WaitingForPendingReplay,
+                            );
+                            touched_recovery_context_ids.insert(conversation_id.clone());
+                            pending_recovery_conversations.insert(conversation_id.clone());
+                            ackable = false;
+                        } else {
+                            match self
+                                .state
+                                .mls_adapter
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    CoreError::invalid_state("mls adapter is not initialized")
+                                })?
+                                .ingest_message(
+                                    &conversation_id,
+                                    &record.envelope.sender_device_id,
+                                    record.envelope.message_type,
+                                    record
+                                        .envelope
+                                        .inline_ciphertext
+                                        .as_deref()
+                                        .unwrap_or_default(),
+                                )? {
+                                IngestResult::AppliedApplication(application) => {
+                                    log::info!(
                                     "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
                                     redact_id("msg", &record.message_id),
                                     application.plaintext.len()
                                 );
-                                if let Some(state) =
-                                    self.state.conversations.get_mut(&conversation_id)
-                                {
-                                    if let Some(message) = state
-                                        .messages
-                                        .iter_mut()
-                                        .find(|message| message.message_id == record.message_id)
+                                    if let Some(state) =
+                                        self.state.conversations.get_mut(&conversation_id)
                                     {
-                                        message.plaintext =
-                                            String::from_utf8(application.plaintext).ok();
-                                        log::info!(
+                                        if let Some(message) = state
+                                            .messages
+                                            .iter_mut()
+                                            .find(|message| message.message_id == record.message_id)
+                                        {
+                                            message.plaintext =
+                                                String::from_utf8(application.plaintext).ok();
+                                            log::info!(
                                             "handle_inbox_records: stored plaintext for message {}",
                                             redact_id("msg", &record.message_id)
                                         );
-                                    } else {
-                                        log::warn!(
+                                        } else {
+                                            log::warn!(
                                             "handle_inbox_records: Could not find message {} in conversation {} to set plaintext",
                                             redact_id("msg", &record.message_id),
                                             redact_id("conversation", &conversation_id)
                                         );
-                                    }
-                                } else {
-                                    log::warn!(
+                                        }
+                                    } else {
+                                        log::warn!(
                                         "handle_inbox_records: Conversation {} not found for message {}",
                                         redact_id("conversation", &conversation_id),
                                         redact_id("msg", &record.message_id)
                                     );
-                                }
-                                if let Ok(summary) = self
-                                    .state
-                                    .mls_adapter
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        CoreError::invalid_state("mls adapter is not initialized")
-                                    })?
-                                    .export_group_summary(&conversation_id)
-                                {
-                                    self.state
-                                        .mls_summaries
-                                        .insert(conversation_id.clone(), summary);
-                                }
-                                self.ack_pending_records_for_conversation_up_to(
-                                    &device_id,
-                                    &conversation_id,
-                                    record.seq,
-                                    &mut contiguous_ack,
-                                    &mut deferred_ackable_seqs,
-                                );
-                                touched_mls_conversation_ids.insert(conversation_id.clone());
-                                touched_recovery_context_ids.insert(conversation_id.clone());
-                                self.clear_recovery_context_as_healthy(&conversation_id);
-                                if self.direct_relationship_open_for_record(
-                                    &record.envelope.sender_user_id,
-                                    &conversation_id,
-                                ) {
-                                    output = merge_outputs(
-                                        output,
-                                        self.promote_pending_outbound_contact(
-                                            &record.envelope.sender_user_id,
-                                            "verified_inbound_mls_application",
-                                        )?,
+                                    }
+                                    if let Ok(summary) = self
+                                        .state
+                                        .mls_adapter
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            CoreError::invalid_state(
+                                                "mls adapter is not initialized",
+                                            )
+                                        })?
+                                        .export_group_summary(&conversation_id)
+                                    {
+                                        self.state
+                                            .mls_summaries
+                                            .insert(conversation_id.clone(), summary);
+                                    }
+                                    self.finish_mls_apply_pending(
+                                        &device_id,
+                                        &conversation_id,
+                                        &mut pending_recovery_conversations,
                                     );
+                                    touched_mls_conversation_ids.insert(conversation_id.clone());
+                                    touched_recovery_context_ids.insert(conversation_id.clone());
+                                    if self.direct_relationship_open_for_record(
+                                        &record.envelope.sender_user_id,
+                                        &conversation_id,
+                                    ) {
+                                        output = merge_outputs(
+                                            output,
+                                            self.promote_pending_outbound_contact(
+                                                &record.envelope.sender_user_id,
+                                                "verified_inbound_mls_application",
+                                            )?,
+                                        );
+                                    }
+                                    ackable = true;
                                 }
-                                ackable = true;
-                            }
-                            IngestResult::AppliedCommit { epoch } => {
-                                log::info!(
+                                IngestResult::AppliedCommit { epoch } => {
+                                    log::info!(
                                     "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
                                     record.message_id,
                                     conversation_id,
                                     epoch
                                 );
-                                if let Ok(summary) = self
-                                    .state
-                                    .mls_adapter
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        CoreError::invalid_state("mls adapter is not initialized")
-                                    })?
-                                    .export_group_summary(&conversation_id)
-                                {
-                                    self.state
-                                        .mls_summaries
-                                        .insert(conversation_id.clone(), summary);
-                                }
-                                self.ack_pending_records_for_conversation_up_to(
-                                    &device_id,
-                                    &conversation_id,
-                                    record.seq,
-                                    &mut contiguous_ack,
-                                    &mut deferred_ackable_seqs,
-                                );
-                                touched_mls_conversation_ids.insert(conversation_id.clone());
-                                touched_recovery_context_ids.insert(conversation_id.clone());
-                                self.clear_recovery_context_as_healthy(&conversation_id);
-                                if self.direct_relationship_open_for_record(
-                                    &record.envelope.sender_user_id,
-                                    &conversation_id,
-                                ) {
-                                    output = merge_outputs(
-                                        output,
-                                        self.promote_pending_outbound_contact(
-                                            &record.envelope.sender_user_id,
-                                            "verified_inbound_mls_commit",
-                                        )?,
+                                    if let Ok(summary) = self
+                                        .state
+                                        .mls_adapter
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            CoreError::invalid_state(
+                                                "mls adapter is not initialized",
+                                            )
+                                        })?
+                                        .export_group_summary(&conversation_id)
+                                    {
+                                        self.state
+                                            .mls_summaries
+                                            .insert(conversation_id.clone(), summary);
+                                    }
+                                    self.finish_mls_apply_pending(
+                                        &device_id,
+                                        &conversation_id,
+                                        &mut pending_recovery_conversations,
                                     );
+                                    touched_mls_conversation_ids.insert(conversation_id.clone());
+                                    touched_recovery_context_ids.insert(conversation_id.clone());
+                                    if self.direct_relationship_open_for_record(
+                                        &record.envelope.sender_user_id,
+                                        &conversation_id,
+                                    ) {
+                                        output = merge_outputs(
+                                            output,
+                                            self.promote_pending_outbound_contact(
+                                                &record.envelope.sender_user_id,
+                                                "verified_inbound_mls_commit",
+                                            )?,
+                                        );
+                                    }
+                                    ackable = true;
                                 }
-                                ackable = true;
-                            }
-                            IngestResult::AppliedWelcome { epoch } => {
-                                log::info!(
+                                IngestResult::AppliedWelcome { epoch } => {
+                                    self.initialize_direct_pcs_from_mls(&conversation_id)?;
+                                    log::info!(
                                     "handle_inbox_records: AppliedWelcome for message {} in conversation {}, epoch={}",
                                     record.message_id,
                                     conversation_id,
                                     epoch
                                 );
-                                if let Ok(summary) = self
-                                    .state
-                                    .mls_adapter
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        CoreError::invalid_state("mls adapter is not initialized")
-                                    })?
-                                    .export_group_summary(&conversation_id)
-                                {
-                                    self.state
-                                        .mls_summaries
-                                        .insert(conversation_id.clone(), summary);
-                                }
-                                self.ack_pending_records_for_conversation_up_to(
-                                    &device_id,
-                                    &conversation_id,
-                                    record.seq,
-                                    &mut contiguous_ack,
-                                    &mut deferred_ackable_seqs,
-                                );
-                                touched_mls_conversation_ids.insert(conversation_id.clone());
-                                touched_recovery_context_ids.insert(conversation_id.clone());
-                                self.clear_recovery_context_as_healthy(&conversation_id);
-                                output
-                                    .effects
-                                    .extend(self.rotate_local_key_package_after_welcome()?);
-                                output.state_update.contacts_changed = true;
-                                if self.direct_relationship_open_for_record(
-                                    &record.envelope.sender_user_id,
-                                    &conversation_id,
-                                ) {
-                                    output = merge_outputs(
-                                        output,
-                                        self.promote_pending_outbound_contact(
-                                            &record.envelope.sender_user_id,
-                                            "verified_inbound_mls_welcome",
-                                        )?,
+                                    if let Ok(summary) = self
+                                        .state
+                                        .mls_adapter
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            CoreError::invalid_state(
+                                                "mls adapter is not initialized",
+                                            )
+                                        })?
+                                        .export_group_summary(&conversation_id)
+                                    {
+                                        self.state
+                                            .mls_summaries
+                                            .insert(conversation_id.clone(), summary);
+                                    }
+                                    self.ack_pending_commits_behind_epoch(
+                                        &device_id,
+                                        &conversation_id,
+                                        epoch,
+                                        &mut contiguous_ack,
+                                        &mut deferred_ackable_seqs,
                                     );
+                                    self.finish_mls_apply_pending(
+                                        &device_id,
+                                        &conversation_id,
+                                        &mut pending_recovery_conversations,
+                                    );
+                                    touched_mls_conversation_ids.insert(conversation_id.clone());
+                                    touched_recovery_context_ids.insert(conversation_id.clone());
+                                    output
+                                        .effects
+                                        .extend(self.rotate_local_key_package_after_welcome()?);
+                                    output.state_update.contacts_changed = true;
+                                    if self.direct_relationship_open_for_record(
+                                        &record.envelope.sender_user_id,
+                                        &conversation_id,
+                                    ) {
+                                        output = merge_outputs(
+                                            output,
+                                            self.promote_pending_outbound_contact(
+                                                &record.envelope.sender_user_id,
+                                                "verified_inbound_mls_welcome",
+                                            )?,
+                                        );
+                                    }
+                                    ackable = true;
                                 }
-                                ackable = true;
-                            }
-                            IngestResult::IgnoredReplay => {
-                                log::warn!(
+                                IngestResult::IgnoredReplay => {
+                                    log::warn!(
                                     "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
                                     redact_id("msg", &record.message_id),
                                     redact_id("conversation", &conversation_id)
                                 );
-                                ackable = true;
-                            }
-                            IngestResult::PendingRetry => {
-                                log::warn!(
+                                    ackable = true;
+                                }
+                                IngestResult::PendingRetry => {
+                                    log::warn!(
                                     "handle_inbox_records: PendingRetry for message {} in conversation {}",
                                     redact_id("msg", &record.message_id),
                                     redact_id("conversation", &conversation_id)
                                 );
-                                let reason = self.recovery_reason_for_record(&conversation_id);
-                                {
-                                    let sync_state = self
-                                        .state
-                                        .sync_states
-                                        .entry(device_id.clone())
-                                        .or_insert_with(|| {
-                                            SyncEngine::new_device_state(&device_id)
-                                        });
-                                    SyncEngine::store_pending_record(sync_state, &record);
+                                    let reason = self.recovery_reason_for_record(&conversation_id);
+                                    {
+                                        let sync_state = self
+                                            .state
+                                            .sync_states
+                                            .entry(device_id.clone())
+                                            .or_insert_with(|| {
+                                                SyncEngine::new_device_state(&device_id)
+                                            });
+                                        SyncEngine::store_pending_record(sync_state, &record);
+                                    }
+                                    self.mark_recovery_needed(&conversation_id, reason);
+                                    self.transition_recovery_phase(
+                                        &conversation_id,
+                                        RecoveryPhase::WaitingForPendingReplay,
+                                    );
+                                    touched_recovery_context_ids.insert(conversation_id.clone());
+                                    pending_recovery_conversations.insert(conversation_id.clone());
+                                    ackable = false;
                                 }
-                                self.mark_recovery_needed(&conversation_id, reason);
-                                self.transition_recovery_phase(
-                                    &conversation_id,
-                                    RecoveryPhase::WaitingForPendingReplay,
-                                );
-                                touched_recovery_context_ids.insert(conversation_id.clone());
-                                pending_recovery_conversations.insert(conversation_id.clone());
-                            }
-                            IngestResult::NeedsRebuild => {
-                                log::warn!(
+                                IngestResult::NeedsRebuild => {
+                                    log::warn!(
                                     "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
                                     redact_id("msg", &record.message_id),
                                     redact_id("conversation", &conversation_id)
                                 );
-                                output = merge_outputs(
-                                    output,
-                                    self.escalate_conversation_to_rebuild(
-                                        &conversation_id,
-                                        RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                                        "MLS marked conversation unrecoverable",
-                                    )?,
-                                );
-                                touched_recovery_context_ids.insert(conversation_id.clone());
+                                    output = merge_outputs(
+                                        output,
+                                        self.escalate_conversation_to_rebuild(
+                                            &conversation_id,
+                                            RecoveryEscalationReason::MlsMarkedUnrecoverable,
+                                            "MLS marked conversation unrecoverable",
+                                        )?,
+                                    );
+                                    touched_recovery_context_ids.insert(conversation_id.clone());
+                                }
                             }
                         }
                     }
@@ -3665,6 +3755,9 @@ impl CoreEngine {
             )?,
         );
         for conversation_id in pending_recovery_conversations_for_persist {
+            if !self.has_pending_records_for_conversation(&device_id, &conversation_id) {
+                self.clear_recovery_context_as_healthy(&conversation_id);
+            }
             touched_conversation_ids.insert(conversation_id.clone());
             touched_recovery_context_ids.insert(conversation_id);
         }
@@ -3710,6 +3803,7 @@ impl CoreEngine {
                 output,
             );
         }
+        refresh_persist_effect_snapshots(&mut output, &self.state);
         self.merge_with_transport_flush(output)
     }
 
@@ -3938,7 +4032,9 @@ impl CoreEngine {
         let protocol_only_contact_control = envelope.as_ref().is_some_and(|env| {
             matches!(
                 env.message_type,
-                MessageType::ControlContactRemoved | MessageType::ControlContactAccepted
+                MessageType::ControlContactRemoved
+                    | MessageType::ControlContactAccepted
+                    | MessageType::ControlDirectCommitAccept
             )
         });
         let current_relationship_removed = self

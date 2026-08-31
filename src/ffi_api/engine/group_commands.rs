@@ -210,6 +210,7 @@ impl CoreEngine {
                 last_known_peer_active_devices: BTreeSet::new(),
                 recovery_status: RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             },
         );
 

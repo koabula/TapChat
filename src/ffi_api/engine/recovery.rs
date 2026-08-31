@@ -1,4 +1,7 @@
 use super::*;
+use crate::mls_adapter::MlsAdapter;
+use crate::model::MessageType;
+use crate::sync_engine::SyncEngine;
 
 impl CoreEngine {
     pub(super) fn reconcile_conversation_membership(
@@ -28,6 +31,58 @@ impl CoreEngine {
                 },
             )?
         };
+        let needs_rebootstrap = {
+            let conversation_state = self
+                .state
+                .conversations
+                .get(&conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+            conversation_state.conversation.state == ConversationState::NeedsRebuild
+                || conversation_state.recovery_status == RecoveryStatus::NeedsRebuild
+                || self
+                    .state
+                    .mls_summaries
+                    .get(&conversation_id)
+                    .map(|summary| summary.status == MlsStateStatus::NeedsRebuild)
+                    .unwrap_or(false)
+        };
+        let handshake_active = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .is_some_and(|state| state.pcs.handshake.is_some());
+        if handshake_active && (reconcile.changed || needs_rebootstrap) {
+            self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
+            let recovery_context_op = if self.state.recovery_contexts.contains_key(&conversation_id)
+            {
+                PersistOp::SaveRecoveryContext {
+                    conversation_id: conversation_id.clone(),
+                }
+            } else {
+                PersistOp::DeleteRecoveryContext {
+                    conversation_id: conversation_id.clone(),
+                }
+            };
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveConversation {
+                            conversation_id: conversation_id.clone(),
+                        },
+                        recovery_context_op,
+                    ],
+                )],
+                view_model: Some(CoreViewModel {
+                    conversations: vec![self.conversation_summary(&conversation_id)?],
+                    ..CoreViewModel::default()
+                }),
+            });
+        }
         {
             let conversation_state = self
                 .state
@@ -154,6 +209,7 @@ impl CoreEngine {
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
                 .create_conversation(&conversation_id, &key_packages)?;
+            self.initialize_direct_pcs_from_mls(&conversation_id)?;
             let summary = self
                 .state
                 .mls_adapter
@@ -218,6 +274,7 @@ impl CoreEngine {
             &peer_user_id,
             &peer_active_device_ids,
         )?;
+        let output = CoreOutput::default();
         if !reconcile.added_devices.is_empty() {
             let key_packages = self.peer_key_packages(&peer_user_id, &reconcile.added_devices)?;
             let artifacts = self
@@ -248,38 +305,41 @@ impl CoreEngine {
         }
         self.enqueue_envelopes(peer_user_id, generated.clone());
         self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
-        self.merge_with_transport_flush(CoreOutput {
-            state_update: CoreStateUpdate {
-                conversations_changed: true,
-                messages_changed: true,
-                contacts_changed: true,
-                system_statuses_changed: vec![SystemStatus::SyncInProgress],
-                ..CoreStateUpdate::default()
+        self.merge_with_transport_flush(merge_outputs(
+            output,
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    messages_changed: true,
+                    contacts_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![
+                        PersistOp::SaveConversation {
+                            conversation_id: conversation_id.clone(),
+                        },
+                        PersistOp::SaveMlsState {
+                            conversation_id: conversation_id.clone(),
+                        },
+                    ],
+                )],
+                view_model: Some(CoreViewModel {
+                    conversations: vec![self.conversation_summary(&conversation_id)?],
+                    messages: generated
+                        .iter()
+                        .map(|envelope| MessageSummary {
+                            conversation_id: envelope.conversation_id.clone(),
+                            message_id: envelope.message_id.clone(),
+                            message_type: envelope.message_type,
+                        })
+                        .collect(),
+                    ..CoreViewModel::default()
+                }),
             },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![
-                    PersistOp::SaveConversation {
-                        conversation_id: conversation_id.clone(),
-                    },
-                    PersistOp::SaveMlsState {
-                        conversation_id: conversation_id.clone(),
-                    },
-                ],
-            )],
-            view_model: Some(CoreViewModel {
-                conversations: vec![self.conversation_summary(&conversation_id)?],
-                messages: generated
-                    .iter()
-                    .map(|envelope| MessageSummary {
-                        conversation_id: envelope.conversation_id.clone(),
-                        message_id: envelope.message_id.clone(),
-                        message_type: envelope.message_type,
-                    })
-                    .collect(),
-                ..CoreViewModel::default()
-            }),
-        })
+        ))
     }
 
     pub(super) fn refresh_identity_state(&mut self, user_id: String) -> CoreResult<CoreOutput> {
@@ -392,6 +452,7 @@ impl CoreEngine {
                     last_message_type,
                     message_count: None,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
+                    pcs_degraded: None,
                 }],
                 ..CoreViewModel::default()
             }),
@@ -663,6 +724,7 @@ impl CoreEngine {
                     .clone()]),
                 recovery_status: RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             });
     }
 
@@ -683,36 +745,59 @@ impl CoreEngine {
             .unwrap_or(false)
     }
 
-    pub(super) fn ack_pending_records_for_conversation_up_to(
+    pub(super) fn finish_mls_apply_pending(
         &mut self,
         device_id: &str,
         conversation_id: &str,
-        up_to_seq: u64,
+        pending_recovery_conversations: &mut BTreeSet<String>,
+    ) {
+        if self.has_pending_records_for_conversation(device_id, conversation_id) {
+            pending_recovery_conversations.insert(conversation_id.to_string());
+            return;
+        }
+        self.clear_recovery_context_as_healthy(conversation_id);
+    }
+
+    pub(super) fn ack_pending_commits_behind_epoch(
+        &mut self,
+        device_id: &str,
+        conversation_id: &str,
+        live_epoch: u64,
         contiguous_ack: &mut u64,
         deferred_ackable_seqs: &mut BTreeSet<u64>,
     ) {
-        let Some(sync_state) = self.state.sync_states.get_mut(device_id) else {
+        let Some(sync_state) = self.state.sync_states.get(device_id) else {
             return;
         };
-        let pending_seqs: Vec<u64> = sync_state
+        let obsolete: Vec<u64> = sync_state
             .pending_records
             .iter()
             .filter_map(|(seq, record)| {
-                if *seq <= up_to_seq && record.envelope.conversation_id == conversation_id {
-                    Some(*seq)
-                } else {
-                    None
+                if record.envelope.conversation_id != conversation_id
+                    || record.envelope.message_type != MessageType::MlsCommit
+                {
+                    return None;
                 }
+                let payload = record
+                    .envelope
+                    .inline_ciphertext
+                    .as_deref()
+                    .unwrap_or_default();
+                let epoch = MlsAdapter::protocol_message_epoch(payload).ok()?;
+                if epoch >= live_epoch {
+                    return None;
+                }
+                Some(*seq)
             })
             .collect();
-        for seq in pending_seqs {
-            log::warn!(
-                "handle_inbox_records: clearing pending retry seq {} for conversation {} after later MLS record applied",
-                seq,
-                redact_id("conversation", conversation_id)
-            );
-            SyncEngine::clear_pending_retry(sync_state, seq);
-            advance_contiguous_ack(contiguous_ack, deferred_ackable_seqs, seq);
+        if obsolete.is_empty() {
+            return;
+        }
+        if let Some(sync_state) = self.state.sync_states.get_mut(device_id) {
+            for seq in obsolete {
+                SyncEngine::clear_pending_retry(sync_state, seq);
+                super::advance_contiguous_ack(contiguous_ack, deferred_ackable_seqs, seq);
+            }
         }
     }
 

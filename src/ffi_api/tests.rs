@@ -5,14 +5,18 @@ mod tests {
         ATTACHMENT_CIPHER_ALGORITHM, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
     };
     use crate::conversation::RecoveryStatus;
+    use crate::direct_pcs::{
+        designated_committer, sign_certificate, DirectCommitCertificate, DirectPcsHandshake,
+        DIRECT_PCS_COMMIT_INTERVAL, DIRECT_PCS_DEBT_HARD,
+    };
     use crate::ffi_api::groups;
     use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput,
-        FfiApiModule, PersistenceMutation, RealtimeEvent,
+        FfiApiModule, PersistenceMutation, PersistenceValue, RealtimeEvent,
     };
     use crate::identity::IdentityManager;
-    use crate::mls_adapter::MlsAdapter;
+    use crate::mls_adapter::{IngestResult, MlsAdapter};
     use crate::model::{
         CapabilityService, ConversationKind, ConversationState, DeliveryClass, DeploymentBundle,
         Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
@@ -22,7 +26,9 @@ mod tests {
         InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
         WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
-    use crate::persistence::{ContactRelationshipStatus, PersistOp, PersistedPendingWelcomePickup};
+    use crate::persistence::{
+        ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedPendingWelcomePickup,
+    };
     use crate::transport_contract::{
         GroupJoinDecision, MessageRequestAction, MessageRequestActionResult,
         SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
@@ -4861,6 +4867,7 @@ mod tests {
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             },
         );
 
@@ -6941,6 +6948,7 @@ mod tests {
                 last_known_peer_active_devices: Default::default(),
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
+                pcs: Default::default(),
             },
         );
         engine
@@ -9078,6 +9086,1844 @@ mod tests {
         output
     }
 
+    #[test]
+    fn direct_pcs_initial_hash_ignores_forged_commit_before_welcome() {
+        assert_direct_pcs_authenticated_initial_hash(true);
+    }
+
+    #[test]
+    fn direct_pcs_initial_hash_ignores_forged_commit_after_welcome() {
+        assert_direct_pcs_authenticated_initial_hash(false);
+    }
+
+    fn assert_direct_pcs_authenticated_initial_hash(forged_before_welcome: bool) {
+        let mut chat = unjoined_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device_id = chat.bob_device_id.clone();
+        let commit = first_pending_envelope(&chat.alice, &bob_device_id, MessageType::MlsCommit);
+        let welcome = first_pending_envelope(&chat.alice, &bob_device_id, MessageType::MlsWelcome);
+        let expected = chat.alice.state.conversations[&conversation_id]
+            .pcs
+            .last_certified_commit_hash
+            .clone()
+            .expect("creator initial hash");
+        assert_ne!(
+            expected,
+            crate::direct_pcs::commit_hash_from_b64(commit.inline_ciphertext.as_deref().unwrap())
+                .unwrap()
+        );
+
+        // Keep a parseable old epoch header, but invalidate the encrypted Commit
+        // and its envelope proof. No trusted client signs this payload.
+        let mut forged = commit.clone();
+        let mut bytes = STANDARD
+            .decode(forged.inline_ciphertext.as_deref().unwrap())
+            .unwrap();
+        *bytes.last_mut().expect("commit bytes") ^= 1;
+        forged.inline_ciphertext = Some(STANDARD.encode(bytes));
+        forged.message_id = format!("{}:forged", commit.message_id);
+        forged.sender_proof.value = "invalid-signature".into();
+        assert!(
+            MlsAdapter::protocol_message_epoch(forged.inline_ciphertext.as_deref().unwrap()).unwrap()
+                < conversation_epoch(&chat.alice, &conversation_id)
+        );
+
+        if forged_before_welcome {
+            deliver_inbox_envelope(&mut chat.bob, &bob_device_id, forged.clone(), 1);
+            assert!(chat.bob.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+                .is_none());
+            assert!(pending_has_message(
+                &chat.bob,
+                &bob_device_id,
+                &forged.message_id
+            ));
+        }
+        let before_welcome = chat.bob.refresh_snapshot();
+        let welcome_output = deliver_inbox_envelope(&mut chat.bob, &bob_device_id, welcome, 2);
+        assert_eq!(
+            chat.bob.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+                .as_ref(),
+            Some(&expected)
+        );
+        // Check emitted persistence, not just the in-memory snapshot.
+        let persisted = CoreEngine::try_from_restored_state(fold_persist_onto_snapshot(
+            before_welcome,
+            &welcome_output,
+        ))
+        .expect("restore persisted initial hash");
+        assert_eq!(
+            persisted.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+                .as_ref(),
+            Some(&expected)
+        );
+        if !forged_before_welcome {
+            deliver_inbox_envelope(&mut chat.bob, &bob_device_id, forged.clone(), 3);
+        }
+        assert!(!pending_has_message(
+            &chat.bob,
+            &bob_device_id,
+            &forged.message_id
+        ));
+        assert_eq!(
+            chat.bob.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+                .as_ref(),
+            Some(&expected)
+        );
+        chat.bob = CoreEngine::try_from_restored_state(chat.bob.refresh_snapshot()).expect("restart");
+
+        // Both parties can send before the creating Commit is delivered.
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "welcome is sufficient".into(),
+            })
+            .expect("reply without creating Commit");
+        let reply = last_pending_application_envelope(&chat.bob, &chat.alice_device_id);
+        deliver_inbox_envelope(&mut chat.alice, &chat.alice_device_id, reply, 4);
+        assert!(conversation_has_plaintext(
+            &chat.alice,
+            &conversation_id,
+            "welcome is sufficient"
+        ));
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "authenticated initial chain".into(),
+            })
+            .expect("creator send");
+        let application = last_pending_application_envelope(&chat.alice, &bob_device_id);
+        deliver_inbox_envelope(&mut chat.bob, &bob_device_id, application, 5);
+        assert!(conversation_has_plaintext(
+            &chat.bob,
+            &conversation_id,
+            "authenticated initial chain"
+        ));
+        deliver_inbox_envelope(&mut chat.bob, &bob_device_id, commit, 6);
+        assert_eq!(
+            chat.bob.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+                .as_ref(),
+            Some(&expected)
+        );
+        let epoch = conversation_epoch(&chat.alice, &conversation_id);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        complete_direct_pcs_handshake(&mut chat);
+        assert_eq!(conversation_epoch(&chat.alice, &conversation_id), epoch + 1);
+        assert_eq!(conversation_epoch(&chat.bob, &conversation_id), epoch + 1);
+        assert_eq!(
+            chat.alice.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash,
+            chat.bob.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+        );
+    }
+
+    #[test]
+    fn direct_pcs_handshake_advances_epoch_and_binds_new_hash() {
+        let mut chat = paired_direct_chat();
+        let genesis_hash = chat
+            .alice
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("alice conversation")
+            .pcs
+            .last_certified_commit_hash
+            .clone()
+            .expect("genesis hash");
+        let epoch_before = conversation_epoch(&chat.alice, &chat.conversation_id);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        complete_direct_pcs_handshake(&mut chat);
+
+        let epoch_after = conversation_epoch(&chat.alice, &chat.conversation_id);
+        assert_eq!(epoch_after, epoch_before + 1);
+        assert_eq!(
+            conversation_epoch(&chat.bob, &chat.conversation_id),
+            epoch_after
+        );
+        let new_hash = chat
+            .alice
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("alice conversation")
+            .pcs
+            .last_certified_commit_hash
+            .clone()
+            .expect("certified hash");
+        assert_ne!(new_hash, genesis_hash);
+        assert_eq!(
+            chat.bob
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("bob conversation")
+                .pcs
+                .last_certified_commit_hash
+                .as_deref(),
+            Some(new_hash.as_str())
+        );
+        assert!(chat
+            .alice
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("alice conversation")
+            .pcs
+            .handshake
+            .is_none());
+
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "after pcs".into(),
+            })
+            .expect("send after handshake");
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        assert!(chat
+            .bob
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after pcs")));
+    }
+
+    #[test]
+    fn direct_pcs_offline_acceptor_does_not_block_send_then_advances() {
+        let mut chat = paired_direct_chat();
+        let epoch_before = conversation_epoch(&chat.alice, &chat.conversation_id);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let conversation_id = chat.conversation_id.clone();
+        for index in 0..3 {
+            committer_engine_mut(&mut chat)
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: format!("queued-{index}"),
+                })
+                .expect("send while acceptor is offline");
+        }
+        assert_eq!(
+            conversation_epoch(committer_engine(&chat), &chat.conversation_id),
+            epoch_before
+        );
+        complete_direct_pcs_handshake(&mut chat);
+        assert_eq!(
+            conversation_epoch(&chat.alice, &chat.conversation_id),
+            epoch_before + 1
+        );
+        assert_eq!(
+            conversation_epoch(&chat.bob, &chat.conversation_id),
+            epoch_before + 1
+        );
+    }
+
+    #[test]
+    fn direct_pcs_rejects_a_second_commit_in_the_same_epoch() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let alice_is = alice_is_committer(&chat);
+        if alice_is {
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        } else {
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        }
+        let first_commit = committer_engine(&chat)
+            .state
+            .pending_outbox
+            .iter()
+            .rev()
+            .find(|item| item.envelope.message_type == MessageType::MlsCommit)
+            .expect("staged pcs commit")
+            .envelope
+            .clone();
+        let conversation_id = chat.conversation_id.clone();
+        let second = committer_engine(&chat)
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .create_forked_direct_self_update(&conversation_id)
+            .expect("second fork commit");
+        assert_ne!(
+            first_commit.inline_ciphertext.as_deref(),
+            Some(second.commit_b64.as_str())
+        );
+        let mut conflicting = first_commit.clone();
+        conflicting.message_id = format!("{}:conflict", conflicting.message_id);
+        conflicting.inline_ciphertext = Some(second.commit_b64);
+        let acceptor_device_id = acceptor_device_id(&chat).to_string();
+        let acceptor = acceptor_engine_mut(&mut chat);
+        acceptor
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: acceptor_device_id.clone(),
+                to_seq: 10_000,
+                records: vec![InboxRecord {
+                    seq: 10_000,
+                    recipient_device_id: acceptor_device_id,
+                    message_id: conflicting.message_id.clone(),
+                    received_at: 10_000,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: conflicting,
+                }],
+            })
+            .expect("conflicting commit ingested");
+        let acceptor_state = acceptor_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("acceptor conversation");
+        assert_eq!(
+            acceptor_state.conversation.state,
+            ConversationState::NeedsRebuild
+        );
+        assert_eq!(
+            acceptor_state.recovery_status,
+            crate::conversation::RecoveryStatus::NeedsRebuild
+        );
+    }
+
+    #[test]
+    fn direct_pcs_hard_debt_marks_degraded_but_still_sends() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_DEBT_HARD - 1);
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "still sending".into(),
+            })
+            .expect("send at hard debt");
+        assert!(
+            chat.alice
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("alice conversation")
+                .pcs
+                .degraded
+        );
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "after degraded".into(),
+            })
+            .expect("send while degraded");
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        assert!(chat
+            .bob
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after degraded")));
+    }
+
+    #[test]
+    fn direct_pcs_decrypts_previous_epoch_message_after_merge() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let alice_was_committer = alice_is_committer(&chat);
+        complete_direct_pcs_committer_only(&mut chat);
+        let conversation_id = chat.conversation_id.clone();
+        if alice_was_committer {
+            chat.bob
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "late-epoch".into(),
+                })
+                .expect("bob send on previous epoch");
+            deliver_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &[MessageType::MlsApplication],
+            );
+            assert!(conversation_has_plaintext(
+                &chat.alice,
+                &conversation_id,
+                "late-epoch"
+            ));
+            assert_ne!(
+                chat.alice
+                    .state
+                    .conversations
+                    .get(&conversation_id)
+                    .expect("conversation")
+                    .conversation
+                    .state,
+                ConversationState::NeedsRebuild
+            );
+        } else {
+            chat.alice
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "late-epoch".into(),
+                })
+                .expect("alice send on previous epoch");
+            deliver_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &[MessageType::MlsApplication],
+            );
+            assert!(conversation_has_plaintext(
+                &chat.bob,
+                &conversation_id,
+                "late-epoch"
+            ));
+            assert_ne!(
+                chat.bob
+                    .state
+                    .conversations
+                    .get(&conversation_id)
+                    .expect("conversation")
+                    .conversation
+                    .state,
+                ConversationState::NeedsRebuild
+            );
+        }
+    }
+
+    #[test]
+    fn direct_pcs_restore_still_decrypts_previous_epoch() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        complete_direct_pcs_protocol_only(&mut chat);
+        chat.alice = CoreEngine::try_from_restored_state(chat.alice.refresh_snapshot())
+            .expect("restore alice");
+        chat.bob =
+            CoreEngine::try_from_restored_state(chat.bob.refresh_snapshot()).expect("restore bob");
+        deliver_pending_outbox_types(
+            &mut chat.bob,
+            &chat.alice,
+            &chat.bob_device_id,
+            &[MessageType::MlsApplication],
+        );
+        deliver_pending_outbox_types(
+            &mut chat.alice,
+            &chat.bob,
+            &chat.alice_device_id,
+            &[MessageType::MlsApplication],
+        );
+        assert!(
+            conversation_has_plaintext(&chat.alice, &chat.conversation_id, "pcs trigger")
+                || conversation_has_plaintext(&chat.bob, &chat.conversation_id, "pcs trigger")
+        );
+    }
+
+    #[test]
+    fn direct_pcs_stale_accept_during_next_handshake_is_idempotent() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        complete_direct_pcs_handshake(&mut chat);
+        let stale_accept = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .chain(chat.bob.state.pending_outbox.iter())
+            .filter(|item| item.envelope.message_type == MessageType::ControlDirectCommitAccept)
+            .map(|item| item.envelope.clone())
+            .next()
+            .expect("previous-round accept");
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        assert!(committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_some());
+        let committer_device = committer_device_id(&chat);
+        let mut stale_accept = stale_accept;
+        stale_accept.recipient_device_id = committer_device.clone();
+        stale_accept.message_id = format!("{}:replay", stale_accept.message_id);
+        committer_engine_mut(&mut chat)
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: committer_device.clone(),
+                to_seq: 20_000,
+                records: vec![InboxRecord {
+                    seq: 20_000,
+                    recipient_device_id: committer_device,
+                    message_id: stale_accept.message_id.clone(),
+                    received_at: 20_000,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: stale_accept,
+                }],
+            })
+            .expect("stale accept replayed");
+        let committer_state = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation");
+        assert_eq!(
+            committer_state.conversation.state,
+            ConversationState::Active
+        );
+        assert!(committer_state.pcs.handshake.is_some());
+        let conversation_id = chat.conversation_id.clone();
+        committer_engine_mut(&mut chat)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "still sending".into(),
+            })
+            .expect("send after stale accept");
+    }
+
+    #[test]
+    fn direct_pcs_offered_handshake_defers_membership_until_apply() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let committer = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        };
+        assert!(committer
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("committer conversation")
+            .pcs
+            .handshake
+            .is_some());
+        assert!(!committer
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("committer conversation")
+            .pcs
+            .handshake
+            .as_ref()
+            .is_some_and(DirectPcsHandshake::is_promised));
+        let (peer_mnemonic, peer_user_id) = if alice_was_committer {
+            (
+                BOB_MNEMONIC,
+                chat.bob
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("bob identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        } else {
+            (
+                ALICE_MNEMONIC,
+                chat.alice
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("alice identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        };
+        let laptop_id = add_extra_peer_device(
+            if alice_was_committer {
+                &mut chat.alice
+            } else {
+                &mut chat.bob
+            },
+            &peer_user_id,
+            peer_mnemonic,
+        );
+        let committer = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        };
+        assert!(committer
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .is_some());
+        let members_before = committer
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("members");
+        assert!(!members_before.contains(&laptop_id));
+        assert!(!committer.state.pending_outbox.iter().any(|item| {
+            item.envelope.message_type == MessageType::MlsWelcome
+                && item.envelope.recipient_device_id == laptop_id
+        }));
+        assert_ne!(
+            committer
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            ConversationState::NeedsRebuild
+        );
+        complete_direct_pcs_protocol_only(&mut chat);
+        let committer = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        };
+        let members_after = committer
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("members after pcs");
+        assert!(members_after.contains(&laptop_id));
+    }
+
+    #[test]
+    fn direct_pcs_inbox_persist_keeps_final_previous_after_apply_and_app() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        deliver_committer_commit_to_acceptor(&mut chat);
+        let conversation_id = chat.conversation_id.clone();
+        let committer_device = if alice_was_committer {
+            chat.alice_device_id.clone()
+        } else {
+            chat.bob_device_id.clone()
+        };
+        let acceptor = if alice_was_committer {
+            &mut chat.bob
+        } else {
+            &mut chat.alice
+        };
+        acceptor
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after-accept".into(),
+            })
+            .expect("acceptor sends during handshake");
+        let accept = first_pending_envelope(
+            acceptor,
+            &committer_device,
+            MessageType::ControlDirectCommitAccept,
+        );
+        let application = last_pending_application_envelope(acceptor, &committer_device);
+        let committer = if alice_was_committer {
+            &mut chat.alice
+        } else {
+            &mut chat.bob
+        };
+        let pre_snapshot = committer.refresh_snapshot();
+        let output = committer
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: committer_device.clone(),
+                to_seq: 50_001,
+                records: vec![
+                    InboxRecord {
+                        seq: 50_000,
+                        recipient_device_id: committer_device.clone(),
+                        message_id: accept.message_id.clone(),
+                        received_at: 50_000,
+                        expires_at: None,
+                        state: InboxRecordState::Available,
+                        envelope: accept,
+                    },
+                    InboxRecord {
+                        seq: 50_001,
+                        recipient_device_id: committer_device.clone(),
+                        message_id: application.message_id.clone(),
+                        received_at: 50_001,
+                        expires_at: None,
+                        state: InboxRecordState::Available,
+                        envelope: application,
+                    },
+                ],
+            })
+            .expect("accept plus application in one batch");
+        assert!(
+            committer
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .pcs
+                .handshake
+                .is_none()
+        );
+        assert!(conversation_has_plaintext(
+            committer,
+            &conversation_id,
+            "after-accept"
+        ));
+        let restored = CoreEngine::try_from_restored_state(fold_persist_onto_snapshot(
+            pre_snapshot,
+            &output,
+        ))
+        .expect("restore folded persist");
+        assert!(
+            restored
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("restored conversation")
+                .pcs
+                .handshake
+                .is_none()
+        );
+        assert!(conversation_has_plaintext(
+            &restored,
+            &conversation_id,
+            "after-accept"
+        ));
+    }
+
+    #[test]
+    fn direct_pcs_handshake_stores_commit_not_store_patch() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let conversation_id = chat.conversation_id.clone();
+        committer_engine_mut(&mut chat)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "live after stage".into(),
+            })
+            .expect("live send after stage");
+        let handshake = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.clone())
+            .expect("handshake");
+        assert!(!handshake.commit_b64.is_empty());
+        let json = serde_json::to_value(&handshake).expect("handshake json");
+        assert!(json.get("patch").is_none());
+        let pcs_json = serde_json::to_value(
+            &committer_engine(&chat)
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("conversation")
+                .pcs,
+        )
+        .expect("pcs json");
+        assert!(pcs_json.get("previousEpochMls").is_none());
+    }
+
+    #[test]
+    fn direct_pcs_persisted_live_cannot_rebuild_consumed_next_epoch_keys() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let conversation_id = chat.conversation_id.clone();
+        let alice_was_committer = alice_is_committer(&chat);
+        let acceptor_device = acceptor_device_id(&chat).to_string();
+        let committer_device = committer_device_id(&chat);
+        let pcs_commit_b64 = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .map(|handshake| handshake.commit_b64.clone())
+            .expect("pcs commit");
+        committer_engine_mut(&mut chat)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "late-e".into(),
+            })
+            .expect("late e during handshake");
+        let late_e = last_pending_application_envelope(committer_engine(&chat), &acceptor_device);
+        complete_direct_pcs_protocol_only(&mut chat);
+        {
+            let committer = if alice_was_committer {
+                &mut chat.alice
+            } else {
+                &mut chat.bob
+            };
+            committer
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "next-epoch".into(),
+                })
+                .expect("e+1 send");
+        }
+        let next_epoch = last_pending_application_envelope(
+            if alice_was_committer {
+                &chat.alice
+            } else {
+                &chat.bob
+            },
+            &acceptor_device,
+        );
+        let acceptor = if alice_was_committer {
+            &mut chat.bob
+        } else {
+            &mut chat.alice
+        };
+        deliver_inbox_envelope(acceptor, &acceptor_device, next_epoch.clone(), 40_000);
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(conversation_has_plaintext(
+            acceptor,
+            &conversation_id,
+            "next-epoch"
+        ));
+        let serialized = acceptor
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .export_persisted_group_state(&conversation_id)
+            .expect("persist live");
+        let summary = acceptor
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .export_group_summary(&conversation_id)
+            .expect("summary");
+        let restored = MlsAdapter::restore_from_persisted_states(&[(
+            conversation_id.clone(),
+            summary,
+            Some(serialized),
+        )])
+        .expect("restore live")
+        .adapter
+        .expect("adapter");
+        let mut restored = restored;
+        match restored
+            .ingest_message(
+                &conversation_id,
+                &committer_device,
+                MessageType::MlsCommit,
+                &pcs_commit_b64,
+            )
+            .expect("replay C")
+        {
+            IngestResult::IgnoredReplay | IngestResult::PendingRetry => {}
+            IngestResult::AppliedCommit { .. } => {
+                panic!("persisted live must not re-merge certified commit C")
+            }
+            other => panic!("unexpected C ingest: {other:?}"),
+        }
+        match restored
+            .ingest_message(
+                &conversation_id,
+                &committer_device,
+                MessageType::MlsApplication,
+                next_epoch.inline_ciphertext.as_deref().unwrap_or_default(),
+            )
+            .expect("replay consumed e+1")
+        {
+            IngestResult::IgnoredReplay => {}
+            IngestResult::AppliedApplication(_) => {
+                panic!("consumed e+1 generation must not decrypt from persisted live + C")
+            }
+            other => panic!("unexpected consumed ingest: {other:?}"),
+        }
+        match restored
+            .ingest_message(
+                &conversation_id,
+                &committer_device,
+                MessageType::MlsApplication,
+                late_e.inline_ciphertext.as_deref().unwrap_or_default(),
+            )
+            .expect("late e")
+        {
+            IngestResult::AppliedApplication(application) => {
+                let plaintext = String::from_utf8(application.plaintext).expect("utf8");
+                assert!(plaintext.contains("late-e"));
+                assert!(application.from_previous_epoch);
+            }
+            other => panic!("expected late-e application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_pcs_membership_commit_before_certificate_replays_after_apply() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        let acceptor_device = acceptor_device_id(&chat).to_string();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let pcs_commit_b64 = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .map(|handshake| handshake.commit_b64.clone())
+            .expect("pcs commit");
+        complete_direct_pcs_committer_only(&mut chat);
+        assert!(if alice_was_committer {
+            chat.bob
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .and_then(|state| state.pcs.handshake.as_ref())
+                .is_some()
+        } else {
+            chat.alice
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .and_then(|state| state.pcs.handshake.as_ref())
+                .is_some()
+        });
+        let (peer_mnemonic, peer_user_id) = if alice_was_committer {
+            (
+                BOB_MNEMONIC,
+                chat.bob
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("bob identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        } else {
+            (
+                ALICE_MNEMONIC,
+                chat.alice
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("alice identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        };
+        let laptop_id = add_extra_peer_device(
+            if alice_was_committer {
+                &mut chat.alice
+            } else {
+                &mut chat.bob
+            },
+            &peer_user_id,
+            peer_mnemonic,
+        );
+        let membership = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        }
+        .state
+        .pending_outbox
+        .iter()
+        .rev()
+        .find(|item| {
+            item.envelope.recipient_device_id == acceptor_device
+                && item.envelope.message_type == MessageType::MlsCommit
+                && item.envelope.inline_ciphertext.as_deref() != Some(pcs_commit_b64.as_str())
+        })
+        .expect("membership commit")
+        .envelope
+        .clone();
+        let complete_cert = first_pending_envelope(
+            if alice_was_committer {
+                &chat.alice
+            } else {
+                &chat.bob
+            },
+            &acceptor_device,
+            MessageType::ControlDirectCommitAccept,
+        );
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            membership.clone(),
+            61_000,
+        );
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(acceptor
+            .state
+            .sync_states
+            .get(&acceptor_device)
+            .is_some_and(|sync| sync
+                .pending_records
+                .values()
+                .any(|record| record.envelope.message_id == membership.message_id)));
+        let restored_acceptor = CoreEngine::try_from_restored_state(acceptor.refresh_snapshot())
+            .expect("restore acceptor with pending membership");
+        if alice_was_committer {
+            chat.bob = restored_acceptor;
+        } else {
+            chat.alice = restored_acceptor;
+        }
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(acceptor
+            .state
+            .sync_states
+            .get(&acceptor_device)
+            .is_some_and(|sync| !sync.pending_records.is_empty()));
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            complete_cert,
+            61_001,
+        );
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        let committer = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        };
+        assert!(acceptor
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_none());
+        let acceptor_members = acceptor
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("acceptor members");
+        let committer_members = committer
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("committer members");
+        assert!(committer_members.contains(&laptop_id));
+        assert!(acceptor_members.contains(&laptop_id));
+    }
+
+    #[test]
+    fn direct_pcs_late_epoch_decrypt_does_not_drop_pending_next_epoch() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        let acceptor_device = acceptor_device_id(&chat).to_string();
+        let conversation_id = chat.conversation_id.clone();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        committer_engine_mut(&mut chat)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "late-e".into(),
+            })
+            .expect("late e during handshake");
+        let late_e = last_pending_application_envelope(committer_engine(&chat), &acceptor_device);
+        complete_direct_pcs_committer_only(&mut chat);
+        {
+            let committer = if alice_was_committer {
+                &mut chat.alice
+            } else {
+                &mut chat.bob
+            };
+            committer
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "next-epoch".into(),
+                })
+                .expect("e+1 send");
+        }
+        let next_epoch = last_pending_application_envelope(
+            if alice_was_committer {
+                &chat.alice
+            } else {
+                &chat.bob
+            },
+            &acceptor_device,
+        );
+        let complete_cert = first_pending_envelope(
+            if alice_was_committer {
+                &chat.alice
+            } else {
+                &chat.bob
+            },
+            &acceptor_device,
+            MessageType::ControlDirectCommitAccept,
+        );
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            next_epoch.clone(),
+            70_000,
+        );
+        assert!(pending_has_message(
+            if alice_was_committer {
+                &chat.bob
+            } else {
+                &chat.alice
+            },
+            &acceptor_device,
+            &next_epoch.message_id,
+        ));
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            late_e,
+            70_001,
+        );
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(conversation_has_plaintext(acceptor, &conversation_id, "late-e"));
+        assert!(pending_has_message(
+            acceptor,
+            &acceptor_device,
+            &next_epoch.message_id,
+        ));
+        let restored = CoreEngine::try_from_restored_state(acceptor.refresh_snapshot())
+            .expect("restore acceptor with pending next-epoch");
+        if alice_was_committer {
+            chat.bob = restored;
+        } else {
+            chat.alice = restored;
+        }
+        assert!(pending_has_message(
+            if alice_was_committer {
+                &chat.bob
+            } else {
+                &chat.alice
+            },
+            &acceptor_device,
+            &next_epoch.message_id,
+        ));
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            complete_cert,
+            70_002,
+        );
+        assert!(conversation_has_plaintext(
+            if alice_was_committer {
+                &chat.bob
+            } else {
+                &chat.alice
+            },
+            &conversation_id,
+            "next-epoch",
+        ));
+    }
+
+    #[test]
+    fn direct_pcs_late_epoch_decrypt_does_not_drop_pending_membership_commit() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        let acceptor_device = acceptor_device_id(&chat).to_string();
+        let conversation_id = chat.conversation_id.clone();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        committer_engine_mut(&mut chat)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "late-e".into(),
+            })
+            .expect("late e during handshake");
+        let late_e = last_pending_application_envelope(committer_engine(&chat), &acceptor_device);
+        let pcs_commit_b64 = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .map(|handshake| handshake.commit_b64.clone())
+            .expect("pcs commit");
+        complete_direct_pcs_committer_only(&mut chat);
+        let (peer_mnemonic, peer_user_id) = if alice_was_committer {
+            (
+                BOB_MNEMONIC,
+                chat.bob
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("bob identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        } else {
+            (
+                ALICE_MNEMONIC,
+                chat.alice
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("alice identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        };
+        let laptop_id = add_extra_peer_device(
+            if alice_was_committer {
+                &mut chat.alice
+            } else {
+                &mut chat.bob
+            },
+            &peer_user_id,
+            peer_mnemonic,
+        );
+        let membership = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        }
+        .state
+        .pending_outbox
+        .iter()
+        .rev()
+        .find(|item| {
+            item.envelope.recipient_device_id == acceptor_device
+                && item.envelope.message_type == MessageType::MlsCommit
+                && item.envelope.inline_ciphertext.as_deref() != Some(pcs_commit_b64.as_str())
+        })
+        .expect("membership commit")
+        .envelope
+        .clone();
+        let complete_cert = first_pending_envelope(
+            if alice_was_committer {
+                &chat.alice
+            } else {
+                &chat.bob
+            },
+            &acceptor_device,
+            MessageType::ControlDirectCommitAccept,
+        );
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            membership.clone(),
+            71_000,
+        );
+        assert!(pending_has_message(
+            if alice_was_committer {
+                &chat.bob
+            } else {
+                &chat.alice
+            },
+            &acceptor_device,
+            &membership.message_id,
+        ));
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            late_e,
+            71_001,
+        );
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(conversation_has_plaintext(acceptor, &conversation_id, "late-e"));
+        assert!(pending_has_message(
+            acceptor,
+            &acceptor_device,
+            &membership.message_id,
+        ));
+        let restored = CoreEngine::try_from_restored_state(acceptor.refresh_snapshot())
+            .expect("restore acceptor with pending membership");
+        if alice_was_committer {
+            chat.bob = restored;
+        } else {
+            chat.alice = restored;
+        }
+        deliver_inbox_envelope(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &acceptor_device,
+            complete_cert,
+            71_002,
+        );
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        let committer = if alice_was_committer {
+            &chat.alice
+        } else {
+            &chat.bob
+        };
+        let acceptor_members = acceptor
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&conversation_id)
+            .expect("acceptor members");
+        let committer_members = committer
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&conversation_id)
+            .expect("committer members");
+        assert!(committer_members.contains(&laptop_id));
+        assert!(acceptor_members.contains(&laptop_id));
+    }
+
+    #[test]
+    fn direct_pcs_forged_commit_envelope_sender_does_not_rebuild() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let acceptor_device = acceptor_device_id(&chat).to_string();
+        let mut forged = first_pending_envelope(
+            committer_engine(&chat),
+            &acceptor_device,
+            MessageType::MlsCommit,
+        );
+        forged.sender_device_id = "device:forged-sender".into();
+        deliver_inbox_envelope(
+            acceptor_engine_mut(&mut chat),
+            &acceptor_device,
+            forged,
+            33_000,
+        );
+        let acceptor_state = acceptor_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation");
+        assert_eq!(
+            acceptor_state.conversation.state,
+            ConversationState::Active
+        );
+        assert_ne!(
+            acceptor_state.conversation.state,
+            ConversationState::NeedsRebuild
+        );
+        assert!(acceptor_state.pcs.handshake.is_none());
+    }
+
+    #[test]
+    fn direct_pcs_promised_handshake_defers_membership_until_apply() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let protocol = [
+            MessageType::MlsCommit,
+            MessageType::ControlDirectCommitAccept,
+        ];
+        if alice_was_committer {
+            deliver_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &protocol,
+            );
+        } else {
+            deliver_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &protocol,
+            );
+        }
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(acceptor
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .is_some_and(DirectPcsHandshake::is_promised));
+        let alice_is_acceptor = !alice_was_committer;
+        let (peer_mnemonic, peer_user_id) = if alice_is_acceptor {
+            (
+                BOB_MNEMONIC,
+                chat.bob
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("bob identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        } else {
+            (
+                ALICE_MNEMONIC,
+                chat.alice
+                    .state
+                    .local_identity
+                    .as_ref()
+                    .expect("alice identity")
+                    .user_identity
+                    .user_id
+                    .clone(),
+            )
+        };
+        let laptop_id = add_extra_peer_device(
+            if alice_was_committer {
+                &mut chat.bob
+            } else {
+                &mut chat.alice
+            },
+            &peer_user_id,
+            peer_mnemonic,
+        );
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        assert!(acceptor
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .is_some_and(DirectPcsHandshake::is_promised));
+        let members_before = acceptor
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("members");
+        assert!(!members_before.contains(&laptop_id));
+        assert!(!acceptor.state.pending_outbox.iter().any(|item| {
+            item.envelope.message_type == MessageType::MlsWelcome
+                && item.envelope.recipient_device_id == laptop_id
+        }));
+        assert_ne!(
+            acceptor
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            ConversationState::NeedsRebuild
+        );
+        complete_direct_pcs_protocol_only(&mut chat);
+        let acceptor = if alice_was_committer {
+            &chat.bob
+        } else {
+            &chat.alice
+        };
+        let members_after = acceptor
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("members after pcs");
+        assert!(members_after.contains(&laptop_id));
+    }
+
+    #[test]
+    fn direct_pcs_previous_consume_survives_restore_without_resurrecting_generation() {
+        let mut chat = paired_direct_chat();
+        let alice_was_committer = alice_is_committer(&chat);
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        complete_direct_pcs_committer_only(&mut chat);
+        let conversation_id = chat.conversation_id.clone();
+        let committer_device = if alice_was_committer {
+            chat.alice_device_id.clone()
+        } else {
+            chat.bob_device_id.clone()
+        };
+        let acceptor = if alice_was_committer {
+            &mut chat.bob
+        } else {
+            &mut chat.alice
+        };
+        acceptor
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "old-1".into(),
+            })
+            .expect("acceptor sends old-1");
+        let consumed = last_pending_application_envelope(acceptor, &committer_device);
+        acceptor
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "old-2".into(),
+            })
+            .expect("acceptor sends old-2");
+        let unconsumed = last_pending_application_envelope(acceptor, &committer_device);
+        let committer = if alice_was_committer {
+            &mut chat.alice
+        } else {
+            &mut chat.bob
+        };
+        deliver_inbox_envelope(committer, &committer_device, consumed.clone(), 40_000);
+        assert_eq!(
+            conversation_plaintext_count(committer, &conversation_id, "old-1"),
+            1
+        );
+        if alice_was_committer {
+            chat.alice = CoreEngine::try_from_restored_state(chat.alice.refresh_snapshot())
+                .expect("restore committer");
+        } else {
+            chat.bob = CoreEngine::try_from_restored_state(chat.bob.refresh_snapshot())
+                .expect("restore committer");
+        }
+        let committer = if alice_was_committer {
+            &mut chat.alice
+        } else {
+            &mut chat.bob
+        };
+        deliver_inbox_envelope(committer, &committer_device, consumed, 40_001);
+        assert_eq!(
+            conversation_plaintext_count(committer, &conversation_id, "old-1"),
+            1
+        );
+        deliver_inbox_envelope(committer, &committer_device, unconsumed, 40_002);
+        assert_eq!(
+            conversation_plaintext_count(committer, &conversation_id, "old-2"),
+            1
+        );
+    }
+
+    #[test]
+    fn direct_pcs_rejects_accept_from_non_session_device() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        chat.alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("alice imports carol");
+        chat.bob
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle,
+            })
+            .expect("bob imports carol");
+        let carol = IdentityManager::create_or_recover(Some(CAROL_MNEMONIC), Some("phone"))
+            .expect("carol identity");
+        let handshake = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.clone())
+            .expect("inflight handshake");
+        let epoch_before = conversation_epoch(committer_engine(&chat), &chat.conversation_id);
+        let mut cert = DirectCommitCertificate {
+            conversation_id: chat.conversation_id.clone(),
+            epoch: handshake.epoch,
+            parent_commit_hash: handshake.parent_commit_hash.clone(),
+            commit_hash: handshake.commit_hash.clone(),
+            committer_device_id: handshake.committer_device_id.clone(),
+            acceptor_device_id: Some(carol.device_identity.device_id.clone()),
+            committer_sig: handshake.committer_sig.clone(),
+            acceptor_sig: Some(sign_certificate(
+                &carol,
+                &chat.conversation_id,
+                handshake.epoch,
+                &handshake.parent_commit_hash,
+                &handshake.commit_hash,
+            )),
+        };
+        if cert.committer_sig.is_none() {
+            let committer_identity = committer_engine(&chat)
+                .state
+                .local_identity
+                .clone()
+                .expect("committer identity");
+            cert.committer_sig = Some(sign_certificate(
+                &committer_identity,
+                &chat.conversation_id,
+                handshake.epoch,
+                &handshake.parent_commit_hash,
+                &handshake.commit_hash,
+            ));
+        }
+        let payload_b64 = STANDARD.encode(serde_json::to_vec(&cert).expect("cert json"));
+        let sender_proof = carol.sign_sender_proof(payload_b64.as_bytes());
+        let committer_device = committer_device_id(&chat);
+        let envelope = Envelope {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            message_id: format!("msg:{}:carol-accept", chat.conversation_id),
+            conversation_id: chat.conversation_id.clone(),
+            sender_user_id: carol.user_identity.user_id.clone(),
+            sender_device_id: carol.device_identity.device_id.clone(),
+            recipient_device_id: committer_device.clone(),
+            created_at: 1,
+            message_type: MessageType::ControlDirectCommitAccept,
+            inline_ciphertext: Some(payload_b64),
+            storage_refs: vec![],
+            delivery_class: DeliveryClass::Normal,
+            wake_hint: None,
+            sender_proof: SenderProof {
+                proof_type: "device_signature".into(),
+                value: sender_proof,
+            },
+        };
+        committer_engine_mut(&mut chat)
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: committer_device.clone(),
+                to_seq: 30_000,
+                records: vec![InboxRecord {
+                    seq: 30_000,
+                    recipient_device_id: committer_device,
+                    message_id: envelope.message_id.clone(),
+                    received_at: 30_000,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope,
+                }],
+            })
+            .expect("non-session accept ingested");
+        let committer_state = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation");
+        assert!(committer_state.pcs.handshake.is_some());
+        assert_eq!(
+            conversation_epoch(committer_engine(&chat), &chat.conversation_id),
+            epoch_before
+        );
+        assert_ne!(
+            committer_state.conversation.state,
+            ConversationState::NeedsRebuild
+        );
+    }
+
+    #[test]
+    fn direct_pcs_unauthenticated_accept_does_not_rebuild() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        deliver_committer_commit_to_acceptor(&mut chat);
+        let committer_device = committer_device_id(&chat);
+        let mut forged = first_pending_envelope(
+            acceptor_engine(&chat),
+            &committer_device,
+            MessageType::ControlDirectCommitAccept,
+        );
+        forged.sender_proof.value = "00".repeat(64);
+        deliver_inbox_envelope(
+            committer_engine_mut(&mut chat),
+            &committer_device,
+            forged,
+            31_000,
+        );
+        let committer_state = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation");
+        assert_eq!(
+            committer_state.conversation.state,
+            ConversationState::Active
+        );
+        assert_ne!(
+            committer_state.conversation.state,
+            ConversationState::NeedsRebuild
+        );
+        assert!(committer_state.pcs.handshake.is_some());
+    }
+
+    #[test]
+    fn direct_pcs_mismatched_accept_conversation_id_does_not_rebuild() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        trigger_direct_pcs_from_committer(&mut chat);
+        deliver_committer_commit_to_acceptor(&mut chat);
+        let committer_device = committer_device_id(&chat);
+        let mut forged = first_pending_envelope(
+            acceptor_engine(&chat),
+            &committer_device,
+            MessageType::ControlDirectCommitAccept,
+        );
+        let payload = STANDARD
+            .decode(forged.inline_ciphertext.as_ref().expect("accept payload"))
+            .expect("decode accept");
+        let mut cert: DirectCommitCertificate =
+            serde_json::from_slice(&payload).expect("accept cert");
+        cert.conversation_id = "conv:forged-conversation".into();
+        let payload_b64 = STANDARD.encode(serde_json::to_vec(&cert).expect("cert json"));
+        let acceptor_identity = acceptor_engine(&chat)
+            .state
+            .local_identity
+            .clone()
+            .expect("acceptor identity");
+        forged.sender_proof.value = acceptor_identity.sign_sender_proof(payload_b64.as_bytes());
+        forged.inline_ciphertext = Some(payload_b64);
+        deliver_inbox_envelope(
+            committer_engine_mut(&mut chat),
+            &committer_device,
+            forged,
+            32_000,
+        );
+        let committer_state = committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation");
+        assert_eq!(
+            committer_state.conversation.state,
+            ConversationState::Active
+        );
+        assert_ne!(
+            committer_state.conversation.state,
+            ConversationState::NeedsRebuild
+        );
+        assert!(committer_state.pcs.handshake.is_some());
+    }
+
+    #[test]
+    fn direct_pcs_attachment_send_counts_toward_commit_interval() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        let conversation_id = chat.conversation_id.clone();
+        complete_direct_attachment_send(committer_engine_mut(&mut chat), &conversation_id);
+        assert!(committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_some());
+    }
+
+    #[test]
+    fn direct_pcs_attachment_send_persists_before_flush() {
+        let mut chat = paired_direct_chat();
+        prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        let conversation_id = chat.conversation_id.clone();
+        let output =
+            complete_direct_attachment_send(committer_engine_mut(&mut chat), &conversation_id);
+        let ops = persist_ops(&output);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveConversation { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveMlsState { conversation_id: saved }
+                if saved == &conversation_id
+        )));
+        let commit_ids: Vec<String> = committer_engine(&chat)
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            })
+            .map(|item| item.envelope.message_id.clone())
+            .collect();
+        assert!(
+            !commit_ids.is_empty(),
+            "attachment send should enqueue PCS commit"
+        );
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            PersistOp::SaveOutgoingEnvelope { message_id } if commit_ids.contains(message_id)
+        )));
+        let persist_index = first_persist_effect_index(&output).expect("persist effect");
+        let http_index = output
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { .. }))
+            .expect("http flush");
+        assert!(
+            persist_index < http_index,
+            "conversation/mls/outbox persist must precede HTTP flush"
+        );
+        let restored =
+            CoreEngine::try_from_restored_state(committer_engine(&chat).refresh_snapshot())
+                .expect("restore after attachment stage");
+        assert!(restored
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("restored conversation")
+            .pcs
+            .handshake
+            .is_some());
+    }
+
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
         let mut engine = CoreEngine::new();
         engine
@@ -9214,6 +11060,428 @@ mod tests {
                 records,
             })
             .expect("recipient inbox records fetched")
+    }
+
+    struct PairedDirectChat {
+        alice: CoreEngine,
+        bob: CoreEngine,
+        conversation_id: String,
+        alice_device_id: String,
+        bob_device_id: String,
+    }
+
+    fn paired_direct_chat() -> PairedDirectChat {
+        let mut chat = unjoined_direct_chat();
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        chat
+    }
+
+    fn unjoined_direct_chat() -> PairedDirectChat {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundle {
+            bundle: alice_bundle.clone(),
+        })
+        .expect("bob imports alice");
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        PairedDirectChat {
+            alice,
+            bob,
+            conversation_id,
+            alice_device_id,
+            bob_device_id,
+        }
+    }
+
+    fn conversation_epoch(engine: &CoreEngine, conversation_id: &str) -> u64 {
+        engine
+            .state
+            .mls_summaries
+            .get(conversation_id)
+            .map(|summary| summary.epoch)
+            .or_else(|| {
+                engine
+                    .state
+                    .mls_adapter
+                    .as_ref()
+                    .and_then(|adapter| adapter.export_group_summary(conversation_id).ok())
+                    .map(|summary| summary.epoch)
+            })
+            .expect("conversation epoch")
+    }
+
+    fn committer_device_id(chat: &PairedDirectChat) -> String {
+        let members = chat
+            .alice
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("alice adapter")
+            .member_device_ids(&chat.conversation_id)
+            .expect("members");
+        designated_committer(
+            &members,
+            conversation_epoch(&chat.alice, &chat.conversation_id),
+        )
+        .expect("committer")
+    }
+
+    fn alice_is_committer(chat: &PairedDirectChat) -> bool {
+        committer_device_id(chat) == chat.alice_device_id
+    }
+
+    fn committer_engine(chat: &PairedDirectChat) -> &CoreEngine {
+        if alice_is_committer(chat) {
+            &chat.alice
+        } else {
+            &chat.bob
+        }
+    }
+
+    fn committer_engine_mut(chat: &mut PairedDirectChat) -> &mut CoreEngine {
+        if alice_is_committer(chat) {
+            &mut chat.alice
+        } else {
+            &mut chat.bob
+        }
+    }
+
+    fn acceptor_engine(chat: &PairedDirectChat) -> &CoreEngine {
+        if alice_is_committer(chat) {
+            &chat.bob
+        } else {
+            &chat.alice
+        }
+    }
+
+    fn acceptor_engine_mut(chat: &mut PairedDirectChat) -> &mut CoreEngine {
+        if alice_is_committer(chat) {
+            &mut chat.bob
+        } else {
+            &mut chat.alice
+        }
+    }
+
+    fn acceptor_device_id(chat: &PairedDirectChat) -> &str {
+        if alice_is_committer(chat) {
+            &chat.bob_device_id
+        } else {
+            &chat.alice_device_id
+        }
+    }
+
+    fn add_extra_peer_device(
+        engine: &mut CoreEngine,
+        peer_user_id: &str,
+        peer_mnemonic: &str,
+    ) -> String {
+        let phone_profile = engine
+            .state
+            .contacts
+            .get(peer_user_id)
+            .expect("peer contact")
+            .bundle
+            .devices[0]
+            .clone();
+        let root = IdentityManager::recover_user_root(peer_mnemonic).expect("peer root");
+        let laptop = IdentityManager::create_new_device_for_user(&root, None).expect("laptop");
+        let package = MlsAdapter::generate_key_package(&laptop, test_now_ms()).expect("package");
+        let laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &laptop,
+            &sample_deployment(),
+            package.key_package_b64,
+            package.expires_at,
+        )
+        .expect("laptop profile");
+        let device_id = laptop_profile.device_id.clone();
+        let merged = IdentityManager::export_identity_bundle_with_devices(
+            &laptop,
+            &sample_deployment(),
+            vec![phone_profile, laptop_profile],
+            None,
+            None,
+        )
+        .expect("merged bundle");
+        engine
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
+            .expect("add extra peer device");
+        device_id
+    }
+
+    fn prime_direct_pcs_count(chat: &mut PairedDirectChat, count: u32) {
+        if let Some(state) = chat
+            .alice
+            .state
+            .conversations
+            .get_mut(&chat.conversation_id)
+        {
+            state.pcs.epoch_app_count = count;
+        }
+        if let Some(state) = chat.bob.state.conversations.get_mut(&chat.conversation_id) {
+            state.pcs.epoch_app_count = count;
+        }
+    }
+
+    fn trigger_direct_pcs_from_committer(chat: &mut PairedDirectChat) {
+        let conversation_id = chat.conversation_id.clone();
+        committer_engine_mut(chat)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "pcs trigger".into(),
+            })
+            .expect("committer send triggers pcs");
+    }
+
+    fn complete_direct_pcs_handshake(chat: &mut PairedDirectChat) {
+        let alice_is = alice_is_committer(chat);
+        if alice_is {
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        } else {
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        }
+    }
+
+    fn complete_direct_pcs_protocol_only(chat: &mut PairedDirectChat) {
+        let types = [
+            MessageType::MlsCommit,
+            MessageType::ControlDirectCommitAccept,
+        ];
+        if alice_is_committer(chat) {
+            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+        } else {
+            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+        }
+    }
+
+    fn complete_direct_pcs_committer_only(chat: &mut PairedDirectChat) {
+        let types = [
+            MessageType::MlsCommit,
+            MessageType::ControlDirectCommitAccept,
+        ];
+        if alice_is_committer(chat) {
+            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+        } else {
+            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+        }
+    }
+
+    fn deliver_committer_commit_to_acceptor(chat: &mut PairedDirectChat) {
+        let types = [MessageType::MlsCommit];
+        if alice_is_committer(chat) {
+            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+        } else {
+            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+        }
+    }
+
+    fn deliver_pending_outbox_types(
+        recipient: &mut CoreEngine,
+        sender: &CoreEngine,
+        device_id: &str,
+        types: &[MessageType],
+    ) -> Option<CoreOutput> {
+        let records = sender
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.recipient_device_id == device_id
+                    && types.contains(&item.envelope.message_type)
+            })
+            .enumerate()
+            .map(|(index, item)| InboxRecord {
+                seq: index as u64 + 1,
+                recipient_device_id: item.envelope.recipient_device_id.clone(),
+                message_id: item.envelope.message_id.clone(),
+                received_at: index as u64 + 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: item.envelope.clone(),
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return None;
+        }
+        Some(
+            recipient
+                .handle_event(CoreEvent::InboxRecordsFetched {
+                    device_id: device_id.to_string(),
+                    to_seq: records.len() as u64,
+                    records,
+                })
+                .expect("filtered inbox records fetched"),
+        )
+    }
+
+    fn deliver_inbox_envelope(
+        recipient: &mut CoreEngine,
+        device_id: &str,
+        envelope: Envelope,
+        seq: u64,
+    ) -> CoreOutput {
+        recipient
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: device_id.to_string(),
+                to_seq: seq,
+                records: vec![InboxRecord {
+                    seq,
+                    recipient_device_id: device_id.to_string(),
+                    message_id: envelope.message_id.clone(),
+                    received_at: seq,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope,
+                }],
+            })
+            .expect("inbox envelope fetched")
+    }
+
+    fn last_pending_application_envelope(sender: &CoreEngine, device_id: &str) -> Envelope {
+        sender
+            .state
+            .pending_outbox
+            .iter()
+            .rev()
+            .find(|item| {
+                item.envelope.recipient_device_id == device_id
+                    && item.envelope.message_type == MessageType::MlsApplication
+            })
+            .expect("pending application")
+            .envelope
+            .clone()
+    }
+
+    fn first_pending_envelope(
+        sender: &CoreEngine,
+        device_id: &str,
+        message_type: MessageType,
+    ) -> Envelope {
+        sender
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| {
+                item.envelope.recipient_device_id == device_id
+                    && item.envelope.message_type == message_type
+            })
+            .expect("pending envelope")
+            .envelope
+            .clone()
+    }
+
+    fn conversation_has_plaintext(
+        engine: &CoreEngine,
+        conversation_id: &str,
+        plaintext: &str,
+    ) -> bool {
+        engine
+            .state
+            .conversations
+            .get(conversation_id)
+            .is_some_and(|state| {
+                state
+                    .messages
+                    .iter()
+                    .any(|message| message.plaintext.as_deref() == Some(plaintext))
+            })
+    }
+
+    fn pending_has_message(engine: &CoreEngine, device_id: &str, message_id: &str) -> bool {
+        engine
+            .state
+            .sync_states
+            .get(device_id)
+            .is_some_and(|sync| {
+                sync.pending_records
+                    .values()
+                    .any(|record| record.envelope.message_id == message_id)
+            })
+    }
+
+    fn conversation_plaintext_count(
+        engine: &CoreEngine,
+        conversation_id: &str,
+        plaintext: &str,
+    ) -> usize {
+        engine
+            .state
+            .conversations
+            .get(conversation_id)
+            .map(|state| {
+                state
+                    .messages
+                    .iter()
+                    .filter(|message| message.plaintext.as_deref() == Some(plaintext))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    fn complete_direct_attachment_send(
+        engine: &mut CoreEngine,
+        conversation_id: &str,
+    ) -> CoreOutput {
+        let upload = engine
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id: conversation_id.to_string(),
+                attachment_descriptor: sample_attachment_descriptor(),
+            })
+            .expect("attachment");
+        let task_id = upload
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ReadAttachmentBytes { read } => Some(read.task_id.clone()),
+                _ => None,
+            })
+            .expect("upload task");
+        engine
+            .handle_event(CoreEvent::AttachmentBytesLoaded {
+                task_id: task_id.clone(),
+                plaintext: vec![1_u8, 2, 3, 4],
+            })
+            .expect("attachment bytes loaded");
+        engine
+            .handle_event(CoreEvent::BlobUploadPrepared {
+                task_id: task_id.clone(),
+                result: crate::transport_contract::PrepareBlobUploadResult {
+                    blob_ref: "blob:attachment-pcs".into(),
+                    upload_target: "upload:attachment-pcs".into(),
+                    upload_headers: std::collections::BTreeMap::new(),
+                    read_capability: "read-capability".into(),
+                    download_target:
+                        "https://storage.example.com/v1/storage/blob/blob%3Aattachment-pcs".into(),
+                    upload_expires_at: Some(99),
+                    blob_expires_at: Some(999),
+                    delete_target: Some(
+                        "https://storage.example.com/v1/storage/blob/blob%3Aattachment-pcs".into(),
+                    ),
+                    delete_capability: Some("delete-attachment-pcs".into()),
+                },
+            })
+            .expect("blob prepared");
+        engine
+            .handle_event(CoreEvent::BlobUploaded { task_id })
+            .expect("blob uploaded")
     }
 
     fn pending_application_record(sender: &CoreEngine, device_id: &str) -> InboxRecord {
@@ -9386,6 +11654,83 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("expected request containing {needle}"))
+    }
+
+    fn fold_persist_onto_snapshot(
+        mut snapshot: CorePersistenceSnapshot,
+        output: &CoreOutput,
+    ) -> CorePersistenceSnapshot {
+        for effect in &output.effects {
+            let CoreEffect::PersistState { persist } = effect else {
+                continue;
+            };
+            for mutation in &persist.mutations {
+                match mutation {
+                    PersistenceMutation::Save {
+                        value: PersistenceValue::ConversationSummary(summary),
+                        ..
+                    } => {
+                        let conversation_id = summary.conversation.conversation_id.clone();
+                        let messages = snapshot
+                            .conversations
+                            .iter()
+                            .find(|item| item.conversation_id == conversation_id)
+                            .map(|item| item.state.messages.clone())
+                            .unwrap_or_default();
+                        let mut conversation = summary.conversation.clone();
+                        if conversation.state.messages.is_empty() {
+                            conversation.state.messages = messages;
+                        }
+                        if let Some(existing) = snapshot
+                            .conversations
+                            .iter_mut()
+                            .find(|item| item.conversation_id == conversation_id)
+                        {
+                            *existing = conversation;
+                        } else {
+                            snapshot.conversations.push(conversation);
+                        }
+                    }
+                    PersistenceMutation::InsertMessage {
+                        conversation_id,
+                        message,
+                    } => {
+                        if let Some(existing) = snapshot
+                            .conversations
+                            .iter_mut()
+                            .find(|item| item.conversation_id == *conversation_id)
+                        {
+                            if let Some(stored) = existing
+                                .state
+                                .messages
+                                .iter_mut()
+                                .find(|item| item.message_id == message.message_id)
+                            {
+                                *stored = message.clone();
+                            } else {
+                                existing.state.messages.push(message.clone());
+                            }
+                        }
+                    }
+                    PersistenceMutation::Save {
+                        value: PersistenceValue::MlsState(mls),
+                        ..
+                    } => {
+                        if let Some(existing) = snapshot
+                            .mls_states
+                            .iter_mut()
+                            .find(|item| item.conversation_id == mls.conversation_id)
+                        {
+                            *existing = mls.clone();
+                        } else {
+                            snapshot.mls_states.push(mls.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        snapshot
     }
 
     fn persist_ops(output: &crate::ffi_api::CoreOutput) -> Vec<PersistOp> {

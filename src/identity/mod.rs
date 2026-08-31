@@ -522,6 +522,18 @@ pub fn parse_signature(input: &str) -> CoreResult<Signature> {
     Ok(Signature::from_bytes(&array))
 }
 
+pub fn verify_device_payload_signature(
+    device_public_key: &str,
+    payload: &[u8],
+    signature_hex: &str,
+) -> CoreResult<()> {
+    let verifying_key = parse_verifying_key(device_public_key)?;
+    let signature = parse_signature(signature_hex)?;
+    verifying_key
+        .verify(payload, &signature)
+        .map_err(|_| CoreError::invalid_input("device signature mismatch"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{IdentityManager, IdentityModule, DEFAULT_MNEMONIC_WORDS};
