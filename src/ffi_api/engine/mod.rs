@@ -324,6 +324,31 @@ impl CoreEngine {
             .map(|identity| identity.device_identity.device_id.as_str())
     }
 
+    /// Copy durable message content into the in-memory security index.
+    /// Restart restores ids/hashes only; attachment open hydrates one row at a time.
+    pub fn hydrate_message_content(
+        &mut self,
+        conversation_id: &str,
+        message: StoredMessage,
+    ) -> CoreResult<()> {
+        let conversation = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("attachment conversation is missing"))?;
+        let existing = conversation
+            .messages
+            .iter_mut()
+            .find(|candidate| message_ids_match(candidate, &message))
+            .ok_or_else(|| CoreError::invalid_input("attachment message is missing"))?;
+        if existing.plaintext.is_some() {
+            return Ok(());
+        }
+        existing.plaintext = message.plaintext;
+        existing.storage_refs = message.storage_refs;
+        Ok(())
+    }
+
     pub fn try_from_restored_state(snapshot: CorePersistenceSnapshot) -> CoreResult<Self> {
         let restored_mls = MlsAdapter::restore_from_persisted_states(
             &snapshot
@@ -2422,6 +2447,14 @@ impl CoreEngine {
                 ),
         }
     }
+}
+
+fn message_ids_match(existing: &StoredMessage, incoming: &StoredMessage) -> bool {
+    existing.message_id == incoming.message_id
+        || existing.app_message_id.as_deref() == Some(incoming.message_id.as_str())
+        || incoming.app_message_id.as_deref().is_some_and(|app_id| {
+            existing.message_id == app_id || existing.app_message_id.as_deref() == Some(app_id)
+        })
 }
 
 fn current_timestamp_hint(outbox_len: usize) -> u64 {

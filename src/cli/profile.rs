@@ -978,6 +978,15 @@ impl Profile {
         self.storage_session.query_messages(query)
     }
 
+    pub fn get_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<crate::conversation::StoredMessage>> {
+        self.storage_session
+            .get_message(conversation_id, message_id)
+    }
+
     pub fn count_received_visible_messages(
         &self,
         conversation_id: &str,

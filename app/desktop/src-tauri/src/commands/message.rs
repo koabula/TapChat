@@ -651,6 +651,7 @@ pub async fn download_attachment(
     reference: String,
     destination: String,
 ) -> crate::errors::DesktopResult<CoreOutput> {
+    ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
     let destination_path = std::path::PathBuf::from(&destination);
     if !destination_path.is_absolute() {
         return Err("Attachment save destination must be an absolute path".into());
@@ -1010,6 +1011,7 @@ pub async fn get_attachment_media_state(
     conversation_id: String,
     message_id: String,
 ) -> crate::errors::DesktopResult<AttachmentMediaState> {
+    ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
     let manifest = attachment_metadata_from_snapshot(&app, &conversation_id, &message_id)
         .await?
         .ok_or_else(|| "Attachment metadata missing".to_string())?;
@@ -1056,6 +1058,7 @@ pub async fn open_media(
     message_id: String,
     variant: String,
 ) -> crate::errors::DesktopResult<OpenMediaResult> {
+    ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
     let descriptor =
         attachment_variant_from_snapshot(&app, &conversation_id, &message_id, &variant).await;
     let pending_source = if descriptor.is_err() {
@@ -2300,9 +2303,60 @@ async fn ensure_attachment_metadata(
     message_id: &str,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let inner = state.inner.read().await;
-    let snapshot = inner.engine.refresh_snapshot();
-    let has_metadata = snapshot
+    {
+        let inner = state.inner.read().await;
+        if snapshot_has_attachment_metadata(
+            &inner.engine.refresh_snapshot(),
+            conversation_id,
+            message_id,
+        ) {
+            return Ok(());
+        }
+    }
+
+    let stored = {
+        let inner = state.inner.read().await;
+        let pm = inner.profile_manager.inner.read().await;
+        let profile = pm
+            .active_profile
+            .as_ref()
+            .ok_or_else(|| "No active profile".to_string())?;
+        profile
+            .get_message(conversation_id, message_id)
+            .map_err(|error| error.to_string())?
+    };
+    let Some(stored) = stored else {
+        return Err("Attachment metadata missing".to_string());
+    };
+    if !stored
+        .plaintext
+        .as_deref()
+        .is_some_and(is_attachment_metadata)
+    {
+        return Err("Attachment metadata missing".to_string());
+    }
+
+    let mut inner = state.inner.write().await;
+    if snapshot_has_attachment_metadata(
+        &inner.engine.refresh_snapshot(),
+        conversation_id,
+        message_id,
+    ) {
+        return Ok(());
+    }
+    inner
+        .engine
+        .hydrate_message_content(conversation_id, stored)
+        .map_err(|error| normalize_attachment_error(&error.to_string()))?;
+    Ok(())
+}
+
+fn snapshot_has_attachment_metadata(
+    snapshot: &tapchat_core::persistence::CorePersistenceSnapshot,
+    conversation_id: &str,
+    message_id: &str,
+) -> bool {
+    snapshot
         .conversations
         .iter()
         .find(|conversation| conversation.conversation_id == conversation_id)
@@ -2323,13 +2377,7 @@ async fn ensure_attachment_metadata(
                         || item.app_message_id.as_deref() == Some(message_id))
             })
             .and_then(|item| item.plaintext_cache.as_deref())
-            .is_some_and(is_attachment_metadata);
-
-    if has_metadata {
-        Ok(())
-    } else {
-        Err("Attachment metadata missing".to_string())
-    }
+            .is_some_and(is_attachment_metadata)
 }
 
 fn is_attachment_metadata(plaintext: &str) -> bool {

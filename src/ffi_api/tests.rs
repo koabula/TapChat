@@ -1,16 +1,16 @@
 #[cfg(test)]
 mod tests {
     use crate::attachment_crypto::{
-        ATTACHMENT_CHUNK_SIZE_BYTES, ATTACHMENT_CIPHER_ALGORITHM, AttachmentCipherMetadata,
-        AttachmentPayloadMetadata, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
+        AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CHUNK_SIZE_BYTES,
+        ATTACHMENT_CIPHER_ALGORITHM, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
     };
     use crate::conversation::RecoveryStatus;
     use crate::direct_pcs::{
-        DIRECT_PCS_COMMIT_INTERVAL, DIRECT_PCS_DEBT_HARD, DirectCommitCertificate,
-        DirectPcsHandshake, designated_committer, sign_certificate,
+        designated_committer, sign_certificate, DirectCommitCertificate, DirectPcsHandshake,
+        DIRECT_PCS_COMMIT_INTERVAL, DIRECT_PCS_DEBT_HARD,
     };
     use crate::ffi_api::groups;
-    use crate::ffi_api::types::{MAX_TRANSPORT_RETRIES, RecoveryContext, RecoveryReason};
+    use crate::ffi_api::types::{RecoveryContext, RecoveryReason, MAX_TRANSPORT_RETRIES};
     use crate::ffi_api::{
         AttachmentDescriptor, CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput,
         FfiApiModule, PersistenceMutation, PersistenceValue, RealtimeEvent,
@@ -19,13 +19,13 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::mls_adapter::{IngestResult, MlsAdapter};
     use crate::model::{
-        CURRENT_MODEL_VERSION, CapabilityService, ConversationKind, ConversationState,
-        DeliveryClass, DeploymentBundle, Envelope, GroupCapability, GroupCapabilityOperation,
-        GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest,
-        GroupJoinRequestStatus, GroupManifest, GroupMemberStatus, GroupMembershipProof,
-        GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle,
-        InboxRecord, InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
-        WelcomePickupDescriptor,
+        CapabilityService, ConversationKind, ConversationState, DeliveryClass, DeploymentBundle,
+        Envelope, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
+        GroupManifest, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
+        GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord,
+        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
+        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{
         ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp,
@@ -36,7 +36,7 @@ mod tests {
         SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
         TransportAuthRequirement,
     };
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
     use ed25519_dalek::Signer;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -838,12 +838,10 @@ mod tests {
             Some(1),
             "provisional genesis exposes only the owner before transition ACK"
         );
-        assert!(
-            output
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::InitializeGroupAuthorization { .. }))
-        );
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::InitializeGroupAuthorization { .. })));
         let transition_output = alice
             .handle_event(CoreEvent::GroupAuthorizationInitialized {
                 group_id: summary.group_id.clone().expect("group id"),
@@ -1042,12 +1040,10 @@ mod tests {
                 group_id: group_id.clone(),
             })
             .expect("submit leave request");
-        assert!(
-            leave
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::SubmitGroupLeaveRequest { .. }))
-        );
+        assert!(leave
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::SubmitGroupLeaveRequest { .. })));
         assert_eq!(alice.state.group_states[&group_id].manifest, before);
         assert_eq!(
             alice.state.group_states[&group_id].local_role,
@@ -1207,13 +1203,11 @@ mod tests {
             })
             .expect("membership revoked is terminal");
 
-        assert!(
-            !alice
-                .state
-                .pending_group_outbox
-                .iter()
-                .any(|item| item.envelope.group_id == group_id)
-        );
+        assert!(!alice
+            .state
+            .pending_group_outbox
+            .iter()
+            .any(|item| item.envelope.group_id == group_id));
         assert_eq!(alice.state.group_states[&group_id].local_role, None);
         assert_eq!(
             alice.state.conversations[&conversation_id]
@@ -1553,14 +1547,12 @@ mod tests {
         );
 
         let ops = persist_ops(&output);
-        assert!(
-            ops.iter()
-                .any(|op| matches!(op, PersistOp::DeleteOutgoingGroupEnvelope { .. }))
-        );
-        assert!(
-            ops.iter()
-                .any(|op| matches!(op, PersistOp::SaveConversation { .. }))
-        );
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, PersistOp::DeleteOutgoingGroupEnvelope { .. })));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, PersistOp::SaveConversation { .. })));
         assert!(
             !ops.iter()
                 .any(|op| matches!(op, PersistOp::DeletePendingGroupSeal { .. })),
@@ -1769,12 +1761,10 @@ mod tests {
                 .is_none(),
             "a retryable seal failure must NOT mark the group dissolved"
         );
-        assert!(
-            retry_output
-                .state_update
-                .system_statuses_changed
-                .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure)
-        );
+        assert!(retry_output
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::TemporaryNetworkFailure));
 
         // Simulate a non-retryable seal failure (e.g. 403 unauthorized).
         // The staged seal must be cleared and the user must see a
@@ -2350,11 +2340,9 @@ mod tests {
         )));
         harness.drain(&mut bob, output);
 
-        assert!(
-            group_plaintexts(&bob, &conversation_id)
-                .iter()
-                .any(|text| text == "from realtime owner")
-        );
+        assert!(group_plaintexts(&bob, &conversation_id)
+            .iter()
+            .any(|text| text == "from realtime owner"));
         assert_eq!(group_cursor(&bob, &group_id), head);
 
         let caught_up = bob
@@ -2367,12 +2355,10 @@ mod tests {
                 },
             })
             .expect("caught-up group realtime event");
-        assert!(
-            !caught_up
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::FetchGroupOutbox { .. }))
-        );
+        assert!(!caught_up
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchGroupOutbox { .. })));
     }
 
     #[test]
@@ -2618,12 +2604,10 @@ mod tests {
             matches!(effect, CoreEffect::AppendGroupEnvelope { append } if append.group_id == group_id)
         }));
         let snapshot = bob.engine.refresh_snapshot();
-        assert!(
-            snapshot
-                .pending_group_outbox
-                .iter()
-                .any(|item| item.group_id == group_id)
-        );
+        assert!(snapshot
+            .pending_group_outbox
+            .iter()
+            .any(|item| item.group_id == group_id));
 
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(restored.state.group_states.contains_key(&group_id));
@@ -2677,15 +2661,13 @@ mod tests {
         assert!(output.effects.iter().any(|effect| {
             matches!(effect, CoreEffect::AppendGroupEnvelope { append } if append.group_id == group_id)
         }));
-        assert!(
-            alice
-                .engine
-                .state
-                .pending_group_outbox
-                .iter()
-                .filter(|item| item.envelope.group_id == group_id)
-                .all(|item| item.in_flight && item.retries == 0)
-        );
+        assert!(alice
+            .engine
+            .state
+            .pending_group_outbox
+            .iter()
+            .filter(|item| item.envelope.group_id == group_id)
+            .all(|item| item.in_flight && item.retries == 0));
     }
 
     #[test]
@@ -2792,21 +2774,17 @@ mod tests {
         assert!(dissolve.effects.iter().any(|effect| {
             matches!(effect, CoreEffect::AppendGroupTransition { append } if append.group_id == group_id)
         }));
-        assert!(
-            alice
-                .engine
-                .state
-                .pending_group_seal
-                .contains_key(&group_id)
-        );
+        assert!(alice
+            .engine
+            .state
+            .pending_group_seal
+            .contains_key(&group_id));
 
         let snapshot = alice.engine.refresh_snapshot();
-        assert!(
-            snapshot
-                .pending_group_seal
-                .iter()
-                .any(|seal| seal.group_id == group_id)
-        );
+        assert!(snapshot
+            .pending_group_seal
+            .iter()
+            .any(|seal| seal.group_id == group_id));
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(restored.state.pending_group_seal.contains_key(&group_id));
         let resumed = restored
@@ -2941,16 +2919,12 @@ mod tests {
         harness.sync_group(&mut bob, &group_id);
         harness.send_text(&mut bob, &conversation_id, "after remove from bob");
         harness.sync_group(&mut alice, &group_id);
-        assert!(
-            group_plaintexts(&bob, &conversation_id)
-                .iter()
-                .any(|text| text == "after remove from alice")
-        );
-        assert!(
-            group_plaintexts(&alice, &conversation_id)
-                .iter()
-                .any(|text| text == "after remove from bob")
-        );
+        assert!(group_plaintexts(&bob, &conversation_id)
+            .iter()
+            .any(|text| text == "after remove from alice"));
+        assert!(group_plaintexts(&alice, &conversation_id)
+            .iter()
+            .any(|text| text == "after remove from bob"));
 
         let carol_before = group_plaintexts(&carol, &conversation_id);
         let _ = carol
@@ -3073,16 +3047,13 @@ mod tests {
                 .is_err(),
             "left member must not send group attachments"
         );
-        assert!(
-            !alice.engine.state.group_states[&group_id]
-                .manifest
-                .members
-                .iter()
-                .any(|member| {
-                    member.user_id == bob.bundle.user_id
-                        && member.status == GroupMemberStatus::Active
-                })
-        );
+        assert!(!alice.engine.state.group_states[&group_id]
+            .manifest
+            .members
+            .iter()
+            .any(|member| {
+                member.user_id == bob.bundle.user_id && member.status == GroupMemberStatus::Active
+            }));
 
         assert!(
             carol
@@ -3123,19 +3094,17 @@ mod tests {
             })
             .expect("admin removes dana");
         harness.drain(&mut carol, admin_remove);
-        assert!(
-            carol
-                .engine
-                .state
-                .group_states
-                .get(&group_id)
-                .expect("carol group")
-                .manifest
-                .members
-                .iter()
-                .any(|member| member.user_id == dana.bundle.user_id
-                    && member.status == GroupMemberStatus::Removed)
-        );
+        assert!(carol
+            .engine
+            .state
+            .group_states
+            .get(&group_id)
+            .expect("carol group")
+            .manifest
+            .members
+            .iter()
+            .any(|member| member.user_id == dana.bundle.user_id
+                && member.status == GroupMemberStatus::Removed));
 
         let mut owner = harness_user("owner", ALICE_MNEMONIC, "phone");
         let mut successor = harness_user("successor", BOB_MNEMONIC, "phone");
@@ -3499,12 +3468,10 @@ mod tests {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("delete contact");
-        assert!(
-            delete_output
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. }))
-        );
+        assert!(delete_output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
         assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
         let archived = alice
             .state
@@ -3530,13 +3497,11 @@ mod tests {
                     .is_some_and(|text| text.contains("archived"))
         }));
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
-        assert!(
-            alice
-                .state
-                .pending_outbox
-                .iter()
-                .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved })
-        );
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved }));
         let pending_after_delete = alice.state.pending_outbox.len();
         let send_err = alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -3567,30 +3532,22 @@ mod tests {
         assert!(replace.document.rejected_sender_user_ids.is_empty());
 
         let snapshot = alice.refresh_snapshot();
-        assert!(
-            snapshot
-                .conversations
-                .iter()
-                .any(|conversation| conversation.conversation_id == conversation_id)
-        );
-        assert!(
-            !snapshot
-                .contacts
-                .iter()
-                .any(|contact| contact.user_id == bob_bundle.user_id)
-        );
-        assert!(
-            !snapshot
-                .mls_states
-                .iter()
-                .any(|state| state.conversation_id == conversation_id)
-        );
-        assert!(
-            snapshot
-                .pending_outbox
-                .iter()
-                .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved })
-        );
+        assert!(snapshot
+            .conversations
+            .iter()
+            .any(|conversation| conversation.conversation_id == conversation_id));
+        assert!(!snapshot
+            .contacts
+            .iter()
+            .any(|contact| contact.user_id == bob_bundle.user_id));
+        assert!(!snapshot
+            .mls_states
+            .iter()
+            .any(|state| state.conversation_id == conversation_id));
+        assert!(snapshot
+            .pending_outbox
+            .iter()
+            .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved }));
 
         let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
         alice
@@ -3700,12 +3657,10 @@ mod tests {
                     .is_some_and(|text| text.contains("archived"))
         }));
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
-        assert!(
-            output
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. }))
-        );
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
 
         let allowlist_output = alice
             .handle_event(CoreEvent::AllowlistFetched {
@@ -4189,14 +4144,13 @@ mod tests {
             sync_state.pending_record_seqs.insert(1);
             sync_state.pending_retry = true;
         }
-        assert!(
-            bob.state
-                .sync_states
-                .get(&bob_device_id)
-                .expect("sync state")
-                .pending_records
-                .contains_key(&1)
-        );
+        assert!(bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state")
+            .pending_records
+            .contains_key(&1));
 
         bob.handle_event(CoreEvent::InboxRecordsFetched {
             device_id: bob_device_id.clone(),
@@ -4278,12 +4232,10 @@ mod tests {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
             .expect("alice accepts bob request");
-        assert!(
-            output
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { .. }))
-        );
+        assert!(output
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { .. })));
 
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let accepted_envelope = alice
@@ -4586,12 +4538,10 @@ mod tests {
             .get(&conversation_id)
             .expect("conversation");
         assert_eq!(bob_conversation.messages.len(), message_count_before);
-        assert!(
-            !bob_conversation
-                .messages
-                .iter()
-                .any(|message| message.message_id == stale_envelope.message_id)
-        );
+        assert!(!bob_conversation
+            .messages
+            .iter()
+            .any(|message| message.message_id == stale_envelope.message_id));
         assert!(!bob.state.recovery_contexts.contains_key(&conversation_id));
         let sync_state = bob
             .state
@@ -5006,13 +4956,11 @@ mod tests {
             })
             .expect("complete original");
         assert!(alice.state.pending_outbox.is_empty());
-        assert!(
-            alice
-                .state
-                .pending_blob_uploads
-                .get(&original_task)
-                .is_some_and(|task| task.uploaded)
-        );
+        assert!(alice
+            .state
+            .pending_blob_uploads
+            .get(&original_task)
+            .is_some_and(|task| task.uploaded));
         assert!(!original_done.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::UploadBlob { upload } if upload.task_id == original_task
@@ -5050,11 +4998,11 @@ mod tests {
             .expect("complete preview");
         assert_eq!(alice.state.pending_blob_uploads.len(), 0);
         assert_eq!(alice.state.pending_outbox.len(), bob_bundle.devices.len());
-        assert!(
-            alice.state.pending_outbox.iter().all(|item| {
-                item.app_message_id.as_deref() == Some(logical_message_id.as_str())
-            })
-        );
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| { item.app_message_id.as_deref() == Some(logical_message_id.as_str()) }));
         assert_eq!(
             completed
                 .effects
@@ -5095,12 +5043,10 @@ mod tests {
                 plaintext: vec![1_u8, 2, 3, 4],
             })
             .expect("attachment bytes loaded");
-        assert!(
-            prepared
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::PrepareBlobUpload { .. }))
-        );
+        assert!(prepared
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::PrepareBlobUpload { .. })));
         let upload_ready = alice
             .handle_event(CoreEvent::BlobUploadPrepared {
                 task_id: task_id.clone(),
@@ -5212,6 +5158,84 @@ mod tests {
     }
 
     #[test]
+    fn hydrate_message_content_restores_attachment_descriptor_after_stripped_snapshot() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let appended = complete_direct_attachment_send(&mut alice, &conversation_id);
+        let request_id = find_http_request_id(&appended, "/messages");
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":4,"delivered_to":"inbox"}"#.into()),
+            })
+            .expect("append response");
+
+        let snapshot = alice.refresh_snapshot();
+        let stored_message = snapshot
+            .conversations
+            .iter()
+            .find(|conversation| conversation.conversation_id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .state
+                    .messages
+                    .iter()
+                    .find(|message| message.plaintext.is_some())
+            })
+            .cloned()
+            .expect("persisted attachment message");
+        let metadata: AttachmentPayloadMetadata = serde_json::from_str(
+            stored_message
+                .plaintext
+                .as_deref()
+                .expect("attachment metadata"),
+        )
+        .expect("attachment metadata json");
+
+        let mut stripped = snapshot;
+        for conversation in &mut stripped.conversations {
+            for message in &mut conversation.state.messages {
+                message.plaintext = None;
+                message.storage_refs.clear();
+            }
+        }
+        for item in &mut stripped.pending_outbox {
+            item.plaintext_cache = None;
+        }
+        for item in &mut stripped.pending_group_outbox {
+            item.plaintext_cache = None;
+        }
+
+        let mut restored =
+            CoreEngine::try_from_restored_state(stripped).expect("restore stripped snapshot");
+        let message_id = stored_message.message_id.clone();
+        assert!(
+            restored
+                .resolve_attachment_descriptor(
+                    &conversation_id,
+                    &message_id,
+                    &metadata.original.object_ref,
+                )
+                .is_err(),
+            "stripped restore must hide attachment metadata"
+        );
+        restored
+            .hydrate_message_content(&conversation_id, stored_message)
+            .expect("hydrate attachment plaintext");
+        let resolved = restored
+            .resolve_attachment_descriptor(
+                &conversation_id,
+                &message_id,
+                &metadata.original.object_ref,
+            )
+            .expect("resolve after hydrate");
+        assert_eq!(resolved.object_ref, metadata.original.object_ref);
+        assert_eq!(resolved.read_capability, metadata.original.read_capability);
+    }
+
+    #[test]
     fn send_attachment_rejects_invalid_descriptor() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -5219,25 +5243,21 @@ mod tests {
 
         let mut descriptor = sample_attachment_descriptor();
         descriptor.size_bytes = 0;
-        assert!(
-            alice
-                .handle_command(CoreCommand::SendAttachmentMessage {
-                    conversation_id: conversation_id.clone(),
-                    attachment_descriptor: descriptor,
-                })
-                .is_err()
-        );
+        assert!(alice
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id: conversation_id.clone(),
+                attachment_descriptor: descriptor,
+            })
+            .is_err());
 
         let mut descriptor = sample_attachment_descriptor();
         descriptor.file_name = Some("nested/file.bin".into());
-        assert!(
-            alice
-                .handle_command(CoreCommand::SendAttachmentMessage {
-                    conversation_id,
-                    attachment_descriptor: descriptor,
-                })
-                .is_err()
-        );
+        assert!(alice
+            .handle_command(CoreCommand::SendAttachmentMessage {
+                conversation_id,
+                attachment_descriptor: descriptor,
+            })
+            .is_err());
     }
 
     #[test]
@@ -5366,11 +5386,11 @@ mod tests {
             task_id.starts_with("blob-download:msg:download:") && task_id.len() > 32
         }));
         assert_ne!(task_ids[0], task_ids[1]);
-        assert!(
-            engine.state.pending_blob_downloads.values().all(|task| {
-                task.blob_descriptor.storage_origin == "https://storage.example.com"
-            })
-        );
+        assert!(engine
+            .state
+            .pending_blob_downloads
+            .values()
+            .all(|task| { task.blob_descriptor.storage_origin == "https://storage.example.com" }));
     }
 
     #[test]
@@ -5452,12 +5472,10 @@ mod tests {
             .expect("fetch response");
 
         assert!(output.state_update.conversations_changed);
-        assert!(
-            engine
-                .state
-                .conversations
-                .contains_key(&expected_conversation_id)
-        );
+        assert!(engine
+            .state
+            .conversations
+            .contains_key(&expected_conversation_id));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -5830,12 +5848,10 @@ mod tests {
         });
 
         let persist = persist.expect("persist effect");
-        assert!(
-            persist
-                .ops
-                .iter()
-                .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. }))
-        );
+        assert!(persist
+            .ops
+            .iter()
+            .any(|op| matches!(op, PersistOp::SaveOutgoingEnvelope { .. })));
         assert!(persist.mutations.iter().any(|mutation| matches!(
             mutation,
             PersistenceMutation::Save {
@@ -5884,12 +5900,10 @@ mod tests {
         let snapshot = alice.refresh_snapshot();
 
         assert!(!snapshot.mls_state_persistence_blocked);
-        assert!(
-            snapshot
-                .mls_states
-                .iter()
-                .all(|state| state.serialized_group_state.is_some())
-        );
+        assert!(snapshot
+            .mls_states
+            .iter()
+            .all(|state| state.serialized_group_state.is_some()));
     }
 
     #[test]
@@ -5991,12 +6005,10 @@ mod tests {
                 ),
             })
             .expect("second stale response is terminal");
-        assert!(
-            failed
-                .effects
-                .iter()
-                .all(|effect| !matches!(effect, CoreEffect::FetchIdentityBundle { .. }))
-        );
+        assert!(failed
+            .effects
+            .iter()
+            .all(|effect| !matches!(effect, CoreEffect::FetchIdentityBundle { .. })));
         let pending = alice
             .state
             .pending_outbox
@@ -6037,19 +6049,15 @@ mod tests {
             })
             .expect("message request response");
 
-        assert!(
-            !alice
-                .state
-                .pending_outbox
-                .iter()
-                .any(|item| item.envelope.message_id == pending_message_id)
-        );
-        assert!(
-            output
-                .state_update
-                .system_statuses_changed
-                .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval)
-        );
+        assert!(!alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| item.envelope.message_id == pending_message_id));
+        assert!(output
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -6128,19 +6136,15 @@ mod tests {
             })
             .expect("rejected response");
 
-        assert!(
-            !alice
-                .state
-                .pending_outbox
-                .iter()
-                .any(|item| item.envelope.message_id == pending_message_id)
-        );
-        assert!(
-            output
-                .state_update
-                .system_statuses_changed
-                .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy)
-        );
+        assert!(!alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| item.envelope.message_id == pending_message_id));
+        assert!(output
+            .state_update
+            .system_statuses_changed
+            .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy));
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -6259,12 +6263,10 @@ mod tests {
                 if saved == &conversation_id
         )));
         let snapshot = alice.refresh_snapshot();
-        assert!(
-            !snapshot
-                .pending_outbox
-                .iter()
-                .any(|item| item.message_id == pending_message_id)
-        );
+        assert!(!snapshot
+            .pending_outbox
+            .iter()
+            .any(|item| item.message_id == pending_message_id));
         let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let conversation = restored
             .conversation_state(&conversation_id)
@@ -6481,12 +6483,10 @@ mod tests {
             .handle_event(CoreEvent::AppStarted)
             .expect("app started");
 
-        assert!(
-            resumed
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. }))
-        );
+        assert!(resumed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ReadAttachmentBytes { .. })));
         assert!(resumed.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -6545,14 +6545,12 @@ mod tests {
         }
         let serialized = serde_json::to_value(&snapshot.pending_blob_transfers)
             .expect("serialize pending blob transfers");
-        assert!(
-            serialized
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("Upload"))
-                .and_then(|upload| upload.get("blob_ciphertext"))
-                .is_none()
-        );
+        assert!(serialized
+            .as_array()
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("Upload"))
+            .and_then(|upload| upload.get("blob_ciphertext"))
+            .is_none());
 
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let resumed = restored
@@ -6819,35 +6817,27 @@ mod tests {
         );
 
         let snapshot = bob.refresh_snapshot();
-        assert!(
-            snapshot
-                .mls_states
-                .iter()
-                .any(|state| state.conversation_id == conversation_id)
-        );
-        assert!(
-            snapshot
-                .sync_states
-                .iter()
-                .any(|state| state.device_id == bob_device_id)
-        );
-        assert!(
-            snapshot
-                .pending_acks
-                .iter()
-                .any(|ack| ack.device_id == bob_device_id)
-        );
+        assert!(snapshot
+            .mls_states
+            .iter()
+            .any(|state| state.conversation_id == conversation_id));
+        assert!(snapshot
+            .sync_states
+            .iter()
+            .any(|state| state.device_id == bob_device_id));
+        assert!(snapshot
+            .pending_acks
+            .iter()
+            .any(|ack| ack.device_id == bob_device_id));
         let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         assert!(restored.mls_summary(&conversation_id).is_some());
         let restored_conversation = restored
             .conversation_state(&conversation_id)
             .expect("restored conversation");
-        assert!(
-            restored_conversation
-                .messages
-                .iter()
-                .any(|message| { message.plaintext.as_deref() == Some("hello after welcome") })
-        );
+        assert!(restored_conversation
+            .messages
+            .iter()
+            .any(|message| { message.plaintext.as_deref() == Some("hello after welcome") }));
         assert!(restored.sync_checkpoint_snapshot(&bob_device_id).is_some());
     }
 
@@ -7014,12 +7004,10 @@ mod tests {
             PersistOp::SaveSyncState { device_id } if device_id == &bob_device_id
         )));
         let snapshot = bob.refresh_snapshot();
-        assert!(
-            !snapshot
-                .pending_acks
-                .iter()
-                .any(|ack| ack.device_id == bob_device_id)
-        );
+        assert!(!snapshot
+            .pending_acks
+            .iter()
+            .any(|ack| ack.device_id == bob_device_id));
     }
 
     #[test]
@@ -7067,12 +7055,10 @@ mod tests {
                     if timer.timer_id == format!("refresh_identity:{}", bob_bundle.user_id)
                 )));
             } else {
-                assert!(
-                    output
-                        .state_update
-                        .system_statuses_changed
-                        .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild)
-                );
+                assert!(output
+                    .state_update
+                    .system_statuses_changed
+                    .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
             }
         }
 
@@ -7287,12 +7273,10 @@ mod tests {
             PersistOp::SaveMlsState { conversation_id: id } if id == &conversation_id
         )));
         let snapshot = alice.refresh_snapshot();
-        assert!(
-            !snapshot
-                .recovery_contexts
-                .iter()
-                .any(|context| context.conversation_id == conversation_id)
-        );
+        assert!(!snapshot
+            .recovery_contexts
+            .iter()
+            .any(|context| context.conversation_id == conversation_id));
 
         let send = alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -7490,12 +7474,10 @@ mod tests {
                     })
                     .expect("retry timer");
             } else {
-                assert!(
-                    !output
-                        .effects
-                        .iter()
-                        .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. }))
-                );
+                assert!(!output
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
             }
         }
 
@@ -8191,13 +8173,11 @@ mod tests {
             .get(&merged.user_id)
             .expect("updated contact");
         assert_eq!(updated.bundle.devices.len(), 2);
-        assert!(
-            updated
-                .bundle
-                .devices
-                .iter()
-                .any(|device| device.device_id == bob_laptop_profile.device_id)
-        );
+        assert!(updated
+            .bundle
+            .devices
+            .iter()
+            .any(|device| device.device_id == bob_laptop_profile.device_id));
     }
 
     #[test]
@@ -8316,16 +8296,12 @@ mod tests {
             })
             .collect();
         assert!(!remove_commits.is_empty());
-        assert!(
-            remove_commits
-                .iter()
-                .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id)
-        );
-        assert!(
-            remove_commits
-                .iter()
-                .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id)
-        );
+        assert!(remove_commits
+            .iter()
+            .all(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
+        assert!(remove_commits
+            .iter()
+            .all(|item| item.envelope.recipient_device_id != bob_phone_profile.device_id));
     }
 
     #[test]
@@ -8462,22 +8438,18 @@ mod tests {
                     .iter()
                     .any(|message| message.message_type == MessageType::MlsWelcome)
         }));
-        assert!(
-            restored.state.pending_outbox[pending_before..]
-                .iter()
-                .any(|item| {
-                    item.envelope.conversation_id == conversation_id
-                        && item.envelope.message_type == MessageType::MlsCommit
-                })
-        );
-        assert!(
-            restored.state.pending_outbox[pending_before..]
-                .iter()
-                .any(|item| {
-                    item.envelope.conversation_id == conversation_id
-                        && item.envelope.message_type == MessageType::MlsWelcome
-                })
-        );
+        assert!(restored.state.pending_outbox[pending_before..]
+            .iter()
+            .any(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            }));
+        assert!(restored.state.pending_outbox[pending_before..]
+            .iter()
+            .any(|item| {
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsWelcome
+            }));
         assert_eq!(
             restored
                 .state
@@ -8522,18 +8494,14 @@ mod tests {
             .expect("reimport deployment");
 
         assert_eq!(publish_shared_state_effects(&output).len(), 2);
-        assert!(
-            publish_shared_state_effects(&output)
-                .iter()
-                .any(|publish| publish.document_kind
-                    == crate::transport_contract::SharedStateDocumentKind::IdentityBundle)
-        );
-        assert!(
-            publish_shared_state_effects(&output)
-                .iter()
-                .any(|publish| publish.document_kind
-                    == crate::transport_contract::SharedStateDocumentKind::DeviceStatus)
-        );
+        assert!(publish_shared_state_effects(&output)
+            .iter()
+            .any(|publish| publish.document_kind
+                == crate::transport_contract::SharedStateDocumentKind::IdentityBundle));
+        assert!(publish_shared_state_effects(&output)
+            .iter()
+            .any(|publish| publish.document_kind
+                == crate::transport_contract::SharedStateDocumentKind::DeviceStatus));
     }
 
     #[test]
@@ -9678,12 +9646,10 @@ mod tests {
 
         if forged_before_welcome {
             deliver_inbox_envelope(&mut chat.bob, &bob_device_id, forged.clone(), 1);
-            assert!(
-                chat.bob.state.conversations[&conversation_id]
-                    .pcs
-                    .last_certified_commit_hash
-                    .is_none()
-            );
+            assert!(chat.bob.state.conversations[&conversation_id]
+                .pcs
+                .last_certified_commit_hash
+                .is_none());
             assert!(pending_has_message(
                 &chat.bob,
                 &bob_device_id,
@@ -9827,16 +9793,15 @@ mod tests {
                 .as_deref(),
             Some(new_hash.as_str())
         );
-        assert!(
-            chat.alice
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("alice conversation")
-                .pcs
-                .handshake
-                .is_none()
-        );
+        assert!(chat
+            .alice
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("alice conversation")
+            .pcs
+            .handshake
+            .is_none());
 
         chat.alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -9845,16 +9810,15 @@ mod tests {
             })
             .expect("send after handshake");
         deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
-        assert!(
-            chat.bob
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("bob conversation")
-                .messages
-                .iter()
-                .any(|message| message.plaintext.as_deref() == Some("after pcs"))
-        );
+        assert!(chat
+            .bob
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after pcs")));
     }
 
     #[test]
@@ -9980,16 +9944,15 @@ mod tests {
             })
             .expect("send while degraded");
         deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
-        assert!(
-            chat.bob
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("bob conversation")
-                .messages
-                .iter()
-                .any(|message| message.plaintext.as_deref() == Some("after degraded"))
-        );
+        assert!(chat
+            .bob
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after degraded")));
     }
 
     #[test]
@@ -10105,16 +10068,14 @@ mod tests {
             .expect("previous-round accept");
         prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
         trigger_direct_pcs_from_committer(&mut chat);
-        assert!(
-            committer_engine(&chat)
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("conversation")
-                .pcs
-                .handshake
-                .is_some()
-        );
+        assert!(committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_some());
         let committer_device = committer_device_id(&chat);
         let mut stale_accept = stale_accept;
         stale_accept.recipient_device_id = committer_device.clone();
@@ -10164,27 +10125,23 @@ mod tests {
         } else {
             &chat.bob
         };
-        assert!(
-            committer
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("committer conversation")
-                .pcs
-                .handshake
-                .is_some()
-        );
-        assert!(
-            !committer
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("committer conversation")
-                .pcs
-                .handshake
-                .as_ref()
-                .is_some_and(DirectPcsHandshake::is_promised)
-        );
+        assert!(committer
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("committer conversation")
+            .pcs
+            .handshake
+            .is_some());
+        assert!(!committer
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("committer conversation")
+            .pcs
+            .handshake
+            .as_ref()
+            .is_some_and(DirectPcsHandshake::is_promised));
         let (peer_mnemonic, peer_user_id) = if alice_was_committer {
             (
                 BOB_MNEMONIC,
@@ -10224,14 +10181,12 @@ mod tests {
         } else {
             &chat.bob
         };
-        assert!(
-            committer
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .and_then(|state| state.pcs.handshake.as_ref())
-                .is_some()
-        );
+        assert!(committer
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .is_some());
         let members_before = committer
             .state
             .mls_adapter
@@ -10332,16 +10287,14 @@ mod tests {
                 ],
             })
             .expect("accept plus application in one batch");
-        assert!(
-            committer
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .pcs
-                .handshake
-                .is_none()
-        );
+        assert!(committer
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_none());
         assert!(conversation_has_plaintext(
             committer,
             &conversation_id,
@@ -10350,16 +10303,14 @@ mod tests {
         let restored =
             CoreEngine::try_from_restored_state(fold_persist_onto_snapshot(pre_snapshot, &output))
                 .expect("restore folded persist");
-        assert!(
-            restored
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("restored conversation")
-                .pcs
-                .handshake
-                .is_none()
-        );
+        assert!(restored
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("restored conversation")
+            .pcs
+            .handshake
+            .is_none());
         assert!(conversation_has_plaintext(
             &restored,
             &conversation_id,
@@ -10637,16 +10588,14 @@ mod tests {
         } else {
             &chat.alice
         };
-        assert!(
-            acceptor
-                .state
-                .sync_states
-                .get(&acceptor_device)
-                .is_some_and(|sync| sync
-                    .pending_records
-                    .values()
-                    .any(|record| record.envelope.message_id == membership.message_id))
-        );
+        assert!(acceptor
+            .state
+            .sync_states
+            .get(&acceptor_device)
+            .is_some_and(|sync| sync
+                .pending_records
+                .values()
+                .any(|record| record.envelope.message_id == membership.message_id)));
         let restored_acceptor = CoreEngine::try_from_restored_state(acceptor.refresh_snapshot())
             .expect("restore acceptor with pending membership");
         if alice_was_committer {
@@ -10659,13 +10608,11 @@ mod tests {
         } else {
             &chat.alice
         };
-        assert!(
-            acceptor
-                .state
-                .sync_states
-                .get(&acceptor_device)
-                .is_some_and(|sync| !sync.pending_records.is_empty())
-        );
+        assert!(acceptor
+            .state
+            .sync_states
+            .get(&acceptor_device)
+            .is_some_and(|sync| !sync.pending_records.is_empty()));
         deliver_inbox_envelope(
             if alice_was_committer {
                 &mut chat.bob
@@ -10686,16 +10633,14 @@ mod tests {
         } else {
             &chat.bob
         };
-        assert!(
-            acceptor
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("conversation")
-                .pcs
-                .handshake
-                .is_none()
-        );
+        assert!(acceptor
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_none());
         let acceptor_members = acceptor
             .state
             .mls_adapter
@@ -11074,14 +11019,12 @@ mod tests {
         } else {
             &chat.alice
         };
-        assert!(
-            acceptor
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .and_then(|state| state.pcs.handshake.as_ref())
-                .is_some_and(DirectPcsHandshake::is_promised)
-        );
+        assert!(acceptor
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .is_some_and(DirectPcsHandshake::is_promised));
         let alice_is_acceptor = !alice_was_committer;
         let (peer_mnemonic, peer_user_id) = if alice_is_acceptor {
             (
@@ -11122,14 +11065,12 @@ mod tests {
         } else {
             &chat.alice
         };
-        assert!(
-            acceptor
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .and_then(|state| state.pcs.handshake.as_ref())
-                .is_some_and(DirectPcsHandshake::is_promised)
-        );
+        assert!(acceptor
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .and_then(|state| state.pcs.handshake.as_ref())
+            .is_some_and(DirectPcsHandshake::is_promised));
         let members_before = acceptor
             .state
             .mls_adapter
@@ -11430,16 +11371,14 @@ mod tests {
         prime_direct_pcs_count(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
         let conversation_id = chat.conversation_id.clone();
         complete_direct_attachment_send(committer_engine_mut(&mut chat), &conversation_id);
-        assert!(
-            committer_engine(&chat)
-                .state
-                .conversations
-                .get(&chat.conversation_id)
-                .expect("conversation")
-                .pcs
-                .handshake
-                .is_some()
-        );
+        assert!(committer_engine(&chat)
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .pcs
+            .handshake
+            .is_some());
     }
 
     #[test]
@@ -11491,16 +11430,14 @@ mod tests {
         let restored =
             CoreEngine::try_from_restored_state(committer_engine(&chat).refresh_snapshot())
                 .expect("restore after attachment stage");
-        assert!(
-            restored
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("restored conversation")
-                .pcs
-                .handshake
-                .is_some()
-        );
+        assert!(restored
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("restored conversation")
+            .pcs
+            .handshake
+            .is_some());
     }
 
     fn seeded_engine(mnemonic: &str, device_name: &str, bundle: IdentityBundle) -> CoreEngine {
@@ -12801,12 +12738,10 @@ mod tests {
             .engine
             .handle_event(CoreEvent::GroupOutboxFetched {
                 group_id: group_id.clone(),
-                records: vec![
-                    harness.outboxes[&group_id]
-                        .last()
-                        .expect("forged record")
-                        .clone(),
-                ],
+                records: vec![harness.outboxes[&group_id]
+                    .last()
+                    .expect("forged record")
+                    .clone()],
                 to_seq: 99,
             })
             .expect_err("non-contiguous forged transition must be rejected");
@@ -12891,12 +12826,10 @@ mod tests {
             .engine
             .handle_event(CoreEvent::GroupOutboxFetched {
                 group_id: group_id.clone(),
-                records: vec![
-                    harness.outboxes[&group_id]
-                        .last()
-                        .expect("forged record")
-                        .clone(),
-                ],
+                records: vec![harness.outboxes[&group_id]
+                    .last()
+                    .expect("forged record")
+                    .clone()],
                 to_seq: 99,
             })
             .expect_err("control without proof must be rejected");
@@ -12994,12 +12927,10 @@ mod tests {
             .engine
             .handle_event(CoreEvent::GroupOutboxFetched {
                 group_id: group_id.clone(),
-                records: vec![
-                    harness.outboxes[&group_id]
-                        .last()
-                        .expect("forged record")
-                        .clone(),
-                ],
+                records: vec![harness.outboxes[&group_id]
+                    .last()
+                    .expect("forged record")
+                    .clone()],
                 to_seq: 99,
             })
             .expect_err("broken commit chain must be rejected");

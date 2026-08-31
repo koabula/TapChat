@@ -340,6 +340,18 @@ impl ProfileStorageSession {
         self.execute(move |connection| query_messages_from_conn(connection, &query))
     }
 
+    pub fn get_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<StoredMessage>> {
+        let conversation_id = conversation_id.to_string();
+        let message_id = message_id.to_string();
+        self.execute(move |connection| {
+            get_message_from_conn(connection, &conversation_id, &message_id)
+        })
+    }
+
     pub fn count_received_visible_messages(
         &self,
         conversation_id: &str,
@@ -486,6 +498,16 @@ impl<'a> SqlCipherLocalStore<'a> {
         let conn = self.connect()?;
         ensure_schema(&conn)?;
         query_messages_from_conn(&conn, query)
+    }
+
+    pub fn get_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<StoredMessage>> {
+        let conn = self.connect()?;
+        ensure_schema(&conn)?;
+        get_message_from_conn(&conn, conversation_id, message_id)
     }
 
     pub fn count_received_visible_messages(
@@ -2214,6 +2236,29 @@ fn load_message_security_index(
     Ok(())
 }
 
+fn get_message_from_conn(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<Option<StoredMessage>> {
+    let columns = "message_id, app_message_id, mls_ciphertext_sha256, sender_user_id,
+                   sender_device_id, recipient_device_id, message_type, created_at,
+                   plaintext, storage_refs, delivery_state, message_request_id";
+    let sql = format!(
+        "SELECT {columns} FROM messages
+         WHERE conversation_id = ?1
+           AND (message_id = ?2 OR app_message_id = ?2)
+         ORDER BY created_at DESC, message_id DESC LIMIT 1"
+    );
+    conn.query_row(
+        &sql,
+        params![conversation_id, message_id],
+        decode_message_row,
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
 fn query_messages_from_conn(conn: &Connection, query: &MessageQuery) -> Result<MessagePage> {
     let limit = query.limit.clamp(1, 200);
     let cursor = query
@@ -2895,6 +2940,92 @@ mod tests {
             )
             .expect("conversation summary after delete");
         assert_eq!(summary, (0, None));
+    }
+
+    #[test]
+    fn get_message_returns_plaintext_after_security_index_restore() {
+        let dir = tempdir().expect("tempdir");
+        let pdek = generate_pdek();
+        let store = SqlCipherLocalStore::new(dir.path(), "profile:test", &*pdek);
+        let conversation_id = "conversation:hydrate".to_string();
+        let message_id = "message:hydrate".to_string();
+        let plaintext = r#"{"version":2,"attachment_id":"att:1"}"#;
+        let message = StoredMessage {
+            message_id: message_id.clone(),
+            app_message_id: Some("app:hydrate".into()),
+            mls_ciphertext_sha256: Some("hash:hydrate".into()),
+            sender_user_id: Some("user:alice".into()),
+            sender_device_id: "device:alice:phone".into(),
+            recipient_device_id: "device:bob:phone".into(),
+            message_type: MessageType::MlsApplication,
+            created_at: 42,
+            plaintext: Some(plaintext.into()),
+            storage_refs: vec![crate::model::StorageRef {
+                kind: "attachment_original".into(),
+                object_ref: "blob:hydrate".into(),
+                size_bytes: 16,
+                mime_type: "application/octet-stream".into(),
+                file_name: None,
+                expires_at: Some(999),
+            }],
+            delivery_state: None,
+            message_request_id: None,
+        };
+        let conversation = PersistedConversation {
+            conversation_id: conversation_id.clone(),
+            state: crate::conversation::LocalConversationState {
+                conversation: Conversation {
+                    conversation_id: conversation_id.clone(),
+                    kind: ConversationKind::Direct,
+                    member_users: vec!["user:alice".into(), "user:bob".into()],
+                    member_devices: vec![],
+                    state: ConversationState::Active,
+                    updated_at: 42,
+                },
+                messages: vec![message.clone()],
+                last_message_type: Some(MessageType::MlsApplication),
+                peer_user_id: "user:bob".into(),
+                last_known_peer_active_devices: Default::default(),
+                recovery_status: crate::conversation::RecoveryStatus::Healthy,
+                archive_metadata: None,
+                pcs: Default::default(),
+            },
+        };
+        store
+            .save_snapshot(&CorePersistenceSnapshot {
+                conversations: vec![conversation],
+                ..CorePersistenceSnapshot::default()
+            })
+            .expect("seed attachment message");
+
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        let restored = snapshot
+            .conversations
+            .iter()
+            .find(|conversation| conversation.conversation_id == conversation_id)
+            .and_then(|conversation| {
+                conversation
+                    .state
+                    .messages
+                    .iter()
+                    .find(|candidate| candidate.message_id == message_id)
+            })
+            .expect("security index row");
+        assert!(restored.plaintext.is_none());
+        assert!(restored.storage_refs.is_empty());
+
+        let loaded = store
+            .get_message(&conversation_id, &message_id)
+            .expect("get_message")
+            .expect("message present");
+        assert_eq!(loaded.plaintext.as_deref(), Some(plaintext));
+        assert_eq!(loaded.storage_refs, message.storage_refs);
+
+        let by_app = store
+            .get_message(&conversation_id, "app:hydrate")
+            .expect("get_message by app id")
+            .expect("message present");
+        assert_eq!(by_app.message_id, message_id);
     }
 
     #[test]
