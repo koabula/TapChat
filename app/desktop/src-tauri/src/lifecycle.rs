@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -13,7 +13,7 @@ use tapchat_core::platform_ports::execute_platform_effect;
 use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput};
 
 use crate::commands::session::{
-    read_session_status_snapshot, set_ws_connection_snapshot, SessionStatus,
+    SessionStatus, read_session_status_snapshot, set_ws_connection_snapshot,
 };
 use crate::state::{AppState, DeferredTransportBatch, LockReason, SessionState, StartupPhase};
 
@@ -368,7 +368,10 @@ fn spawn_runtime_auth_scheduler(app: AppHandle) {
                     let snapshot = state.runtime_auth.snapshot().await;
                     log::warn!(
                         "scheduled runtime authorization refresh failed: code={} retryable={} next_retry_at={}",
-                        snapshot.error_code.as_deref().unwrap_or("temporary_unavailable"),
+                        snapshot
+                            .error_code
+                            .as_deref()
+                            .unwrap_or("temporary_unavailable"),
                         snapshot.retryable,
                         snapshot
                             .next_retry_at
@@ -819,13 +822,13 @@ fn split_persistence_prefix(effects: Vec<CoreEffect>) -> (Vec<CoreEffect>, Vec<C
 #[cfg(test)]
 mod deferred_send_tests {
     use super::{
-        complete_persistence, pending_persistence_count, split_persistence_prefix, DriverWork,
+        DriverWork, complete_persistence, pending_persistence_count, split_persistence_prefix,
     };
     use std::sync::Arc;
     use std::time::Duration;
-    use tapchat_core::ffi_api::{PersistStateEffect, TimerEffect};
     use tapchat_core::CoreEffect;
-    use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+    use tapchat_core::ffi_api::{PersistStateEffect, TimerEffect};
+    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 
     #[test]
     fn persistence_prefix_is_removed_without_reordering_transport() {

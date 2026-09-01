@@ -277,6 +277,7 @@ export interface ContactSummary {
   device_count: number;
   display_name?: string | null;
   relationship_status: ContactRelationshipStatus;
+  verified?: boolean;
 }
 
 export interface ContactLinkPreview {

@@ -9,6 +9,7 @@ import GroupsPage from "./pages/groups/GroupsPage";
 
 import ContactList from "./pages/contacts/ContactList";
 import ContactDetail from "./pages/contacts/ContactDetail";
+import VerifyIdentity from "./pages/contacts/VerifyIdentity";
 
 import MessageRequests from "./pages/requests/MessageRequests";
 
@@ -286,6 +287,7 @@ function AppInner({ startupError }: { startupError: string | null }) {
               <Route path="groups" element={<GroupsPage />} />
               <Route path="contacts" element={<ContactList />} />
               <Route path="contacts/:id" element={<ContactDetail />} />
+              <Route path="contacts/:id/verify" element={<VerifyIdentity />} />
               <Route path="requests" element={<MessageRequests />} />
               <Route path="settings" element={<RouteSuspense><Settings /></RouteSuspense>} />
               <Route path="settings/devices" element={<RouteSuspense><Settings initialSection="devices" /></RouteSuspense>} />

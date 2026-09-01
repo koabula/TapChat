@@ -12,11 +12,11 @@ mod storage_layout;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "gui")]
+use tauri::Manager;
+#[cfg(feature = "gui")]
 use tauri::menu::{Menu, MenuItem};
 #[cfg(feature = "gui")]
 use tauri::tray::TrayIconBuilder;
-#[cfg(feature = "gui")]
-use tauri::Manager;
 
 pub use state::{AppState, SessionState};
 
@@ -333,6 +333,8 @@ pub fn run() {
             commands::contact::refresh_contact,
             commands::contact::set_contact_display_name,
             commands::contact::delete_contact,
+            commands::contact::get_safety_number,
+            commands::contact::set_contact_verified,
             // Profile
             commands::profile::list_profiles,
             commands::profile::create_profile,

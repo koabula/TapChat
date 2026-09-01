@@ -48,8 +48,8 @@ pub(super) fn visible_plaintext_preview(plaintext: &str) -> String {
 mod tests {
     use super::visible_plaintext_preview;
     use tapchat_core::attachment_crypto::{
-        encrypt_blob, sha256_hex, AttachmentKind, AttachmentManifestV2, AttachmentVariant,
-        EncryptedBlobDescriptor,
+        AttachmentKind, AttachmentManifestV2, AttachmentVariant, EncryptedBlobDescriptor,
+        encrypt_blob, sha256_hex,
     };
 
     #[test]

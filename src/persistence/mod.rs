@@ -90,6 +90,37 @@ pub struct PersistedContact {
     pub relationship_status: ContactRelationshipStatus,
     #[serde(default)]
     pub added_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_root_key: Option<String>,
+}
+
+impl PersistedContact {
+    pub fn is_verified(&self) -> bool {
+        self.verified_at.is_some()
+            && self.verified_root_key.as_deref() == Some(self.bundle.user_public_key.as_str())
+    }
+
+    pub fn set_verified(&mut self, verified: bool, now: u64) {
+        if verified {
+            self.verified_at = Some(now);
+            self.verified_root_key = Some(self.bundle.user_public_key.clone());
+        } else {
+            self.clear_verification();
+        }
+    }
+
+    pub fn align_verification(&mut self) {
+        if !self.is_verified() {
+            self.clear_verification();
+        }
+    }
+
+    fn clear_verification(&mut self) {
+        self.verified_at = None;
+        self.verified_root_key = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -967,8 +998,8 @@ mod tests {
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
-        WakeHint, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
+        MessageType, SenderProof, WakeHint,
     };
     use base64::Engine as _;
 
@@ -1012,6 +1043,8 @@ mod tests {
                 original_name: None,
                 relationship_status: ContactRelationshipStatus::Available,
                 added_at: 0,
+                verified_at: None,
+                verified_root_key: None,
             }],
             conversations: vec![PersistedConversation {
                 conversation_id: conversation.conversation.conversation_id.clone(),
@@ -1283,6 +1316,8 @@ mod tests {
                 original_name: None,
                 relationship_status: ContactRelationshipStatus::Available,
                 added_at: 0,
+                verified_at: None,
+                verified_root_key: None,
             }],
             conversations: vec![],
             sync_states: vec![],
@@ -1368,11 +1403,13 @@ mod tests {
 
         let snapshot = decode_snapshot(bytes.as_bytes()).expect("decode v1 snapshot");
         assert_eq!(snapshot.message_nonce, 7);
-        assert!(snapshot
-            .deployment
-            .as_ref()
-            .and_then(|deployment| deployment.pending_identity_publication.as_ref())
-            .is_none());
+        assert!(
+            snapshot
+                .deployment
+                .as_ref()
+                .and_then(|deployment| deployment.pending_identity_publication.as_ref())
+                .is_none()
+        );
         assert!(snapshot.pending_group_outbox.is_empty());
     }
 

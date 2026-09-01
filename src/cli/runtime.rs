@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use serde_json::json;
 
 use crate::identity::LocalIdentityState;
 use crate::model::{
-    DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceRuntimeRefreshChallenge,
-    DeviceRuntimeRefreshProof, IdentityBundle, Validate, CURRENT_MODEL_VERSION,
+    CURRENT_MODEL_VERSION, DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth,
+    DeviceRuntimeRefreshChallenge, DeviceRuntimeRefreshProof, IdentityBundle, Validate,
 };
 
 #[derive(Debug)]
@@ -565,13 +565,19 @@ pub async fn wait_until_ready(base_url: &str, expected_runtime_id: &str) -> Resu
                         .await
                         .context("decode runtime readiness response")?;
                     if !ready.ready || ready.runtime_id != expected_runtime_id {
-                        bail!("runtime_mismatch: runtime readiness audience differs from provisioning journal");
+                        bail!(
+                            "runtime_mismatch: runtime readiness audience differs from provisioning journal"
+                        );
                     }
                     if ready.protocol_version != 5 || ready.registry_schema_version != 2 {
-                        bail!("protocol_mismatch: runtime readiness protocol or registry schema is unsupported");
+                        bail!(
+                            "protocol_mismatch: runtime readiness protocol or registry schema is unsupported"
+                        );
                     }
                     if ready.worker_build_id != CLI_WORKER_BUILD_ID {
-                        bail!("worker_build_mismatch: deployed worker build differs from provisioning request");
+                        bail!(
+                            "worker_build_mismatch: deployed worker build differs from provisioning request"
+                        );
                     }
                     return Ok(());
                 } else if status.as_u16() == 404
@@ -595,7 +601,9 @@ pub async fn wait_until_ready(base_url: &str, expected_runtime_id: &str) -> Resu
             );
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!("runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}. Last error: {last_error}");
+            bail!(
+                "runtime_not_ready_in_time: cloudflare runtime did not become ready in time for {base_url}. Last error: {last_error}"
+            );
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
@@ -892,7 +900,7 @@ pub fn prepare_runtime_secret_rotation(
         RuntimeSecretRotationPhase::PendingAuthorization
             if secrets.previous_device_runtime_secret.is_some() =>
         {
-            return Ok(())
+            return Ok(());
         }
         RuntimeSecretRotationPhase::Stable | RuntimeSecretRotationPhase::PendingAuthorization => {}
     }
@@ -1289,11 +1297,7 @@ fn prompt_line(prompt: &str) -> Result<String> {
 }
 
 fn display_default(value: &str) -> &str {
-    if value.is_empty() {
-        "<empty>"
-    } else {
-        value
-    }
+    if value.is_empty() { "<empty>" } else { value }
 }
 
 pub fn generate_hex_secret() -> String {

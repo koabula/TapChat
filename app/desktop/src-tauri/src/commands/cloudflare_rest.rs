@@ -881,8 +881,8 @@ pub async fn get_accounts(api_token: &str) -> Result<Vec<AccountInfo>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_worker_metadata, create_r2_bucket_at, merge_tapchat_lifecycle_rules,
-        WorkerDeployConfig, WORKER_COMPATIBILITY_DATE,
+        WORKER_COMPATIBILITY_DATE, WorkerDeployConfig, build_worker_metadata, create_r2_bucket_at,
+        merge_tapchat_lifecycle_rules,
     };
     use reqwest::Client;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1034,9 +1034,11 @@ mod tests {
             1
         );
         for name in ["SHARING_INTERNAL_SECRET", "DEVICE_RUNTIME_SECRET"] {
-            assert!(bindings
-                .iter()
-                .any(|binding| { binding["type"] == "secret_text" && binding["name"] == name }));
+            assert!(
+                bindings
+                    .iter()
+                    .any(|binding| { binding["type"] == "secret_text" && binding["name"] == name })
+            );
         }
     }
 

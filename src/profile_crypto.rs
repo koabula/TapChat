@@ -1,8 +1,8 @@
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
-    aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
+    aead::{Aead, Payload},
 };
 use hkdf::Hkdf;
 use rand::RngCore;
@@ -520,9 +520,11 @@ mod tests {
         let plaintext = br#"{"secret":"visible-marker"}"#;
 
         let encrypted = encrypt_snapshot(profile_id, &*pdek, plaintext).expect("encrypt");
-        assert!(!encrypted
-            .windows("visible-marker".len())
-            .any(|window| window == b"visible-marker"));
+        assert!(
+            !encrypted
+                .windows("visible-marker".len())
+                .any(|window| window == b"visible-marker")
+        );
 
         let decrypted = decrypt_snapshot(profile_id, &*pdek, &encrypted).expect("decrypt");
         assert_eq!(decrypted, plaintext);
@@ -535,9 +537,11 @@ mod tests {
         let encrypted =
             encrypt_profile_document(profile_id, &*pdek, "private-state", b"visible-marker")
                 .expect("encrypt");
-        assert!(!encrypted
-            .windows("visible-marker".len())
-            .any(|window| window == b"visible-marker"));
+        assert!(
+            !encrypted
+                .windows("visible-marker".len())
+                .any(|window| window == b"visible-marker")
+        );
 
         let decrypted = decrypt_profile_document(profile_id, &*pdek, "private-state", &encrypted)
             .expect("decrypt");

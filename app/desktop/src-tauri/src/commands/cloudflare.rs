@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -22,8 +22,8 @@ use tapchat_core::{CoreCommand, CoreEvent};
 use crate::commands::cloudflare_rest::{
     self, DeployPhase, DeployProgress, DeployResult, WorkerDeployConfig,
 };
-use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
-use crate::lifecycle::{drive_core_with_handle, drive_prepared_core_output, CoreInput};
+use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
+use crate::lifecycle::{CoreInput, drive_core_with_handle, drive_prepared_core_output};
 use crate::platform::log_sanitize::sanitize_url_for_log;
 use crate::runtime_auth::wait_for_runtime_bundle;
 use crate::state::AppState;
@@ -444,9 +444,11 @@ mod tests {
             None,
         );
         assert!(legacy.needs_upgrade);
-        assert!(runtime_missing_group_outbox_message(&legacy)
-            .expect("upgrade message")
-            .contains("runtime_missing_group_outbox"));
+        assert!(
+            runtime_missing_group_outbox_message(&legacy)
+                .expect("upgrade message")
+                .contains("runtime_missing_group_outbox")
+        );
 
         let current = status_from_features(
             true,
@@ -1309,7 +1311,7 @@ async fn prepare_runtime_secret_rotation(state: &State<'_, AppState>) -> Result<
         RuntimeSecretRotationPhase::Grace => {
             return Err(
                 "The current rotation is still in grace; finalize it before rotating again.".into(),
-            )
+            );
         }
         RuntimeSecretRotationPhase::PendingAuthorization
             if secrets.previous_device_runtime_secret.is_some() =>

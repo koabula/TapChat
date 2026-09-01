@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tapchat_core::external_fetch::{
-    fetch_external_json, validate_group_invite_transport_binding, ExternalResourceKind,
+    ExternalResourceKind, fetch_external_json, validate_group_invite_transport_binding,
 };
 use tapchat_core::ffi_api::{
     CacheUploadedAttachmentEffect, CoreEvent, DeleteBlobRequest, HttpMethod, HttpRequestEffect,
@@ -52,7 +52,7 @@ use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::persistence::DesktopPersistence;
 use crate::platform::profile::ProfileManagerInner;
 use crate::platform::realtime::RealtimeManager;
-use crate::platform::transport::{build_desktop_http_client, DesktopTransport};
+use crate::platform::transport::{DesktopTransport, build_desktop_http_client};
 use crate::runtime_auth::RuntimeAuthManager;
 
 /// Desktop-specific implementation of all platform port traits.
@@ -2153,7 +2153,7 @@ impl SecureStoragePort for DesktopPlatformPorts {}
 mod tests {
     use super::*;
     use tapchat_core::cli::profile::{
-        override_profile_registry_path_for_test, Profile, ProfileInitOptions, ProfileRegistry,
+        Profile, ProfileInitOptions, ProfileRegistry, override_profile_registry_path_for_test,
     };
 
     #[test]
@@ -2242,9 +2242,11 @@ mod tests {
                 .join("objects")
                 .join(format!("{cache_id}.enc"));
             let encrypted = std::fs::read(path).expect("read encrypted cache");
-            assert!(!encrypted
-                .windows(plaintext.len())
-                .any(|window| window == plaintext));
+            assert!(
+                !encrypted
+                    .windows(plaintext.len())
+                    .any(|window| window == plaintext)
+            );
             let decrypted = {
                 let manager = profile_inner.read().await;
                 manager
@@ -2350,8 +2352,10 @@ mod tests {
         )
         .expect_err("invalid outbox endpoint should be rejected");
 
-        assert!(error
-            .to_string()
-            .contains("group outbox endpoint must end with /outbox/messages"));
+        assert!(
+            error
+                .to_string()
+                .contains("group outbox endpoint must end with /outbox/messages")
+        );
     }
 }

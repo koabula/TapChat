@@ -11,6 +11,7 @@ export interface ContactProjection {
   device_count: number;
   last_refresh: number | null;
   relationship_status: ContactRelationshipStatus;
+  verified: boolean;
 }
 
 export function mapContacts(contacts: ContactSummaryInput[]): ContactProjection[] {
@@ -20,6 +21,7 @@ export function mapContacts(contacts: ContactSummaryInput[]): ContactProjection[
     device_count: contact.device_count,
     last_refresh: null,
     relationship_status: contact.relationship_status ?? "available",
+    verified: Boolean(contact.verified),
   }));
 }
 

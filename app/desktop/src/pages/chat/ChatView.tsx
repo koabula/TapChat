@@ -463,6 +463,7 @@ export default function ChatView() {
         device_count: contact.device_count,
         last_refresh: Date.now(),
         relationship_status: contact.relationship_status ?? "available",
+        verified: Boolean(contact.verified),
       })),
     );
   };
@@ -1047,7 +1048,9 @@ export default function ChatView() {
                 {dissolved ? (
                   <span className="text-red-500">Dissolved</span>
                 ) : conversationRecovering ? (
-                  <span className="text-yellow-500">Needs recovery</span>
+                  <span className="text-yellow-500">
+                    {recoveryHeadline(conversationRecovery?.reason)}
+                  </span>
                 ) : (
                   <>
                     <GroupSyncIndicator status={groupSyncStatus} compact />
@@ -1070,7 +1073,9 @@ export default function ChatView() {
                 {directPendingOutbound ? (
                   <span className="text-muted-color">Waiting for accept</span>
                 ) : conversationRecovering ? (
-                  <span className="text-yellow-500">Needs recovery</span>
+                  <span className="text-yellow-500">
+                    {recoveryHeadline(conversationRecovery?.reason)}
+                  </span>
                 ) : directClosed ? (
                   <span className="text-muted-color">
                     {activeConversation?.state === "archived" ? "Archived" : "Closed"}
@@ -1079,6 +1084,20 @@ export default function ChatView() {
                   <>
                     <span className="w-1.5 h-1.5 rounded-full status-success animate-pulse" />
                     End-to-end encrypted
+                    <button
+                      type="button"
+                      className={`ml-2 badge text-[10px] uppercase tracking-wide ${
+                        activeDirectContact?.verified
+                          ? "status-success"
+                          : "bg-yellow-500/10 text-yellow-500"
+                      }`}
+                      onClick={() => {
+                        const userId = activeConversation?.peer_user_id;
+                        if (userId) navigate(`/contacts/${encodeURIComponent(userId)}/verify`);
+                      }}
+                    >
+                      {activeDirectContact?.verified ? "Verified" : "Unverified"}
+                    </button>
                   </>
                 )}
               </>
@@ -1121,7 +1140,9 @@ export default function ChatView() {
           <div className="mx-auto flex max-w-4xl flex-wrap items-center gap-3 text-sm">
             <AlertTriangle size={16} className="shrink-0 text-yellow-500" />
             <div className="min-w-0 flex-1">
-              <div className="font-medium text-primary-color">Secure chat needs recovery</div>
+              <div className="font-medium text-primary-color">
+                {recoveryHeadline(conversationRecovery.reason)}
+              </div>
               <div className="break-words text-muted-color">
                 {formatRecoveryMessage(
                   conversationRecovery.restore_failure_reason,
@@ -1143,6 +1164,28 @@ export default function ChatView() {
           </div>
         </div>
       )}
+
+      {!isGroup &&
+        !directPendingOutbound &&
+        !directClosed &&
+        !conversationRecovering &&
+        activeDirectContact &&
+        !activeDirectContact.verified && (
+          <div className="border-b border-subtle bg-surface px-4 py-2">
+            <div className="mx-auto flex max-w-4xl items-center gap-3 text-sm">
+              <span className="text-yellow-500">Identity unverified</span>
+              <button
+                className="btn btn-ghost text-xs ml-auto"
+                onClick={() => {
+                  const userId = activeConversation?.peer_user_id;
+                  if (userId) navigate(`/contacts/${encodeURIComponent(userId)}/verify`);
+                }}
+              >
+                Verify
+              </button>
+            </div>
+          </div>
+        )}
 
       <div
         ref={messagesContainerRef}
@@ -1280,6 +1323,17 @@ function formatGroupStateEvent(
       return `${actor} updated the group details.`;
     case "group_dissolved":
       return `${actor} dissolved the group.`;
+  }
+}
+
+function recoveryHeadline(reason?: string): string {
+  switch (reason) {
+    case "membership_changed":
+      return "Devices changed";
+    case "identity_changed":
+      return "Identity changed";
+    default:
+      return "Needs recovery";
   }
 }
 

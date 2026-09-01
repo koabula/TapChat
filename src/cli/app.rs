@@ -1,7 +1,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use reqwest::Client;
 use serde::Serialize;
@@ -2301,9 +2301,7 @@ fn parse_group_join_policy(value: &str) -> Result<crate::model::GroupJoinPolicy>
 fn parse_group_member_invite_policy(value: &str) -> Result<crate::model::GroupMemberInvitePolicy> {
     match value {
         "owner_admin_only" => Ok(crate::model::GroupMemberInvitePolicy::OwnerAdminOnly),
-        "request_owner_approval" => {
-            Ok(crate::model::GroupMemberInvitePolicy::RequestOwnerApproval)
-        }
+        "request_owner_approval" => Ok(crate::model::GroupMemberInvitePolicy::RequestOwnerApproval),
         other => Err(anyhow!(
             "unknown member invite policy {other:?} (expected owner_admin_only|request_owner_approval)"
         )),

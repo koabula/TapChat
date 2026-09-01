@@ -221,6 +221,21 @@ export default function ContactDetail() {
               <span className="text-primary-color">{contact?.device_count || 1} device(s)</span>
             </div>
 
+            <div className="card">
+              <label className="text-muted-color text-xs block mb-1">Identity</label>
+              <div className="flex items-center justify-between gap-2">
+                <span className={contact?.verified ? "status-success" : "text-yellow-500"}>
+                  {contact?.verified ? "Verified" : "Unverified"}
+                </span>
+                <button
+                  className="btn btn-ghost text-sm"
+                  onClick={() => navigate(`/contacts/${encodeURIComponent(userId || "")}/verify`)}
+                >
+                  Verify
+                </button>
+              </div>
+            </div>
+
             {relationshipInfo && (
               <div className="card">
                 <label className="text-muted-color text-xs block mb-1">Status</label>

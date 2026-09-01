@@ -1,8 +1,8 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, Payload},
 };
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
@@ -481,11 +481,10 @@ pub fn blob_cache_id(storage_origin: &str, object_ref: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attachment_chunk_ciphertext_range, attachment_chunk_count, attachment_chunk_nonce,
-        decrypt_attachment_chunk, decrypt_blob, decrypt_chunked_blob, encrypt_blob,
-        encrypt_chunked_blob, plaintext_range_to_chunk_span, sha256_hex, AttachmentKind,
-        AttachmentManifestV2, AttachmentVariant, EncryptedBlobDescriptor,
-        ATTACHMENT_CHUNK_SIZE_BYTES,
+        ATTACHMENT_CHUNK_SIZE_BYTES, AttachmentKind, AttachmentManifestV2, AttachmentVariant,
+        EncryptedBlobDescriptor, attachment_chunk_ciphertext_range, attachment_chunk_count,
+        attachment_chunk_nonce, decrypt_attachment_chunk, decrypt_blob, decrypt_chunked_blob,
+        encrypt_blob, encrypt_chunked_blob, plaintext_range_to_chunk_span, sha256_hex,
     };
 
     #[test]
@@ -625,33 +624,39 @@ mod tests {
             attachment_chunk_ciphertext_range(&encrypted.metadata, plaintext.len() as u64, 0)
                 .expect("range");
         let chunk = &encrypted.ciphertext[range.start as usize..range.end_exclusive as usize];
-        assert!(decrypt_attachment_chunk(
-            chunk,
-            &encrypted.metadata,
-            "message:other",
-            AttachmentVariant::Original,
-            plaintext.len() as u64,
-            0,
-        )
-        .is_err());
-        assert!(decrypt_attachment_chunk(
-            chunk,
-            &encrypted.metadata,
-            "message:bound",
-            AttachmentVariant::Preview,
-            plaintext.len() as u64,
-            0,
-        )
-        .is_err());
-        assert!(decrypt_attachment_chunk(
-            chunk,
-            &encrypted.metadata,
-            "message:bound",
-            AttachmentVariant::Original,
-            plaintext.len() as u64,
-            1,
-        )
-        .is_err());
+        assert!(
+            decrypt_attachment_chunk(
+                chunk,
+                &encrypted.metadata,
+                "message:other",
+                AttachmentVariant::Original,
+                plaintext.len() as u64,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            decrypt_attachment_chunk(
+                chunk,
+                &encrypted.metadata,
+                "message:bound",
+                AttachmentVariant::Preview,
+                plaintext.len() as u64,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            decrypt_attachment_chunk(
+                chunk,
+                &encrypted.metadata,
+                "message:bound",
+                AttachmentVariant::Original,
+                plaintext.len() as u64,
+                1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

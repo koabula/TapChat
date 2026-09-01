@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{connect_async_tls_with_config, WebSocketStream};
+use tokio_tungstenite::{WebSocketStream, connect_async_tls_with_config};
 
 use tapchat_core::cli::util::to_camel_case_json_string;
 use tapchat_core::ffi_api::{CoreEvent, RealtimeEvent};
@@ -17,7 +17,7 @@ use tapchat_core::transport_contract::{
 };
 
 use crate::commands::session::set_ws_connection_snapshot;
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::ProfileManagerInner;
 use crate::state::AppState;
@@ -238,8 +238,8 @@ impl RealtimeManager {
             .context("build websocket request")?;
 
         for (key, value) in subscription.headers.iter() {
-            use http::header::HeaderName;
             use http::HeaderValue;
+            use http::header::HeaderName;
             let name: HeaderName = key.parse().context("parse header name")?;
             let val: HeaderValue = value.parse().context("parse header value")?;
             request.headers_mut().insert(name, val);
@@ -1260,17 +1260,13 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
             redact_id("user", sender_user_id),
             redact_id("request", request_id)
         ),
-        WsServerEvent::GroupHeadUpdated {
-            group_id, seq, ..
-        } => {
+        WsServerEvent::GroupHeadUpdated { group_id, seq, .. } => {
             format!(
                 "group_id={} type=group_head_updated seq={seq}",
                 redact_id("group", group_id)
             )
         }
-        WsServerEvent::GroupOutboxRecordAvailable {
-            group_id, seq, ..
-        } => {
+        WsServerEvent::GroupOutboxRecordAvailable { group_id, seq, .. } => {
             format!(
                 "group_id={} type=group_outbox_record_available seq={seq}",
                 redact_id("group", group_id)

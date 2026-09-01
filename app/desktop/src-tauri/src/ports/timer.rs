@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use tapchat_core::CoreEvent;
 use tauri::AppHandle;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::platform::log_sanitize::redact_id;
 
 /// Schedule a timer that will fire after the given delay.

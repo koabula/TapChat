@@ -8,6 +8,7 @@ interface Contact {
   device_count: number;
   last_refresh: number | null;
   relationship_status: ContactRelationshipStatus;
+  verified: boolean;
 }
 
 interface ContactsState {

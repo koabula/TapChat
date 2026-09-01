@@ -56,6 +56,7 @@ urlencoding = "2.1"
 url = "2.5"
 log = "0.4"
 tapchat_core = { path = "../../../", package = "TapChat" }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 dirs = "6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 hmac = "0.12"

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -2041,10 +2041,10 @@ pub fn validate_published_key_package_lifetime(
 #[cfg(test)]
 mod tests {
     use super::{
-        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
-        IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
-        KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
-        KEY_PACKAGE_ROTATION_WINDOW_MS,
+        DirectCommitClass, IngestResult, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
+        KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, MlsAdapter, MlsAdapterModule,
+        PeerDeviceKeyPackage, PublishedKeyPackage, key_package_rotation_jitter_ms,
+        validate_published_key_package_lifetime,
     };
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
@@ -2530,12 +2530,16 @@ mod tests {
             IngestResult::AppliedProposal => {}
             other => panic!("expected AppliedProposal, got {other:?}"),
         }
-        assert!(!alice
-            .has_pending_proposals("conv:alice:bob")
-            .expect("live store"));
-        assert!(alice
-            .has_pcs_update_proposals("conv:alice:bob")
-            .expect("sidecar"));
+        assert!(
+            !alice
+                .has_pending_proposals("conv:alice:bob")
+                .expect("live store")
+        );
+        assert!(
+            alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("sidecar")
+        );
         alice
             .encrypt_application("conv:alice:bob", b"while waiting")
             .expect("sender can still encrypt with pending PCS proposal");
@@ -2605,9 +2609,11 @@ mod tests {
             IngestResult::AppliedProposal => {}
             other => panic!("expected AppliedProposal, got {other:?}"),
         }
-        assert!(!alice
-            .has_pcs_update_proposals("conv:alice:bob")
-            .expect("sidecar"));
+        assert!(
+            !alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("sidecar")
+        );
         let commit = alice
             .stage_group_pcs_commit("conv:alice:bob")
             .expect("pcs commit");
@@ -2667,14 +2673,18 @@ mod tests {
             IngestResult::AppliedProposal => {}
             other => panic!("expected AppliedProposal, got {other:?}"),
         }
-        assert!(alice
-            .has_pcs_update_proposals("conv:alice:bob")
-            .expect("sidecar"));
+        assert!(
+            alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("sidecar")
+        );
         let stale_full = alice.export_bootstrap_state().expect("stale full dump");
         alice.clear_pcs_update_sidecar("conv:alice:bob");
-        assert!(!alice
-            .has_pcs_update_proposals("conv:alice:bob")
-            .expect("cleared"));
+        assert!(
+            !alice
+                .has_pcs_update_proposals("conv:alice:bob")
+                .expect("cleared")
+        );
         let fresh_b = alice
             .export_persisted_group_state("conv:alice:bob")
             .expect("fresh b");

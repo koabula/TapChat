@@ -6,8 +6,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use fs2::FileExt;
 use keyring::{credential::CredentialPersistence, default};
 use serde::de::DeserializeOwned;
@@ -20,19 +20,18 @@ use zeroize::Zeroizing;
 use crate::ffi_api::PersistStateEffect;
 use crate::fs_util::write_atomic_unique;
 use crate::local_store::{
-    inspect_storage, LocalStoreDiagnostics, MessageReadCursor, ProfileStorageSession,
-    PRIVATE_STATE_DOCUMENT_KIND, STATE_DB_FILE_NAME,
+    LocalStoreDiagnostics, MessageReadCursor, PRIVATE_STATE_DOCUMENT_KIND, ProfileStorageSession,
+    STATE_DB_FILE_NAME, inspect_storage,
 };
 use crate::log_sanitize::redact_id;
 use crate::model::{ConversationKind, DeploymentBundle, DeviceRuntimeAuth, IdentityBundle};
 use crate::persistence::CorePersistenceSnapshot;
 use crate::profile_crypto::{
-    build_os_keychain_wrapper, build_passphrase_wrapper,
+    LEGACY_SNAPSHOT_FILE_NAME, OS_KEYCHAIN_SERVICE, PDEK_LEN, ProfileEncryptionMetadata,
+    ProfileKeyWrapperKind, SNAPSHOT_FILE_NAME, build_os_keychain_wrapper, build_passphrase_wrapper,
     decrypt_profile_document as decrypt_profile_document_bytes, default_encryption_metadata,
     encrypt_profile_document as encrypt_profile_document_bytes, generate_pdek, generate_wrap_key,
     unwrap_with_key, unwrap_with_passphrase, validate_encryption_metadata,
-    ProfileEncryptionMetadata, ProfileKeyWrapperKind, LEGACY_SNAPSHOT_FILE_NAME,
-    OS_KEYCHAIN_SERVICE, PDEK_LEN, SNAPSHOT_FILE_NAME,
 };
 
 use super::util::to_snake_case_json_string;
@@ -1855,7 +1854,7 @@ fn keychain_cleanup_supported() -> bool {
 fn enumerate_tapchat_keychain_accounts() -> Result<Vec<String>> {
     use windows_sys::Win32::{
         Foundation::ERROR_NOT_FOUND,
-        Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW},
+        Security::Credentials::{CREDENTIALW, CredEnumerateW, CredFree},
     };
 
     let mut count = 0_u32;
@@ -2128,9 +2127,11 @@ mod tests {
             .checkpoint_local_store()
             .expect("checkpoint state db");
         let bytes = std::fs::read(profile.state_db_path()).expect("read encrypted state db");
-        assert!(!bytes
-            .windows("visible-marker".len())
-            .any(|window| window == b"visible-marker"));
+        assert!(
+            !bytes
+                .windows("visible-marker".len())
+                .any(|window| window == b"visible-marker")
+        );
         drop(profile);
 
         let reopened =
@@ -2138,9 +2139,11 @@ mod tests {
                 .expect("open profile");
         assert_eq!(reopened.load_snapshot().expect("load"), snapshot);
         let state_db = std::fs::read(reopened.state_db_path()).expect("read state db");
-        assert!(!state_db
-            .windows("visible-marker".len())
-            .any(|window| window == b"visible-marker"));
+        assert!(
+            !state_db
+                .windows("visible-marker".len())
+                .any(|window| window == b"visible-marker")
+        );
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
         }
@@ -2184,9 +2187,11 @@ mod tests {
                 Ok(_) => panic!("wrong passphrase should be rejected"),
                 Err(error) => error,
             };
-        assert!(error
-            .to_string()
-            .contains("failed to unlock encrypted profile"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to unlock encrypted profile")
+        );
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
         }
@@ -2393,11 +2398,13 @@ mod tests {
             .expect("load cache entries");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].cache_id, "cache-marker");
-        assert!(profile
-            .load_private_state()
-            .expect("private state")
-            .attachment_cache
-            .is_empty());
+        assert!(
+            profile
+                .load_private_state()
+                .expect("private state")
+                .attachment_cache
+                .is_empty()
+        );
         unsafe {
             std::env::remove_var("TAPCHAT_PROFILE_REGISTRY_PATH");
         }
@@ -2495,9 +2502,11 @@ mod tests {
             Ok(_) => panic!("legacy profile should be rejected"),
             Err(error) => error,
         };
-        assert!(error
-            .to_string()
-            .contains("insecure plaintext snapshot.json"));
+        assert!(
+            error
+                .to_string()
+                .contains("insecure plaintext snapshot.json")
+        );
     }
 
     #[test]

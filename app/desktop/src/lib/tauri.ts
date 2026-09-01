@@ -219,6 +219,24 @@ export async function deleteContact(userId: string): Promise<CoreOutput> {
   return invoke("delete_contact", { userId });
 }
 
+export interface SafetyNumberView {
+  groups: string[];
+  digits: string;
+  qr_svg: string;
+  verified: boolean;
+}
+
+export async function getSafetyNumber(userId: string): Promise<SafetyNumberView> {
+  return invoke("get_safety_number", { userId });
+}
+
+export async function setContactVerified(
+  userId: string,
+  verified: boolean,
+): Promise<CoreOutput> {
+  return invoke("set_contact_verified", { userId, verified });
+}
+
 // Message Requests
 export async function listMessageRequests(): Promise<CoreOutput> {
   return invoke("list_message_requests");

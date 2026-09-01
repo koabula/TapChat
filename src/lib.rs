@@ -22,6 +22,7 @@ pub mod passphrase_strength;
 pub mod persistence;
 pub mod platform_ports;
 pub mod profile_crypto;
+pub mod safety_number;
 pub mod sync_engine;
 pub mod transport_contract;
 

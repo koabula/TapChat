@@ -50,6 +50,7 @@ export default function ContactList() {
           device_count: c.device_count,
           last_refresh: null,
           relationship_status: c.relationship_status ?? "available",
+          verified: Boolean(c.verified),
         }));
         setContacts(mappedContacts);
       } catch (err) {
@@ -97,6 +98,7 @@ export default function ContactList() {
         device_count: c.device_count,
         last_refresh: null,
         relationship_status: c.relationship_status ?? "available",
+        verified: Boolean(c.verified),
       }));
       setContacts(mappedContacts);
       navigate(`/chat/${result.conversation_id}`);

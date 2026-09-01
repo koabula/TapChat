@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use uuid::Uuid;
 
 pub(crate) fn write_atomic_unique(path: &Path, bytes: &[u8]) -> Result<()> {

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 const CACHE_NAMESPACE: &str = "attachment-cache";
 const CACHE_OBJECTS_DIR: &str = "objects";

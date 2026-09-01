@@ -1,10 +1,10 @@
 use ed25519_dalek::{Signer, Verifier};
 
 use crate::error::{CoreError, CoreResult};
-use crate::identity::{encode_hex, parse_verifying_key, LocalIdentityState};
+use crate::identity::{LocalIdentityState, encode_hex, parse_verifying_key};
 use crate::model::{
-    CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
-    DeviceContactProfile, InboxAppendCapability, KeyPackageRef, Validate, CURRENT_MODEL_VERSION,
+    CURRENT_MODEL_VERSION, CapabilityConstraints, CapabilityOperation, CapabilityService,
+    DeploymentBundle, DeviceContactProfile, InboxAppendCapability, KeyPackageRef, Validate,
 };
 
 pub const INBOX_APPEND_CAPABILITY_LIFETIME_MS: u64 = 365 * 24 * 60 * 60 * 1000;

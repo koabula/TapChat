@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex};
+use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
 use crate::conversation::StoredMessage;
@@ -19,17 +19,18 @@ use crate::ffi_api::{
 use crate::fs_util::write_atomic_unique;
 use crate::model::ConversationKind;
 use crate::persistence::{
-    decode_snapshot, encode_snapshot, CorePersistenceSnapshot, PersistOp, PersistedContact,
-    PersistedConversation, PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
+    CorePersistenceSnapshot, PersistOp, PersistedContact, PersistedConversation,
+    PersistedGroupCursor, PersistedGroupInvite, PersistedGroupJoinRequest,
     PersistedGroupRealtimeSession, PersistedGroupState, PersistedMlsState,
     PersistedOutgoingEnvelope, PersistedOutgoingGroupEnvelope, PersistedPendingAck,
     PersistedPendingBlobTransfer, PersistedPendingGroupJoinApproval, PersistedPendingWelcomePickup,
-    PersistedRealtimeSession, PersistedRecoveryContext, PersistedSyncState,
+    PersistedRealtimeSession, PersistedRecoveryContext, PersistedSyncState, decode_snapshot,
+    encode_snapshot,
 };
 use crate::profile_crypto::{
+    LEGACY_SNAPSHOT_FILE_NAME, PRIVATE_STATE_FILE_NAME, SNAPSHOT_FILE_NAME,
     decrypt_profile_document, decrypt_snapshot, derive_profile_document_key,
-    encrypt_profile_document, encrypt_snapshot, LEGACY_SNAPSHOT_FILE_NAME, PRIVATE_STATE_FILE_NAME,
-    SNAPSHOT_FILE_NAME,
+    encrypt_profile_document, encrypt_snapshot,
 };
 use crate::transport_contract::SealGroupOutboxRequest;
 
@@ -2612,9 +2613,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::model::{
-        CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
-        DeviceStatusKind, GroupCapability, GroupCapabilityOperation, GroupRole, MessageType,
-        CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION, CapabilityService, Conversation, ConversationKind,
+        ConversationMember, ConversationState, DeviceStatusKind, GroupCapability,
+        GroupCapabilityOperation, GroupRole, MessageType,
     };
     use crate::profile_crypto::generate_pdek;
     use tempfile::tempdir;
@@ -2657,12 +2658,16 @@ mod tests {
         assert!(diagnostics.encrypted_snapshot_exists);
         assert!(diagnostics.encrypted_snapshot_backup_exists);
         assert!(diagnostics.state_db_size_bytes.is_some_and(|size| size > 0));
-        assert!(diagnostics
-            .encrypted_snapshot_size_bytes
-            .is_some_and(|size| size > 0));
-        assert!(diagnostics
-            .encrypted_snapshot_backup_size_bytes
-            .is_some_and(|size| size > 0));
+        assert!(
+            diagnostics
+                .encrypted_snapshot_size_bytes
+                .is_some_and(|size| size > 0)
+        );
+        assert!(
+            diagnostics
+                .encrypted_snapshot_backup_size_bytes
+                .is_some_and(|size| size > 0)
+        );
         assert!(
             diagnostics
                 .legacy_files_present
@@ -2803,11 +2808,13 @@ mod tests {
                 snapshot: Some(CorePersistenceSnapshot::default()),
             })
             .expect("delete pending seal");
-        assert!(store
-            .load_snapshot()
-            .expect("load after delete")
-            .pending_group_seal
-            .is_empty());
+        assert!(
+            store
+                .load_snapshot()
+                .expect("load after delete")
+                .pending_group_seal
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2923,15 +2930,17 @@ mod tests {
                 snapshot: None,
             })
             .expect("delete message");
-        assert!(store
-            .query_messages(&MessageQuery {
-                conversation_id: conversation_id.clone(),
-                before_cursor: None,
-                limit: 10,
-            })
-            .expect("query after delete")
-            .messages
-            .is_empty());
+        assert!(
+            store
+                .query_messages(&MessageQuery {
+                    conversation_id: conversation_id.clone(),
+                    before_cursor: None,
+                    limit: 10,
+                })
+                .expect("query after delete")
+                .messages
+                .is_empty()
+        );
         let summary: (i64, Option<Vec<u8>>) = conn
             .query_row(
                 "SELECT message_count, last_visible_message FROM conversations WHERE key = ?1",
@@ -3107,9 +3116,11 @@ mod tests {
         let bootstrap = store.load_snapshot().expect("compact bootstrap");
         let compact = &bootstrap.conversations[0].state.messages;
         assert_eq!(compact.len(), 100_000);
-        assert!(compact
-            .iter()
-            .all(|message| message.plaintext.is_none() && message.storage_refs.is_empty()));
+        assert!(
+            compact
+                .iter()
+                .all(|message| message.plaintext.is_none() && message.storage_refs.is_empty())
+        );
 
         let mut after = snapshot;
         let new_message = StoredMessage {

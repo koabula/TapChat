@@ -12,7 +12,7 @@ use tapchat_core::{CoreCommand, ErrorDomain};
 use super::conversation_view::{generate_last_message_preview, summarize_plaintext};
 use crate::commands::read_state;
 use crate::errors::{DesktopError, DesktopResult};
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::state::{AppState, SessionState};
 
 /// Simplified result for create_conversation command
@@ -231,7 +231,9 @@ pub async fn create_conversation(
             .await
             .is_err()
             {
-                log::warn!("create_conversation: contact identity refresh did not produce a usable key package");
+                log::warn!(
+                    "create_conversation: contact identity refresh did not produce a usable key package"
+                );
             }
             drive_core_with_handle(
                 &app,

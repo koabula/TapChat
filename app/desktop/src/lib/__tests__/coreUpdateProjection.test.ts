@@ -25,6 +25,7 @@ describe("core update projections", () => {
         device_count: 2,
         last_refresh: null,
         relationship_status: "available",
+        verified: false,
       },
       {
         user_id: "user:bob",
@@ -32,6 +33,7 @@ describe("core update projections", () => {
         device_count: 1,
         last_refresh: null,
         relationship_status: "blocked",
+        verified: false,
       },
     ]);
   });

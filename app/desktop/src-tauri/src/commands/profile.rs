@@ -5,9 +5,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tapchat_core::CoreEngine;
 
 use crate::commands::session::{
-    read_session_status_snapshot, set_ws_connection_snapshot, SessionStatus,
+    SessionStatus, read_session_status_snapshot, set_ws_connection_snapshot,
 };
-use crate::lifecycle::{drive_core_with_handle, CoreInput};
+use crate::lifecycle::{CoreInput, drive_core_with_handle};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::state::{AppState, LockReason, SessionState};
@@ -300,7 +300,9 @@ async fn reload_engine_from_profile(
             let auth = state.runtime_auth.snapshot().await;
             log::warn!(
                 "profile switch runtime authorization unavailable: code={} retryable={} next_retry_at={}",
-                auth.error_code.as_deref().unwrap_or("temporary_unavailable"),
+                auth.error_code
+                    .as_deref()
+                    .unwrap_or("temporary_unavailable"),
                 auth.retryable,
                 auth.next_retry_at
                     .map(|value| value.to_string())

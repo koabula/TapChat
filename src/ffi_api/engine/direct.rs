@@ -61,17 +61,11 @@ impl CoreEngine {
         let original_name = bundle.display_name.clone();
         let now = current_timestamp_hint(self.state.outbox.len());
 
-        // Check if contact already exists to preserve user's display_name
-        let existing_display_name = self
-            .state
-            .contacts
-            .get(&user_id)
-            .and_then(|c| c.display_name.clone());
-        let existing_relationship_status = self
-            .state
-            .contacts
-            .get(&user_id)
-            .map(|c| c.relationship_status.clone());
+        let existing = self.state.contacts.get(&user_id);
+        let existing_display_name = existing.and_then(|c| c.display_name.clone());
+        let existing_relationship_status = existing.map(|c| c.relationship_status.clone());
+        let existing_verified_at = existing.and_then(|c| c.verified_at);
+        let existing_verified_root_key = existing.and_then(|c| c.verified_root_key.clone());
         let relationship_status = if Self::relationship_is_removed(&relationship_status) {
             ContactRelationshipStatus::default()
         } else {
@@ -86,14 +80,17 @@ impl CoreEngine {
                 _ => relationship_status,
             };
 
-        let persisted_contact = PersistedContact {
+        let mut persisted_contact = PersistedContact {
             user_id: user_id.clone(),
             bundle,
             display_name: existing_display_name,
             original_name,
             relationship_status,
             added_at: now,
+            verified_at: existing_verified_at,
+            verified_root_key: existing_verified_root_key,
         };
+        persisted_contact.align_verification();
 
         self.state
             .contacts
@@ -136,15 +133,20 @@ impl CoreEngine {
         let relationship_status = existing
             .map(|c| c.relationship_status.clone())
             .unwrap_or_default();
+        let verified_at = existing.and_then(|c| c.verified_at);
+        let verified_root_key = existing.and_then(|c| c.verified_root_key.clone());
 
-        let persisted_contact = PersistedContact {
+        let mut persisted_contact = PersistedContact {
             user_id: user_id.clone(),
             bundle,
             display_name,
             original_name,
             relationship_status,
             added_at,
+            verified_at,
+            verified_root_key,
         };
+        persisted_contact.align_verification();
 
         self.state
             .contacts
@@ -2155,6 +2157,35 @@ impl CoreEngine {
         })
     }
 
+    pub(super) fn set_contact_verified(
+        &mut self,
+        user_id: String,
+        verified: bool,
+    ) -> CoreResult<CoreOutput> {
+        if !self.state.contacts.contains_key(&user_id) {
+            return Err(CoreError::invalid_input("contact does not exist"));
+        }
+        let now = current_unix_millis(self.state.message_nonce);
+        if let Some(contact) = self.state.contacts.get_mut(&user_id) {
+            contact.set_verified(verified, now);
+        }
+
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![PersistOp::SaveContact { user_id }],
+            )],
+            view_model: Some(CoreViewModel {
+                contacts: self.contact_summaries(),
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
     fn ensure_identity_publication_idle(&self) -> CoreResult<()> {
         let Some(pending) = self.state.pending_identity_publication.as_ref() else {
             return Ok(());
@@ -2183,6 +2214,7 @@ impl CoreEngine {
                 .or(contact.original_name.clone()),
             device_count: contact.bundle.devices.len(),
             relationship_status: contact.relationship_status.clone(),
+            verified: contact.is_verified(),
         }
     }
 

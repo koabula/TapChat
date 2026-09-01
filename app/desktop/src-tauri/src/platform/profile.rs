@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -618,7 +618,7 @@ mod tests {
         Profile, ProfileInitOptions, ProfileRegistry, ProfileRegistryEntry,
     };
 
-    use super::{resolve_profile_selector, ProfileManager, ProfileProtectionMode};
+    use super::{ProfileManager, ProfileProtectionMode, resolve_profile_selector};
     use crate::storage_layout::DesktopStorageLayout;
 
     #[test]
@@ -633,9 +633,11 @@ mod tests {
             .init_options(Some("secret".into()))
             .expect("passphrase protection");
         assert!(!passphrase_only.use_keychain);
-        assert!(ProfileProtectionMode::PassphraseOnly
-            .init_options(None)
-            .is_err());
+        assert!(
+            ProfileProtectionMode::PassphraseOnly
+                .init_options(None)
+                .is_err()
+        );
 
         let keychain_only = ProfileProtectionMode::KeychainOnly
             .init_options(Some("ignored".into()))
@@ -777,9 +779,11 @@ mod tests {
             .await
             .expect_err("wrong passphrase should fail");
 
-        assert!(error
-            .to_string()
-            .contains("failed to unlock encrypted profile"));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to unlock encrypted profile")
+        );
         let registry = ProfileRegistry::load_from(&layout.registry_path).expect("load registry");
         assert_eq!(
             registry.active_profile.as_deref(),

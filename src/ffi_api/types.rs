@@ -250,6 +250,10 @@ pub enum CoreCommand {
         user_id: String,
         display_name: Option<String>,
     },
+    SetContactVerified {
+        user_id: String,
+        verified: bool,
+    },
     DeleteContact {
         user_id: String,
     },
@@ -1062,6 +1066,8 @@ pub struct ContactSummary {
     pub device_count: usize,
     #[serde(default)]
     pub relationship_status: ContactRelationshipStatus,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

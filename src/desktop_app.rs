@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::driver::{ContactDeviceSnapshot, CoreDriver};
@@ -11,12 +11,12 @@ use crate::cli::profile::{
     RuntimeSecretRotationPhase, RuntimeSecrets,
 };
 use crate::cli::runtime::{
+    CloudflareDeployOverrides, CloudflarePreflight, ResolvedCloudflareDeployConfig,
     cloudflare_preflight as runtime_cloudflare_preflight, deploy_cloudflare_runtime,
     derive_cloudflare_defaults, enroll_device_runtime_v2, ensure_cloudflare_runtime_metadata,
     fetch_deployment_bundle_v3, prepare_legacy_runtime_secret_migration,
     prepare_runtime_secret_rotation, rebuild_cloudflare_config, resolve_cloudflare_config,
-    resolve_service_root, CloudflareDeployOverrides, CloudflarePreflight,
-    ResolvedCloudflareDeployConfig,
+    resolve_service_root,
 };
 use crate::contact_workflows::{
     accept_message_request_with_bundle_import, fetch_identity_bundle_from_url,
@@ -2876,7 +2876,7 @@ pub fn map_realtime_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::Value;
 
     #[test]
