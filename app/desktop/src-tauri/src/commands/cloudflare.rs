@@ -15,7 +15,7 @@ use tapchat_core::cli::profile::{
     RuntimeSecretRotationMetadata, RuntimeSecretRotationPhase, RuntimeSecrets,
 };
 use tapchat_core::cli::runtime::derive_cloudflare_defaults;
-use tapchat_core::model::DeploymentBundle;
+use tapchat_core::model::{DeploymentBundle, DeviceRuntimeAuth};
 use tapchat_core::persistence::PersistedDeployment;
 use tapchat_core::{CoreCommand, CoreEvent};
 
@@ -25,7 +25,7 @@ use crate::commands::cloudflare_rest::{
 use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
 use crate::lifecycle::{CoreInput, drive_core_with_handle, drive_prepared_core_output};
 use crate::platform::log_sanitize::sanitize_url_for_log;
-use crate::runtime_auth::wait_for_runtime_bundle;
+use crate::runtime_auth::{RuntimeAuthSnapshot, RuntimeAuthState, wait_for_runtime_bundle};
 use crate::state::AppState;
 use crate::state::SessionState;
 use crate::timetest;
@@ -279,6 +279,116 @@ fn runtime_writeback_matches(
         && bundle_endpoint == Some(snapshot_endpoint)
 }
 
+fn apply_offline_expired(status: &mut CloudflareRuntimeStatus) {
+    status.state = "offline_expired".into();
+    status.action = Some("refresh_auth".into());
+    status.error_code = Some("runtime_auth_expired".into());
+    status.details = Some(
+        "Runtime authorization is expired; local data remains available while refresh retries."
+            .into(),
+    );
+}
+
+fn apply_enrollment_required(status: &mut CloudflareRuntimeStatus, error_code: &str, details: &str) {
+    status.state = "enrollment_required".into();
+    status.action = Some("refresh_auth".into());
+    status.error_code = Some(error_code.into());
+    status.details = Some(details.into());
+}
+
+/// Overlay in-memory runtime auth onto a deployment-ready status.
+/// Disk expiry must not hide a live Ready / Refreshing / Degraded manager.
+fn overlay_runtime_auth(
+    status: &mut CloudflareRuntimeStatus,
+    credential: Option<&DeviceRuntimeAuth>,
+    deployment_runtime_id: &str,
+    now: u64,
+    auth: &RuntimeAuthSnapshot,
+) {
+    if status.state != "ready" {
+        return;
+    }
+
+    status.credential_expires_at = auth
+        .expires_at
+        .or_else(|| credential.map(|value| value.expires_at));
+
+    match auth.state {
+        RuntimeAuthState::Refreshing => {
+            status.state = "refreshing".into();
+            status.action = None;
+            return;
+        }
+        RuntimeAuthState::Degraded => {
+            status.state = "degraded".into();
+            status.action = None;
+            status.error_code = auth.error_code.clone();
+            status.details = Some(
+                "Runtime authorization refresh will retry automatically; the current credential is still valid."
+                    .into(),
+            );
+            return;
+        }
+        RuntimeAuthState::OfflineExpired => {
+            apply_offline_expired(status);
+            status.error_code = auth.error_code.clone().or(status.error_code.clone());
+            return;
+        }
+        RuntimeAuthState::UpgradeRequired => {
+            status.state = "upgrade_required".into();
+            status.action = Some("upgrade".into());
+            status.error_code = auth.error_code.clone();
+            return;
+        }
+        RuntimeAuthState::EnrollmentRequired => {
+            apply_enrollment_required(
+                status,
+                auth.error_code.as_deref().unwrap_or("enrollment_required"),
+                "This device must enroll with the upgraded runtime.",
+            );
+            return;
+        }
+        RuntimeAuthState::DeviceRevoked => {
+            status.state = "device_revoked".into();
+            status.action = None;
+            status.error_code = auth.error_code.clone();
+            status.details = Some(
+                "This device has been revoked. Restore the identity or create a new device."
+                    .into(),
+            );
+            return;
+        }
+        RuntimeAuthState::Ready => {
+            status.error_code = auth.error_code.clone();
+            if auth.expires_at.is_some_and(|expires_at| expires_at > now) {
+                return;
+            }
+        }
+    }
+
+    match credential {
+        None => apply_enrollment_required(
+            status,
+            "enrollment_required",
+            "This device must enroll with the upgraded runtime.",
+        ),
+        Some(stored) if stored.runtime_id != deployment_runtime_id => apply_enrollment_required(
+            status,
+            "runtime_mismatch",
+            "The saved runtime credential belongs to another runtime.",
+        ),
+        Some(stored) if stored.expires_at <= now => apply_offline_expired(status),
+        _ => {}
+    }
+}
+
+pub(crate) async fn emit_runtime_status(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if let Ok(status) = cloudflare_status_impl(&state).await {
+        let _ = app.emit("runtime-status-changed", status);
+    }
+}
+
 pub async fn runtime_status_for_deployment(
     deployment: Option<PersistedDeployment>,
 ) -> CloudflareRuntimeStatus {
@@ -421,10 +531,12 @@ pub fn runtime_missing_group_outbox_message(status: &CloudflareRuntimeStatus) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        cloudflare_deploy_error_code, repair_worker_secret, runtime_missing_group_outbox_message,
-        runtime_writeback_matches, safe_deploy_diagnostic, status_from_features,
-        valid_worker_secret,
+        cloudflare_deploy_error_code, overlay_runtime_auth, repair_worker_secret,
+        runtime_missing_group_outbox_message, runtime_writeback_matches, safe_deploy_diagnostic,
+        status_from_features, valid_worker_secret, CloudflareRuntimeStatus,
     };
+    use crate::runtime_auth::{RuntimeAuthSnapshot, RuntimeAuthState};
+    use tapchat_core::model::DeviceRuntimeAuth;
 
     #[test]
     fn worker_secret_reuses_valid_input() {
@@ -509,6 +621,102 @@ mod tests {
             Some(endpoint),
             endpoint
         ));
+    }
+
+    fn ready_status() -> CloudflareRuntimeStatus {
+        CloudflareRuntimeStatus {
+            bound: true,
+            endpoint: Some("https://example.worker.dev".into()),
+            features: Vec::new(),
+            supports_group_outbox: true,
+            supports_welcome_pickup: true,
+            needs_upgrade: false,
+            last_error: None,
+            state: "ready".into(),
+            action: None,
+            details: None,
+            secret_rotation: None,
+            credential_expires_at: None,
+            error_code: None,
+        }
+    }
+
+    fn credential(expires_at: u64) -> DeviceRuntimeAuth {
+        DeviceRuntimeAuth {
+            scheme: "bearer".into(),
+            token: "secret".into(),
+            issued_at: 1,
+            expires_at,
+            runtime_id: "runtime-1".into(),
+            user_id: "user".into(),
+            device_id: "device".into(),
+            scopes: vec!["inbox_read".into()],
+            registration_version: 1,
+            key_id: None,
+        }
+    }
+
+    fn auth_snapshot(state: RuntimeAuthState, expires_at: Option<u64>) -> RuntimeAuthSnapshot {
+        RuntimeAuthSnapshot {
+            state,
+            expires_at,
+            error_code: None,
+            retryable: false,
+            next_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn overlay_keeps_ready_when_memory_has_a_fresh_credential() {
+        let mut status = ready_status();
+        overlay_runtime_auth(
+            &mut status,
+            Some(&credential(1_000)),
+            "runtime-1",
+            5_000,
+            &auth_snapshot(RuntimeAuthState::Ready, Some(9_000)),
+        );
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.credential_expires_at, Some(9_000));
+    }
+
+    #[test]
+    fn overlay_reports_disk_expiry_before_ensure_has_run() {
+        let mut status = ready_status();
+        overlay_runtime_auth(
+            &mut status,
+            Some(&credential(1_000)),
+            "runtime-1",
+            5_000,
+            &auth_snapshot(RuntimeAuthState::Ready, None),
+        );
+        assert_eq!(status.state, "offline_expired");
+    }
+
+    #[test]
+    fn overlay_prefers_refreshing_over_disk_expiry() {
+        let mut status = ready_status();
+        overlay_runtime_auth(
+            &mut status,
+            Some(&credential(1_000)),
+            "runtime-1",
+            5_000,
+            &auth_snapshot(RuntimeAuthState::Refreshing, Some(1_000)),
+        );
+        assert_eq!(status.state, "refreshing");
+    }
+
+    #[test]
+    fn overlay_keeps_offline_expired_when_manager_confirms_it() {
+        let mut status = ready_status();
+        overlay_runtime_auth(
+            &mut status,
+            Some(&credential(1_000)),
+            "runtime-1",
+            5_000,
+            &auth_snapshot(RuntimeAuthState::OfflineExpired, Some(1_000)),
+        );
+        assert_eq!(status.state, "offline_expired");
     }
 }
 
@@ -1632,7 +1840,7 @@ pub async fn cloudflare_status(
 }
 
 async fn cloudflare_status_impl(
-    state: &State<'_, AppState>,
+    state: &AppState,
 ) -> Result<CloudflareRuntimeStatus, String> {
     let (runtime, snapshot_deployment, bundle_file, metadata_bundle_path, credential) = {
         let inner = state.inner.read().await;
@@ -1730,74 +1938,24 @@ async fn cloudflare_status_impl(
         RuntimeSecretRotationPhase::Stable => {}
     }
     status.credential_expires_at = credential.as_ref().map(|value| value.expires_at);
-    if status.state == "ready" {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        match credential {
-            None => {
-                status.state = "enrollment_required".into();
-                status.action = Some("refresh_auth".into());
-                status.error_code = Some("enrollment_required".into());
-                status.details = Some("This device must enroll with the upgraded runtime.".into());
-            }
-            Some(auth) if auth.runtime_id != deployment.deployment_bundle.runtime_id => {
-                status.state = "enrollment_required".into();
-                status.action = Some("refresh_auth".into());
-                status.error_code = Some("runtime_mismatch".into());
-                status.details =
-                    Some("The saved runtime credential belongs to another runtime.".into());
-            }
-            Some(auth) if auth.expires_at <= now => {
-                status.state = "offline_expired".into();
-                status.action = Some("refresh_auth".into());
-                status.error_code = Some("runtime_auth_expired".into());
-                status.details = Some("Runtime authorization is expired; local data remains available while refresh retries.".into());
-            }
-            _ => {}
-        }
-    }
-    if status.state == "ready" {
-        let auth = state.runtime_auth.snapshot().await;
-        status.credential_expires_at = auth.expires_at.or(status.credential_expires_at);
-        status.error_code = auth.error_code.clone();
-        match auth.state {
-            crate::runtime_auth::RuntimeAuthState::Ready => {}
-            crate::runtime_auth::RuntimeAuthState::Refreshing => {
-                status.state = "refreshing".into();
-            }
-            crate::runtime_auth::RuntimeAuthState::Degraded => {
-                status.state = "degraded".into();
-                status.details = Some("Runtime authorization refresh will retry automatically; the current credential is still valid.".into());
-            }
-            crate::runtime_auth::RuntimeAuthState::OfflineExpired => {
-                status.state = "offline_expired".into();
-                status.action = Some("refresh_auth".into());
-            }
-            crate::runtime_auth::RuntimeAuthState::UpgradeRequired => {
-                status.state = "upgrade_required".into();
-                status.action = Some("upgrade".into());
-            }
-            crate::runtime_auth::RuntimeAuthState::EnrollmentRequired => {
-                status.state = "enrollment_required".into();
-                status.action = Some("refresh_auth".into());
-            }
-            crate::runtime_auth::RuntimeAuthState::DeviceRevoked => {
-                status.state = "device_revoked".into();
-                status.action = None;
-                status.details = Some(
-                    "This device has been revoked. Restore the identity or create a new device."
-                        .into(),
-                );
-            }
-        }
-    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let auth = state.runtime_auth.snapshot().await;
+    overlay_runtime_auth(
+        &mut status,
+        credential.as_ref(),
+        &deployment.deployment_bundle.runtime_id,
+        now,
+        &auth,
+    );
     Ok(status)
 }
 
 #[tauri::command]
 pub async fn cloudflare_refresh_runtime_auth(
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> crate::errors::DesktopResult<CloudflareRuntimeStatus> {
     let profile_manager = {
@@ -1809,5 +1967,7 @@ pub async fn cloudflare_refresh_runtime_auth(
         .ensure(&profile_manager, true)
         .await
         .map_err(|error| error.to_string())?;
-    Ok(cloudflare_status_impl(&state).await?)
+    let status = cloudflare_status_impl(&state).await?;
+    let _ = app.emit("runtime-status-changed", status.clone());
+    Ok(status)
 }

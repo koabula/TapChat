@@ -21,6 +21,7 @@ import type {
   RealtimeEventPayload,
   SystemBanner as SystemBannerItem,
 } from "@/lib/types";
+import { runtimeBannerForStatus } from "@/lib/runtimeBanner";
 import { useSessionStore } from "@/store/session";
 
 const statusIcons: Record<SystemBannerItem["status"], ReactNode> = {
@@ -34,15 +35,15 @@ const statusIcons: Record<SystemBannerItem["status"], ReactNode> = {
   message_rejected_by_policy: <ShieldX size={18} />,
 };
 
-const statusColors: Record<SystemBannerItem["status"], string> = {
-  sync_in_progress: "bg-frost.3 text-polar.1",
-  identity_refresh_needed: "bg-aurora.orange text-polar.1",
-  conversation_needs_rebuild: "bg-aurora.yellow text-polar.1",
-  attachment_upload_failed: "bg-aurora.red text-polar.1",
-  attachment_download_failed: "bg-aurora.red text-polar.1",
-  temporary_network_failure: "bg-aurora.red text-polar.1",
-  message_queued_for_approval: "bg-frost.2 text-polar.1",
-  message_rejected_by_policy: "bg-aurora.red text-polar.1",
+const statusTones: Record<SystemBannerItem["status"], "warning" | "error" | "info"> = {
+  sync_in_progress: "info",
+  identity_refresh_needed: "warning",
+  conversation_needs_rebuild: "warning",
+  attachment_upload_failed: "error",
+  attachment_download_failed: "error",
+  temporary_network_failure: "error",
+  message_queued_for_approval: "info",
+  message_rejected_by_policy: "error",
 };
 
 function bannerKey(banner: SystemBannerItem): string {
@@ -53,15 +54,22 @@ function visibleBanners(banners: SystemBannerItem[] | undefined): SystemBannerIt
   return (banners ?? []).filter((banner) => banner.message.trim().length > 0);
 }
 
+function toneClass(tone: "warning" | "error" | "info"): string {
+  if (tone === "error") return "status-error";
+  if (tone === "warning") return "status-warning";
+  return "text-muted-color";
+}
+
 /**
- * System banner component for displaying sync status, errors, and warnings.
- * Appears at the top of the main chat layout when there are user-visible banners.
+ * System toasts for sync status, errors, and runtime issues that need user action.
+ * Anchored to the bottom-right so they never overlay the app chrome.
  */
 export default function SystemBanner() {
   const navigate = useNavigate();
   const [banners, setBanners] = useState<SystemBannerItem[]>([]);
   const [runtimeStatus, setRuntimeStatus] = useState<CloudflareStatus | null>(null);
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const [runtimeDismissed, setRuntimeDismissed] = useState(false);
 
   useEffect(() => {
     const unlisten = listen<CoreUpdateEvent>("core-update", (event) => {
@@ -79,7 +87,10 @@ export default function SystemBanner() {
   useEffect(() => {
     const refreshRuntime = () => {
       invoke<CloudflareStatus>("cloudflare_status")
-        .then(setRuntimeStatus)
+        .then((status) => {
+          setRuntimeStatus(status);
+          setRuntimeDismissed(false);
+        })
         .catch((err) => {
           console.debug(`[SystemBanner] cloudflare_status failed: ${presentError(err).message}`);
         });
@@ -87,6 +98,7 @@ export default function SystemBanner() {
     refreshRuntime();
     const unlisten = listen<CloudflareStatus>("runtime-status-changed", (event) => {
       setRuntimeStatus(event.payload);
+      setRuntimeDismissed(false);
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -99,44 +111,52 @@ export default function SystemBanner() {
     setBanners((prev) => prev.filter((item) => bannerKey(item) !== key));
   };
 
-  const runtimeBanner = runtimeBannerForStatus(runtimeStatus);
+  const runtimeBanner = runtimeDismissed ? null : runtimeBannerForStatus(runtimeStatus);
 
   if (banners.length === 0 && !runtimeBanner) {
     return null;
   }
 
   return (
-    <div className="fixed top-0 left-0 right-0 z-50 flex flex-col gap-1 p-2">
+    <div className="pointer-events-none fixed bottom-20 right-4 z-50 flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2">
       {runtimeBanner && (
-        <div className="flex items-center justify-between rounded-lg bg-aurora.orange px-3 py-2 text-polar.1 shadow-lg">
-          <div className="flex items-center gap-2">
+        <div className="toast toast-card pointer-events-auto flex items-start gap-2 px-3 py-2">
+          <span className={`mt-0.5 shrink-0 ${toneClass(runtimeBanner.tone)}`}>
             <AlertTriangle size={18} />
-            <span className="text-sm font-medium">{runtimeBanner.message}</span>
-          </div>
-          <div className="flex items-center gap-2">
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium text-primary-color">{runtimeBanner.message}</p>
             {runtimeBanner.actionLabel && (
               <button
-                className="rounded bg-polar.1/20 px-2 py-1 text-xs font-medium hover:bg-polar.1/30"
+                className="mt-1 text-xs font-medium text-secondary-color hover:text-primary-color"
                 onClick={() => navigate("/settings/runtime")}
               >
                 {runtimeBanner.actionLabel}
               </button>
             )}
           </div>
+          <button
+            className="shrink-0 text-muted-color hover:text-primary-color"
+            onClick={() => setRuntimeDismissed(true)}
+            aria-label="Dismiss"
+          >
+            <X size={16} />
+          </button>
         </div>
       )}
       {banners.map((banner) => (
         <div
           key={bannerKey(banner)}
-          className={`flex items-center justify-between px-3 py-2 rounded-lg shadow-lg ${statusColors[banner.status]}`}
+          className="toast toast-card pointer-events-auto flex items-start gap-2 px-3 py-2"
         >
-          <div className="flex items-center gap-2">
-            <span className="text-lg">{statusIcons[banner.status]}</span>
-            <span className="text-sm font-medium">{banner.message}</span>
-          </div>
+          <span className={`mt-0.5 shrink-0 ${toneClass(statusTones[banner.status])}`}>
+            {statusIcons[banner.status]}
+          </span>
+          <p className="min-w-0 flex-1 text-sm font-medium text-primary-color">{banner.message}</p>
           <button
-            className="text-sm px-2 hover:opacity-70"
+            className="shrink-0 text-muted-color hover:text-primary-color"
             onClick={() => handleDismiss(banner)}
+            aria-label="Dismiss"
           >
             <X size={16} />
           </button>
@@ -144,63 +164,6 @@ export default function SystemBanner() {
       ))}
     </div>
   );
-}
-
-function runtimeBannerForStatus(status: CloudflareStatus | null): {
-  message: string;
-  actionLabel?: string;
-} | null {
-  if (!status || status.state === "ready" || status.state === "refreshing" || status.state === "degraded") {
-    return null;
-  }
-  switch (status.state) {
-    case "missing":
-      return {
-        message: "Cloudflare runtime is not deployed.",
-        actionLabel: "Deploy",
-      };
-    case "incomplete":
-    case "writeback_incomplete":
-      return {
-        message: status.details || "Cloudflare runtime setup is incomplete.",
-        actionLabel: "Repair",
-      };
-    case "outdated":
-      return {
-        message: "Cloudflare runtime needs an upgrade.",
-        actionLabel: "Upgrade",
-      };
-    case "unreachable":
-      return {
-        message: status.last_error || "Cloudflare runtime is unreachable.",
-        actionLabel: "Redeploy",
-      };
-    case "auth_expired":
-    case "offline_expired":
-      return {
-        message: "Cloudflare runtime authorization needs refresh.",
-        actionLabel: "Refresh",
-      };
-    case "upgrade_required":
-      return {
-        message: "Cloudflare runtime needs a one-time upgrade.",
-        actionLabel: "Upgrade",
-      };
-    case "enrollment_required":
-      return {
-        message: "This device must enroll with the Cloudflare runtime.",
-        actionLabel: "Open",
-      };
-    case "device_revoked":
-      return {
-        message: "This device was revoked. Restore your identity or create a new device.",
-      };
-    default:
-      return {
-        message: status.details || status.last_error || "Cloudflare runtime needs attention.",
-        actionLabel: "Open",
-      };
-  }
 }
 
 /**
@@ -289,7 +252,7 @@ export function NetworkIndicator() {
     <div className="flex items-center gap-1 px-2 py-1 text-xs">
       {syncing ? (
         <>
-          <span className="w-2 h-2 rounded-full bg-frost.3 animate-pulse" />
+          <span className="w-2 h-2 rounded-full bg-frost-3 animate-pulse" />
           <span className="text-muted-color">Syncing...</span>
         </>
       ) : connected === true ? (
@@ -300,7 +263,7 @@ export function NetworkIndicator() {
       ) : connected === false ? (
         <>
           <span
-            className={`w-2 h-2 rounded-full ${isLongDisconnect ? "status-error" : "bg-frost.3"} animate-pulse`}
+            className={`w-2 h-2 rounded-full ${isLongDisconnect ? "status-error" : "bg-frost-3"} animate-pulse`}
           />
           {isLongDisconnect ? (
             <button

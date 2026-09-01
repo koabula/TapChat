@@ -566,6 +566,13 @@
   .toast-exit {
     animation: slideInRight 0.3s ease reverse;
   }
+  .toast-card {
+    background-color: var(--bg-surface);
+    color: var(--text-primary);
+    border: 1px solid var(--border-default);
+    border-radius: 0.5rem;
+    box-shadow: 0 8px 24px rgb(46 52 64 / 0.16);
+  }
 
   /* Progress bar animation */
   .progress-bar {

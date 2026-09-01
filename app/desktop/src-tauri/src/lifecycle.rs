@@ -15,6 +15,7 @@ use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput};
 use crate::commands::session::{
     SessionStatus, read_session_status_snapshot, set_ws_connection_snapshot,
 };
+use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::{AppState, DeferredTransportBatch, LockReason, SessionState, StartupPhase};
 
 /// Input to the core engine — either a user-initiated command or a platform event.
@@ -289,6 +290,11 @@ pub async fn on_app_ready(app: &AppHandle) {
             {
                 log::warn!("startup attachment maintenance failed: {error}");
             }
+            let state = app_clone.state::<AppState>();
+            if let Err(error) = ensure_fresh_device_runtime_auth_for_state(state.inner()).await {
+                log::warn!("startup runtime authorization refresh failed: {error}");
+            }
+            crate::commands::cloudflare::emit_runtime_status(&app_clone).await;
             // Fire AppStarted to kick off sync
             if let Err(_error) =
                 drive_core_with_handle(&app_clone, CoreInput::Event(CoreEvent::AppStarted)).await
@@ -380,6 +386,7 @@ fn spawn_runtime_auth_scheduler(app: AppHandle) {
                     );
                 }
             }
+            crate::commands::cloudflare::emit_runtime_status(&app).await;
         }
     });
 }
@@ -1173,6 +1180,11 @@ pub async fn complete_onboarding(app: AppHandle) -> crate::errors::DesktopResult
     if let Some(onboarding_window) = app.get_webview_window("onboarding") {
         onboarding_window.close().map_err(|e| e.to_string())?;
     }
+
+    if let Err(error) = ensure_fresh_device_runtime_auth_for_state(state.inner()).await {
+        log::warn!("onboarding runtime authorization refresh failed: {error}");
+    }
+    crate::commands::cloudflare::emit_runtime_status(&app).await;
 
     // Start session with AppStarted event
     drive_core_with_handle(&app, CoreInput::Event(CoreEvent::AppStarted))

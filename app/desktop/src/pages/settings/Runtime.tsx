@@ -503,7 +503,7 @@ function runtimeStateMessage(status: RuntimeStatus): string {
       return "Cloudflare runtime needs an upgrade.";
     case "auth_expired":
     case "offline_expired":
-      return "Cloudflare runtime authorization needs refresh.";
+      return "Runtime authorization expired. Refresh will retry automatically, or retry now.";
     case "refreshing":
       return "Refreshing runtime authorization…";
     case "degraded":
