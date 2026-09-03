@@ -21,7 +21,7 @@ Most messaging systems still depend on a central service for message delivery, a
 - message history is synchronized by cursor, not by best-effort push state
 - attachments are encrypted locally before being uploaded as blobs
 
-This does not remove all metadata. Network timing, account-level Cloudflare metadata, and contact graph hints can still exist. The goal is to reduce centralized control and cross-user metadata concentration while keeping the app usable. In the current group protocol, the Group Outbox holds a complete signed membership/role manifest and can observe a single group's roster. See the [threat model](./doc/THREAT_MODEL.md).
+This does not remove all metadata. Network timing, account-level Cloudflare metadata, and contact graph hints can still exist. The goal is to reduce centralized control and cross-user metadata concentration while keeping the app usable. In the current group protocol, the Group Outbox holds a complete signed membership/role manifest and can observe a single group's roster. 
 
 ## How it works
 

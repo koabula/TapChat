@@ -1708,6 +1708,22 @@ impl CoreEngine {
                 };
                 match result {
                     IngestResult::AppliedApplication(application) => {
+                        let sender_identity_valid =
+                            Self::parse_mls_sender_identity(&application.sender_identity)
+                                .is_some_and(|mls_sender| {
+                                    mls_sender.user_id == record.envelope.sender_user_id
+                                        && mls_sender.device_id
+                                            == record.envelope.sender_device_id
+                                });
+                        if !sender_identity_valid {
+                            log::warn!(
+                                "sync_group_outbox: dropping application message {} whose envelope sender does not match its MLS-authenticated sender in group {}",
+                                redact_id("msg", &record.envelope.message_id),
+                                redact_id("group", &group_id)
+                            );
+                            last_terminal_seq = record_seq;
+                            continue;
+                        }
                         self.store_group_record_message(
                             &conversation_id,
                             &record,

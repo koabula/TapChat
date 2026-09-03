@@ -1902,6 +1902,66 @@ mod tests {
     }
 
     #[test]
+    fn group_application_message_with_spoofed_envelope_sender_is_dropped() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob, &mut carol]);
+        let mut harness =
+            GroupHarness::with_bundles(&[&alice, &bob, &carol].map(|u| HarnessUser {
+                name: u.name,
+                bundle: u.bundle.clone(),
+                engine: CoreEngine::new(),
+            }));
+
+        let (group_id, conversation_id) = harness.create_group(
+            &mut alice,
+            "Project",
+            vec![bob.bundle.user_id.clone(), carol.bundle.user_id.clone()],
+        );
+        harness.import_welcome(&mut bob, &group_id);
+        harness.import_welcome(&mut carol, &group_id);
+        harness.sync_group(&mut bob, &group_id);
+        harness.sync_group(&mut carol, &group_id);
+
+        // Alice sends a real, correctly-authenticated MLS application message.
+        harness.send_text(&mut alice, &conversation_id, "hi from alice for real");
+
+        // A malicious/compromised Outbox relabels the envelope's sender fields to
+        // Carol, without touching the MLS ciphertext (which it cannot forge).
+        {
+            let record = harness
+                .outboxes
+                .get_mut(&group_id)
+                .expect("group outbox")
+                .last_mut()
+                .expect("application record");
+            assert_eq!(record.envelope.message_type, GroupMessageType::MlsApplication);
+            record.envelope.sender_user_id = carol.bundle.user_id.clone();
+            record.envelope.sender_device_id = carol.bundle.devices[0].device_id.clone();
+        }
+
+        harness.sync_group(&mut bob, &group_id);
+
+        let bob_texts = group_plaintexts(&bob, &conversation_id);
+        assert!(
+            !bob_texts.iter().any(|text| text == "hi from alice for real"),
+            "message with a spoofed envelope sender must not be accepted, even though its MLS ciphertext is genuine: {bob_texts:?}"
+        );
+        assert!(
+            !bob.engine
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .messages
+                .iter()
+                .any(|message| message.sender_user_id.as_deref() == Some(carol.bundle.user_id.as_str())),
+            "no message should ever be attributed to carol here"
+        );
+    }
+
+    #[test]
     fn group_pcs_member_proposal_then_owner_commit_decrypts() {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
