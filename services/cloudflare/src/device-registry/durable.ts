@@ -16,7 +16,11 @@ import {
   type DeviceRuntimeRefreshChallenge,
   type DeviceRuntimeRefreshProof,
   type DeviceRuntimeToken,
-  type IdentityBundle
+  type IdentityBundle,
+  type KeyPackagePoolClaimResult,
+  type KeyPackagePoolCountResult,
+  type KeyPackagePoolReplenishRequest,
+  type OneTimeKeyPackageEntry
 } from "../types/contracts";
 import type { Env } from "../types/env";
 import { appErrorBody } from "../errors";
@@ -31,6 +35,9 @@ const KEY_PACKAGE_NOT_BEFORE_SKEW_MS = 60 * 60 * 1000;
 const KEY_PACKAGE_MIN_REMAINING_MS = 7 * 24 * 60 * 60 * 1000;
 const CLOCK_TOLERANCE_MS = 5 * 60 * 1000;
 const INBOX_CAPABILITY_MAX_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
+const KEY_PACKAGE_POOL_PREFIX = "keypackage_pool:";
+const KEY_PACKAGE_POOL_MAX_SIZE = 40;
+const MAX_KEY_PACKAGE_BASE64_LENGTH = 8192;
 
 interface StoredIdentityBundle {
   bundle: IdentityBundle;
@@ -67,6 +74,36 @@ function challengeKey(nonce: string): string {
 
 function deviceKey(deviceId: string): string {
   return `${DEVICE_PREFIX}${deviceId}`;
+}
+
+function keyPackagePoolPrefix(deviceId: string): string {
+  return `${KEY_PACKAGE_POOL_PREFIX}${deviceId}:`;
+}
+
+function keyPackagePoolKey(deviceId: string, keyPackageId: string): string {
+  return `${keyPackagePoolPrefix(deviceId)}${keyPackageId}`;
+}
+
+function validateOneTimeKeyPackageEntry(entry: OneTimeKeyPackageEntry, now: number): void {
+  if (
+    !entry.keyPackageId ||
+    !entry.keyPackage ||
+    entry.keyPackage.length > MAX_KEY_PACKAGE_BASE64_LENGTH ||
+    entry.lifecycleVersion !== 1 ||
+    !Number.isSafeInteger(entry.notBefore) ||
+    !Number.isSafeInteger(entry.createdAt) ||
+    !Number.isSafeInteger(entry.expiresAt) ||
+    entry.expiresAt - entry.createdAt !== KEY_PACKAGE_LIFETIME_MS ||
+    entry.notBefore !== Math.max(0, entry.createdAt - KEY_PACKAGE_NOT_BEFORE_SKEW_MS)
+  ) {
+    throw new HttpError(422, "keypackage_lifetime_invalid", "one-time key package lifecycle metadata is invalid");
+  }
+  if (entry.createdAt > now + CLOCK_TOLERANCE_MS || entry.notBefore > now + CLOCK_TOLERANCE_MS) {
+    throw new HttpError(422, "device_clock_invalid", "one-time key package timestamps are too far in the future");
+  }
+  if (entry.expiresAt <= now - CLOCK_TOLERANCE_MS) {
+    throw new HttpError(422, "keypackage_expired", "one-time key package is already expired");
+  }
 }
 
 function randomNonce(): string {
@@ -209,6 +246,15 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
       }
       if (request.method === "POST" && url.pathname.endsWith("/identity-bundle/migrate")) {
         return await this.migrateIdentityBundle(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/keypackage-pool/replenish")) {
+        return await this.replenishKeyPackagePool(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/keypackage-pool/claim")) {
+        return await this.claimKeyPackage(request);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/keypackage-pool/count")) {
+        return await this.keyPackagePoolCount(request);
       }
       return errorResponse(404, "not_found");
     } catch (error) {
@@ -512,6 +558,56 @@ export class DeviceRegistryDurableObject extends DurableObjectBase {
     const response = jsonResponse(stored.bundle);
     response.headers.set("etag", stored.etag);
     return response;
+  }
+
+  private async replenishKeyPackagePool(request: Request, now: number): Promise<Response> {
+    const body = await readJsonLimited<KeyPackagePoolReplenishRequest>(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.deviceId || !Array.isArray(body.keyPackages) || body.keyPackages.length === 0) {
+      throw new HttpError(400, "invalid_input", "replenish request is missing deviceId or key packages");
+    }
+    const prefix = keyPackagePoolPrefix(body.deviceId);
+    const added = await this.stateRef.storage.transaction(async (transaction) => {
+      const existing = await transaction.list({ prefix });
+      const available = KEY_PACKAGE_POOL_MAX_SIZE - existing.size;
+      let count = 0;
+      for (const entry of body.keyPackages) {
+        if (count >= available) break;
+        validateOneTimeKeyPackageEntry(entry, now);
+        await transaction.put(keyPackagePoolKey(body.deviceId, entry.keyPackageId), entry);
+        count += 1;
+      }
+      return count;
+    });
+    return jsonResponse({ added, capacity: KEY_PACKAGE_POOL_MAX_SIZE });
+  }
+
+  private async claimKeyPackage(request: Request): Promise<Response> {
+    const body = await readJsonLimited<{ deviceId?: string }>(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.deviceId) {
+      throw new HttpError(400, "invalid_input", "claim request is missing deviceId");
+    }
+    const prefix = keyPackagePoolPrefix(body.deviceId);
+    const claimed = await this.stateRef.storage.transaction(async (transaction) => {
+      const existing = await transaction.list<OneTimeKeyPackageEntry>({ prefix, limit: 1 });
+      const first = existing.entries().next();
+      if (first.done) return null;
+      const [key, entry] = first.value;
+      await transaction.delete(key);
+      return entry;
+    });
+    if (!claimed) {
+      return errorResponse(404, "pool_empty");
+    }
+    return jsonResponse({ keyPackage: claimed } satisfies KeyPackagePoolClaimResult);
+  }
+
+  private async keyPackagePoolCount(request: Request): Promise<Response> {
+    const body = await readJsonLimited<{ deviceId?: string }>(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.deviceId) {
+      throw new HttpError(400, "invalid_input", "count request is missing deviceId");
+    }
+    const existing = await this.stateRef.storage.list({ prefix: keyPackagePoolPrefix(body.deviceId) });
+    return jsonResponse({ count: existing.size } satisfies KeyPackagePoolCountResult);
   }
 }
 

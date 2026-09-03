@@ -825,6 +825,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
 
         let summary = output
             .view_model
@@ -956,6 +957,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -1011,6 +1013,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -1065,6 +1068,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let summary = output
             .view_model
             .as_ref()
@@ -1112,6 +1116,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let summary = created
             .view_model
             .as_ref()
@@ -1174,6 +1179,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let summary = created
             .view_model
             .as_ref()
@@ -1244,6 +1250,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let summary = output
             .view_model
             .as_ref()
@@ -1312,6 +1319,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let group_id = created
             .view_model
             .as_ref()
@@ -1405,6 +1413,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let group_id = created
             .view_model
             .as_ref()
@@ -1501,6 +1510,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let group_id = created
             .view_model
             .as_ref()
@@ -1578,6 +1588,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let group_id = created
             .view_model
             .as_ref()
@@ -1634,6 +1645,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let group_id = created
             .view_model
             .as_ref()
@@ -1733,6 +1745,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let created = simulate_pending_key_package_claims(&mut alice, created);
         let group_id = created
             .view_model
             .as_ref()
@@ -4091,6 +4104,1026 @@ mod tests {
     }
 
     #[test]
+    fn create_direct_conversation_claims_key_package_before_creating_mls_group() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create conversation");
+
+        // Nothing is visible yet: the command only issues the claim request,
+        // the MLS group/conversation is not created until the claim resolves.
+        assert!(output.view_model.is_none());
+        assert!(alice.state.conversations.is_empty());
+        assert!(alice.state.mls_summaries.is_empty());
+        assert_eq!(output.effects.len(), 1);
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert_eq!(request.method, crate::ffi_api::HttpMethod::Post);
+        assert!(request.url.contains("/keypackage-pool/"));
+        assert!(request.url.ends_with("/claim"));
+        assert!(request.auth.is_none(), "claiming a peer's pool is unauthenticated");
+
+        let claimed_key_package_b64 = bob_bundle.devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("bob key package")
+            .object_ref
+            .clone();
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "claim-1",
+                "keyPackage": claimed_key_package_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        let completed = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: request.request_id.clone(),
+                status: 200,
+                body: Some(body),
+            })
+            .expect("claim response completes conversation creation");
+
+        let summary = completed
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("conversation summary");
+        assert_eq!(summary.peer_user_id, bob_bundle.user_id);
+        assert_eq!(alice.state.conversations.len(), 1);
+        assert!(
+            alice
+                .state
+                .mls_summaries
+                .contains_key(&summary.conversation_id)
+        );
+    }
+
+    #[test]
+    fn create_direct_conversation_falls_back_to_last_resort_on_pool_empty() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create conversation");
+        let request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+
+        let completed = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 404,
+                body: Some(r#"{"code":"pool_empty"}"#.into()),
+            })
+            .expect("pool_empty falls back to the cached last-resort key package");
+
+        let summary = completed
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("conversation summary despite pool_empty");
+        assert_eq!(alice.state.conversations.len(), 1);
+        assert!(
+            alice
+                .state
+                .mls_summaries
+                .contains_key(&summary.conversation_id)
+        );
+    }
+
+    #[test]
+    fn create_direct_conversation_hard_claim_failure_aborts_without_partial_state() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create conversation");
+        let request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+
+        let aborted = alice
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id,
+                failure: test_failure("network_unreachable", true, None),
+            })
+            .expect("claim failure surfaces as a notification, not a hard command error");
+
+        assert!(aborted.view_model.is_none(), "no conversation was created");
+        assert!(alice.state.conversations.is_empty());
+        assert!(alice.state.mls_summaries.is_empty());
+        assert_eq!(
+            aborted.state_update.system_statuses_changed,
+            vec![crate::ffi_api::SystemStatus::TemporaryNetworkFailure]
+        );
+        assert!(aborted.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::EmitUserNotification { notification }
+                if notification.status == crate::ffi_api::SystemStatus::TemporaryNetworkFailure
+        )));
+
+        // No leftover pending-creation state: retrying the command starts a
+        // clean new claim rather than erroring or getting stuck.
+        let retry_output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("retry after abort");
+        assert!(matches!(
+            retry_output.effects.first(),
+            Some(CoreEffect::ExecuteHttpRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn create_group_conversation_claims_key_packages_sequentially_in_member_order() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("import carol");
+
+        let mut ordered_members = vec![
+            (bob_bundle.user_id.clone(), bob_bundle.devices[0].clone()),
+            (carol_bundle.user_id.clone(), carol_bundle.devices[0].clone()),
+        ];
+        ordered_members.sort_by(|a, b| a.0.cmp(&b.0));
+        let claim_response_for = |device: &crate::model::DeviceContactProfile| {
+            serde_json::json!({
+                "keyPackage": {
+                    "keyPackageId": "claim",
+                    "keyPackage": device
+                        .keypackage_ref
+                        .as_ref()
+                        .expect("device key package")
+                        .object_ref
+                        .clone(),
+                    "lifecycleVersion": 1,
+                    "notBefore": 0,
+                    "createdAt": 0,
+                    "expiresAt": 0,
+                }
+            })
+            .to_string()
+        };
+
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_bundle.user_id.clone(), carol_bundle.user_id.clone()],
+            })
+            .expect("create group");
+
+        assert!(
+            output.view_model.is_none(),
+            "no group is visible before every member device's key package is resolved"
+        );
+        assert!(alice.state.group_states.is_empty());
+        assert_eq!(
+            output.effects.len(),
+            1,
+            "claims are strictly sequential: only one in flight at a time"
+        );
+        let first_request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        let expected_first_device =
+            urlencoding::encode(&ordered_members[0].1.device_id).into_owned();
+        assert!(
+            first_request.url.contains(&expected_first_device),
+            "first claim must target the first member in sorted user_id order: {}",
+            first_request.url
+        );
+
+        let second_output = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: first_request.request_id.clone(),
+                status: 200,
+                body: Some(claim_response_for(&ordered_members[0].1)),
+            })
+            .expect("first claim resolves");
+        assert!(
+            second_output.view_model.is_none(),
+            "still waiting on the second member's claim"
+        );
+        assert!(alice.state.group_states.is_empty());
+        assert_eq!(second_output.effects.len(), 1);
+        let second_request = match &second_output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected the second claim request, got {other:?}"),
+        };
+        let expected_second_device =
+            urlencoding::encode(&ordered_members[1].1.device_id).into_owned();
+        assert!(
+            second_request.url.contains(&expected_second_device),
+            "second claim must target the second member only after the first resolves: {}",
+            second_request.url
+        );
+
+        let completed = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: second_request.request_id.clone(),
+                status: 200,
+                body: Some(claim_response_for(&ordered_members[1].1)),
+            })
+            .expect("second claim resolves and finalizes group creation");
+
+        let summary = completed
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary after both claims resolve");
+        assert_eq!(summary.kind, Some(ConversationKind::Group));
+        assert!(
+            alice
+                .state
+                .group_states
+                .contains_key(summary.group_id.as_deref().expect("group id"))
+        );
+    }
+
+    /// Creates a group owned by `alice` with `bob` as its only other member,
+    /// resolving the creation's KeyPackage claim and settling the resulting
+    /// pending group transition so the group is fully `Ready` for the
+    /// caller's own claim-batch test. Returns the group id.
+    fn create_ready_two_member_group(alice: &mut CoreEngine, bob_user_id: &str) -> String {
+        let output = alice
+            .handle_command(CoreCommand::CreateGroupConversation {
+                title: "Project".into(),
+                member_user_ids: vec![bob_user_id.to_string()],
+            })
+            .expect("create group");
+        let output = simulate_pending_key_package_claims(alice, output);
+        let group_id = output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.conversations.first())
+            .expect("group summary")
+            .group_id
+            .clone()
+            .expect("group id");
+        acknowledge_pending_group_transition(alice, &group_id);
+        group_id
+    }
+
+    #[test]
+    fn invite_to_group_claims_key_package_before_adding_member() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("import carol");
+        let group_id = create_ready_two_member_group(&mut alice, &bob_bundle.user_id);
+
+        let output = alice
+            .handle_command(CoreCommand::InviteToGroup {
+                group_id: group_id.clone(),
+                invitee_user_ids: vec![carol_bundle.user_id.clone()],
+            })
+            .expect("invite carol");
+
+        // Nothing is visible yet: the command only issues the claim
+        // request, carol is not added until the claim resolves.
+        assert!(output.view_model.is_none());
+        assert_eq!(output.effects.len(), 1);
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert_eq!(request.method, crate::ffi_api::HttpMethod::Post);
+        assert!(request.url.contains("/keypackage-pool/"));
+        assert!(request.url.ends_with("/claim"));
+        assert!(
+            !alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.user_id == carol_bundle.user_id),
+            "carol must not be a member until the claim resolves"
+        );
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_none()
+        );
+
+        let claimed_key_package_b64 = carol_bundle.devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("carol key package")
+            .object_ref
+            .clone();
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "claim-carol",
+                "keyPackage": claimed_key_package_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: request.request_id.clone(),
+                status: 200,
+                body: Some(body),
+            })
+            .expect("claim response completes invite");
+
+        // The claim resolving stages the membership transition; the group's
+        // canonical manifest only picks it up once the transition is
+        // appended (mirroring how group creation itself works).
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_some()
+        );
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.user_id == carol_bundle.user_id),
+            "carol must be a member after the transition is acknowledged"
+        );
+    }
+
+    #[test]
+    fn invite_to_group_falls_back_to_last_resort_on_pool_empty() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("import carol");
+        let group_id = create_ready_two_member_group(&mut alice, &bob_bundle.user_id);
+
+        let output = alice
+            .handle_command(CoreCommand::InviteToGroup {
+                group_id: group_id.clone(),
+                invitee_user_ids: vec![carol_bundle.user_id.clone()],
+            })
+            .expect("invite carol");
+        let request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 404,
+                body: Some(r#"{"code":"pool_empty"}"#.into()),
+            })
+            .expect("pool_empty falls back to the cached last-resort key package");
+
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_some(),
+            "pool_empty must still stage the invite via the cached last-resort key package"
+        );
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.user_id == carol_bundle.user_id)
+        );
+    }
+
+    #[test]
+    fn approve_group_join_claims_key_package_before_adding_member() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let dana_bundle = sample_identity_bundle(DANA_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: dana_bundle.clone(),
+            })
+            .expect("import dana");
+        let group_id = create_ready_two_member_group(&mut alice, &bob_bundle.user_id);
+
+        // Fabricate an already-leased, ready-to-approve join request for
+        // dana. The invite/submit/decide/lease round trip that produces
+        // this state is exercised elsewhere (`group_invite_approval_adds_dana_e2e`);
+        // this test isolates just the claim-then-add behavior of the final
+        // approval step.
+        let request_id = "join:dana:1".to_string();
+        let join = GroupJoinRequest {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            request_id: request_id.clone(),
+            group_id: group_id.clone(),
+            invite_id: "invite:dana".into(),
+            joiner_user_id: dana_bundle.user_id.clone(),
+            joiner_device_id: dana_bundle.devices[0].device_id.clone(),
+            joiner_contact_share_url: "https://example.com/share/dana".into(),
+            requested_at: 0,
+            request_capability: "cap".into(),
+            signature: "sig".into(),
+            status: GroupJoinRequestStatus::WaitingForGroupCommit,
+            auto_approve: None,
+        };
+        alice.state.group_join_requests.insert(
+            request_id.clone(),
+            crate::persistence::PersistedGroupJoinRequest {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+                request: join,
+                join_request_endpoint: None,
+                welcome_pickup: None,
+                manifest: None,
+                start_cursor: None,
+                lease_token: Some("lease-token".into()),
+                lease_expires_at: Some(u64::MAX),
+            },
+        );
+
+        let output = alice
+            .handle_command(CoreCommand::ApproveGroupJoin {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+            })
+            .expect("approve join issues a claim");
+
+        assert!(output.view_model.is_none());
+        assert_eq!(output.effects.len(), 1);
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert!(request.url.contains("/keypackage-pool/"));
+        assert!(request.url.ends_with("/claim"));
+        assert!(
+            !alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.user_id == dana_bundle.user_id),
+            "dana must not be a member until the claim resolves"
+        );
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_none()
+        );
+
+        let claimed_key_package_b64 = dana_bundle.devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("dana key package")
+            .object_ref
+            .clone();
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "claim-dana",
+                "keyPackage": claimed_key_package_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: request.request_id.clone(),
+                status: 200,
+                body: Some(body),
+            })
+            .expect("claim response completes the approval");
+
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_some(),
+            "claim resolving stages the membership transition"
+        );
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .members
+                .iter()
+                .any(|member| member.user_id == dana_bundle.user_id)
+        );
+    }
+
+    #[test]
+    fn add_group_member_device_claims_key_package_from_own_runtime_before_adding_device() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let group_id = create_ready_two_member_group(&mut alice, &bob_bundle.user_id);
+        let alice_user_id = alice
+            .local_identity()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+
+        // Register a second device (tablet) in alice's own local bundle,
+        // simulating it having been created and merged in via an identity
+        // refresh elsewhere.
+        let alice_root = IdentityManager::recover_user_root(ALICE_MNEMONIC).expect("alice root");
+        let alice_tablet = IdentityManager::create_new_device_for_user(&alice_root, None)
+            .expect("alice tablet identity");
+        let tablet_package =
+            MlsAdapter::generate_key_package(&alice_tablet, test_now_ms()).expect("tablet package");
+        let tablet_keypackage_b64 = tablet_package.key_package_b64.clone();
+        let tablet_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &alice_tablet,
+            &sample_deployment(),
+            tablet_package.key_package_b64,
+            tablet_package.expires_at,
+        )
+        .expect("tablet profile");
+        let tablet_device_id = tablet_profile.device_id.clone();
+        alice
+            .state
+            .local_bundle
+            .as_mut()
+            .expect("local bundle")
+            .devices
+            .push(tablet_profile);
+
+        let output = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                user_id: alice_user_id.clone(),
+                device_id: tablet_device_id.clone(),
+            })
+            .expect("add tablet device issues a claim");
+
+        assert!(output.view_model.is_none());
+        assert_eq!(output.effects.len(), 1);
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert!(request.url.ends_with("/claim"));
+        // This is the one case where a claim targets the LOCAL user's own
+        // runtime (the deployment's inbox origin), not a contact lookup —
+        // registering an additional device is not a contact operation.
+        let own_origin = sample_deployment().inbox_http_endpoint;
+        assert!(
+            request.url.starts_with(&own_origin),
+            "add_group_member_device must claim from the local user's own runtime ({own_origin}), got {}",
+            request.url
+        );
+        assert!(request.auth.is_none(), "claiming a pool is unauthenticated");
+        assert!(
+            !alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .member_devices
+                .iter()
+                .any(|device| device.device_id == tablet_device_id),
+            "tablet must not be an MLS member until the claim resolves"
+        );
+
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "claim-tablet",
+                "keyPackage": tablet_keypackage_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: request.request_id.clone(),
+                status: 200,
+                body: Some(body),
+            })
+            .expect("claim response completes add_group_member_device");
+
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_some()
+        );
+        acknowledge_pending_group_transition(&mut alice, &group_id);
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .member_devices
+                .iter()
+                .any(|device| device.device_id == tablet_device_id)
+        );
+    }
+
+    #[test]
+    fn add_group_member_device_hard_claim_failure_aborts_without_partial_state() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let group_id = create_ready_two_member_group(&mut alice, &bob_bundle.user_id);
+        let alice_user_id = alice
+            .local_identity()
+            .expect("identity")
+            .user_identity
+            .user_id
+            .clone();
+
+        let alice_root = IdentityManager::recover_user_root(ALICE_MNEMONIC).expect("alice root");
+        let alice_tablet = IdentityManager::create_new_device_for_user(&alice_root, None)
+            .expect("alice tablet identity");
+        let tablet_package =
+            MlsAdapter::generate_key_package(&alice_tablet, test_now_ms()).expect("tablet package");
+        let tablet_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &alice_tablet,
+            &sample_deployment(),
+            tablet_package.key_package_b64,
+            tablet_package.expires_at,
+        )
+        .expect("tablet profile");
+        let tablet_device_id = tablet_profile.device_id.clone();
+        alice
+            .state
+            .local_bundle
+            .as_mut()
+            .expect("local bundle")
+            .devices
+            .push(tablet_profile);
+
+        let output = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                user_id: alice_user_id.clone(),
+                device_id: tablet_device_id.clone(),
+            })
+            .expect("add tablet device issues a claim");
+        let request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+
+        let aborted = alice
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id,
+                failure: test_failure("network_unreachable", true, None),
+            })
+            .expect("claim failure surfaces as a notification, not a hard command error");
+
+        assert!(aborted.view_model.is_none());
+        assert!(
+            alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .pending_group_transition
+                .is_none(),
+            "no partial group transition was left behind"
+        );
+        assert!(
+            !alice
+                .state
+                .group_states
+                .get(&group_id)
+                .expect("group state")
+                .manifest
+                .member_devices
+                .iter()
+                .any(|device| device.device_id == tablet_device_id)
+        );
+        assert_eq!(
+            aborted.state_update.system_statuses_changed,
+            vec![crate::ffi_api::SystemStatus::TemporaryNetworkFailure]
+        );
+        assert!(aborted.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::EmitUserNotification { notification }
+                if notification.status == crate::ffi_api::SystemStatus::TemporaryNetworkFailure
+        )));
+
+        // No leftover pending-claim state: retrying the command starts a
+        // clean new claim rather than erroring or getting stuck.
+        let retry_output = alice
+            .handle_command(CoreCommand::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                user_id: alice_user_id,
+                device_id: tablet_device_id,
+            })
+            .expect("retry after abort");
+        assert!(matches!(
+            retry_output.effects.first(),
+            Some(CoreEffect::ExecuteHttpRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn reconcile_membership_rebootstrap_claims_key_package_before_recreating_group() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "before rebuild".into(),
+            })
+            .expect("send");
+
+        // Force the conversation into a needs-rebuild state (via a
+        // persistence round trip, matching how a real MLS-unrecoverable
+        // restore marks a conversation) so reconciliation takes the
+        // rebootstrap path.
+        let mut snapshot = alice.refresh_snapshot();
+        snapshot
+            .mls_states
+            .first_mut()
+            .expect("mls state")
+            .summary
+            .status = crate::model::MlsStateStatus::NeedsRebuild;
+        let persisted_conversation = snapshot
+            .conversations
+            .iter_mut()
+            .find(|entry| entry.conversation_id == conversation_id)
+            .expect("persisted conversation");
+        persisted_conversation.state.conversation.state = ConversationState::NeedsRebuild;
+        persisted_conversation.state.recovery_status = RecoveryStatus::NeedsRebuild;
+        let mut alice = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
+
+        let output = alice
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("reconcile triggers rebootstrap");
+
+        assert!(output.view_model.is_none());
+        assert_eq!(output.effects.len(), 1);
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert!(request.url.ends_with("/claim"));
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            ConversationState::NeedsRebuild,
+            "the conversation is not rebuilt until the claim resolves"
+        );
+
+        let claimed_key_package_b64 = bob_bundle.devices[0]
+            .keypackage_ref
+            .as_ref()
+            .expect("bob key package")
+            .object_ref
+            .clone();
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "claim-rebootstrap",
+                "keyPackage": claimed_key_package_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        let completed = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: request.request_id.clone(),
+                status: 200,
+                body: Some(body),
+            })
+            .expect("claim response rebuilds the conversation");
+
+        assert!(completed.view_model.as_ref().is_some_and(|view| {
+            view.messages
+                .iter()
+                .any(|message| message.message_type == MessageType::MlsCommit)
+                && view
+                    .messages
+                    .iter()
+                    .any(|message| message.message_type == MessageType::MlsWelcome)
+        }));
+        assert_eq!(
+            alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .expect("conversation")
+                .conversation
+                .state,
+            ConversationState::Active
+        );
+        assert!(alice.state.mls_summaries.contains_key(&conversation_id));
+    }
+
+    #[test]
+    fn reconcile_membership_add_devices_claims_key_package_before_adding_member() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+
+        let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
+        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+            .expect("bob laptop identity");
+        let bob_laptop_package =
+            MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
+        let laptop_keypackage_b64 = bob_laptop_package.key_package_b64.clone();
+        let bob_laptop_profile = crate::capability::CapabilityManager::build_device_contact_profile(
+            &bob_laptop,
+            &sample_deployment(),
+            bob_laptop_package.key_package_b64,
+            bob_laptop_package.expires_at,
+        )
+        .expect("laptop profile");
+        let laptop_device_id = bob_laptop_profile.device_id.clone();
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .bundle
+            .devices
+            .push(bob_laptop_profile);
+
+        let output = alice
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("reconcile claims the new device's key package");
+
+        assert!(
+            output.view_model.is_none(),
+            "nothing changes until the claim resolves"
+        );
+        assert_eq!(output.effects.len(), 1);
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert!(request.url.ends_with("/claim"));
+        assert!(request.url.contains(&urlencoding::encode(&laptop_device_id).into_owned()));
+        assert!(!alice.state.pending_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.recipient_device_id == laptop_device_id
+        }));
+
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "claim-laptop",
+                "keyPackage": laptop_keypackage_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        let completed = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: request.request_id.clone(),
+                status: 200,
+                body: Some(body),
+            })
+            .expect("claim response adds the new device");
+
+        assert!(completed.state_update.conversations_changed);
+        assert!(alice.state.pending_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.recipient_device_id == laptop_device_id
+                && item.envelope.message_type == MessageType::MlsWelcome
+        }));
+        assert!(alice.state.pending_outbox.iter().any(|item| {
+            item.envelope.conversation_id == conversation_id
+                && item.envelope.message_type == MessageType::MlsCommit
+        }));
+    }
+
+    #[test]
+    fn credential_maintenance_replenishes_pool_when_below_low_water_mark() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let now_ms = engine
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("published key package")
+            .created_at;
+
+        let output = engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms })
+            .expect("credential maintenance");
+        let count_request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+
+        let below_low_water = crate::mls_adapter::ONE_TIME_KEY_PACKAGE_POOL_LOW_WATER.saturating_sub(2);
+        let replenished = engine
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: count_request_id,
+                status: 200,
+                body: Some(format!(r#"{{"count":{below_low_water}}}"#)),
+            })
+            .expect("pool count below low water triggers a replenish request");
+
+        let replenish_request = replenished
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.method == crate::ffi_api::HttpMethod::Put
+                        && request.url.contains("/keypackage-pool/") =>
+                {
+                    Some(request.clone())
+                }
+                _ => None,
+            })
+            .expect("replenish request");
+        let body: serde_json::Value =
+            serde_json::from_str(replenish_request.body.as_deref().expect("replenish body"))
+                .expect("replenish body json");
+        let key_packages = body["keyPackages"].as_array().expect("keyPackages array");
+        assert_eq!(
+            key_packages.len(),
+            (crate::mls_adapter::ONE_TIME_KEY_PACKAGE_POOL_TARGET - below_low_water) as usize,
+            "must request exactly enough key packages to top the pool back up to the target"
+        );
+    }
+
+    #[test]
     fn direct_shell_without_mls_state_is_recovery_only_and_blocks_send() {
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
@@ -5631,6 +6664,11 @@ mod tests {
                 .expect("bundle"),
             })
             .expect("identity bundle response");
+        // Bob's device swap (phone -> laptop) is an added + revoked device
+        // for the existing direct conversation, which now claims a one-time
+        // KeyPackage for the new device before the membership commit is
+        // generated.
+        let response = simulate_pending_key_package_claims(&mut alice, response);
 
         assert!(response.state_update.conversations_changed);
         assert!(response.effects.iter().any(|effect| matches!(
@@ -6323,6 +7361,7 @@ mod tests {
                 conversation_kind: ConversationKind::Direct,
             })
             .expect("conversation setup");
+        let output = simulate_pending_key_package_claims(&mut alice, output);
         let request_id = find_http_request_id(&output, "/messages");
 
         let output = alice
@@ -7876,9 +8915,10 @@ mod tests {
             None,
         )
         .expect("merged bundle");
-        alice
+        let output = alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
             .expect("apply merged bundle");
+        simulate_pending_key_package_claims(&mut alice, output);
         let welcome = alice
             .state
             .pending_outbox
@@ -8227,6 +9267,90 @@ mod tests {
     }
 
     #[test]
+    fn direct_welcome_via_pool_entry_does_not_rotate_last_resort_key_package() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let bob_user_id = bob_bundle.user_id.clone();
+        let before = local_key_package_ref(&bob);
+
+        // Generate a fresh one-time pool KeyPackage for bob's own device
+        // (distinct bytes/init secret from bob's currently-advertised
+        // last-resort KeyPackage, but built with bob's own provider/signer
+        // so bob can actually process a Welcome built against it) and use
+        // it as the simulated claim response instead of the cached
+        // last-resort bytes that `create_direct_conversation` would
+        // otherwise reuse.
+        let pool_entry = bob
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("bob mls adapter")
+            .generate_one_time_key_packages(1, test_now_ms())
+            .expect("generate pool entry")
+            .remove(0);
+        assert_ne!(pool_entry.key_package_b64, {
+            bob.state
+                .published_key_package
+                .as_ref()
+                .expect("bob last-resort key package")
+                .key_package_b64
+                .clone()
+        });
+
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_user_id,
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create conversation");
+        let request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+        let body = serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "pool-entry-1",
+                "keyPackage": pool_entry.key_package_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string();
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(body),
+            })
+            .expect("pool-entry claim response completes conversation creation");
+
+        let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+
+        let after = bob
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("last-resort key package must be unchanged")
+            .key_package_ref
+            .clone();
+        assert_eq!(
+            before, after,
+            "a Welcome built from a claimed one-time pool entry must not rotate the last-resort key package"
+        );
+        assert!(
+            bob.state.pending_identity_publication.is_none(),
+            "no rotation means no pending identity republish either"
+        );
+        assert!(
+            !publish_shared_state_effects(&output)
+                .iter()
+                .any(|publish| publish.document_kind == SharedStateDocumentKind::IdentityBundle),
+            "no identity bundle republish should be triggered by a pool-sourced welcome"
+        );
+    }
+
+    #[test]
     fn delayed_welcome_rebases_an_unconfirmed_share_rotation() {
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
         let confirmed_share_id = bob
@@ -8475,11 +9599,12 @@ mod tests {
         )
         .expect("merged bundle");
 
-        alice
+        let output = alice
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
                 bundle: merged.clone(),
             })
             .expect("apply bundle update");
+        simulate_pending_key_package_claims(&mut alice, output);
 
         assert!(alice.state.pending_outbox.iter().any(|item| {
             item.envelope.conversation_id == conversation_id
@@ -8698,6 +9823,10 @@ mod tests {
                 conversation_id: conversation_id.clone(),
             })
             .expect("reconcile after rebuild");
+        // Rebootstrap now claims a one-time KeyPackage for each peer device
+        // before rebuilding the MLS group, rather than reading it straight
+        // out of the cached contact bundle.
+        let output = simulate_pending_key_package_claims(&mut restored, output);
 
         assert!(output.view_model.as_ref().is_some_and(|view| {
             view.messages
@@ -9509,6 +10638,54 @@ mod tests {
                             })
                             .expect("group authorization initialized")
                     }
+                    CoreEffect::ExecuteHttpRequest { request }
+                        if request.url.contains("/keypackage-pool/")
+                            && request.url.ends_with("/claim") =>
+                    {
+                        let device_id = request
+                            .url
+                            .split("/keypackage-pool/")
+                            .nth(1)
+                            .and_then(|rest| rest.strip_suffix("/claim"))
+                            .map(|encoded| {
+                                urlencoding::decode(encoded)
+                                    .expect("valid device id encoding")
+                                    .into_owned()
+                            })
+                            .expect("claim url must contain a device id");
+                        let key_package_b64 = self
+                            .bundles
+                            .values()
+                            .find_map(|bundle| {
+                                bundle
+                                    .devices
+                                    .iter()
+                                    .find(|device| device.device_id == device_id)
+                                    .and_then(|device| device.keypackage_ref.as_ref())
+                                    .map(|keypackage_ref| keypackage_ref.object_ref.clone())
+                            })
+                            .expect(
+                                "group harness must have a cached key package to simulate a claim response",
+                            );
+                        let body = serde_json::json!({
+                            "keyPackage": {
+                                "keyPackageId": "test-claim",
+                                "keyPackage": key_package_b64,
+                                "lifecycleVersion": 1,
+                                "notBefore": 0,
+                                "createdAt": 0,
+                                "expiresAt": 0,
+                            }
+                        })
+                        .to_string();
+                        user.engine
+                            .handle_event(CoreEvent::HttpResponseReceived {
+                                request_id: request.request_id,
+                                status: 200,
+                                body: Some(body),
+                            })
+                            .expect("claim response applied")
+                    }
                     CoreEffect::PersistState { .. }
                     | CoreEffect::EmitUserNotification { .. }
                     | CoreEffect::ExecuteHttpRequest { .. }
@@ -9537,7 +10714,15 @@ mod tests {
                     member_user_ids,
                 })
                 .expect("create group");
-            let summary = output
+            // `CreateGroupConversation` now claims each target device's
+            // one-time KeyPackage sequentially before it can finish; `drain`
+            // (which now also simulates `/keypackage-pool/.../claim`
+            // responses) must run first so the real view model — carried by
+            // whichever response resolves the last outstanding claim — is
+            // available, and so every effect that finalize emits also gets
+            // drained.
+            let drained = self.drain(owner, output);
+            let summary = drained
                 .view_model
                 .as_ref()
                 .and_then(|view| view.conversations.first())
@@ -9545,7 +10730,6 @@ mod tests {
                 .clone();
             let group_id = summary.group_id.clone().expect("group id");
             let conversation_id = summary.conversation_id;
-            self.drain(owner, output);
             (group_id, conversation_id)
         }
 
@@ -11825,13 +13009,81 @@ mod tests {
             .unwrap_or_else(|| panic!("missing HTTP request containing {needle}"))
     }
 
+    /// Resolves every in-flight `ClaimKeyPackage` HTTP effect in `output` by
+    /// synthesizing a successful `/v1/keypackage-pool/{deviceId}/claim`
+    /// response (claims are strictly sequential, so this loops until none
+    /// remain), reusing the target device's cached last-resort KeyPackage
+    /// bytes as the "claimed" one-time KeyPackage — realistic enough for
+    /// test purposes since the bytes just need to be a validly encoded MLS
+    /// KeyPackage. Returns the final output (from whichever call resolved
+    /// the last outstanding claim), which carries the real view model.
+    fn simulate_pending_key_package_claims(engine: &mut CoreEngine, mut output: CoreOutput) -> CoreOutput {
+        loop {
+            let claim = output.effects.iter().find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.url.contains("/keypackage-pool/") && request.url.ends_with("/claim") =>
+                {
+                    Some((request.request_id.clone(), request.url.clone()))
+                }
+                _ => None,
+            });
+            let Some((request_id, url)) = claim else {
+                break;
+            };
+            let device_id = url
+                .split("/keypackage-pool/")
+                .nth(1)
+                .and_then(|rest| rest.strip_suffix("/claim"))
+                .map(|encoded| {
+                    urlencoding::decode(encoded)
+                        .expect("valid device id encoding")
+                        .into_owned()
+                })
+                .expect("claim url must contain a device id");
+            let key_package_b64 = engine
+                .state
+                .contacts
+                .values()
+                .find_map(|contact| {
+                    contact
+                        .bundle
+                        .devices
+                        .iter()
+                        .find(|device| device.device_id == device_id)
+                        .and_then(|device| device.keypackage_ref.as_ref())
+                        .map(|keypackage_ref| keypackage_ref.object_ref.clone())
+                })
+                .expect("test harness must have a cached key package to simulate a claim response");
+            let body = serde_json::json!({
+                "keyPackage": {
+                    "keyPackageId": "test-claim",
+                    "keyPackage": key_package_b64,
+                    "lifecycleVersion": 1,
+                    "notBefore": 0,
+                    "createdAt": 0,
+                    "expiresAt": 0,
+                }
+            })
+            .to_string();
+            output = engine
+                .handle_event(CoreEvent::HttpResponseReceived {
+                    request_id,
+                    status: 200,
+                    body: Some(body),
+                })
+                .expect("claim response applied");
+        }
+        output
+    }
+
     fn create_direct_conversation(engine: &mut CoreEngine, peer_user_id: String) -> String {
-        engine
+        let output = engine
             .handle_command(CoreCommand::CreateConversation {
                 peer_user_id,
                 conversation_kind: ConversationKind::Direct,
             })
-            .expect("conversation")
+            .expect("conversation");
+        simulate_pending_key_package_claims(engine, output)
             .view_model
             .unwrap()
             .conversations[0]
@@ -12036,9 +13288,14 @@ mod tests {
             None,
         )
         .expect("merged bundle");
-        engine
+        let output = engine
             .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
             .expect("add extra peer device");
+        // Adding a new peer device may now trigger a reconciliation that
+        // claims a one-time KeyPackage for it before the membership commit
+        // is generated (a no-op when the reconcile takes a fully synchronous
+        // path instead, e.g. while a direct PCS handshake is active).
+        simulate_pending_key_package_claims(engine, output);
         device_id
     }
 
@@ -12079,19 +13336,66 @@ mod tests {
         }
     }
 
+    /// Delivers a pending-outbox record set to `recipient` and, if delivery
+    /// produced an output, resolves any `ClaimKeyPackage` HTTP effect it
+    /// left in flight (e.g. reconciliation triggered once a deferred PCS
+    /// handshake applies now claims a one-time KeyPackage for a newly
+    /// active peer device before generating the membership commit). A no-op
+    /// when no claim is outstanding.
+    fn deliver_and_settle_pending_outbox_types(
+        recipient: &mut CoreEngine,
+        sender: &CoreEngine,
+        device_id: &str,
+        types: &[MessageType],
+    ) {
+        if let Some(output) = deliver_pending_outbox_types(recipient, sender, device_id, types) {
+            simulate_pending_key_package_claims(recipient, output);
+        }
+    }
+
     fn complete_direct_pcs_protocol_only(chat: &mut PairedDirectChat) {
         let types = [
             MessageType::MlsCommit,
             MessageType::ControlDirectCommitAccept,
         ];
         if alice_is_committer(chat) {
-            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
-            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
-            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &types,
+            );
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &types,
+            );
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &types,
+            );
         } else {
-            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
-            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
-            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &types,
+            );
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &types,
+            );
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &types,
+            );
         }
     }
 
@@ -12101,11 +13405,31 @@ mod tests {
             MessageType::ControlDirectCommitAccept,
         ];
         if alice_is_committer(chat) {
-            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
-            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &types,
+            );
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &types,
+            );
         } else {
-            deliver_pending_outbox_types(&mut chat.alice, &chat.bob, &chat.alice_device_id, &types);
-            deliver_pending_outbox_types(&mut chat.bob, &chat.alice, &chat.bob_device_id, &types);
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.alice,
+                &chat.bob,
+                &chat.alice_device_id,
+                &types,
+            );
+            deliver_and_settle_pending_outbox_types(
+                &mut chat.bob,
+                &chat.alice,
+                &chat.bob_device_id,
+                &types,
+            );
         }
     }
 
@@ -12607,7 +13931,7 @@ mod tests {
                 device_status_ref: Some(
                     "https://storage.example.com/state/user:alice/device_status.json".into(),
                 ),
-                keypackage_ref_base: Some("https://storage.example.com/keypackages".into()),
+                keypackage_pool_base: Some("https://storage.example.com/keypackages".into()),
                 max_inline_bytes: Some(4096),
                 features: vec![
                     "generic_sync".into(),
@@ -12663,6 +13987,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let summary = output
             .view_model
             .as_ref()
@@ -12700,6 +14025,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -12758,6 +14084,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -12799,6 +14126,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -12839,6 +14167,7 @@ mod tests {
                 member_user_ids: vec![bob_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut alice, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -12981,6 +14310,7 @@ mod tests {
                 member_user_ids: vec![alice_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut bob.engine, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -13080,6 +14410,7 @@ mod tests {
                 member_user_ids: vec![alice_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut bob.engine, output);
         let group_id = output
             .view_model
             .as_ref()
@@ -13170,6 +14501,7 @@ mod tests {
                 member_user_ids: vec![alice_bundle.user_id.clone()],
             })
             .expect("create group");
+            let output = simulate_pending_key_package_claims(&mut bob.engine, output);
         let group_id = output
             .view_model
             .as_ref()

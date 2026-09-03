@@ -2,15 +2,14 @@ mod direct;
 mod group_commands;
 mod group_fsm;
 mod group_sync;
+mod keypackage_claim;
 mod recovery;
 mod transport;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::attachments::{attachment_download_task_id, validate_attachment_descriptor};
-use super::groups::{
-    active_peer_key_packages, group_capability_operations, group_message_type_to_direct,
-};
+use super::groups::{group_capability_operations, group_message_type_to_direct};
 use super::recovery::{
     is_degraded_restore_diagnostic, recovery_recoverable, suggested_recovery_action,
 };
@@ -712,6 +711,7 @@ impl CoreEngine {
                     .as_ref()
                     .and_then(|deployment| deployment.pending_identity_publication.clone()),
                 pending_requests: BTreeMap::new(),
+                pending_key_package_claim_batches: BTreeMap::new(),
                 request_nonce: 0,
                 message_nonce: snapshot.message_nonce,
                 recovery_contexts,
@@ -840,22 +840,241 @@ impl CoreEngine {
         if let Some(group_id) = transition_group_id {
             self.ensure_group_state_operation_ready(group_id)?;
         }
-        let staging_context = if stage_group_transition {
-            let canonical_mls = self.state.mls_adapter.take();
-            let staged_mls = canonical_mls.as_ref().map(MlsAdapter::fork).transpose()?;
-            self.state.mls_adapter = staged_mls;
-            Some((
-                canonical_mls,
-                self.state.group_states.clone(),
-                self.state.conversations.clone(),
-                self.state.mls_summaries.clone(),
-                self.state.pending_group_outbox.len(),
-            ))
+        if stage_group_transition {
+            self.run_staged_group_mutation(staged_join_request_id, |engine| {
+                engine.dispatch_command(command)
+            })
         } else {
-            None
-        };
+            self.dispatch_command(command)
+        }
+    }
 
-        let result = match command {
+    /// Runs `f` — a group-mutating operation — wrapped in the standard
+    /// stage-fork-then-diff-into-pending-transition machinery used by every
+    /// FSM v2 group-membership command: `f` runs against a forked MLS
+    /// adapter and group/conversation/summary snapshots; if it doesn't
+    /// actually stage any outbox item carrying a `membership_proof`,
+    /// everything is rolled back to canonical and `f`'s output is returned
+    /// as-is (the common "nothing changed yet" case — e.g. a
+    /// `DecideGroupJoinRequest`-only return, or a `ClaimKeyPackage` HTTP
+    /// effect still in flight); if it does, the proof is finalized into a
+    /// `ControlGroupStateEvent`, canonical state is restored, and a
+    /// `pending_group_transition` is installed so the existing
+    /// group-transition sync machinery (`AppendGroupTransition`, its
+    /// ack/retry handling) takes it from here.
+    ///
+    /// Callers: `handle_command` for the original synchronous group
+    /// commands, and `finalize_key_package_claim_batch` for the
+    /// `ApproveGroupJoin`/`InviteToGroup`/`AddGroupMemberDevice` claim-batch
+    /// kinds, whose actual group mutation now happens once every target
+    /// device's KeyPackage claim has resolved rather than synchronously
+    /// inside the initial `handle_command` call.
+    pub(super) fn run_staged_group_mutation<F>(
+        &mut self,
+        staged_join_request_id: Option<String>,
+        f: F,
+    ) -> CoreResult<CoreOutput>
+    where
+        F: FnOnce(&mut Self) -> CoreResult<CoreOutput>,
+    {
+        let canonical_mls = self.state.mls_adapter.take();
+        let staged_mls = canonical_mls.as_ref().map(MlsAdapter::fork).transpose()?;
+        self.state.mls_adapter = staged_mls;
+        let canonical_groups = self.state.group_states.clone();
+        let canonical_conversations = self.state.conversations.clone();
+        let canonical_summaries = self.state.mls_summaries.clone();
+        let pending_start = self.state.pending_group_outbox.len();
+
+        let result = f(self);
+        let mut output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                self.state.mls_adapter = canonical_mls;
+                self.state.group_states = canonical_groups;
+                self.state.conversations = canonical_conversations;
+                self.state.mls_summaries = canonical_summaries;
+                self.state.pending_group_outbox.truncate(pending_start);
+                return Err(error);
+            }
+        };
+        let staged_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
+        let Some(mut proof) = staged_items
+            .iter()
+            .find_map(|item| item.envelope.membership_proof.clone())
+        else {
+            self.state.mls_adapter = canonical_mls;
+            self.state.group_states = canonical_groups;
+            self.state.conversations = canonical_conversations;
+            self.state.mls_summaries = canonical_summaries;
+            self.state.pending_group_outbox.truncate(pending_start);
+            return Ok(output);
+        };
+        let group_id = staged_items
+            .iter()
+            .find(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
+            .map(|item| item.envelope.group_id.clone())
+            .ok_or_else(|| CoreError::invalid_state("staged group transition has no group"))?;
+        let proposed = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("staged group transition lost proposed state"))?
+            .clone();
+        let base_manifest = canonical_groups
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
+            .manifest
+            .clone();
+        let transition_id = format!("group-transition:{}", proof.control_message_id);
+        let mut event_envelope = self.build_group_envelope(
+            &group_id,
+            &proposed.conversation_id,
+            GroupMessageType::ControlGroupStateEvent,
+            if proof.operation == "pcs_update" {
+                GroupEnvelopeVisibility::Protocol
+            } else {
+                GroupEnvelopeVisibility::Visible
+            },
+            "pending-state-event".into(),
+        )?;
+        event_envelope.transition_id = Some(transition_id.clone());
+        let event_record = GroupOutboxRecord {
+            seq: 0,
+            group_id: group_id.clone(),
+            message_id: event_envelope.message_id.clone(),
+            received_at: event_envelope.created_at,
+            expires_at: None,
+            state: GroupOutboxRecordState::Available,
+            envelope: event_envelope.clone(),
+        };
+        let event_plaintext = Self::derive_group_state_event(
+            &base_manifest,
+            &proposed.manifest,
+            &proof,
+            &event_record,
+        )
+        .ok_or_else(|| CoreError::invalid_state("failed to derive group state event"))?;
+        let encrypted_event = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
+            .encrypt_application(&proposed.conversation_id, event_plaintext.as_bytes())?;
+        event_envelope.inline_ciphertext = Some(encrypted_event.payload_b64.clone());
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        event_envelope.sender_proof.value =
+            identity.sign_sender_proof(encrypted_event.payload_b64.as_bytes());
+        proof.state_event_message_id = Some(event_envelope.message_id.clone());
+        proof.signature = identity.sign_sender_proof(&Self::membership_proof_payload(&proof));
+        proof.validate()?;
+        for item in &mut self.state.pending_group_outbox[pending_start..] {
+            if item.envelope.membership_proof.is_some() {
+                item.envelope.membership_proof = Some(proof.clone());
+                item.envelope.transition_id = Some(transition_id.clone());
+            }
+        }
+        event_envelope.membership_proof = Some(proof.clone());
+        let capability = self.group_capability_for_state(&proposed)?;
+        self.enqueue_group_envelope(event_envelope, capability, Some(event_plaintext));
+        let new_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
+        let welcomes: Vec<PutWelcomePickupRequest> = output
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::PutWelcomePickup { put } => Some(put.clone()),
+                _ => None,
+            })
+            .collect();
+        let join_request_id = staged_join_request_id.or_else(|| {
+            output.effects.iter().find_map(|effect| match effect {
+                CoreEffect::DecideGroupJoinRequest { decide }
+                    if decide.decision == GroupJoinDecision::Approve =>
+                {
+                    Some(decide.request_id.clone())
+                }
+                _ => None,
+            })
+        });
+        let intent = self.transition_intent_from_staged_state(
+            &base_manifest,
+            &proposed.manifest,
+            &proof,
+            join_request_id.as_deref(),
+        )?;
+        let mls_patch = canonical_mls
+            .as_ref()
+            .zip(self.state.mls_adapter.as_ref())
+            .map(|(canonical, staged)| {
+                canonical.conversation_patch(staged, &proposed.conversation_id)
+            })
+            .transpose()?
+            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?;
+        self.state.mls_adapter = canonical_mls;
+        self.state.group_states = canonical_groups;
+        self.state.conversations = canonical_conversations;
+        self.state.mls_summaries = canonical_summaries;
+        let base = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
+            .clone();
+        if let Some(state) = self.state.group_states.get_mut(&group_id) {
+            state.pending_group_transition = Some(PersistedPendingGroupTransition {
+                transition_id: transition_id.clone(),
+                intent,
+                stage: PendingGroupTransitionStage::Prepared,
+                base_manifest_hash: Self::manifest_sha256(&base.manifest)?,
+                base_roster_version: proof.previous_roster_version,
+                base_commit_message_id: proof.previous_commit_message_id.clone(),
+                proposed_manifest: proposed.manifest,
+                mls_patch: Some(mls_patch),
+                staged_mls_state: None,
+                envelopes: new_items
+                    .iter()
+                    .filter(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
+                    .map(|item| item.envelope.clone())
+                    .collect(),
+                state_event_plaintext: new_items
+                    .iter()
+                    .find(|item| {
+                        item.envelope.message_type == GroupMessageType::ControlGroupStateEvent
+                    })
+                    .and_then(|item| item.plaintext_cache.clone()),
+                welcomes,
+                join_request_id,
+                retries: 0,
+                first_seq: None,
+                last_seq: None,
+            });
+        }
+        output.effects.retain(|effect| {
+            !matches!(
+                effect,
+                CoreEffect::PutWelcomePickup { .. }
+                    | CoreEffect::AppendGroupEnvelope { .. }
+                    | CoreEffect::AppendGroupTransition { .. }
+                    | CoreEffect::DecideGroupJoinRequest { .. }
+            )
+        });
+        output.view_model = None;
+        let snapshot = build_persistence_snapshot(&self.state);
+        for effect in &mut output.effects {
+            if let CoreEffect::PersistState { persist } = effect {
+                persist.mutations = persistence_mutations(&snapshot, &persist.ops);
+                persist.snapshot = None;
+            }
+        }
+        output = merge_outputs(output, self.flush_group_outbox()?);
+        Ok(output)
+    }
+
+    fn dispatch_command(&mut self, command: CoreCommand) -> CoreResult<CoreOutput> {
+        match command {
             CoreCommand::CreateOrLoadIdentity {
                 mnemonic,
                 device_name,
@@ -1054,203 +1273,7 @@ impl CoreEngine {
             CoreCommand::SyncGroupsForRemovedDevice { device_id } => {
                 self.sync_groups_for_removed_device(device_id)
             }
-        };
-
-        let Some((
-            canonical_mls,
-            canonical_groups,
-            canonical_conversations,
-            canonical_summaries,
-            pending_start,
-        )) = staging_context
-        else {
-            return result;
-        };
-        let mut output = match result {
-            Ok(output) => output,
-            Err(error) => {
-                self.state.mls_adapter = canonical_mls;
-                self.state.group_states = canonical_groups;
-                self.state.conversations = canonical_conversations;
-                self.state.mls_summaries = canonical_summaries;
-                self.state.pending_group_outbox.truncate(pending_start);
-                return Err(error);
-            }
-        };
-        let staged_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
-        let Some(mut proof) = staged_items
-            .iter()
-            .find_map(|item| item.envelope.membership_proof.clone())
-        else {
-            self.state.mls_adapter = canonical_mls;
-            self.state.group_states = canonical_groups;
-            self.state.conversations = canonical_conversations;
-            self.state.mls_summaries = canonical_summaries;
-            self.state.pending_group_outbox.truncate(pending_start);
-            return Ok(output);
-        };
-        let group_id = staged_items
-            .iter()
-            .find(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
-            .map(|item| item.envelope.group_id.clone())
-            .ok_or_else(|| CoreError::invalid_state("staged group transition has no group"))?;
-        let proposed = self
-            .state
-            .group_states
-            .get(&group_id)
-            .ok_or_else(|| CoreError::invalid_state("staged group transition lost proposed state"))?
-            .clone();
-        let base_manifest = canonical_groups
-            .get(&group_id)
-            .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
-            .manifest
-            .clone();
-        let transition_id = format!("group-transition:{}", proof.control_message_id);
-        let mut event_envelope = self.build_group_envelope(
-            &group_id,
-            &proposed.conversation_id,
-            GroupMessageType::ControlGroupStateEvent,
-            if proof.operation == "pcs_update" {
-                GroupEnvelopeVisibility::Protocol
-            } else {
-                GroupEnvelopeVisibility::Visible
-            },
-            "pending-state-event".into(),
-        )?;
-        event_envelope.transition_id = Some(transition_id.clone());
-        let event_record = GroupOutboxRecord {
-            seq: 0,
-            group_id: group_id.clone(),
-            message_id: event_envelope.message_id.clone(),
-            received_at: event_envelope.created_at,
-            expires_at: None,
-            state: GroupOutboxRecordState::Available,
-            envelope: event_envelope.clone(),
-        };
-        let event_plaintext = Self::derive_group_state_event(
-            &base_manifest,
-            &proposed.manifest,
-            &proof,
-            &event_record,
-        )
-        .ok_or_else(|| CoreError::invalid_state("failed to derive group state event"))?;
-        let encrypted_event = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?
-            .encrypt_application(&proposed.conversation_id, event_plaintext.as_bytes())?;
-        event_envelope.inline_ciphertext = Some(encrypted_event.payload_b64.clone());
-        let identity = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        event_envelope.sender_proof.value =
-            identity.sign_sender_proof(encrypted_event.payload_b64.as_bytes());
-        proof.state_event_message_id = Some(event_envelope.message_id.clone());
-        proof.signature = identity.sign_sender_proof(&Self::membership_proof_payload(&proof));
-        proof.validate()?;
-        for item in &mut self.state.pending_group_outbox[pending_start..] {
-            if item.envelope.membership_proof.is_some() {
-                item.envelope.membership_proof = Some(proof.clone());
-                item.envelope.transition_id = Some(transition_id.clone());
-            }
         }
-        event_envelope.membership_proof = Some(proof.clone());
-        let capability = self.group_capability_for_state(&proposed)?;
-        self.enqueue_group_envelope(event_envelope, capability, Some(event_plaintext));
-        let new_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
-        let welcomes: Vec<PutWelcomePickupRequest> = output
-            .effects
-            .iter()
-            .filter_map(|effect| match effect {
-                CoreEffect::PutWelcomePickup { put } => Some(put.clone()),
-                _ => None,
-            })
-            .collect();
-        let join_request_id = staged_join_request_id.or_else(|| {
-            output.effects.iter().find_map(|effect| match effect {
-                CoreEffect::DecideGroupJoinRequest { decide }
-                    if decide.decision == GroupJoinDecision::Approve =>
-                {
-                    Some(decide.request_id.clone())
-                }
-                _ => None,
-            })
-        });
-        let intent = self.transition_intent_from_staged_state(
-            &base_manifest,
-            &proposed.manifest,
-            &proof,
-            join_request_id.as_deref(),
-        )?;
-        let mls_patch = canonical_mls
-            .as_ref()
-            .zip(self.state.mls_adapter.as_ref())
-            .map(|(canonical, staged)| {
-                canonical.conversation_patch(staged, &proposed.conversation_id)
-            })
-            .transpose()?
-            .ok_or_else(|| CoreError::invalid_state("staged MLS adapter is missing"))?;
-        self.state.mls_adapter = canonical_mls;
-        self.state.group_states = canonical_groups;
-        self.state.conversations = canonical_conversations;
-        self.state.mls_summaries = canonical_summaries;
-        let base = self
-            .state
-            .group_states
-            .get(&group_id)
-            .ok_or_else(|| CoreError::invalid_state("canonical group state is missing"))?
-            .clone();
-        if let Some(state) = self.state.group_states.get_mut(&group_id) {
-            state.pending_group_transition = Some(PersistedPendingGroupTransition {
-                transition_id: transition_id.clone(),
-                intent,
-                stage: PendingGroupTransitionStage::Prepared,
-                base_manifest_hash: Self::manifest_sha256(&base.manifest)?,
-                base_roster_version: proof.previous_roster_version,
-                base_commit_message_id: proof.previous_commit_message_id.clone(),
-                proposed_manifest: proposed.manifest,
-                mls_patch: Some(mls_patch),
-                staged_mls_state: None,
-                envelopes: new_items
-                    .iter()
-                    .filter(|item| item.envelope.membership_proof.as_ref() == Some(&proof))
-                    .map(|item| item.envelope.clone())
-                    .collect(),
-                state_event_plaintext: new_items
-                    .iter()
-                    .find(|item| {
-                        item.envelope.message_type == GroupMessageType::ControlGroupStateEvent
-                    })
-                    .and_then(|item| item.plaintext_cache.clone()),
-                welcomes,
-                join_request_id,
-                retries: 0,
-                first_seq: None,
-                last_seq: None,
-            });
-        }
-        output.effects.retain(|effect| {
-            !matches!(
-                effect,
-                CoreEffect::PutWelcomePickup { .. }
-                    | CoreEffect::AppendGroupEnvelope { .. }
-                    | CoreEffect::AppendGroupTransition { .. }
-                    | CoreEffect::DecideGroupJoinRequest { .. }
-            )
-        });
-        output.view_model = None;
-        let snapshot = build_persistence_snapshot(&self.state);
-        for effect in &mut output.effects {
-            if let CoreEffect::PersistState { persist } = effect {
-                persist.mutations = persistence_mutations(&snapshot, &persist.ops);
-                persist.snapshot = None;
-            }
-        }
-        output = merge_outputs(output, self.flush_group_outbox()?);
-        Ok(output)
     }
 
     pub fn handle_event(&mut self, event: CoreEvent) -> CoreResult<CoreOutput> {
@@ -3589,7 +3612,7 @@ mod group_membership_security_tests {
                 supported_realtime_kinds: vec![],
                 identity_bundle_ref: None,
                 device_status_ref: None,
-                keypackage_ref_base: None,
+                keypackage_pool_base: None,
                 max_inline_bytes: Some(4096),
                 features: vec!["group_membership_fsm_v2".into()],
             },

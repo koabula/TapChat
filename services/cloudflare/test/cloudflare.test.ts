@@ -20,8 +20,11 @@ import {
   type GroupMessageType,
   type IdentityBundle,
   type InboxAppendCapability,
+  type KeyPackagePoolClaimResult,
+  type KeyPackagePoolCountResult,
   type MessageRequestActionResult,
   type MessageRequestListResult,
+  type OneTimeKeyPackageEntry,
   type SubmitGroupJoinRequest
 } from "../src/types/contracts";
 import type {
@@ -384,6 +387,8 @@ class FakeDeviceRegistryStub {
   private readonly records = new Map<string, { status: "active" | "revoked"; registrationVersion: number }>();
   private readonly config: () => { runtimeId: string; userId: string; workerBuildId: string };
   private identityBundle: IdentityBundle | null = null;
+  private readonly keyPackagePools = new Map<string, Map<string, OneTimeKeyPackageEntry>>();
+  private static readonly KEY_PACKAGE_POOL_MAX_SIZE = 40;
 
   constructor(config: () => { runtimeId: string; userId: string; workerBuildId: string }) {
     this.config = config;
@@ -470,6 +475,52 @@ class FakeDeviceRegistryStub {
       return this.identityBundle
         ? Response.json(this.identityBundle, { headers: { etag: `"${this.identityBundle.publicationRevision ?? 0}"` } })
         : fakeAppError("not_found", "transport", 404);
+    }
+    if (path.endsWith("/keypackage-pool/replenish")) {
+      const deviceId = body.deviceId as string;
+      const entries = (body.keyPackages ?? []) as OneTimeKeyPackageEntry[];
+      if (!deviceId || entries.length === 0) {
+        return fakeAppError("invalid_input", "validation", 400);
+      }
+      let pool = this.keyPackagePools.get(deviceId);
+      if (!pool) {
+        pool = new Map();
+        this.keyPackagePools.set(deviceId, pool);
+      }
+      const capacity = FakeDeviceRegistryStub.KEY_PACKAGE_POOL_MAX_SIZE;
+      const available = capacity - pool.size;
+      const toAdd: OneTimeKeyPackageEntry[] = [];
+      for (const entry of entries) {
+        if (toAdd.length >= available) break;
+        const validLifecycle =
+          Boolean(entry.keyPackageId) &&
+          Boolean(entry.keyPackage) &&
+          entry.lifecycleVersion === 1 &&
+          entry.expiresAt - entry.createdAt === 84 * 24 * 60 * 60 * 1000 &&
+          entry.notBefore === Math.max(0, entry.createdAt - 60 * 60 * 1000);
+        if (!validLifecycle) {
+          return fakeAppError("keypackage_lifetime_invalid", "mls", 422);
+        }
+        toAdd.push(entry);
+      }
+      for (const entry of toAdd) pool.set(entry.keyPackageId, entry);
+      return Response.json({ added: toAdd.length, capacity });
+    }
+    if (path.endsWith("/keypackage-pool/claim")) {
+      const deviceId = body.deviceId as string;
+      const pool = this.keyPackagePools.get(deviceId);
+      const next = pool?.entries().next();
+      if (!pool || !next || next.done) {
+        return fakeAppError("pool_empty", "mls", 404);
+      }
+      const [id, entry] = next.value;
+      pool.delete(id);
+      return Response.json({ keyPackage: entry });
+    }
+    if (path.endsWith("/keypackage-pool/count")) {
+      const deviceId = body.deviceId as string;
+      const count = this.keyPackagePools.get(deviceId)?.size ?? 0;
+      return Response.json({ count });
     }
     return fakeAppError("not_found", "transport", 404);
   }
@@ -3509,4 +3560,146 @@ test("legacy message request entries are migrated lazily and expire", async () =
   assert.ok((migrated?.byteSize ?? 0) > 0);
   assert.equal(migrated?.expiresAt, 11_000);
   assert.equal((await service.listMessageRequests(11_001)).length, 0);
+});
+
+function oneTimeKeyPackageFixture(id: string, now: number): OneTimeKeyPackageEntry {
+  const createdAt = now;
+  const expiresAt = createdAt + 84 * 24 * 60 * 60 * 1000;
+  const notBefore = Math.max(0, createdAt - 60 * 60 * 1000);
+  return {
+    keyPackageId: id,
+    keyPackage: Buffer.from(`fixture-one-time-key-package-${id}`).toString("base64"),
+    lifecycleVersion: 1,
+    notBefore,
+    createdAt,
+    expiresAt
+  };
+}
+
+async function replenishKeyPackagePool(
+  env: Env,
+  token: string,
+  deviceId: string,
+  entries: OneTimeKeyPackageEntry[]
+): Promise<Response> {
+  return handleRequest(
+    new Request(`https://example.com/v1/keypackage-pool/${encodeURIComponent(deviceId)}`, {
+      method: "PUT",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ version: CURRENT_MODEL_VERSION, deviceId, keyPackages: entries })
+    }),
+    env
+  );
+}
+
+async function claimKeyPackage(env: Env, deviceId: string): Promise<Response> {
+  return handleRequest(
+    new Request(`https://example.com/v1/keypackage-pool/${encodeURIComponent(deviceId)}/claim`, {
+      method: "POST"
+    }),
+    env
+  );
+}
+
+async function keyPackagePoolCount(env: Env, token: string, deviceId: string): Promise<Response> {
+  return handleRequest(
+    new Request(`https://example.com/v1/keypackage-pool/${encodeURIComponent(deviceId)}`, {
+      method: "GET",
+      headers: authHeaders(token)
+    }),
+    env
+  );
+}
+
+test("keypackage pool replenish requires device runtime authorization", async () => {
+  const { env } = createEnv();
+  await issueDeviceBundle(env);
+  const now = Date.now();
+  const response = await handleRequest(
+    new Request("https://example.com/v1/keypackage-pool/device:bob:phone", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        version: CURRENT_MODEL_VERSION,
+        deviceId: "device:bob:phone",
+        keyPackages: [oneTimeKeyPackageFixture("kp1", now)]
+      })
+    }),
+    env
+  );
+  assert.equal(response.status, 403);
+});
+
+test("keypackage pool claim is unauthenticated, atomic, and drains without repeats", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const now = Date.now();
+  const entries = [
+    oneTimeKeyPackageFixture("kp1", now),
+    oneTimeKeyPackageFixture("kp2", now),
+    oneTimeKeyPackageFixture("kp3", now)
+  ];
+  const replenished = await replenishKeyPackagePool(env, bundle.runtimeCredential.token, "device:bob:phone", entries);
+  assert.equal(replenished.status, 200);
+  assert.deepEqual(await replenished.json(), { added: 3, capacity: 40 });
+
+  const claimedIds = new Set<string>();
+  for (let i = 0; i < 3; i += 1) {
+    const claimed = await claimKeyPackage(env, "device:bob:phone");
+    assert.equal(claimed.status, 200);
+    const { keyPackage } = (await claimed.json()) as KeyPackagePoolClaimResult;
+    assert.ok(!claimedIds.has(keyPackage.keyPackageId), "claim must never return the same entry twice");
+    claimedIds.add(keyPackage.keyPackageId);
+  }
+  assert.equal(claimedIds.size, 3);
+
+  const drained = await claimKeyPackage(env, "device:bob:phone");
+  assert.equal(drained.status, 404);
+  assert.equal((await drained.json() as { code: string }).code, "pool_empty");
+});
+
+test("keypackage pool claim never double-issues the same entry under concurrent requests", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const now = Date.now();
+  await replenishKeyPackagePool(env, bundle.runtimeCredential.token, "device:bob:phone", [
+    oneTimeKeyPackageFixture("only", now)
+  ]);
+
+  const [first, second] = await Promise.all([
+    claimKeyPackage(env, "device:bob:phone"),
+    claimKeyPackage(env, "device:bob:phone")
+  ]);
+  const statuses = [first.status, second.status].sort();
+  assert.deepEqual(statuses, [200, 404]);
+});
+
+test("keypackage pool replenish is capped and reports remaining capacity via count", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const now = Date.now();
+  const overflow = Array.from({ length: 45 }, (_, index) => oneTimeKeyPackageFixture(`kp${index}`, now));
+  const replenished = await replenishKeyPackagePool(env, bundle.runtimeCredential.token, "device:bob:phone", overflow);
+  assert.equal(replenished.status, 200);
+  assert.deepEqual(await replenished.json(), { added: 40, capacity: 40 });
+
+  const countResponse = await keyPackagePoolCount(env, bundle.runtimeCredential.token, "device:bob:phone");
+  assert.equal(countResponse.status, 200);
+  assert.deepEqual(await countResponse.json(), { count: 40 } satisfies KeyPackagePoolCountResult);
+
+  const topUp = await replenishKeyPackagePool(env, bundle.runtimeCredential.token, "device:bob:phone", [
+    oneTimeKeyPackageFixture("kp-extra", now)
+  ]);
+  assert.equal(topUp.status, 200);
+  assert.deepEqual(await topUp.json(), { added: 0, capacity: 40 });
+});
+
+test("keypackage pool rejects malformed lifecycle metadata", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const now = Date.now();
+  const malformed = { ...oneTimeKeyPackageFixture("bad", now), expiresAt: now + 1 };
+  const response = await replenishKeyPackagePool(env, bundle.runtimeCredential.token, "device:bob:phone", [malformed]);
+  assert.equal(response.status, 422);
+  assert.equal((await response.json() as { code: string }).code, "keypackage_lifetime_invalid");
 });

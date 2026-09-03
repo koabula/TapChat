@@ -35,17 +35,18 @@ impl CoreEngine {
             ));
         }
 
-        let mut peer_keypackages = Vec::new();
-        let mut member_devices = vec![ConversationMember {
-            user_id: local_identity.user_identity.user_id.clone(),
-            device_id: local_identity.device_identity.device_id.clone(),
-            status: DeviceStatusKind::Active,
-        }];
-        let mut manifest_member_devices = vec![GroupMemberDevice {
-            user_id: local_identity.user_identity.user_id.clone(),
-            device_id: local_identity.device_identity.device_id.clone(),
-            status: GroupMemberStatus::Active,
-        }];
+        // Precondition validation only, exactly matching the original
+        // synchronous behavior: gather every Active device that has a
+        // usable *cached* last-resort KeyPackage reference (the same
+        // eligibility filter as before), erroring out for the same
+        // "device_clock_invalid"/"keypackage_expired" reasons if a member
+        // has none. The actual KeyPackage material used to create the
+        // group, however, no longer comes straight from this cache: each
+        // eligible device is queued for a one-time-pool claim first (see
+        // `start_conversation_creation`), and the cached ref here is only
+        // consulted again as a fallback if that device's claim comes back
+        // `pool_empty`.
+        let mut remaining_devices: VecDeque<(String, String)> = VecDeque::new();
         for user_id in &member_user_ids {
             let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
             let now_ms = current_unix_millis(self.state.message_nonce);
@@ -55,7 +56,7 @@ impl CoreEngine {
                 .iter()
                 .filter(|device| matches!(device.status, DeviceStatusKind::Active))
             {
-                let Some(keypackage_ref) = device
+                let Some(_keypackage_ref) = device
                     .keypackage_ref
                     .as_ref()
                     .filter(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
@@ -63,22 +64,7 @@ impl CoreEngine {
                     continue;
                 };
                 usable_device_found = true;
-                peer_keypackages.push(PeerDeviceKeyPackage {
-                    user_id: user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    device_public_key: device.device_public_key.clone(),
-                    key_package_b64: keypackage_ref.object_ref.clone(),
-                });
-                member_devices.push(ConversationMember {
-                    user_id: user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    status: DeviceStatusKind::Active,
-                });
-                manifest_member_devices.push(GroupMemberDevice {
-                    user_id: user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    status: GroupMemberStatus::Active,
-                });
+                remaining_devices.push_back((user_id.clone(), device.device_id.clone()));
             }
             if !usable_device_found {
                 if bundle.devices.iter().any(|device| {
@@ -101,16 +87,12 @@ impl CoreEngine {
                 ));
             }
         }
-        if peer_keypackages.is_empty() {
+        if remaining_devices.is_empty() {
             return Err(CoreError::new(
                 "keypackage_expired",
                 "invited contacts have no usable key packages",
             ));
         }
-        let invitee_user_by_device: BTreeMap<String, String> = peer_keypackages
-            .iter()
-            .map(|package| (package.device_id.clone(), package.user_id.clone()))
-            .collect();
 
         let group_id = self.next_group_id(&title, &member_user_ids);
         let conversation_id = format!("conv:{group_id}");
@@ -121,6 +103,58 @@ impl CoreEngine {
                 "group conversation already exists",
             ));
         }
+
+        self.start_key_package_claim_batch(
+            KeyPackageClaimBatchKind::Group {
+                title,
+                member_user_ids,
+                group_id,
+                conversation_id,
+            },
+            remaining_devices,
+        )
+    }
+
+    pub(super) fn finalize_group_conversation_creation(
+        &mut self,
+        title: String,
+        member_user_ids: Vec<String>,
+        group_id: String,
+        conversation_id: String,
+        peer_keypackages: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
+        let mut member_devices = vec![ConversationMember {
+            user_id: local_identity.user_identity.user_id.clone(),
+            device_id: local_identity.device_identity.device_id.clone(),
+            status: DeviceStatusKind::Active,
+        }];
+        let mut manifest_member_devices = vec![GroupMemberDevice {
+            user_id: local_identity.user_identity.user_id.clone(),
+            device_id: local_identity.device_identity.device_id.clone(),
+            status: GroupMemberStatus::Active,
+        }];
+        for package in &peer_keypackages {
+            member_devices.push(ConversationMember {
+                user_id: package.user_id.clone(),
+                device_id: package.device_id.clone(),
+                status: DeviceStatusKind::Active,
+            });
+            manifest_member_devices.push(GroupMemberDevice {
+                user_id: package.user_id.clone(),
+                device_id: package.device_id.clone(),
+                status: GroupMemberStatus::Active,
+            });
+        }
+        let invitee_user_by_device: BTreeMap<String, String> = peer_keypackages
+            .iter()
+            .map(|package| (package.device_id.clone(), package.user_id.clone()))
+            .collect();
 
         let canonical_summary = self
             .state
@@ -858,12 +892,79 @@ impl CoreEngine {
                 view_model: None,
             });
         }
+        let contact = self
+            .state
+            .contacts
+            .get(&join.joiner_user_id)
+            .ok_or_else(|| {
+                CoreError::invalid_state("joiner identity bundle has not been imported")
+            })?
+            .bundle
+            .clone();
+        // Precondition validation only, exactly matching the original
+        // synchronous behavior: gather every Active device of the joiner
+        // that has a usable *cached* last-resort KeyPackage reference. The
+        // actual KeyPackage material used to add the joiner, however, no
+        // longer comes straight from this cache: each eligible device is
+        // queued for a one-time-pool claim first, and the cached ref here
+        // is only consulted again as a fallback if that device's claim
+        // comes back `pool_empty`. The "already a member" guards, which
+        // depend on the live group/MLS state, are re-checked fresh in
+        // `finalize_group_join_approval` once every claim has resolved,
+        // since the group may have changed while the claim round trip was
+        // in flight.
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        let mut remaining_devices: VecDeque<(String, String)> = VecDeque::new();
+        for device in contact
+            .devices
+            .iter()
+            .filter(|device| matches!(device.status, DeviceStatusKind::Active))
+        {
+            if device
+                .keypackage_ref
+                .as_ref()
+                .is_some_and(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
+            {
+                remaining_devices.push_back((contact.user_id.clone(), device.device_id.clone()));
+            }
+        }
+        if remaining_devices.is_empty() {
+            return Err(CoreError::invalid_state(
+                "joiner has no active key packages",
+            ));
+        }
+        self.start_key_package_claim_batch(
+            KeyPackageClaimBatchKind::ApproveGroupJoin {
+                group_id: group_id.clone(),
+                request_id: request_id.clone(),
+                join,
+            },
+            remaining_devices,
+        )
+    }
+
+    pub(super) fn finalize_group_join_approval(
+        &mut self,
+        group_id: String,
+        request_id: String,
+        join: crate::model::GroupJoinRequest,
+        peer_devices: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        if !matches!(role, GroupRole::Owner | GroupRole::Admin) {
+            return Err(CoreError::invalid_input(
+                "only owner or admin can approve group join requests",
+            ));
+        }
         let group_state = self
             .state
             .group_states
             .get(&group_id)
             .cloned()
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?;
+        // Re-check the "already a member" guards against the *current*
+        // group state: the join could have been approved (or the group
+        // could have changed) by the time this claim batch resolves.
         let manifest_already_contains_user = group_state.manifest.members.iter().any(|member| {
             member.user_id == join.joiner_user_id && member.status == GroupMemberStatus::Active
         });
@@ -896,16 +997,6 @@ impl CoreEngine {
                 "already_member: joiner device is already in this group; ask the joiner to retry the initial group invite import or create a new group",
             ));
         }
-        let contact = self
-            .state
-            .contacts
-            .get(&join.joiner_user_id)
-            .ok_or_else(|| {
-                CoreError::invalid_state("joiner identity bundle has not been imported")
-            })?
-            .bundle
-            .clone();
-        let peer_devices = active_peer_key_packages(&contact)?;
         if peer_devices.is_empty() {
             return Err(CoreError::invalid_state(
                 "joiner has no active key packages",
@@ -1148,9 +1239,8 @@ impl CoreEngine {
             .get(&group_id)
             .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
             .clone();
-        let previous_manifest = group_state.manifest.clone();
-        let mut manifest = previous_manifest.clone();
-        let existing_ids: BTreeSet<String> = manifest
+        let existing_ids: BTreeSet<String> = group_state
+            .manifest
             .members
             .iter()
             .filter(|m| matches!(m.status, GroupMemberStatus::Active))
@@ -1165,20 +1255,78 @@ impl CoreEngine {
                 "all invitees are already active members of this group",
             ));
         }
-        let mut peer_keypackages = Vec::new();
+        // Precondition validation only, exactly matching the original
+        // synchronous behavior: gather every Active device of every new
+        // invitee that has a usable *cached* last-resort KeyPackage
+        // reference, erroring out per-invitee (and in aggregate) exactly as
+        // before. The actual KeyPackage material used to add the invitees,
+        // however, no longer comes straight from this cache: each eligible
+        // device is queued for a one-time-pool claim first, and the cached
+        // ref here is only consulted again as a fallback if that device's
+        // claim comes back `pool_empty`.
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        let mut remaining_devices: VecDeque<(String, String)> = VecDeque::new();
         for user_id in &invitee_user_ids {
             if existing_ids.contains(user_id) {
                 continue;
             }
             let bundle = self.direct_peer_contact_bundle(user_id)?.clone();
-            let kps = active_peer_key_packages(&bundle)?;
-            if kps.is_empty() {
+            let mut usable_device_found = false;
+            for device in bundle
+                .devices
+                .iter()
+                .filter(|device| matches!(device.status, DeviceStatusKind::Active))
+            {
+                if device
+                    .keypackage_ref
+                    .as_ref()
+                    .is_some_and(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))
+                {
+                    usable_device_found = true;
+                    remaining_devices.push_back((user_id.clone(), device.device_id.clone()));
+                }
+            }
+            if !usable_device_found {
                 return Err(CoreError::invalid_state(format!(
                     "invitee {user_id} has no active key packages",
                 )));
             }
-            peer_keypackages.extend(kps);
         }
+        if remaining_devices.is_empty() {
+            return Err(CoreError::invalid_input(
+                "no active key packages found for any invitee",
+            ));
+        }
+        self.start_key_package_claim_batch(
+            KeyPackageClaimBatchKind::InviteToGroup {
+                group_id: group_id.clone(),
+                invitee_user_ids: invitee_user_ids.clone(),
+            },
+            remaining_devices,
+        )
+    }
+
+    pub(super) fn finalize_invite_to_group(
+        &mut self,
+        group_id: String,
+        invitee_user_ids: Vec<String>,
+        peer_keypackages: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
+        let role = self.local_group_role(&group_id)?;
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let previous_manifest = group_state.manifest.clone();
+        let mut manifest = previous_manifest.clone();
+        let existing_ids: BTreeSet<String> = manifest
+            .members
+            .iter()
+            .filter(|m| matches!(m.status, GroupMemberStatus::Active))
+            .map(|m| m.user_id.clone())
+            .collect();
         if peer_keypackages.is_empty() {
             return Err(CoreError::invalid_input(
                 "no active key packages found for any invitee",
@@ -2454,7 +2602,16 @@ impl CoreEngine {
             .ok_or_else(|| {
                 CoreError::invalid_input("target device is not an active device of the local user")
             })?;
-        let keypackage_ref = device_profile
+        // Precondition validation only, exactly matching the original
+        // synchronous behavior: confirm the target device has a usable
+        // *cached* last-resort KeyPackage reference. The actual KeyPackage
+        // material used to add the device, however, no longer comes
+        // straight from this cache: the device is queued for a one-time-pool
+        // claim first — against this user's OWN runtime, since this is
+        // registering the local user's own additional device rather than a
+        // contact's — and the cached ref here is only consulted again as a
+        // fallback if that claim comes back `pool_empty`.
+        device_profile
             .keypackage_ref
             .as_ref()
             .filter(|keypackage_ref| {
@@ -2466,12 +2623,37 @@ impl CoreEngine {
                     "target device does not have a usable key package",
                 )
             })?;
-        let peer_keypackage = PeerDeviceKeyPackage {
-            user_id: local_user_id.clone(),
-            device_id: device_id.clone(),
-            device_public_key: device_profile.device_public_key.clone(),
-            key_package_b64: keypackage_ref.object_ref.clone(),
-        };
+        let mut remaining_devices: VecDeque<(String, String)> = VecDeque::new();
+        remaining_devices.push_back((local_user_id.clone(), device_id.clone()));
+        self.start_key_package_claim_batch(
+            KeyPackageClaimBatchKind::AddGroupMemberDevice {
+                group_id: group_id.clone(),
+                device_id: device_id.clone(),
+            },
+            remaining_devices,
+        )
+    }
+
+    pub(super) fn finalize_add_group_member_device(
+        &mut self,
+        group_id: String,
+        device_id: String,
+        mut resolved_key_packages: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
+        let local_user_id = self.local_identity_user_id()?;
+        if resolved_key_packages.len() != 1 {
+            return Err(CoreError::invalid_state(
+                "expected exactly one resolved key package for add_group_member_device",
+            ));
+        }
+        let peer_keypackage = resolved_key_packages.remove(0);
+        let group_state = self
+            .state
+            .group_states
+            .get(&group_id)
+            .ok_or_else(|| CoreError::invalid_input("group does not exist"))?
+            .clone();
+        let role = self.local_group_role(&group_id)?;
         let (artifacts, summary) = {
             let adapter = self
                 .state

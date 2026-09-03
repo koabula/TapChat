@@ -824,7 +824,7 @@ mod tests {
                 device_status_ref: Some(
                     "https://storage.example.com/state/user:alice/device_status.json".into(),
                 ),
-                keypackage_ref_base: Some("https://storage.example.com/keypackages".into()),
+                keypackage_pool_base: Some("https://storage.example.com/keypackages".into()),
                 max_inline_bytes: Some(4096),
                 features: vec!["generic_sync".into()],
             },

@@ -4,7 +4,6 @@ import {
   validateAnyDeviceRuntimeAuthorization,
   validateAppendAuthorization,
   validateDeviceRuntimeAuthorizationForDevice,
-  validateKeyPackageWriteAuthorization,
   validateSharedStateWriteAuthorization,
   validateWelcomePickupAuthorization
 } from "../auth/capability";
@@ -34,7 +33,7 @@ import {
   type DeviceStatusDocument,
   type GroupInviteTokenPayload,
   type IdentityBundle,
-  type KeyPackageRefsDocument,
+  type KeyPackagePoolReplenishRequest,
   type PrepareBlobUploadRequest,
   type PutWelcomePickupRequest,
   type WelcomePickupDescriptor
@@ -318,7 +317,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
       supportedRealtimeKinds: ["websocket"],
       identityBundleRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/identity-bundle`,
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
-      keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
+      keypackagePoolBase: `${baseUrl(request, env)}/v1/keypackage-pool`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
       features: [
         "generic_sync",
@@ -336,6 +335,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "device_runtime_refresh_v2",
         "device_registry_v1",
         "keypackage_lifecycle_v1",
+        "keypackage_pool_v1",
         "identity_bundle_cas_v1",
         "structured_errors_v1"
       ]
@@ -813,65 +813,42 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse(document);
     }
 
-    const keyPackageRefsMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);
-    if (keyPackageRefsMatch) {
-      const userId = decodeURIComponent(keyPackageRefsMatch[1]);
-      const deviceId = decodeURIComponent(keyPackageRefsMatch[2]);
-      if (request.method === "GET") {
-        const document = await sharedState.getKeyPackageRefs(userId, deviceId);
-        if (!document) {
-          return structuredErrorResponse(request, 404, "not_found", false);
-        }
-        return jsonResponse(document);
-      }
-      if (request.method === "PUT") {
-        const authorization = await validateKeyPackageWriteAuthorization(
-          request,
-          deviceRuntimeSecrets(env),
-          userId,
-          deviceId,
-          undefined,
-          now,
-          sharedStateSecret(env)
-        );
-        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
-        const body = await readJsonLimited<KeyPackageRefsDocument>(request, CONTROL_JSON_MAX_BYTES);
-        await sharedState.putKeyPackageRefs(userId, deviceId, body);
-        const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
-        return jsonResponse(saved);
-      }
+    const keyPackagePoolClaimMatch = url.pathname.match(/^\/v1\/keypackage-pool\/([^/]+)\/claim$/);
+    if (keyPackagePoolClaimMatch && request.method === "POST") {
+      const deviceId = decodeURIComponent(keyPackagePoolClaimMatch[1]);
+      const claimed = await registryStub(env).fetch(
+        new Request("https://device-registry.internal/v2/device-registry/keypackage-pool/claim", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ deviceId })
+        })
+      );
+      return claimed;
     }
 
-    const keyPackageObjectMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);
-    if (keyPackageObjectMatch) {
-      const userId = decodeURIComponent(keyPackageObjectMatch[1]);
-      const deviceId = decodeURIComponent(keyPackageObjectMatch[2]);
-      const keyPackageId = decodeURIComponent(keyPackageObjectMatch[3]);
-      if (request.method === "GET") {
-        const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
-        if (!payload) {
-          return structuredErrorResponse(request, 404, "not_found", false);
-        }
-        return new Response(payload, {
-          status: 200,
-          headers: {
-            "content-type": "application/octet-stream"
-          }
-        });
-      }
+    const keyPackagePoolMatch = url.pathname.match(/^\/v1\/keypackage-pool\/([^/]+)$/);
+    if (keyPackagePoolMatch) {
+      const deviceId = decodeURIComponent(keyPackagePoolMatch[1]);
       if (request.method === "PUT") {
-        const authorization = await validateKeyPackageWriteAuthorization(
-          request,
-          deviceRuntimeSecrets(env),
-          userId,
-          deviceId,
-          keyPackageId,
-          now,
-          sharedStateSecret(env)
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "keypackage_write", now);
+        const body = await readJsonLimited<KeyPackagePoolReplenishRequest>(request, CONTROL_JSON_MAX_BYTES);
+        return await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/keypackage-pool/replenish", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ...body, deviceId })
+          })
         );
-        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
-        await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
-        return new Response(null, { status: 204 });
+      }
+      if (request.method === "GET") {
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "keypackage_write", now);
+        return await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/keypackage-pool/count", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ deviceId })
+          })
+        );
       }
     }
 

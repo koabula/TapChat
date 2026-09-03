@@ -1262,7 +1262,7 @@ mod tests {
                         supported_realtime_kinds: vec![crate::model::RealtimeKind::Websocket],
                         identity_bundle_ref: Some("ref:identity-local".into()),
                         device_status_ref: Some("ref:device-status-local".into()),
-                        keypackage_ref_base: Some("ref:keypackages-local".into()),
+                        keypackage_pool_base: Some("ref:keypackages-local".into()),
                         max_inline_bytes: Some(4096),
                         features: vec!["generic_sync".into()],
                     },

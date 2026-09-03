@@ -1806,8 +1806,8 @@ pub struct RuntimeConfig {
     #[serde(alias = "deviceStatusRef")]
     pub device_status_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "keypackageRefBase")]
-    pub keypackage_ref_base: Option<String>,
+    #[serde(alias = "keypackagePoolBase")]
+    pub keypackage_pool_base: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(alias = "maxInlineBytes")]
     pub max_inline_bytes: Option<u64>,
@@ -1957,8 +1957,8 @@ fn validate_runtime_config(config: &RuntimeConfig) -> CoreResult<()> {
     if let Some(device_status_ref) = &config.device_status_ref {
         validate_required("runtime_config.device_status_ref", device_status_ref)?;
     }
-    if let Some(keypackage_ref_base) = &config.keypackage_ref_base {
-        validate_required("runtime_config.keypackage_ref_base", keypackage_ref_base)?;
+    if let Some(keypackage_pool_base) = &config.keypackage_pool_base {
+        validate_required("runtime_config.keypackage_pool_base", keypackage_pool_base)?;
     }
     for feature in &config.features {
         validate_required("runtime_config.features", feature)?;
@@ -2530,7 +2530,7 @@ mod tests {
             supported_realtime_kinds: vec![RealtimeKind::Websocket, RealtimeKind::Polling],
             identity_bundle_ref: Some("ref:identity:alice".into()),
             device_status_ref: Some("ref:device-status:alice".into()),
-            keypackage_ref_base: Some("ref:keypackages:alice".into()),
+            keypackage_pool_base: Some("ref:keypackages:alice".into()),
             max_inline_bytes: Some(4096),
             features: vec!["generic_sync".into(), "attachment_v1".into()],
         };
@@ -2582,7 +2582,7 @@ mod tests {
                 "supportedRealtimeKinds": ["websocket"],
                 "identityBundleRef": "https://runtime.example/v1/shared-state/{userId}/identity-bundle",
                 "deviceStatusRef": "https://runtime.example/v1/shared-state/{userId}/device-status",
-                "keypackageRefBase": "https://runtime.example/v1/shared-state/keypackages",
+                "keypackagePoolBase": "https://runtime.example/v1/shared-state/keypackages",
                 "maxInlineBytes": 4096,
                 "features": ["device_runtime_refresh_v2"]
             }

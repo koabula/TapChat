@@ -1716,6 +1716,13 @@ impl CoreEngine {
                     self.flush_pending_transport()?,
                 ))
             }
+            PendingRequest::ClaimKeyPackage {
+                creation_id,
+                user_id,
+                device_id,
+            } => self.handle_key_package_claimed(creation_id, user_id, device_id, body),
+            PendingRequest::ReplenishKeyPackagePool => Ok(CoreOutput::default()),
+            PendingRequest::KeyPackagePoolCount => self.handle_key_package_pool_count(body),
             PendingRequest::Ack { device_id, .. } => {
                 let result: AckResult = serde_json::from_str(
                     body.as_deref()
@@ -1906,6 +1913,17 @@ impl CoreEngine {
         // User notifications must not include raw transport or server details.
         let detail: Option<String> = None;
         match request {
+            PendingRequest::ClaimKeyPackage {
+                creation_id,
+                user_id,
+                device_id,
+            } => self.abort_key_package_claim_batch(
+                &creation_id,
+                format!("key package claim failed for {user_id}/{device_id}"),
+            ),
+            PendingRequest::ReplenishKeyPackagePool | PendingRequest::KeyPackagePoolCount => {
+                Ok(CoreOutput::default())
+            }
             PendingRequest::AppendEnvelope {
                 message_id,
                 peer_user_id,
@@ -3191,9 +3209,9 @@ impl CoreEngine {
                             );
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
-                            output
-                                .effects
-                                .extend(self.rotate_local_key_package_after_welcome()?);
+                            output.effects.extend(
+                                self.rotate_local_key_package_after_welcome(inline_ciphertext)?,
+                            );
                             output.state_update.contacts_changed = true;
                             ackable = true;
                         }
@@ -3549,9 +3567,15 @@ impl CoreEngine {
                                     );
                                     touched_mls_conversation_ids.insert(conversation_id.clone());
                                     touched_recovery_context_ids.insert(conversation_id.clone());
-                                    output
-                                        .effects
-                                        .extend(self.rotate_local_key_package_after_welcome()?);
+                                    output.effects.extend(
+                                        self.rotate_local_key_package_after_welcome(
+                                            record
+                                                .envelope
+                                                .inline_ciphertext
+                                                .as_deref()
+                                                .unwrap_or_default(),
+                                        )?,
+                                    );
                                     output.state_update.contacts_changed = true;
                                     if self.direct_relationship_open_for_record(
                                         &record.envelope.sender_user_id,
@@ -3824,6 +3848,27 @@ impl CoreEngine {
         body: Option<String>,
     ) -> CoreResult<CoreOutput> {
         match request {
+            PendingRequest::ClaimKeyPackage {
+                creation_id,
+                user_id,
+                device_id,
+            } => {
+                let code = body.as_deref().and_then(|value| {
+                    serde_json::from_str::<serde_json::Value>(value)
+                        .ok()
+                        .and_then(|json| json.get("code")?.as_str().map(str::to_owned))
+                });
+                if status == 404 && code.as_deref() == Some("pool_empty") {
+                    return self.handle_key_package_claim_pool_empty(creation_id, user_id, device_id);
+                }
+                self.abort_key_package_claim_batch(
+                    &creation_id,
+                    format!("key package claim returned status {status} for {user_id}/{device_id}"),
+                )
+            }
+            PendingRequest::ReplenishKeyPackagePool | PendingRequest::KeyPackagePoolCount => {
+                Ok(CoreOutput::default())
+            }
             PendingRequest::AppendEnvelope {
                 message_id,
                 peer_user_id,

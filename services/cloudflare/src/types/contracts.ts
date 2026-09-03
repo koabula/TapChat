@@ -699,7 +699,7 @@ export interface RuntimeConfig {
   supportedRealtimeKinds: Array<"websocket" | "server_sent_events" | "polling">;
   identityBundleRef?: string;
   deviceStatusRef?: string;
-  keypackageRefBase?: string;
+  keypackagePoolBase?: string;
   maxInlineBytes?: number;
   features: string[];
 }
@@ -812,19 +812,27 @@ export interface DeviceStatusDocument {
   devices: DeviceStatusRecord[];
 }
 
-export interface KeyPackageRefEntry {
+export interface OneTimeKeyPackageEntry {
   keyPackageId: string;
-  ref: string;
-  expiresAt: number;
+  keyPackage: string;
+  lifecycleVersion: number;
+  notBefore: number;
   createdAt: number;
+  expiresAt: number;
 }
 
-export interface KeyPackageRefsDocument {
+export interface KeyPackagePoolReplenishRequest {
   version: string;
-  userId: string;
   deviceId: string;
-  updatedAt: number;
-  refs: KeyPackageRefEntry[];
+  keyPackages: OneTimeKeyPackageEntry[];
+}
+
+export interface KeyPackagePoolClaimResult {
+  keyPackage: OneTimeKeyPackageEntry;
+}
+
+export interface KeyPackagePoolCountResult {
+  count: number;
 }
 
 export interface SharedStateWriteToken {
@@ -832,15 +840,6 @@ export interface SharedStateWriteToken {
   service: "shared_state";
   userId: string;
   objectKinds: Array<"identity_bundle" | "device_status">;
-  expiresAt: number;
-}
-
-export interface KeyPackageWriteToken {
-  version: string;
-  service: "keypackages";
-  userId: string;
-  deviceId: string;
-  keyPackageId?: string;
   expiresAt: number;
 }
 

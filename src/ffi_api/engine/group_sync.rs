@@ -3554,7 +3554,7 @@ impl CoreEngine {
                 updated_at: current_unix_millis(self.state.message_nonce),
             },
         );
-        let post_welcome_effects = self.rotate_local_key_package_after_welcome()?;
+        let post_welcome_effects = self.rotate_local_key_package_after_welcome(&welcome_b64)?;
         log::info!(
             "handle_welcome_pickup_fetched: group imported group_id={} conversation_id={} epoch_ready=true",
             group_state.group_id,

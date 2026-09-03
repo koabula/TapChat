@@ -2,8 +2,7 @@ import { HttpError } from "../auth/capability";
 import type {
   DeviceListDocument,
   DeviceStatusDocument,
-  IdentityBundle,
-  KeyPackageRefsDocument
+  IdentityBundle
 } from "../types/contracts";
 import type { JsonBlobStore } from "../types/runtime";
 
@@ -32,28 +31,12 @@ export class SharedStateService {
     return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
   }
 
-  keyPackageRefsKey(userId: string, deviceId: string): string {
-    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/refs.json`;
-  }
-
-  keyPackageObjectKey(userId: string, deviceId: string, keyPackageId: string): string {
-    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/${sanitizeSegment(keyPackageId)}.bin`;
-  }
-
   identityBundleUrl(userId: string): string {
     return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
   }
 
   deviceStatusUrl(userId: string): string {
     return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/device-status`;
-  }
-
-  keyPackageRefsUrl(userId: string, deviceId: string): string {
-    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}`;
-  }
-
-  keyPackageObjectUrl(userId: string, deviceId: string, keyPackageId: string): string {
-    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/${encodeURIComponent(keyPackageId)}`;
   }
 
   async getIdentityBundle(userId: string): Promise<IdentityBundle | null> {
@@ -102,32 +85,6 @@ export class SharedStateService {
       }
     }
     await this.store.putJson(this.deviceStatusKey(userId), document);
-  }
-
-  async getKeyPackageRefs(userId: string, deviceId: string): Promise<KeyPackageRefsDocument | null> {
-    return this.store.getJson<KeyPackageRefsDocument>(this.keyPackageRefsKey(userId, deviceId));
-  }
-
-  async putKeyPackageRefs(userId: string, deviceId: string, document: KeyPackageRefsDocument): Promise<void> {
-    if (document.userId !== userId || document.deviceId !== deviceId) {
-      throw new HttpError(400, "invalid_input", "keypackage refs scope does not match request path");
-    }
-    for (const entry of document.refs) {
-      if (!entry.ref || !entry.ref.startsWith(this.keyPackageRefsUrl(userId, deviceId))) {
-        throw new HttpError(400, "invalid_input", "keypackage ref must be a concrete object URL");
-      }
-    }
-    await this.store.putJson(this.keyPackageRefsKey(userId, deviceId), document);
-  }
-
-  async putKeyPackageObject(userId: string, deviceId: string, keyPackageId: string, body: ArrayBuffer): Promise<void> {
-    await this.store.putBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId), body, {
-      "content-type": "application/octet-stream"
-    });
-  }
-
-  async getKeyPackageObject(userId: string, deviceId: string, keyPackageId: string): Promise<ArrayBuffer | null> {
-    return this.store.getBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId));
   }
 
   private buildDeviceListDocument(bundle: IdentityBundle): DeviceListDocument {

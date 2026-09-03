@@ -33,6 +33,7 @@ export const ERROR_DEFAULTS = {
   keypackage_lifetime_invalid: ["mls", false, "refresh_identity"],
   keypackage_refresh_pending: ["mls", true, "reconnect"],
   keypackage_publish_failed: ["mls", true, "retry"],
+  pool_empty: ["mls", true, null],
   device_clock_invalid: ["security", false, null],
   identity_bundle_conflict: ["identity", true, "sync_now"],
   identity_refresh_required: ["identity", true, "refresh_identity"],

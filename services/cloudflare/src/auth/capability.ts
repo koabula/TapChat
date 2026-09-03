@@ -13,7 +13,6 @@ import type {
   GroupMessageType,
   IdentityBundle,
   InboxAppendCapability,
-  KeyPackageWriteToken,
   SharedStateWriteToken,
   WelcomePickupDescriptor
 } from "../types/contracts";
@@ -673,35 +672,3 @@ export async function validateSharedStateWriteAuthorization(
   return token;
 }
 
-export async function validateKeyPackageWriteAuthorization(
-  request: Request,
-  secret: string | RotatingSecretSet,
-  userId: string,
-  deviceId: string,
-  keyPackageId: string | undefined,
-  now: number,
-  legacySecret?: string
-): Promise<KeyPackageWriteToken | DeviceRuntimeToken> {
-  try {
-    return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
-  } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
-      throw error;
-    }
-  }
-
-  const token = await verifySignedToken<KeyPackageWriteToken>(legacySecret ?? secret, request, now);
-  if (token.version !== CURRENT_MODEL_VERSION) {
-    throw new HttpError(400, "unsupported_version", "keypackage token version is not supported");
-  }
-  if (token.service !== "keypackages") {
-    throw new HttpError(403, "invalid_capability", "token service must be keypackages");
-  }
-  if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "token scope does not match request path");
-  }
-  if (token.keyPackageId && token.keyPackageId !== keyPackageId) {
-    throw new HttpError(403, "invalid_capability", "token keyPackageId does not match request path");
-  }
-  return token;
-}

@@ -202,87 +202,147 @@ impl CoreEngine {
         }
 
         if needs_rebootstrap {
-            let key_packages = self.peer_key_packages(&peer_user_id, &peer_active_device_ids)?;
-            let artifacts = self
-                .state
-                .mls_adapter
-                .as_mut()
-                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .create_conversation(&conversation_id, &key_packages)?;
-            self.initialize_direct_pcs_from_mls(&conversation_id)?;
-            let summary = self
-                .state
-                .mls_adapter
-                .as_ref()
-                .ok_or_else(|| CoreError::invalid_state("mls adapter missing after rebuild"))?
-                .export_group_summary(&conversation_id)?;
-            self.state
-                .mls_summaries
-                .insert(conversation_id.clone(), summary);
-            if let Some(conversation_state) = self.state.conversations.get_mut(&conversation_id) {
-                conversation_state.conversation.state = ConversationState::Active;
-                conversation_state.recovery_status = RecoveryStatus::NeedsRecovery;
-                conversation_state.conversation.member_devices = reconcile.member_devices.clone();
-                conversation_state.last_known_peer_active_devices =
-                    peer_active_device_ids.iter().cloned().collect();
-            }
-
-            let mut generated = self.commit_envelopes_for_artifacts(
-                &conversation_id,
-                &peer_active_device_ids,
-                &artifacts,
-            )?;
-            generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
-            self.enqueue_envelopes(peer_user_id, generated.clone());
-            self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
-            return self.merge_with_transport_flush(CoreOutput {
-                state_update: CoreStateUpdate {
-                    conversations_changed: true,
-                    messages_changed: true,
-                    contacts_changed: true,
-                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
-                    ..CoreStateUpdate::default()
+            // Precondition validation already happened above via
+            // `peer_active_device_ids` (only Active devices with a usable
+            // *cached* last-resort KeyPackage reference are included). The
+            // actual KeyPackage material used to rebuild the conversation,
+            // however, no longer comes straight from this cache: each
+            // device is queued for a one-time-pool claim first, and the
+            // cached ref here is only consulted again as a fallback if that
+            // device's claim comes back `pool_empty`.
+            let remaining_devices: VecDeque<(String, String)> = peer_active_device_ids
+                .iter()
+                .map(|device_id| (peer_user_id.clone(), device_id.clone()))
+                .collect();
+            return self.start_key_package_claim_batch(
+                KeyPackageClaimBatchKind::ReconcileMembershipRebootstrap {
+                    conversation_id: conversation_id.clone(),
+                    peer_user_id: peer_user_id.clone(),
+                    peer_active_device_ids: peer_active_device_ids.clone(),
+                    member_devices: reconcile.member_devices.clone(),
                 },
-                effects: vec![persist_effect(
-                    &self.state,
-                    vec![
-                        PersistOp::SaveConversation {
-                            conversation_id: conversation_id.clone(),
-                        },
-                        PersistOp::SaveMlsState {
-                            conversation_id: conversation_id.clone(),
-                        },
-                    ],
-                )],
-                view_model: Some(CoreViewModel {
-                    conversations: vec![self.conversation_summary(&conversation_id)?],
-                    messages: generated
-                        .iter()
-                        .map(|envelope| MessageSummary {
-                            conversation_id: envelope.conversation_id.clone(),
-                            message_id: envelope.message_id.clone(),
-                            message_type: envelope.message_type,
-                        })
-                        .collect(),
-                    ..CoreViewModel::default()
-                }),
-            });
+                remaining_devices,
+            );
         }
 
+        // Same reasoning as the rebootstrap branch above: `reconcile.added_devices`
+        // is already restricted to devices with a usable cached last-resort
+        // KeyPackage reference (via `peer_active_device_ids`), but the actual
+        // bytes are claimed from the pool first. An empty `added_devices` list
+        // (e.g. a reconciliation that only revokes devices) still routes
+        // through the claim batch machinery — it simply finalizes immediately
+        // with no network round trip.
+        let remaining_devices: VecDeque<(String, String)> = reconcile
+            .added_devices
+            .iter()
+            .map(|device_id| (peer_user_id.clone(), device_id.clone()))
+            .collect();
+        self.start_key_package_claim_batch(
+            KeyPackageClaimBatchKind::ReconcileMembershipAddDevices {
+                conversation_id: conversation_id.clone(),
+                peer_user_id: peer_user_id.clone(),
+                peer_active_device_ids: peer_active_device_ids.clone(),
+                revoked_devices: reconcile.revoked_devices.clone(),
+            },
+            remaining_devices,
+        )
+    }
+
+    pub(super) fn finalize_reconcile_membership_rebootstrap(
+        &mut self,
+        conversation_id: String,
+        peer_user_id: String,
+        peer_active_device_ids: Vec<String>,
+        member_devices: Vec<ConversationMember>,
+        resolved_key_packages: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
+        let artifacts = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .create_conversation(&conversation_id, &resolved_key_packages)?;
+        self.initialize_direct_pcs_from_mls(&conversation_id)?;
+        let summary = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter missing after rebuild"))?
+            .export_group_summary(&conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(conversation_id.clone(), summary);
+        if let Some(conversation_state) = self.state.conversations.get_mut(&conversation_id) {
+            conversation_state.conversation.state = ConversationState::Active;
+            conversation_state.recovery_status = RecoveryStatus::NeedsRecovery;
+            conversation_state.conversation.member_devices = member_devices;
+            conversation_state.last_known_peer_active_devices =
+                peer_active_device_ids.iter().cloned().collect();
+        }
+
+        let mut generated = self.commit_envelopes_for_artifacts(
+            &conversation_id,
+            &peer_active_device_ids,
+            &artifacts,
+        )?;
+        generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
+        self.enqueue_envelopes(peer_user_id, generated.clone());
+        self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                contacts_changed: true,
+                system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveConversation {
+                        conversation_id: conversation_id.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: conversation_id.clone(),
+                    },
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(&conversation_id)?],
+                messages: generated
+                    .iter()
+                    .map(|envelope| MessageSummary {
+                        conversation_id: envelope.conversation_id.clone(),
+                        message_id: envelope.message_id.clone(),
+                        message_type: envelope.message_type,
+                    })
+                    .collect(),
+                ..CoreViewModel::default()
+            }),
+        })
+    }
+
+    pub(super) fn finalize_reconcile_membership_add_devices(
+        &mut self,
+        conversation_id: String,
+        peer_user_id: String,
+        peer_active_device_ids: Vec<String>,
+        revoked_devices: Vec<String>,
+        resolved_key_packages: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
         let mut generated = self.build_control_membership_changed_messages(
             &conversation_id,
             &peer_user_id,
             &peer_active_device_ids,
         )?;
         let output = CoreOutput::default();
-        if !reconcile.added_devices.is_empty() {
-            let key_packages = self.peer_key_packages(&peer_user_id, &reconcile.added_devices)?;
+        if !resolved_key_packages.is_empty() {
             let artifacts = self
                 .state
                 .mls_adapter
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .add_members(&conversation_id, &key_packages)?;
+                .add_members(&conversation_id, &resolved_key_packages)?;
             generated.extend(self.commit_envelopes_for_artifacts(
                 &conversation_id,
                 &peer_active_device_ids,
@@ -290,13 +350,13 @@ impl CoreEngine {
             )?);
             generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
         }
-        if !reconcile.revoked_devices.is_empty() {
+        if !revoked_devices.is_empty() {
             let artifacts = self
                 .state
                 .mls_adapter
                 .as_mut()
                 .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .remove_members(&conversation_id, &reconcile.revoked_devices)?;
+                .remove_members(&conversation_id, &revoked_devices)?;
             generated.extend(self.commit_envelopes_for_remove(
                 &conversation_id,
                 &peer_active_device_ids,

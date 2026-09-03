@@ -2236,7 +2236,7 @@ fn public_deployment_bundle(
             supported_realtime_kinds: vec![tapchat_core::model::RealtimeKind::Websocket],
             identity_bundle_ref: Some(identity_ref),
             device_status_ref: Some(device_status_ref),
-            keypackage_ref_base: Some(format!(
+            keypackage_pool_base: Some(format!(
                 "{}/v1/shared-state/keypackages",
                 runtime.base_url()
             )),

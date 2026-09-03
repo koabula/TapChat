@@ -20,6 +20,13 @@ pub const KEY_PACKAGE_CLOCK_SKEW_MS: u64 = 60 * 60 * 1000;
 pub const KEY_PACKAGE_CLOCK_TOLERANCE_MS: u64 = 5 * 60 * 1000;
 pub const KEY_PACKAGE_ROTATION_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 pub const KEY_PACKAGE_ROTATION_JITTER_MAX_MS: u64 = 24 * 60 * 60 * 1000;
+/// Target size of the one-time KeyPackage pool each device keeps replenished
+/// on its own runtime, so that starting a new session consumes a KeyPackage
+/// that is never handed out to a second contact.
+pub const ONE_TIME_KEY_PACKAGE_POOL_TARGET: u32 = 20;
+/// Once the remaining pool count (as reported by the runtime) drops below
+/// this, the maintenance timer tops the pool back up to the target size.
+pub const ONE_TIME_KEY_PACKAGE_POOL_LOW_WATER: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, SerdeDeserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -505,6 +512,29 @@ impl MlsAdapter {
             self.credential_identity.clone(),
             now,
         )
+    }
+
+    /// Builds `count` one-time KeyPackages for the one-time pool, each with its
+    /// own independently generated MLS init secret (openmls stores each by the
+    /// KeyPackage's own hash, so these coexist without collision). Unlike the
+    /// single long-lived last-resort KeyPackage, these are meant to be claimed
+    /// and consumed exactly once each.
+    pub fn generate_one_time_key_packages(
+        &self,
+        count: u32,
+        now: u64,
+    ) -> CoreResult<Vec<PublishedKeyPackage>> {
+        (0..count)
+            .map(|_| {
+                Self::build_published_key_package(
+                    &self.provider,
+                    &self.signer,
+                    self.credential_with_key.clone(),
+                    self.credential_identity.clone(),
+                    now,
+                )
+            })
+            .collect()
     }
 
     pub fn create_conversation(
@@ -1866,6 +1896,44 @@ impl MlsAdapter {
             credential_identity,
         })
     }
+
+    /// Returns true if the Welcome's encrypted group secrets target
+    /// `key_package_b64` specifically, i.e. this KeyPackage (rather than
+    /// some other one, such as a one-time pool entry) was the one consumed
+    /// to build this Welcome for us. Used to scope the reactive
+    /// "rotate the last-resort KeyPackage after a Welcome arrives" behavior
+    /// to Welcomes that actually consumed the last-resort KeyPackage —
+    /// Welcomes built from a claimed one-time pool entry must not trigger
+    /// it, since the pool's own count already dropped server-side and the
+    /// periodic maintenance timer is what tops it back up.
+    pub fn welcome_targets_key_package(
+        &self,
+        welcome_payload_b64: &str,
+        key_package_b64: &str,
+    ) -> CoreResult<bool> {
+        let welcome_bytes = BASE64
+            .decode(welcome_payload_b64)
+            .map_err(|_| CoreError::invalid_input("invalid base64 welcome payload"))?;
+        let welcome_message = MlsMessageIn::tls_deserialize_exact(welcome_bytes).map_err(|error| {
+            CoreError::invalid_input(format!("failed to decode welcome message: {error}"))
+        })?;
+        let welcome = match welcome_message.extract() {
+            MlsMessageBodyIn::Welcome(welcome) => welcome,
+            _ => {
+                return Err(CoreError::invalid_input(
+                    "decoded MLS message was not a welcome",
+                ));
+            }
+        };
+        let candidate = decode_key_package(key_package_b64)?;
+        let candidate_ref = candidate.hash_ref(self.provider.crypto()).map_err(|error| {
+            CoreError::invalid_state(format!("failed to hash key package: {error}"))
+        })?;
+        Ok(welcome
+            .secrets()
+            .iter()
+            .any(|secret| secret.new_member() == candidate_ref))
+    }
 }
 
 fn current_unix_time_ms() -> CoreResult<u64> {
@@ -2043,8 +2111,8 @@ mod tests {
     use super::{
         DirectCommitClass, IngestResult, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
         KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, MlsAdapter, MlsAdapterModule,
-        PeerDeviceKeyPackage, PublishedKeyPackage, key_package_rotation_jitter_ms,
-        validate_published_key_package_lifetime,
+        ONE_TIME_KEY_PACKAGE_POOL_TARGET, PeerDeviceKeyPackage, PublishedKeyPackage,
+        key_package_rotation_jitter_ms, validate_published_key_package_lifetime,
     };
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
@@ -2095,6 +2163,34 @@ mod tests {
             package.expires_at,
         )
         .expect("outer metadata must match MLS lifetime");
+    }
+
+    #[test]
+    fn one_time_key_package_batch_has_distinct_init_secrets() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let (adapter, _) = MlsAdapter::bootstrap(&identity).expect("adapter");
+        let batch = adapter
+            .generate_one_time_key_packages(ONE_TIME_KEY_PACKAGE_POOL_TARGET, test_now_ms())
+            .expect("batch");
+        assert_eq!(batch.len(), ONE_TIME_KEY_PACKAGE_POOL_TARGET as usize);
+        let unique: std::collections::BTreeSet<_> =
+            batch.iter().map(|package| package.key_package_b64.clone()).collect();
+        assert_eq!(
+            unique.len(),
+            batch.len(),
+            "every one-time key package must carry a distinct init secret"
+        );
+        for package in &batch {
+            validate_published_key_package_lifetime(
+                &package.key_package_b64,
+                package.lifecycle_version,
+                package.not_before,
+                package.created_at,
+                package.expires_at,
+            )
+            .expect("each pool entry must have valid MLS lifecycle metadata");
+        }
     }
 
     #[test]

@@ -1,16 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::attachment_crypto::{AttachmentVariant, EncryptedBlobDescriptor};
 use crate::conversation::{
     LocalConversationState, RecoveryStatus, StoredMessage, StoredMessageDeliveryState,
 };
 use crate::identity::LocalIdentityState;
-use crate::mls_adapter::{MlsAdapter, PublishedKeyPackage};
+use crate::mls_adapter::{MlsAdapter, PeerDeviceKeyPackage, PublishedKeyPackage};
 use crate::model::{
-    Ack, ConversationKind, DeploymentBundle, Envelope, GroupCursor, GroupEnvelope,
-    GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupRole, IdentityBundle,
-    InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, StorageRef, WelcomePickupDescriptor,
+    Ack, ConversationKind, ConversationMember, DeploymentBundle, Envelope, GroupCursor,
+    GroupEnvelope, GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupRole,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, StorageRef,
+    WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
@@ -1337,6 +1338,9 @@ pub(crate) struct CoreState {
     pub(crate) key_package_inventory: Vec<PublishedKeyPackage>,
     pub(crate) pending_identity_publication: Option<crate::persistence::PendingIdentityPublication>,
     pub(crate) pending_requests: BTreeMap<String, PendingRequest>,
+    /// In-flight sequential-claim KeyPackage batches, keyed by creation_id.
+    /// Not persisted — see `PendingKeyPackageClaimBatch` doc comment.
+    pub(crate) pending_key_package_claim_batches: BTreeMap<String, PendingKeyPackageClaimBatch>,
     pub(crate) request_nonce: u64,
     pub(crate) message_nonce: u64,
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
@@ -1401,6 +1405,72 @@ pub(crate) enum PendingRequest {
         device_id: String,
         ack_seq: u64,
     },
+    ClaimKeyPackage {
+        creation_id: String,
+        user_id: String,
+        device_id: String,
+    },
+    ReplenishKeyPackagePool,
+    KeyPackagePoolCount,
+}
+
+/// What a `PendingKeyPackageClaimBatch` will do once every target device's
+/// one-time KeyPackage claim (or last-resort fallback) has resolved. Holds
+/// exactly the inputs the corresponding synchronous finalize step needs;
+/// everything else (member device lists, manifests, MLS artifacts) is
+/// rebuilt at finalize time from the resolved `PeerDeviceKeyPackage`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyPackageClaimBatchKind {
+    Direct {
+        peer_user_id: String,
+        conversation_id: String,
+        peer_device_ids: Vec<String>,
+    },
+    Group {
+        title: String,
+        member_user_ids: Vec<String>,
+        group_id: String,
+        conversation_id: String,
+    },
+    ApproveGroupJoin {
+        group_id: String,
+        request_id: String,
+        join: GroupJoinRequest,
+    },
+    InviteToGroup {
+        group_id: String,
+        invitee_user_ids: Vec<String>,
+    },
+    AddGroupMemberDevice {
+        group_id: String,
+        device_id: String,
+    },
+    ReconcileMembershipRebootstrap {
+        conversation_id: String,
+        peer_user_id: String,
+        peer_active_device_ids: Vec<String>,
+        member_devices: Vec<ConversationMember>,
+    },
+    ReconcileMembershipAddDevices {
+        conversation_id: String,
+        peer_user_id: String,
+        peer_active_device_ids: Vec<String>,
+        revoked_devices: Vec<String>,
+    },
+}
+
+/// In-memory-only bookkeeping for a batch of sequential one-time KeyPackage
+/// claims that must all resolve (via `ClaimKeyPackage` HTTP round trips,
+/// each optionally falling back to a cached last-resort KeyPackage on
+/// `pool_empty`) before the actual MLS operation (`create_conversation`/
+/// `add_members`) that depends on them can run. Never persisted: a
+/// mid-flight restart simply drops the entry and the caller must retry the
+/// command (matches how `pending_requests` itself is not persisted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingKeyPackageClaimBatch {
+    pub(crate) kind: KeyPackageClaimBatchKind,
+    pub(crate) remaining_devices: VecDeque<(String, String)>,
+    pub(crate) resolved_key_packages: Vec<PeerDeviceKeyPackage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1508,6 +1578,7 @@ impl Default for CoreState {
             key_package_inventory: Vec::new(),
             pending_identity_publication: None,
             pending_requests: BTreeMap::new(),
+            pending_key_package_claim_batches: BTreeMap::new(),
             request_nonce: 0,
             message_nonce: 0,
             recovery_contexts: BTreeMap::new(),

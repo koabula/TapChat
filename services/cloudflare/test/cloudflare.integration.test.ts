@@ -1173,6 +1173,71 @@ test("runtime integration: group FSM routes expose open-invite and join lease fl
   socket.close(1000, "done");
 });
 
+test("runtime integration: one-time key package pool replenishes, claims atomically, and empties", async (t) => {
+  const mf = await createRuntime();
+  t.after(async () => {
+    await mf.dispose();
+  });
+
+  const bundle = await issueDeviceBundle(mf, "user:bob", "device:bob:phone");
+  const token = bundle.runtimeCredential.token;
+  const deviceId = "device:bob:phone";
+  const now = Date.now();
+  const oneTimeKeyPackage = (id: string) => ({
+    keyPackageId: id,
+    keyPackage: Buffer.from(`integration-fixture-${id}`).toString("base64"),
+    lifecycleVersion: 1,
+    notBefore: Math.max(0, now - 60 * 60 * 1000),
+    createdAt: now,
+    expiresAt: now + 84 * 24 * 60 * 60 * 1000
+  });
+
+  const unauthorizedReplenish = await mf.dispatchFetch(`${BASE_URL}/v1/keypackage-pool/${encodeURIComponent(deviceId)}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ version: CURRENT_MODEL_VERSION, deviceId, keyPackages: [oneTimeKeyPackage("unauth")] })
+  });
+  assert.equal(unauthorizedReplenish.status, 403);
+
+  const replenish = await mf.dispatchFetch(`${BASE_URL}/v1/keypackage-pool/${encodeURIComponent(deviceId)}`, {
+    method: "PUT",
+    headers: { ...authHeaders(token), "content-type": "application/json" },
+    body: JSON.stringify({
+      version: CURRENT_MODEL_VERSION,
+      deviceId,
+      keyPackages: [oneTimeKeyPackage("kp1"), oneTimeKeyPackage("kp2")]
+    })
+  });
+  assert.equal(replenish.status, 200);
+  assert.deepEqual(await replenish.json(), { added: 2, capacity: 40 });
+
+  const countResponse = await mf.dispatchFetch(`${BASE_URL}/v1/keypackage-pool/${encodeURIComponent(deviceId)}`, {
+    method: "GET",
+    headers: authHeaders(token)
+  });
+  assert.equal(countResponse.status, 200);
+  assert.deepEqual(await countResponse.json(), { count: 2 });
+
+  const claimUrl = `${BASE_URL}/v1/keypackage-pool/${encodeURIComponent(deviceId)}/claim`;
+  const [firstClaim, secondClaim] = await Promise.all([
+    mf.dispatchFetch(claimUrl, { method: "POST" }),
+    mf.dispatchFetch(claimUrl, { method: "POST" })
+  ]);
+  assert.equal(firstClaim.status, 200);
+  assert.equal(secondClaim.status, 200);
+  const firstBody = (await firstClaim.json()) as { keyPackage: { keyPackageId: string } };
+  const secondBody = (await secondClaim.json()) as { keyPackage: { keyPackageId: string } };
+  assert.notEqual(
+    firstBody.keyPackage.keyPackageId,
+    secondBody.keyPackage.keyPackageId,
+    "concurrent claims against the real durable object must never return the same entry"
+  );
+
+  const drained = await mf.dispatchFetch(claimUrl, { method: "POST" });
+  assert.equal(drained.status, 404);
+  assert.equal(((await drained.json()) as { code: string }).code, "pool_empty");
+});
+
 test.after(async () => {
   await fs.rm(TMP_DIR, { recursive: true, force: true });
 });

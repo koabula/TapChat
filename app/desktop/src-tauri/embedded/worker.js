@@ -2354,6 +2354,8 @@ function requiredGroupAppendOperations(messageType) {
   switch (messageType) {
     case "mls_application":
       return ["append_application"];
+    case "mls_proposal":
+      return ["append_control"];
     case "mls_commit":
     case "control_group_membership_changed":
     case "control_group_state_event":
@@ -2482,29 +2484,6 @@ async function validateSharedStateWriteAuthorization(request, secret, userId, de
   }
   if (!token.objectKinds.includes(objectKind)) {
     throw new HttpError(403, "invalid_capability", "token does not grant this shared-state object kind");
-  }
-  return token;
-}
-async function validateKeyPackageWriteAuthorization(request, secret, userId, deviceId, keyPackageId, now, legacySecret) {
-  try {
-    return await validateDeviceRuntimeAuthorization(request, secret, userId, deviceId, "keypackage_write", now);
-  } catch (error) {
-    if (!(error instanceof HttpError) || error.code === "runtime_auth_expired") {
-      throw error;
-    }
-  }
-  const token = await verifySignedToken(legacySecret ?? secret, request, now);
-  if (token.version !== CURRENT_MODEL_VERSION) {
-    throw new HttpError(400, "unsupported_version", "keypackage token version is not supported");
-  }
-  if (token.service !== "keypackages") {
-    throw new HttpError(403, "invalid_capability", "token service must be keypackages");
-  }
-  if (token.userId !== userId || token.deviceId !== deviceId) {
-    throw new HttpError(403, "invalid_capability", "token scope does not match request path");
-  }
-  if (token.keyPackageId && token.keyPackageId !== keyPackageId) {
-    throw new HttpError(403, "invalid_capability", "token keyPackageId does not match request path");
   }
   return token;
 }
@@ -2663,6 +2642,7 @@ var ERROR_DEFAULTS = {
   keypackage_lifetime_invalid: ["mls", false, "refresh_identity"],
   keypackage_refresh_pending: ["mls", true, "reconnect"],
   keypackage_publish_failed: ["mls", true, "retry"],
+  pool_empty: ["mls", true, null],
   device_clock_invalid: ["security", false, null],
   identity_bundle_conflict: ["identity", true, "sync_now"],
   identity_refresh_required: ["identity", true, "refresh_identity"],
@@ -2731,6 +2711,9 @@ var KEY_PACKAGE_NOT_BEFORE_SKEW_MS = 60 * 60 * 1e3;
 var KEY_PACKAGE_MIN_REMAINING_MS = 7 * 24 * 60 * 60 * 1e3;
 var CLOCK_TOLERANCE_MS = 5 * 60 * 1e3;
 var INBOX_CAPABILITY_MAX_LIFETIME_MS = 365 * 24 * 60 * 60 * 1e3;
+var KEY_PACKAGE_POOL_PREFIX = "keypackage_pool:";
+var KEY_PACKAGE_POOL_MAX_SIZE = 40;
+var MAX_KEY_PACKAGE_BASE64_LENGTH = 8192;
 var DurableObjectBase = globalThis.DurableObject ?? class {
   constructor(_state, _env) {
   }
@@ -2755,6 +2738,23 @@ function challengeKey(nonce) {
 }
 function deviceKey(deviceId) {
   return `${DEVICE_PREFIX}${deviceId}`;
+}
+function keyPackagePoolPrefix(deviceId) {
+  return `${KEY_PACKAGE_POOL_PREFIX}${deviceId}:`;
+}
+function keyPackagePoolKey(deviceId, keyPackageId) {
+  return `${keyPackagePoolPrefix(deviceId)}${keyPackageId}`;
+}
+function validateOneTimeKeyPackageEntry(entry, now) {
+  if (!entry.keyPackageId || !entry.keyPackage || entry.keyPackage.length > MAX_KEY_PACKAGE_BASE64_LENGTH || entry.lifecycleVersion !== 1 || !Number.isSafeInteger(entry.notBefore) || !Number.isSafeInteger(entry.createdAt) || !Number.isSafeInteger(entry.expiresAt) || entry.expiresAt - entry.createdAt !== KEY_PACKAGE_LIFETIME_MS || entry.notBefore !== Math.max(0, entry.createdAt - KEY_PACKAGE_NOT_BEFORE_SKEW_MS)) {
+    throw new HttpError(422, "keypackage_lifetime_invalid", "one-time key package lifecycle metadata is invalid");
+  }
+  if (entry.createdAt > now + CLOCK_TOLERANCE_MS || entry.notBefore > now + CLOCK_TOLERANCE_MS) {
+    throw new HttpError(422, "device_clock_invalid", "one-time key package timestamps are too far in the future");
+  }
+  if (entry.expiresAt <= now - CLOCK_TOLERANCE_MS) {
+    throw new HttpError(422, "keypackage_expired", "one-time key package is already expired");
+  }
 }
 function randomNonce() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -2854,6 +2854,15 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
       }
       if (request.method === "POST" && url.pathname.endsWith("/identity-bundle/migrate")) {
         return await this.migrateIdentityBundle(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/keypackage-pool/replenish")) {
+        return await this.replenishKeyPackagePool(request, now);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/keypackage-pool/claim")) {
+        return await this.claimKeyPackage(request);
+      }
+      if (request.method === "POST" && url.pathname.endsWith("/keypackage-pool/count")) {
+        return await this.keyPackagePoolCount(request);
       }
       return errorResponse(404, "not_found");
     } catch (error) {
@@ -3094,6 +3103,53 @@ var DeviceRegistryDurableObject = class extends DurableObjectBase {
     const response = jsonResponse(stored.bundle);
     response.headers.set("etag", stored.etag);
     return response;
+  }
+  async replenishKeyPackagePool(request, now) {
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.deviceId || !Array.isArray(body.keyPackages) || body.keyPackages.length === 0) {
+      throw new HttpError(400, "invalid_input", "replenish request is missing deviceId or key packages");
+    }
+    const prefix = keyPackagePoolPrefix(body.deviceId);
+    const added = await this.stateRef.storage.transaction(async (transaction) => {
+      const existing = await transaction.list({ prefix });
+      const available = KEY_PACKAGE_POOL_MAX_SIZE - existing.size;
+      let count = 0;
+      for (const entry of body.keyPackages) {
+        if (count >= available) break;
+        validateOneTimeKeyPackageEntry(entry, now);
+        await transaction.put(keyPackagePoolKey(body.deviceId, entry.keyPackageId), entry);
+        count += 1;
+      }
+      return count;
+    });
+    return jsonResponse({ added, capacity: KEY_PACKAGE_POOL_MAX_SIZE });
+  }
+  async claimKeyPackage(request) {
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.deviceId) {
+      throw new HttpError(400, "invalid_input", "claim request is missing deviceId");
+    }
+    const prefix = keyPackagePoolPrefix(body.deviceId);
+    const claimed = await this.stateRef.storage.transaction(async (transaction) => {
+      const existing = await transaction.list({ prefix, limit: 1 });
+      const first = existing.entries().next();
+      if (first.done) return null;
+      const [key, entry] = first.value;
+      await transaction.delete(key);
+      return entry;
+    });
+    if (!claimed) {
+      return errorResponse(404, "pool_empty");
+    }
+    return jsonResponse({ keyPackage: claimed });
+  }
+  async keyPackagePoolCount(request) {
+    const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+    if (!body.deviceId) {
+      throw new HttpError(400, "invalid_input", "count request is missing deviceId");
+    }
+    const existing = await this.stateRef.storage.list({ prefix: keyPackagePoolPrefix(body.deviceId) });
+    return jsonResponse({ count: existing.size });
   }
 };
 function registryStub(env) {
@@ -3594,6 +3650,11 @@ function validateTransitionShape(oldManifest, nextManifest, proof, operation) {
         expected.lastCommitMessageId = nextManifest.lastCommitMessageId;
       });
       break;
+    case "pcs_update":
+      valid = commitChanged && manifestTransitionMatches(oldManifest, nextManifest, (expected) => {
+        expected.lastCommitMessageId = nextManifest.lastCommitMessageId;
+      });
+      break;
   }
   if (!valid) {
     throw new HttpError(409, "group_transition_invalid", `manifest changes do not match ${operation.type}`);
@@ -3607,6 +3668,8 @@ function groupTransitionProofOperation(operation) {
       return "leave";
     case "remove_member":
       return "remove";
+    case "pcs_update":
+      return "pcs_update";
     default:
       return operation.type;
   }
@@ -6279,23 +6342,11 @@ var SharedStateService = class {
   deviceStatusKey(userId) {
     return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
   }
-  keyPackageRefsKey(userId, deviceId) {
-    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/refs.json`;
-  }
-  keyPackageObjectKey(userId, deviceId, keyPackageId) {
-    return `keypackages/${sanitizeSegment(userId)}/${sanitizeSegment(deviceId)}/${sanitizeSegment(keyPackageId)}.bin`;
-  }
   identityBundleUrl(userId) {
     return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
   }
   deviceStatusUrl(userId) {
     return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/device-status`;
-  }
-  keyPackageRefsUrl(userId, deviceId) {
-    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}`;
-  }
-  keyPackageObjectUrl(userId, deviceId, keyPackageId) {
-    return `${this.baseUrl}/v1/shared-state/keypackages/${encodeURIComponent(userId)}/${encodeURIComponent(deviceId)}/${encodeURIComponent(keyPackageId)}`;
   }
   async getIdentityBundle(userId) {
     return this.store.getJson(this.identityBundleKey(userId));
@@ -6337,28 +6388,6 @@ var SharedStateService = class {
       }
     }
     await this.store.putJson(this.deviceStatusKey(userId), document);
-  }
-  async getKeyPackageRefs(userId, deviceId) {
-    return this.store.getJson(this.keyPackageRefsKey(userId, deviceId));
-  }
-  async putKeyPackageRefs(userId, deviceId, document) {
-    if (document.userId !== userId || document.deviceId !== deviceId) {
-      throw new HttpError(400, "invalid_input", "keypackage refs scope does not match request path");
-    }
-    for (const entry of document.refs) {
-      if (!entry.ref || !entry.ref.startsWith(this.keyPackageRefsUrl(userId, deviceId))) {
-        throw new HttpError(400, "invalid_input", "keypackage ref must be a concrete object URL");
-      }
-    }
-    await this.store.putJson(this.keyPackageRefsKey(userId, deviceId), document);
-  }
-  async putKeyPackageObject(userId, deviceId, keyPackageId, body) {
-    await this.store.putBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId), body, {
-      "content-type": "application/octet-stream"
-    });
-  }
-  async getKeyPackageObject(userId, deviceId, keyPackageId) {
-    return this.store.getBytes(this.keyPackageObjectKey(userId, deviceId, keyPackageId));
   }
   buildDeviceListDocument(bundle) {
     return {
@@ -6854,7 +6883,7 @@ function publicDeploymentBundle(request, env) {
       supportedRealtimeKinds: ["websocket"],
       identityBundleRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/identity-bundle`,
       deviceStatusRef: `${baseUrl(request, env)}/v1/shared-state/{userId}/device-status`,
-      keypackageRefBase: `${baseUrl(request, env)}/v1/shared-state/keypackages`,
+      keypackagePoolBase: `${baseUrl(request, env)}/v1/keypackage-pool`,
       maxInlineBytes: Number(env.MAX_INLINE_BYTES ?? "4096"),
       features: [
         "generic_sync",
@@ -6872,6 +6901,7 @@ function publicDeploymentBundle(request, env) {
         "device_runtime_refresh_v2",
         "device_registry_v1",
         "keypackage_lifecycle_v1",
+        "keypackage_pool_v1",
         "identity_bundle_cas_v1",
         "structured_errors_v1"
       ]
@@ -7280,64 +7310,41 @@ async function handleRequest(request, env) {
       }
       return jsonResponse4(document);
     }
-    const keyPackageRefsMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)$/);
-    if (keyPackageRefsMatch) {
-      const userId = decodeURIComponent(keyPackageRefsMatch[1]);
-      const deviceId = decodeURIComponent(keyPackageRefsMatch[2]);
-      if (request.method === "GET") {
-        const document = await sharedState.getKeyPackageRefs(userId, deviceId);
-        if (!document) {
-          return structuredErrorResponse(request, 404, "not_found", false);
-        }
-        return jsonResponse4(document);
-      }
-      if (request.method === "PUT") {
-        const authorization = await validateKeyPackageWriteAuthorization(
-          request,
-          deviceRuntimeSecrets(env),
-          userId,
-          deviceId,
-          void 0,
-          now,
-          sharedStateSecret(env)
-        );
-        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
-        const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-        await sharedState.putKeyPackageRefs(userId, deviceId, body);
-        const saved = await sharedState.getKeyPackageRefs(userId, deviceId);
-        return jsonResponse4(saved);
-      }
+    const keyPackagePoolClaimMatch = url.pathname.match(/^\/v1\/keypackage-pool\/([^/]+)\/claim$/);
+    if (keyPackagePoolClaimMatch && request.method === "POST") {
+      const deviceId = decodeURIComponent(keyPackagePoolClaimMatch[1]);
+      const claimed = await registryStub(env).fetch(
+        new Request("https://device-registry.internal/v2/device-registry/keypackage-pool/claim", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ deviceId })
+        })
+      );
+      return claimed;
     }
-    const keyPackageObjectMatch = url.pathname.match(/^\/v1\/shared-state\/keypackages\/([^/]+)\/([^/]+)\/([^/]+)$/);
-    if (keyPackageObjectMatch) {
-      const userId = decodeURIComponent(keyPackageObjectMatch[1]);
-      const deviceId = decodeURIComponent(keyPackageObjectMatch[2]);
-      const keyPackageId = decodeURIComponent(keyPackageObjectMatch[3]);
-      if (request.method === "GET") {
-        const payload = await sharedState.getKeyPackageObject(userId, deviceId, keyPackageId);
-        if (!payload) {
-          return structuredErrorResponse(request, 404, "not_found", false);
-        }
-        return new Response(payload, {
-          status: 200,
-          headers: {
-            "content-type": "application/octet-stream"
-          }
-        });
-      }
+    const keyPackagePoolMatch = url.pathname.match(/^\/v1\/keypackage-pool\/([^/]+)$/);
+    if (keyPackagePoolMatch) {
+      const deviceId = decodeURIComponent(keyPackagePoolMatch[1]);
       if (request.method === "PUT") {
-        const authorization = await validateKeyPackageWriteAuthorization(
-          request,
-          deviceRuntimeSecrets(env),
-          userId,
-          deviceId,
-          keyPackageId,
-          now,
-          sharedStateSecret(env)
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "keypackage_write", now);
+        const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
+        return await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/keypackage-pool/replenish", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ...body, deviceId })
+          })
         );
-        if (authorization.service === "device_runtime") await assertRegisteredRuntimeToken(env, authorization);
-        await sharedState.putKeyPackageObject(userId, deviceId, keyPackageId, await request.arrayBuffer());
-        return new Response(null, { status: 204 });
+      }
+      if (request.method === "GET") {
+        await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "keypackage_write", now);
+        return await registryStub(env).fetch(
+          new Request("https://device-registry.internal/v2/device-registry/keypackage-pool/count", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ deviceId })
+          })
+        );
       }
     }
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {

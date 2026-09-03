@@ -407,8 +407,14 @@ impl CoreEngine {
             return self.stage_local_inbox_capability_renewal(now_ms, true);
         }
         {
+            // Best-effort top-up check for the one-time KeyPackage pool,
+            // right after the existing last-resort rotation check. This is
+            // background maintenance: failures here (see
+            // `handle_key_package_pool_count`/the ReplenishKeyPackagePool
+            // arms in transport.rs) are never surfaced to the user.
+            let pool_check = self.key_package_pool_count_check_effect()?;
             return Ok(CoreOutput {
-                effects: vec![timer],
+                effects: vec![pool_check, timer],
                 ..CoreOutput::default()
             });
         }
@@ -592,7 +598,30 @@ impl CoreEngine {
         })
     }
 
-    pub(super) fn rotate_local_key_package_after_welcome(&mut self) -> CoreResult<Vec<CoreEffect>> {
+    /// Rotates the last-resort KeyPackage after an inbound Welcome — but
+    /// only when that Welcome actually consumed the currently-advertised
+    /// last-resort KeyPackage. A Welcome built from a claimed one-time pool
+    /// entry must not trigger this: the pool entry was already atomically
+    /// removed server-side on claim, and the periodic maintenance timer
+    /// (not this reactive path) is what notices a shrinking pool and tops
+    /// it back up.
+    pub(super) fn rotate_local_key_package_after_welcome(
+        &mut self,
+        welcome_payload_b64: &str,
+    ) -> CoreResult<Vec<CoreEffect>> {
+        let Some(published) = self.state.published_key_package.clone() else {
+            return Ok(Vec::new());
+        };
+        let targets_last_resort = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .welcome_targets_key_package(welcome_payload_b64, &published.key_package_b64)
+            .unwrap_or(false);
+        if !targets_last_resort {
+            return Ok(Vec::new());
+        }
         let now_ms = current_unix_millis(self.state.message_nonce);
         let pending = self.state.pending_identity_publication.clone();
         let confirmed_bundle = self.state.local_bundle.clone();
@@ -909,6 +938,40 @@ impl CoreEngine {
             &local_identity.user_identity.user_id,
             &peer_user_id,
         );
+        // The actual MLS `create_conversation` call (and everything that
+        // depends on its artifacts: persistence, envelope generation, view
+        // model) is deferred to `finalize_direct_conversation_creation`,
+        // which runs once every target device's one-time KeyPackage has
+        // been claimed from its owner's runtime (falling back to the
+        // cached last-resort KeyPackage on `pool_empty`). Claims are
+        // strictly sequential, one device in flight at a time.
+        let remaining_devices: std::collections::VecDeque<(String, String)> = peer_device_ids
+            .iter()
+            .map(|device_id| (peer_user_id.clone(), device_id.clone()))
+            .collect();
+        self.start_key_package_claim_batch(
+            KeyPackageClaimBatchKind::Direct {
+                peer_user_id: peer_user_id.clone(),
+                conversation_id,
+                peer_device_ids,
+            },
+            remaining_devices,
+        )
+    }
+
+    pub(super) fn finalize_direct_conversation_creation(
+        &mut self,
+        peer_user_id: String,
+        conversation_id: String,
+        peer_device_ids: Vec<String>,
+        peer_keypackages: Vec<PeerDeviceKeyPackage>,
+    ) -> CoreResult<CoreOutput> {
+        let local_identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
+            .clone();
         let local_conversation = ConversationManager::create_direct_conversation_with_id(
             conversation_id.clone(),
             &local_identity.user_identity.user_id,
@@ -916,21 +979,6 @@ impl CoreEngine {
             &peer_user_id,
             &peer_device_ids,
         )?;
-        let peer_keypackages: Vec<PeerDeviceKeyPackage> = contact_bundle
-            .devices
-            .iter()
-            .filter_map(|device| {
-                let keypackage_ref = device.keypackage_ref.as_ref()?;
-                (matches!(device.status, crate::model::DeviceStatusKind::Active)
-                    && keypackage_ref.is_usable_at(now_ms))
-                .then(|| PeerDeviceKeyPackage {
-                    user_id: peer_user_id.clone(),
-                    device_id: device.device_id.clone(),
-                    device_public_key: device.device_public_key.clone(),
-                    key_package_b64: keypackage_ref.object_ref.clone(),
-                })
-            })
-            .collect();
         let artifacts = self
             .state
             .mls_adapter
@@ -1560,31 +1608,6 @@ impl CoreEngine {
             ));
         }
         Ok(devices)
-    }
-
-    pub(super) fn peer_key_packages(
-        &self,
-        peer_user_id: &str,
-        device_ids: &[String],
-    ) -> CoreResult<Vec<PeerDeviceKeyPackage>> {
-        let wanted: BTreeSet<String> = device_ids.iter().cloned().collect();
-        let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
-        let now_ms = current_unix_millis(self.state.message_nonce);
-        Ok(bundle
-            .devices
-            .iter()
-            .filter_map(|device| {
-                let keypackage_ref = device.keypackage_ref.as_ref()?;
-                (wanted.contains(&device.device_id) && keypackage_ref.is_usable_at(now_ms)).then(
-                    || PeerDeviceKeyPackage {
-                        user_id: peer_user_id.to_string(),
-                        device_id: device.device_id.clone(),
-                        device_public_key: device.device_public_key.clone(),
-                        key_package_b64: keypackage_ref.object_ref.clone(),
-                    },
-                )
-            })
-            .collect())
     }
 
     pub(super) fn peer_user_for_conversation(&self, conversation_id: &str) -> CoreResult<String> {

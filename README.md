@@ -122,6 +122,7 @@ npm run tauri:dev
 - The Cloudflare reference transport stores and routes encrypted envelopes and encrypted blobs; it should not be able to decrypt message contents.
 - TapChat still exposes some metadata through network timing, endpoint access, account-level infrastructure, and user-controlled deployment choices.
 - “Metadata-private” does not currently mean anonymous messaging or hiding a group's membership from its Group Outbox provider.
+- Each device keeps a pool of one-time MLS KeyPackages (target size 20, refilled once fewer than 5 remain) so that starting a new session consumes a KeyPackage that is never handed out twice, bounding what a leaked session-establishment key can expose to that single session. If more than 20 contacts start a session with a device in the same short window, before the pool is topped up, the overflow falls back to a single longer-lived last-resort KeyPackage (rotated roughly every 70 days) — this narrow, bounded case is an explicit assumption of the current design.
 - The project has not received a third-party security audit.
 - Do not use this alpha for high-risk or life-critical communication.
 
