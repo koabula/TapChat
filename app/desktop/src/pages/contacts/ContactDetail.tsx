@@ -234,6 +234,12 @@ export default function ContactDetail() {
                   Verify
                 </button>
               </div>
+              {contact?.key_changed_unverified && (
+                <p className="status-error text-sm mt-2">
+                  This contact's safety number changed since you last checked it. Verify again
+                  before trusting new messages.
+                </p>
+              )}
             </div>
 
             {relationshipInfo && (

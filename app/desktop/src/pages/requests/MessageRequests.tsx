@@ -135,6 +135,7 @@ export default function MessageRequests() {
               last_refresh: null,
               relationship_status: contact.relationship_status ?? "available",
               verified: Boolean(contact.verified),
+              key_changed_unverified: Boolean(contact.key_changed_unverified),
             })),
           );
           console.debug(`[MessageRequests] Refreshed contacts count=${contacts.length}`);

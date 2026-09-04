@@ -12,6 +12,7 @@ export interface ContactProjection {
   last_refresh: number | null;
   relationship_status: ContactRelationshipStatus;
   verified: boolean;
+  key_changed_unverified: boolean;
 }
 
 export function mapContacts(contacts: ContactSummaryInput[]): ContactProjection[] {
@@ -22,6 +23,7 @@ export function mapContacts(contacts: ContactSummaryInput[]): ContactProjection[
     last_refresh: null,
     relationship_status: contact.relationship_status ?? "available",
     verified: Boolean(contact.verified),
+    key_changed_unverified: Boolean(contact.key_changed_unverified),
   }));
 }
 

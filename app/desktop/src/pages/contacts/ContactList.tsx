@@ -51,6 +51,7 @@ export default function ContactList() {
           last_refresh: null,
           relationship_status: c.relationship_status ?? "available",
           verified: Boolean(c.verified),
+          key_changed_unverified: Boolean(c.key_changed_unverified),
         }));
         setContacts(mappedContacts);
       } catch (err) {
@@ -99,6 +100,7 @@ export default function ContactList() {
         last_refresh: null,
         relationship_status: c.relationship_status ?? "available",
         verified: Boolean(c.verified),
+        key_changed_unverified: Boolean(c.key_changed_unverified),
       }));
       setContacts(mappedContacts);
       navigate(`/chat/${result.conversation_id}`);

@@ -278,6 +278,7 @@ export interface ContactSummary {
   display_name?: string | null;
   relationship_status: ContactRelationshipStatus;
   verified?: boolean;
+  key_changed_unverified?: boolean;
 }
 
 export interface ContactLinkPreview {

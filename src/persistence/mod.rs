@@ -94,6 +94,12 @@ pub struct PersistedContact {
     pub verified_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_root_key: Option<String>,
+    /// Set whenever a re-imported identity bundle carries a different
+    /// user_public_key than the one this contact previously had, regardless
+    /// of prior verification status. Cleared only when the user explicitly
+    /// acts on the contact's verification state (see `set_verified`).
+    #[serde(default)]
+    pub key_changed_unverified: bool,
 }
 
 impl PersistedContact {
@@ -103,6 +109,7 @@ impl PersistedContact {
     }
 
     pub fn set_verified(&mut self, verified: bool, now: u64) {
+        self.key_changed_unverified = false;
         if verified {
             self.verified_at = Some(now);
             self.verified_root_key = Some(self.bundle.user_public_key.clone());
@@ -114,6 +121,16 @@ impl PersistedContact {
     pub fn align_verification(&mut self) {
         if !self.is_verified() {
             self.clear_verification();
+        }
+    }
+
+    /// Compares against the root key this contact had before an identity
+    /// bundle re-import, and latches `key_changed_unverified` if it differs.
+    /// The flag is sticky (never auto-clears) so a change is not missed if
+    /// several imports happen before the user opens the contact.
+    pub fn note_root_key_before_update(&mut self, previous_root_key: &str) {
+        if previous_root_key != self.bundle.user_public_key {
+            self.key_changed_unverified = true;
         }
     }
 
@@ -1045,6 +1062,7 @@ mod tests {
                 added_at: 0,
                 verified_at: None,
                 verified_root_key: None,
+                key_changed_unverified: false,
             }],
             conversations: vec![PersistedConversation {
                 conversation_id: conversation.conversation.conversation_id.clone(),
@@ -1318,6 +1336,7 @@ mod tests {
                 added_at: 0,
                 verified_at: None,
                 verified_root_key: None,
+                key_changed_unverified: false,
             }],
             conversations: vec![],
             sync_states: vec![],

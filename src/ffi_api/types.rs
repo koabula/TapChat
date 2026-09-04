@@ -1069,6 +1069,12 @@ pub struct ContactSummary {
     pub relationship_status: ContactRelationshipStatus,
     #[serde(default)]
     pub verified: bool,
+    /// True when this contact's root key changed since the last time the
+    /// user looked at its verification state — regardless of whether the
+    /// contact was ever verified. The UI should surface this unconditionally
+    /// (e.g. "safety number changed") rather than only for verified contacts.
+    #[serde(default)]
+    pub key_changed_unverified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

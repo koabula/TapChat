@@ -34,6 +34,7 @@ fn contact_summary(persisted: &PersistedContact) -> ContactSummary {
         device_count: persisted.bundle.devices.len(),
         relationship_status: persisted.relationship_status.clone(),
         verified: persisted.is_verified(),
+        key_changed_unverified: persisted.key_changed_unverified,
     }
 }
 

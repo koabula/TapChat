@@ -9,6 +9,7 @@ interface Contact {
   last_refresh: number | null;
   relationship_status: ContactRelationshipStatus;
   verified: boolean;
+  key_changed_unverified: boolean;
 }
 
 interface ContactsState {

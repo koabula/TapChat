@@ -464,6 +464,7 @@ export default function ChatView() {
         last_refresh: Date.now(),
         relationship_status: contact.relationship_status ?? "available",
         verified: Boolean(contact.verified),
+        key_changed_unverified: Boolean(contact.key_changed_unverified),
       })),
     );
   };
@@ -1170,10 +1171,17 @@ export default function ChatView() {
         !directClosed &&
         !conversationRecovering &&
         activeDirectContact &&
-        !activeDirectContact.verified && (
+        (activeDirectContact.key_changed_unverified || !activeDirectContact.verified) && (
           <div className="border-b border-subtle bg-surface px-4 py-2">
             <div className="mx-auto flex max-w-4xl items-center gap-3 text-sm">
-              <span className="text-yellow-500">Identity unverified</span>
+              {activeDirectContact.key_changed_unverified ? (
+                <span className="status-error">
+                  Safety number changed. Re-verify to confirm you're still talking to the same
+                  person.
+                </span>
+              ) : (
+                <span className="text-yellow-500">Identity unverified</span>
+              )}
               <button
                 className="btn btn-ghost text-xs ml-auto"
                 onClick={() => {

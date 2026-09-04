@@ -53,7 +53,7 @@ export default function VerifyIdentity() {
     setError(null);
     try {
       await setContactVerified(userId, verified);
-      updateContact(userId, { verified });
+      updateContact(userId, { verified, key_changed_unverified: false });
       const contacts = await listContacts();
       setContacts(
         contacts.map((item) => ({
@@ -63,6 +63,7 @@ export default function VerifyIdentity() {
           last_refresh: null,
           relationship_status: item.relationship_status ?? "available",
           verified: Boolean(item.verified),
+          key_changed_unverified: Boolean(item.key_changed_unverified),
         })),
       );
       const next = await getSafetyNumber(userId);

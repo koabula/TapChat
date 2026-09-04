@@ -66,6 +66,9 @@ impl CoreEngine {
         let existing_relationship_status = existing.map(|c| c.relationship_status.clone());
         let existing_verified_at = existing.and_then(|c| c.verified_at);
         let existing_verified_root_key = existing.and_then(|c| c.verified_root_key.clone());
+        let existing_root_key = existing.map(|c| c.bundle.user_public_key.clone());
+        let existing_key_changed_unverified =
+            existing.map(|c| c.key_changed_unverified).unwrap_or(false);
         let relationship_status = if Self::relationship_is_removed(&relationship_status) {
             ContactRelationshipStatus::default()
         } else {
@@ -89,7 +92,11 @@ impl CoreEngine {
             added_at: now,
             verified_at: existing_verified_at,
             verified_root_key: existing_verified_root_key,
+            key_changed_unverified: existing_key_changed_unverified,
         };
+        if let Some(previous_root_key) = existing_root_key.as_deref() {
+            persisted_contact.note_root_key_before_update(previous_root_key);
+        }
         persisted_contact.align_verification();
 
         self.state
@@ -135,6 +142,9 @@ impl CoreEngine {
             .unwrap_or_default();
         let verified_at = existing.and_then(|c| c.verified_at);
         let verified_root_key = existing.and_then(|c| c.verified_root_key.clone());
+        let existing_root_key = existing.map(|c| c.bundle.user_public_key.clone());
+        let existing_key_changed_unverified =
+            existing.map(|c| c.key_changed_unverified).unwrap_or(false);
 
         let mut persisted_contact = PersistedContact {
             user_id: user_id.clone(),
@@ -145,7 +155,11 @@ impl CoreEngine {
             added_at,
             verified_at,
             verified_root_key,
+            key_changed_unverified: existing_key_changed_unverified,
         };
+        if let Some(previous_root_key) = existing_root_key.as_deref() {
+            persisted_contact.note_root_key_before_update(previous_root_key);
+        }
         persisted_contact.align_verification();
 
         self.state
@@ -2238,6 +2252,7 @@ impl CoreEngine {
             device_count: contact.bundle.devices.len(),
             relationship_status: contact.relationship_status.clone(),
             verified: contact.is_verified(),
+            key_changed_unverified: contact.key_changed_unverified,
         }
     }
 

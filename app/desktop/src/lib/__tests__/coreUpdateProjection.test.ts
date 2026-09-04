@@ -26,6 +26,7 @@ describe("core update projections", () => {
         last_refresh: null,
         relationship_status: "available",
         verified: false,
+        key_changed_unverified: false,
       },
       {
         user_id: "user:bob",
@@ -34,6 +35,7 @@ describe("core update projections", () => {
         last_refresh: null,
         relationship_status: "blocked",
         verified: false,
+        key_changed_unverified: false,
       },
     ]);
   });
