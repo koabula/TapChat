@@ -7569,14 +7569,13 @@ mod tests {
                 bundle: bob_bundle.clone(),
             })
             .expect("same-key update");
-        assert!(
-            alice
-                .state
-                .contacts
-                .get(&bob_bundle.user_id)
-                .expect("bob contact")
-                .is_verified()
-        );
+        let same_key_contact = alice
+            .state
+            .contacts
+            .get(&bob_bundle.user_id)
+            .expect("bob contact");
+        assert!(same_key_contact.is_verified());
+        assert!(!same_key_contact.key_changed_unverified);
 
         let snapshot = alice.refresh_snapshot();
         let restored = CoreEngine::try_from_restored_state(snapshot).expect("restore");
@@ -7634,6 +7633,12 @@ mod tests {
                 bundle: bob_bundle.clone(),
             })
             .expect("update after key mismatch");
+        // This test mutates the remembered `verified_root_key`, not the
+        // contact's actual `bundle.user_public_key` — it simulates the
+        // user's confirmation going stale, not a real key change on the
+        // wire, so key_changed_unverified must NOT fire here. See
+        // `key_changed_unverified_is_set_for_a_real_key_change` below for
+        // the case where the underlying root key actually changes.
         assert!(
             !alice
                 .state
@@ -7641,6 +7646,130 @@ mod tests {
                 .get(&bob_bundle.user_id)
                 .expect("bob contact")
                 .is_verified()
+        );
+    }
+
+    #[test]
+    fn key_changed_unverified_is_set_for_a_real_key_change_regardless_of_prior_verification() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("import");
+        alice
+            .handle_command(CoreCommand::SetContactVerified {
+                user_id: bob_bundle.user_id.clone(),
+                verified: true,
+            })
+            .expect("verify");
+
+        // Simulate the contact's stored bundle having previously carried a
+        // different root key. The reimport below restores the real key, so
+        // is_verified() legitimately ends up true again (it always tracks
+        // "does verified_root_key match the current bundle key", which it
+        // now does) — that path is already covered by
+        // `contact_verification_clears_when_root_key_diverges`. What this
+        // test isolates is that note_root_key_before_update still latches
+        // key_changed_unverified purely from seeing the key change happen,
+        // regardless of whether verification status happens to end up true.
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .bundle
+            .user_public_key =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("update after real key change");
+        assert!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .key_changed_unverified
+        );
+    }
+
+    #[test]
+    fn key_changed_unverified_is_set_even_when_contact_was_never_verified() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("import");
+
+        let fresh_contact = alice
+            .state
+            .contacts
+            .get(&bob_bundle.user_id)
+            .expect("bob contact");
+        assert!(!fresh_contact.is_verified());
+        assert!(!fresh_contact.key_changed_unverified);
+
+        // Simulate the contact having previously been on a different root
+        // key, without ever having been marked verified — this is exactly
+        // the branch that used to produce zero signal.
+        alice
+            .state
+            .contacts
+            .get_mut(&bob_bundle.user_id)
+            .expect("bob contact")
+            .bundle
+            .user_public_key =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("update after key change");
+        let changed_contact = alice
+            .state
+            .contacts
+            .get(&bob_bundle.user_id)
+            .expect("bob contact");
+        assert!(!changed_contact.is_verified());
+        assert!(changed_contact.key_changed_unverified);
+
+        // The flag is sticky: a subsequent update that does not itself
+        // change the key must not clear it until the user acknowledges.
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("no-op update");
+        assert!(
+            alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .key_changed_unverified
+        );
+
+        alice
+            .handle_command(CoreCommand::SetContactVerified {
+                user_id: bob_bundle.user_id.clone(),
+                verified: true,
+            })
+            .expect("acknowledge via verify");
+        assert!(
+            !alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .key_changed_unverified
         );
     }
 

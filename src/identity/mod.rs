@@ -3,7 +3,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha512;
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::capability::CapabilityManager;
 use crate::error::{CoreError, CoreResult};
@@ -105,7 +105,7 @@ impl IdentityManager {
         let user_public_key = encode_hex(user_root_key.verifying_key().as_bytes());
         let user_id = format!(
             "user:{}",
-            short_fingerprint(user_root_key.verifying_key().as_bytes(), 16)
+            user_identity_fingerprint(user_root_key.verifying_key().as_bytes())
         );
         let user_identity = UserIdentity {
             version: CURRENT_MODEL_VERSION.to_string(),
@@ -214,7 +214,7 @@ impl IdentityManager {
         let verifying_key = parse_verifying_key(&bundle.user_public_key)?;
         let expected_user_id = format!(
             "user:{}",
-            short_fingerprint(verifying_key.as_bytes(), 16)
+            user_identity_fingerprint(verifying_key.as_bytes())
         );
         if bundle.user_id != expected_user_id {
             return Err(CoreError::invalid_input(
@@ -495,6 +495,16 @@ fn short_fingerprint(bytes: &[u8], len: usize) -> String {
     encode_hex(bytes)[..len].to_string()
 }
 
+/// Fingerprints a user root public key for use in `user_id`. Hashes first
+/// (rather than truncating the raw key) and keeps 128 bits so that forging a
+/// different keypair whose fingerprint collides with a specific existing
+/// user_id requires a ~2^128 preimage search, matching this project's
+/// nation-state-adversary threat model.
+fn user_identity_fingerprint(pubkey_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(pubkey_bytes);
+    encode_hex(&digest)[..32].to_string()
+}
+
 pub fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -714,6 +724,45 @@ mod tests {
         )
         .expect("bundle");
         IdentityManager::verify_identity_bundle(&bundle).expect("bundle should verify");
+    }
+
+    #[test]
+    fn identity_bundle_verification_rejects_user_id_not_matching_public_key_fingerprint() {
+        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock")
+            .as_millis() as u64;
+        let package = crate::mls_adapter::MlsAdapter::generate_key_package(&identity, now_ms)
+            .expect("key package");
+        let mut bundle = IdentityManager::export_identity_bundle(
+            &identity,
+            &sample_deployment(),
+            package.key_package_b64,
+            package.expires_at,
+        )
+        .expect("bundle");
+
+        // A forged user_id under the same (real, validly signed) public key.
+        // Every copy of user_id embedded in the bundle (binding, capability,
+        // keypackage ref) must be changed together, otherwise
+        // model::Validate's existing internal-consistency checks fire first
+        // instead of the fingerprint check this test targets.
+        let forged_user_id = "user:0000000000000000000000000000ff".to_string();
+        bundle.user_id = forged_user_id.clone();
+        bundle.devices[0].binding.user_id = forged_user_id.clone();
+        if let Some(capability) = bundle.devices[0].inbox_append_capability.as_mut() {
+            capability.user_id = forged_user_id.clone();
+        }
+        if let Some(keypackage_ref) = bundle.devices[0].keypackage_ref.as_mut() {
+            keypackage_ref.user_id = forged_user_id;
+        }
+
+        let error = IdentityManager::verify_identity_bundle(&bundle)
+            .expect_err("user_id not derived from the public key should be rejected");
+        assert_eq!(error.code(), "invalid_input");
+        assert!(error.to_string().contains("does not match fingerprint"));
     }
 
     #[test]
