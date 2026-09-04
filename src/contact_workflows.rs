@@ -50,6 +50,11 @@ pub async fn accept_message_request_with_bundle_import(
         )
     })?;
     let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
+    if bundle.user_id != request.sender_user_id {
+        return Err(anyhow!(
+            "fetched identity bundle user_id does not match the message request's sender_user_id"
+        ));
+    }
     import_identity_bundle_into_profile(profile, driver, bundle).await?;
     let output = driver
         .run_command_until_idle(CoreCommand::ActOnMessageRequest {

@@ -212,6 +212,15 @@ impl IdentityManager {
     pub fn verify_identity_bundle(bundle: &IdentityBundle) -> CoreResult<()> {
         bundle.validate()?;
         let verifying_key = parse_verifying_key(&bundle.user_public_key)?;
+        let expected_user_id = format!(
+            "user:{}",
+            short_fingerprint(verifying_key.as_bytes(), 16)
+        );
+        if bundle.user_id != expected_user_id {
+            return Err(CoreError::invalid_input(
+                "identity bundle user_id does not match fingerprint of user_public_key",
+            ));
+        }
         let signature = parse_signature(&bundle.signature)?;
         let verified = verifying_key
             .verify(identity_bundle_payload(bundle).as_bytes(), &signature)
