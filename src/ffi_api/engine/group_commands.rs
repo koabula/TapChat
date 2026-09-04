@@ -3326,9 +3326,10 @@ impl CoreEngine {
         if let Some(adapter) = self.state.mls_adapter.as_mut() {
             adapter.clear_pcs_update_sidecar(&conversation_id);
         }
+        let now_ms = current_unix_millis(self.state.message_nonce);
         if let Some(state) = self.state.group_states.get_mut(group_id) {
             if let Some(leaf_key) = leaf_key {
-                state.pcs.on_commit_merged(&leaf_key);
+                state.pcs.on_commit_merged(&leaf_key, now_ms);
             } else {
                 state.pcs.proposal_in_flight = false;
             }
@@ -3346,7 +3347,7 @@ impl CoreEngine {
             .as_ref()
             .and_then(|adapter| adapter.own_leaf_key_b64(conversation_id).ok())
         {
-            pcs.on_commit_merged(&leaf_key);
+            pcs.on_commit_merged(&leaf_key, current_unix_millis(self.state.message_nonce));
         }
         pcs
     }
@@ -3375,9 +3376,10 @@ impl CoreEngine {
                 .as_ref()
                 .and_then(|adapter| adapter.has_pcs_update_proposals(&conversation_id).ok())
                 .unwrap_or(false);
+            let now_ms = current_unix_millis(self.state.message_nonce);
             (
-                pcs.should_commit(is_privileged, has_pending_proposals),
-                pcs.should_propose(),
+                pcs.should_commit(is_privileged, has_pending_proposals, now_ms),
+                pcs.should_propose(now_ms),
             )
         };
         if should_commit {

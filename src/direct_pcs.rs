@@ -7,6 +7,10 @@ use crate::identity::LocalIdentityState;
 
 pub const DIRECT_PCS_COMMIT_INTERVAL: u32 = 32;
 pub const DIRECT_PCS_DEBT_HARD: u32 = 256;
+/// Time-based fallback for `should_initiate_commit`: a low-traffic
+/// conversation may never reach `DIRECT_PCS_COMMIT_INTERVAL` messages, which
+/// would otherwise let post-compromise healing stall indefinitely.
+pub const DIRECT_PCS_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 const SIGNING_DOMAIN: &str = "tapchat-direct-pcs-v1";
 
@@ -101,6 +105,8 @@ pub struct DirectPcsState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_certified_commit_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_certified_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_commit_hash: Option<String>,
@@ -133,10 +139,20 @@ impl DirectPcsState {
         }
     }
 
-    pub fn should_initiate_commit(&self, local_device_id: &str, committer_device_id: &str) -> bool {
+    pub fn should_initiate_commit(
+        &self,
+        local_device_id: &str,
+        committer_device_id: &str,
+        now_ms: u64,
+    ) -> bool {
         self.handshake.is_none()
-            && self.epoch_app_count >= DIRECT_PCS_COMMIT_INTERVAL
             && local_device_id == committer_device_id
+            && (self.epoch_app_count >= DIRECT_PCS_COMMIT_INTERVAL || self.commit_overdue(now_ms))
+    }
+
+    fn commit_overdue(&self, now_ms: u64) -> bool {
+        self.last_certified_at_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) >= DIRECT_PCS_MAX_AGE_MS)
     }
 
     pub fn abort_handshake(&mut self) {
@@ -154,9 +170,10 @@ impl DirectPcsState {
             || self.previous_certified_commit_hash.as_deref() == Some(commit_hash)
     }
 
-    pub fn mark_certified(&mut self, commit_hash: String) {
+    pub fn mark_certified(&mut self, commit_hash: String, now_ms: u64) {
         self.previous_certified_commit_hash = self.last_certified_commit_hash.clone();
         self.last_certified_commit_hash = Some(commit_hash);
+        self.last_certified_at_ms = Some(now_ms);
         self.epoch_app_count = 0;
         self.degraded = false;
         self.handshake = None;
@@ -339,5 +356,33 @@ mod tests {
         state.note_application_message();
         assert!(state.degraded);
         assert_eq!(state.epoch_app_count, DIRECT_PCS_DEBT_HARD);
+    }
+
+    #[test]
+    fn stale_epoch_triggers_commit_even_with_few_messages() {
+        let mut state = DirectPcsState {
+            last_certified_at_ms: Some(0),
+            ..Default::default()
+        };
+        state.epoch_app_count = 1;
+        let committer = "device:alice:phone";
+        assert!(!state.should_initiate_commit(committer, committer, DIRECT_PCS_MAX_AGE_MS - 1));
+        assert!(state.should_initiate_commit(committer, committer, DIRECT_PCS_MAX_AGE_MS));
+    }
+
+    #[test]
+    fn mark_certified_resets_the_staleness_clock() {
+        let mut state = DirectPcsState {
+            last_certified_at_ms: Some(0),
+            ..Default::default()
+        };
+        state.mark_certified("sha256:commit".into(), DIRECT_PCS_MAX_AGE_MS);
+        assert_eq!(state.last_certified_at_ms, Some(DIRECT_PCS_MAX_AGE_MS));
+        let committer = "device:alice:phone";
+        assert!(!state.should_initiate_commit(
+            committer,
+            committer,
+            DIRECT_PCS_MAX_AGE_MS + DIRECT_PCS_MAX_AGE_MS - 1
+        ));
     }
 }

@@ -560,6 +560,10 @@ impl MlsAdapter {
 
         let group_id = GroupId::from_slice(conversation_id.as_bytes());
         self.delete_stale_persisted_group(&group_id)?;
+        // max_past_epochs(1): tolerate one epoch of reordering/late delivery.
+        // Trade-off: the forward-secrecy boundary is epoch e-1, not e — a
+        // compromise while in epoch e can still decrypt epoch e-1 traffic,
+        // since that epoch's key material is deliberately kept around.
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)
@@ -637,6 +641,8 @@ impl MlsAdapter {
         }
         let group_id = GroupId::from_slice(conversation_id.as_bytes());
         self.delete_stale_persisted_group(&group_id)?;
+        // max_past_epochs(1): see the comment in create_conversation — same
+        // reorder-tolerance trade-off, same epoch e-1 forward-secrecy boundary.
         let config = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)
@@ -1703,6 +1709,8 @@ impl MlsAdapter {
         if self.groups.contains_key(conversation_id) {
             self.clear_conversation(conversation_id);
         }
+        // max_past_epochs(1): see the comment in create_conversation — same
+        // reorder-tolerance trade-off, same epoch e-1 forward-secrecy boundary.
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)

@@ -3307,6 +3307,7 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .direct_pcs_initial_hash(conversation_id)?;
+        let now_ms = current_unix_millis(self.state.message_nonce);
         let state = self
             .state
             .conversations
@@ -3314,6 +3315,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         state.pcs = crate::direct_pcs::DirectPcsState {
             last_certified_commit_hash: Some(initial_hash),
+            last_certified_at_ms: Some(now_ms),
             ..Default::default()
         };
         Ok(())
@@ -3358,6 +3360,7 @@ impl CoreEngine {
             })
             .unwrap_or(1);
         let committer = designated_committer(&member_device_ids, epoch)?;
+        let now_ms = current_unix_millis(self.state.message_nonce);
         let should_initiate = self
             .state
             .conversations
@@ -3365,7 +3368,7 @@ impl CoreEngine {
             .is_some_and(|state| {
                 state
                     .pcs
-                    .should_initiate_commit(&local_device_id, &committer)
+                    .should_initiate_commit(&local_device_id, &committer, now_ms)
             });
         if !should_initiate {
             return Ok(());
@@ -4145,8 +4148,9 @@ impl CoreEngine {
         self.state
             .mls_summaries
             .insert(conversation_id.to_string(), summary);
+        let now_ms = current_unix_millis(self.state.message_nonce);
         if let Some(state) = self.state.conversations.get_mut(conversation_id) {
-            state.pcs.mark_certified(handshake.commit_hash);
+            state.pcs.mark_certified(handshake.commit_hash, now_ms);
         }
         Ok(DirectPcsApplyOutcome::Applied(
             self.direct_pcs_persist_output(conversation_id)?,
