@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "TapChat"
-version = "0.1.18"
+version = "0.1.17"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -6134,7 +6134,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "tapchat-desktop"
-version = "0.1.18"
+version = "0.1.17"
 dependencies = [
  "TapChat",
  "anyhow",
