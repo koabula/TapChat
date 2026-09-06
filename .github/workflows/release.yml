@@ -13,13 +13,53 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   RUST_MIN_STACK: 67108864
 
 jobs:
+  # Pushing the release commit to main (which every release does before
+  # tagging) already triggers a full run of ci.yml for this exact commit.
+  # Re-running it here via `uses: ./.github/workflows/ci.yml` would execute
+  # the entire test suite (including cargo test) a second time in parallel.
+  # Instead, wait for that existing run and require it to have succeeded.
   quality:
-    uses: ./.github/workflows/ci.yml
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the CI workflow to pass on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for the CI workflow to complete for commit $SHA..."
+          attempt=0
+          max_attempts=120
+          while [ "$attempt" -lt "$max_attempts" ]; do
+            attempt=$((attempt + 1))
+            run_json=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=1" --jq '.workflow_runs[0] // empty')
+            if [ -n "$run_json" ]; then
+              status=$(echo "$run_json" | jq -r '.status')
+              if [ "$status" = "completed" ]; then
+                conclusion=$(echo "$run_json" | jq -r '.conclusion')
+                run_url=$(echo "$run_json" | jq -r '.html_url')
+                echo "CI workflow run finished: conclusion=$conclusion ($run_url)"
+                if [ "$conclusion" != "success" ]; then
+                  echo "::error::CI workflow did not succeed for commit $SHA (conclusion: $conclusion). See $run_url"
+                  exit 1
+                fi
+                exit 0
+              fi
+              echo "CI workflow run status: $status (attempt $attempt/$max_attempts)"
+            else
+              echo "No CI workflow run found yet for commit $SHA (attempt $attempt/$max_attempts)"
+            fi
+            sleep 15
+          done
+          echo "::error::Timed out waiting for the CI workflow to complete for commit $SHA"
+          exit 1
 
   validate:
     runs-on: ubuntu-latest
