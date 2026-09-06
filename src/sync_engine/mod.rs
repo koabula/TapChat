@@ -129,8 +129,8 @@ impl SyncEngine {
 mod tests {
     use super::{SyncEngine, SyncEngineModule};
     use crate::model::{
-        CURRENT_MODEL_VERSION, DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType,
-        SenderProof, WakeHint,
+        DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType, SenderProof, WakeHint,
+        CURRENT_MODEL_VERSION,
     };
 
     #[test]

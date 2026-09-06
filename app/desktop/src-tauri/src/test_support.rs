@@ -15,10 +15,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
-use tapchat_core::CoreEngine;
 use tapchat_core::cli::profile::Profile;
+use tapchat_core::CoreEngine;
 
 use crate::platform::profile::{ProfileManager, ProfileManagerInner};
 use crate::ports::DesktopPlatformPorts;
@@ -31,7 +31,7 @@ use crate::state::{
 // engine through the same retry / effects plumbing the production
 // `drive_core_with_handle` uses (minus the UI emit and the `AppHandle`
 // registration).
-pub use crate::lifecycle::{CoreInput, drive_core_without_handle};
+pub use crate::lifecycle::{drive_core_without_handle, CoreInput};
 
 // Re-export all group Tauri command `_impl` functions so integration
 // tests can call them as plain async functions.
@@ -154,7 +154,7 @@ pub async fn build_test_app_state_for_profile(profile_root: &Path) -> Result<App
 mod tests {
     use std::path::PathBuf;
     use tapchat_core::cli::profile::{
-        Profile, ProfileInitOptions, override_profile_registry_path_for_test,
+        override_profile_registry_path_for_test, Profile, ProfileInitOptions,
     };
     use uuid::Uuid;
 

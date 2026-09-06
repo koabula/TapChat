@@ -87,13 +87,11 @@ mod tests {
         let reverse = compute(KEY_B, KEY_A).expect("reverse");
         assert_eq!(forward, reverse);
         assert_eq!(forward.groups.len(), GROUP_COUNT);
-        assert!(
-            forward
-                .groups
-                .iter()
-                .all(|group| group.len() == DIGITS_PER_GROUP
-                    && group.chars().all(|ch| ch.is_ascii_digit()))
-        );
+        assert!(forward
+            .groups
+            .iter()
+            .all(|group| group.len() == DIGITS_PER_GROUP
+                && group.chars().all(|ch| ch.is_ascii_digit())));
         assert_eq!(forward.digits.len(), GROUP_COUNT * DIGITS_PER_GROUP);
         assert_eq!(
             forward.qr_payload,

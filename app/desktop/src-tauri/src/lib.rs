@@ -12,11 +12,11 @@ mod storage_layout;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "gui")]
-use tauri::Manager;
-#[cfg(feature = "gui")]
 use tauri::menu::{Menu, MenuItem};
 #[cfg(feature = "gui")]
 use tauri::tray::TrayIconBuilder;
+#[cfg(feature = "gui")]
+use tauri::Manager;
 
 pub use state::{AppState, SessionState};
 

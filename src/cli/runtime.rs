@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ use serde_json::json;
 
 use crate::identity::LocalIdentityState;
 use crate::model::{
-    CURRENT_MODEL_VERSION, DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth,
-    DeviceRuntimeRefreshChallenge, DeviceRuntimeRefreshProof, IdentityBundle, Validate,
+    DeploymentBundle, DeviceContactProfile, DeviceRuntimeAuth, DeviceRuntimeRefreshChallenge,
+    DeviceRuntimeRefreshProof, IdentityBundle, Validate, CURRENT_MODEL_VERSION,
 };
 
 #[derive(Debug)]
@@ -1297,7 +1297,11 @@ fn prompt_line(prompt: &str) -> Result<String> {
 }
 
 fn display_default(value: &str) -> &str {
-    if value.is_empty() { "<empty>" } else { value }
+    if value.is_empty() {
+        "<empty>"
+    } else {
+        value
+    }
 }
 
 pub fn generate_hex_secret() -> String {

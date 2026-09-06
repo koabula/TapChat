@@ -3,7 +3,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use tapchat_core::{CoreCommand, CoreOutput};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::{AppState, SessionState, StartupPhase};
 use crate::timetest;

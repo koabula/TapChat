@@ -14,25 +14,25 @@ use super::recovery::{
     is_degraded_restore_diagnostic, recovery_recoverable, suggested_recovery_action,
 };
 use super::sync::{
-    GROUP_OUTBOX_FETCH_LIMIT, WELCOME_PICKUP_RETRY_TIMER_PREFIX, pending_welcome_pickup_key,
-    retry_delay_ms,
+    pending_welcome_pickup_key, retry_delay_ms, GROUP_OUTBOX_FETCH_LIMIT,
+    WELCOME_PICKUP_RETRY_TIMER_PREFIX,
 };
 use crate::attachment_crypto::{
-    AttachmentKind, AttachmentManifestV2, AttachmentPayloadMetadata, AttachmentVariant,
-    CHUNKED_ATTACHMENT_CIPHER_ALGORITHM, EncryptedBlobDescriptor, decrypt_blob,
-    decrypt_chunked_blob, encrypt_blob, encrypt_chunked_blob,
+    decrypt_blob, decrypt_chunked_blob, encrypt_blob, encrypt_chunked_blob, AttachmentKind,
+    AttachmentManifestV2, AttachmentPayloadMetadata, AttachmentVariant, EncryptedBlobDescriptor,
+    CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
 };
 use crate::conversation::{
-    ConversationArchiveMetadata, ConversationManager, LocalConversationState,
-    ReconcileMembershipInput, RecoveryStatus, StoredMessage, direct_conversation_id,
+    direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
+    LocalConversationState, ReconcileMembershipInput, RecoveryStatus, StoredMessage,
 };
 use crate::direct_pcs::{
-    DirectCommitCertificate, DirectPcsHandshake, DirectPcsRole, commit_hash_from_b64,
-    designated_committer, sign_certificate,
+    commit_hash_from_b64, designated_committer, sign_certificate, DirectCommitCertificate,
+    DirectPcsHandshake, DirectPcsRole,
 };
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
-use crate::identity::{IdentityManager, parse_signature, parse_verifying_key};
+use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
     CreateConversationArtifacts, DecryptedApplicationMessage, DirectCommitClass, IngestResult,
@@ -81,7 +81,7 @@ use crate::transport_contract::{
     RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
     SubmitGroupJoinRequest, SubmitGroupLeaveRequest, TransportAuthRequirement,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::Verifier;
 use log;
 use serde::{Deserialize, Serialize};
@@ -3315,9 +3315,9 @@ mod protected_application_message_tests {
     use crate::conversation::{LocalConversationState, RecoveryStatus, StoredMessage};
     use crate::mls_adapter::DecryptedApplicationMessage;
     use crate::model::{
-        CURRENT_MODEL_VERSION, Conversation, ConversationKind, ConversationMember,
-        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, InboxRecord,
-        InboxRecordState, MessageType, ProtectedAppMessage, SenderProof,
+        Conversation, ConversationKind, ConversationMember, ConversationState, DeliveryClass,
+        DeviceStatusKind, Envelope, InboxRecord, InboxRecordState, MessageType,
+        ProtectedAppMessage, SenderProof, CURRENT_MODEL_VERSION,
     };
 
     fn sender_identity(user_id: &str, device_id: &str) -> String {
@@ -3584,13 +3584,13 @@ mod protected_application_message_tests {
 
 #[cfg(test)]
 mod group_membership_security_tests {
-    use super::{CoreEngine, advance_contiguous_ack};
+    use super::{advance_contiguous_ack, CoreEngine};
     use crate::ffi_api::CoreCommand;
     use crate::model::{
-        CURRENT_MODEL_VERSION, DeploymentBundle, GroupEnvelope, GroupEnvelopeVisibility,
-        GroupJoinPolicy, GroupManifest, GroupMember, GroupMemberDevice, GroupMemberInvitePolicy,
-        GroupMemberStatus, GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor,
-        GroupRole, RuntimeConfig, SenderProof, StorageBaseInfo, Validate, WelcomePickupDescriptor,
+        DeploymentBundle, GroupEnvelope, GroupEnvelopeVisibility, GroupJoinPolicy, GroupManifest,
+        GroupMember, GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus,
+        GroupMembershipProof, GroupMessageType, GroupOutboxDescriptor, GroupRole, RuntimeConfig,
+        SenderProof, StorageBaseInfo, Validate, WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
     use std::collections::BTreeSet;
 
@@ -3961,12 +3961,10 @@ mod group_membership_security_tests {
             .expect_err("invalid manifest signature must be rejected");
 
         assert!(!error.to_string().is_empty());
-        assert!(
-            !engine
-                .state
-                .group_states
-                .contains_key("group:welcome-invalid-signature")
-        );
+        assert!(!engine
+            .state
+            .group_states
+            .contains_key("group:welcome-invalid-signature"));
     }
 
     #[test]

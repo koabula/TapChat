@@ -777,10 +777,10 @@ pub struct PublishSharedStateRequest {
 mod tests {
     use super::*;
     use crate::model::{
-        CURRENT_MODEL_VERSION, CapabilityService, DeliveryClass, GroupCapability,
-        GroupCapabilityOperation, GroupEnvelope, GroupEnvelopeVisibility, GroupMembershipProof,
-        GroupMessageType, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, MessageType,
-        SenderProof, StorageRef, WelcomePickupDescriptor,
+        CapabilityService, DeliveryClass, GroupCapability, GroupCapabilityOperation, GroupEnvelope,
+        GroupEnvelopeVisibility, GroupMembershipProof, GroupMessageType, GroupOutboxRecord,
+        GroupOutboxRecordState, GroupRole, MessageType, SenderProof, StorageRef,
+        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
     };
 
     #[test]

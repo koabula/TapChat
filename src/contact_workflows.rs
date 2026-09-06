@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 
 use crate::cli::driver::CoreDriver;
 use crate::cli::profile::Profile;
 use crate::cli::util::to_snake_case_json_string;
-use crate::external_fetch::{ExternalResourceKind, fetch_external_json};
+use crate::external_fetch::{fetch_external_json, ExternalResourceKind};
 use crate::ffi_api::{CoreCommand, CoreOutput, MessageRequestActionSummary};
 use crate::identity::IdentityManager;
 use crate::model::{IdentityBundle, Validate};

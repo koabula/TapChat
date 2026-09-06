@@ -5,7 +5,7 @@ use tapchat_core::model::ConversationKind;
 use tapchat_core::persistence::{ContactRelationshipStatus, PersistedContact};
 use tapchat_core::{CoreCommand, CoreOutput};
 
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -5,9 +5,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tapchat_core::CoreEngine;
 
 use crate::commands::session::{
-    SessionStatus, read_session_status_snapshot, set_ws_connection_snapshot,
+    read_session_status_snapshot, set_ws_connection_snapshot, SessionStatus,
 };
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::state::{AppState, LockReason, SessionState};

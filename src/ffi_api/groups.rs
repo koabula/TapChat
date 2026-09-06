@@ -65,4 +65,3 @@ pub(super) fn group_message_type_to_direct(message_type: GroupMessageType) -> Me
         }
     }
 }
-

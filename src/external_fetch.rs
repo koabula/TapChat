@@ -283,7 +283,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    use crate::model::{CURRENT_MODEL_VERSION, GroupJoinPolicy};
+    use crate::model::{GroupJoinPolicy, CURRENT_MODEL_VERSION};
 
     fn serve_once(status: &str, content_type: &str, body: String, extra_headers: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");

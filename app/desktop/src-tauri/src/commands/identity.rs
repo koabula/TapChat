@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -11,7 +11,7 @@ use tapchat_core::model::DeviceStatusKind;
 use tapchat_core::{CoreCommand, CoreOperationStatus, CoreOutput, ErrorDomain, RecoveryAction};
 
 use crate::errors::{DesktopError, DesktopResult};
-use crate::lifecycle::{CoreInput, drive_core_with_handle, merge_core_outputs};
+use crate::lifecycle::{drive_core_with_handle, merge_core_outputs, CoreInput};
 use crate::platform::log_sanitize::redact_id;
 use crate::platform::profile::{ProfileProtectionMode, ProfileSummary};
 use crate::state::{

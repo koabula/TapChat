@@ -1344,7 +1344,7 @@ impl WelcomePickupDescriptor {
     /// `engine.rs::request_join_group`, which accepts either the raw
     /// descriptor JSON or the URL wrapper.
     pub fn to_welcome_pickup_url(&self) -> String {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         // `serde_json::to_vec` on a well-formed descriptor cannot fail
         // (all fields are owned primitive types), so `unwrap_or_default`
         // is safe and keeps the signature infallible.
@@ -1360,7 +1360,7 @@ impl WelcomePickupDescriptor {
     /// Returns a validation error when the URL/JSON cannot be decoded
     /// into a well-formed [`WelcomePickupDescriptor`].
     pub fn from_welcome_pickup_url(url: &str) -> CoreResult<Self> {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let trimmed = url.trim();
         let json_bytes: Vec<u8> =
             if let Some(payload) = trimmed.strip_prefix("tapchat://welcome-pickup/") {
@@ -2350,15 +2350,13 @@ mod tests {
     #[test]
     fn welcome_pickup_url_rejects_malformed_input() {
         // Malformed base64 payload.
-        assert!(
-            WelcomePickupDescriptor::from_welcome_pickup_url(
-                "tapchat://welcome-pickup/!!!not-base64!!!"
-            )
-            .is_err()
-        );
+        assert!(WelcomePickupDescriptor::from_welcome_pickup_url(
+            "tapchat://welcome-pickup/!!!not-base64!!!"
+        )
+        .is_err());
 
         // Valid base64 but the payload is not a descriptor JSON.
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let junk_b64 = STANDARD.encode(b"not descriptor json");
         let url = format!("tapchat://welcome-pickup/{junk_b64}");
         assert!(WelcomePickupDescriptor::from_welcome_pickup_url(&url).is_err());

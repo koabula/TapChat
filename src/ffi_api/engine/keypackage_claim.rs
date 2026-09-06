@@ -142,11 +142,16 @@ impl CoreEngine {
         ))
     }
 
-    fn peer_key_package_claim_url(&self, peer_user_id: &str, device_id: &str) -> CoreResult<String> {
+    fn peer_key_package_claim_url(
+        &self,
+        peer_user_id: &str,
+        device_id: &str,
+    ) -> CoreResult<String> {
         let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
-        let reference = bundle.identity_bundle_ref.as_deref().ok_or_else(|| {
-            CoreError::invalid_input("peer identity bundle reference is missing")
-        })?;
+        let reference = bundle
+            .identity_bundle_ref
+            .as_deref()
+            .ok_or_else(|| CoreError::invalid_input("peer identity bundle reference is missing"))?;
         let origin = origin_from_url(reference)?;
         Ok(format!(
             "{origin}/v1/keypackage-pool/{}/claim",
@@ -176,9 +181,11 @@ impl CoreEngine {
             // response is handled defensively.
             return Ok(CoreOutput::default());
         }
-        let response: ClaimKeyPackagePoolResponse = serde_json::from_str(body.as_deref().unwrap_or(""))
-            .map_err(|error| {
-                CoreError::invalid_input(format!("failed to decode key package claim response: {error}"))
+        let response: ClaimKeyPackagePoolResponse =
+            serde_json::from_str(body.as_deref().unwrap_or("")).map_err(|error| {
+                CoreError::invalid_input(format!(
+                    "failed to decode key package claim response: {error}"
+                ))
             })?;
         let device_public_key = self
             .cached_device_public_key(&user_id, &device_id)
@@ -219,7 +226,10 @@ impl CoreEngine {
                     .keypackage_ref
                     .as_ref()
                     .filter(|keypackage_ref| keypackage_ref.is_usable_at(now_ms))?;
-                Some((device.device_public_key.clone(), keypackage_ref.object_ref.clone()))
+                Some((
+                    device.device_public_key.clone(),
+                    keypackage_ref.object_ref.clone(),
+                ))
             });
         let Some((device_public_key, key_package_b64)) = fallback else {
             return self.abort_key_package_claim_batch(
@@ -337,7 +347,10 @@ impl CoreEngine {
                     engine.finalize_invite_to_group(group_id, invitee_user_ids, resolved)
                 })
             }
-            KeyPackageClaimBatchKind::AddGroupMemberDevice { group_id, device_id } => {
+            KeyPackageClaimBatchKind::AddGroupMemberDevice {
+                group_id,
+                device_id,
+            } => {
                 self.ensure_group_state_operation_ready(&group_id)?;
                 let resolved = pending.resolved_key_packages;
                 self.run_staged_group_mutation(None, move |engine| {
@@ -441,7 +454,10 @@ impl CoreEngine {
     /// uploads them to top the pool back up to the target size. Best-effort
     /// background maintenance — failures here are never surfaced to the
     /// user (unlike an aborted, user-initiated conversation creation).
-    pub(super) fn handle_key_package_pool_count(&mut self, body: Option<String>) -> CoreResult<CoreOutput> {
+    pub(super) fn handle_key_package_pool_count(
+        &mut self,
+        body: Option<String>,
+    ) -> CoreResult<CoreOutput> {
         let response: KeyPackagePoolCountResponse =
             serde_json::from_str(body.as_deref().unwrap_or("{\"count\":0}")).map_err(|error| {
                 CoreError::invalid_input(format!(
@@ -451,7 +467,8 @@ impl CoreEngine {
         if response.count >= crate::mls_adapter::ONE_TIME_KEY_PACKAGE_POOL_LOW_WATER {
             return Ok(CoreOutput::default());
         }
-        let deficit = crate::mls_adapter::ONE_TIME_KEY_PACKAGE_POOL_TARGET.saturating_sub(response.count);
+        let deficit =
+            crate::mls_adapter::ONE_TIME_KEY_PACKAGE_POOL_TARGET.saturating_sub(response.count);
         if deficit == 0 {
             return Ok(CoreOutput::default());
         }

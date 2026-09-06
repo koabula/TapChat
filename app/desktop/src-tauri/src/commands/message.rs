@@ -9,7 +9,7 @@ use tauri_plugin_dialog::DialogExt;
 use tokio::io::AsyncWriteExt;
 
 use tapchat_core::attachment_crypto::{
-    AttachmentPayloadMetadata, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM, EncryptedBlobDescriptor,
+    AttachmentPayloadMetadata, EncryptedBlobDescriptor, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
 };
 use tapchat_core::ffi_api::{AttachmentDescriptor, AttachmentVariantSource, SystemStatus};
 use tapchat_core::{CoreCommand, CoreOutput};
@@ -29,7 +29,7 @@ use super::conversation::MessageDeliveryState;
 #[cfg(any(test, feature = "test-support"))]
 use crate::lifecycle::drive_core_without_handle;
 use crate::lifecycle::{
-    CoreInput, drive_core_persist_then_defer_transport, drive_core_with_handle,
+    drive_core_persist_then_defer_transport, drive_core_with_handle, CoreInput,
 };
 use crate::ports::media_cache::EncryptedCacheDestination;
 use crate::state::AppState;
@@ -2507,7 +2507,7 @@ fn unique_download_destination(
 mod tests {
     use super::*;
     use tapchat_core::cli::profile::{
-        Profile, ProfileInitOptions, override_profile_registry_path_for_test,
+        override_profile_registry_path_for_test, Profile, ProfileInitOptions,
     };
 
     #[test]
@@ -2565,11 +2565,9 @@ mod tests {
         write_atomic_sync(&cache_path, &encrypted_cache).expect("write encrypted cache");
 
         let bytes = std::fs::read(&cache_path).expect("read cache");
-        assert!(
-            !bytes
-                .windows(plaintext.len())
-                .any(|window| window == plaintext)
-        );
+        assert!(!bytes
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
         let round_trip = profile
             .decrypt_profile_document(&attachment_cache_document_kind(cache_id), &bytes)
             .expect("decrypt cache");

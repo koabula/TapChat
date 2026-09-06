@@ -1712,8 +1712,7 @@ impl CoreEngine {
                             Self::parse_mls_sender_identity(&application.sender_identity)
                                 .is_some_and(|mls_sender| {
                                     mls_sender.user_id == record.envelope.sender_user_id
-                                        && mls_sender.device_id
-                                            == record.envelope.sender_device_id
+                                        && mls_sender.device_id == record.envelope.sender_device_id
                                 });
                         if !sender_identity_valid {
                             log::warn!(

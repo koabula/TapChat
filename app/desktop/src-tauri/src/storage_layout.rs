@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use tapchat_core::cli::profile::ProfileStoragePaths;
 use tauri::{AppHandle, Manager};
 

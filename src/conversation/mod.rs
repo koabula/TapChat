@@ -396,13 +396,11 @@ mod tests {
 
         assert_eq!(reconcile.revoked_devices, vec!["device:bob:laptop"]);
         assert!(reconcile.should_mark_recovery);
-        assert!(
-            reconcile
-                .member_devices
-                .iter()
-                .any(|member| member.device_id == "device:bob:laptop"
-                    && member.status == crate::model::DeviceStatusKind::Revoked)
-        );
+        assert!(reconcile
+            .member_devices
+            .iter()
+            .any(|member| member.device_id == "device:bob:laptop"
+                && member.status == crate::model::DeviceStatusKind::Revoked));
     }
 
     #[test]

@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tapchat_core::ffi_api::AttachmentDescriptor;
 use tapchat_core::{CoreEffect, CoreEngine};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 
 use crate::platform::profile::ProfileManager;
 use crate::ports::DesktopPlatformPorts;

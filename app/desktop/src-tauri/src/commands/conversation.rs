@@ -12,7 +12,7 @@ use tapchat_core::{CoreCommand, ErrorDomain};
 use super::conversation_view::{generate_last_message_preview, summarize_plaintext};
 use crate::commands::read_state;
 use crate::errors::{DesktopError, DesktopResult};
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::state::{AppState, SessionState};
 
 /// Simplified result for create_conversation command

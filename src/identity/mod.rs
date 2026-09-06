@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::capability::CapabilityManager;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
-    CURRENT_MODEL_VERSION, DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus,
-    DeviceStatusKind, IdentityBundle, StorageProfile, UserIdentity, Validate,
+    DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind,
+    IdentityBundle, StorageProfile, UserIdentity, Validate, CURRENT_MODEL_VERSION,
 };
 
 type HmacSha512 = Hmac<Sha512>;
@@ -555,11 +555,11 @@ pub fn verify_device_payload_signature(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MNEMONIC_WORDS, IdentityManager, IdentityModule};
+    use super::{IdentityManager, IdentityModule, DEFAULT_MNEMONIC_WORDS};
     use crate::model::{
-        CURRENT_MODEL_VERSION, CapabilityConstraints, CapabilityOperation, CapabilityService,
-        DeploymentBundle, DeviceContactProfile, DeviceStatusKind, IdentityBundle,
-        InboxAppendCapability, KeyPackageRef, StorageBaseInfo,
+        CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
+        DeviceContactProfile, DeviceStatusKind, IdentityBundle, InboxAppendCapability,
+        KeyPackageRef, StorageBaseInfo, CURRENT_MODEL_VERSION,
     };
     use bip39::Language;
 

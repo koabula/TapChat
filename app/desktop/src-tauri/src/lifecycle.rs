@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -13,7 +13,7 @@ use tapchat_core::platform_ports::execute_platform_effect;
 use tapchat_core::{CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput};
 
 use crate::commands::session::{
-    SessionStatus, read_session_status_snapshot, set_ws_connection_snapshot,
+    read_session_status_snapshot, set_ws_connection_snapshot, SessionStatus,
 };
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;
 use crate::state::{AppState, DeferredTransportBatch, LockReason, SessionState, StartupPhase};
@@ -829,13 +829,13 @@ fn split_persistence_prefix(effects: Vec<CoreEffect>) -> (Vec<CoreEffect>, Vec<C
 #[cfg(test)]
 mod deferred_send_tests {
     use super::{
-        DriverWork, complete_persistence, pending_persistence_count, split_persistence_prefix,
+        complete_persistence, pending_persistence_count, split_persistence_prefix, DriverWork,
     };
     use std::sync::Arc;
     use std::time::Duration;
-    use tapchat_core::CoreEffect;
     use tapchat_core::ffi_api::{PersistStateEffect, TimerEffect};
-    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+    use tapchat_core::CoreEffect;
+    use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
     #[test]
     fn persistence_prefix_is_removed_without_reordering_transport() {

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rand::{RngCore, rngs::OsRng};
+use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -22,10 +22,10 @@ use tapchat_core::{CoreCommand, CoreEvent};
 use crate::commands::cloudflare_rest::{
     self, DeployPhase, DeployProgress, DeployResult, WorkerDeployConfig,
 };
-use crate::commands::session::{SessionStatus, set_ws_connection_snapshot};
-use crate::lifecycle::{CoreInput, drive_core_with_handle, drive_prepared_core_output};
+use crate::commands::session::{set_ws_connection_snapshot, SessionStatus};
+use crate::lifecycle::{drive_core_with_handle, drive_prepared_core_output, CoreInput};
 use crate::platform::log_sanitize::sanitize_url_for_log;
-use crate::runtime_auth::{RuntimeAuthSnapshot, RuntimeAuthState, wait_for_runtime_bundle};
+use crate::runtime_auth::{wait_for_runtime_bundle, RuntimeAuthSnapshot, RuntimeAuthState};
 use crate::state::AppState;
 use crate::state::SessionState;
 use crate::timetest;
@@ -289,7 +289,11 @@ fn apply_offline_expired(status: &mut CloudflareRuntimeStatus) {
     );
 }
 
-fn apply_enrollment_required(status: &mut CloudflareRuntimeStatus, error_code: &str, details: &str) {
+fn apply_enrollment_required(
+    status: &mut CloudflareRuntimeStatus,
+    error_code: &str,
+    details: &str,
+) {
     status.state = "enrollment_required".into();
     status.action = Some("refresh_auth".into());
     status.error_code = Some(error_code.into());
@@ -353,8 +357,7 @@ fn overlay_runtime_auth(
             status.action = None;
             status.error_code = auth.error_code.clone();
             status.details = Some(
-                "This device has been revoked. Restore the identity or create a new device."
-                    .into(),
+                "This device has been revoked. Restore the identity or create a new device.".into(),
             );
             return;
         }
@@ -556,11 +559,9 @@ mod tests {
             None,
         );
         assert!(legacy.needs_upgrade);
-        assert!(
-            runtime_missing_group_outbox_message(&legacy)
-                .expect("upgrade message")
-                .contains("runtime_missing_group_outbox")
-        );
+        assert!(runtime_missing_group_outbox_message(&legacy)
+            .expect("upgrade message")
+            .contains("runtime_missing_group_outbox"));
 
         let current = status_from_features(
             true,
@@ -1839,9 +1840,7 @@ pub async fn cloudflare_status(
     Ok(cloudflare_status_impl(&state).await?)
 }
 
-async fn cloudflare_status_impl(
-    state: &AppState,
-) -> Result<CloudflareRuntimeStatus, String> {
+async fn cloudflare_status_impl(state: &AppState) -> Result<CloudflareRuntimeStatus, String> {
     let (runtime, snapshot_deployment, bundle_file, metadata_bundle_path, credential) = {
         let inner = state.inner.read().await;
         let pm_inner = inner.profile_manager.inner.read().await;

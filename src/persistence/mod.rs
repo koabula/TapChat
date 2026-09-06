@@ -1015,8 +1015,8 @@ mod tests {
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        CURRENT_MODEL_VERSION, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
-        MessageType, SenderProof, WakeHint,
+        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
+        WakeHint, CURRENT_MODEL_VERSION,
     };
     use base64::Engine as _;
 
@@ -1422,13 +1422,11 @@ mod tests {
 
         let snapshot = decode_snapshot(bytes.as_bytes()).expect("decode v1 snapshot");
         assert_eq!(snapshot.message_nonce, 7);
-        assert!(
-            snapshot
-                .deployment
-                .as_ref()
-                .and_then(|deployment| deployment.pending_identity_publication.as_ref())
-                .is_none()
-        );
+        assert!(snapshot
+            .deployment
+            .as_ref()
+            .and_then(|deployment| deployment.pending_identity_publication.as_ref())
+            .is_none());
         assert!(snapshot.pending_group_outbox.is_empty());
     }
 

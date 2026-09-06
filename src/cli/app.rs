@@ -1,7 +1,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use reqwest::Client;
 use serde::Serialize;

@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
@@ -45,7 +45,7 @@ use crate::commands::cloudflare::{
     runtime_missing_group_outbox_message, runtime_status_for_deployment,
 };
 use crate::commands::read_state;
-use crate::lifecycle::{CoreInput, drive_core_with_handle};
+use crate::lifecycle::{drive_core_with_handle, CoreInput};
 use crate::platform::log_sanitize::{redact_id, sanitize_url_for_log};
 use crate::state::AppState;
 

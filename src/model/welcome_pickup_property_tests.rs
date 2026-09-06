@@ -52,7 +52,11 @@ fn arb_ascii_printable_id() -> impl Strategy<Value = String> {
         "must contain at least one non-space char",
         |bytes| {
             let s = String::from_utf8(bytes).ok()?;
-            if s.trim().is_empty() { None } else { Some(s) }
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         },
     )
 }
@@ -95,7 +99,7 @@ fn arb_https_endpoint() -> impl Strategy<Value = String> {
 /// bytes, so we generate 0..=128 random bytes and base64-encode them.
 fn arb_capability() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<u8>(), 0..=128).prop_map(|bytes| {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let encoded = STANDARD.encode(&bytes);
         // `Validate` rejects empty capability strings; zero-byte input
         // base64-encodes to the empty string, which would fail

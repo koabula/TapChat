@@ -73,7 +73,8 @@ pub fn evaluate_passphrase_strength(
             level: PassphraseStrengthLevel::Weak,
             score: 1,
             label: "Weak",
-            message: "Short or predictable passphrases protect less well than longer unique phrases.",
+            message:
+                "Short or predictable passphrases protect less well than longer unique phrases.",
             requires_confirmation: true,
         };
     }
@@ -148,7 +149,7 @@ fn reverse(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PassphraseStrengthLevel, evaluate_passphrase_strength};
+    use super::{evaluate_passphrase_strength, PassphraseStrengthLevel};
 
     #[derive(serde::Deserialize)]
     struct StrengthCase {

@@ -7,7 +7,7 @@ use tapchat_core::{CoreCommand, CoreOutput, CoreStateUpdate};
 use tauri::{AppHandle, State};
 
 use crate::lifecycle::{
-    CoreInput, drive_core_then_defer_event_effects, drive_core_with_handle, emit_core_update,
+    drive_core_then_defer_event_effects, drive_core_with_handle, emit_core_update, CoreInput,
 };
 use crate::platform::log_sanitize::redact_id;
 use crate::runtime_auth::ensure_fresh_device_runtime_auth_for_state;

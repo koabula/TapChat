@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -1922,9 +1922,10 @@ impl MlsAdapter {
         let welcome_bytes = BASE64
             .decode(welcome_payload_b64)
             .map_err(|_| CoreError::invalid_input("invalid base64 welcome payload"))?;
-        let welcome_message = MlsMessageIn::tls_deserialize_exact(welcome_bytes).map_err(|error| {
-            CoreError::invalid_input(format!("failed to decode welcome message: {error}"))
-        })?;
+        let welcome_message =
+            MlsMessageIn::tls_deserialize_exact(welcome_bytes).map_err(|error| {
+                CoreError::invalid_input(format!("failed to decode welcome message: {error}"))
+            })?;
         let welcome = match welcome_message.extract() {
             MlsMessageBodyIn::Welcome(welcome) => welcome,
             _ => {
@@ -1934,9 +1935,11 @@ impl MlsAdapter {
             }
         };
         let candidate = decode_key_package(key_package_b64)?;
-        let candidate_ref = candidate.hash_ref(self.provider.crypto()).map_err(|error| {
-            CoreError::invalid_state(format!("failed to hash key package: {error}"))
-        })?;
+        let candidate_ref = candidate
+            .hash_ref(self.provider.crypto())
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to hash key package: {error}"))
+            })?;
         Ok(welcome
             .secrets()
             .iter()
@@ -2117,10 +2120,10 @@ pub fn validate_published_key_package_lifetime(
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectCommitClass, IngestResult, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
-        KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, MlsAdapter, MlsAdapterModule,
-        ONE_TIME_KEY_PACKAGE_POOL_TARGET, PeerDeviceKeyPackage, PublishedKeyPackage,
-        key_package_rotation_jitter_ms, validate_published_key_package_lifetime,
+        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
+        IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
+        KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
+        KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
     };
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
@@ -2182,8 +2185,10 @@ mod tests {
             .generate_one_time_key_packages(ONE_TIME_KEY_PACKAGE_POOL_TARGET, test_now_ms())
             .expect("batch");
         assert_eq!(batch.len(), ONE_TIME_KEY_PACKAGE_POOL_TARGET as usize);
-        let unique: std::collections::BTreeSet<_> =
-            batch.iter().map(|package| package.key_package_b64.clone()).collect();
+        let unique: std::collections::BTreeSet<_> = batch
+            .iter()
+            .map(|package| package.key_package_b64.clone())
+            .collect();
         assert_eq!(
             unique.len(),
             batch.len(),
@@ -2634,16 +2639,12 @@ mod tests {
             IngestResult::AppliedProposal => {}
             other => panic!("expected AppliedProposal, got {other:?}"),
         }
-        assert!(
-            !alice
-                .has_pending_proposals("conv:alice:bob")
-                .expect("live store")
-        );
-        assert!(
-            alice
-                .has_pcs_update_proposals("conv:alice:bob")
-                .expect("sidecar")
-        );
+        assert!(!alice
+            .has_pending_proposals("conv:alice:bob")
+            .expect("live store"));
+        assert!(alice
+            .has_pcs_update_proposals("conv:alice:bob")
+            .expect("sidecar"));
         alice
             .encrypt_application("conv:alice:bob", b"while waiting")
             .expect("sender can still encrypt with pending PCS proposal");
@@ -2713,11 +2714,9 @@ mod tests {
             IngestResult::AppliedProposal => {}
             other => panic!("expected AppliedProposal, got {other:?}"),
         }
-        assert!(
-            !alice
-                .has_pcs_update_proposals("conv:alice:bob")
-                .expect("sidecar")
-        );
+        assert!(!alice
+            .has_pcs_update_proposals("conv:alice:bob")
+            .expect("sidecar"));
         let commit = alice
             .stage_group_pcs_commit("conv:alice:bob")
             .expect("pcs commit");
@@ -2777,18 +2776,14 @@ mod tests {
             IngestResult::AppliedProposal => {}
             other => panic!("expected AppliedProposal, got {other:?}"),
         }
-        assert!(
-            alice
-                .has_pcs_update_proposals("conv:alice:bob")
-                .expect("sidecar")
-        );
+        assert!(alice
+            .has_pcs_update_proposals("conv:alice:bob")
+            .expect("sidecar"));
         let stale_full = alice.export_bootstrap_state().expect("stale full dump");
         alice.clear_pcs_update_sidecar("conv:alice:bob");
-        assert!(
-            !alice
-                .has_pcs_update_proposals("conv:alice:bob")
-                .expect("cleared")
-        );
+        assert!(!alice
+            .has_pcs_update_proposals("conv:alice:bob")
+            .expect("cleared"));
         let fresh_b = alice
             .export_persisted_group_state("conv:alice:bob")
             .expect("fresh b");
