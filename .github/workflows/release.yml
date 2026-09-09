@@ -10,6 +10,11 @@ on:
         description: 'Release version, for example 0.1.8'
         required: true
         type: string
+      dry_run:
+        description: 'Build, bundle and sign every platform but publish nothing'
+        required: false
+        default: false
+        type: boolean
 
 # Building never needs write access. Only the single `release` job that talks to
 # the Releases API elevates to `contents: write`.
@@ -417,6 +422,10 @@ jobs:
   # so this can be re-run on its own if publishing fails.
   release:
     needs: [validate, build]
+    # A dry run exercises the whole build/bundle/sign path and stops here, so
+    # the macOS bundler and the asset staging can be smoke-tested without
+    # touching a release.
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -452,8 +461,15 @@ jobs:
       - name: Create draft release
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release $RELEASE_TAG already exists; reusing it."
+          if is_draft=$(gh release view "$RELEASE_TAG" --repo "$REPO" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            # Re-pointing a release tag re-triggers this workflow. Without this
+            # guard the upload step below would clobber the assets of an
+            # already-published release with freshly rebuilt, re-signed ones.
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $RELEASE_TAG is already published. Refusing to overwrite its assets. Bump the version, or delete the release first if you really mean to replace it."
+              exit 1
+            fi
+            echo "Reusing existing draft release $RELEASE_TAG."
           else
             gh release create "$RELEASE_TAG" \
               --repo "$REPO" \
