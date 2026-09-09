@@ -288,8 +288,20 @@ jobs:
         with:
           projectPath: app/desktop
           args: ${{ matrix.build_args }}
+          # One extra attempt. By the time bundling fails the Rust binary is
+          # already in CARGO_TARGET_DIR, so a retry re-runs only the bundler
+          # instead of recompiling the workspace.
+          retryAttempts: 1
         env:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # tauri-action defaults this to "true", which suppresses the bundler's
+          # own CI guard and makes bundle_dmg.sh drive Finder over AppleScript to
+          # lay out the DMG window. That is the least reliable step in the macOS
+          # build (it failed on macos-arm in run 34311349303 while macos-intel
+          # passed). Anything other than "true" restores `--skip-jenkins`, and
+          # this project sets no dmg background or icon positions, so the
+          # styling pass has nothing to apply anyway.
+          TAURI_BUNDLER_DMG_IGNORE_CI: 'false'
 
       - name: Verify bundled runtime resources
         shell: pwsh
