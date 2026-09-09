@@ -11,9 +11,14 @@ on:
         required: true
         type: string
 
+# Building never needs write access. Only the single `release` job that talks to
+# the Releases API elevates to `contents: write`.
 permissions:
-  contents: write
-  actions: read
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   RUST_MIN_STACK: 67108864
@@ -26,6 +31,9 @@ jobs:
   # Instead, wait for that existing run and require it to have succeeded.
   quality:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Wait for the CI workflow to pass on this commit
         env:
@@ -58,7 +66,7 @@ jobs:
             fi
             sleep 15
           done
-          echo "::error::Timed out waiting for the CI workflow to complete for commit $SHA"
+          echo "::error::Timed out waiting for the CI workflow to complete for commit $SHA. ci.yml only runs on pull requests and on pushes to main, so release commits must be pushed to main (and go green) before the release tag is pushed."
           exit 1
 
   validate:
@@ -150,6 +158,9 @@ jobs:
             exit 1
           fi
 
+  # Builds only. These jobs never touch the Releases API: they bundle, sign and
+  # hand the assets to `actions/upload-artifact`, so a publishing failure never
+  # costs another ~45 minutes of cross-platform compilation.
   build:
     needs: [quality, validate]
     strategy:
@@ -160,18 +171,22 @@ jobs:
             runner: ubuntu-latest
             target: ''
             build_args: ''
+            updater_arch: ''
           - platform: windows
             runner: windows-latest
             target: ''
             build_args: ''
+            updater_arch: ''
           - platform: macos-intel
             runner: macos-latest
             target: x86_64-apple-darwin
             build_args: '--target x86_64-apple-darwin'
+            updater_arch: x64
           - platform: macos-arm
             runner: macos-latest
             target: aarch64-apple-darwin
             build_args: '--target aarch64-apple-darwin'
+            updater_arch: aarch64
 
     runs-on: ${{ matrix.runner }}
 
@@ -268,17 +283,12 @@ jobs:
 
           "path=$keyPath" >> $env:GITHUB_OUTPUT
 
+      # No tagName/releaseId inputs: the action only builds, bundles and signs.
       - uses: tauri-apps/tauri-action@fce9c6108b31ea247710505d3aaaa893ee6768d4 # v0
         with:
           projectPath: app/desktop
-          tagName: ${{ needs.validate.outputs.release_tag }}
-          releaseName: 'TapChat ${{ needs.validate.outputs.release_tag }}'
-          releaseBody: 'See assets below for platform-specific installers.'
-          releaseDraft: true
-          prerelease: false
           args: ${{ matrix.build_args }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Verify bundled runtime resources
@@ -340,12 +350,112 @@ jobs:
             throw "Desktop bundle contains removed runtime artifacts"
           }
 
-  publish:
+      # Selects exactly the asset set previous releases shipped: the CamelCase
+      # bundles plus their detached updater signatures. Tauri also emits
+      # lowercase `tap-chat_*` copies and an `.AppImage.tar.gz`, which were never
+      # release assets, so they are filtered out here.
+      - name: Stage release assets
+        id: stage
+        shell: pwsh
+        env:
+          UPDATER_ARCH: ${{ matrix.updater_arch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staging = Join-Path $env:RUNNER_TEMP "release-assets"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+
+          $bundleDirectories = Get-ChildItem -LiteralPath $env:CARGO_TARGET_DIR -Recurse -Directory | Where-Object {
+            $_.Name -eq "bundle"
+          }
+          $bundleFiles = $bundleDirectories | ForEach-Object {
+            Get-ChildItem -LiteralPath $_.FullName -Recurse -File
+          }
+
+          switch ("${{ matrix.platform }}") {
+            "linux" { $pattern = '^TapChat[-_].+\.(deb|rpm|AppImage)(\.sig)?$' }
+            "windows" { $pattern = '^TapChat[-_].+(\.msi|-setup\.exe)(\.sig)?$' }
+            default { $pattern = '^(TapChat[-_].+\.dmg|TapChat\.app\.tar\.gz(\.sig)?)$' }
+          }
+
+          $selected = $bundleFiles | Where-Object { $_.Name -match $pattern }
+          if (-not $selected) {
+            throw "No release assets matched $pattern under $env:CARGO_TARGET_DIR"
+          }
+
+          foreach ($file in $selected) {
+            # macOS ships one `TapChat.app.tar.gz` per architecture; the updater
+            # distinguishes them by the `_x64` / `_aarch64` suffix.
+            $name = $file.Name -replace '^TapChat\.app\.tar\.gz', "TapChat_$($env:UPDATER_ARCH).app.tar.gz"
+            $destination = Join-Path $staging $name
+            if (Test-Path -LiteralPath $destination) {
+              throw "Duplicate release asset name: $name"
+            }
+            Copy-Item -LiteralPath $file.FullName -Destination $destination
+            Write-Output "staged $name"
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that writes to the Releases API. Every asset is already built,
+  # so this can be re-run on its own if publishing fails.
+  release:
     needs: [validate, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
+      RELEASE_NOTES: 'See assets below for platform-specific installers.'
     steps:
-      - name: Publish completed cross-platform release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
-        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Build updater manifest
+        run: |
+          node scripts/build-updater-manifest.mjs \
+            --dir release-assets \
+            --version "$RELEASE_VERSION" \
+            --tag "$RELEASE_TAG" \
+            --repo "$REPO" \
+            --notes "$RELEASE_NOTES"
+
+      - name: Create draft release
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; reusing it."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$REPO" \
+              --target "$GITHUB_SHA" \
+              --title "TapChat $RELEASE_TAG" \
+              --notes "$RELEASE_NOTES" \
+              --draft
+          fi
+
+      - name: Upload release assets
+        run: |
+          set -euo pipefail
+          ls -la release-assets
+          gh release upload "$RELEASE_TAG" --repo "$REPO" --clobber release-assets/*
+
+      - name: Publish release
+        run: gh release edit "$RELEASE_TAG" --repo "$REPO" --draft=false --latest
